@@ -11,6 +11,21 @@ pub struct GlyphRegion {
     pub bearing_y: f32,
 }
 
+/// Dirty rectangle region (pixel coordinates) for incremental texture upload.
+#[derive(Clone, Copy, Debug)]
+pub struct DirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DirtyRect {
+    pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
 /// Key for the glyph cache: character + style + subpixel position.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AtlasGlyphKey {

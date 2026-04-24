@@ -1,6 +1,6 @@
 use ab_glyph::{point, Font, FontVec, GlyphId, PxScale, ScaleFont};
 use std::collections::HashMap;
-use super::font_backend::{FontBackend, GlyphRegion, AtlasGlyphKey, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
+use super::font_backend::{FontBackend, GlyphRegion, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
 
 fn is_cjk_or_wide(ch: char) -> bool {
     matches!(ch as u32,
@@ -35,7 +35,8 @@ pub struct AbGlyphAtlas {
     shelf_y: u32,
     shelf_height: u32,
     cache: HashMap<AtlasGlyphKey, GlyphRegion>,
-    dirty: bool,
+    dirty_rects: Vec<DirtyRect>,
+    needs_full_upload: bool,
     needs_rebind: bool,
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -81,7 +82,8 @@ impl AbGlyphAtlas {
             shelf_y: 0,
             shelf_height: 0,
             cache: HashMap::with_capacity(256),
-            dirty: false,
+            dirty_rects: Vec::new(),
+            needs_full_upload: false,
             needs_rebind: false,
             texture,
             view,
@@ -153,7 +155,8 @@ impl AbGlyphAtlas {
 
         self.width = new_size;
         self.height = new_size;
-        self.dirty = true;
+        self.needs_full_upload = true;
+        self.dirty_rects.clear();
         true
     }
 }
@@ -253,7 +256,8 @@ impl FontBackend for AbGlyphAtlas {
                 }
             });
 
-            self.dirty = true;
+            // Record dirty rectangle (with padding)
+            self.dirty_rects.push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
 
             // Apply subpixel offset to bearing_x: 0 → 0.0px, 1 → 0.25px, 2 → 0.5px, 3 → 0.75px
             let subpixel_shift = match subpixel_offset {
@@ -330,20 +334,70 @@ impl FontBackend for AbGlyphAtlas {
     }
 
     fn ensure_uploaded(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if !self.dirty {
-            return;
-        }
-
+        // Check if texture needs to be recreated
         let tex_size = self.texture.size();
         if tex_size.width != self.width || tex_size.height != self.height {
             let (texture, view, sampler) = create_gpu_resources(device, self.width, self.height);
             self.texture = texture;
             self.view = view;
             self.sampler = sampler;
+            self.needs_full_upload = true;
         }
 
-        upload_bitmap(queue, &self.texture, &self.bitmap, self.width, self.height);
-        self.dirty = false;
+        // Full upload when atlas was resized or texture recreated
+        if self.needs_full_upload {
+            upload_bitmap(queue, &self.texture, &self.bitmap, self.width, self.height);
+            self.needs_full_upload = false;
+            self.dirty_rects.clear();
+            return;
+        }
+
+        // Incremental upload: process dirty rectangles
+        if self.dirty_rects.is_empty() {
+            return;
+        }
+
+        for rect in &self.dirty_rects {
+            let x = rect.x;
+            let y = rect.y;
+            let w = rect.width.min(self.width.saturating_sub(x));
+            let h = rect.height.min(self.height.saturating_sub(y));
+
+            if w == 0 || h == 0 {
+                continue;
+            }
+
+            // Extract dirty rectangle data from bitmap
+            let mut rect_data = Vec::with_capacity((w * h * 4) as usize);
+            for row in y..(y + h) {
+                let src_start = ((row * self.width + x) * 4) as usize;
+                let src_end = src_start + (w * 4) as usize;
+                rect_data.extend_from_slice(&self.bitmap[src_start..src_end]);
+            }
+
+            // Upload only the dirty rectangle
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rect_data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        self.dirty_rects.clear();
     }
 
     fn backend_name(&self) -> &'static str {
