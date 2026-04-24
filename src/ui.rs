@@ -312,11 +312,13 @@ pub struct TerminalRenderer {
     last_rendered_scroll_offset: usize,
     last_rendered_selection: Option<crate::terminal::Selection>,
     last_rendered_search_hash: u64,
+    last_search_match_lines: Vec<usize>,
     last_rendered_hovered_link: Option<crate::link::Link>,
     last_rendered_cols: usize,
     last_rendered_rows: usize,
     last_rendered_terminal_ptr: usize, // Track which terminal to detect session switches
     dirty_rows_buffer: Vec<bool>,
+    changed_rows_buffer: Vec<usize>, // Reusable buffer for get_dirty_rows
 }
 
 impl TerminalRenderer {
@@ -363,11 +365,13 @@ impl TerminalRenderer {
             last_rendered_scroll_offset: 0,
             last_rendered_selection: None,
             last_rendered_search_hash: 0,
+            last_search_match_lines: Vec::new(),
             last_rendered_hovered_link: None,
             last_rendered_cols: 0,
             last_rendered_rows: 0,
             last_rendered_terminal_ptr: 0,
             dirty_rows_buffer: Vec::new(),
+            changed_rows_buffer: Vec::new(),
         }
     }
 
@@ -1246,9 +1250,10 @@ impl TerminalRenderer {
         if need_full_rebuild {
             dirty_rows.fill(true);
         } else {
-            // Grid content changes
-            let changed = terminal.get_dirty_rows(self.last_rendered_grid_version);
-            for &r in &changed {
+            // Grid content changes - reuse changed_rows_buffer for collection
+            self.changed_rows_buffer.clear();
+            terminal.get_dirty_rows(self.last_rendered_grid_version, &mut self.changed_rows_buffer);
+            for &r in &self.changed_rows_buffer {
                 if r < rows {
                     dirty_rows[r] = true;
                 }
@@ -1266,9 +1271,21 @@ impl TerminalRenderer {
                 Self::mark_selection_rows(&current_selection, rows, &mut dirty_rows, terminal);
             }
 
-            // Search overlay changes
+            // Search overlay changes - only mark matching lines dirty
             if self.last_rendered_search_hash != search_hash {
-                dirty_rows.fill(true);
+                // Mark all previously matched lines as dirty (to clear old highlights)
+                for &old_line in &self.last_search_match_lines {
+                    if old_line < dirty_rows.len() {
+                        dirty_rows[old_line] = true;
+                    }
+                }
+
+                // Mark all currently matched lines as dirty
+                for m in &search_state.matches {
+                    if m.line < dirty_rows.len() {
+                        dirty_rows[m.line] = true;
+                    }
+                }
             }
 
             // Link hover changes
@@ -1441,6 +1458,11 @@ impl TerminalRenderer {
         self.last_rendered_scroll_offset = current_scroll_offset;
         self.last_rendered_selection = current_selection;
         self.last_rendered_search_hash = search_hash;
+        // Update last_search_match_lines for next frame's dirty tracking
+        self.last_search_match_lines.clear();
+        for m in &search_state.matches {
+            self.last_search_match_lines.push(m.line);
+        }
         self.last_rendered_hovered_link = hovered_link.clone();
         self.last_rendered_cols = cols;
         self.last_rendered_rows = rows;

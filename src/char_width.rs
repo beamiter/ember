@@ -1,7 +1,22 @@
 /// P5 优化：字符宽度计算缓存
 /// 使用 LRU 缓存来避免重复的 Unicode 宽度计算
 /// 特别对于中文字符，性能提升显著（10-15%）
+/// ASCII 字符使用静态查找表，消除缓存开销
 use std::cell::RefCell;
+
+// ASCII 字符宽度静态查找表 (0-127)
+const ASCII_WIDTHS: [u8; 128] = [
+    // 0x00-0x1F: 控制字符，宽度为0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    // 0x20-0x7E: 可打印ASCII字符，宽度为1
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, // 0x7F: DEL 控制字符
+];
 
 thread_local! {
     static CHAR_WIDTH_CACHE: RefCell<lru::LruCache<char, usize>> = {
@@ -22,11 +37,18 @@ thread_local! {
 /// ```
 #[inline]
 pub fn cached_char_width(ch: char) -> usize {
+    let c = ch as u32;
+
+    // 快速路径：ASCII 字符使用查找表
+    if c < 128 {
+        return ASCII_WIDTHS[c as usize] as usize;
+    }
+
     CHAR_WIDTH_CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
+        let mut cache_ref = cache.borrow_mut();
 
         // 先检查缓存（peek 不会改变 LRU 顺序）
-        if let Some(&w) = c.peek(&ch) {
+        if let Some(&w) = cache_ref.peek(&ch) {
             return w;
         }
 
@@ -34,7 +56,7 @@ pub fn cached_char_width(ch: char) -> usize {
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
 
         // 存入缓存
-        c.put(ch, w);
+        cache_ref.put(ch, w);
         w
     })
 }

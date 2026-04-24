@@ -912,18 +912,13 @@ impl TerminalState {
     }
 
     /// P4：获取上次渲染后修改过的行索引
-    pub fn get_dirty_rows(&self, last_rendered_version: u64) -> Vec<usize> {
-        self.row_versions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &v)| {
-                if v > last_rendered_version {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect()
+    pub fn get_dirty_rows(&self, last_rendered_version: u64, out: &mut Vec<usize>) {
+        out.clear();
+        for (i, &v) in self.row_versions.iter().enumerate() {
+            if v > last_rendered_version {
+                out.push(i);
+            }
+        }
     }
 
     /// P4：获取网格版本号（用于缓存比较）
