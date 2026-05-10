@@ -1503,6 +1503,10 @@ impl TerminalRenderer {
             instances: self.cached_instances.clone(),
             uniforms: background_uniforms,
             instance_count,
+            row_offsets: self.row_instance_offsets.clone(),
+            row_counts: self.row_instance_counts.clone(),
+            dirty_rows: dirty_rows.clone(),
+            use_partial_upload: !need_full_rebuild && any_dirty,
         };
 
         let foreground_callback = gpu::callback::GridForegroundCallback {
@@ -1899,7 +1903,7 @@ impl TerminalRenderer {
 
     pub fn handle_keyboard_input(
         &self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         input: &mut Vec<u8>,
         _consumed_keys: &std::collections::HashSet<&str>,
         suppress_text_events: bool,
@@ -1908,8 +1912,8 @@ impl TerminalRenderer {
         xterm_modify_other_keys: u16,
         xterm_format_other_keys: u16,
         application_cursor_keys: bool,
+        events: &[egui::Event],
     ) {
-        let events = ctx.input(|i| i.events.clone());
         let report_all_keys = report_all_keys_mode || (keyboard_enhancement_flags & 0b1000) != 0;
         let effective_keyboard_flags = if report_all_keys_mode {
             keyboard_enhancement_flags | 0b1000
@@ -1922,7 +1926,7 @@ impl TerminalRenderer {
         // the actual character produced by the OS (including Caps Lock).
         let mut text_from_events: Option<String> = None;
         if report_all_keys {
-            for evt in &events {
+            for evt in events {
                 if let egui::Event::Text(t) = evt {
                     if !t.is_empty() && t.as_bytes()[0] >= 32 {
                         text_from_events = Some(t.clone());
@@ -1975,20 +1979,20 @@ impl TerminalRenderer {
                         t.len() == 1 && t.as_bytes()[0].is_ascii_uppercase() && !modifiers.shift
                     });
                     let effective_modifiers = if caps_lock {
-                        egui::Modifiers { shift: true, ..modifiers }
+                        egui::Modifiers { shift: true, ..*modifiers }
                     } else {
-                        modifiers
+                        *modifiers
                     };
 
                     if let Some(encoded) =
-                        kitty_encode_key_event(key, effective_modifiers, effective_keyboard_flags)
+                        kitty_encode_key_event(*key, effective_modifiers, effective_keyboard_flags)
                     {
                         input.extend(encoded.as_bytes());
                         continue;
                     }
 
                     if let Some(encoded) = xterm_encode_modify_other_keys(
-                        key,
+                        *key,
                         effective_modifiers,
                         xterm_modify_other_keys,
                         xterm_format_other_keys,
@@ -1999,7 +2003,7 @@ impl TerminalRenderer {
                     }
 
                     // Handle normal key sequences
-                    let seq = key_to_terminal_sequence(key, effective_modifiers, application_cursor_keys);
+                    let seq = key_to_terminal_sequence(*key, effective_modifiers, application_cursor_keys);
 
                     if let Some(s) = seq {
                         input.extend(s.as_bytes());

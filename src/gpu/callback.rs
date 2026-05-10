@@ -26,6 +26,10 @@ pub struct GridBackgroundCallback {
     pub instances: Arc<Vec<CellInstance>>,
     pub uniforms: GridUniforms,
     pub instance_count: u32,
+    pub row_offsets: Vec<usize>,
+    pub row_counts: Vec<usize>,
+    pub dirty_rows: Vec<bool>,
+    pub use_partial_upload: bool,
 }
 
 impl egui_wgpu::CallbackTrait for GridBackgroundCallback {
@@ -50,8 +54,20 @@ impl egui_wgpu::CallbackTrait for GridBackgroundCallback {
         }
 
         res.pipeline.update_uniforms(queue, &self.uniforms);
-        res.pipeline
-            .update_instances(device, queue, &self.instances);
+
+        if self.use_partial_upload && !self.dirty_rows.is_empty() {
+            res.pipeline.update_instances_partial(
+                device,
+                queue,
+                &self.instances,
+                &self.row_offsets,
+                &self.row_counts,
+                &self.dirty_rows,
+            );
+        } else {
+            res.pipeline
+                .update_instances(device, queue, &self.instances);
+        }
 
         Vec::new()
     }

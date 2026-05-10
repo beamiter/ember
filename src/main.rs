@@ -617,6 +617,8 @@ struct TerminalApp {
     font_size_accumulator: f32,
     // 上一帧是否有Ctrl+滚轮事件
     had_ctrl_scroll_last_frame: bool,
+    // 每帧事件缓存，避免多次克隆
+    frame_events: Vec<egui::Event>,
 }
 
 fn should_restore_terminal_shortcut_event(ctx: &egui::Context, modifiers: egui::Modifiers) -> bool {
@@ -1035,6 +1037,7 @@ impl TerminalApp {
             mouse_scroll_accumulator: 0.0,
             font_size_accumulator: 0.0,
             had_ctrl_scroll_last_frame: false,
+            frame_events: Vec::new(),
         }
     }
 
@@ -2361,12 +2364,15 @@ impl eframe::App for TerminalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.debug_panel.record_frame();
 
+        // Collect events once per frame to avoid multiple clones
+        self.frame_events.clear();
+        ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
+
         let active_session_idx = self.session_manager.active_index();
         let session = self.session_manager.get_active_session_mut();
 
         // Step 1: 处理 IME 事件
-        let all_events = ctx.input(|i| i.events.clone());
-        for evt in &all_events {
+        for evt in &self.frame_events {
             if let egui::Event::Ime(ime_event) = evt {
                 let mut terminal = session.terminal.lock();
                 match ime_event {
@@ -2418,9 +2424,8 @@ impl eframe::App for TerminalApp {
         // Step 1.5: 处理累积的Ctrl+滚轮字体缩放
         // 检查是否有ctrl+scroll事件
         let has_ctrl_scroll_this_frame = {
-            let all_events = ctx.input(|i| i.events.clone());
             let ctrl_pressed = ctx.input(|i| i.modifiers.ctrl);
-            ctrl_pressed && all_events.iter().any(|evt| {
+            ctrl_pressed && self.frame_events.iter().any(|evt| {
                 matches!(evt, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl)
             })
         };
@@ -2479,9 +2484,8 @@ impl eframe::App for TerminalApp {
 
         // 当命令调色板打开时，处理其事件
         if self.command_palette.is_open {
-            let all_events = ctx.input(|i| i.events.clone());
-
-            for evt in &all_events {
+            let events_copy = self.frame_events.clone();
+            for evt in &events_copy {
                 match evt {
                     egui::Event::Key {
                         key,
@@ -2740,9 +2744,8 @@ impl eframe::App for TerminalApp {
 
         // Step 2.5: 搜索面板事件处理
         if self.search_state.is_open {
-            let all_events = ctx.input(|i| i.events.clone());
-
-            for evt in &all_events {
+            let events_copy = self.frame_events.clone();
+            for evt in &events_copy {
                 match evt {
                     egui::Event::Key {
                         key,
@@ -2774,14 +2777,14 @@ impl eframe::App for TerminalApp {
         }
 
         // Step 3: 处理复制粘贴（从配置系统或硬编码的 Ctrl+Shift+C/V）
-        let all_events = ctx.input(|i| i.events.clone());
+        let events_copy = self.frame_events.clone();
         let mut consumed_keys = std::collections::HashSet::new();
 
         let mut saw_ctrl_shift_c = false;
         let mut saw_ctrl_shift_v = false;
         let mut saw_semantic_paste = false;
 
-        for evt in &all_events {
+        for evt in &events_copy {
             match evt {
                 egui::Event::Key {
                     key,
@@ -3042,6 +3045,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
+                &self.frame_events,
             );
         }
 

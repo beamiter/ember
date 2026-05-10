@@ -1,5 +1,7 @@
 use ab_glyph::{point, Font, FontVec, GlyphId, PxScale, ScaleFont};
 use std::collections::HashMap;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use super::font_backend::{FontBackend, GlyphRegion, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
 
 fn is_cjk_or_wide(ch: char) -> bool {
@@ -34,7 +36,8 @@ pub struct AbGlyphAtlas {
     shelf_x: u32,
     shelf_y: u32,
     shelf_height: u32,
-    cache: HashMap<AtlasGlyphKey, GlyphRegion>,
+    ascii_cache: HashMap<AtlasGlyphKey, GlyphRegion>,
+    unicode_cache: LruCache<AtlasGlyphKey, GlyphRegion>,
     dirty_rects: Vec<DirtyRect>,
     needs_full_upload: bool,
     needs_rebind: bool,
@@ -81,7 +84,8 @@ impl AbGlyphAtlas {
             shelf_x: 0,
             shelf_y: 0,
             shelf_height: 0,
-            cache: HashMap::with_capacity(256),
+            ascii_cache: HashMap::with_capacity(1024),
+            unicode_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
             dirty_rects: Vec::new(),
             needs_full_upload: false,
             needs_rebind: false,
@@ -128,6 +132,15 @@ impl AbGlyphAtlas {
         false
     }
 
+    /// Insert region into the appropriate cache (ASCII or Unicode)
+    fn cache_insert(&mut self, key: AtlasGlyphKey, region: GlyphRegion) {
+        if (key.ch as u32) < 128 {
+            self.ascii_cache.insert(key, region);
+        } else {
+            self.unicode_cache.put(key, region);
+        }
+    }
+
     fn grow(&mut self) -> bool {
         let new_size = self.width * 2;
         if new_size > MAX_ATLAS_SIZE {
@@ -146,7 +159,13 @@ impl AbGlyphAtlas {
         self.bitmap = new_bitmap;
         let scale_x = self.width as f32 / new_size as f32;
         let scale_y = self.height as f32 / new_size as f32;
-        for region in self.cache.values_mut() {
+        for region in self.ascii_cache.values_mut() {
+            region.u0 *= scale_x;
+            region.u1 *= scale_x;
+            region.v0 *= scale_y;
+            region.v1 *= scale_y;
+        }
+        for (_, region) in self.unicode_cache.iter_mut() {
             region.u0 *= scale_x;
             region.u1 *= scale_x;
             region.v0 *= scale_y;
@@ -165,8 +184,17 @@ impl FontBackend for AbGlyphAtlas {
     fn get_or_rasterize(&mut self, ch: char, bold: bool, subpixel_offset: u8) -> GlyphRegion {
         let effective_subpixel = if is_cjk_or_wide(ch) { 0 } else { subpixel_offset };
         let key = AtlasGlyphKey { ch, bold, subpixel_offset: effective_subpixel };
-        if let Some(&region) = self.cache.get(&key) {
-            return region;
+
+        // Tier 1: ASCII permanent cache (never evicted)
+        if (ch as u32) < 128 {
+            if let Some(&region) = self.ascii_cache.get(&key) {
+                return region;
+            }
+        } else {
+            // Tier 2: Unicode LRU cache
+            if let Some(&region) = self.unicode_cache.get(&key) {
+                return region;
+            }
         }
 
         let font = if bold {
@@ -218,7 +246,7 @@ impl FontBackend for AbGlyphAtlas {
 
             if glyph_w == 0 || glyph_h == 0 {
                 let region = empty_glyph_region();
-                self.cache.insert(key, region);
+                self.cache_insert(key, region);
                 return region;
             }
 
@@ -228,12 +256,12 @@ impl FontBackend for AbGlyphAtlas {
             if !self.allocate_shelf(padded_w, padded_h) {
                 if !self.grow() {
                     let region = empty_glyph_region();
-                    self.cache.insert(key, region);
+                    self.cache_insert(key, region);
                     return region;
                 }
                 if !self.allocate_shelf(padded_w, padded_h) {
                     let region = empty_glyph_region();
-                    self.cache.insert(key, region);
+                    self.cache_insert(key, region);
                     return region;
                 }
             }
@@ -277,7 +305,7 @@ impl FontBackend for AbGlyphAtlas {
                 bearing_x: bounds.min.x + subpixel_shift,
                 bearing_y: bounds.min.y,
             };
-            self.cache.insert(key, region);
+            self.cache_insert(key, region);
             region
         } else {
             let h_advance = scaled_font.h_advance(glyph_id);
@@ -297,13 +325,14 @@ impl FontBackend for AbGlyphAtlas {
                 bearing_x: subpixel_shift,
                 bearing_y: 0.0,
             };
-            self.cache.insert(key, region);
+            self.cache_insert(key, region);
             region
         }
     }
 
     fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.cache.clear();
+        self.ascii_cache.clear();
+        self.unicode_cache.clear();
         self.shelf_x = 0;
         self.shelf_y = 0;
         self.shelf_height = 0;

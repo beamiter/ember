@@ -240,6 +240,83 @@ impl GridPipeline {
         queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
     }
 
+    /// Upload only dirty rows' instance data in contiguous spans.
+    /// Reduces GPU upload bandwidth by only sending changed rows.
+    pub fn update_instances_partial(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[CellInstance],
+        row_offsets: &[usize],
+        row_counts: &[usize],
+        dirty_rows: &[bool],
+    ) {
+        if instances.is_empty() {
+            return;
+        }
+
+        // Reallocate buffer if needed (same logic as update_instances)
+        if instances.len() > self.instance_capacity {
+            let new_capacity = instances.len().next_power_of_two();
+            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("grid_instances"),
+                size: (new_capacity * std::mem::size_of::<CellInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_capacity = new_capacity;
+        }
+
+        // Upload dirty rows in contiguous spans to minimize write_buffer calls
+        let mut upload_start: Option<usize> = None;
+
+        for (row_idx, &is_dirty) in dirty_rows.iter().enumerate() {
+            if is_dirty {
+                if upload_start.is_none() {
+                    upload_start = Some(row_idx);
+                }
+            } else if let Some(start_row) = upload_start {
+                // Flush span [start_row..row_idx)
+                self.upload_row_span(queue, instances, row_offsets, row_counts, start_row, row_idx);
+                upload_start = None;
+            }
+        }
+
+        // Flush trailing span if any
+        if let Some(start_row) = upload_start {
+            self.upload_row_span(queue, instances, row_offsets, row_counts, start_row, dirty_rows.len());
+        }
+    }
+
+    #[inline]
+    fn upload_row_span(
+        &self,
+        queue: &wgpu::Queue,
+        instances: &[CellInstance],
+        row_offsets: &[usize],
+        row_counts: &[usize],
+        start_row: usize,
+        end_row: usize,
+    ) {
+        let instance_offset = row_offsets[start_row];
+        let instance_count: usize = (start_row..end_row)
+            .map(|r| row_counts[r])
+            .sum();
+
+        if instance_count == 0 {
+            return;
+        }
+
+        let byte_offset = (instance_offset * std::mem::size_of::<CellInstance>()) as u64;
+        let slice = &instances[instance_offset..instance_offset + instance_count];
+
+        queue.write_buffer(
+            &self.instance_buffer,
+            byte_offset,
+            bytemuck::cast_slice(slice),
+        );
+    }
+
     pub fn pipeline(&self) -> &wgpu::RenderPipeline {
         &self.pipeline
     }
