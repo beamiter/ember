@@ -2751,31 +2751,26 @@ impl TerminalState {
         }
     }
 
-    pub fn is_cell_selected(&self, viewport_row: usize, col: usize) -> bool {
-        if let Some(sel) = self.selection {
-            let abs_row = self.viewport_row_to_absolute(viewport_row);
-            let (start, end) = if sel.anchor <= sel.active {
-                (sel.anchor, sel.active)
-            } else {
-                (sel.active, sel.anchor)
-            };
-
-            if abs_row < start.0 || abs_row > end.0 {
-                return false;
-            }
-
-            if abs_row == start.0 && abs_row == end.0 {
-                col >= start.1 && col <= end.1
-            } else if abs_row == start.0 {
-                col >= start.1
-            } else if abs_row == end.0 {
-                col <= end.1
-            } else {
-                true
-            }
+    /// Returns the selected column range for a given viewport row.
+    /// Returns None if row is not selected, or Some((start_col, end_col)) where:
+    /// - For partial row selection: actual column range
+    /// - For fully-selected middle rows: (0, usize::MAX)
+    pub fn row_selection_cols(&self, viewport_row: usize) -> Option<(usize, usize)> {
+        let sel = self.selection?;
+        let abs_row = self.viewport_row_to_absolute(viewport_row);
+        let (start, end) = if sel.anchor <= sel.active {
+            (sel.anchor, sel.active)
         } else {
-            false
+            (sel.active, sel.anchor)
+        };
+
+        if abs_row < start.0 || abs_row > end.0 {
+            return None;
         }
+
+        let col_start = if abs_row == start.0 { start.1 } else { 0 };
+        let col_end = if abs_row == end.0 { end.1 } else { usize::MAX };
+        Some((col_start, col_end))
     }
 
     // IME support methods

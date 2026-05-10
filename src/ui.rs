@@ -1579,13 +1579,18 @@ impl TerminalRenderer {
         row_idx: usize,
         cols: usize,
     ) {
+        // Compute selection range once per row instead of per cell
+        let sel_cols = terminal.row_selection_cols(row_idx);
+
         for col_idx in 0..cols {
             let cell = &grid[row_idx][col_idx];
             if cell.wide_continuation {
                 continue;
             }
 
-            let is_selected = terminal.is_cell_selected(row_idx, col_idx);
+            let is_selected = sel_cols
+                .map(|(start, end)| col_idx >= start && col_idx <= end)
+                .unwrap_or(false);
             let is_inverse = cell.flags.inverse;
 
             let mut bg_color = if is_selected {
@@ -1744,13 +1749,17 @@ impl TerminalRenderer {
 
         // Phase 1: Render non-default backgrounds
         for row_idx in 0..rows {
+            let sel_cols = terminal.row_selection_cols(row_idx);
+
             for col_idx in 0..cols {
                 let cell = &grid[row_idx][col_idx];
                 if cell.wide_continuation {
                     continue;
                 }
 
-                let is_selected = terminal.is_cell_selected(row_idx, col_idx);
+                let is_selected = sel_cols
+                    .map(|(start, end)| col_idx >= start && col_idx <= end)
+                    .unwrap_or(false);
                 let is_inverse = cell.flags.inverse;
 
                 if !is_selected
@@ -1809,6 +1818,7 @@ impl TerminalRenderer {
 
         // Phase 2: Render characters
         for row_idx in 0..rows {
+            let sel_cols = terminal.row_selection_cols(row_idx);
             let (_, snapped_height) = snapped_span(content_rect.top(), row_idx, line_height);
             let y = snapped_span(content_rect.top(), row_idx, line_height).0;
 
@@ -1820,7 +1830,9 @@ impl TerminalRenderer {
                     continue;
                 }
 
-                let is_selected = terminal.is_cell_selected(row_idx, col_idx);
+                let is_selected = sel_cols
+                    .map(|(start, end)| col_idx >= start && col_idx <= end)
+                    .unwrap_or(false);
                 let mut fg_color = if is_selected {
                     self.theme.selection_fg_color()
                 } else if cell.flags.inverse {
