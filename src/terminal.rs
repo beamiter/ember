@@ -951,17 +951,22 @@ impl TerminalState {
     }
 
     pub fn process_input(&mut self, input: &[u8]) {
-        let mut data = Vec::with_capacity(self.pending_escape.len() + input.len());
-        if !self.pending_escape.is_empty() {
-            data.extend_from_slice(&self.pending_escape);
-            self.pending_escape.clear();
-        }
-        data.extend_from_slice(input);
+        // Fast path: if no pending escape, process input directly without allocation
+        let data;
+        let data_slice: &[u8] = if self.pending_escape.is_empty() {
+            input
+        } else {
+            // Slow path: merge pending escape with new input
+            let mut combined = std::mem::take(&mut self.pending_escape);
+            combined.extend_from_slice(input);
+            data = combined;
+            &data
+        };
 
         let mut i = 0;
 
-        while i < data.len() {
-            let byte = data[i];
+        while i < data_slice.len() {
+            let byte = data_slice[i];
 
             match byte {
                 b'\x08' | b'\x7f' => {
@@ -1011,12 +1016,12 @@ impl TerminalState {
                 b'\x1b' => {
                     let esc_start = i;
 
-                    if i + 1 >= data.len() {
-                        self.pending_escape.extend_from_slice(&data[esc_start..]);
+                    if i + 1 >= data_slice.len() {
+                        self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
                         break;
                     }
 
-                    match data[i + 1] {
+                    match data_slice[i + 1] {
                         b'7' => {
                             // DECSC - Save Cursor Position
                             self.saved_cursor_row = self.cursor_row;
@@ -1035,14 +1040,14 @@ impl TerminalState {
                             let payload_start = i;
 
                             let mut terminated = false;
-                            while i < data.len() {
-                                if data[i] == 0x07 {
+                            while i < data_slice.len() {
+                                if data_slice[i] == 0x07 {
                                     i += 1;
                                     terminated = true;
                                     break;
-                                } else if i + 1 < data.len()
-                                    && data[i] == 0x1b
-                                    && data[i + 1] == 0x5c
+                                } else if i + 1 < data_slice.len()
+                                    && data_slice[i] == 0x1b
+                                    && data_slice[i + 1] == 0x5c
                                 {
                                     i += 2;
                                     terminated = true;
@@ -1053,14 +1058,14 @@ impl TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape.extend_from_slice(&data[esc_start..]);
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
 
-                            let payload_end = if data[i - 1] == 0x07 { i - 1 } else { i - 2 };
+                            let payload_end = if data_slice[i - 1] == 0x07 { i - 1 } else { i - 2 };
                             if payload_end >= payload_start {
                                 if let Ok(payload) =
-                                    std::str::from_utf8(&data[payload_start..payload_end])
+                                    std::str::from_utf8(&data_slice[payload_start..payload_end])
                                 {
                                     if let Some((command, value)) = payload.split_once(';') {
                                         if command == "0" || command == "2" {
@@ -1107,10 +1112,10 @@ impl TerminalState {
 
                             let mut terminated = false;
                             let dcs_start = i;
-                            while i < data.len() {
-                                if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == 0x5c {
+                            while i < data_slice.len() {
+                                if i + 1 < data_slice.len() && data_slice[i] == 0x1b && data_slice[i + 1] == 0x5c {
                                     // Extract DCS payload
-                                    let payload = &data[dcs_start..i];
+                                    let payload = &data_slice[dcs_start..i];
 
                                     // Check if this is a Kitty graphics protocol DCS
                                     if let Ok(payload_str) = std::str::from_utf8(payload) {
@@ -1139,7 +1144,7 @@ impl TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape.extend_from_slice(&data[esc_start..]);
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
                         }
@@ -1159,15 +1164,15 @@ impl TerminalState {
                             i += 2;
                         }
                         b'(' | b')' => {
-                            if i + 2 >= data.len() {
-                                self.pending_escape.extend_from_slice(&data[esc_start..]);
+                            if i + 2 >= data_slice.len() {
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
 
                             // Character set selection: ESC ( X or ESC ) X
-                            // data[i] = ESC, data[i+1] = '(' or ')', data[i+2] = designator
-                            let is_g0 = data[i + 1] == b'(';
-                            let designator = data[i + 2];
+                            // data_slice[i] = ESC, data_slice[i+1] = '(' or ')', data_slice[i+2] = designator
+                            let is_g0 = data_slice[i + 1] == b'(';
+                            let designator = data_slice[i + 2];
                             let charset = Self::charset_from_designator(designator);
 
                             crate::debug_log!(
@@ -1242,12 +1247,12 @@ impl TerminalState {
                             let mut intermediates = Vec::new();
                             let mut final_byte = None;
 
-                            while i < data.len() {
-                                match data[i] {
-                                    0x30..=0x3f => param_bytes.push(data[i]),
-                                    0x20..=0x2f => intermediates.push(data[i]),
+                            while i < data_slice.len() {
+                                match data_slice[i] {
+                                    0x30..=0x3f => param_bytes.push(data_slice[i]),
+                                    0x20..=0x2f => intermediates.push(data_slice[i]),
                                     0x40..=0x7e => {
-                                        final_byte = Some(data[i]);
+                                        final_byte = Some(data_slice[i]);
                                         break;
                                     }
                                     _ => break,
@@ -1256,7 +1261,7 @@ impl TerminalState {
                             }
 
                             let Some(final_byte) = final_byte else {
-                                self.pending_escape.extend_from_slice(&data[esc_start..]);
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             };
 

@@ -319,6 +319,7 @@ pub struct TerminalRenderer {
     last_rendered_terminal_ptr: usize, // Track which terminal to detect session switches
     dirty_rows_buffer: Vec<bool>,
     changed_rows_buffer: Vec<usize>, // Reusable buffer for get_dirty_rows
+    row_instances_scratch: Vec<gpu::instance::CellInstance>, // Reusable buffer for partial row rebuild
 }
 
 impl TerminalRenderer {
@@ -372,6 +373,7 @@ impl TerminalRenderer {
             last_rendered_terminal_ptr: 0,
             dirty_rows_buffer: Vec::new(),
             changed_rows_buffer: Vec::new(),
+            row_instances_scratch: Vec::new(),
         }
     }
 
@@ -1266,11 +1268,6 @@ impl TerminalRenderer {
                 Self::mark_selection_rows(&current_selection, rows, &mut dirty_rows, terminal);
             }
 
-            // Also always mark current selection rows during drag (workaround for selection rendering issue)
-            if current_selection.is_some() {
-                Self::mark_selection_rows(&current_selection, rows, &mut dirty_rows, terminal);
-            }
-
             // Search overlay changes - only mark matching lines dirty
             if self.last_rendered_search_hash != search_hash {
                 // Mark all previously matched lines as dirty (to clear old highlights)
@@ -1338,6 +1335,15 @@ impl TerminalRenderer {
                     link_map.entry(link.line).or_insert_with(Vec::new).push(link);
                 }
 
+                // Build search match map for O(1) per-row lookup instead of O(M) per-cell scan
+                let mut search_map: std::collections::HashMap<usize, Vec<&crate::search::SearchMatch>> =
+                    std::collections::HashMap::new();
+                if has_search {
+                    for m in &search_state.matches {
+                        search_map.entry(m.line).or_insert_with(Vec::new).push(m);
+                    }
+                }
+
                 if need_full_rebuild {
                     // Full rebuild: clear and rebuild all
                     let instances = std::sync::Arc::make_mut(&mut self.cached_instances);
@@ -1355,6 +1361,7 @@ impl TerminalRenderer {
                             terminal,
                             search_state,
                             &link_map,
+                            &search_map,
                             hovered_link,
                             &self.theme,
                             default_bg,
@@ -1373,20 +1380,23 @@ impl TerminalRenderer {
                 } else {
                     // Partial rebuild: only rebuild dirty rows
                     let mut needs_relayout = false;
+                    let mut row_scratch = std::mem::take(&mut self.row_instances_scratch);
+
                     for row_idx in 0..rows {
                         if !dirty_rows[row_idx] {
                             continue;
                         }
 
-                        // Build new instances for this row into a temp buffer
-                        let mut row_instances = Vec::new();
+                        // Build new instances for this row into reusable scratch buffer
+                        row_scratch.clear();
                         Self::build_row_instances(
-                            &mut row_instances,
+                            &mut row_scratch,
                             gpu_res,
                             grid,
                             terminal,
                             search_state,
                             &link_map,
+                            &search_map,
                             hovered_link,
                             &self.theme,
                             default_bg,
@@ -1400,7 +1410,7 @@ impl TerminalRenderer {
                         );
 
                         let old_count = self.row_instance_counts[row_idx];
-                        if row_instances.len() != old_count {
+                        if row_scratch.len() != old_count {
                             // Instance count changed (wide chars appeared/disappeared)
                             // Fall back to full relayout
                             needs_relayout = true;
@@ -1410,8 +1420,11 @@ impl TerminalRenderer {
                         // Patch in-place
                         let offset = self.row_instance_offsets[row_idx];
                         let instances = std::sync::Arc::make_mut(&mut self.cached_instances);
-                        instances[offset..offset + old_count].copy_from_slice(&row_instances);
+                        instances[offset..offset + old_count].copy_from_slice(&row_scratch);
                     }
+
+                    // Return scratch buffer for next frame
+                    self.row_instances_scratch = row_scratch;
 
                     if needs_relayout {
                         // Rebuild all from scratch
@@ -1429,6 +1442,7 @@ impl TerminalRenderer {
                                 terminal,
                                 search_state,
                                 &link_map,
+                                &search_map,
                                 hovered_link,
                                 &self.theme,
                                 default_bg,
@@ -1553,6 +1567,7 @@ impl TerminalRenderer {
         terminal: &TerminalState,
         search_state: &crate::search::SearchState,
         link_map: &std::collections::HashMap<usize, Vec<&crate::link::Link>>,
+        search_map: &std::collections::HashMap<usize, Vec<&crate::search::SearchMatch>>,
         hovered_link: &Option<crate::link::Link>,
         theme: &crate::theme::Theme,
         default_bg: Color32,
@@ -1582,22 +1597,27 @@ impl TerminalRenderer {
             };
 
             if has_search {
-                for (match_idx, m) in search_state.matches.iter().enumerate() {
-                    if m.line == row_idx && col_idx >= m.col_start && col_idx < m.col_end {
-                        let orig_fg = resolve_foreground_color(cell.foreground, theme);
-                        bg_color = orig_fg;
-                        if match_idx
-                            == search_state.current_match_index % search_state.matches.len()
-                        {
-                            let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
-                            bg_color = Color32::from_rgba_unmultiplied(
-                                (r as u16 * 180 / 255) as u8,
-                                (g as u16 * 180 / 255) as u8,
-                                (b as u16 * 180 / 255) as u8,
-                                255,
-                            );
+                if let Some(row_matches) = search_map.get(&row_idx) {
+                    let active_match_idx = search_state.current_match_index % search_state.matches.len();
+                    for m in row_matches.iter() {
+                        if col_idx >= m.col_start && col_idx < m.col_end {
+                            let orig_fg = resolve_foreground_color(cell.foreground, theme);
+                            bg_color = orig_fg;
+                            // Find global match index by scanning search_state.matches
+                            let global_match_idx = search_state.matches.iter()
+                                .position(|gm| std::ptr::eq(*m, gm))
+                                .unwrap_or(0);
+                            if global_match_idx == active_match_idx {
+                                let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
+                                bg_color = Color32::from_rgba_unmultiplied(
+                                    (r as u16 * 180 / 255) as u8,
+                                    (g as u16 * 180 / 255) as u8,
+                                    (b as u16 * 180 / 255) as u8,
+                                    255,
+                                );
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
