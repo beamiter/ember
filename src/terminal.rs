@@ -1243,14 +1243,27 @@ impl TerminalState {
                         b'[' => {
                             i += 2;
 
-                            let mut param_bytes = Vec::new();
-                            let mut intermediates = Vec::new();
+                            // Use stack arrays for CSI params (typical CSI sequences are short)
+                            let mut param_bytes = [0u8; 32];
+                            let mut param_len = 0;
+                            let mut intermediates = [0u8; 8];
+                            let mut inter_len = 0;
                             let mut final_byte = None;
 
                             while i < data_slice.len() {
                                 match data_slice[i] {
-                                    0x30..=0x3f => param_bytes.push(data_slice[i]),
-                                    0x20..=0x2f => intermediates.push(data_slice[i]),
+                                    0x30..=0x3f => {
+                                        if param_len < param_bytes.len() {
+                                            param_bytes[param_len] = data_slice[i];
+                                            param_len += 1;
+                                        }
+                                    }
+                                    0x20..=0x2f => {
+                                        if inter_len < intermediates.len() {
+                                            intermediates[inter_len] = data_slice[i];
+                                            inter_len += 1;
+                                        }
+                                    }
                                     0x40..=0x7e => {
                                         final_byte = Some(data_slice[i]);
                                         break;
@@ -1265,21 +1278,25 @@ impl TerminalState {
                                 break;
                             };
 
-                            let private_prefix = match param_bytes.first().copied() {
+                            let private_prefix = match param_bytes.get(0).copied() {
                                 Some(prefix @ (b'<' | b'=' | b'>' | b'?')) => {
-                                    param_bytes.remove(0);
+                                    // Shift remaining params left
+                                    for j in 0..param_len - 1 {
+                                        param_bytes[j] = param_bytes[j + 1];
+                                    }
+                                    param_len -= 1;
                                     Some(prefix)
                                 }
                                 _ => None,
                             };
-                            let params = Self::parse_csi_params(&param_bytes);
+                            let params = Self::parse_csi_params(&param_bytes[..param_len]);
                             let cmd = final_byte as char;
 
                             self.handle_escape_sequence(
                                 &params,
                                 cmd,
                                 private_prefix,
-                                &intermediates,
+                                &intermediates[..inter_len],
                             );
                             i += 1;
                         }
