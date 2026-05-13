@@ -2123,6 +2123,12 @@ impl TerminalState {
                     self.use_alt_buffer = false;
                     self.modes.remove(&1049);
 
+                    // Reset SGR attributes to prevent alternate screen colors from bleeding through
+                    self.current_fg = Color::Default;
+                    self.current_bg = Color::Default;
+                    self.global_bg = Color::Default;
+                    self.current_flags = StyleFlags::default();
+
                     // Mark all rows dirty after grid swap to force full re-render
                     // Increment by rows+1 to trigger grid_version_jumped in ui.rs
                     self.grid_version += self.grid.rows() as u64 + 1;
