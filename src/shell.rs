@@ -282,17 +282,18 @@ impl ShellSession {
         }
     }
 
-    /// 向 shell 发送输入数据（例如用户输入）
     /// 处理大数据写入：循环写入并在 poll 等待时释放锁，避免与 io_loop 死锁
-    pub fn write(&self, data: &[u8]) -> std::result::Result<(), String> {
+    pub(crate) fn write_to_pty(
+        pty: &Arc<Mutex<Pty>>,
+        data: &[u8],
+    ) -> std::result::Result<(), String> {
         let mut offset = 0;
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(10);
 
         // 先获取 master_fd（不需要长期持锁）
         let master_fd = {
-            let pty = self
-                .pty
+            let pty = pty
                 .lock()
                 .map_err(|_| "Failed to lock PTY for fd".to_string())?;
             pty.master_fd()
@@ -309,8 +310,7 @@ impl ShellSession {
 
             // 获取锁，尝试写入，然后立即释放锁
             {
-                let mut pty = self
-                    .pty
+                let mut pty = pty
                     .lock()
                     .map_err(|_| "Failed to lock PTY for write".to_string())?;
                 match pty.write(&data[offset..]) {
@@ -346,6 +346,19 @@ impl ShellSession {
         Ok(())
     }
 
+    /// 向 shell 发送输入数据（例如用户输入）
+    pub fn write(&self, data: &[u8]) -> std::result::Result<(), String> {
+        Self::write_to_pty(&self.pty, data)
+    }
+
+    /// 在后台线程发送大块数据，避免阻塞 UI 更新循环。
+    pub fn write_async(&self, data: Vec<u8>) {
+        let pty = Arc::clone(&self.pty);
+        thread::spawn(move || {
+            let _ = Self::write_to_pty(&pty, &data);
+        });
+    }
+
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
         let mut pty = self
             .pty
@@ -355,7 +368,7 @@ impl ShellSession {
             .map_err(|e| format!("Resize error: {}", e))
     }
 
-/// 获取 shell 子进程的 PID
+    /// 获取 shell 子进程的 PID
     pub fn get_child_pid(&self) -> i32 {
         self.child_pid
     }

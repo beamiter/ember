@@ -2884,8 +2884,7 @@ impl eframe::App for TerminalApp {
                                     let paste_packet = kitty_graphics_payload(mime_type, &bytes);
                                     crate::debug_log!("[KITTY] Ctrl+Shift+V pasting {} bytes with mime_type={}, packet_size={}",
                                                     bytes.len(), mime_type, paste_packet.len());
-                                    let write_result = session.shell.write(&paste_packet);
-                                    crate::debug_log!("[KITTY] write result: {:?}", write_result);
+                                    session.shell.write_async(paste_packet);
                                     consumed_keys.insert("Ctrl+Shift+V".to_string());
                                 } else {
                                     crate::debug_log!(
@@ -2908,36 +2907,43 @@ impl eframe::App for TerminalApp {
 
         if saw_semantic_paste {
             crate::debug_log!("[PASTE] ===== Semantic Paste triggered =====");
-            let unsolicited_paste = if let Some(clipboard) = &self.clipboard {
-                let mime_types = clipboard.available_mime_types().unwrap_or_default();
-                crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
-                let mut terminal = session.terminal.lock();
+            let paste_events_enabled = {
+                let terminal = session.terminal.lock();
                 let paste_events_enabled = terminal.is_paste_events_enabled();
                 crate::debug_log!(
                     "[PASTE] terminal paste_events_enabled (mode 5522): {}",
                     paste_events_enabled
                 );
-                if paste_events_enabled {
-                    // 应用支持粘贴事件协议，发送 MIME 类型列表，让应用请求
-                    crate::debug_log!("[PASTE] app supports paste events, building paste event");
-                    Some(terminal.build_paste_event(&mime_types))
-                } else {
-                    crate::debug_log!("[PASTE] app does NOT support paste events");
-                    None
-                }
-            } else {
-                crate::debug_log!("[PASTE] clipboard not available");
-                None
+                paste_events_enabled
             };
 
-            if let Some(bytes) = unsolicited_paste {
-                crate::debug_log!(
-                    "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
-                    bytes.len()
-                );
-                let _ = session.shell.write(&bytes);
+            if paste_events_enabled && self.clipboard.is_some() {
+                // 应用支持粘贴事件协议，发送 MIME 类型列表，让应用请求
+                crate::debug_log!("[PASTE] app supports paste events, building paste event");
+                let terminal = Arc::clone(&session.terminal);
+                let pty = session.shell.pty_writer();
+                std::thread::spawn(move || {
+                    let mime_types = ClipboardManager::new()
+                        .and_then(|clipboard| clipboard.available_mime_types())
+                        .unwrap_or_default();
+                    crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
+                    let bytes = {
+                        let mut terminal = terminal.lock();
+                        terminal.build_paste_event(&mime_types)
+                    };
+                    crate::debug_log!(
+                        "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
+                        bytes.len()
+                    );
+                    let _ = ShellSession::write_to_pty(&pty, &bytes);
+                });
                 consumed_keys.insert("PasteEvent".to_string());
             } else {
+                if self.clipboard.is_none() {
+                    crate::debug_log!("[PASTE] clipboard not available");
+                } else {
+                    crate::debug_log!("[PASTE] app does NOT support paste events");
+                }
                 // 应用不支持粘贴事件协议，需要特殊处理不同类型的内容
                 crate::debug_log!(
                     "[PASTE] fallback: app doesn't support paste events, handling content directly"
@@ -2987,11 +2993,7 @@ impl eframe::App for TerminalApp {
                                             kitty_graphics_payload(mime_type, &bytes);
                                         crate::debug_log!("[KITTY] fallback: pasting {} bytes with mime_type={}, packet_size={}",
                                                         bytes.len(), mime_type, paste_packet.len());
-                                        let write_result = session.shell.write(&paste_packet);
-                                        crate::debug_log!(
-                                            "[KITTY] fallback: write result: {:?}",
-                                            write_result
-                                        );
+                                        session.shell.write_async(paste_packet);
                                         consumed_keys.insert("PasteEvent".to_string());
                                     } else {
                                         // 未知的二进制格式，不发送（防止破坏终端）
@@ -3148,32 +3150,43 @@ impl eframe::App for TerminalApp {
             let clipboard_requests = terminal.take_clipboard_read_requests();
             drop(terminal);
 
-            if let Some(clipboard) = &self.clipboard {
-                for request in clipboard_requests {
-                    match request.kind {
-                        terminal::ClipboardReadKind::MimeList => {
-                            let mime_types = clipboard.available_mime_types().unwrap_or_default();
-                            let mut terminal = session.terminal.lock();
-                            let response = terminal.build_paste_event(&mime_types);
-                            drop(terminal);
-                            let _ = session.shell.write(&response);
-                        }
-                        terminal::ClipboardReadKind::MimeData(mime_type) => {
-                            let data = clipboard.read_mime(&mime_type).unwrap_or_default();
-                            let response = if data.is_empty() {
-                                osc_5522_packet("type=read:status=ENOSYS", None)
-                            } else {
-                                clipboard_5522_response_for_mime(&mime_type, &data)
-                            };
-                            crate::debug_log!(
-                                "[OSC5522] responding to mime request mime={} bytes={}",
-                                mime_type,
-                                data.len()
-                            );
-                            let _ = session.shell.write(&response);
+            if self.clipboard.is_some() && !clipboard_requests.is_empty() {
+                let terminal = Arc::clone(&session.terminal);
+                let pty = session.shell.pty_writer();
+                std::thread::spawn(move || {
+                    let Ok(clipboard) = ClipboardManager::new() else {
+                        return;
+                    };
+
+                    for request in clipboard_requests {
+                        match request.kind {
+                            terminal::ClipboardReadKind::MimeList => {
+                                let mime_types = clipboard
+                                    .available_mime_types()
+                                    .unwrap_or_default();
+                                let response = {
+                                    let mut terminal = terminal.lock();
+                                    terminal.build_paste_event(&mime_types)
+                                };
+                                let _ = ShellSession::write_to_pty(&pty, &response);
+                            }
+                            terminal::ClipboardReadKind::MimeData(mime_type) => {
+                                let data = clipboard.read_mime(&mime_type).unwrap_or_default();
+                                let response = if data.is_empty() {
+                                    osc_5522_packet("type=read:status=ENOSYS", None)
+                                } else {
+                                    clipboard_5522_response_for_mime(&mime_type, &data)
+                                };
+                                crate::debug_log!(
+                                    "[OSC5522] responding to mime request mime={} bytes={}",
+                                    mime_type,
+                                    data.len()
+                                );
+                                let _ = ShellSession::write_to_pty(&pty, &response);
+                            }
                         }
                     }
-                }
+                });
             }
         }
 
