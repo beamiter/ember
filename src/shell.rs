@@ -389,6 +389,15 @@ impl ShellSession {
 }
 
 impl Drop for ShellSession {
+    /// 清理shell进程及其子进程
+    ///
+    /// 多层保护机制确保rsh进程在jterm2退出时被清理：
+    /// 1. 正常退出：Drop被调用，发送SIGHUP/SIGTERM/SIGKILL到进程组
+    /// 2. SIGINT/SIGTERM：信号处理器触发正常退出，Drop被调用
+    /// 3. SIGKILL或panic：PR_SET_PDEATHSIG确保子进程收到SIGTERM
+    ///
+    /// 进程组杀死：使用负PID向整个进程组发送信号，因为shell通过
+    /// setsid()创建了新会话，所以child_pid就是进程组ID
     fn drop(&mut self) {
         // 通知 IO 线程退出
         self.shutdown.store(true, Ordering::Relaxed);
@@ -396,7 +405,9 @@ impl Drop for ShellSession {
         // 直接杀死整个进程组，确保 shell 及其子进程都被清理
         unsafe {
             let pgid = -(self.child_pid as i32);
+            // SIGHUP: 通知shell会话终止
             libc::kill(pgid, libc::SIGHUP);
+            // SIGTERM: 请求优雅退出
             libc::kill(self.child_pid, libc::SIGTERM);
 
             // 短暂等待后强制杀死

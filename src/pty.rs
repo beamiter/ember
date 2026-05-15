@@ -116,7 +116,21 @@ mod unix_pty {
                     // 关闭 master
                     libc::close(master);
 
+                    // 【关键】设置父进程死亡信号：当父进程(jterm2)死亡时，此进程会收到SIGTERM
+                    // 这是最后一道防线，确保即使jterm2被SIGKILL强制杀死或panic崩溃，
+                    // rsh进程也会收到退出信号，不会变成孤儿进程继续运行。
+                    //
+                    // 配合其他清理机制：
+                    // - 正常退出：ShellSession::Drop 清理进程组
+                    // - SIGINT/SIGTERM：信号处理器触发正常退出
+                    // - SIGKILL/panic：PR_SET_PDEATHSIG 确保子进程退出
+                    #[cfg(target_os = "linux")]
+                    {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    }
+
                     // 创建新的会话和进程组（将此进程设为会话leader）
+                    // 这允许我们通过负PID向整个进程组发送信号，杀死shell的所有子进程
                     libc::setsid();
 
                     // 如果指定了工作目录，在执行 shell 前改变目录

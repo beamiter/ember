@@ -43,9 +43,35 @@ use shell::{ShellEvent, ShellSession};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use terminal::{clamp_terminal_dimensions, TerminalState};
 use ui::TerminalRenderer;
+
+// 全局标志，用于信号处理
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 设置信号处理器，确保收到SIGINT/SIGTERM时能正常退出
+/// 这允许Drop逻辑执行，从而清理所有rsh子进程
+#[cfg(unix)]
+fn setup_signal_handlers() {
+    extern "C" fn handle_signal(_: libc::c_int) {
+        SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+        // 注意：在信号处理器中只能做最少的工作
+        // 主程序会检查SHUTDOWN_REQUESTED并正常退出
+    }
+
+    // 注册SIGINT (Ctrl+C) 和 SIGTERM (kill) 处理器
+    unsafe {
+        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn setup_signal_handlers() {
+    // Windows平台暂不支持
+}
 
 fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
     if data.len() < 4 {
@@ -511,6 +537,16 @@ fn apply_theme_visuals(ctx: &egui::Context, theme: &theme::Theme) {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // 设置panic hook，记录panic信息
+    // 注意：panic时Drop可能不会被调用，但我们依赖PR_SET_PDEATHSIG确保子进程退出
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("[PANIC] jterm2 panicked: {}", panic_info);
+        eprintln!("[PANIC] Child rsh processes should exit due to PR_SET_PDEATHSIG");
+    }));
+
+    // 设置信号处理，确保收到SIGINT/SIGTERM时能正常清理
+    setup_signal_handlers();
+
     // Load configuration
     let cfg = config::Config::load();
 
@@ -2362,6 +2398,13 @@ impl eframe::App for TerminalApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 检查是否收到退出信号（SIGINT/SIGTERM）
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            crate::debug_log!("[SIGNAL] Shutdown requested, exiting gracefully");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         self.debug_panel.record_frame();
 
         // Collect events once per frame to avoid multiple clones
