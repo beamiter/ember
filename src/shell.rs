@@ -354,9 +354,13 @@ impl ShellSession {
     /// 在后台线程发送大块数据，避免阻塞 UI 更新循环。
     pub fn write_async(&self, data: Vec<u8>) {
         let pty = Arc::clone(&self.pty);
-        thread::spawn(move || {
-            let _ = Self::write_to_pty(&pty, &data);
-        });
+        let _ = thread::Builder::new()
+            .name("pty-async-writer".to_string())
+            .spawn(move || {
+                if let Err(e) = Self::write_to_pty(&pty, &data) {
+                    eprintln!("[ERROR] Failed to write to PTY asynchronously: {}", e);
+                }
+            });
     }
 
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {

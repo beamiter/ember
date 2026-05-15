@@ -2922,21 +2922,22 @@ impl eframe::App for TerminalApp {
                 crate::debug_log!("[PASTE] app supports paste events, building paste event");
                 let terminal = Arc::clone(&session.terminal);
                 let pty = session.shell.pty_writer();
-                std::thread::spawn(move || {
-                    let mime_types = ClipboardManager::new()
-                        .and_then(|clipboard| clipboard.available_mime_types())
-                        .unwrap_or_default();
-                    crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
-                    let bytes = {
-                        let mut terminal = terminal.lock();
-                        terminal.build_paste_event(&mime_types)
-                    };
-                    crate::debug_log!(
-                        "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
-                        bytes.len()
-                    );
-                    let _ = ShellSession::write_to_pty(&pty, &bytes);
-                });
+                let _ = std::thread::Builder::new()
+                    .name("paste-event-sender".to_string())
+                    .spawn(move || {
+                        let mime_types = ClipboardManager::new()
+                            .and_then(|clipboard| clipboard.available_mime_types())
+                            .unwrap_or_default();
+                        crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
+                        let bytes = terminal.lock().build_paste_event(&mime_types);
+                        crate::debug_log!(
+                            "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
+                            bytes.len()
+                        );
+                        if let Err(e) = ShellSession::write_to_pty(&pty, &bytes) {
+                            crate::debug_log!("[PASTE] Failed to write paste event: {}", e);
+                        }
+                    });
                 consumed_keys.insert("PasteEvent".to_string());
             } else {
                 if self.clipboard.is_none() {
@@ -3153,40 +3154,44 @@ impl eframe::App for TerminalApp {
             if self.clipboard.is_some() && !clipboard_requests.is_empty() {
                 let terminal = Arc::clone(&session.terminal);
                 let pty = session.shell.pty_writer();
-                std::thread::spawn(move || {
-                    let Ok(clipboard) = ClipboardManager::new() else {
-                        return;
-                    };
+                let _ = std::thread::Builder::new()
+                    .name("clipboard-request-handler".to_string())
+                    .spawn(move || {
+                        let Ok(clipboard) = ClipboardManager::new() else {
+                            crate::debug_log!("[OSC5522] Failed to create clipboard manager");
+                            return;
+                        };
 
-                    for request in clipboard_requests {
-                        match request.kind {
-                            terminal::ClipboardReadKind::MimeList => {
-                                let mime_types = clipboard
-                                    .available_mime_types()
-                                    .unwrap_or_default();
-                                let response = {
-                                    let mut terminal = terminal.lock();
-                                    terminal.build_paste_event(&mime_types)
-                                };
-                                let _ = ShellSession::write_to_pty(&pty, &response);
-                            }
-                            terminal::ClipboardReadKind::MimeData(mime_type) => {
-                                let data = clipboard.read_mime(&mime_type).unwrap_or_default();
-                                let response = if data.is_empty() {
-                                    osc_5522_packet("type=read:status=ENOSYS", None)
-                                } else {
-                                    clipboard_5522_response_for_mime(&mime_type, &data)
-                                };
-                                crate::debug_log!(
-                                    "[OSC5522] responding to mime request mime={} bytes={}",
-                                    mime_type,
-                                    data.len()
-                                );
-                                let _ = ShellSession::write_to_pty(&pty, &response);
+                        for request in clipboard_requests {
+                            match request.kind {
+                                terminal::ClipboardReadKind::MimeList => {
+                                    let mime_types = clipboard
+                                        .available_mime_types()
+                                        .unwrap_or_default();
+                                    let response = terminal.lock().build_paste_event(&mime_types);
+                                    if let Err(e) = ShellSession::write_to_pty(&pty, &response) {
+                                        crate::debug_log!("[OSC5522] Failed to write mime list response: {}", e);
+                                    }
+                                }
+                                terminal::ClipboardReadKind::MimeData(mime_type) => {
+                                    let data = clipboard.read_mime(&mime_type).unwrap_or_default();
+                                    let response = if data.is_empty() {
+                                        osc_5522_packet("type=read:status=ENOSYS", None)
+                                    } else {
+                                        clipboard_5522_response_for_mime(&mime_type, &data)
+                                    };
+                                    crate::debug_log!(
+                                        "[OSC5522] responding to mime request mime={} bytes={}",
+                                        mime_type,
+                                        data.len()
+                                    );
+                                    if let Err(e) = ShellSession::write_to_pty(&pty, &response) {
+                                        crate::debug_log!("[OSC5522] Failed to write mime data response: {}", e);
+                                    }
+                                }
                             }
                         }
-                    }
-                });
+                    });
             }
         }
 
