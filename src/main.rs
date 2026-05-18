@@ -598,6 +598,7 @@ struct TerminalApp {
     rows: usize,
     next_cursor_blink_time: std::time::Instant,
     cursor_visible: bool,
+    last_activity_time: std::time::Instant,  // 最后活动时间，用于控制光标闪烁
     status_message: String,
     last_window_title: String,
     // Tab UI state
@@ -1039,6 +1040,7 @@ impl TerminalApp {
             rows,
             next_cursor_blink_time: std::time::Instant::now() + Duration::from_millis(1000),
             cursor_visible: true,
+            last_activity_time: std::time::Instant::now(),
             status_message: String::new(),
             last_window_title: String::new(),
             hovered_tab_index: None,
@@ -3098,6 +3100,11 @@ impl eframe::App for TerminalApp {
         let has_keyboard_input = !keyboard_input.is_empty();
         let has_cursor_move_input = !self.renderer.cursor_move_input.is_empty();
 
+        // 有输入活动时更新最后活动时间
+        if has_keyboard_input || has_cursor_move_input {
+            self.last_activity_time = std::time::Instant::now();
+        }
+
         {
             let mut input_guard = self.input_queue.lock();
             if has_keyboard_input {
@@ -3182,6 +3189,8 @@ impl eframe::App for TerminalApp {
             let mut terminal = session.terminal.lock();
             terminal.process_batch(&accumulated_data);
             self.status_message.clear();
+            // 有输出时更新最后活动时间
+            self.last_activity_time = std::time::Instant::now();
         }
 
         // Step 7: 发送终端输出回 shell（DSR 响应等）
@@ -3239,6 +3248,7 @@ impl eframe::App for TerminalApp {
         }
 
         // Step 8: 光标闪烁
+        // 优化逻辑：只有在完全空闲时才闪烁，有活动时保持常显
         let mut cursor_state_changed = false;
         {
             let terminal = session.terminal.lock();
@@ -3247,19 +3257,31 @@ impl eframe::App for TerminalApp {
 
             if app_wants_cursor_visible {
                 let now = std::time::Instant::now();
+                let idle_duration = now.duration_since(self.last_activity_time);
+                const IDLE_THRESHOLD: Duration = Duration::from_millis(1500); // 1.5秒空闲后才开始闪烁
 
-                // 只有当时间到达时才改变光标状态
-                if now >= self.next_cursor_blink_time {
-                    self.cursor_visible = !self.cursor_visible;
-                    cursor_state_changed = true;
+                if idle_duration < IDLE_THRESHOLD {
+                    // 有活动或刚有活动，光标保持常显
+                    if !self.cursor_visible {
+                        self.cursor_visible = true;
+                        cursor_state_changed = true;
+                    }
+                    // 重置下次闪烁时间为空闲阈值后
+                    self.next_cursor_blink_time = self.last_activity_time + IDLE_THRESHOLD;
+                } else {
+                    // 完全空闲，开始闪烁
+                    if now >= self.next_cursor_blink_time {
+                        self.cursor_visible = !self.cursor_visible;
+                        cursor_state_changed = true;
 
-                    debug_log!(
-                        "[CURSOR] blink toggle: {}, next in 1000ms",
-                        self.cursor_visible
-                    );
+                        debug_log!(
+                            "[CURSOR] idle blink toggle: {}, next in 1000ms",
+                            self.cursor_visible
+                        );
 
-                    // 计算下一次改变的时间
-                    self.next_cursor_blink_time = now + Duration::from_millis(1000);
+                        // 计算下一次改变的时间
+                        self.next_cursor_blink_time = now + Duration::from_millis(1000);
+                    }
                 }
             } else {
                 if self.cursor_visible {
