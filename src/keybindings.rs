@@ -132,6 +132,7 @@ impl std::str::FromStr for Command {
 /// 快捷键修饰符
 #[allow(dead_code)]
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub shift: bool,
@@ -139,16 +140,6 @@ pub struct Modifiers {
     pub super_key: bool,
 }
 
-impl Default for Modifiers {
-    fn default() -> Self {
-        Self {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            super_key: false,
-        }
-    }
-}
 
 impl Modifiers {
     pub fn is_none(&self) -> bool {

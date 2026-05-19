@@ -1,3 +1,4 @@
+mod app;
 mod char_width;
 mod clipboard;
 mod color;
@@ -33,6 +34,8 @@ mod ui;
 #[allow(dead_code)]
 mod windows_compat;
 
+use app::events::{build_keybinding_string, normalize_terminal_shortcut_events,
+                  should_restore_terminal_shortcut_event};
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
 use eframe::egui;
@@ -40,6 +43,7 @@ use parking_lot::Mutex as ParkingMutex;
 use session::Session;
 use session_manager::SessionManager;
 use shell::{ShellEvent, ShellSession};
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
@@ -62,6 +66,8 @@ fn setup_signal_handlers() {
     }
 
     // 注册SIGINT (Ctrl+C) 和 SIGTERM (kill) 处理器
+    // SAFETY: signal 注册信号处理器。handle_signal 是 extern "C" 函数，
+    // 符合 sighandler_t 的签名要求。处理器只做最小工作（设置原子标志），是信号安全的。
     unsafe {
         libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
@@ -116,13 +122,10 @@ fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
             data[0], data[1], data[2], data[3]
         )
     } else {
-        format!(
-            "{}",
-            data.iter()
+        data.iter()
                 .map(|b| format!("{:02X}", b))
                 .collect::<Vec<_>>()
-                .join(" ")
-        )
+                .join(" ").to_string()
     };
     crate::debug_log!(
         "[MIME] unknown format ({}bytes): {}",
@@ -480,7 +483,7 @@ fn configure_fonts_and_gpu(
         let atlas = create_font_backend(
             &render_state.device,
             &render_state.queue,
-            &cfg,
+            cfg,
             &font_bytes,
             bold_font_data.as_deref(),
             &fallback_font_data,
@@ -489,8 +492,8 @@ fn configure_fonts_and_gpu(
         let pipeline = gpu::pipeline::GridPipeline::new(
             &render_state.device,
             render_state.target_format,
-            &atlas.gpu_resources().0,
-            &atlas.gpu_resources().1,
+            atlas.gpu_resources().0,
+            atlas.gpu_resources().1,
         );
 
         let mut renderer = render_state.renderer.write();
@@ -589,182 +592,10 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-struct TerminalApp {
-    session_manager: SessionManager,
-    renderer: TerminalRenderer,
-    input_queue: Arc<ParkingMutex<Vec<u8>>>,
-    clipboard: Option<ClipboardManager>,
-    cols: usize,
-    rows: usize,
-    next_cursor_blink_time: std::time::Instant,
-    cursor_visible: bool,
-    last_activity_time: std::time::Instant,  // 最后活动时间，用于控制光标闪烁
-    status_message: String,
-    last_window_title: String,
-    // Tab UI state
-    hovered_tab_index: Option<usize>,
-    dragging_tab: Option<usize>,
-    drag_start_pos: Option<f32>,
-    current_mouse_x: f32,
-    tab_scroll_offset: f32,
-    // Search state
-    search_state: search::SearchState,
-    // Link detection
-    link_detector: link::LinkDetector,
-    hovered_link: Option<link::Link>,
-    cached_links: Vec<link::Link>,
-    cached_links_grid_version: u64,
-    cached_links_scroll_offset: usize,
-    // Keybindings
-    keybindings: keybindings::KeyBindings,
-    // Command palette
-    command_palette: command_palette::CommandPalette,
-    // Force resize flag for new sessions
-    force_resize_session: bool,
-    // Theme system
-    current_theme: theme::Theme,
-    // Layout system (split panes)
-    layout_manager: layout::LayoutManager,
-    // Pane renderers (one per pane)
-    pane_renderers: Vec<TerminalRenderer>,
-    // Divider drag state
-    dragging_divider: bool,
-    // Help panel
-    help_panel: help::HelpPanel,
-    // Config panel
-    config_panel: config_panel::ConfigPanel,
-    // Debug overlay panel
-    debug_panel: debug_panel::DebugPanel,
-    // Config system
-    config: config::Config,
-    config_save_pending: bool,
-    config_save_deadline: std::time::Instant,
-    // Session persistence
-    session_save_pending: bool,
-    session_save_deadline: std::time::Instant,
-    // Lock file to detect running instances
-    _lock_file: Option<std::fs::File>,
-    // 每帧字节限制溢出的缓冲区，下一帧继续处理
-    pending_output: Vec<u8>,
-    // 滚轮像素累积器，累积到一行高度才滚动
-    scroll_accumulator: f32,
-    // 鼠标报告模式下的滚轮累积器，避免轻微触控板滚动被放大成大量事件
-    mouse_scroll_accumulator: f32,
-    // Ctrl+滚轮字体缩放累积器，避免每次滚轮都重新配置GPU资源
-    font_size_accumulator: f32,
-    // 上一帧是否有Ctrl+滚轮事件
-    had_ctrl_scroll_last_frame: bool,
-    // 每帧事件缓存，避免多次克隆
-    frame_events: Vec<egui::Event>,
-}
+// TerminalApp struct definition moved to app::state module
+use app::state::TerminalApp;
 
-fn should_restore_terminal_shortcut_event(ctx: &egui::Context, modifiers: egui::Modifiers) -> bool {
-    !ctx.text_edit_focused() && modifiers.command && !modifiers.alt
-}
-
-fn shortcut_event_to_key_event(
-    event: egui::Event,
-    modifiers: egui::Modifiers,
-) -> Option<egui::Event> {
-    let key = match event {
-        egui::Event::Copy => {
-            crate::debug_log!("[EVENT] converting Copy to Key::C");
-            egui::Key::C
-        }
-        egui::Event::Cut => {
-            crate::debug_log!("[EVENT] converting Cut to Key::X");
-            egui::Key::X
-        }
-        egui::Event::Paste(ref content) => {
-            crate::debug_log!("[EVENT] converting Paste to Key::V (content: {} bytes, modifiers: ctrl={} shift={} alt={})",
-                             content.len(), modifiers.ctrl, modifiers.shift, modifiers.alt);
-            egui::Key::V
-        }
-        _ => return None,
-    };
-
-    Some(egui::Event::Key {
-        key,
-        physical_key: Some(key),
-        pressed: true,
-        repeat: false,
-        modifiers,
-    })
-}
-
-fn normalize_terminal_shortcut_events(
-    events: &mut Vec<egui::Event>,
-    modifiers: egui::Modifiers,
-    restore_shortcuts: bool,
-    preserve_paste_event: bool,
-) {
-    crate::debug_log!(
-        "[NORMALIZE] input: {} events, restore_shortcuts={}, preserve_paste_event={}",
-        events.len(),
-        restore_shortcuts,
-        preserve_paste_event
-    );
-
-    let mut normalized_events = Vec::with_capacity(events.len());
-
-    for event in events.drain(..) {
-        match &event {
-            egui::Event::Paste(_) => {
-                crate::debug_log!("[NORMALIZE] found Paste event");
-            }
-            egui::Event::Copy => {
-                crate::debug_log!("[NORMALIZE] found Copy event");
-            }
-            egui::Event::Cut => {
-                crate::debug_log!("[NORMALIZE] found Cut event");
-            }
-            egui::Event::Key {
-                key,
-                modifiers: key_mods,
-                pressed,
-                ..
-            } => {
-                crate::debug_log!(
-                    "[NORMALIZE] found Key event: {:?} pressed={} ctrl={} shift={}",
-                    key,
-                    pressed,
-                    key_mods.ctrl,
-                    key_mods.shift
-                );
-            }
-            _ => {}
-        }
-
-        if preserve_paste_event && matches!(event, egui::Event::Paste(_)) {
-            crate::debug_log!("[NORMALIZE] preserving Paste (preserve_paste_event=true)");
-            normalized_events.push(event);
-            continue;
-        }
-
-        if restore_shortcuts {
-            if let Some(key_event) = shortcut_event_to_key_event(event.clone(), modifiers) {
-                crate::debug_log!("[NORMALIZE] converted to Key event via restore_shortcuts");
-                normalized_events.push(key_event);
-                continue;
-            }
-        }
-
-        // 关键修复：粘贴事件即使没有 preserve_paste_event 也应该保留
-        // 这样 main.rs 中的粘贴处理代码可以从剪贴板读取内容并发送
-        if matches!(event, egui::Event::Paste(_)) {
-            crate::debug_log!("[NORMALIZE] preserving Paste as fallback");
-            normalized_events.push(event);
-            continue;
-        }
-
-        if !matches!(event, egui::Event::Copy | egui::Event::Cut) {
-            normalized_events.push(event);
-        }
-    }
-
-    crate::debug_log!("[NORMALIZE] output: {} events", normalized_events.len());
-    *events = normalized_events;
-}
+// normalize_terminal_shortcut_events moved to app::events module
 
 fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
     let mut wrapped = Vec::with_capacity(payload.len() + 12);
@@ -799,120 +630,7 @@ fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
     output
 }
 
-/// 将 egui::Key 转换为字符串表示
-fn key_to_string(key: egui::Key) -> Option<String> {
-    match key {
-        egui::Key::Enter => Some("return".to_string()),
-        egui::Key::Escape => Some("escape".to_string()),
-        egui::Key::Backspace => Some("backspace".to_string()),
-        egui::Key::Tab => Some("tab".to_string()),
-        egui::Key::ArrowUp => Some("up".to_string()),
-        egui::Key::ArrowDown => Some("down".to_string()),
-        egui::Key::ArrowLeft => Some("left".to_string()),
-        egui::Key::ArrowRight => Some("right".to_string()),
-        egui::Key::Home => Some("home".to_string()),
-        egui::Key::End => Some("end".to_string()),
-        egui::Key::Insert => Some("insert".to_string()),
-        egui::Key::Delete => Some("delete".to_string()),
-        egui::Key::PageUp => Some("pageup".to_string()),
-        egui::Key::PageDown => Some("pagedown".to_string()),
-        egui::Key::F1 => Some("f1".to_string()),
-        egui::Key::F2 => Some("f2".to_string()),
-        egui::Key::F3 => Some("f3".to_string()),
-        egui::Key::F4 => Some("f4".to_string()),
-        egui::Key::F5 => Some("f5".to_string()),
-        egui::Key::F6 => Some("f6".to_string()),
-        egui::Key::F7 => Some("f7".to_string()),
-        egui::Key::F8 => Some("f8".to_string()),
-        egui::Key::F9 => Some("f9".to_string()),
-        egui::Key::F10 => Some("f10".to_string()),
-        egui::Key::F11 => Some("f11".to_string()),
-        egui::Key::F12 => Some("f12".to_string()),
-        egui::Key::A => Some("a".to_string()),
-        egui::Key::B => Some("b".to_string()),
-        egui::Key::C => Some("c".to_string()),
-        egui::Key::D => Some("d".to_string()),
-        egui::Key::E => Some("e".to_string()),
-        egui::Key::F => Some("f".to_string()),
-        egui::Key::G => Some("g".to_string()),
-        egui::Key::H => Some("h".to_string()),
-        egui::Key::I => Some("i".to_string()),
-        egui::Key::J => Some("j".to_string()),
-        egui::Key::K => Some("k".to_string()),
-        egui::Key::L => Some("l".to_string()),
-        egui::Key::M => Some("m".to_string()),
-        egui::Key::N => Some("n".to_string()),
-        egui::Key::O => Some("o".to_string()),
-        egui::Key::P => Some("p".to_string()),
-        egui::Key::Q => Some("q".to_string()),
-        egui::Key::R => Some("r".to_string()),
-        egui::Key::S => Some("s".to_string()),
-        egui::Key::T => Some("t".to_string()),
-        egui::Key::U => Some("u".to_string()),
-        egui::Key::V => Some("v".to_string()),
-        egui::Key::W => Some("w".to_string()),
-        egui::Key::X => Some("x".to_string()),
-        egui::Key::Y => Some("y".to_string()),
-        egui::Key::Z => Some("z".to_string()),
-        egui::Key::Num0 => Some("0".to_string()),
-        egui::Key::Num1 => Some("1".to_string()),
-        egui::Key::Num2 => Some("2".to_string()),
-        egui::Key::Num3 => Some("3".to_string()),
-        egui::Key::Num4 => Some("4".to_string()),
-        egui::Key::Num5 => Some("5".to_string()),
-        egui::Key::Num6 => Some("6".to_string()),
-        egui::Key::Num7 => Some("7".to_string()),
-        egui::Key::Num8 => Some("8".to_string()),
-        egui::Key::Num9 => Some("9".to_string()),
-        egui::Key::Comma => Some(",".to_string()),
-        egui::Key::Period => Some(".".to_string()),
-        egui::Key::Plus => Some("+".to_string()),
-        egui::Key::Minus => Some("-".to_string()),
-        egui::Key::Slash => Some("/".to_string()),
-        egui::Key::Backslash => Some("\\".to_string()),
-        egui::Key::Semicolon => Some(";".to_string()),
-        egui::Key::Quote => Some("'".to_string()),
-        egui::Key::OpenBracket => Some("[".to_string()),
-        egui::Key::CloseBracket => Some("]".to_string()),
-        egui::Key::Equals => Some("=".to_string()),
-        egui::Key::Backtick => Some("`".to_string()),
-        _ => None,
-    }
-}
-
-/// 从 egui 的 Key 和 Modifiers 构建快捷键字符串（用于查询快捷键配置）
-fn build_keybinding_string(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
-    let key_str = key_to_string(key)?;
-    let mut parts = Vec::new();
-
-    if modifiers.ctrl {
-        parts.push("ctrl");
-    }
-    if modifiers.shift {
-        parts.push("shift");
-    }
-    if modifiers.alt {
-        parts.push("alt");
-    }
-    // 仅在 macOS 上（cfg(target_os = "macos")）才添加 super/command
-    // 在其他平台上忽略 command 修饰符，防止误触发
-    #[cfg(target_os = "macos")]
-    if modifiers.mac_cmd || modifiers.command_only() {
-        parts.push("super");
-    }
-
-    parts.push(&key_str);
-    let result = parts.join("+");
-    crate::debug_log!(
-        "[KEYBINDING] key={:?}, shift={}, ctrl={}, alt={} => {}",
-        key,
-        modifiers.shift,
-        modifiers.ctrl,
-        modifiers.alt,
-        result
-    );
-    Some(result)
-}
+// key_to_string and build_keybinding_string moved to app::events module
 
 impl TerminalApp {
     fn new(
@@ -1076,6 +794,8 @@ impl TerminalApp {
             font_size_accumulator: 0.0,
             had_ctrl_scroll_last_frame: false,
             frame_events: Vec::new(),
+            keyboard_input_buffer: Vec::new(),
+            adaptive_frame_budget: 32768, // 初始值 32KB
         }
     }
 
@@ -1298,7 +1018,7 @@ impl TerminalApp {
                             .map(|(_, _, w)| *w)
                             .unwrap_or(min_tab_width);
                         let remaining = (available_width - active_w - total_spacing).max(0.0);
-                        let inactive_count = if n > 1 { n - 1 } else { 0 };
+                        let inactive_count = n.saturating_sub(1);
 
                         if inactive_count == 0 {
                             // 只有一个 tab
@@ -1561,13 +1281,12 @@ impl TerminalApp {
                                     tab_rect_item =
                                         tab_rect_item.translate(egui::vec2(push_offset, 0.0));
                                 }
-                            } else if drag_to_right {
-                                if i < from_idx {
+                            } else if drag_to_right
+                                && i < from_idx {
                                     let push_offset = -(tab_width + tab_spacing);
                                     tab_rect_item =
                                         tab_rect_item.translate(egui::vec2(push_offset, 0.0));
                                 }
-                            }
                         }
                     }
 
@@ -2280,6 +1999,9 @@ impl TerminalApp {
             let scrollback_max = terminal.max_scrollback();
             drop(terminal);
             let session_count = self.session_manager.len();
+            let pending_output_bytes = self.pending_output.len();
+            let texture_cache_size = self.renderer.texture_cache_len();
+            let frame_budget_kb = self.adaptive_frame_budget / 1024;
             self.debug_panel.show(
                 ctx,
                 grid_cols,
@@ -2289,46 +2011,15 @@ impl TerminalApp {
                 scrollback_max,
                 kitty_images_count,
                 kitty_memory_mb,
+                pending_output_bytes,
+                texture_cache_size,
+                frame_budget_kb,
             );
         }
     }
 
-    // 配置保存相关方法
-    fn schedule_config_save(&mut self) {
-        self.config_save_pending = true;
-        self.config_save_deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(500);
-    }
-
-    fn flush_config_save(&mut self) {
-        if self.config_save_pending && std::time::Instant::now() >= self.config_save_deadline {
-            self.config_save_pending = false;
-            if let Err(e) = self.config.save() {
-                eprintln!("[Config] Failed to save: {}", e);
-            }
-        }
-    }
-
-    fn schedule_session_save(&mut self) {
-        self.session_save_pending = true;
-        self.session_save_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    }
-
-    fn flush_session_save(&mut self) {
-        if self.session_save_pending && std::time::Instant::now() >= self.session_save_deadline {
-            self.session_save_pending = false;
-            if let Ok(path) = config::Config::session_history_path() {
-                let _ = session_persistence::ensure_session_history_dir(&path);
-                let snapshots = self.session_manager.get_session_snapshots();
-                let active_index = Some(self.session_manager.active_index());
-                let snapshot =
-                    session_persistence::SessionsSnapshot::from_snapshots(snapshots, active_index);
-                if let Err(e) = snapshot.save(&path) {
-                    eprintln!("[SessionPersistence] Failed to save: {}", e);
-                }
-            }
-        }
-    }
+    // adjust_frame_budget moved to app::rendering module
+    // Config and session save methods moved to app::window module
 }
 
 impl eframe::App for TerminalApp {
@@ -2408,6 +2099,9 @@ impl eframe::App for TerminalApp {
         }
 
         self.debug_panel.record_frame();
+
+        // 自适应调整帧预算：根据帧时间动态调整每帧处理字节数
+        self.adjust_frame_budget();
 
         // Collect events once per frame to avoid multiple clones
         self.frame_events.clear();
@@ -3062,7 +2756,8 @@ impl eframe::App for TerminalApp {
 
         // Step 4: 处理普通键盘输入
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
-        let mut keyboard_input = Vec::new();
+        // 复用缓冲区减少内存分配
+        self.keyboard_input_buffer.clear();
         if !self.search_state.is_open && !self.config_panel.is_open {
             let (
                 keyboard_enhancement_flags,
@@ -3085,7 +2780,7 @@ impl eframe::App for TerminalApp {
                 consumed_keys.iter().map(|s| s.as_str()).collect();
             self.renderer.handle_keyboard_input(
                 ctx,
-                &mut keyboard_input,
+                &mut self.keyboard_input_buffer,
                 &consumed_keys_refs,
                 has_preedit,
                 keyboard_enhancement_flags,
@@ -3097,7 +2792,7 @@ impl eframe::App for TerminalApp {
             );
         }
 
-        let has_keyboard_input = !keyboard_input.is_empty();
+        let has_keyboard_input = !self.keyboard_input_buffer.is_empty();
         let has_cursor_move_input = !self.renderer.cursor_move_input.is_empty();
 
         // 有输入活动时更新最后活动时间
@@ -3108,7 +2803,7 @@ impl eframe::App for TerminalApp {
         {
             let mut input_guard = self.input_queue.lock();
             if has_keyboard_input {
-                input_guard.extend(keyboard_input);
+                input_guard.extend(&self.keyboard_input_buffer);
             }
             if has_cursor_move_input {
                 input_guard.extend(&self.renderer.cursor_move_input);
@@ -3129,8 +2824,9 @@ impl eframe::App for TerminalApp {
         // Step 6: 处理 shell 事件
         // 关键：限制每帧处理的总字节数，防止大量 ANSI 数据阻塞 UI 线程导致假死。
         // 超出限制的数据保存到 pending_output，下一帧继续处理。
+        // 使用自适应帧预算，根据帧时间动态调整
         let mut has_new_output = false;
-        const MAX_BYTES_PER_FRAME: usize = 32768; // 32KB/帧 - 确保 process_input < 5ms
+        let max_bytes_per_frame = self.adaptive_frame_budget;
         let mut has_more_data = false;
 
         // 先取回上一帧未处理完的数据
@@ -3140,13 +2836,13 @@ impl eframe::App for TerminalApp {
         }
 
         // 从 channel 中收集数据，直到达到字节上限
-        if accumulated_data.len() < MAX_BYTES_PER_FRAME {
+        if accumulated_data.len() < max_bytes_per_frame {
             loop {
                 match session.shell.events().try_recv() {
                     Ok(ShellEvent::Output(data)) => {
                         accumulated_data.extend(data);
                         has_new_output = true;
-                        if accumulated_data.len() >= MAX_BYTES_PER_FRAME {
+                        if accumulated_data.len() >= max_bytes_per_frame {
                             has_more_data = true;
                             break;
                         }
@@ -3175,8 +2871,8 @@ impl eframe::App for TerminalApp {
         }
 
         // 如果累积数据超过帧限制，将多余部分保存到下一帧
-        if accumulated_data.len() > MAX_BYTES_PER_FRAME {
-            self.pending_output = accumulated_data.split_off(MAX_BYTES_PER_FRAME);
+        if accumulated_data.len() > max_bytes_per_frame {
+            self.pending_output = accumulated_data.split_off(max_bytes_per_frame);
             has_more_data = true;
         }
         // 也检查 channel 中是否还有数据
@@ -3283,35 +2979,35 @@ impl eframe::App for TerminalApp {
                         self.next_cursor_blink_time = now + Duration::from_millis(1000);
                     }
                 }
-            } else {
-                if self.cursor_visible {
-                    self.cursor_visible = false;
-                    cursor_state_changed = true;
-                }
+            } else if self.cursor_visible {
+                self.cursor_visible = false;
+                cursor_state_changed = true;
             }
         }
 
         // Step 9: 滚动处理
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl) {
-            let mut terminal = session.terminal.lock();
-            terminal.scroll(-3);
-        }
-
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl) {
-            let mut terminal = session.terminal.lock();
-            terminal.scroll(3);
-        }
-
-        if ctx.input(|i| i.key_pressed(egui::Key::PageUp) && !i.modifiers.ctrl) {
-            let mut terminal = session.terminal.lock();
+        // 优化：批量处理键盘滚动，只获取一次锁
+        let scroll_amount = if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl) {
+            Some(-3)
+        } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl) {
+            Some(3)
+        } else if ctx.input(|i| i.key_pressed(egui::Key::PageUp) && !i.modifiers.ctrl) {
+            let terminal = session.terminal.lock();
             let (_, rows) = terminal.get_dimensions();
-            terminal.scroll(rows as isize);
-        }
-
-        if ctx.input(|i| i.key_pressed(egui::Key::PageDown) && !i.modifiers.ctrl) {
-            let mut terminal = session.terminal.lock();
+            drop(terminal);
+            Some(rows as isize)
+        } else if ctx.input(|i| i.key_pressed(egui::Key::PageDown) && !i.modifiers.ctrl) {
+            let terminal = session.terminal.lock();
             let (_, rows) = terminal.get_dimensions();
-            terminal.scroll(-(rows as isize));
+            drop(terminal);
+            Some(-(rows as isize))
+        } else {
+            None
+        };
+
+        if let Some(amount) = scroll_amount {
+            let mut terminal = session.terminal.lock();
+            terminal.scroll(amount);
         }
 
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
@@ -3411,9 +3107,9 @@ impl eframe::App for TerminalApp {
                         }
                     }
 
-                    // 处理鼠标按钮
+                    // 处理鼠标按钮（使用 SmallVec 避免堆分配）
                     let button_pressed = ctx.input(|i| {
-                        let mut btns = Vec::new();
+                        let mut btns: SmallVec<[u8; 3]> = SmallVec::new();
                         if i.pointer.button_pressed(egui::PointerButton::Primary) {
                             btns.push(0);
                         }

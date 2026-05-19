@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// 高级搜索配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct SearchConfig {
     pub use_regex: bool,
     pub case_sensitive: bool,
@@ -10,16 +11,6 @@ pub struct SearchConfig {
     pub multi_line: bool,
 }
 
-impl Default for SearchConfig {
-    fn default() -> Self {
-        SearchConfig {
-            use_regex: false,
-            case_sensitive: false,
-            whole_word: false,
-            multi_line: false,
-        }
-    }
-}
 
 /// 替换选项
 #[derive(Clone, Debug)]
@@ -115,12 +106,10 @@ impl SearchAndReplaceEngine {
 
         let count = if options.replace_all {
             regex.find_iter(text).count()
+        } else if regex.is_match(text) {
+            1
         } else {
-            if regex.is_match(text) {
-                1
-            } else {
-                0
-            }
+            0
         };
 
         Ok((result, count))

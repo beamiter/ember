@@ -224,7 +224,7 @@ impl LayoutManager {
     pub fn get_divider_rect(&self) -> Option<Rect> {
         match self.mode {
             SplitMode::VerticalSplit { ratio: _ } => {
-                if let Some(pane0) = self.panes.get(0) {
+                if let Some(pane0) = self.panes.first() {
                     let divider_x = pane0.rect.right();
                     Some(Rect::from_min_max(
                         egui::pos2(divider_x - 2.0, pane0.rect.top()),
@@ -235,7 +235,7 @@ impl LayoutManager {
                 }
             }
             SplitMode::HorizontalSplit { ratio: _ } => {
-                if let Some(pane0) = self.panes.get(0) {
+                if let Some(pane0) = self.panes.first() {
                     let divider_y = pane0.rect.bottom();
                     Some(Rect::from_min_max(
                         egui::pos2(pane0.rect.left(), divider_y - 2.0),

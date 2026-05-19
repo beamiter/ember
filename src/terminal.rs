@@ -276,20 +276,19 @@ pub enum Color {
 }
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub enum CursorShape {
+    #[default]
     Block,     // 0 or 1 - block cursor (default)
     Underline, // 2 - underline cursor
     Beam,      // 3 - beam/vertical line cursor
 }
 
-impl Default for CursorShape {
-    fn default() -> Self {
-        CursorShape::Block
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum UnderlineStyle {
+    #[default]
     None,
     Single,
     Double,
@@ -301,11 +300,6 @@ pub enum UnderlineStyle {
     Dashed,  // SGR 4:5
 }
 
-impl Default for UnderlineStyle {
-    fn default() -> Self {
-        UnderlineStyle::None
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StyleFlags {
@@ -1197,35 +1191,33 @@ impl TerminalState {
 
                             if self.cursor_row > self.scroll_region_top {
                                 self.cursor_row -= 1;
-                            } else {
-                                if self.scroll_region_top < self.grid.rows()
-                                    && self.scroll_region_bottom < self.grid.rows()
-                                    && self.scroll_region_top <= self.scroll_region_bottom
-                                {
-                                    let cols = self.grid.row_len();
-                                    let mut new_lines = vec![self.blank_line(cols)];
+                            } else if self.scroll_region_top < self.grid.rows()
+                                && self.scroll_region_bottom < self.grid.rows()
+                                && self.scroll_region_top <= self.scroll_region_bottom
+                            {
+                                let cols = self.grid.row_len();
+                                let mut new_lines = vec![self.blank_line(cols)];
 
-                                    for row in self.scroll_region_top..self.scroll_region_bottom {
-                                        if row < self.grid.rows() {
-                                            new_lines.push(self.grid.get_row(row));
-                                        }
+                                for row in self.scroll_region_top..self.scroll_region_bottom {
+                                    if row < self.grid.rows() {
+                                        new_lines.push(self.grid.get_row(row));
                                     }
-
-                                    for (offset, line) in new_lines.iter().enumerate() {
-                                        if self.scroll_region_top + offset
-                                            <= self.scroll_region_bottom
-                                        {
-                                            self.grid.set_row(
-                                                self.scroll_region_top + offset,
-                                                line.clone(),
-                                            );
-                                        }
-                                    }
-                                    self.mark_rows_dirty(
-                                        self.scroll_region_top,
-                                        self.scroll_region_bottom,
-                                    );
                                 }
+
+                                for (offset, line) in new_lines.iter().enumerate() {
+                                    if self.scroll_region_top + offset
+                                        <= self.scroll_region_bottom
+                                    {
+                                        self.grid.set_row(
+                                            self.scroll_region_top + offset,
+                                            line.clone(),
+                                        );
+                                    }
+                                }
+                                self.mark_rows_dirty(
+                                    self.scroll_region_top,
+                                    self.scroll_region_bottom,
+                                );
                             }
                         }
                         b'D' => {
@@ -1278,7 +1270,7 @@ impl TerminalState {
                                 break;
                             };
 
-                            let private_prefix = match param_bytes.get(0).copied() {
+                            let private_prefix = match param_bytes.first().copied() {
                                 Some(prefix @ (b'<' | b'=' | b'>' | b'?')) => {
                                     // Shift remaining params left
                                     for j in 0..param_len - 1 {
@@ -1435,7 +1427,7 @@ impl TerminalState {
                 self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
             }
             'H' => {
-                let row = params.get(0).copied().unwrap_or(1) as usize;
+                let row = params.first().copied().unwrap_or(1) as usize;
                 let col = params.get(1).copied().unwrap_or(1) as usize;
                 self.cursor_row = row.saturating_sub(1).min(self.grid.rows() - 1);
                 self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
@@ -1453,7 +1445,7 @@ impl TerminalState {
                         self.xterm_format_other_keys = value;
                     }
                 } else {
-                    let row = params.get(0).copied().unwrap_or(1) as usize;
+                    let row = params.first().copied().unwrap_or(1) as usize;
                     let col = params.get(1).copied().unwrap_or(1) as usize;
                     self.cursor_row = row.saturating_sub(1).min(self.grid.rows() - 1);
                     self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
@@ -1722,14 +1714,13 @@ impl TerminalState {
                 }
             }
             'p' => {
-                if private_prefix == Some(b'?') && intermediates == [b'$'] {
-                    if params.first().copied() == Some(5522) {
+                if private_prefix == Some(b'?') && intermediates == [b'$']
+                    && params.first().copied() == Some(5522) {
                         let state = if self.modes.contains(&5522) { 1 } else { 2 };
                         let response = format!("\x1b[?5522;{}$y", state);
                         crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
                         self.output_buffer.extend_from_slice(response.as_bytes());
                     }
-                }
             }
             'h' => {
                 // Set mode (DECSET)
@@ -1745,7 +1736,7 @@ impl TerminalState {
             }
             'r' => {
                 // Set scroll region (DECSTBM)
-                let top = params.get(0).copied().unwrap_or(1) as usize;
+                let top = params.first().copied().unwrap_or(1) as usize;
                 let bottom = params.get(1).copied().unwrap_or(self.grid.rows() as u16) as usize;
 
                 // Convert from 1-indexed to 0-indexed, and clamp to valid range
@@ -1818,12 +1809,11 @@ impl TerminalState {
                 self.mark_row_dirty(self.cursor_row);
             }
             'q' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty() {
-                    if params.first().copied().unwrap_or(0) == 0 {
+                if private_prefix == Some(b'>') && intermediates.is_empty()
+                    && params.first().copied().unwrap_or(0) == 0 {
                         crate::debug_log!("[XTVERSION] report terminal version request");
                         self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
                     }
-                }
 
                 // DECSCUSR - Set cursor style
                 if private_prefix.is_none() && intermediates == [b' '] {
@@ -2031,7 +2021,7 @@ impl TerminalState {
                 // Bracketed paste mode
                 self.modes.insert(2004);
             }
-            1000 | 1001 | 1002 | 1003 => {
+            1000..=1003 => {
                 // Mouse reporting modes
                 self.modes.insert(mode);
             }
@@ -2093,7 +2083,7 @@ impl TerminalState {
                 // Disable bracketed paste mode
                 self.modes.remove(&2004);
             }
-            1000 | 1001 | 1002 | 1003 => {
+            1000..=1003 => {
                 // Disable mouse reporting
                 self.modes.remove(&mode);
             }
@@ -2194,9 +2184,9 @@ impl TerminalState {
         } else {
             // Standard xterm format: CSI M button col row (raw bytes)
             // Col and row are offset by 32 (space character)
-            let button_byte = (32 + button) as u8;
-            let col_byte = (32 + (col as u8).min(223)) as u8;
-            let row_byte = (32 + (row as u8).min(223)) as u8;
+            let button_byte = 32 + button ;
+            let col_byte = 32 + (col as u8).min(223) ;
+            let row_byte = 32 + (row as u8).min(223) ;
             Some(format!(
                 "\x1b[M{}{}{}",
                 button_byte as char, col_byte as char, row_byte as char

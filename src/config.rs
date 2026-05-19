@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,44 +15,46 @@ const NERD_FONT_CANDIDATES: &[&str] = &[
     "FiraCode Nerd Font",
 ];
 
+// 延迟加载的字体列表缓存（避免启动时阻塞）
+static AVAILABLE_FONTS: Lazy<Vec<String>> = Lazy::new(|| {
+    eprintln!("[Config] Scanning system fonts (one-time)...");
+    detect_fonts_by_query(&[":"])
+});
+
+static MONOSPACE_FONTS: Lazy<Vec<String>> = Lazy::new(|| {
+    eprintln!("[Config] Scanning monospace fonts (one-time)...");
+    detect_fonts_by_query(&[":spacing=100"])
+});
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum FontBackendType {
+    #[default]
     Fontdue,
     AbGlyph,
 }
 
-impl Default for FontBackendType {
-    fn default() -> Self {
-        FontBackendType::Fontdue
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AppRendererType {
+    #[default]
     Glow,
     Wgpu,
 }
 
-impl Default for AppRendererType {
-    fn default() -> Self {
-        AppRendererType::Glow
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ScrollbarVisibility {
     Auto,
+    #[default]
     Always,
 }
 
-impl Default for ScrollbarVisibility {
-    fn default() -> Self {
-        Self::Always
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -155,41 +158,33 @@ fn detect_fonts_by_query(extra_args: &[&str]) -> Vec<String> {
                     }
                 })
                 .collect();
-            families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            families.sort_by_key(|a| a.to_lowercase());
             return families;
         }
     }
     Vec::new()
 }
 
-fn detect_available_fonts() -> Vec<String> {
-    detect_fonts_by_query(&[":"])
+fn detect_available_fonts() -> &'static Vec<String> {
+    &AVAILABLE_FONTS
 }
 
-fn detect_monospace_fonts() -> Vec<String> {
-    detect_fonts_by_query(&[":spacing=100"])
+fn detect_monospace_fonts() -> &'static Vec<String> {
+    &MONOSPACE_FONTS
 }
 
 fn default_font_family() -> String {
-    let available_fonts = detect_available_fonts();
-
-    // Try each candidate font in priority order
-    for candidate in NERD_FONT_CANDIDATES {
-        if available_fonts
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(candidate))
-        {
-            eprintln!("[Config] Using font: {}", candidate);
-            return candidate.to_string();
-        }
-    }
-
-    // Fallback to first candidate if none found (system may still have it)
+    // 快速路径：直接使用第一个候选字体，不检测系统字体
+    // 这避免了启动时的 fc-list 调用，加快启动速度
+    // 字体检测会在用户打开配置面板时延迟进行
     eprintln!(
-        "[Config] No Nerd Font detected, using default: {}",
+        "[Config] Using default font (no scan): {}",
         NERD_FONT_CANDIDATES[0]
     );
     NERD_FONT_CANDIDATES[0].to_string()
+
+    // 原有的检测逻辑已移除，避免启动时阻塞
+    // 如需验证字体存在性，可在配置面板中按需检测
 }
 
 fn default_padding() -> f32 {
@@ -347,11 +342,11 @@ impl Config {
         speed.clamp(1, 10)
     }
 
-    pub fn get_monospace_fonts() -> Vec<String> {
+    pub fn get_monospace_fonts() -> &'static Vec<String> {
         detect_monospace_fonts()
     }
 
-    pub fn get_all_fonts() -> Vec<String> {
+    pub fn get_all_fonts() -> &'static Vec<String> {
         detect_available_fonts()
     }
 }

@@ -1,0 +1,11 @@
+// Application core module - main app state and coordination
+
+pub mod events;
+pub mod input;
+pub mod rendering;
+pub mod state;
+pub mod tabs;
+pub mod window;
+
+// Re-export the main app struct
+pub use state::TerminalApp;

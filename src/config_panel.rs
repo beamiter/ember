@@ -115,8 +115,9 @@ impl ConfigPanel {
         self.sync_from_config(config);
 
         if !self.fonts_loaded {
-            self.monospace_fonts = Config::get_monospace_fonts();
-            self.all_fonts = Config::get_all_fonts();
+            // 字体列表是延迟加载且缓存的，首次访问时触发 fc-list
+            self.monospace_fonts = Config::get_monospace_fonts().clone();
+            self.all_fonts = Config::get_all_fonts().clone();
             if self.monospace_fonts.is_empty() {
                 self.monospace_fonts = vec![
                     "SauceCodePro Nerd Font".to_string(),
@@ -350,11 +351,10 @@ impl ConfigPanel {
                     .desired_width(200.0)
                     .hint_text("Filter fonts..."),
             );
-            if !self.font_filter.is_empty() {
-                if ui.small_button("x").clicked() {
+            if !self.font_filter.is_empty()
+                && ui.small_button("x").clicked() {
                     self.font_filter.clear();
                 }
-            }
         });
 
         ui.horizontal(|ui| {
@@ -966,9 +966,9 @@ fn color_row_rgba(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4]) -> bool {
 
 // Helper: compact color button (for ANSI grid)
 fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool {
-    let changed = ui
+    
+    ui
         .color_edit_button_srgb(color)
         .on_hover_text(tooltip)
-        .changed();
-    changed
+        .changed()
 }

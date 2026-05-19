@@ -89,6 +89,8 @@ pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
     // LOCK_EX | LOCK_NB: 非阻塞排他锁
+    // SAFETY: flock 对有效的文件描述符是安全的。fd 来自有效的 File 对象，
+    // 标志是合法的 flock 常量。File 对象的生命周期确保 fd 在调用期间有效。
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if ret == 0 {
         // 写入 PID 方便调试
@@ -194,6 +196,8 @@ pub fn match_restorable_command(args: &[String]) -> Option<String> {
 /// Detect restorable interactive commands running in a terminal by inspecting the
 /// foreground process group and walking up the process tree to the shell.
 pub fn get_restorable_commands(shell_pid: i32, master_fd: i32) -> Option<String> {
+    // SAFETY: tcgetpgrp 获取终端的前台进程组 ID。master_fd 是有效的 PTY master fd。
+    // 即使 fd 无效，tcgetpgrp 也只会返回 -1，不会导致未定义行为。
     let fg_pgid = unsafe { libc::tcgetpgrp(master_fd) };
     if fg_pgid <= 0 || fg_pgid == shell_pid {
         return None; // shell itself is foreground — nothing to restore

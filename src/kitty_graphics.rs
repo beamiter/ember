@@ -1,5 +1,4 @@
 use base64::Engine;
-use image;
 use std::collections::HashMap;
 
 const MAX_KITTY_IMAGES: usize = 100;

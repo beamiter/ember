@@ -1,0 +1,115 @@
+// Application state management
+
+use crate::clipboard::ClipboardManager;
+use crate::command_palette;
+use crate::config;
+use crate::config_panel;
+use crate::debug_panel;
+use crate::help;
+use crate::keybindings;
+use crate::layout;
+use crate::link;
+use crate::search;
+use crate::session_manager::SessionManager;
+use crate::ui::TerminalRenderer;
+use parking_lot::Mutex as ParkingMutex;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Main application state
+pub struct TerminalApp {
+    pub session_manager: SessionManager,
+    pub renderer: TerminalRenderer,
+    pub input_queue: Arc<ParkingMutex<Vec<u8>>>,
+    pub clipboard: Option<ClipboardManager>,
+    pub cols: usize,
+    pub rows: usize,
+    pub next_cursor_blink_time: std::time::Instant,
+    pub cursor_visible: bool,
+    pub last_activity_time: std::time::Instant,
+    pub status_message: String,
+    pub last_window_title: String,
+
+    // Tab UI state
+    pub hovered_tab_index: Option<usize>,
+    pub dragging_tab: Option<usize>,
+    pub drag_start_pos: Option<f32>,
+    pub current_mouse_x: f32,
+    pub tab_scroll_offset: f32,
+
+    // Search state
+    pub search_state: search::SearchState,
+
+    // Link detection
+    pub link_detector: link::LinkDetector,
+    pub hovered_link: Option<link::Link>,
+    pub cached_links: Vec<link::Link>,
+    pub cached_links_grid_version: u64,
+    pub cached_links_scroll_offset: usize,
+
+    // Keybindings
+    pub keybindings: keybindings::KeyBindings,
+
+    // Command palette
+    pub command_palette: command_palette::CommandPalette,
+
+    // Force resize flag for new sessions
+    pub force_resize_session: bool,
+
+    // Theme system
+    pub current_theme: crate::theme::Theme,
+
+    // Layout system (split panes)
+    pub layout_manager: layout::LayoutManager,
+
+    // Pane renderers (one per pane)
+    pub pane_renderers: Vec<TerminalRenderer>,
+
+    // Divider drag state
+    pub dragging_divider: bool,
+
+    // Help panel
+    pub help_panel: help::HelpPanel,
+
+    // Config panel
+    pub config_panel: config_panel::ConfigPanel,
+
+    // Debug overlay panel
+    pub debug_panel: debug_panel::DebugPanel,
+
+    // Config system
+    pub config: config::Config,
+    pub config_save_pending: bool,
+    pub config_save_deadline: std::time::Instant,
+
+    // Session persistence
+    pub session_save_pending: bool,
+    pub session_save_deadline: std::time::Instant,
+
+    // Lock file to detect running instances
+    pub _lock_file: Option<std::fs::File>,
+
+    // 每帧字节限制溢出的缓冲区，下一帧继续处理
+    pub pending_output: Vec<u8>,
+
+    // 滚轮像素累积器，累积到一行高度才滚动
+    pub scroll_accumulator: f32,
+
+    // 鼠标报告模式下的滚轮累积器
+    pub mouse_scroll_accumulator: f32,
+
+    // Ctrl+滚轮字体缩放累积器
+    pub font_size_accumulator: f32,
+
+    // 上一帧是否有Ctrl+滚轮事件
+    pub had_ctrl_scroll_last_frame: bool,
+
+    // 每帧事件缓存，避免多次克隆
+    pub frame_events: Vec<egui::Event>,
+
+    // 键盘输入缓冲区，复用以减少内存分配
+    pub keyboard_input_buffer: Vec<u8>,
+
+    // 自适应帧预算：根据帧时间动态调整每帧处理的字节数
+    pub adaptive_frame_budget: usize,
+}

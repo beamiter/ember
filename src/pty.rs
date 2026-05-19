@@ -67,6 +67,10 @@ mod unix_pty {
             cwd: Option<&str>,
             session_id: Option<&str>,
         ) -> Result<Self> {
+            // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
+            // 所有的 libc 调用都检查了返回值并正确处理错误。
+            // 文件描述符的生命周期被正确管理（成功时存储在 PtySession 中，失败时关闭）。
+            // fork 后的子进程分支永不返回（通过 execve 或 exit），避免了未定义行为。
             unsafe {
                 // 1. 创建 PTY
                 let mut master = 0;
@@ -284,6 +288,8 @@ mod unix_pty {
                 revents: 0,
             };
 
+            // SAFETY: poll_fd 是有效的栈上变量，libc::poll 接受可变指针和长度，
+            // 超时参数是合法的毫秒值。poll 调用是原子的，不会导致数据竞争。
             let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
             if ready < 0 {
                 Err(anyhow!(
@@ -299,6 +305,8 @@ mod unix_pty {
 
         /// Single non-blocking write. Returns bytes written, or WouldBlock if buffer full.
         pub fn write(&mut self, data: &[u8]) -> Result<usize> {
+            // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
+            // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
             unsafe {
                 let n = libc::write(self.master, data.as_ptr() as *const _, data.len());
                 if n < 0 {
@@ -313,6 +321,8 @@ mod unix_pty {
         }
 
         pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            // SAFETY: self.master 是有效的文件描述符，buf.as_mut_ptr() 指向有效的可变内存，
+            // buf.len() 是正确的缓冲区大小。read 不会超出边界。
             unsafe {
                 let n = libc::read(self.master, buf.as_mut_ptr() as *mut _, buf.len());
                 if n < 0 {
@@ -329,6 +339,8 @@ mod unix_pty {
         }
 
         pub fn resize(&mut self, cols: usize, rows: usize) -> Result<()> {
+            // SAFETY: win_size 是有效的栈上变量，符合 libc::winsize 的内存布局。
+            // ioctl TIOCSWINSZ 调用是标准的 PTY 窗口大小设置操作。
             unsafe {
                 let win_size = libc::winsize {
                     ws_row: rows as u16,
@@ -355,6 +367,8 @@ mod unix_pty {
                 return false;
             }
 
+            // SAFETY: waitpid 使用 WNOHANG 非阻塞检查子进程状态。
+            // status 是有效的栈变量，child_pid 是有效的进程 ID。
             unsafe {
                 let mut status = 0;
                 let result = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
@@ -368,6 +382,8 @@ mod unix_pty {
                 return Ok(code);
             }
 
+            // SAFETY: waitpid 阻塞等待子进程退出。status 是有效的栈变量，
+            // child_pid 是我们 fork 创建的有效进程 ID。
             unsafe {
                 let mut status = 0;
                 let result = libc::waitpid(self.child_pid, &mut status, 0);
@@ -397,6 +413,9 @@ mod unix_pty {
         }
 
         pub fn terminate(&mut self) -> Result<()> {
+            // SAFETY: kill 系统调用发送信号到进程/进程组。
+            // 负 PID 是向进程组发送信号的标准方式。child_pid 是有效的进程 ID。
+            // 即使进程已经退出，kill 调用也是安全的（会返回错误但不会导致 UB）。
             unsafe {
                 // 向整个进程组发送 SIGHUP（子进程通过 setsid() 创建了新会话）
                 // 使用负 PID 向进程组发信号，确保 shell 的子进程也被杀死
@@ -426,6 +445,8 @@ mod unix_pty {
             if self.is_alive() {
                 let _ = self.terminate();
             }
+            // SAFETY: close 关闭文件描述符。master 是有效的 fd，
+            // 关闭后不会再使用（因为这是 Drop 实现）。
             unsafe {
                 let _ = libc::close(self.master);
             }

@@ -281,7 +281,7 @@ impl SessionManager {
             }
             // 为第一个 session 回放恢复命令
             if let Some(ref cmds) = first.restorable_commands {
-                if let Some(session) = self.sessions.get(0) {
+                if let Some(session) = self.sessions.first() {
                     Self::schedule_command_replay(&session.shell, cmds.clone());
                 }
             }

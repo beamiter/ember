@@ -334,6 +334,8 @@ impl ShellSession {
             }
             // 锁已释放！io_loop 可以读取 PTY 输出，vim 可以排空缓冲区
             // poll 等待 PTY 可写
+            // SAFETY: pfd 是有效的栈变量，符合 libc::pollfd 布局。
+            // poll 调用使用有效的 fd 和超时值，不会导致未定义行为。
             unsafe {
                 let mut pfd = libc::pollfd {
                     fd: master_fd,
@@ -403,8 +405,10 @@ impl Drop for ShellSession {
         self.shutdown.store(true, Ordering::Relaxed);
 
         // 直接杀死整个进程组，确保 shell 及其子进程都被清理
+        // SAFETY: kill 向进程/进程组发送信号。负 PID 向进程组发送信号是标准做法。
+        // child_pid 来自 fork 创建的有效进程。即使进程已退出，kill 也是安全的。
         unsafe {
-            let pgid = -(self.child_pid as i32);
+            let pgid = -self.child_pid;
             // SIGHUP: 通知shell会话终止
             libc::kill(pgid, libc::SIGHUP);
             // SIGTERM: 请求优雅退出

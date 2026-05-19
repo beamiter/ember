@@ -2,6 +2,8 @@ use crate::color;
 use crate::gpu;
 use crate::terminal::{clamp_terminal_dimensions, TerminalState};
 use egui::{Color32, FontId, Response, Ui, Vec2};
+use lru::LruCache;
+use std::num::NonZeroUsize;
 
 /// Quantize to 1/4 pixel increments for subpixel rendering cache coherence.
 fn quantize_subpixel(v: f32) -> u8 {
@@ -290,10 +292,10 @@ pub struct TerminalRenderer {
     requested_initial_focus: bool,
     ime_enabled: bool,
     last_ime_rect: Option<egui::Rect>,
-    // Kitty graphics texture cache: image_id -> (texture_handle, width, height)
-    // Will be populated in Phase 4
+    // Kitty graphics texture cache with LRU eviction (max 100 images)
+    // Prevents unbounded memory growth from image sequences
     #[allow(dead_code)]
-    texture_cache: std::collections::HashMap<u32, (egui::TextureHandle, u32, u32)>,
+    texture_cache: LruCache<u32, (egui::TextureHandle, u32, u32)>,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
     pub opacity: f32,
@@ -355,7 +357,7 @@ impl TerminalRenderer {
             last_ime_rect: None,
             opacity: 1.0,
             gpu_rendering: true,
-            texture_cache: std::collections::HashMap::new(),
+            texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             wgpu_render_state: None,
             cursor_move_input: Vec::new(),
             // Dirty-region rendering cache (initialized empty)
@@ -429,6 +431,11 @@ impl TerminalRenderer {
         }
     }
 
+    /// 获取纹理缓存大小（用于性能监控）
+    pub fn texture_cache_len(&self) -> usize {
+        self.texture_cache.len()
+    }
+
     /// 获取或创建图像纹理
     fn get_image_texture(
         &mut self,
@@ -436,7 +443,7 @@ impl TerminalRenderer {
         image_id: u32,
         image: &crate::kitty_graphics::KittyImage,
     ) -> Option<egui::TextureHandle> {
-        // Check cache first
+        // Check cache first (get_mut to update LRU order)
         if let Some((handle, _w, _h)) = self.texture_cache.get(&image_id) {
             return Some(handle.clone());
         }
@@ -452,9 +459,9 @@ impl TerminalRenderer {
             Default::default(),
         );
 
-        // Cache it
+        // Cache it (LRU will auto-evict oldest if at capacity)
         let result = handle.clone();
-        self.texture_cache.insert(image_id, (handle, image.width, image.height));
+        self.texture_cache.put(image_id, (handle, image.width, image.height));
         Some(result)
     }
 
@@ -696,7 +703,7 @@ impl TerminalRenderer {
                 .expand(Self::SCROLLBAR_HIT_EXPAND)
                 .contains(pos)
         });
-        let show_scrollbar = terminal.scrollback.len() > 0
+        let show_scrollbar = !terminal.scrollback.is_empty()
             && match self.scrollbar_visibility {
                 crate::config::ScrollbarVisibility::Always => true,
                 crate::config::ScrollbarVisibility::Auto => {
@@ -705,8 +712,7 @@ impl TerminalRenderer {
             };
 
         // Compute thumb rect and related values for interaction
-        let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> = if terminal.scrollback.len()
-            > 0
+        let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> = if !terminal.scrollback.is_empty()
         {
             let total_lines = terminal.scrollback.len() + rows;
             let visible_lines = rows;
@@ -779,7 +785,7 @@ impl TerminalRenderer {
         // Click in scrollbar track (not on thumb): page up/down
         if response.drag_started() && !self.dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
-                if pos.x >= scrollbar_x && terminal.scrollback.len() > 0 {
+                if pos.x >= scrollbar_x && !terminal.scrollback.is_empty() {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
                         if pos.y < thumb_rect.top() {
                             // Click above thumb: scroll up (see older history)
@@ -1050,7 +1056,7 @@ impl TerminalRenderer {
             let mut link_map: std::collections::HashMap<usize, Vec<&crate::link::Link>> =
                 std::collections::HashMap::new();
             for link in links {
-                link_map.entry(link.line).or_insert_with(Vec::new).push(link);
+                link_map.entry(link.line).or_default().push(link);
             }
             // Fallback: CPU rendering via egui painter
             self.render_grid_cpu(
@@ -1332,7 +1338,7 @@ impl TerminalRenderer {
                 let mut link_map: std::collections::HashMap<usize, Vec<&crate::link::Link>> =
                     std::collections::HashMap::new();
                 for link in links {
-                    link_map.entry(link.line).or_insert_with(Vec::new).push(link);
+                    link_map.entry(link.line).or_default().push(link);
                 }
 
                 // Build search match map for O(1) per-row lookup instead of O(M) per-cell scan
@@ -1340,7 +1346,7 @@ impl TerminalRenderer {
                     std::collections::HashMap::new();
                 if has_search {
                     for m in &search_state.matches {
-                        search_map.entry(m.line).or_insert_with(Vec::new).push(m);
+                        search_map.entry(m.line).or_default().push(m);
                     }
                 }
 

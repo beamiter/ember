@@ -218,7 +218,7 @@ impl LinkDetector {
         trimmed.starts_with('/')
             || trimmed.starts_with("./")
             || trimmed.starts_with("../")
-            || (trimmed.len() > 0 && trimmed.chars().next().unwrap().is_alphabetic())
+            || (!trimmed.is_empty() && trimmed.chars().next().unwrap().is_alphabetic())
     }
 
     /// 在整个网格中检测链接（带缓存）
@@ -301,11 +301,7 @@ impl LinkDetector {
 
                     // 检查该链接是否与这个物理行重叠
                     if link_start < row_end_offset && link_end > row_offset {
-                        let col_start = if link_start > row_offset {
-                            link_start - row_offset
-                        } else {
-                            0
-                        };
+                        let col_start = link_start.saturating_sub(row_offset);
                         let col_end = if link_end < row_end_offset {
                             link_end - row_offset
                         } else {
@@ -419,7 +415,7 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     {
         use std::io::Write;
         let mut child = std::process::Command::new("xclip")
-            .args(&["-selection", "clipboard"])
+            .args(["-selection", "clipboard"])
             .stdin(std::process::Stdio::piped())
             .spawn()?;
 

@@ -53,7 +53,7 @@ pub fn color_256(idx: u8) -> Color32 {
             let r = (idx / 36) * 51;
             let g = ((idx % 36) / 6) * 51;
             let b = (idx % 6) * 51;
-            Color32::from_rgb(r as u8, g as u8, b as u8)
+            Color32::from_rgb(r, g, b)
         }
         232..=255 => {
             let gray = 8 + (idx - 232) * 10;

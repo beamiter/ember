@@ -52,6 +52,11 @@ impl DebugPanel {
         sum / self.frame_times.len() as f64
     }
 
+    /// 获取平均帧时间（供外部使用）
+    pub fn get_avg_frame_time_ms(&self) -> f64 {
+        self.avg_frame_time_ms()
+    }
+
     fn fps(&self) -> f64 {
         let avg = self.avg_frame_time_ms();
         if avg > 0.0 {
@@ -74,6 +79,7 @@ impl DebugPanel {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &self,
         ctx: &egui::Context,
@@ -84,6 +90,9 @@ impl DebugPanel {
         scrollback_max: usize,
         kitty_images_count: usize,
         kitty_memory_mb: u64,
+        pending_output_bytes: usize,
+        texture_cache_size: usize,
+        frame_budget_kb: usize,
     ) {
         if !self.is_open {
             return;
@@ -119,6 +128,7 @@ impl DebugPanel {
                 let lines: Vec<(&str, String)> = vec![
                     ("FPS", format!("{:.1}", fps)),
                     ("Frame", format!("{:.2} ms", frame_ms)),
+                    ("Budget", format!("{} KB", frame_budget_kb)),
                     ("Memory", mem_str),
                     ("Scale", format!("{:.2}x (zoom {:.2})", scale, zoom)),
                     ("Grid", format!("{}x{}", grid_cols, grid_rows)),
@@ -127,6 +137,8 @@ impl DebugPanel {
                         "Scrollback",
                         format!("{} / {}", scrollback_used, scrollback_max),
                     ),
+                    ("Pending", format!("{} B", pending_output_bytes)),
+                    ("Tex Cache", format!("{} imgs", texture_cache_size)),
                     ("Kitty Images", format!("{}", kitty_images_count)),
                     ("Kitty Memory", format!("{} MB", kitty_memory_mb)),
                 ];
