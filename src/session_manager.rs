@@ -19,15 +19,17 @@ pub struct SessionManager {
     sessions: Vec<Session>,
     active_index: usize,
     repaint_ctx: egui::Context,
+    configured_shell: Option<String>,
 }
 
 impl SessionManager {
     /// 创建新的会话管理器，初始化一个默认会话
-    pub fn new(first_session: Session, repaint_ctx: egui::Context) -> Self {
+    pub fn new(first_session: Session, repaint_ctx: egui::Context, configured_shell: Option<String>) -> Self {
         SessionManager {
             sessions: vec![first_session],
             active_index: 0,
             repaint_ctx,
+            configured_shell,
         }
     }
 
@@ -56,7 +58,7 @@ impl SessionManager {
 
         // 创建新会话，继承工作目录（新会话不传 session_id，自动生成）
         let cwd_ref = cwd.as_deref();
-        match ShellSession::new_with_cwd(cols, rows, cwd_ref, None, self.repaint_ctx.clone()) {
+        match ShellSession::new_with_cwd(cols, rows, cwd_ref, None, self.configured_shell.as_deref(), self.repaint_ctx.clone()) {
             Ok(shell) => {
                 let mut terminal = TerminalState::new(cols, rows);
                 terminal.set_max_scrollback(scrollback_lines);
@@ -291,7 +293,7 @@ impl SessionManager {
         for snap in snapshots.into_iter().skip(1) {
             let cwd_ref = snap.cwd.as_deref();
             let sid_ref = snap.session_id.as_deref();
-            match ShellSession::new_with_cwd(80, 24, cwd_ref, sid_ref, self.repaint_ctx.clone()) {
+            match ShellSession::new_with_cwd(80, 24, cwd_ref, sid_ref, self.configured_shell.as_deref(), self.repaint_ctx.clone()) {
                 Ok(shell) => {
                     let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
                     let mut session = Session::new(snap.name, snap.tags, terminal, shell);

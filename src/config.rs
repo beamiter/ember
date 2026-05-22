@@ -120,6 +120,10 @@ pub struct Config {
 
     #[serde(default)]
     pub ui_scale: Option<f32>,
+
+    /// Explicit shell path (overrides auto-detection). Useful when PATH is stripped by launchers like wofi.
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 fn default_font_size() -> f32 {
@@ -255,6 +259,7 @@ impl Default for Config {
             app_renderer: AppRendererType::default(),
             scroll_speed: default_scroll_speed(),
             ui_scale: None,
+            shell: None,
         }
     }
 }

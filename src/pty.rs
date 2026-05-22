@@ -31,21 +31,26 @@ mod unix_pty {
             .map(|p| p.to_string_lossy().to_string())
     }
 
-    fn choose_shell() -> String {
-        // Priority 1: rsh (preferred shell with advanced features)
+    fn choose_shell(configured_shell: Option<&str>) -> String {
+        // Priority 1: explicit config / env var (needed when PATH is stripped by launchers like wofi)
+        if let Some(path) = configured_shell {
+            if is_executable(Path::new(path)) {
+                return path.to_string();
+            }
+            eprintln!("[PTY] Configured shell '{}' is not executable, falling back", path);
+        }
+
+        // Priority 2: rsh (preferred shell with advanced features)
         if let Some(rsh_path) = find_executable_in_path("rsh") {
-            // eprintln!("[PTY] Using rsh: {}", rsh_path);
             return rsh_path;
         }
 
-        // Priority 2: bash (fallback)
+        // Priority 3: bash (fallback)
         if let Some(bash_path) = find_executable_in_path("bash") {
-            // eprintln!("[PTY] Using bash: {}", bash_path);
             return bash_path;
         }
 
-        // Priority 3: sh (last resort)
-        // eprintln!("[PTY] Using sh");
+        // Priority 4: sh (last resort)
         "sh".to_string()
     }
 
@@ -58,7 +63,7 @@ mod unix_pty {
     impl Pty {
         #[allow(dead_code)]
         pub fn new(cols: usize, rows: usize) -> Result<Self> {
-            Self::new_with_cwd(cols, rows, None, None)
+            Self::new_with_cwd(cols, rows, None, None, None)
         }
 
         pub fn new_with_cwd(
@@ -66,6 +71,7 @@ mod unix_pty {
             rows: usize,
             cwd: Option<&str>,
             session_id: Option<&str>,
+            configured_shell: Option<&str>,
         ) -> Result<Self> {
             // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
             // 所有的 libc 调用都检查了返回值并正确处理错误。
@@ -168,7 +174,7 @@ mod unix_pty {
                     }
 
                     // 选择 shell：优先 rsh，fallback bash，最后 sh
-                    let shell_path = choose_shell();
+                    let shell_path = choose_shell(configured_shell);
 
                     let term_name = CString::new("TERM").unwrap();
                     let term_value = CString::new("xterm-256color").unwrap();

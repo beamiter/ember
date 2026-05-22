@@ -674,11 +674,14 @@ impl TerminalApp {
         let saved_active_index = saved_snapshot.as_ref().and_then(|s| s.active_index);
         let terminal = TerminalState::new(cols, rows);
 
+        let configured_shell = std::env::var("JTERM2_SHELL").ok().or(cfg.shell.clone());
+
         let shell = match ShellSession::new_with_cwd(
             cols,
             rows,
             first_cwd.as_deref(),
             first_session_id.as_deref(),
+            configured_shell.as_deref(),
             repaint_ctx.clone(),
         ) {
             Ok(session) => {
@@ -690,13 +693,13 @@ impl TerminalApp {
                     "✗ Failed to start shell with saved cwd, falling back: {}",
                     e
                 );
-                ShellSession::new(cols, rows, repaint_ctx.clone())
+                ShellSession::new(cols, rows, configured_shell.as_deref(), repaint_ctx.clone())
                     .unwrap_or_else(|e| panic!("Cannot create shell session: {}", e))
             }
         };
 
         let session = Session::with_default_name(0, Arc::new(ParkingMutex::new(terminal)), shell);
-        let mut session_manager = SessionManager::new(session, repaint_ctx);
+        let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);
 
         // 恢复额外的会话（包括 restorable commands 回放）
         if let Some(snap) = saved_snapshot {
