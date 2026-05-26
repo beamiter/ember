@@ -305,6 +305,8 @@ pub struct TerminalRenderer {
     pub wgpu_render_state: Option<egui_wgpu::RenderState>,
     /// Pending cursor movement input (arrow keys) from mouse clicks
     pub cursor_move_input: Vec<u8>,
+    /// Sub-line pixel offset for smooth scrolling animation
+    pub scroll_pixel_offset: f32,
 
     // Dirty-region rendering cache
     cached_instances: std::sync::Arc<Vec<gpu::instance::CellInstance>>,
@@ -360,6 +362,7 @@ impl TerminalRenderer {
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             wgpu_render_state: None,
             cursor_move_input: Vec::new(),
+            scroll_pixel_offset: 0.0,
             // Dirty-region rendering cache (initialized empty)
             cached_instances: std::sync::Arc::new(Vec::new()),
             row_instance_offsets: Vec::new(),
@@ -383,6 +386,11 @@ impl TerminalRenderer {
     pub fn reset_ime_state(&mut self) {
         self.ime_enabled = false;
         self.last_ime_rect = None;
+    }
+
+    pub fn invalidate_font_cache(&mut self) {
+        self.cached_instances = std::sync::Arc::new(Vec::new());
+        self.last_rendered_grid_version = 0;
     }
 
     pub fn sync_font_metrics(&mut self, ctx: &egui::Context) {
@@ -1511,7 +1519,7 @@ impl TerminalRenderer {
             atlas_width: atlas_w,
             atlas_height: atlas_h,
             render_phase: 0.0,
-            _pad: 0.0,
+            scroll_pixel_offset: self.scroll_pixel_offset * ppp,
         };
 
         let foreground_uniforms = gpu::instance::GridUniforms {
@@ -1670,7 +1678,6 @@ impl TerminalRenderer {
             };
 
             let bold = cell.flags.bold;
-            let has_underline = cell.flags.underline != crate::terminal::UnderlineStyle::None || is_link;
             let has_strikethrough = cell.flags.strikethrough;
             let is_wide = cell.wide;
 
@@ -1682,8 +1689,19 @@ impl TerminalRenderer {
             if is_wide {
                 flags |= gpu::instance::CellInstance::FLAG_WIDE;
             }
-            if has_underline {
-                flags |= gpu::instance::CellInstance::FLAG_UNDERLINE;
+            // Encode underline style in bits 2-4
+            let underline_style = if is_link && cell.flags.underline == crate::terminal::UnderlineStyle::None {
+                crate::terminal::UnderlineStyle::Single
+            } else {
+                cell.flags.underline
+            };
+            match underline_style {
+                crate::terminal::UnderlineStyle::None => {}
+                crate::terminal::UnderlineStyle::Single => flags |= gpu::instance::CellInstance::UNDERLINE_SINGLE,
+                crate::terminal::UnderlineStyle::Double => flags |= gpu::instance::CellInstance::UNDERLINE_DOUBLE,
+                crate::terminal::UnderlineStyle::Curly => flags |= gpu::instance::CellInstance::UNDERLINE_CURLY,
+                crate::terminal::UnderlineStyle::Dotted => flags |= gpu::instance::CellInstance::UNDERLINE_DOTTED,
+                crate::terminal::UnderlineStyle::Dashed => flags |= gpu::instance::CellInstance::UNDERLINE_DASHED,
             }
             if has_strikethrough {
                 flags |= gpu::instance::CellInstance::FLAG_STRIKETHROUGH;

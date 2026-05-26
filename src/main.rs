@@ -489,11 +489,31 @@ fn configure_fonts_and_gpu(
             &fallback_font_data,
             font_size_px,
         );
+        let color_atlas_placeholder = render_state.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("color_atlas_init"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let color_atlas_view = color_atlas_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_atlas_sampler = render_state.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("color_atlas_sampler_init"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let pipeline = gpu::pipeline::GridPipeline::new(
             &render_state.device,
             render_state.target_format,
             atlas.gpu_resources().0,
             atlas.gpu_resources().1,
+            &color_atlas_view,
+            &color_atlas_sampler,
         );
 
         let mut renderer = render_state.renderer.write();
@@ -504,7 +524,7 @@ fn configure_fonts_and_gpu(
             gpu_res.atlas = atlas;
             gpu_res.pipeline = pipeline;
         } else {
-            let gpu_resources = gpu::callback::GpuResources::new(atlas, pipeline);
+            let gpu_resources = gpu::callback::GpuResources::new(atlas, pipeline, &render_state.device);
             renderer.callback_resources.insert(gpu_resources);
         }
 
@@ -799,6 +819,10 @@ impl TerminalApp {
             frame_events: Vec::new(),
             keyboard_input_buffer: Vec::new(),
             adaptive_frame_budget: 32768, // 初始值 32KB
+            config_last_mtime: config::Config::config_mtime(),
+            config_last_check: std::time::Instant::now(),
+            smooth_scroll_velocity: 0.0,
+            smooth_scroll_pixel_offset: 0.0,
         }
     }
 
@@ -2887,6 +2911,7 @@ impl eframe::App for TerminalApp {
         if !accumulated_data.is_empty() {
             let mut terminal = session.terminal.lock();
             terminal.process_batch(&accumulated_data);
+            terminal.check_sync_output_timeout();
             self.status_message.clear();
             // 有输出时更新最后活动时间
             self.last_activity_time = std::time::Instant::now();
@@ -2943,6 +2968,37 @@ impl eframe::App for TerminalApp {
                             }
                         }
                     });
+            }
+        }
+
+        // OSC 52 clipboard handling
+        {
+            let mut terminal = session.terminal.lock();
+            if let Some(text) = terminal.take_osc52_clipboard_set() {
+                if let Some(clipboard) = &self.clipboard {
+                    let _ = clipboard.copy(&text);
+                }
+            }
+            if terminal.take_osc52_clipboard_query() {
+                let content = self
+                    .clipboard
+                    .as_ref()
+                    .and_then(|c| c.paste().ok())
+                    .unwrap_or_default();
+                terminal.respond_osc52_clipboard(&content);
+            }
+        }
+
+        // OSC 9/777 desktop notifications
+        {
+            let mut terminal = session.terminal.lock();
+            let notifications: Vec<_> = terminal.pending_notifications.drain(..).collect();
+            drop(terminal);
+            for (title, body) in notifications {
+                let _ = std::process::Command::new("notify-send")
+                    .arg(&title)
+                    .arg(&body)
+                    .spawn();
             }
         }
 
@@ -3025,14 +3081,33 @@ impl eframe::App for TerminalApp {
         // 1. 如果应用启用了鼠标报告（如 vim），滚轮会在下面的鼠标处理部分发送给应用
         // 2. 如果应用未启用鼠标，或在普通终端，滚轮用于查看历史
         if scroll_delta != 0.0 && !mouse_enabled {
-            self.scroll_accumulator += scroll_delta;
+            self.smooth_scroll_velocity += scroll_delta * self.config.scroll_speed as f32;
+        }
+
+        // Smooth scroll physics
+        if self.smooth_scroll_velocity.abs() > 0.1 {
+            self.smooth_scroll_velocity *= 0.88;
+            self.smooth_scroll_pixel_offset += self.smooth_scroll_velocity;
+
             let line_h = self.renderer.line_height.max(1.0);
-            let lines = (self.scroll_accumulator / line_h) as isize;
+            let lines = (self.smooth_scroll_pixel_offset / line_h) as isize;
             if lines != 0 {
-                self.scroll_accumulator -= lines as f32 * line_h;
-                let scroll_lines = lines * self.config.scroll_speed as isize;
+                self.smooth_scroll_pixel_offset -= lines as f32 * line_h;
                 let mut terminal = session.terminal.lock();
-                terminal.scroll(scroll_lines);
+                terminal.scroll(lines);
+            }
+
+            self.renderer.scroll_pixel_offset = self.smooth_scroll_pixel_offset;
+            for pr in &mut self.pane_renderers {
+                pr.scroll_pixel_offset = self.smooth_scroll_pixel_offset;
+            }
+            ctx.request_repaint();
+        } else if self.smooth_scroll_velocity.abs() > 0.0 {
+            self.smooth_scroll_velocity = 0.0;
+            self.smooth_scroll_pixel_offset = 0.0;
+            self.renderer.scroll_pixel_offset = 0.0;
+            for pr in &mut self.pane_renderers {
+                pr.scroll_pixel_offset = 0.0;
             }
         }
 
@@ -3268,6 +3343,7 @@ impl eframe::App for TerminalApp {
         // Debounce 保存配置和会话
         self.flush_config_save();
         self.flush_session_save();
+        self.check_config_hot_reload();
 
         // Handle shell exit: close current session
         if shell_exited {

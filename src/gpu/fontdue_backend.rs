@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use super::font_backend::{FontBackend, GlyphRegion, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
+use super::font_backend::{FontBackend, GlyphRegion, ShapedGlyph, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
 
 /// Check if character is CJK or other wide script that shouldn't use subpixel binning.
 fn is_cjk_or_wide(ch: char) -> bool {
@@ -24,6 +25,14 @@ fn is_cjk_or_wide(ch: char) -> bool {
     )
 }
 
+/// Key for glyph-ID based caching (used after shaping)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct GidGlyphKey {
+    gid: u16,
+    bold: bool,
+    subpixel_offset: u8,
+}
+
 pub struct FontdueAtlas {
     font_regular: fontdue::Font,
     font_bold: Option<fontdue::Font>,
@@ -38,6 +47,7 @@ pub struct FontdueAtlas {
     shelf_height: u32,
     ascii_cache: HashMap<AtlasGlyphKey, GlyphRegion>,
     unicode_cache: LruCache<AtlasGlyphKey, GlyphRegion>,
+    gid_cache: HashMap<GidGlyphKey, GlyphRegion>,
     dirty_rects: Vec<DirtyRect>,
     needs_full_upload: bool,
     needs_rebind: bool,
@@ -46,6 +56,12 @@ pub struct FontdueAtlas {
     pub sampler: wgpu::Sampler,
     cached_ascent: f32,
     cached_descent: f32,
+    // Font shaping support
+    font_data_regular: Arc<Vec<u8>>,
+    font_data_bold: Option<Arc<Vec<u8>>>,
+    shaping_enabled: bool,
+    // Subpixel rendering
+    subpixel_rendering: bool,
 }
 
 impl FontdueAtlas {
@@ -80,6 +96,13 @@ impl FontdueAtlas {
 
         let (cached_ascent, cached_descent) = Self::compute_metrics(&font_regular, font_size_px);
 
+        // Check if font supports shaping (has GSUB table for ligatures)
+        let font_data_arc = Arc::new(font_data_regular.to_vec());
+        let font_data_bold_arc = font_data_bold.map(|d| Arc::new(d.to_vec()));
+        let shaping_enabled = ttf_parser::Face::parse(&font_data_arc, 0)
+            .map(|face| face.tables().gsub.is_some())
+            .unwrap_or(false);
+
         let mut atlas = FontdueAtlas {
             font_regular,
             font_bold,
@@ -94,6 +117,7 @@ impl FontdueAtlas {
             shelf_height: 0,
             ascii_cache: HashMap::with_capacity(1024),
             unicode_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
+            gid_cache: HashMap::with_capacity(512),
             dirty_rects: Vec::new(),
             needs_full_upload: false,
             needs_rebind: false,
@@ -102,6 +126,10 @@ impl FontdueAtlas {
             sampler,
             cached_ascent,
             cached_descent,
+            font_data_regular: font_data_arc,
+            font_data_bold: font_data_bold_arc,
+            shaping_enabled,
+            subpixel_rendering: true,
         };
 
         atlas.prepopulate_ascii();
@@ -235,19 +263,27 @@ impl FontdueAtlas {
         let by = atlas_y + GLYPH_PADDING;
 
         let weight_boost = if bold { 1.0 } else { self.font_weight };
+        let use_subpixel = self.subpixel_rendering && !is_cjk_or_wide(key.ch);
 
-        for gy in 0..glyph_h {
-            for gx in 0..glyph_w {
-                let src_idx = (gy * glyph_w + gx) as usize;
-                let dst_x = bx + gx;
-                let dst_y = by + gy;
-                if dst_x < self.width && dst_y < self.height {
-                    let coverage = glyph_bitmap[src_idx] as f32 / 255.0;
-                    let boosted = (coverage * weight_boost).min(1.0);
-                    let alpha = alpha_from_coverage(boosted);
-                    let pixel = [255, 255, 255, (alpha * 255.0 + 0.5) as u8];
-                    let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
-                    self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+        if use_subpixel {
+            self.rasterize_subpixel(
+                metrics, glyph_bitmap, glyph_w, glyph_h, bx, by, weight_boost,
+            );
+        } else {
+            for gy in 0..glyph_h {
+                for gx in 0..glyph_w {
+                    let src_idx = (gy * glyph_w + gx) as usize;
+                    let dst_x = bx + gx;
+                    let dst_y = by + gy;
+                    if dst_x < self.width && dst_y < self.height {
+                        let coverage = glyph_bitmap[src_idx] as f32 / 255.0;
+                        let boosted = (coverage * weight_boost).min(1.0);
+                        let alpha = alpha_from_coverage(boosted);
+                        let a8 = (alpha * 255.0 + 0.5) as u8;
+                        let pixel = [a8, a8, a8, a8];
+                        let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
+                        self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+                    }
                 }
             }
         }
@@ -275,6 +311,163 @@ impl FontdueAtlas {
             bearing_y,
         };
         self.cache_insert(key, region);
+        region
+    }
+
+    fn rasterize_subpixel(
+        &mut self,
+        _metrics: &fontdue::Metrics,
+        glyph_bitmap: &[u8],
+        glyph_w: u32,
+        glyph_h: u32,
+        bx: u32,
+        by: u32,
+        weight_boost: f32,
+    ) {
+        // For subpixel rendering, the input bitmap is 1x resolution grayscale.
+        // We treat each pixel as 3 subpixels (RGB) and use a simple box filter
+        // weighted by the neighboring pixels to produce per-channel coverage.
+        // FIR filter weights (simple 1/3-weight kernel centered on each subpixel)
+        const W: [f32; 5] = [1.0 / 9.0, 2.0 / 9.0, 3.0 / 9.0, 2.0 / 9.0, 1.0 / 9.0];
+
+        for gy in 0..glyph_h {
+            for gx in 0..glyph_w {
+                let dst_x = bx + gx;
+                let dst_y = by + gy;
+                if dst_x >= self.width || dst_y >= self.height {
+                    continue;
+                }
+
+                // Sample 5 horizontal neighbors (clamped)
+                let mut samples = [0.0f32; 5];
+                for i in 0..5i32 {
+                    let sx = (gx as i32 + i - 2).clamp(0, glyph_w as i32 - 1) as u32;
+                    let src_idx = (gy * glyph_w + sx) as usize;
+                    let cov = glyph_bitmap[src_idx] as f32 / 255.0;
+                    samples[i as usize] = (cov * weight_boost).min(1.0);
+                }
+
+                // R subpixel: centered at -1/3 pixel offset
+                let r_cov = samples[0] * W[0] + samples[1] * W[1] + samples[2] * W[2]
+                    + samples[3] * W[3] + samples[4] * W[4];
+                // G subpixel: centered at 0
+                let g_cov = {
+                    let src_idx = (gy * glyph_w + gx) as usize;
+                    let cov = glyph_bitmap[src_idx] as f32 / 255.0;
+                    (cov * weight_boost).min(1.0)
+                };
+                // B subpixel: centered at +1/3 pixel offset
+                // Use shifted samples
+                let mut b_samples = [0.0f32; 5];
+                for i in 0..5i32 {
+                    let sx = (gx as i32 + i - 1).clamp(0, glyph_w as i32 - 1) as u32;
+                    let src_idx = (gy * glyph_w + sx) as usize;
+                    let cov = glyph_bitmap[src_idx] as f32 / 255.0;
+                    b_samples[i as usize] = (cov * weight_boost).min(1.0);
+                }
+                let b_cov = b_samples[0] * W[0] + b_samples[1] * W[1] + b_samples[2] * W[2]
+                    + b_samples[3] * W[3] + b_samples[4] * W[4];
+
+                let r = alpha_from_coverage(r_cov);
+                let g = alpha_from_coverage(g_cov);
+                let b = alpha_from_coverage(b_cov);
+                let a = r.max(g).max(b);
+
+                let pixel = [
+                    (r * 255.0 + 0.5) as u8,
+                    (g * 255.0 + 0.5) as u8,
+                    (b * 255.0 + 0.5) as u8,
+                    (a * 255.0 + 0.5) as u8,
+                ];
+                let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
+                self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+            }
+        }
+    }
+
+    fn rasterize_gid(&mut self, gid: u16, bold: bool, subpixel_offset: u8) -> GlyphRegion {
+        let key = GidGlyphKey { gid, bold, subpixel_offset };
+        if let Some(&region) = self.gid_cache.get(&key) {
+            return region;
+        }
+
+        let font = if bold {
+            self.font_bold.as_ref().unwrap_or(&self.font_regular)
+        } else {
+            &self.font_regular
+        };
+
+        let (metrics, glyph_bitmap) = font.rasterize_indexed(gid as u16, self.font_size_px);
+
+        if glyph_bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
+            let region = empty_glyph_region();
+            self.gid_cache.insert(key, region);
+            return region;
+        }
+
+        let glyph_w = metrics.width as u32;
+        let glyph_h = metrics.height as u32;
+        let padded_w = glyph_w + GLYPH_PADDING * 2;
+        let padded_h = glyph_h + GLYPH_PADDING * 2;
+
+        if !self.allocate_shelf(padded_w, padded_h) {
+            if !self.grow() {
+                let region = empty_glyph_region();
+                self.gid_cache.insert(key, region);
+                return region;
+            }
+            if !self.allocate_shelf(padded_w, padded_h) {
+                let region = empty_glyph_region();
+                self.gid_cache.insert(key, region);
+                return region;
+            }
+        }
+
+        let atlas_x = self.shelf_x - padded_w;
+        let atlas_y = self.shelf_y;
+        let bx = atlas_x + GLYPH_PADDING;
+        let by = atlas_y + GLYPH_PADDING;
+
+        let weight_boost = if bold { 1.0 } else { self.font_weight };
+
+        for gy in 0..glyph_h {
+            for gx in 0..glyph_w {
+                let src_idx = (gy * glyph_w + gx) as usize;
+                let dst_x = bx + gx;
+                let dst_y = by + gy;
+                if dst_x < self.width && dst_y < self.height {
+                    let coverage = glyph_bitmap[src_idx] as f32 / 255.0;
+                    let boosted = (coverage * weight_boost).min(1.0);
+                    let alpha = alpha_from_coverage(boosted);
+                    let pixel = [255, 255, 255, (alpha * 255.0 + 0.5) as u8];
+                    let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
+                    self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+                }
+            }
+        }
+
+        self.dirty_rects.push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
+
+        let subpixel_shift = match subpixel_offset {
+            1 => 0.25,
+            2 => 0.5,
+            3 => 0.75,
+            _ => 0.0,
+        };
+        let bearing_x = metrics.xmin as f32 + subpixel_shift;
+        let bearing_y = self.cached_ascent - (metrics.ymin as f32 + metrics.height as f32);
+
+        let region = GlyphRegion {
+            u0: bx as f32 / self.width as f32,
+            v0: by as f32 / self.height as f32,
+            u1: (bx + glyph_w) as f32 / self.width as f32,
+            v1: (by + glyph_h) as f32 / self.height as f32,
+            width_px: glyph_w as f32,
+            height_px: glyph_h as f32,
+            bearing_x,
+            bearing_y,
+        };
+        self.gid_cache.insert(key, region);
         region
     }
 }
@@ -368,6 +561,7 @@ impl FontBackend for FontdueAtlas {
     fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.ascii_cache.clear();
         self.unicode_cache.clear();
+        self.gid_cache.clear();
         self.shelf_x = 0;
         self.shelf_y = 0;
         self.shelf_height = 0;
@@ -480,5 +674,78 @@ impl FontBackend for FontdueAtlas {
         let v = self.needs_rebind;
         self.needs_rebind = false;
         v
+    }
+
+    fn supports_shaping(&self) -> bool {
+        self.shaping_enabled
+    }
+
+    fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Vec<ShapedGlyph> {
+        if !self.shaping_enabled || text.is_empty() {
+            // Fallback: per-character rasterization
+            let mut glyphs = Vec::with_capacity(text.len());
+            for ch in text.chars() {
+                let region = self.get_or_rasterize(ch, bold, subpixel_offset);
+                glyphs.push(ShapedGlyph {
+                    cluster: 0,
+                    x_advance: region.width_px,
+                    x_offset: 0.0,
+                    y_offset: 0.0,
+                    region,
+                });
+            }
+            return glyphs;
+        }
+
+        let font_data = if bold {
+            self.font_data_bold.as_ref().unwrap_or(&self.font_data_regular)
+        } else {
+            &self.font_data_regular
+        };
+
+        let face = match rustybuzz::Face::from_slice(font_data, 0) {
+            Some(f) => f,
+            None => {
+                // Fallback if face parsing fails
+                let mut glyphs = Vec::with_capacity(text.len());
+                for ch in text.chars() {
+                    let region = self.get_or_rasterize(ch, bold, subpixel_offset);
+                    glyphs.push(ShapedGlyph {
+                        cluster: 0,
+                        x_advance: region.width_px,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                        region,
+                    });
+                }
+                return glyphs;
+            }
+        };
+
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+
+        let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
+        let infos = glyph_buffer.glyph_infos();
+        let positions = glyph_buffer.glyph_positions();
+
+        let upem = face.units_per_em() as f32;
+        let scale = self.font_size_px / upem;
+
+        let mut glyphs = Vec::with_capacity(infos.len());
+        for (info, pos) in infos.iter().zip(positions.iter()) {
+            let gid = info.glyph_id as u16;
+            let region = self.rasterize_gid(gid, bold, subpixel_offset);
+
+            glyphs.push(ShapedGlyph {
+                cluster: info.cluster,
+                x_advance: pos.x_advance as f32 * scale,
+                x_offset: pos.x_offset as f32 * scale,
+                y_offset: pos.y_offset as f32 * scale,
+                region,
+            });
+        }
+
+        glyphs
     }
 }

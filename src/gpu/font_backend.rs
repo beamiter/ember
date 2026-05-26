@@ -35,6 +35,16 @@ pub struct AtlasGlyphKey {
     pub subpixel_offset: u8,
 }
 
+/// A shaped glyph from rustybuzz, ready for rendering.
+#[derive(Clone, Debug)]
+pub struct ShapedGlyph {
+    pub cluster: u32,
+    pub x_advance: f32,
+    pub x_offset: f32,
+    pub y_offset: f32,
+    pub region: GlyphRegion,
+}
+
 pub trait FontBackend: Send + Sync {
     fn get_or_rasterize(&mut self, ch: char, bold: bool, subpixel_offset: u8) -> GlyphRegion;
     #[allow(dead_code)]
@@ -46,6 +56,28 @@ pub trait FontBackend: Send + Sync {
     fn gpu_resources(&self) -> (&wgpu::TextureView, &wgpu::Sampler);
     fn atlas_dimensions(&self) -> (u32, u32);
     fn take_needs_rebind(&mut self) -> bool;
+
+    /// Shape a text run using font shaping (ligatures, kerning).
+    /// Returns shaped glyphs with atlas regions. Default impl falls back to per-char rasterization.
+    fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Vec<ShapedGlyph> {
+        let mut glyphs = Vec::new();
+        for ch in text.chars() {
+            let region = self.get_or_rasterize(ch, bold, subpixel_offset);
+            glyphs.push(ShapedGlyph {
+                cluster: 0,
+                x_advance: region.width_px,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                region,
+            });
+        }
+        glyphs
+    }
+
+    /// Check if this backend supports shaping (ligatures).
+    fn supports_shaping(&self) -> bool {
+        false
+    }
 }
 
 pub const GLYPH_PADDING: u32 = 2;

@@ -24,8 +24,8 @@ pub struct CellInstance {
     /// Bit flags:
     ///   bit 0: has_glyph (character is not space)
     ///   bit 1: wide (CJK double-width)
-    ///   bit 2: underline
-    ///   bit 3: strikethrough
+    ///   bits 2-4: underline style (0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed)
+    ///   bit 5: strikethrough
     pub flags: u32,
     /// Horizontal offset within cell for glyph centering (physical pixels)
     pub glyph_offset_x: f32,
@@ -37,8 +37,16 @@ pub struct CellInstance {
 impl CellInstance {
     pub const FLAG_HAS_GLYPH: u32 = 1;
     pub const FLAG_WIDE: u32 = 2;
-    pub const FLAG_UNDERLINE: u32 = 4;
-    pub const FLAG_STRIKETHROUGH: u32 = 8;
+    // Underline style encoded in bits 2-4 (shifted by 2): style << 2
+    pub const UNDERLINE_SHIFT: u32 = 2;
+    pub const UNDERLINE_MASK: u32 = 0b111 << 2; // bits 2-4
+    pub const UNDERLINE_SINGLE: u32 = 1 << 2;
+    pub const UNDERLINE_DOUBLE: u32 = 2 << 2;
+    pub const UNDERLINE_CURLY: u32 = 3 << 2;
+    pub const UNDERLINE_DOTTED: u32 = 4 << 2;
+    pub const UNDERLINE_DASHED: u32 = 5 << 2;
+    pub const FLAG_STRIKETHROUGH: u32 = 32; // bit 5
+    pub const FLAG_COLOR_GLYPH: u32 = 64; // bit 6
 
     pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -110,5 +118,6 @@ pub struct GridUniforms {
     pub atlas_height: f32,
     /// 0.0 = background pass, 1.0 = foreground pass
     pub render_phase: f32,
-    pub _pad: f32,
+    /// Sub-line pixel offset for smooth scrolling
+    pub scroll_pixel_offset: f32,
 }

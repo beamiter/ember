@@ -112,4 +112,12 @@ pub struct TerminalApp {
 
     // 自适应帧预算：根据帧时间动态调整每帧处理的字节数
     pub adaptive_frame_budget: usize,
+
+    // Config hot-reload
+    pub config_last_mtime: Option<std::time::SystemTime>,
+    pub config_last_check: std::time::Instant,
+
+    // Smooth scrolling
+    pub smooth_scroll_velocity: f32,
+    pub smooth_scroll_pixel_offset: f32,
 }

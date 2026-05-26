@@ -314,8 +314,262 @@ pub struct StyleFlags {
 
 #[derive(Clone, Debug)]
 pub struct ScrollbackLine {
-    pub cells: Vec<TerminalCell>,
+    data: CompressedLineData,
     pub is_wrapped: bool,
+    cols: u16,
+}
+
+#[derive(Clone, Debug)]
+enum CompressedLineData {
+    Plain(String, u16),
+    Encoded(Vec<u8>),
+}
+
+impl ScrollbackLine {
+    pub fn compress(cells: Vec<TerminalCell>, is_wrapped: bool) -> Self {
+        let cols = cells.len() as u16;
+        let trailing_blanks = cells.iter().rev()
+            .take_while(|c| c.character == ' ' && c.foreground == Color::Default
+                && c.background == Color::Default && !c.flags.bold && !c.flags.italic
+                && matches!(c.flags.underline, UnderlineStyle::None) && !c.flags.inverse
+                && !c.flags.dim && !c.flags.strikethrough && !c.wide && !c.wide_continuation)
+            .count();
+
+        let active_len = cells.len() - trailing_blanks;
+        let all_default_attrs = cells[..active_len].iter().all(|c|
+            c.foreground == Color::Default && c.background == Color::Default
+            && !c.flags.bold && !c.flags.italic
+            && matches!(c.flags.underline, UnderlineStyle::None)
+            && !c.flags.inverse && !c.flags.dim && !c.flags.strikethrough
+            && !c.wide && !c.wide_continuation
+        );
+
+        if all_default_attrs {
+            let text: String = cells[..active_len].iter().map(|c| c.character).collect();
+            ScrollbackLine {
+                data: CompressedLineData::Plain(text, trailing_blanks as u16),
+                is_wrapped,
+                cols,
+            }
+        } else {
+            let encoded = Self::encode_cells(&cells[..active_len]);
+            ScrollbackLine {
+                data: CompressedLineData::Encoded(encoded),
+                is_wrapped,
+                cols,
+            }
+        }
+    }
+
+    pub fn decompress(&self) -> Vec<TerminalCell> {
+        match &self.data {
+            CompressedLineData::Plain(text, trailing) => {
+                let mut cells: Vec<TerminalCell> = text.chars()
+                    .map(|ch| TerminalCell { character: ch, ..Default::default() })
+                    .collect();
+                cells.resize(cells.len() + *trailing as usize, TerminalCell::default());
+                cells
+            }
+            CompressedLineData::Encoded(data) => {
+                Self::decode_cells(data, self.cols as usize)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn cells(&self) -> Vec<TerminalCell> {
+        self.decompress()
+    }
+
+    fn encode_color(color: &Color, buf: &mut Vec<u8>) {
+        match color {
+            Color::Default => buf.push(0),
+            Color::Black => buf.push(1),
+            Color::Red => buf.push(2),
+            Color::Green => buf.push(3),
+            Color::Yellow => buf.push(4),
+            Color::Blue => buf.push(5),
+            Color::Magenta => buf.push(6),
+            Color::Cyan => buf.push(7),
+            Color::White => buf.push(8),
+            Color::BrightBlack => buf.push(9),
+            Color::BrightRed => buf.push(10),
+            Color::BrightGreen => buf.push(11),
+            Color::BrightYellow => buf.push(12),
+            Color::BrightBlue => buf.push(13),
+            Color::BrightMagenta => buf.push(14),
+            Color::BrightCyan => buf.push(15),
+            Color::BrightWhite => buf.push(16),
+            Color::Indexed(i) => { buf.push(17); buf.push(*i); }
+            Color::Rgb(r, g, b) => { buf.push(18); buf.push(*r); buf.push(*g); buf.push(*b); }
+        }
+    }
+
+    fn decode_color(data: &[u8], pos: &mut usize) -> Color {
+        if *pos >= data.len() { return Color::Default; }
+        let tag = data[*pos];
+        *pos += 1;
+        match tag {
+            0 => Color::Default,
+            1 => Color::Black,
+            2 => Color::Red,
+            3 => Color::Green,
+            4 => Color::Yellow,
+            5 => Color::Blue,
+            6 => Color::Magenta,
+            7 => Color::Cyan,
+            8 => Color::White,
+            9 => Color::BrightBlack,
+            10 => Color::BrightRed,
+            11 => Color::BrightGreen,
+            12 => Color::BrightYellow,
+            13 => Color::BrightBlue,
+            14 => Color::BrightMagenta,
+            15 => Color::BrightCyan,
+            16 => Color::BrightWhite,
+            17 => {
+                let i = data.get(*pos).copied().unwrap_or(0);
+                *pos += 1;
+                Color::Indexed(i)
+            }
+            18 => {
+                let r = data.get(*pos).copied().unwrap_or(0);
+                let g = data.get(*pos + 1).copied().unwrap_or(0);
+                let b = data.get(*pos + 2).copied().unwrap_or(0);
+                *pos += 3;
+                Color::Rgb(r, g, b)
+            }
+            _ => Color::Default,
+        }
+    }
+
+    fn encode_flags(flags: &StyleFlags, wide: bool, wide_cont: bool) -> u8 {
+        let mut f = 0u8;
+        if flags.bold { f |= 1; }
+        if flags.italic { f |= 2; }
+        match flags.underline {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => f |= 4,
+            UnderlineStyle::Double => f |= 8,
+            UnderlineStyle::Curly => f |= 12,
+            UnderlineStyle::Dotted => f |= 16,
+            UnderlineStyle::Dashed => f |= 20,
+        }
+        if flags.inverse { f |= 32; }
+        if flags.dim { f |= 64; }
+        if flags.strikethrough { f |= 128; }
+        if wide { f |= 0; } // encoded separately below
+        let _ = wide_cont;
+        f
+    }
+
+    fn decode_flags(f: u8) -> (StyleFlags, bool, bool) {
+        let underline = match (f >> 2) & 0x7 {
+            0 => UnderlineStyle::None,
+            1 => UnderlineStyle::Single,
+            2 => UnderlineStyle::Double,
+            3 => UnderlineStyle::Curly,
+            4 => UnderlineStyle::Dotted,
+            5 => UnderlineStyle::Dashed,
+            _ => UnderlineStyle::None,
+        };
+        let flags = StyleFlags {
+            bold: f & 1 != 0,
+            italic: f & 2 != 0,
+            underline,
+            inverse: f & 32 != 0,
+            dim: f & 64 != 0,
+            blink: false,
+            strikethrough: f & 128 != 0,
+        };
+        (flags, false, false)
+    }
+
+    fn encode_cells(cells: &[TerminalCell]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(cells.len() * 3);
+        let mut i = 0;
+        while i < cells.len() {
+            let cell = &cells[i];
+            let ch_str = cell.character.to_string();
+            let ch_bytes = ch_str.as_bytes();
+
+            // RLE: count consecutive identical cells
+            let mut run = 1u8;
+            while (run as u16) < 255 && (i + run as usize) < cells.len() {
+                let next = &cells[i + run as usize];
+                if next.character == cell.character && next.foreground == cell.foreground
+                    && next.background == cell.background && next.flags.bold == cell.flags.bold
+                    && next.flags.italic == cell.flags.italic
+                    && next.flags.underline == cell.flags.underline
+                    && next.flags.inverse == cell.flags.inverse
+                    && next.flags.dim == cell.flags.dim
+                    && next.flags.strikethrough == cell.flags.strikethrough
+                    && next.wide == cell.wide && next.wide_continuation == cell.wide_continuation
+                {
+                    run += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Format: [char_len:1][char_bytes][fg][bg][flags:1][wide_bits:1][run:1]
+            buf.push(ch_bytes.len() as u8);
+            buf.extend_from_slice(ch_bytes);
+            Self::encode_color(&cell.foreground, &mut buf);
+            Self::encode_color(&cell.background, &mut buf);
+            let f = Self::encode_flags(&cell.flags, cell.wide, cell.wide_continuation);
+            buf.push(f);
+            let wide_bits = if cell.wide { 1u8 } else { 0 } | if cell.wide_continuation { 2 } else { 0 };
+            buf.push(wide_bits);
+            buf.push(run);
+
+            i += run as usize;
+        }
+        buf
+    }
+
+    fn decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
+        let mut cells = Vec::with_capacity(cols);
+        let mut pos = 0;
+        while pos < data.len() {
+            let ch_len = data[pos] as usize;
+            pos += 1;
+            if pos + ch_len > data.len() { break; }
+            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
+                .ok()
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ');
+            pos += ch_len;
+
+            let fg = Self::decode_color(data, &mut pos);
+            let bg = Self::decode_color(data, &mut pos);
+            let f = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let wide_bits = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let run = data.get(pos).copied().unwrap_or(1).max(1);
+            pos += 1;
+
+            let (flags, _, _) = Self::decode_flags(f);
+            let wide = wide_bits & 1 != 0;
+            let wide_continuation = wide_bits & 2 != 0;
+
+            let cell = TerminalCell {
+                character: ch,
+                foreground: fg,
+                background: bg,
+                flags,
+                wide,
+                wide_continuation,
+            };
+            for _ in 0..run {
+                cells.push(cell.clone());
+            }
+        }
+        // Pad to cols
+        cells.resize(cols, TerminalCell::default());
+        cells
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -392,12 +646,17 @@ impl DirtyRegion {
 
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMode {
+    Normal,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
-    /// 鼠标按下时的锚点（不排序，保持原始位置）
     pub anchor: (usize, usize),
-    /// 鼠标当前位置
     pub active: (usize, usize),
+    pub mode: SelectionMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -416,6 +675,24 @@ pub enum ClipboardReadKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardReadRequest {
     pub kind: ClipboardReadKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandZone {
+    pub prompt_start: usize,
+    pub command_start: Option<usize>,
+    pub output_start: Option<usize>,
+    pub output_end: Option<usize>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default)]
+enum ZoneState {
+    #[default]
+    Idle,
+    PromptStarted(usize),
+    CommandStarted(usize, usize),
+    OutputStarted(usize, usize, usize),
 }
 
 pub struct TerminalState {
@@ -496,6 +773,27 @@ pub struct TerminalState {
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)
     #[allow(dead_code)]
     osc8_hyperlinks: Vec<crate::link::Link>, // Stored hyperlinks from OSC 8
+
+    // Synchronized output (mode 2026): suppress rendering until mode is cleared
+    pub sync_output_active: bool,
+    sync_output_start: Option<std::time::Instant>,
+
+    // OSC 52 clipboard set requests (selection_param, decoded_text)
+    pub pending_osc52_clipboard_set: Option<String>,
+    // OSC 52 clipboard query pending (needs clipboard read + response)
+    pub pending_osc52_clipboard_query: bool,
+
+    // OSC 133 shell integration: command zones for prompt navigation
+    pub command_zones: VecDeque<CommandZone>,
+    current_zone_state: ZoneState,
+
+    // OSC 10/11/12 dynamic colors
+    pub dynamic_fg: Option<(u8, u8, u8)>,
+    pub dynamic_bg: Option<(u8, u8, u8)>,
+    pub dynamic_cursor_color: Option<(u8, u8, u8)>,
+
+    // OSC 9/777 pending notifications
+    pub pending_notifications: Vec<(String, String)>,
 }
 
 impl TerminalState {
@@ -587,6 +885,16 @@ impl TerminalState {
             visible_cells_cache: None,
             current_hyperlink: None,
             osc8_hyperlinks: Vec::new(),
+            sync_output_active: false,
+            sync_output_start: None,
+            pending_osc52_clipboard_set: None,
+            pending_osc52_clipboard_query: false,
+            command_zones: VecDeque::new(),
+            current_zone_state: ZoneState::default(),
+            dynamic_fg: None,
+            dynamic_bg: None,
+            dynamic_cursor_color: None,
+            pending_notifications: Vec::new(),
         }
     }
 
@@ -609,6 +917,132 @@ impl TerminalState {
             self.output_buffer.extend_from_slice(payload.as_bytes());
         }
         self.output_buffer.extend_from_slice(Self::osc_terminator());
+    }
+
+    fn handle_osc_color(&mut self, command: &str, value: &str) {
+        if value == "?" {
+            // Query: respond with current color
+            let color = match command {
+                "10" => self.dynamic_fg.unwrap_or((255, 255, 255)),
+                "11" => self.dynamic_bg.unwrap_or((0, 0, 0)),
+                "12" => self.dynamic_cursor_color.unwrap_or((255, 255, 255)),
+                _ => return,
+            };
+            let response = format!(
+                "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                command,
+                (color.0 as u16) * 257,
+                (color.1 as u16) * 257,
+                (color.2 as u16) * 257,
+            );
+            self.output_buffer.extend_from_slice(response.as_bytes());
+        } else if let Some(rgb) = Self::parse_color_spec(value) {
+            match command {
+                "10" => self.dynamic_fg = Some(rgb),
+                "11" => self.dynamic_bg = Some(rgb),
+                "12" => self.dynamic_cursor_color = Some(rgb),
+                _ => {}
+            }
+        }
+    }
+
+    fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
+        // Parse rgb:RR/GG/BB or rgb:RRRR/GGGG/BBBB or #RRGGBB
+        if let Some(hex) = spec.strip_prefix('#') {
+            if hex.len() == 6 {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                return Some((r, g, b));
+            }
+        } else if let Some(rgb) = spec.strip_prefix("rgb:") {
+            let parts: Vec<&str> = rgb.split('/').collect();
+            if parts.len() == 3 {
+                let r = u16::from_str_radix(parts[0], 16).ok()?;
+                let g = u16::from_str_radix(parts[1], 16).ok()?;
+                let b = u16::from_str_radix(parts[2], 16).ok()?;
+                // Normalize to 8-bit
+                let scale = if parts[0].len() == 4 { 257 } else { 1 };
+                return Some(((r / scale) as u8, (g / scale) as u8, (b / scale) as u8));
+            }
+        }
+        None
+    }
+
+    fn handle_osc_133(&mut self, value: &str) {
+        let absolute_row = self.scrollback.len() + self.cursor_row;
+        let mark = value.chars().next().unwrap_or('\0');
+        match mark {
+            'A' => {
+                // Prompt start
+                self.current_zone_state = ZoneState::PromptStarted(absolute_row);
+            }
+            'B' => {
+                // Command start (user is typing the command)
+                if let ZoneState::PromptStarted(prompt_start) = self.current_zone_state {
+                    self.current_zone_state = ZoneState::CommandStarted(prompt_start, absolute_row);
+                }
+            }
+            'C' => {
+                // Command executed (output begins)
+                if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state {
+                    self.current_zone_state =
+                        ZoneState::OutputStarted(prompt_start, cmd_start, absolute_row);
+                }
+            }
+            'D' => {
+                // Command finished
+                let exit_code = value.get(2..).and_then(|s| s.parse::<i32>().ok());
+                match self.current_zone_state {
+                    ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
+                        let zone = CommandZone {
+                            prompt_start,
+                            command_start: Some(cmd_start),
+                            output_start: Some(out_start),
+                            output_end: Some(absolute_row),
+                            exit_code,
+                        };
+                        self.command_zones.push_back(zone);
+                        if self.command_zones.len() > 256 {
+                            self.command_zones.pop_front();
+                        }
+                    }
+                    ZoneState::CommandStarted(prompt_start, cmd_start) => {
+                        let zone = CommandZone {
+                            prompt_start,
+                            command_start: Some(cmd_start),
+                            output_start: None,
+                            output_end: Some(absolute_row),
+                            exit_code,
+                        };
+                        self.command_zones.push_back(zone);
+                        if self.command_zones.len() > 256 {
+                            self.command_zones.pop_front();
+                        }
+                    }
+                    _ => {}
+                }
+                self.current_zone_state = ZoneState::Idle;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_osc_52(&mut self, value: &str) {
+        // OSC 52 format: <selection>;<base64-data>
+        // selection: c=clipboard, p=primary, s=select (we treat all as clipboard)
+        // data: ? means query, base64 means set
+        if let Some((_sel, data)) = value.split_once(';') {
+            if data == "?" {
+                // Query: signal main loop to read clipboard and respond
+                self.pending_osc52_clipboard_query = true;
+            } else if !data.is_empty() {
+                // Set: decode base64 and store for main loop to apply
+                if let Some(decoded) = Self::decode_base64(data) {
+                    self.pending_osc52_clipboard_set = Some(decoded);
+                }
+            }
+        }
     }
 
     fn handle_osc_5522(&mut self, metadata: &str, payload: Option<&str>) {
@@ -746,6 +1180,50 @@ impl TerminalState {
         self.mark_row_dirty(self.cursor_row);
     }
 
+    fn put_ascii_run(&mut self, bytes: &[u8]) {
+        let cols = self.grid.row_len();
+        let autowrap = self.modes.contains(&7);
+        let mut pos = 0;
+
+        while pos < bytes.len() {
+            let remaining = cols - self.cursor_col;
+            let chunk_len = (bytes.len() - pos).min(remaining);
+
+            // Write chunk to grid directly
+            for j in 0..chunk_len {
+                let cell = self.grid.get_mut(self.cursor_row, self.cursor_col + j);
+                cell.character = bytes[pos + j] as char;
+                cell.foreground = self.current_fg;
+                cell.background = self.current_bg;
+                cell.flags = self.current_flags;
+                cell.wide = false;
+                cell.wide_continuation = false;
+            }
+
+            self.cursor_col += chunk_len;
+            pos += chunk_len;
+
+            self.dirty_region.mark_row(self.cursor_row);
+            self.mark_row_dirty(self.cursor_row);
+
+            // Handle wrap if there's more data
+            if pos < bytes.len() && self.cursor_col >= cols {
+                if autowrap {
+                    self.grid.row_wrapped[self.cursor_row] = true;
+                    self.cursor_col = 0;
+                    self.cursor_row += 1;
+                    if self.cursor_row >= self.grid.rows() {
+                        self.cursor_row = self.grid.rows() - 1;
+                        self.scroll_down();
+                    }
+                } else {
+                    self.cursor_col = cols - 1;
+                    break;
+                }
+            }
+        }
+    }
+
     fn create_blank_cell(&self) -> TerminalCell {
         TerminalCell {
             character: ' ',
@@ -783,10 +1261,7 @@ impl TerminalState {
         if self.scrollback.len() >= self.max_scrollback {
             self.scrollback.pop_front();
         }
-        self.scrollback.push_back(ScrollbackLine {
-            cells,
-            is_wrapped,
-        });
+        self.scrollback.push_back(ScrollbackLine::compress(cells, is_wrapped));
     }
 
     fn scroll_region_up(&mut self, top: usize, bottom: usize) {
@@ -918,6 +1393,39 @@ impl TerminalState {
     /// P4：获取网格版本号（用于缓存比较）
     pub fn get_grid_version(&self) -> u64 {
         self.grid_version
+    }
+
+    pub fn take_osc52_clipboard_set(&mut self) -> Option<String> {
+        self.pending_osc52_clipboard_set.take()
+    }
+
+    pub fn take_osc52_clipboard_query(&mut self) -> bool {
+        let q = self.pending_osc52_clipboard_query;
+        self.pending_osc52_clipboard_query = false;
+        q
+    }
+
+    pub fn respond_osc52_clipboard(&mut self, content: &str) {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+        self.output_buffer.extend_from_slice(b"\x1b]52;c;");
+        self.output_buffer.extend_from_slice(encoded.as_bytes());
+        self.output_buffer.extend_from_slice(Self::osc_terminator());
+    }
+
+    /// Check if sync output timed out (>1s) and auto-clear if so
+    pub fn check_sync_output_timeout(&mut self) {
+        if self.sync_output_active {
+            if let Some(start) = self.sync_output_start {
+                if start.elapsed() > std::time::Duration::from_secs(1) {
+                    self.sync_output_active = false;
+                    self.sync_output_start = None;
+                    self.modes.remove(&2026);
+                    self.dirty_region.mark_all(self.grid.rows());
+                    self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+                }
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1086,6 +1594,29 @@ impl TerminalState {
                                                 // OSC 8 ; ; (close hyperlink)
                                                 self.current_hyperlink = None;
                                             }
+                                        } else if command == "10" || command == "11" || command == "12" {
+                                            self.handle_osc_color(command, value);
+                                        } else if command == "9" {
+                                            // Desktop notification (iTerm2/ConEmu)
+                                            if self.pending_notifications.len() < 8 {
+                                                let title = "jterm2".to_string();
+                                                let body = value.chars().take(256).collect();
+                                                self.pending_notifications.push((title, body));
+                                            }
+                                        } else if command == "777" {
+                                            // rxvt notification: 777;notify;title;body
+                                            let parts: Vec<&str> = value.splitn(3, ';').collect();
+                                            if parts.len() >= 2 && parts[0] == "notify" {
+                                                let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
+                                                let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                                                if self.pending_notifications.len() < 8 {
+                                                    self.pending_notifications.push((title, body));
+                                                }
+                                            }
+                                        } else if command == "133" {
+                                            self.handle_osc_133(value);
+                                        } else if command == "52" {
+                                            self.handle_osc_52(value);
                                         } else if command == "5522" {
                                             let (metadata, osc_payload) =
                                                 if let Some((metadata, osc_payload)) =
@@ -1298,9 +1829,22 @@ impl TerminalState {
                     }
                 }
                 32..=126 => {
-                    // ASCII printable character
-                    self.put_char(byte as char);
-                    i += 1;
+                    // ASCII fast path: scan for run of printable ASCII and process in bulk
+                    if self.utf8_len == 0 && self.active_charset == Charset::Ascii {
+                        let run_start = i;
+                        i += 1;
+                        while i < data_slice.len() {
+                            let b = data_slice[i];
+                            if b < 32 || b > 126 {
+                                break;
+                            }
+                            i += 1;
+                        }
+                        self.put_ascii_run(&data_slice[run_start..i]);
+                    } else {
+                        self.put_char(byte as char);
+                        i += 1;
+                    }
                 }
                 // UTF-8 2-byte sequence (0xC2-0xDF)
                 0xC2..=0xDF => {
@@ -1850,7 +2394,24 @@ impl TerminalState {
                 1 => self.current_flags.bold = true,
                 2 => self.current_flags.dim = true,
                 3 => self.current_flags.italic = true,
-                4 => self.current_flags.underline = UnderlineStyle::Single,
+                4 => {
+                    // Check if next param is an underline sub-param (SGR 4:N)
+                    if i + 1 < params.len() && params[i + 1] <= 5 {
+                        let style = params[i + 1];
+                        self.current_flags.underline = match style {
+                            0 => UnderlineStyle::None,
+                            1 => UnderlineStyle::Single,
+                            2 => UnderlineStyle::Double,
+                            3 => UnderlineStyle::Curly,
+                            4 => UnderlineStyle::Dotted,
+                            5 => UnderlineStyle::Dashed,
+                            _ => UnderlineStyle::Single,
+                        };
+                        i += 1;
+                    } else {
+                        self.current_flags.underline = UnderlineStyle::Single;
+                    }
+                }
                 5 => self.current_flags.blink = true,
                 7 => self.current_flags.inverse = true,
                 9 => self.current_flags.strikethrough = true,
@@ -2058,6 +2619,12 @@ impl TerminalState {
                     self.modes.insert(1049);
                 }
             }
+            2026 => {
+                // Synchronized output: suppress rendering until cleared
+                self.modes.insert(2026);
+                self.sync_output_active = true;
+                self.sync_output_start = Some(std::time::Instant::now());
+            }
             7 => {
                 // Autowrap mode
                 self.modes.insert(7);
@@ -2128,6 +2695,14 @@ impl TerminalState {
                     self.dirty_region.mark_all(self.grid.rows());
                 }
             }
+            2026 => {
+                // End synchronized output: force full render
+                self.modes.remove(&2026);
+                self.sync_output_active = false;
+                self.sync_output_start = None;
+                self.dirty_region.mark_all(self.grid.rows());
+                self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+            }
             7 => {
                 // Disable autowrap
                 self.modes.remove(&7);
@@ -2187,6 +2762,28 @@ impl TerminalState {
             let button_byte = 32 + button ;
             let col_byte = 32 + (col as u8).min(223) ;
             let row_byte = 32 + (row as u8).min(223) ;
+            Some(format!(
+                "\x1b[M{}{}{}",
+                button_byte as char, col_byte as char, row_byte as char
+            ))
+        }
+    }
+
+    pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
+        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003) {
+            return None;
+        }
+
+        if self.modes.contains(&1006) {
+            // SGR format: lowercase 'm' for release
+            let x = (col as u32 + 1).min(255);
+            let y = (row as u32 + 1).min(255);
+            Some(format!("\x1b[<{};{};{}m", button, x, y))
+        } else {
+            // Standard xterm: release is button 3
+            let button_byte = 32 + 3u8;
+            let col_byte = 32 + (col as u8).min(223);
+            let row_byte = 32 + (row as u8).min(223);
             Some(format!(
                 "\x1b[M{}{}{}",
                 button_byte as char, col_byte as char, row_byte as char
@@ -2316,7 +2913,7 @@ impl TerminalState {
             let reflowed = Self::reflow_lines(&to_reflow, cols, &blank_cell);
             let skip = reflowed.len().saturating_sub(self.scroll_offset + rows);
             let visible_start = skip + (reflowed.len() - skip).saturating_sub(self.scroll_offset);
-            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..].iter().map(|l| l.cells.clone()).collect();
+            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..].iter().map(|l| l.decompress()).collect();
 
             if result.len() > rows {
                 result.truncate(rows);
@@ -2374,12 +2971,20 @@ impl TerminalState {
 
     #[allow(dead_code)]
     pub fn select_text(&mut self, anchor: (usize, usize), active: (usize, usize)) {
-        self.selection = Some(Selection { anchor, active });
+        self.selection = Some(Selection { anchor, active, mode: SelectionMode::Normal });
     }
 
     /// Start a new selection at a viewport-relative position.
     /// Converts to absolute buffer coordinates internally.
     pub fn start_selection(&mut self, viewport_pos: (usize, usize)) {
+        self.start_selection_with_mode(viewport_pos, SelectionMode::Normal);
+    }
+
+    pub fn start_block_selection(&mut self, viewport_pos: (usize, usize)) {
+        self.start_selection_with_mode(viewport_pos, SelectionMode::Block);
+    }
+
+    fn start_selection_with_mode(&mut self, viewport_pos: (usize, usize), mode: SelectionMode) {
         let abs = (
             self.viewport_row_to_absolute(viewport_pos.0),
             viewport_pos.1,
@@ -2387,6 +2992,7 @@ impl TerminalState {
         self.selection = Some(Selection {
             anchor: abs,
             active: abs,
+            mode,
         });
     }
 
@@ -2423,6 +3029,7 @@ impl TerminalState {
             self.selection = Some(Selection {
                 anchor: (abs_row, left),
                 active: (abs_row, right),
+                mode: SelectionMode::Normal,
             });
             return;
         }
@@ -2481,6 +3088,7 @@ impl TerminalState {
         self.selection = Some(Selection {
             anchor: (abs_row, left),
             active: (abs_row, right),
+            mode: SelectionMode::Normal,
         });
     }
 
@@ -2595,7 +3203,7 @@ impl TerminalState {
 
                 if abs_row < scrollback_len {
                     // Read from scrollback
-                    let line = &self.scrollback[abs_row].cells;
+                    let line = self.scrollback[abs_row].decompress();
                     for col in start_col..=end_col.min(line.len().saturating_sub(1)) {
                         if !line[col].wide_continuation {
                             result.push(line[col].character);
@@ -2662,20 +3270,19 @@ impl TerminalState {
 
         while i < len {
             let mut logical_line: Vec<TerminalCell> = Vec::new();
-            logical_line.extend_from_slice(Self::strip_trailing_blanks(&lines[i].cells));
+            let decompressed = lines[i].decompress();
+            logical_line.extend_from_slice(Self::strip_trailing_blanks(&decompressed));
             while i < len && lines[i].is_wrapped {
                 i += 1;
                 if i < len {
-                    logical_line.extend_from_slice(Self::strip_trailing_blanks(&lines[i].cells));
+                    let dc = lines[i].decompress();
+                    logical_line.extend_from_slice(Self::strip_trailing_blanks(&dc));
                 }
             }
             i += 1;
 
             if logical_line.is_empty() {
-                result.push(ScrollbackLine {
-                    cells: vec![blank_cell.clone(); new_cols],
-                    is_wrapped: false,
-                });
+                result.push(ScrollbackLine::compress(vec![blank_cell.clone(); new_cols], false));
                 continue;
             }
 
@@ -2686,10 +3293,7 @@ impl TerminalState {
                 if cells.len() < new_cols {
                     cells.resize(new_cols, blank_cell.clone());
                 }
-                result.push(ScrollbackLine {
-                    cells,
-                    is_wrapped: ci + 1 < num_chunks,
-                });
+                result.push(ScrollbackLine::compress(cells, ci + 1 < num_chunks));
             }
         }
 
@@ -2764,9 +3368,18 @@ impl TerminalState {
             return None;
         }
 
-        let col_start = if abs_row == start.0 { start.1 } else { 0 };
-        let col_end = if abs_row == end.0 { end.1 } else { usize::MAX };
-        Some((col_start, col_end))
+        match sel.mode {
+            SelectionMode::Block => {
+                let col_min = sel.anchor.1.min(sel.active.1);
+                let col_max = sel.anchor.1.max(sel.active.1);
+                Some((col_min, col_max))
+            }
+            SelectionMode::Normal => {
+                let col_start = if abs_row == start.0 { start.1 } else { 0 };
+                let col_end = if abs_row == end.0 { end.1 } else { usize::MAX };
+                Some((col_start, col_end))
+            }
+        }
     }
 
     // IME support methods
@@ -2806,7 +3419,7 @@ mod tests {
         terminal.process_input(b"\n");
 
         assert_eq!(terminal.scrollback.len(), 1);
-        assert_eq!(terminal.scrollback[0].cells[0].character, 'A');
+        assert_eq!(terminal.scrollback[0].decompress()[0].character, 'A');
         assert_eq!(terminal.grid[0][0].character, 'B');
         assert_eq!(terminal.grid[1][0].character, ' ');
     }

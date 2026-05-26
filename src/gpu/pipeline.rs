@@ -19,6 +19,8 @@ impl GridPipeline {
         target_format: wgpu::TextureFormat,
         atlas_view: &wgpu::TextureView,
         atlas_sampler: &wgpu::Sampler,
+        color_atlas_view: &wgpu::TextureView,
+        color_atlas_sampler: &wgpu::Sampler,
     ) -> Self {
         let shader_src = include_str!("shader.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -54,6 +56,24 @@ impl GridPipeline {
                 // Atlas sampler
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Color atlas texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Color atlas sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -132,6 +152,8 @@ impl GridPipeline {
             &background_uniform_buffer,
             atlas_view,
             atlas_sampler,
+            color_atlas_view,
+            color_atlas_sampler,
         );
 
         let foreground_bind_group = Self::create_bind_group(
@@ -140,6 +162,8 @@ impl GridPipeline {
             &foreground_uniform_buffer,
             atlas_view,
             atlas_sampler,
+            color_atlas_view,
+            color_atlas_sampler,
         );
 
         GridPipeline {
@@ -160,6 +184,8 @@ impl GridPipeline {
         uniform_buffer: &wgpu::Buffer,
         atlas_view: &wgpu::TextureView,
         atlas_sampler: &wgpu::Sampler,
+        color_atlas_view: &wgpu::TextureView,
+        color_atlas_sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("grid_bind_group"),
@@ -177,6 +203,14 @@ impl GridPipeline {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(atlas_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(color_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(color_atlas_sampler),
+                },
             ],
         })
     }
@@ -187,6 +221,8 @@ impl GridPipeline {
         device: &wgpu::Device,
         atlas_view: &wgpu::TextureView,
         atlas_sampler: &wgpu::Sampler,
+        color_atlas_view: &wgpu::TextureView,
+        color_atlas_sampler: &wgpu::Sampler,
     ) {
         self.background_bind_group = Self::create_bind_group(
             device,
@@ -194,6 +230,8 @@ impl GridPipeline {
             &self.background_uniform_buffer,
             atlas_view,
             atlas_sampler,
+            color_atlas_view,
+            color_atlas_sampler,
         );
         self.foreground_bind_group = Self::create_bind_group(
             device,
@@ -201,6 +239,8 @@ impl GridPipeline {
             &self.foreground_uniform_buffer,
             atlas_view,
             atlas_sampler,
+            color_atlas_view,
+            color_atlas_sampler,
         );
     }
 

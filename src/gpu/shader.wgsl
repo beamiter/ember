@@ -6,12 +6,14 @@ struct Uniforms {
     atlas_width: f32,
     atlas_height: f32,
     render_phase: f32,
-    _pad: f32,
+    scroll_pixel_offset: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas_texture: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+@group(0) @binding(3) var color_atlas_texture: texture_2d<f32>;
+@group(0) @binding(4) var color_atlas_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -66,9 +68,9 @@ fn vs_main(
         mix(quad_min.y, quad_max.y, qy),
     );
 
-    // Cell position in physical pixels relative to viewport origin
+    // Cell position in physical pixels relative to viewport origin (with smooth scroll offset)
     let px = f32(col_row.x) * u.cell_width + px_in_cell.x;
-    let py = f32(col_row.y) * u.cell_height + px_in_cell.y;
+    let py = f32(col_row.y) * u.cell_height + px_in_cell.y - u.scroll_pixel_offset;
 
     // Convert to NDC (viewport is set to content_rect by egui-wgpu)
     let ndc_x = (px / u.viewport_width) * 2.0 - 1.0;
@@ -106,8 +108,9 @@ fn gamma_from_linear_rgb(linear: vec3<f32>) -> vec3<f32> {
 // Compute final fragment color (shared by both entry points)
 fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
     let has_glyph = (in.flags & 1u) != 0u;
-    let has_underline = (in.flags & 4u) != 0u;
-    let has_strikethrough = (in.flags & 8u) != 0u;
+    let underline_style = (in.flags >> 2u) & 7u; // bits 2-4: 0=none,1=single,2=double,3=curly,4=dotted,5=dashed
+    let has_strikethrough = (in.flags & 32u) != 0u;
+    let is_color_glyph = (in.flags & 64u) != 0u;
     let background_pass = u.render_phase < 0.5;
 
     let is_wide = (in.flags & 2u) != 0u;
@@ -123,7 +126,7 @@ fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
         return color;
     }
 
-    // Composite glyph foreground using atlas alpha with simple gamma-space blending
+    // Composite glyph foreground
     if has_glyph {
         let glyph_size = (in.glyph_uv1 - in.glyph_uv0) * vec2<f32>(u.atlas_width, u.atlas_height);
 
@@ -131,24 +134,62 @@ fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
         let t = clamp(rel / max(glyph_size, vec2<f32>(1.0, 1.0)), vec2<f32>(0.0), vec2<f32>(1.0));
         let uv = in.glyph_uv0 + t * (in.glyph_uv1 - in.glyph_uv0);
 
-        let alpha = textureSample(atlas_texture, atlas_sampler, uv).a;
-
         let in_bounds = step(0.0, rel.x) * step(0.0, rel.y)
                       * step(rel.x, glyph_size.x) * step(rel.y, glyph_size.y);
 
-        let a = alpha * in_bounds;
-        if a > 0.001 {
-            color = vec4<f32>(mix(in.bg_color.rgb, in.fg_color.rgb, a), 1.0);
+        if is_color_glyph {
+            let texel = textureSample(color_atlas_texture, color_atlas_sampler, uv);
+            let a = texel.a * in_bounds;
+            if a > 0.001 {
+                color = vec4<f32>(texel.rgb, a);
+            }
+        } else {
+            let texel = textureSample(atlas_texture, atlas_sampler, uv);
+            let coverage = texel.rgb;
+            let cov = coverage * in_bounds;
+            let a = max(cov.r, max(cov.g, cov.b));
+            if a > 0.001 {
+                let blended = vec3<f32>(
+                    mix(in.bg_color.r, in.fg_color.r, cov.r),
+                    mix(in.bg_color.g, in.fg_color.g, cov.g),
+                    mix(in.bg_color.b, in.fg_color.b, cov.b),
+                );
+                color = vec4<f32>(blended, 1.0);
+            }
         }
     }
 
-    // Underline: 1-2px line at bottom of cell
+    // Underline styles
     let within_cell = in.cell_local_pos.x >= 0.0 && in.cell_local_pos.x <= 1.0
         && in.cell_local_pos.y >= 0.0 && in.cell_local_pos.y <= 1.0;
 
-    if has_underline && within_cell {
-        let bottom_band = 1.0 - in.cell_local_pos.y;
-        if bottom_band < 0.08 {
+    if underline_style > 0u && within_cell {
+        let y_pos = in.cell_local_pos.y;
+        let x_pos = in.cell_local_pos.x;
+        var draw_underline = false;
+
+        if underline_style == 1u {
+            // Single: 1px line near bottom
+            draw_underline = (1.0 - y_pos) < 0.08;
+        } else if underline_style == 2u {
+            // Double: two lines
+            let band = 1.0 - y_pos;
+            draw_underline = (band > 0.02 && band < 0.06) || (band > 0.09 && band < 0.13);
+        } else if underline_style == 3u {
+            // Curly: sine wave at bottom
+            let wave_y = 0.92 + sin(x_pos * 6.283185) * 0.03;
+            draw_underline = abs(y_pos - wave_y) < 0.025;
+        } else if underline_style == 4u {
+            // Dotted: evenly spaced dots
+            let dot_phase = fract(x_pos * 4.0);
+            draw_underline = (1.0 - y_pos) < 0.08 && dot_phase < 0.5;
+        } else if underline_style == 5u {
+            // Dashed: longer segments
+            let dash_phase = fract(x_pos * 2.0);
+            draw_underline = (1.0 - y_pos) < 0.08 && dash_phase < 0.6;
+        }
+
+        if draw_underline {
             color = vec4<f32>(in.fg_color.rgb, 1.0);
         }
     }

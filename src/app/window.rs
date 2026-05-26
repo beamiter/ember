@@ -41,4 +41,82 @@ impl TerminalApp {
             }
         }
     }
+
+    pub fn check_config_hot_reload(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.config_last_check) < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.config_last_check = now;
+
+        // Don't reload if we just saved (avoid feedback loop)
+        if self.config_save_pending {
+            return;
+        }
+
+        let current_mtime = config::Config::config_mtime();
+        if current_mtime == self.config_last_mtime {
+            return;
+        }
+        self.config_last_mtime = current_mtime;
+
+        if let Ok(config_path) = config::Config::config_path() {
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                match toml::from_str::<config::Config>(&content) {
+                    Ok(new_config) => {
+                        self.apply_hot_reload(&new_config);
+                        eprintln!("[Config] Hot-reloaded from {}", config_path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("[Config] Hot-reload parse error: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_hot_reload(&mut self, new: &config::Config) {
+        let old = &self.config;
+
+        let font_size_changed = (new.font_size - old.font_size).abs() > 0.01;
+        let theme_changed = new.theme != old.theme;
+        let opacity_changed = (new.opacity - old.opacity).abs() > 0.001;
+        let padding_changed = (new.padding - old.padding).abs() > 0.01;
+        let line_spacing_changed = (new.line_spacing - old.line_spacing).abs() > 0.01;
+        let scrollback_changed = new.scrollback_lines != old.scrollback_lines;
+        let scroll_speed_changed = new.scroll_speed != old.scroll_speed;
+
+        if font_size_changed {
+            self.config.font_size = new.font_size;
+            self.renderer.invalidate_font_cache();
+            for pr in &mut self.pane_renderers {
+                pr.invalidate_font_cache();
+            }
+        }
+        if theme_changed {
+            self.config.theme = new.theme.clone();
+            if let Some(theme) = crate::theme::Theme::get_theme(&new.theme) {
+                self.current_theme = theme;
+            }
+        }
+        if opacity_changed {
+            self.config.opacity = new.opacity;
+        }
+        if padding_changed {
+            self.config.padding = new.padding;
+        }
+        if line_spacing_changed {
+            self.config.line_spacing = new.line_spacing;
+            self.renderer.invalidate_font_cache();
+            for pr in &mut self.pane_renderers {
+                pr.invalidate_font_cache();
+            }
+        }
+        if scrollback_changed {
+            self.config.scrollback_lines = new.scrollback_lines;
+        }
+        if scroll_speed_changed {
+            self.config.scroll_speed = new.scroll_speed;
+        }
+    }
 }

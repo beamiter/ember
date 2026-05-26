@@ -121,6 +121,9 @@ pub struct Config {
     #[serde(default)]
     pub ui_scale: Option<f32>,
 
+    #[serde(default = "default_subpixel_rendering")]
+    pub subpixel_rendering: bool,
+
     /// Explicit shell path (overrides auto-detection). Useful when PATH is stripped by launchers like wofi.
     #[serde(default)]
     pub shell: Option<String>,
@@ -235,6 +238,10 @@ fn default_scroll_speed() -> u32 {
     3
 }
 
+fn default_subpixel_rendering() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -258,6 +265,7 @@ impl Default for Config {
             gpu_rendering: default_gpu_rendering(),
             app_renderer: AppRendererType::default(),
             scroll_speed: default_scroll_speed(),
+            subpixel_rendering: default_subpixel_rendering(),
             ui_scale: None,
             shell: None,
         }
@@ -307,9 +315,16 @@ impl Config {
         Ok(config_dir.join("jterm2").join("session_history.json"))
     }
 
-    fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
         Ok(config_dir.join("jterm2").join("config.toml"))
+    }
+
+    pub fn config_mtime() -> Option<std::time::SystemTime> {
+        Self::config_path()
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
     }
 
     pub fn get_font_family(&self) -> &str {
