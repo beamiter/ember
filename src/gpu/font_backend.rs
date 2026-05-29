@@ -36,6 +36,7 @@ pub struct AtlasGlyphKey {
 }
 
 /// A shaped glyph from rustybuzz, ready for rendering.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ShapedGlyph {
     pub cluster: u32,
@@ -57,8 +58,7 @@ pub trait FontBackend: Send + Sync {
     fn atlas_dimensions(&self) -> (u32, u32);
     fn take_needs_rebind(&mut self) -> bool;
 
-    /// Shape a text run using font shaping (ligatures, kerning).
-    /// Returns shaped glyphs with atlas regions. Default impl falls back to per-char rasterization.
+    #[allow(dead_code)]
     fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Vec<ShapedGlyph> {
         let mut glyphs = Vec::new();
         for ch in text.chars() {
@@ -74,7 +74,7 @@ pub trait FontBackend: Send + Sync {
         glyphs
     }
 
-    /// Check if this backend supports shaping (ligatures).
+    #[allow(dead_code)]
     fn supports_shaping(&self) -> bool {
         false
     }

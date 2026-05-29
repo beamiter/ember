@@ -677,6 +677,7 @@ pub struct ClipboardReadRequest {
     pub kind: ClipboardReadKind,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct CommandZone {
     pub prompt_start: usize,

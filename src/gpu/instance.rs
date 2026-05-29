@@ -37,8 +37,9 @@ pub struct CellInstance {
 impl CellInstance {
     pub const FLAG_HAS_GLYPH: u32 = 1;
     pub const FLAG_WIDE: u32 = 2;
-    // Underline style encoded in bits 2-4 (shifted by 2): style << 2
+    #[allow(dead_code)]
     pub const UNDERLINE_SHIFT: u32 = 2;
+    #[allow(dead_code)]
     pub const UNDERLINE_MASK: u32 = 0b111 << 2; // bits 2-4
     pub const UNDERLINE_SINGLE: u32 = 1 << 2;
     pub const UNDERLINE_DOUBLE: u32 = 2 << 2;
@@ -46,6 +47,7 @@ impl CellInstance {
     pub const UNDERLINE_DOTTED: u32 = 4 << 2;
     pub const UNDERLINE_DASHED: u32 = 5 << 2;
     pub const FLAG_STRIKETHROUGH: u32 = 32; // bit 5
+    #[allow(dead_code)]
     pub const FLAG_COLOR_GLYPH: u32 = 64; // bit 6
 
     pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {

@@ -14,7 +14,6 @@ use crate::session_manager::SessionManager;
 use crate::ui::TerminalRenderer;
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Main application state
 pub struct TerminalApp {
@@ -91,9 +90,6 @@ pub struct TerminalApp {
 
     // 每帧字节限制溢出的缓冲区，下一帧继续处理
     pub pending_output: Vec<u8>,
-
-    // 滚轮像素累积器，累积到一行高度才滚动
-    pub scroll_accumulator: f32,
 
     // 鼠标报告模式下的滚轮累积器
     pub mouse_scroll_accumulator: f32,

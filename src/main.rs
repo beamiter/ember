@@ -812,7 +812,6 @@ impl TerminalApp {
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             _lock_file: lock_file,
             pending_output: Vec::new(),
-            scroll_accumulator: 0.0,
             mouse_scroll_accumulator: 0.0,
             font_size_accumulator: 0.0,
             had_ctrl_scroll_last_frame: false,
@@ -3202,6 +3201,26 @@ impl eframe::App for TerminalApp {
 
                     for button_num in button_pressed {
                         if let Some(report) = terminal.get_mouse_report(button_num, col, row) {
+                            reports.push(report);
+                        }
+                    }
+
+                    let button_released = ctx.input(|i| {
+                        let mut btns: SmallVec<[u8; 3]> = SmallVec::new();
+                        if i.pointer.button_released(egui::PointerButton::Primary) {
+                            btns.push(0);
+                        }
+                        if i.pointer.button_released(egui::PointerButton::Secondary) {
+                            btns.push(2);
+                        }
+                        if i.pointer.button_released(egui::PointerButton::Middle) {
+                            btns.push(1);
+                        }
+                        btns
+                    });
+
+                    for button_num in button_released {
+                        if let Some(report) = terminal.get_mouse_release_report(button_num, col, row) {
                             reports.push(report);
                         }
                     }

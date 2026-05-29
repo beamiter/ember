@@ -898,8 +898,13 @@ impl TerminalRenderer {
                     } else {
                         0
                     };
-                    terminal.start_selection((row, col));
-                    ui.ctx().request_repaint(); // Force repaint to show selection
+                    let alt_held = ui.input(|i| i.modifiers.alt);
+                    if alt_held {
+                        terminal.start_block_selection((row, col));
+                    } else {
+                        terminal.start_selection((row, col));
+                    }
+                    ui.ctx().request_repaint();
                 }
             }
         }

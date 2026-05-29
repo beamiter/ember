@@ -7,5 +7,3 @@ pub mod state;
 pub mod tabs;
 pub mod window;
 
-// Re-export the main app struct
-pub use state::TerminalApp;

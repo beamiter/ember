@@ -1,7 +1,6 @@
 // Rendering coordination module
 
 use super::state::TerminalApp;
-use std::time::Duration;
 
 impl TerminalApp {
     /// 自适应帧预算：根据帧时间动态调整处理量

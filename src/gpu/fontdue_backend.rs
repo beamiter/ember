@@ -25,7 +25,7 @@ fn is_cjk_or_wide(ch: char) -> bool {
     )
 }
 
-/// Key for glyph-ID based caching (used after shaping)
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct GidGlyphKey {
     gid: u16,
@@ -47,6 +47,7 @@ pub struct FontdueAtlas {
     shelf_height: u32,
     ascii_cache: HashMap<AtlasGlyphKey, GlyphRegion>,
     unicode_cache: LruCache<AtlasGlyphKey, GlyphRegion>,
+    #[allow(dead_code)]
     gid_cache: HashMap<GidGlyphKey, GlyphRegion>,
     dirty_rects: Vec<DirtyRect>,
     needs_full_upload: bool,
@@ -56,9 +57,11 @@ pub struct FontdueAtlas {
     pub sampler: wgpu::Sampler,
     cached_ascent: f32,
     cached_descent: f32,
-    // Font shaping support
+    #[allow(dead_code)]
     font_data_regular: Arc<Vec<u8>>,
+    #[allow(dead_code)]
     font_data_bold: Option<Arc<Vec<u8>>>,
+    #[allow(dead_code)]
     shaping_enabled: bool,
     // Subpixel rendering
     subpixel_rendering: bool,
@@ -385,6 +388,7 @@ impl FontdueAtlas {
         }
     }
 
+    #[allow(dead_code)]
     fn rasterize_gid(&mut self, gid: u16, bold: bool, subpixel_offset: u8) -> GlyphRegion {
         let key = GidGlyphKey { gid, bold, subpixel_offset };
         if let Some(&region) = self.gid_cache.get(&key) {
