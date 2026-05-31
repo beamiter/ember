@@ -57,6 +57,7 @@ pub struct FontdueAtlas {
     pub sampler: wgpu::Sampler,
     cached_ascent: f32,
     cached_descent: f32,
+    cached_advance_width: f32,
     #[allow(dead_code)]
     font_data_regular: Arc<Vec<u8>>,
     #[allow(dead_code)]
@@ -98,6 +99,7 @@ impl FontdueAtlas {
         upload_bitmap(queue, &texture, &bitmap, width, height);
 
         let (cached_ascent, cached_descent) = Self::compute_metrics(&font_regular, font_size_px);
+        let cached_advance_width = font_regular.metrics('0', font_size_px).advance_width;
 
         // Check if font supports shaping (has GSUB table for ligatures)
         let font_data_arc = Arc::new(font_data_regular.to_vec());
@@ -129,6 +131,7 @@ impl FontdueAtlas {
             sampler,
             cached_ascent,
             cached_descent,
+            cached_advance_width,
             font_data_regular: font_data_arc,
             font_data_bold: font_data_bold_arc,
             shaping_enabled,
@@ -584,6 +587,7 @@ impl FontBackend for FontdueAtlas {
         let (asc, desc) = Self::compute_metrics(&self.font_regular, self.font_size_px);
         self.cached_ascent = asc;
         self.cached_descent = desc;
+        self.cached_advance_width = self.font_regular.metrics('0', self.font_size_px).advance_width;
 
         self.prepopulate_ascii();
         self.ensure_uploaded(device, queue);
@@ -591,8 +595,7 @@ impl FontBackend for FontdueAtlas {
     }
 
     fn font_metrics(&self) -> (f32, f32, f32) {
-        let m = self.font_regular.metrics('0', self.font_size_px);
-        (self.cached_ascent, self.cached_descent, m.advance_width)
+        (self.cached_ascent, self.cached_descent, self.cached_advance_width)
     }
 
     fn ensure_uploaded(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {

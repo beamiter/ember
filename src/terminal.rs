@@ -1,5 +1,6 @@
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
+use smallvec::SmallVec;
 use std::collections::VecDeque;
 
 /// Character class for word selection boundaries.
@@ -124,23 +125,19 @@ impl TerminalGrid {
     }
 
     /// 设置整行
+    #[allow(dead_code)]
     pub fn set_row(&mut self, row: usize, cells: Vec<TerminalCell>) {
         let start = row * self.cols;
-        let _end = start + self.cols;
-        for (i, cell) in cells.into_iter().enumerate() {
-            if start + i < self.cells.len() {
-                self.cells[start + i] = cell;
-            }
-        }
+        let copy_len = cells.len().min(self.cols);
+        self.cells[start..start + copy_len].copy_from_slice(&cells[..copy_len]);
     }
 
     /// 获取所有行为Vec<Vec> (用于兼容旧代码)
     pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
-        let mut result = Vec::with_capacity(self.rows);
-        for row in 0..self.rows {
-            result.push(self.get_row(row));
-        }
-        result
+        self.cells
+            .chunks_exact(self.cols)
+            .map(|chunk| chunk.to_vec())
+            .collect()
     }
 
 
@@ -150,10 +147,7 @@ impl TerminalGrid {
             return;
         }
         let start = row * self.cols;
-        // Shift cells right from the end of the row down to col+1
-        for i in (start + col..start + self.cols - 1).rev() {
-            self.cells[i + 1] = self.cells[i].clone();
-        }
+        self.cells.copy_within(start + col..start + self.cols - 1, start + col + 1);
         self.cells[start + col] = cell;
     }
 
@@ -163,41 +157,35 @@ impl TerminalGrid {
             return;
         }
         let start = row * self.cols;
-        // Shift cells left
-        for i in start + col..start + self.cols - 1 {
-            self.cells[i] = self.cells[i + 1].clone();
-        }
+        self.cells.copy_within(start + col + 1..start + self.cols, start + col);
         // Fill last cell with default
         self.cells[start + self.cols - 1] = TerminalCell::default();
     }
 
     /// 删除第一行，向上移动所有行，末尾补新行
+    #[allow(dead_code)]
     pub fn remove_first_row(&mut self) -> (Vec<TerminalCell>, bool) {
         let removed = self.get_row(0);
         let was_wrapped = self.row_wrapped[0];
-        // Shift all cells up by one row
-        for i in 0..self.cells.len() - self.cols {
-            self.cells[i] = self.cells[i + self.cols].clone();
-        }
-        // Clear last row
-        let last_start = (self.rows - 1) * self.cols;
-        for i in last_start..self.cells.len() {
-            self.cells[i] = TerminalCell::default();
-        }
-        // Shift row_wrapped
-        for i in 0..self.rows - 1 {
-            self.row_wrapped[i] = self.row_wrapped[i + 1];
-        }
-        self.row_wrapped[self.rows - 1] = false;
+        self.shift_rows_up();
         (removed, was_wrapped)
+    }
+
+    /// Shift all rows up by one (discard first row, blank last row).
+    /// Does not return the removed row - use get_row(0) before calling if needed.
+    #[inline]
+    pub fn shift_rows_up(&mut self) {
+        self.cells.copy_within(self.cols.., 0);
+        let last_start = (self.rows - 1) * self.cols;
+        self.cells[last_start..].fill(TerminalCell::default());
+        self.row_wrapped.copy_within(1.., 0);
+        self.row_wrapped[self.rows - 1] = false;
     }
 
     /// 用blank_cell填充末尾一行
     pub fn fill_last_row(&mut self, cell: TerminalCell) {
         let last_start = (self.rows - 1) * self.cols;
-        for i in last_start..self.cells.len() {
-            self.cells[i] = cell.clone();
-        }
+        self.cells[last_start..].fill(cell);
     }
 
     /// 是否为空
@@ -212,15 +200,14 @@ impl TerminalGrid {
         let copy_rows = self.rows.min(new_rows);
         let copy_cols = self.cols.min(new_cols);
         for row in 0..copy_rows {
-            for col in 0..copy_cols {
-                new_cells[row * new_cols + col] = self.cells[row * self.cols + col].clone();
-            }
+            let src_start = row * self.cols;
+            let dst_start = row * new_cols;
+            new_cells[dst_start..dst_start + copy_cols]
+                .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
         }
         self.cells = new_cells;
         let mut new_wrapped = vec![false; new_rows];
-        for row in 0..copy_rows {
-            new_wrapped[row] = self.row_wrapped[row];
-        }
+        new_wrapped[..copy_rows].copy_from_slice(&self.row_wrapped[..copy_rows]);
         self.row_wrapped = new_wrapped;
         self.rows = new_rows;
         self.cols = new_cols;
@@ -300,16 +287,101 @@ pub enum UnderlineStyle {
     Dashed,  // SGR 4:5
 }
 
+/// Packed style flags in a u16 bitfield (includes wide character bits).
+/// Layout:
+///   bit 0: bold
+///   bit 1: italic
+///   bit 2-4: underline style (3 bits, 0-5)
+///   bit 5: inverse
+///   bit 6: dim
+///   bit 7: blink
+///   bit 8: strikethrough
+///   bit 9: wide
+///   bit 10: wide_continuation
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct StyleFlags(u16);
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StyleFlags {
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: UnderlineStyle,
-    pub inverse: bool,
-    pub dim: bool,
-    pub blink: bool,
-    pub strikethrough: bool,
+impl std::fmt::Debug for StyleFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StyleFlags")
+            .field("bold", &self.bold())
+            .field("italic", &self.italic())
+            .field("underline", &self.underline())
+            .field("inverse", &self.inverse())
+            .field("dim", &self.dim())
+            .field("blink", &self.blink())
+            .field("strikethrough", &self.strikethrough())
+            .finish()
+    }
+}
+
+const BOLD_BIT: u16 = 1 << 0;
+const ITALIC_BIT: u16 = 1 << 1;
+const UNDERLINE_SHIFT: u32 = 2;
+const UNDERLINE_MASK: u16 = 0b111 << 2;
+const INVERSE_BIT: u16 = 1 << 5;
+const DIM_BIT: u16 = 1 << 6;
+const BLINK_BIT: u16 = 1 << 7;
+const STRIKETHROUGH_BIT: u16 = 1 << 8;
+const WIDE_BIT: u16 = 1 << 9;
+const WIDE_CONT_BIT: u16 = 1 << 10;
+
+impl StyleFlags {
+    #[inline(always)]
+    pub fn new() -> Self { Self(0) }
+
+    #[inline(always)]
+    pub fn bold(&self) -> bool { self.0 & BOLD_BIT != 0 }
+    #[inline(always)]
+    pub fn italic(&self) -> bool { self.0 & ITALIC_BIT != 0 }
+    #[inline(always)]
+    pub fn underline(&self) -> UnderlineStyle {
+        match (self.0 & UNDERLINE_MASK) >> UNDERLINE_SHIFT {
+            1 => UnderlineStyle::Single,
+            2 => UnderlineStyle::Double,
+            3 => UnderlineStyle::Curly,
+            4 => UnderlineStyle::Dotted,
+            5 => UnderlineStyle::Dashed,
+            _ => UnderlineStyle::None,
+        }
+    }
+    #[inline(always)]
+    pub fn inverse(&self) -> bool { self.0 & INVERSE_BIT != 0 }
+    #[inline(always)]
+    pub fn dim(&self) -> bool { self.0 & DIM_BIT != 0 }
+    #[inline(always)]
+    pub fn blink(&self) -> bool { self.0 & BLINK_BIT != 0 }
+    #[inline(always)]
+    pub fn strikethrough(&self) -> bool { self.0 & STRIKETHROUGH_BIT != 0 }
+    #[inline(always)]
+    pub fn wide(&self) -> bool { self.0 & WIDE_BIT != 0 }
+    #[inline(always)]
+    pub fn wide_continuation(&self) -> bool { self.0 & WIDE_CONT_BIT != 0 }
+
+    #[inline(always)]
+    pub fn set_bold(&mut self, v: bool) { if v { self.0 |= BOLD_BIT; } else { self.0 &= !BOLD_BIT; } }
+    #[inline(always)]
+    pub fn set_italic(&mut self, v: bool) { if v { self.0 |= ITALIC_BIT; } else { self.0 &= !ITALIC_BIT; } }
+    #[inline(always)]
+    pub fn set_underline(&mut self, v: UnderlineStyle) {
+        self.0 = (self.0 & !UNDERLINE_MASK) | ((v as u16) << UNDERLINE_SHIFT);
+    }
+    #[inline(always)]
+    pub fn set_inverse(&mut self, v: bool) { if v { self.0 |= INVERSE_BIT; } else { self.0 &= !INVERSE_BIT; } }
+    #[inline(always)]
+    pub fn set_dim(&mut self, v: bool) { if v { self.0 |= DIM_BIT; } else { self.0 &= !DIM_BIT; } }
+    #[inline(always)]
+    pub fn set_blink(&mut self, v: bool) { if v { self.0 |= BLINK_BIT; } else { self.0 &= !BLINK_BIT; } }
+    #[inline(always)]
+    pub fn set_strikethrough(&mut self, v: bool) { if v { self.0 |= STRIKETHROUGH_BIT; } else { self.0 &= !STRIKETHROUGH_BIT; } }
+    #[inline(always)]
+    pub fn set_wide(&mut self, v: bool) { if v { self.0 |= WIDE_BIT; } else { self.0 &= !WIDE_BIT; } }
+    #[inline(always)]
+    pub fn set_wide_continuation(&mut self, v: bool) { if v { self.0 |= WIDE_CONT_BIT; } else { self.0 &= !WIDE_CONT_BIT; } }
+
+    #[inline(always)]
+    pub fn is_default_style(&self) -> bool { self.0 & 0x1FF == 0 }
 }
 
 #[derive(Clone, Debug)]
@@ -330,18 +402,15 @@ impl ScrollbackLine {
         let cols = cells.len() as u16;
         let trailing_blanks = cells.iter().rev()
             .take_while(|c| c.character == ' ' && c.foreground == Color::Default
-                && c.background == Color::Default && !c.flags.bold && !c.flags.italic
-                && matches!(c.flags.underline, UnderlineStyle::None) && !c.flags.inverse
-                && !c.flags.dim && !c.flags.strikethrough && !c.wide && !c.wide_continuation)
+                && c.background == Color::Default && c.flags.is_default_style()
+                && !c.flags.wide() && !c.flags.wide_continuation())
             .count();
 
         let active_len = cells.len() - trailing_blanks;
         let all_default_attrs = cells[..active_len].iter().all(|c|
             c.foreground == Color::Default && c.background == Color::Default
-            && !c.flags.bold && !c.flags.italic
-            && matches!(c.flags.underline, UnderlineStyle::None)
-            && !c.flags.inverse && !c.flags.dim && !c.flags.strikethrough
-            && !c.wide && !c.wide_continuation
+            && c.flags.is_default_style()
+            && !c.flags.wide() && !c.flags.wide_continuation()
         );
 
         if all_default_attrs {
@@ -443,11 +512,11 @@ impl ScrollbackLine {
         }
     }
 
-    fn encode_flags(flags: &StyleFlags, wide: bool, wide_cont: bool) -> u8 {
+    fn encode_flags(flags: &StyleFlags) -> u8 {
         let mut f = 0u8;
-        if flags.bold { f |= 1; }
-        if flags.italic { f |= 2; }
-        match flags.underline {
+        if flags.bold() { f |= 1; }
+        if flags.italic() { f |= 2; }
+        match flags.underline() {
             UnderlineStyle::None => {}
             UnderlineStyle::Single => f |= 4,
             UnderlineStyle::Double => f |= 8,
@@ -455,15 +524,13 @@ impl ScrollbackLine {
             UnderlineStyle::Dotted => f |= 16,
             UnderlineStyle::Dashed => f |= 20,
         }
-        if flags.inverse { f |= 32; }
-        if flags.dim { f |= 64; }
-        if flags.strikethrough { f |= 128; }
-        if wide { f |= 0; } // encoded separately below
-        let _ = wide_cont;
+        if flags.inverse() { f |= 32; }
+        if flags.dim() { f |= 64; }
+        if flags.strikethrough() { f |= 128; }
         f
     }
 
-    fn decode_flags(f: u8) -> (StyleFlags, bool, bool) {
+    fn decode_flags(f: u8) -> StyleFlags {
         let underline = match (f >> 2) & 0x7 {
             0 => UnderlineStyle::None,
             1 => UnderlineStyle::Single,
@@ -473,16 +540,14 @@ impl ScrollbackLine {
             5 => UnderlineStyle::Dashed,
             _ => UnderlineStyle::None,
         };
-        let flags = StyleFlags {
-            bold: f & 1 != 0,
-            italic: f & 2 != 0,
-            underline,
-            inverse: f & 32 != 0,
-            dim: f & 64 != 0,
-            blink: false,
-            strikethrough: f & 128 != 0,
-        };
-        (flags, false, false)
+        let mut flags = StyleFlags::new();
+        flags.set_bold(f & 1 != 0);
+        flags.set_italic(f & 2 != 0);
+        flags.set_underline(underline);
+        flags.set_inverse(f & 32 != 0);
+        flags.set_dim(f & 64 != 0);
+        flags.set_strikethrough(f & 128 != 0);
+        flags
     }
 
     fn encode_cells(cells: &[TerminalCell]) -> Vec<u8> {
@@ -493,18 +558,12 @@ impl ScrollbackLine {
             let ch_str = cell.character.to_string();
             let ch_bytes = ch_str.as_bytes();
 
-            // RLE: count consecutive identical cells
+            // RLE: count consecutive identical cells (packed flags comparison is a single u16 ==)
             let mut run = 1u8;
             while (run as u16) < 255 && (i + run as usize) < cells.len() {
                 let next = &cells[i + run as usize];
                 if next.character == cell.character && next.foreground == cell.foreground
-                    && next.background == cell.background && next.flags.bold == cell.flags.bold
-                    && next.flags.italic == cell.flags.italic
-                    && next.flags.underline == cell.flags.underline
-                    && next.flags.inverse == cell.flags.inverse
-                    && next.flags.dim == cell.flags.dim
-                    && next.flags.strikethrough == cell.flags.strikethrough
-                    && next.wide == cell.wide && next.wide_continuation == cell.wide_continuation
+                    && next.background == cell.background && next.flags == cell.flags
                 {
                     run += 1;
                 } else {
@@ -517,9 +576,9 @@ impl ScrollbackLine {
             buf.extend_from_slice(ch_bytes);
             Self::encode_color(&cell.foreground, &mut buf);
             Self::encode_color(&cell.background, &mut buf);
-            let f = Self::encode_flags(&cell.flags, cell.wide, cell.wide_continuation);
+            let f = Self::encode_flags(&cell.flags);
             buf.push(f);
-            let wide_bits = if cell.wide { 1u8 } else { 0 } | if cell.wide_continuation { 2 } else { 0 };
+            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 } | if cell.flags.wide_continuation() { 2 } else { 0 };
             buf.push(wide_bits);
             buf.push(run);
 
@@ -550,20 +609,18 @@ impl ScrollbackLine {
             let run = data.get(pos).copied().unwrap_or(1).max(1);
             pos += 1;
 
-            let (flags, _, _) = Self::decode_flags(f);
-            let wide = wide_bits & 1 != 0;
-            let wide_continuation = wide_bits & 2 != 0;
+            let mut flags = Self::decode_flags(f);
+            flags.set_wide(wide_bits & 1 != 0);
+            flags.set_wide_continuation(wide_bits & 2 != 0);
 
             let cell = TerminalCell {
                 character: ch,
                 foreground: fg,
                 background: bg,
                 flags,
-                wide,
-                wide_continuation,
             };
             for _ in 0..run {
-                cells.push(cell.clone());
+                cells.push(cell);
             }
         }
         // Pad to cols
@@ -572,14 +629,12 @@ impl ScrollbackLine {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct TerminalCell {
     pub character: char,
     pub foreground: Color,
     pub background: Color,
     pub flags: StyleFlags,
-    pub wide: bool,
-    pub wide_continuation: bool,
 }
 
 impl Default for TerminalCell {
@@ -588,12 +643,12 @@ impl Default for TerminalCell {
             character: ' ',
             foreground: Color::Default,
             background: Color::Default,
-            flags: StyleFlags::default(),
-            wide: false,
-            wide_continuation: false,
+            flags: StyleFlags::new(),
         }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<TerminalCell>() == 16);
 
 /// 追踪改变的行和列区间（脏矩形）
 #[derive(Clone, Debug)]
@@ -696,6 +751,54 @@ enum ZoneState {
     OutputStarted(usize, usize, usize),
 }
 
+#[derive(Clone, Debug, Default)]
+struct TerminalModes {
+    bits: u32,
+}
+
+impl TerminalModes {
+    const fn bit_index(mode: u16) -> Option<u32> {
+        match mode {
+            7 => Some(0),
+            25 => Some(1),
+            1000 => Some(2),
+            1001 => Some(3),
+            1002 => Some(4),
+            1003 => Some(5),
+            1004 => Some(6),
+            1006 => Some(7),
+            1049 => Some(8),
+            2004 => Some(9),
+            2026 => Some(10),
+            2031 => Some(11),
+            5522 => Some(12),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn contains(&self, mode: &u16) -> bool {
+        match Self::bit_index(*mode) {
+            Some(bit) => self.bits & (1 << bit) != 0,
+            None => false,
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, mode: u16) {
+        if let Some(bit) = Self::bit_index(mode) {
+            self.bits |= 1 << bit;
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, mode: &u16) {
+        if let Some(bit) = Self::bit_index(*mode) {
+            self.bits &= !(1 << bit);
+        }
+    }
+}
+
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
@@ -742,8 +845,7 @@ pub struct TerminalState {
     pub preedit_text: String,
     pub preedit_cursor: usize,
 
-    // DECSET modes
-    modes: std::collections::HashSet<u16>,
+    modes: TerminalModes,
 
     // Output buffer for DSR/CPR responses to be sent back to PTY
     pub output_buffer: Vec<u8>,
@@ -768,7 +870,7 @@ pub struct TerminalState {
     pub row_versions: Vec<u64>, // 每行的修改版本号
 
     // Cached visible cells to avoid per-frame cloning
-    visible_cells_cache: Option<(u64, usize, Vec<Vec<TerminalCell>>)>,
+    visible_cells_cache: Option<(u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>)>,
 
     // OSC 8 hyperlink tracking
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)
@@ -798,25 +900,30 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    fn parse_csi_params(param_bytes: &[u8]) -> Vec<u16> {
-        let mut params = Vec::new();
-        let mut current = String::new();
+    fn parse_csi_params(param_bytes: &[u8]) -> SmallVec<[u16; 8]> {
+        let mut params = SmallVec::new();
+        let mut current: u16 = 0;
+        let mut has_digits = false;
 
         for &byte in param_bytes {
             match byte {
-                b'0'..=b'9' => current.push(byte as char),
+                b'0'..=b'9' => {
+                    current = current.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                    has_digits = true;
+                }
                 b';' | b':' => {
-                    if let Ok(value) = current.parse::<u16>() {
-                        params.push(value);
+                    if has_digits {
+                        params.push(current);
                     }
-                    current.clear();
+                    current = 0;
+                    has_digits = false;
                 }
                 _ => {}
             }
         }
 
-        if let Ok(value) = current.parse::<u16>() {
-            params.push(value);
+        if has_digits {
+            params.push(current);
         }
 
         params
@@ -827,9 +934,9 @@ impl TerminalState {
         let grid = TerminalGrid::new(rows, cols);
         let alt_grid = TerminalGrid::new(rows, cols);
 
-        let mut modes = std::collections::HashSet::new();
-        modes.insert(25); // Cursor visible by default
-        modes.insert(7); // Autowrap mode enabled by default (DECAWM)
+        let mut modes = TerminalModes::default();
+        modes.insert(25);
+        modes.insert(7);
 
         let mut dirty_region = DirtyRegion::new(cols);
         // Mark all rows as dirty on initialization to ensure first frame renders correctly
@@ -841,7 +948,7 @@ impl TerminalState {
             scrollback: VecDeque::new(),
             selection: None,
             scroll_offset: 0,
-            max_scrollback: 2000,
+            max_scrollback: 10000,
             use_alt_buffer: false,
             cursor_row: 0,
             cursor_col: 0,
@@ -1149,13 +1256,13 @@ impl TerminalState {
             && self
                 .grid
                 .get(self.cursor_row, self.cursor_col)
-                .wide_continuation
+                .flags.wide_continuation()
         {
             *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell.clone();
         }
 
         // If current position has a wide character, clear its continuation cell
-        if self.grid.get(self.cursor_row, self.cursor_col).wide && self.cursor_col + 1 < cols {
+        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide() && self.cursor_col + 1 < cols {
             *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell.clone();
         }
 
@@ -1165,14 +1272,14 @@ impl TerminalState {
         cell.foreground = self.current_fg;
         cell.background = self.current_bg;
         cell.flags = self.current_flags;
-        cell.wide = width == 2;
-        cell.wide_continuation = false;
+        cell.flags.set_wide(width == 2);
+        cell.flags.set_wide_continuation(false);
 
         // Set up wide character continuation cell if needed
         if width == 2 && self.cursor_col + 1 < cols {
             let cont_cell = self.grid.get_mut(self.cursor_row, self.cursor_col + 1);
             *cont_cell = blank_cell;
-            cont_cell.wide_continuation = true;
+            cont_cell.flags.set_wide_continuation(true);
         }
 
         self.cursor_col += width;
@@ -1197,8 +1304,8 @@ impl TerminalState {
                 cell.foreground = self.current_fg;
                 cell.background = self.current_bg;
                 cell.flags = self.current_flags;
-                cell.wide = false;
-                cell.wide_continuation = false;
+                cell.flags.set_wide(false);
+                cell.flags.set_wide_continuation(false);
             }
 
             self.cursor_col += chunk_len;
@@ -1231,8 +1338,6 @@ impl TerminalState {
             foreground: Color::Default,
             background: self.current_bg, // Preserve current background color
             flags: StyleFlags::default(),
-            wide: false,
-            wide_continuation: false,
         }
     }
 
@@ -1265,29 +1370,54 @@ impl TerminalState {
         self.scrollback.push_back(ScrollbackLine::compress(cells, is_wrapped));
     }
 
+    fn scroll_region_down(&mut self, top: usize, bottom: usize) {
+        if top >= self.grid.rows() || bottom >= self.grid.rows() || top > bottom {
+            return;
+        }
+        let cols = self.grid.row_len();
+        // Shift rows down: move [top..bottom) to [top+1..=bottom]
+        let src_start = top * cols;
+        let src_end = bottom * cols;
+        let dst = (top + 1) * cols;
+        self.grid.cells.copy_within(src_start..src_end, dst);
+        // Clear top row
+        self.grid.cells[src_start..src_start + cols].fill(TerminalCell::default());
+        self.grid.row_wrapped.copy_within(top..bottom, top + 1);
+        self.grid.row_wrapped[top] = false;
+        self.dirty_region.mark_rows(top, bottom);
+        self.mark_rows_dirty(top, bottom);
+    }
+
     fn scroll_region_up(&mut self, top: usize, bottom: usize) {
         if top >= self.grid.rows() || bottom >= self.grid.rows() || top > bottom {
             return;
         }
 
         let cols = self.grid.row_len();
-        let removed_line = self.grid.get_row(top);
-        let was_wrapped = self.grid.row_wrapped[top];
+        let is_full_screen_region = top == 0 && bottom + 1 == self.grid.rows();
 
-        for row in top..bottom {
-            let next_row = self.grid.get_row(row + 1);
-            self.grid.set_row(row, next_row);
-            self.grid.row_wrapped[row] = self.grid.row_wrapped[row + 1];
-        }
-        self.grid.set_row(bottom, self.blank_line(cols));
+        // Only snapshot the removed line if we need it for scrollback
+        let scrollback_data = if is_full_screen_region && !self.use_alt_buffer {
+            let removed_line = self.grid.get_row(top);
+            let was_wrapped = self.grid.row_wrapped[top];
+            Some((removed_line, was_wrapped))
+        } else {
+            None
+        };
+
+        let src_start = (top + 1) * cols;
+        let src_end = (bottom + 1) * cols;
+        let dst_start = top * cols;
+        self.grid.cells.copy_within(src_start..src_end, dst_start);
+        let blank_start = bottom * cols;
+        self.grid.cells[blank_start..blank_start + cols].fill(TerminalCell::default());
+        self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
         self.grid.row_wrapped[bottom] = false;
 
-        // Mark the scrolled region as dirty
         self.dirty_region.mark_rows(top, bottom);
         self.mark_rows_dirty(top, bottom);
 
-        let is_full_screen_region = top == 0 && bottom + 1 == self.grid.rows();
-        if is_full_screen_region {
+        if let Some((removed_line, was_wrapped)) = scrollback_data {
             self.push_scrollback_line(removed_line, was_wrapped);
         }
     }
@@ -1341,15 +1471,13 @@ impl TerminalState {
             foreground: Color::Default,
             background: bg_color,
             flags: StyleFlags::default(),
-            wide: false,
-            wide_continuation: false,
         };
         // If clearing a continuation cell, also clear the wide character body
-        if self.grid.get(row, col).wide_continuation && col > 0 {
+        if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
             *self.grid.get_mut(row, col - 1) = blank_cell.clone();
         }
         // If clearing a wide character body, also clear the continuation cell
-        if self.grid.get(row, col).wide && col + 1 < cols {
+        if self.grid.get(row, col).flags.wide() && col + 1 < cols {
             *self.grid.get_mut(row, col + 1) = blank_cell.clone();
         }
         *self.grid.get_mut(row, col) = blank_cell;
@@ -1358,25 +1486,20 @@ impl TerminalState {
     /// P3 优化：批量处理输入数据，只在处理完成后触发一次网格版本更新
     /// 相比多次 process_input，这个方法避免了多次网格版本递增
     pub fn process_batch(&mut self, input: &[u8]) {
-        // 累积所有输入字节，一次性处理
+        self.grid_version = self.grid_version.wrapping_add(1);
         self.process_input(input);
-        // 网格版本已在 process_input 中根据实际改变自动递增
     }
 
-    /// P4：标记一行已修改
     #[inline]
     fn mark_row_dirty(&mut self, row: usize) {
-        self.grid_version = self.grid_version.wrapping_add(1);
         if row < self.row_versions.len() {
             self.row_versions[row] = self.grid_version;
         }
     }
 
-    /// P4：标记多行已修改
     #[inline]
     fn mark_rows_dirty(&mut self, start: usize, end: usize) {
-        self.grid_version = self.grid_version.wrapping_add(1);
-        for row in start..=end.min(self.row_versions.len() - 1) {
+        for row in start..=end.min(self.row_versions.len().saturating_sub(1)) {
             self.row_versions[row] = self.grid_version;
         }
     }
@@ -1727,26 +1850,7 @@ impl TerminalState {
                                 && self.scroll_region_bottom < self.grid.rows()
                                 && self.scroll_region_top <= self.scroll_region_bottom
                             {
-                                let cols = self.grid.row_len();
-                                let mut new_lines = vec![self.blank_line(cols)];
-
-                                for row in self.scroll_region_top..self.scroll_region_bottom {
-                                    if row < self.grid.rows() {
-                                        new_lines.push(self.grid.get_row(row));
-                                    }
-                                }
-
-                                for (offset, line) in new_lines.iter().enumerate() {
-                                    if self.scroll_region_top + offset
-                                        <= self.scroll_region_bottom
-                                    {
-                                        self.grid.set_row(
-                                            self.scroll_region_top + offset,
-                                            line.clone(),
-                                        );
-                                    }
-                                }
-                                self.mark_rows_dirty(
+                                self.scroll_region_down(
                                     self.scroll_region_top,
                                     self.scroll_region_bottom,
                                 );
@@ -1847,35 +1951,70 @@ impl TerminalState {
                         i += 1;
                     }
                 }
-                // UTF-8 2-byte sequence (0xC2-0xDF)
+                // UTF-8 multi-byte sequences: try to consume all bytes eagerly
                 0xC2..=0xDF => {
-                    self.utf8_buf[0] = byte;
-                    self.utf8_len = 1;
-                    self.utf8_expected = 2;
-                    i += 1;
+                    let expected: u8 = 2;
+                    if i + 1 < data_slice.len() && (data_slice[i + 1] & 0xC0) == 0x80 {
+                        let buf = [byte, data_slice[i + 1], 0, 0];
+                        if let Ok(s) = std::str::from_utf8(&buf[..2]) {
+                            if let Some(ch) = s.chars().next() {
+                                self.put_char(ch);
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = expected;
+                        i += 1;
+                    }
                 }
-                // UTF-8 3-byte sequence (0xE0-0xEF)
                 0xE0..=0xEF => {
-                    self.utf8_buf[0] = byte;
-                    self.utf8_len = 1;
-                    self.utf8_expected = 3;
-                    i += 1;
+                    let expected: u8 = 3;
+                    if i + 2 < data_slice.len()
+                        && (data_slice[i + 1] & 0xC0) == 0x80
+                        && (data_slice[i + 2] & 0xC0) == 0x80
+                    {
+                        let buf = [byte, data_slice[i + 1], data_slice[i + 2], 0];
+                        if let Ok(s) = std::str::from_utf8(&buf[..3]) {
+                            if let Some(ch) = s.chars().next() {
+                                self.put_char(ch);
+                            }
+                        }
+                        i += 3;
+                    } else {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = expected;
+                        i += 1;
+                    }
                 }
-                // UTF-8 4-byte sequence (0xF0-0xF4)
                 0xF0..=0xF4 => {
-                    self.utf8_buf[0] = byte;
-                    self.utf8_len = 1;
-                    self.utf8_expected = 4;
-                    i += 1;
+                    let expected: u8 = 4;
+                    if i + 3 < data_slice.len()
+                        && (data_slice[i + 1] & 0xC0) == 0x80
+                        && (data_slice[i + 2] & 0xC0) == 0x80
+                        && (data_slice[i + 3] & 0xC0) == 0x80
+                    {
+                        let buf = [byte, data_slice[i + 1], data_slice[i + 2], data_slice[i + 3]];
+                        if let Ok(s) = std::str::from_utf8(&buf[..4]) {
+                            if let Some(ch) = s.chars().next() {
+                                self.put_char(ch);
+                            }
+                        }
+                        i += 4;
+                    } else {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = expected;
+                        i += 1;
+                    }
                 }
                 _ => {
-                    // Invalid byte or continuation byte with no sequence - skip
                     if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
-                        // UTF-8 continuation byte
                         self.utf8_buf[self.utf8_len as usize] = byte;
                         self.utf8_len += 1;
                         if self.utf8_len == self.utf8_expected {
-                            // Sequence complete, decode it
                             if let Ok(s) =
                                 std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize])
                             {
@@ -1886,7 +2025,6 @@ impl TerminalState {
                             self.utf8_len = 0;
                         }
                     } else {
-                        // Invalid continuation byte or stray byte - reset buffer and skip
                         self.utf8_len = 0;
                     }
                     i += 1;
@@ -1907,39 +2045,17 @@ impl TerminalState {
                 // Cursor up - should scroll region down if at top
                 let n = params.first().copied().unwrap_or(1) as usize;
 
-                let mut scrolled = false;
                 for _ in 0..n {
                     if self.cursor_row > self.scroll_region_top {
-                        // Cursor is not at top of scroll region, just move up
                         self.cursor_row -= 1;
-                    } else {
-                        // Cursor is at top of scroll region, scroll the region down
-                        if self.scroll_region_top < self.grid.rows()
-                            && self.scroll_region_bottom < self.grid.rows()
-                        {
-                            let cols = self.grid.row_len();
-                            let mut new_lines = vec![self.blank_line(cols)]; // New blank line at top
-
-                            // Keep lines from top to bottom-1
-                            for i in self.scroll_region_top..self.scroll_region_bottom {
-                                if i < self.grid.rows() {
-                                    new_lines.push(self.grid.get_row(i));
-                                }
-                            }
-
-                            // Replace region lines
-                            for (j, line) in new_lines.iter().enumerate() {
-                                if self.scroll_region_top + j <= self.scroll_region_bottom {
-                                    self.grid.set_row(self.scroll_region_top + j, line.clone());
-                                }
-                            }
-                            scrolled = true;
-                        }
-                        // Cursor stays at top row
+                    } else if self.scroll_region_top < self.grid.rows()
+                        && self.scroll_region_bottom < self.grid.rows()
+                    {
+                        self.scroll_region_down(
+                            self.scroll_region_top,
+                            self.scroll_region_bottom,
+                        );
                     }
-                }
-                if scrolled {
-                    self.mark_rows_dirty(self.scroll_region_top, self.scroll_region_bottom);
                 }
             }
             'B' => {
@@ -2070,40 +2186,34 @@ impl TerminalState {
                 }
             }
             'L' => {
-                // Insert line(s) at cursor position (push lines down)
                 let n = params.first().copied().unwrap_or(1) as usize;
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
                     {
                         let cols = self.grid.row_len();
-                        // Shift lines down within scroll region: move cursor_row..bottom-1 to cursor_row+1..bottom
-                        for row in (self.cursor_row..self.scroll_region_bottom).rev() {
-                            let src = self.grid.get_row(row);
-                            self.grid.set_row(row + 1, src);
-                        }
-                        // Insert blank line at cursor position
-                        self.grid.set_row(self.cursor_row, self.blank_line(cols));
+                        let src_start = self.cursor_row * cols;
+                        let src_end = self.scroll_region_bottom * cols;
+                        let dst = (self.cursor_row + 1) * cols;
+                        self.grid.cells.copy_within(src_start..src_end, dst);
+                        self.grid.cells[src_start..src_start + cols].fill(TerminalCell::default());
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
             'M' => {
-                // Delete line(s) at cursor position (pull lines up)
                 let n = params.first().copied().unwrap_or(1) as usize;
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
                     {
                         let cols = self.grid.row_len();
-                        // Shift lines up within scroll region: move cursor_row+1..bottom to cursor_row..bottom-1
-                        for row in self.cursor_row..self.scroll_region_bottom {
-                            let src = self.grid.get_row(row + 1);
-                            self.grid.set_row(row, src);
-                        }
-                        // Insert blank line at bottom of region
-                        self.grid
-                            .set_row(self.scroll_region_bottom, self.blank_line(cols));
+                        let src_start = (self.cursor_row + 1) * cols;
+                        let src_end = (self.scroll_region_bottom + 1) * cols;
+                        let dst = self.cursor_row * cols;
+                        self.grid.cells.copy_within(src_start..src_end, dst);
+                        let blank_start = self.scroll_region_bottom * cols;
+                        self.grid.cells[blank_start..blank_start + cols].fill(TerminalCell::default());
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
@@ -2199,32 +2309,8 @@ impl TerminalState {
             'T' => {
                 // Scroll down (Scroll Down, SD) - content moves down, new lines appear at top
                 let n = params.first().copied().unwrap_or(1) as usize;
-                // Scroll within the scroll region by moving lines
                 for _ in 0..n {
-                    if self.scroll_region_top < self.grid.rows()
-                        && self.scroll_region_bottom < self.grid.rows()
-                        && self.scroll_region_top <= self.scroll_region_bottom
-                    {
-                        let cols = self.grid.row_len();
-
-                        // Shift lines down within the region by collecting from bottom to top
-                        let mut new_lines = vec![self.blank_line(cols)]; // New blank line at top
-
-                        // Keep lines from top to bottom-1
-                        for i in self.scroll_region_top..self.scroll_region_bottom {
-                            if i < self.grid.rows() {
-                                new_lines.push(self.grid.get_row(i));
-                            }
-                        }
-
-                        // Replace region lines
-                        for (i, line) in new_lines.iter().enumerate() {
-                            if self.scroll_region_top + i <= self.scroll_region_bottom {
-                                self.grid.set_row(self.scroll_region_top + i, line.clone());
-                            }
-                        }
-                        self.mark_rows_dirty(self.scroll_region_top, self.scroll_region_bottom);
-                    }
+                    self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
                 }
             }
             'n' => {
@@ -2392,14 +2478,13 @@ impl TerminalState {
                     self.current_fg = Color::Default;
                     self.current_bg = Color::Default;
                 }
-                1 => self.current_flags.bold = true,
-                2 => self.current_flags.dim = true,
-                3 => self.current_flags.italic = true,
+                1 => self.current_flags.set_bold(true),
+                2 => self.current_flags.set_dim(true),
+                3 => self.current_flags.set_italic(true),
                 4 => {
-                    // Check if next param is an underline sub-param (SGR 4:N)
                     if i + 1 < params.len() && params[i + 1] <= 5 {
                         let style = params[i + 1];
-                        self.current_flags.underline = match style {
+                        self.current_flags.set_underline(match style {
                             0 => UnderlineStyle::None,
                             1 => UnderlineStyle::Single,
                             2 => UnderlineStyle::Double,
@@ -2407,25 +2492,25 @@ impl TerminalState {
                             4 => UnderlineStyle::Dotted,
                             5 => UnderlineStyle::Dashed,
                             _ => UnderlineStyle::Single,
-                        };
+                        });
                         i += 1;
                     } else {
-                        self.current_flags.underline = UnderlineStyle::Single;
+                        self.current_flags.set_underline(UnderlineStyle::Single);
                     }
                 }
-                5 => self.current_flags.blink = true,
-                7 => self.current_flags.inverse = true,
-                9 => self.current_flags.strikethrough = true,
-                21 => self.current_flags.underline = UnderlineStyle::Double,
+                5 => self.current_flags.set_blink(true),
+                7 => self.current_flags.set_inverse(true),
+                9 => self.current_flags.set_strikethrough(true),
+                21 => self.current_flags.set_underline(UnderlineStyle::Double),
                 22 => {
-                    self.current_flags.bold = false;
-                    self.current_flags.dim = false;
+                    self.current_flags.set_bold(false);
+                    self.current_flags.set_dim(false);
                 }
-                23 => self.current_flags.italic = false,
-                24 => self.current_flags.underline = UnderlineStyle::None,
-                25 => self.current_flags.blink = false,
-                27 => self.current_flags.inverse = false,
-                29 => self.current_flags.strikethrough = false,
+                23 => self.current_flags.set_italic(false),
+                24 => self.current_flags.set_underline(UnderlineStyle::None),
+                25 => self.current_flags.set_blink(false),
+                27 => self.current_flags.set_inverse(false),
+                29 => self.current_flags.set_strikethrough(false),
                 39 => self.current_fg = Color::Default,
                 30..=37 => {
                     self.current_fg = match param {
@@ -2557,8 +2642,6 @@ impl TerminalState {
                     foreground: Color::Default,
                     background: bg_color,
                     flags: StyleFlags::default(),
-                    wide: false,
-                    wide_continuation: false,
                 };
             }
         }
@@ -2867,24 +2950,32 @@ impl TerminalState {
                 foreground: Color::Default,
                 background: bg_color,
                 flags: StyleFlags::default(),
-                wide: false,
-                wide_continuation: false,
             };
-            let (old_line, was_wrapped) = self.grid.remove_first_row();
-            self.grid.fill_last_row(blank_cell);
-            self.push_scrollback_line(old_line, was_wrapped);
-            // Mark all rows as dirty after scrolling
+
+            // Snapshot first row for scrollback only when needed
+            if !self.use_alt_buffer {
+                let old_line = self.grid.get_row(0);
+                let was_wrapped = self.grid.row_wrapped[0];
+                self.grid.shift_rows_up();
+                self.grid.fill_last_row(blank_cell);
+                self.push_scrollback_line(old_line, was_wrapped);
+            } else {
+                self.grid.shift_rows_up();
+                self.grid.fill_last_row(blank_cell);
+            }
+
             self.dirty_region.mark_all(self.grid.rows());
-            self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+            let version = self.grid_version;
+            for v in self.row_versions.iter_mut() {
+                *v = version;
+            }
         }
     }
 
-    pub fn get_visible_cells(&mut self) -> Vec<Vec<TerminalCell>> {
-        // Check if cache is valid
+    pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
         if let Some((cached_version, cached_offset, ref cells)) = self.visible_cells_cache {
             if cached_version == self.grid_version && cached_offset == self.scroll_offset {
-                // Return clone of cached data (cheap: only clones Vec pointers, not cells)
-                return cells.clone();
+                return std::sync::Arc::clone(cells);
             }
         }
 
@@ -2935,10 +3026,9 @@ impl TerminalState {
             result
         };
 
-        // Store in cache and return clone
-        let result_clone = cells.clone();
-        self.visible_cells_cache = Some((self.grid_version, self.scroll_offset, cells));
-        result_clone
+        let arc = std::sync::Arc::new(cells);
+        self.visible_cells_cache = Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
+        arc
     }
 
     pub fn get_cursor_pos(&self) -> (usize, usize) {
@@ -2964,8 +3054,7 @@ impl TerminalState {
         std::mem::take(&mut self.output_buffer)
     }
 
-    /// Convert a viewport-relative row to an absolute row in the full buffer
-    /// (scrollback + grid). Absolute row 0 = first scrollback line.
+    #[inline]
     fn viewport_row_to_absolute(&self, viewport_row: usize) -> usize {
         self.scrollback.len().saturating_sub(self.scroll_offset) + viewport_row
     }
@@ -3021,7 +3110,7 @@ impl TerminalState {
 
         // Skip wide_continuation to find the real character
         let mut start_col = col;
-        if line[start_col].wide_continuation && start_col > 0 {
+        if line[start_col].flags.wide_continuation() && start_col > 0 {
             start_col -= 1;
         }
 
@@ -3043,7 +3132,7 @@ impl TerminalState {
         while left > 0 {
             let prev = left - 1;
             let c = line[prev].character;
-            if line[prev].wide_continuation {
+            if line[prev].flags.wide_continuation() {
                 left = prev;
                 continue;
             }
@@ -3056,7 +3145,7 @@ impl TerminalState {
         // Expand right
         let mut right = start_col;
         loop {
-            let next = if line[right].wide {
+            let next = if line[right].flags.wide() {
                 right + 2
             } else {
                 right + 1
@@ -3064,7 +3153,7 @@ impl TerminalState {
             if next >= cols {
                 break;
             }
-            if line[next].wide_continuation {
+            if line[next].flags.wide_continuation() {
                 // shouldn't happen after a non-wide char, but skip
                 if next + 1 < cols {
                     if char_class(line[next + 1].character) != class {
@@ -3081,7 +3170,7 @@ impl TerminalState {
             right = next;
         }
         // If the selected end is a wide char, include its continuation cell
-        if line[right].wide && right + 1 < cols {
+        if line[right].flags.wide() && right + 1 < cols {
             right += 1;
         }
 
@@ -3110,7 +3199,7 @@ impl TerminalState {
         let mut left = start_col;
         while left > 0 {
             let prev = left - 1;
-            if line[prev].wide_continuation {
+            if line[prev].flags.wide_continuation() {
                 left = prev;
                 continue;
             }
@@ -3122,7 +3211,7 @@ impl TerminalState {
 
         let mut right = start_col;
         loop {
-            let next = if line[right].wide {
+            let next = if line[right].flags.wide() {
                 right + 2
             } else {
                 right + 1
@@ -3130,7 +3219,7 @@ impl TerminalState {
             if next >= cols {
                 break;
             }
-            if line[next].wide_continuation {
+            if line[next].flags.wide_continuation() {
                 if next + 1 < cols && is_extended_token_char(line[next + 1].character) {
                     right = next + 1;
                     continue;
@@ -3148,7 +3237,7 @@ impl TerminalState {
         }
 
         while right > start_col && is_token_suffix_wrapper(line[right].character) {
-            right -= if line[right].wide_continuation && right > 0 {
+            right -= if line[right].flags.wide_continuation() && right > 0 {
                 2
             } else {
                 1
@@ -3162,7 +3251,7 @@ impl TerminalState {
         let mut has_alnum = false;
         let mut has_separator = false;
         for cell in &line[left..=right] {
-            if cell.wide_continuation {
+            if cell.flags.wide_continuation() {
                 continue;
             }
             let ch = cell.character;
@@ -3174,7 +3263,7 @@ impl TerminalState {
             return None;
         }
 
-        if line[right].wide && right + 1 < cols {
+        if line[right].flags.wide() && right + 1 < cols {
             right += 1;
         }
 
@@ -3206,7 +3295,7 @@ impl TerminalState {
                     // Read from scrollback
                     let line = self.scrollback[abs_row].decompress();
                     for col in start_col..=end_col.min(line.len().saturating_sub(1)) {
-                        if !line[col].wide_continuation {
+                        if !line[col].flags.wide_continuation() {
                             result.push(line[col].character);
                         }
                     }
@@ -3216,7 +3305,7 @@ impl TerminalState {
                     if grid_row < grid_rows {
                         for col in start_col..=end_col {
                             let cell = self.grid.get(grid_row, col);
-                            if !cell.wide_continuation {
+                            if !cell.flags.wide_continuation() {
                                 result.push(cell.character);
                             }
                         }
@@ -3258,7 +3347,7 @@ impl TerminalState {
 
     fn strip_trailing_blanks(cells: &[TerminalCell]) -> &[TerminalCell] {
         let mut end = cells.len();
-        while end > 0 && cells[end - 1].character == ' ' && cells[end - 1].background == Color::Default && !cells[end - 1].wide && !cells[end - 1].wide_continuation {
+        while end > 0 && cells[end - 1].character == ' ' && cells[end - 1].background == Color::Default && !cells[end - 1].flags.wide() && !cells[end - 1].flags.wide_continuation() {
             end -= 1;
         }
         &cells[..end]
@@ -3352,10 +3441,7 @@ impl TerminalState {
         }
     }
 
-    /// Returns the selected column range for a given viewport row.
-    /// Returns None if row is not selected, or Some((start_col, end_col)) where:
-    /// - For partial row selection: actual column range
-    /// - For fully-selected middle rows: (0, usize::MAX)
+    #[inline]
     pub fn row_selection_cols(&self, viewport_row: usize) -> Option<(usize, usize)> {
         let sel = self.selection?;
         let abs_row = self.viewport_row_to_absolute(viewport_row);
@@ -3509,11 +3595,11 @@ mod tests {
         let first = &terminal.grid[0][0];
         let second = &terminal.grid[0][1];
 
-        assert!(first.flags.inverse);
+        assert!(first.flags.inverse());
         assert_eq!(first.foreground, Color::Cyan);
         assert_eq!(first.background, Color::Blue);
 
-        assert!(!second.flags.inverse);
+        assert!(!second.flags.inverse());
         assert_eq!(second.foreground, Color::Default);
         assert_eq!(second.background, Color::Default);
     }

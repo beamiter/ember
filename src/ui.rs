@@ -320,10 +320,12 @@ pub struct TerminalRenderer {
     last_rendered_hovered_link: Option<crate::link::Link>,
     last_rendered_cols: usize,
     last_rendered_rows: usize,
-    last_rendered_terminal_ptr: usize, // Track which terminal to detect session switches
+    last_rendered_terminal_ptr: usize,
     dirty_rows_buffer: Vec<bool>,
-    changed_rows_buffer: Vec<usize>, // Reusable buffer for get_dirty_rows
-    row_instances_scratch: Vec<gpu::instance::CellInstance>, // Reusable buffer for partial row rebuild
+    changed_rows_buffer: Vec<usize>,
+    row_instances_scratch: Vec<gpu::instance::CellInstance>,
+    cached_atlas_w: f32,
+    cached_atlas_h: f32,
 }
 
 impl TerminalRenderer {
@@ -379,6 +381,8 @@ impl TerminalRenderer {
             dirty_rows_buffer: Vec::new(),
             changed_rows_buffer: Vec::new(),
             row_instances_scratch: Vec::new(),
+            cached_atlas_w: 1.0,
+            cached_atlas_h: 1.0,
         }
     }
 
@@ -536,10 +540,8 @@ impl TerminalRenderer {
         hovered_link: &Option<crate::link::Link>,
         target_rect: egui::Rect,
     ) -> Response {
-        let grid = terminal.get_visible_cells();
-
-        let rows = grid.len();
-        let cols = if rows > 0 { grid[0].len() } else { 80 };
+        let rows = terminal.grid.rows();
+        let cols = terminal.grid.row_len();
 
         let line_height = self.line_height;
         let char_width = self.char_width;
@@ -578,18 +580,13 @@ impl TerminalRenderer {
         links: &[crate::link::Link],
         hovered_link: &Option<crate::link::Link>,
     ) -> Response {
-        let grid = terminal.get_visible_cells();
-
-        let rows = grid.len();
-        let cols = if rows > 0 { grid[0].len() } else { 80 };
+        let rows = terminal.grid.rows();
+        let cols = terminal.grid.row_len();
 
         // Get available space
         let available = ui.available_size();
         let available_width = available.x;
         let available_height = available.y;
-
-        // eprintln!("[UI] Available: {:.0} x {:.0}", available_width, available_height);
-        // eprintln!("[UI] Grid: {} x {}", cols, rows);
 
         let line_height = self.line_height;
         let char_width = self.char_width;
@@ -1065,11 +1062,11 @@ impl TerminalRenderer {
         };
 
         if !gpu_rendered {
-            // Build link map for O(1) lookup
-            let mut link_map: std::collections::HashMap<usize, Vec<&crate::link::Link>> =
-                std::collections::HashMap::new();
+            let mut link_map: Vec<Vec<&crate::link::Link>> = vec![Vec::new(); rows];
             for link in links {
-                link_map.entry(link.line).or_default().push(link);
+                if link.line < rows {
+                    link_map[link.line].push(link);
+                }
             }
             // Fallback: CPU rendering via egui painter
             self.render_grid_cpu(
@@ -1092,11 +1089,11 @@ impl TerminalRenderer {
         if cursor_visible && cursor_pos.0 < rows && cursor_pos.1 < cols {
             let (crow, ccol) = cursor_pos;
             let cell = &grid[crow][ccol];
-            if !cell.wide_continuation {
+            if !cell.flags.wide_continuation() {
                 let (x, snapped_width) = snapped_span(content_rect.left(), ccol, char_width);
                 let (y, snapped_height) = snapped_span(content_rect.top(), crow, line_height);
 
-                let cell_width = if cell.wide {
+                let cell_width = if cell.flags.wide() {
                     let (_, next_width) = snapped_span(content_rect.left(), ccol + 1, char_width);
                     snapped_width + next_width
                 } else {
@@ -1323,9 +1320,6 @@ impl TerminalRenderer {
         if !any_dirty && !self.cached_instances.is_empty() {
             // Nothing changed — reuse cached instances as-is
         } else {
-            // --- Build/patch instances ---
-            let atlas_w;
-            let atlas_h;
             {
                 let mut renderer = render_state.renderer.write();
                 let gpu_res = match renderer
@@ -1337,8 +1331,8 @@ impl TerminalRenderer {
                 };
                 let (ascent, descent, advance) = gpu_res.atlas.font_metrics();
                 let (aw, ah) = gpu_res.atlas.atlas_dimensions();
-                atlas_w = aw as f32;
-                atlas_h = ah as f32;
+                self.cached_atlas_w = aw as f32;
+                self.cached_atlas_h = ah as f32;
                 let font_cell_width = advance;
                 let font_cell_height = ascent - descent;
                 // Round adjustments to integer pixels to prevent blur from linear filtering
@@ -1347,19 +1341,19 @@ impl TerminalRenderer {
                 let glyph_offset_y_adjust =
                     ((target_cell_height - font_cell_height) * 0.5).max(0.0).round();
 
-                // Build link map for O(1) lookup instead of O(n) search per cell
-                let mut link_map: std::collections::HashMap<usize, Vec<&crate::link::Link>> =
-                    std::collections::HashMap::new();
+                let mut link_map: Vec<Vec<&crate::link::Link>> = vec![Vec::new(); rows];
                 for link in links {
-                    link_map.entry(link.line).or_default().push(link);
+                    if link.line < rows {
+                        link_map[link.line].push(link);
+                    }
                 }
 
-                // Build search match map for O(1) per-row lookup instead of O(M) per-cell scan
-                let mut search_map: std::collections::HashMap<usize, Vec<&crate::search::SearchMatch>> =
-                    std::collections::HashMap::new();
+                let mut search_map: Vec<Vec<&crate::search::SearchMatch>> = vec![Vec::new(); rows];
                 if has_search {
                     for m in &search_state.matches {
-                        search_map.entry(m.line).or_default().push(m);
+                        if m.line < rows {
+                            search_map[m.line].push(m);
+                        }
                     }
                 }
 
@@ -1480,8 +1474,6 @@ impl TerminalRenderer {
                     }
                 }
 
-                // Store atlas dimensions for uniforms (atlas_w/atlas_h set above)
-                let _ = (atlas_w, atlas_h);
             } // drop renderer write lock
         }
 
@@ -1500,20 +1492,7 @@ impl TerminalRenderer {
         self.last_rendered_cols = cols;
         self.last_rendered_rows = rows;
 
-        // Get atlas dimensions for uniforms
-        let (atlas_w, atlas_h) = {
-            let renderer = render_state.renderer.read();
-            match renderer
-                .callback_resources
-                .get::<gpu::callback::GpuResources>()
-            {
-                Some(r) => {
-                    let (aw, ah) = r.atlas.atlas_dimensions();
-                    (aw as f32, ah as f32)
-                }
-                None => return false,
-            }
-        };
+        let (atlas_w, atlas_h) = (self.cached_atlas_w, self.cached_atlas_h);
 
         let instance_count = self.cached_instances.len() as u32;
         let background_uniforms = gpu::instance::GridUniforms {
@@ -1538,7 +1517,7 @@ impl TerminalRenderer {
             instance_count,
             row_offsets: self.row_instance_offsets.clone(),
             row_counts: self.row_instance_counts.clone(),
-            dirty_rows: dirty_rows.clone(),
+            dirty_rows,
             use_partial_upload: !need_full_rebuild && any_dirty,
         };
 
@@ -1555,8 +1534,6 @@ impl TerminalRenderer {
             content_rect,
             foreground_callback,
         ));
-
-        self.dirty_rows_buffer = dirty_rows;
         true
     }
 
@@ -1585,8 +1562,8 @@ impl TerminalRenderer {
         grid: &[Vec<crate::terminal::TerminalCell>],
         terminal: &TerminalState,
         search_state: &crate::search::SearchState,
-        link_map: &std::collections::HashMap<usize, Vec<&crate::link::Link>>,
-        search_map: &std::collections::HashMap<usize, Vec<&crate::search::SearchMatch>>,
+        link_map: &[Vec<&crate::link::Link>],
+        search_map: &[Vec<&crate::search::SearchMatch>],
         hovered_link: &Option<crate::link::Link>,
         theme: &crate::theme::Theme,
         default_bg: Color32,
@@ -1598,19 +1575,18 @@ impl TerminalRenderer {
         row_idx: usize,
         cols: usize,
     ) {
-        // Compute selection range once per row instead of per cell
         let sel_cols = terminal.row_selection_cols(row_idx);
 
         for col_idx in 0..cols {
             let cell = &grid[row_idx][col_idx];
-            if cell.wide_continuation {
+            if cell.flags.wide_continuation() {
                 continue;
             }
 
             let is_selected = sel_cols
                 .map(|(start, end)| col_idx >= start && col_idx <= end)
                 .unwrap_or(false);
-            let is_inverse = cell.flags.inverse;
+            let is_inverse = cell.flags.inverse();
 
             let mut bg_color = if is_selected {
                 theme.selection_color()
@@ -1621,7 +1597,8 @@ impl TerminalRenderer {
             };
 
             if has_search {
-                if let Some(row_matches) = search_map.get(&row_idx) {
+                let row_matches = &search_map[row_idx];
+                if !row_matches.is_empty() {
                     let active_match_idx = search_state.current_match_index % search_state.matches.len();
                     for m in row_matches.iter() {
                         if col_idx >= m.col_start && col_idx < m.col_end {
@@ -1662,7 +1639,8 @@ impl TerminalRenderer {
                 resolve_foreground_color(cell.foreground, theme)
             };
 
-            let is_link = if let Some(row_links) = link_map.get(&row_idx) {
+            let is_link = {
+                let row_links = &link_map[row_idx];
                 let mut found = false;
                 for link in row_links {
                     if col_idx >= link.col_start && col_idx < link.col_end {
@@ -1678,13 +1656,11 @@ impl TerminalRenderer {
                     }
                 }
                 found
-            } else {
-                false
             };
 
-            let bold = cell.flags.bold;
-            let has_strikethrough = cell.flags.strikethrough;
-            let is_wide = cell.wide;
+            let bold = cell.flags.bold();
+            let has_strikethrough = cell.flags.strikethrough();
+            let is_wide = cell.flags.wide();
 
             let mut flags: u32 = 0;
             let has_glyph = cell.character != ' ' && cell.character != '\0';
@@ -1695,10 +1671,10 @@ impl TerminalRenderer {
                 flags |= gpu::instance::CellInstance::FLAG_WIDE;
             }
             // Encode underline style in bits 2-4
-            let underline_style = if is_link && cell.flags.underline == crate::terminal::UnderlineStyle::None {
+            let underline_style = if is_link && cell.flags.underline() == crate::terminal::UnderlineStyle::None {
                 crate::terminal::UnderlineStyle::Single
             } else {
-                cell.flags.underline
+                cell.flags.underline()
             };
             match underline_style {
                 crate::terminal::UnderlineStyle::None => {}
@@ -1764,7 +1740,7 @@ impl TerminalRenderer {
         painter: &egui::Painter,
         terminal: &TerminalState,
         search_state: &crate::search::SearchState,
-        link_map: &std::collections::HashMap<usize, Vec<&crate::link::Link>>,
+        link_map: &[Vec<&crate::link::Link>],
         hovered_link: &Option<crate::link::Link>,
         grid: &[Vec<crate::terminal::TerminalCell>],
         rows: usize,
@@ -1776,20 +1752,19 @@ impl TerminalRenderer {
         let default_bg = self.theme.terminal_background();
         let has_search = !search_state.matches.is_empty() && !search_state.query.is_empty();
 
-        // Phase 1: Render non-default backgrounds
         for row_idx in 0..rows {
             let sel_cols = terminal.row_selection_cols(row_idx);
 
             for col_idx in 0..cols {
                 let cell = &grid[row_idx][col_idx];
-                if cell.wide_continuation {
+                if cell.flags.wide_continuation() {
                     continue;
                 }
 
                 let is_selected = sel_cols
                     .map(|(start, end)| col_idx >= start && col_idx <= end)
                     .unwrap_or(false);
-                let is_inverse = cell.flags.inverse;
+                let is_inverse = cell.flags.inverse();
 
                 if !is_selected
                     && !is_inverse
@@ -1832,7 +1807,7 @@ impl TerminalRenderer {
 
                 let (x, snapped_width) = snapped_span(content_rect.left(), col_idx, char_width);
                 let (y, snapped_height) = snapped_span(content_rect.top(), row_idx, line_height);
-                let cell_w = if cell.wide {
+                let cell_w = if cell.flags.wide() {
                     let (_, next_width) =
                         snapped_span(content_rect.left(), col_idx + 1, char_width);
                     snapped_width + next_width
@@ -1854,7 +1829,7 @@ impl TerminalRenderer {
             let mut col_idx = 0;
             while col_idx < cols {
                 let cell = &grid[row_idx][col_idx];
-                if cell.wide_continuation || cell.character == ' ' {
+                if cell.flags.wide_continuation() || cell.character == ' ' {
                     col_idx += 1;
                     continue;
                 }
@@ -1864,13 +1839,14 @@ impl TerminalRenderer {
                     .unwrap_or(false);
                 let mut fg_color = if is_selected {
                     self.theme.selection_fg_color()
-                } else if cell.flags.inverse {
+                } else if cell.flags.inverse() {
                     resolve_background_color(cell.background, &self.theme)
                 } else {
                     resolve_foreground_color(cell.foreground, &self.theme)
                 };
 
-                let is_link = if let Some(row_links) = link_map.get(&row_idx) {
+                let is_link = {
+                    let row_links = &link_map[row_idx];
                     let mut found = false;
                     for link in row_links {
                         if col_idx >= link.col_start && col_idx < link.col_end {
@@ -1886,14 +1862,12 @@ impl TerminalRenderer {
                         }
                     }
                     found
-                } else {
-                    false
                 };
 
-                let bold = cell.flags.bold;
-                let has_underline = cell.flags.underline != crate::terminal::UnderlineStyle::None || is_link;
-                let has_strikethrough = cell.flags.strikethrough;
-                let is_wide = cell.wide;
+                let bold = cell.flags.bold();
+                let has_underline = cell.flags.underline() != crate::terminal::UnderlineStyle::None || is_link;
+                let has_strikethrough = cell.flags.strikethrough();
+                let is_wide = cell.flags.wide();
 
                 let mut font_id = FontId::monospace(self.font_size);
                 if bold {

@@ -97,9 +97,14 @@ impl ShellSession {
         repaint_ctx: egui::Context,
         shutdown: Arc<AtomicBool>,
     ) {
-        const BUFFER_SIZE: usize = 65536; // 64KB 读缓冲
-        const BATCH_SIZE_THRESHOLD: usize = 131072; // 128KB 累积阈值
-        const BATCH_TIMEOUT_MS: u64 = 2; // 2ms 累积超时
+        const BUFFER_SIZE: usize = 65536;
+        const BATCH_SIZE_THRESHOLD: usize = 131072;
+        const BATCH_TIMEOUT_MS: u64 = 2;
+
+        let master_fd = match pty.lock() {
+            Ok(g) => g.master_fd(),
+            Err(_) => return,
+        };
 
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut accumulated = Vec::with_capacity(BATCH_SIZE_THRESHOLD);
@@ -128,28 +133,14 @@ impl ShellSession {
                     .max(1)
             };
 
-            let master_fd = match pty.lock() {
-                Ok(pty_guard) => pty_guard.master_fd(),
-                Err(_) => {
-                    let _ = Self::send_event(
-                        &event_tx,
-                        &repaint_ctx,
-                        ShellEvent::Error("PTY lock poisoned".to_string()),
-                    );
-                    return;
-                }
-            };
-
             match Pty::wait_fd_readable(master_fd, timeout_ms) {
                 Ok(true) => {
                     // PTY 可读，读取数据
                     if let Ok(mut pty_guard) = pty.lock() {
-                        // 非阻塞读取所有可用数据
                         loop {
                             match pty_guard.read(&mut buf) {
                                 Ok(n) if n > 0 => {
                                     accumulated.extend_from_slice(&buf[..n]);
-                                    // 数据足够时立即发送，避免内存爆炸
                                     if accumulated.len() >= BATCH_SIZE_THRESHOLD {
                                         let data = std::mem::take(&mut accumulated);
                                         if !Self::send_event(
@@ -157,17 +148,15 @@ impl ShellSession {
                                             &repaint_ctx,
                                             ShellEvent::Output(data),
                                         ) {
-                                            crate::debug_log!("[IOLoop] 接收者已断开，退出循环");
                                             return;
                                         }
                                         last_batch_time = std::time::Instant::now();
                                     }
                                 }
-                                Ok(_) => break, // EOF 或无更多数据
+                                Ok(_) => break,
                                 Err(e) => {
                                     crate::debug_log!("[IOLoop] 读取错误: {}", e);
                                     if !pty_guard.is_alive() {
-                                        // 进程已退出，发送积累的数据和退出事件
                                         if !accumulated.is_empty() {
                                             let data = std::mem::take(&mut accumulated);
                                             let _ = Self::send_event(
@@ -178,18 +167,10 @@ impl ShellSession {
                                         }
                                         match pty_guard.wait_timeout(0) {
                                             Ok(exit_code) => {
-                                                crate::debug_log!(
-                                                    "[IOLoop] 发送 Exit 事件，exit_code={}",
-                                                    exit_code
-                                                );
-                                                let result = Self::send_event(
+                                                let _ = Self::send_event(
                                                     &event_tx,
                                                     &repaint_ctx,
                                                     ShellEvent::Exit(exit_code),
-                                                );
-                                                crate::debug_log!(
-                                                    "[IOLoop] Exit 事件发送结果: {}",
-                                                    result
                                                 );
                                             }
                                             Err(e) => {
@@ -214,6 +195,17 @@ impl ShellSession {
                                 }
                             }
                         }
+                    }
+                    // Flush accumulated data immediately after draining the fd
+                    // instead of waiting for next poll timeout
+                    if !accumulated.is_empty()
+                        && last_batch_time.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
+                    {
+                        let data = std::mem::take(&mut accumulated);
+                        if !Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data)) {
+                            return;
+                        }
+                        last_batch_time = std::time::Instant::now();
                     }
                 }
                 Ok(false) => {

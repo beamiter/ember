@@ -42,8 +42,11 @@ pub fn format_bytes(bytes: &[u8]) -> String {
 #[macro_export]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        if $crate::debug::enabled() {
-            eprintln!($($arg)*);
+        #[cfg(debug_assertions)]
+        {
+            if $crate::debug::enabled() {
+                eprintln!($($arg)*);
+            }
         }
     };
 }

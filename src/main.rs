@@ -1694,8 +1694,6 @@ impl TerminalApp {
                         self.cached_links_grid_version = grid_version;
                         self.cached_links_scroll_offset = scroll_offset;
                     }
-                    let links = self.cached_links.clone();
-
                     // 在渲染终端之前读取滚轮值和 Ctrl 键状态
                     let ctrl_pressed_render = ui.input(|i| i.modifiers.ctrl);
 
@@ -1732,7 +1730,7 @@ impl TerminalApp {
                         &mut terminal_guard,
                         self.cursor_visible,
                         &self.search_state,
-                        &links,
+                        &self.cached_links,
                         &self.hovered_link,
                     );
                 }
@@ -2179,11 +2177,8 @@ impl eframe::App for TerminalApp {
             terminal.window_title.clone()
         };
         if !window_title.is_empty() && window_title != self.last_window_title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title));
-            self.last_window_title = {
-                let terminal = session.terminal.lock();
-                terminal.window_title.clone()
-            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));
+            self.last_window_title = window_title;
         }
 
         // Step 1.5: 处理累积的Ctrl+滚轮字体缩放
@@ -3253,7 +3248,6 @@ impl eframe::App for TerminalApp {
                 self.cached_links_grid_version = grid_version;
                 self.cached_links_scroll_offset = scroll_offset;
             }
-            let links = self.cached_links.clone();
             drop(terminal);
 
             // 检测悬停的链接
@@ -3279,12 +3273,10 @@ impl eframe::App for TerminalApp {
                         0
                     };
 
-                    // 查找当前位置是否有链接
                     if content_rect.contains(pos) {
-                        for link in &links {
+                        for link in &self.cached_links {
                             if link.line == row && col >= link.col_start && col < link.col_end {
                                 self.hovered_link = Some(link.clone());
-                                // 设置鼠标光标为手型
                                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                                 break;
                             }
@@ -3413,7 +3405,7 @@ impl Drop for TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_terminal_shortcut_events, shortcut_event_to_key_event};
+    use crate::app::events::{normalize_terminal_shortcut_events, shortcut_event_to_key_event};
     use eframe::egui;
 
     #[test]

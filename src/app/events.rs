@@ -89,12 +89,14 @@ pub fn normalize_terminal_shortcut_events(
             continue;
         }
 
-        if restore_shortcuts {
-            if let Some(key_event) = shortcut_event_to_key_event(event.clone(), modifiers) {
+        if restore_shortcuts
+            && matches!(event, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_))
+        {
+            if let Some(key_event) = shortcut_event_to_key_event(event, modifiers) {
                 crate::debug_log!("[NORMALIZE] converted to Key event via restore_shortcuts");
                 normalized_events.push(key_event);
-                continue;
             }
+            continue;
         }
 
         normalized_events.push(event);
@@ -186,41 +188,26 @@ pub fn key_to_string(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-/// 从 egui 的 Key 和 Modifiers 构建快捷键字符串（用于查询快捷键配置）
 pub fn build_keybinding_string(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
-    use smallvec::SmallVec;
-
     let key_str = key_to_string(key)?;
-    // 使用 SmallVec 避免堆分配（修饰符通常 ≤ 4 个）
-    let mut parts: SmallVec<[&str; 5]> = SmallVec::new();
+    let mut buf = String::with_capacity(32);
 
     if modifiers.ctrl {
-        parts.push("ctrl");
+        buf.push_str("ctrl+");
     }
     if modifiers.shift {
-        parts.push("shift");
+        buf.push_str("shift+");
     }
     if modifiers.alt {
-        parts.push("alt");
+        buf.push_str("alt+");
     }
-    // 仅在 macOS 上（cfg(target_os = "macos")）才添加 super/command
-    // 在其他平台上忽略 command 修饰符，防止误触发
     #[cfg(target_os = "macos")]
     if modifiers.mac_cmd || modifiers.command_only() {
-        parts.push("super");
+        buf.push_str("super+");
     }
 
-    parts.push(key_str);
-    let result = parts.join("+");
-    crate::debug_log!(
-        "[KEYBINDING] key={:?}, shift={}, ctrl={}, alt={} => {}",
-        key,
-        modifiers.shift,
-        modifiers.ctrl,
-        modifiers.alt,
-        result
-    );
-    Some(result)
+    buf.push_str(key_str);
+    Some(buf)
 }
 
 impl TerminalApp {
