@@ -2,7 +2,6 @@ use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
 use crossbeam::channel::{unbounded, Receiver};
 use eframe::egui;
-use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -371,11 +370,6 @@ impl ShellSession {
     /// 获取 shell 子进程的 PID
     pub fn get_child_pid(&self) -> i32 {
         self.child_pid
-    }
-
-    /// 获取 PTY master fd（用于 tcgetpgrp 等系统调用）
-    pub fn get_master_fd(&self) -> Option<RawFd> {
-        self.pty.lock().ok().map(|pty| pty.master_fd())
     }
 
     /// 获取可克隆的 PTY writer（用于延迟写入命令）

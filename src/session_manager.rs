@@ -245,21 +245,16 @@ impl SessionManager {
         }
     }
 
-    /// 获取会话列表的快照用于持久化（包含 cwd 和 restorable commands）
+    /// 获取会话列表的快照用于持久化（包含 cwd）
     pub fn get_session_snapshots(&self) -> Vec<session_persistence::SessionSnapshot> {
         self.sessions
             .iter()
             .map(|s| {
                 let cwd = get_process_cwd(s.get_shell_pid());
-                let master_fd = s.shell.get_master_fd();
-                let restorable_commands = master_fd.and_then(|fd| {
-                    session_persistence::get_restorable_commands(s.get_shell_pid(), fd)
-                });
                 session_persistence::SessionSnapshot {
                     name: s.metadata.name.clone(),
                     tags: s.metadata.tags.clone(),
                     cwd,
-                    restorable_commands,
                     session_id: Some(s.metadata.session_id.clone()),
                 }
             })
@@ -281,12 +276,6 @@ impl SessionManager {
                     session.metadata.session_id = sid.clone();
                 }
             }
-            // 为第一个 session 回放恢复命令
-            if let Some(ref cmds) = first.restorable_commands {
-                if let Some(session) = self.sessions.first() {
-                    Self::schedule_command_replay(&session.shell, cmds.clone());
-                }
-            }
         }
 
         // 为剩余快照创建新会话
@@ -299,10 +288,6 @@ impl SessionManager {
                     let mut session = Session::new(snap.name, snap.tags, terminal, shell);
                     if let Some(sid) = snap.session_id {
                         session.metadata.session_id = sid;
-                    }
-                    // 回放恢复命令
-                    if let Some(ref cmds) = snap.restorable_commands {
-                        Self::schedule_command_replay(&session.shell, cmds.clone());
                     }
                     self.sessions.push(session);
                 }
@@ -318,20 +303,6 @@ impl SessionManager {
                 self.active_index = idx;
             }
         }
-    }
-
-    /// 延迟回放恢复命令到 shell（500ms 延迟确保 shell 进入 raw mode）
-    fn schedule_command_replay(shell: &ShellSession, commands: String) {
-        let pty = shell.pty_writer();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Ok(mut pty_guard) = pty.lock() {
-                for cmd in commands.split(", ") {
-                    let text = format!("{}\r", cmd.trim());
-                    let _ = pty_guard.write(text.as_bytes());
-                }
-            }
-        });
     }
 }
 
