@@ -926,7 +926,6 @@ impl Theme {
     }
 
     /// 获取 ANSI 颜色
-    #[allow(dead_code)]
     pub fn ansi_color(&self, index: usize) -> Color32 {
         if index < 16 {
             Self::rgb_to_color32(self.terminal.ansi_colors[index])

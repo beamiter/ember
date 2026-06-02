@@ -11,25 +11,6 @@ fn quantize_subpixel(v: f32) -> u8 {
     (quantized % 4).min(3)
 }
 
-fn resolve_foreground_color(
-    color_value: crate::terminal::Color,
-    theme: &crate::theme::Theme,
-) -> Color32 {
-    match color_value {
-        crate::terminal::Color::Default => theme.terminal_foreground(),
-        _ => color::to_egui_color32(color_value),
-    }
-}
-
-fn resolve_background_color(
-    color_value: crate::terminal::Color,
-    theme: &crate::theme::Theme,
-) -> Color32 {
-    match color_value {
-        crate::terminal::Color::Default => theme.terminal_background(),
-        _ => color::to_egui_color32(color_value),
-    }
-}
 
 fn snapped_span(origin: f32, index: usize, cell_size: f32) -> (f32, f32) {
     let start = (origin + index as f32 * cell_size).round();
@@ -1588,12 +1569,15 @@ impl TerminalRenderer {
                 .unwrap_or(false);
             let is_inverse = cell.flags.inverse();
 
+            let bold = cell.flags.bold();
+            let dim = cell.flags.dim();
+
             let mut bg_color = if is_selected {
                 theme.selection_color()
             } else if is_inverse {
-                resolve_foreground_color(cell.foreground, theme)
+                color::resolve_fg(cell.foreground, theme, bold, dim)
             } else {
-                resolve_background_color(cell.background, theme)
+                color::resolve_bg(cell.background, theme)
             };
 
             if has_search {
@@ -1602,9 +1586,7 @@ impl TerminalRenderer {
                     let active_match_idx = search_state.current_match_index % search_state.matches.len();
                     for m in row_matches.iter() {
                         if col_idx >= m.col_start && col_idx < m.col_end {
-                            let orig_fg = resolve_foreground_color(cell.foreground, theme);
-                            bg_color = orig_fg;
-                            // Find global match index by scanning search_state.matches
+                            bg_color = color::resolve_fg(cell.foreground, theme, bold, dim);
                             let global_match_idx = search_state.matches.iter()
                                 .position(|gm| std::ptr::eq(*m, gm))
                                 .unwrap_or(0);
@@ -1634,9 +1616,9 @@ impl TerminalRenderer {
             let mut fg_color = if is_selected {
                 theme.selection_fg_color()
             } else if is_inverse {
-                resolve_background_color(cell.background, theme)
+                color::resolve_bg(cell.background, theme)
             } else {
-                resolve_foreground_color(cell.foreground, theme)
+                color::resolve_fg(cell.foreground, theme, bold, dim)
             };
 
             let is_link = {
@@ -1657,8 +1639,6 @@ impl TerminalRenderer {
                 }
                 found
             };
-
-            let bold = cell.flags.bold();
             let has_strikethrough = cell.flags.strikethrough();
             let is_wide = cell.flags.wide();
 
@@ -1765,6 +1745,8 @@ impl TerminalRenderer {
                     .map(|(start, end)| col_idx >= start && col_idx <= end)
                     .unwrap_or(false);
                 let is_inverse = cell.flags.inverse();
+                let bold = cell.flags.bold();
+                let dim = cell.flags.dim();
 
                 if !is_selected
                     && !is_inverse
@@ -1777,16 +1759,15 @@ impl TerminalRenderer {
                 let mut bg_color = if is_selected {
                     self.theme.selection_color()
                 } else if is_inverse {
-                    resolve_foreground_color(cell.foreground, &self.theme)
+                    color::resolve_fg(cell.foreground, &self.theme, bold, dim)
                 } else {
-                    resolve_background_color(cell.background, &self.theme)
+                    color::resolve_bg(cell.background, &self.theme)
                 };
 
                 if has_search {
                     for (match_idx, m) in search_state.matches.iter().enumerate() {
                         if m.line == row_idx && col_idx >= m.col_start && col_idx < m.col_end {
-                            let orig_fg = resolve_foreground_color(cell.foreground, &self.theme);
-                            bg_color = orig_fg;
+                            bg_color = color::resolve_fg(cell.foreground, &self.theme, bold, dim);
                             if match_idx
                                 == search_state.current_match_index % search_state.matches.len()
                             {
@@ -1837,12 +1818,14 @@ impl TerminalRenderer {
                 let is_selected = sel_cols
                     .map(|(start, end)| col_idx >= start && col_idx <= end)
                     .unwrap_or(false);
+                let bold = cell.flags.bold();
+                let dim = cell.flags.dim();
                 let mut fg_color = if is_selected {
                     self.theme.selection_fg_color()
                 } else if cell.flags.inverse() {
-                    resolve_background_color(cell.background, &self.theme)
+                    color::resolve_bg(cell.background, &self.theme)
                 } else {
-                    resolve_foreground_color(cell.foreground, &self.theme)
+                    color::resolve_fg(cell.foreground, &self.theme, bold, dim)
                 };
 
                 let is_link = {
@@ -1863,8 +1846,6 @@ impl TerminalRenderer {
                     }
                     found
                 };
-
-                let bold = cell.flags.bold();
                 let has_underline = cell.flags.underline() != crate::terminal::UnderlineStyle::None || is_link;
                 let has_strikethrough = cell.flags.strikethrough();
                 let is_wide = cell.flags.wide();
