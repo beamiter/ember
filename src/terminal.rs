@@ -2991,15 +2991,35 @@ impl TerminalState {
         // Try to recycle the previous allocation. The renderer drops its returned
         // Arc each frame, so by the next miss we are usually the sole owner and can
         // refill the existing nested Vecs in place instead of reallocating per row.
-        let mut recycled = self.visible_cells_cache.take().map(|(_, _, a)| a);
+        let prev = self.visible_cells_cache.take();
+        let prev_version = prev.as_ref().map(|(v, _, _)| *v);
+        let prev_offset = prev.as_ref().map(|(_, o, _)| *o);
+        let mut recycled = prev.map(|(_, _, a)| a);
 
         if self.scroll_offset == 0 {
             // Fast path: copy current grid, reusing inner Vec capacity when possible.
             if let Some(buf) = recycled.as_mut().and_then(std::sync::Arc::get_mut) {
-                buf.resize_with(rows, Vec::new);
-                for (dst, chunk) in buf.iter_mut().zip(self.grid.iter()) {
-                    dst.clear();
-                    dst.extend_from_slice(chunk);
+                // Incremental path: if the recycled buffer already holds a same-sized
+                // snapshot taken at scroll_offset==0, only re-copy rows whose
+                // row_versions changed since that snapshot. Untouched rows already
+                // hold valid data, turning an O(rows*cols) copy into O(dirty cells).
+                let can_incremental = prev_offset == Some(0)
+                    && buf.len() == rows
+                    && buf.iter().all(|r| r.len() == cols);
+                if can_incremental {
+                    let base = prev_version.unwrap_or(0);
+                    for (r, (dst, chunk)) in buf.iter_mut().zip(self.grid.iter()).enumerate() {
+                        if self.row_versions[r] > base {
+                            dst.clear();
+                            dst.extend_from_slice(chunk);
+                        }
+                    }
+                } else {
+                    buf.resize_with(rows, Vec::new);
+                    for (dst, chunk) in buf.iter_mut().zip(self.grid.iter()) {
+                        dst.clear();
+                        dst.extend_from_slice(chunk);
+                    }
                 }
                 let arc = recycled.unwrap();
                 self.visible_cells_cache =

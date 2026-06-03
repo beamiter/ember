@@ -2,8 +2,9 @@ use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
 use crossbeam::channel::{unbounded, Receiver};
 use eframe::egui;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -99,11 +100,9 @@ impl ShellSession {
         const BUFFER_SIZE: usize = 65536;
         const BATCH_SIZE_THRESHOLD: usize = 131072;
         const BATCH_TIMEOUT_MS: u64 = 2;
+        const ALIVE_CHECK_MS: u64 = 250;
 
-        let master_fd = match pty.lock() {
-            Ok(g) => g.master_fd(),
-            Err(_) => return,
-        };
+        let master_fd = pty.lock().master_fd();
 
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut accumulated = Vec::with_capacity(BATCH_SIZE_THRESHOLD);
@@ -127,7 +126,7 @@ impl ShellSession {
                 remaining_ms.max(1).min(100)
             } else {
                 // 无累积数据，使用标准超时（减去 alive_check 耗时）
-                (100_i32)
+                (ALIVE_CHECK_MS as i32)
                     .saturating_sub(last_alive_check.elapsed().as_millis() as i32)
                     .max(1)
             };
@@ -135,7 +134,8 @@ impl ShellSession {
             match Pty::wait_fd_readable(master_fd, timeout_ms) {
                 Ok(true) => {
                     // PTY 可读，读取数据
-                    if let Ok(mut pty_guard) = pty.lock() {
+                    {
+                        let mut pty_guard = pty.lock();
                         loop {
                             match pty_guard.read(&mut buf) {
                                 Ok(n) if n > 0 => {
@@ -231,46 +231,38 @@ impl ShellSession {
                 }
             }
 
-            // 检查进程是否存活（100ms 检查一次）
-            if last_alive_check.elapsed() >= Duration::from_millis(100) {
-                if let Ok(mut pty_guard) = pty.lock() {
-                    if !pty_guard.is_alive() {
-                        crate::debug_log!("[IOLoop] 检测到子进程已退出");
-                        // 发送积累的数据
-                        if !accumulated.is_empty() {
-                            let data = std::mem::take(&mut accumulated);
-                            let _ =
-                                Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
-                        }
-                        match pty_guard.wait_timeout(0) {
-                            Ok(exit_code) => {
-                                crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
-                                let _result = Self::send_event(
-                                    &event_tx,
-                                    &repaint_ctx,
-                                    ShellEvent::Exit(exit_code),
-                                );
-                                crate::debug_log!("[IOLoop] Exit 事件发送结果: {}", _result);
-                            }
-                            Err(e) => {
-                                let _ = Self::send_event(
-                                    &event_tx,
-                                    &repaint_ctx,
-                                    ShellEvent::Error(format!("Process exit error: {}", e)),
-                                );
-                            }
-                        }
-                        return;
+            // 检查进程是否存活（250ms 检查一次，空闲时降低唤醒频率）
+            if last_alive_check.elapsed() >= Duration::from_millis(ALIVE_CHECK_MS) {
+                let mut pty_guard = pty.lock();
+                if !pty_guard.is_alive() {
+                    crate::debug_log!("[IOLoop] 检测到子进程已退出");
+                    // 发送积累的数据
+                    if !accumulated.is_empty() {
+                        let data = std::mem::take(&mut accumulated);
+                        let _ =
+                            Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
                     }
-                    last_alive_check = std::time::Instant::now();
-                } else {
-                    let _ = Self::send_event(
-                        &event_tx,
-                        &repaint_ctx,
-                        ShellEvent::Error("PTY lock poisoned".to_string()),
-                    );
+                    match pty_guard.wait_timeout(0) {
+                        Ok(exit_code) => {
+                            crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
+                            let _result = Self::send_event(
+                                &event_tx,
+                                &repaint_ctx,
+                                ShellEvent::Exit(exit_code),
+                            );
+                            crate::debug_log!("[IOLoop] Exit 事件发送结果: {}", _result);
+                        }
+                        Err(e) => {
+                            let _ = Self::send_event(
+                                &event_tx,
+                                &repaint_ctx,
+                                ShellEvent::Error(format!("Process exit error: {}", e)),
+                            );
+                        }
+                    }
                     return;
                 }
+                last_alive_check = std::time::Instant::now();
             }
         }
     }
@@ -286,9 +278,7 @@ impl ShellSession {
 
         // 先获取 master_fd（不需要长期持锁）
         let master_fd = {
-            let pty = pty
-                .lock()
-                .map_err(|_| "Failed to lock PTY for fd".to_string())?;
+            let pty = pty.lock();
             pty.master_fd()
         };
 
@@ -303,9 +293,7 @@ impl ShellSession {
 
             // 获取锁，尝试写入，然后立即释放锁
             {
-                let mut pty = pty
-                    .lock()
-                    .map_err(|_| "Failed to lock PTY for write".to_string())?;
+                let mut pty = pty.lock();
                 match pty.write(&data[offset..]) {
                     Ok(n) if n > 0 => {
                         offset += n;
@@ -359,10 +347,7 @@ impl ShellSession {
     }
 
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
-        let mut pty = self
-            .pty
-            .lock()
-            .map_err(|_| "Failed to lock PTY for resize".to_string())?;
+        let mut pty = self.pty.lock();
         pty.resize(cols, rows)
             .map_err(|e| format!("Resize error: {}", e))
     }

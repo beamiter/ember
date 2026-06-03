@@ -1575,6 +1575,15 @@ impl TerminalRenderer {
     ) {
         let sel_cols = terminal.row_selection_cols(row_idx);
 
+        // Precompute the active match's identity once per row to avoid an O(matches)
+        // scan per highlighted cell. A match is uniquely identified by (line, col_start).
+        let active_match_pos = if has_search && !search_state.matches.is_empty() {
+            let idx = search_state.current_match_index % search_state.matches.len();
+            search_state.matches.get(idx).map(|m| (m.line, m.col_start))
+        } else {
+            None
+        };
+
         for col_idx in 0..cols {
             let cell = &grid[row_idx][col_idx];
             if cell.flags.wide_continuation() {
@@ -1600,14 +1609,10 @@ impl TerminalRenderer {
             if has_search {
                 let row_matches = search_map.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
                 if !row_matches.is_empty() {
-                    let active_match_idx = search_state.current_match_index % search_state.matches.len();
                     for m in row_matches.iter() {
                         if col_idx >= m.col_start && col_idx < m.col_end {
                             bg_color = color::resolve_fg(cell.foreground, theme, bold, dim);
-                            let global_match_idx = search_state.matches.iter()
-                                .position(|gm| std::ptr::eq(*m, gm))
-                                .unwrap_or(0);
-                            if global_match_idx == active_match_idx {
+                            if active_match_pos == Some((m.line, m.col_start)) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
                                     (r as u16 * 180 / 255) as u8,

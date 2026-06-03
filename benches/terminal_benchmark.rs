@@ -73,6 +73,17 @@ fn bench_grid_operations(c: &mut Criterion) {
         });
     });
 
+    // Streaming workload on a large grid: one row changes per iter, then read.
+    // Exercises the incremental-copy fast path of get_visible_cells.
+    group.bench_function("get_visible_cells_streaming", |b| {
+        let mut terminal = TerminalState::new(200, 50);
+        terminal.process_batch(&vec![b'X'; 8000]);
+        b.iter(|| {
+            terminal.process_batch(b"streaming line of output\r\n");
+            black_box(terminal.get_visible_cells());
+        });
+    });
+
     group.finish();
 }
 
