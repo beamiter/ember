@@ -245,12 +245,12 @@ impl ShellSession {
                         match pty_guard.wait_timeout(0) {
                             Ok(exit_code) => {
                                 crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
-                                let result = Self::send_event(
+                                let _result = Self::send_event(
                                     &event_tx,
                                     &repaint_ctx,
                                     ShellEvent::Exit(exit_code),
                                 );
-                                crate::debug_log!("[IOLoop] Exit 事件发送结果: {}", result);
+                                crate::debug_log!("[IOLoop] Exit 事件发送结果: {}", _result);
                             }
                             Err(e) => {
                                 let _ = Self::send_event(

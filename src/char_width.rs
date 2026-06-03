@@ -100,15 +100,16 @@ mod tests {
 
     #[test]
     fn test_caching() {
+        // 注意：ASCII 字符走静态查找表，不进缓存，所以这里必须用非 ASCII 字符
         clear_width_cache();
         let (before, _) = get_cache_stats();
 
-        cached_char_width('A');
+        cached_char_width('中');
         let (after_1, _) = get_cache_stats();
         assert_eq!(after_1, before + 1);
 
         // 再次调用应该使用缓存
-        cached_char_width('A');
+        cached_char_width('中');
         let (after_2, _) = get_cache_stats();
         assert_eq!(after_2, after_1); // 缓存大小不变
     }

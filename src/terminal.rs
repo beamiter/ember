@@ -1153,8 +1153,8 @@ impl TerminalState {
         }
     }
 
-    fn handle_osc_5522(&mut self, metadata: &str, payload: Option<&str>) {
-        crate::debug_log!("[OSC5522] metadata={} payload={:?}", metadata, payload);
+    fn handle_osc_5522(&mut self, metadata: &str, _payload: Option<&str>) {
+        crate::debug_log!("[OSC5522] metadata={} payload={:?}", metadata, _payload);
 
         let mut message_type = None;
         let mut mime = None;
@@ -1297,15 +1297,20 @@ impl TerminalState {
             let remaining = cols - self.cursor_col;
             let chunk_len = (bytes.len() - pos).min(remaining);
 
-            // Write chunk to grid directly
-            for j in 0..chunk_len {
-                let cell = self.grid.get_mut(self.cursor_row, self.cursor_col + j);
-                cell.character = bytes[pos + j] as char;
-                cell.foreground = self.current_fg;
-                cell.background = self.current_bg;
-                cell.flags = self.current_flags;
-                cell.flags.set_wide(false);
-                cell.flags.set_wide_continuation(false);
+            // Write chunk to grid directly through a single row slice
+            // (avoids recomputing row*cols + bounds-check on every cell)
+            let fg = self.current_fg;
+            let bg = self.current_bg;
+            let mut flags = self.current_flags;
+            flags.set_wide(false);
+            flags.set_wide_continuation(false);
+            let col = self.cursor_col;
+            let row = &mut self.grid[self.cursor_row][col..col + chunk_len];
+            for (cell, &byte) in row.iter_mut().zip(&bytes[pos..pos + chunk_len]) {
+                cell.character = byte as char;
+                cell.foreground = fg;
+                cell.background = bg;
+                cell.flags = flags;
             }
 
             self.cursor_col += chunk_len;
@@ -1773,13 +1778,13 @@ impl TerminalState {
                                             || payload_str.contains("a=")
                                             || payload_str.starts_with("kitty")
                                         {
-                                            if let Err(e) = self
+                                            if let Err(_e) = self
                                                 .kitty_graphics
                                                 .parse_graphics_payload(payload_str)
                                             {
                                                 crate::debug_log!(
                                                     "[DCS] Kitty graphics error: {}",
-                                                    e
+                                                    _e
                                                 );
                                             }
                                         }
@@ -2983,8 +2988,28 @@ impl TerminalState {
         let rows = self.grid.rows();
         let cols = if rows > 0 { self.grid.row_len() } else { 80 };
 
+        // Try to recycle the previous allocation. The renderer drops its returned
+        // Arc each frame, so by the next miss we are usually the sole owner and can
+        // refill the existing nested Vecs in place instead of reallocating per row.
+        let mut recycled = self.visible_cells_cache.take().map(|(_, _, a)| a);
+
+        if self.scroll_offset == 0 {
+            // Fast path: copy current grid, reusing inner Vec capacity when possible.
+            if let Some(buf) = recycled.as_mut().and_then(std::sync::Arc::get_mut) {
+                buf.resize_with(rows, Vec::new);
+                for (dst, chunk) in buf.iter_mut().zip(self.grid.iter()) {
+                    dst.clear();
+                    dst.extend_from_slice(chunk);
+                }
+                let arc = recycled.unwrap();
+                self.visible_cells_cache =
+                    Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
+                return arc;
+            }
+        }
+
         let cells = if self.scroll_offset == 0 {
-            // Fast path: just get current grid
+            // Fast path (shared allocation): fresh copy of current grid.
             self.grid.to_vec()
         } else {
             // Slow path: reflow scrollback
@@ -3026,7 +3051,14 @@ impl TerminalState {
             result
         };
 
-        let arc = std::sync::Arc::new(cells);
+        // Reuse the recycled Arc's outer allocation if we still solely own it.
+        let arc = match recycled.as_mut().and_then(std::sync::Arc::get_mut) {
+            Some(buf) => {
+                *buf = cells;
+                recycled.unwrap()
+            }
+            None => std::sync::Arc::new(cells),
+        };
         self.visible_cells_cache = Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
         arc
     }

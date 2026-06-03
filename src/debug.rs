@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+// Only called from the debug_log! macro, which compiles to a no-op in release builds.
+#[allow(dead_code)]
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
 

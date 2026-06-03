@@ -51,8 +51,8 @@ pub struct GridBackgroundCallback {
     pub instances: Arc<Vec<CellInstance>>,
     pub uniforms: GridUniforms,
     pub instance_count: u32,
-    pub row_offsets: Vec<usize>,
-    pub row_counts: Vec<usize>,
+    pub row_offsets: Arc<Vec<usize>>,
+    pub row_counts: Arc<Vec<usize>>,
     pub dirty_rows: Vec<bool>,
     pub use_partial_upload: bool,
 }
@@ -88,8 +88,8 @@ impl egui_wgpu::CallbackTrait for GridBackgroundCallback {
                 device,
                 queue,
                 &self.instances,
-                &self.row_offsets,
-                &self.row_counts,
+                &self.row_offsets[..],
+                &self.row_counts[..],
                 &self.dirty_rows,
             );
         } else {

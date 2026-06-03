@@ -116,7 +116,7 @@ fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
     }
 
     // 未识别的格式，显示前几个字节
-    let hex_preview = if data.len() >= 8 {
+    let _hex_preview = if data.len() >= 8 {
         format!(
             "{:02X} {:02X} {:02X} {:02X} ...",
             data[0], data[1], data[2], data[3]
@@ -130,7 +130,7 @@ fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
     crate::debug_log!(
         "[MIME] unknown format ({}bytes): {}",
         data.len(),
-        hex_preview
+        _hex_preview
     );
     None
 }
@@ -2571,10 +2571,10 @@ impl eframe::App for TerminalApp {
                     // 造成双重粘贴（应用收到 0x16 + bracketed paste 文本）。
                     // Ctrl+V 粘贴只应通过 Ctrl+Shift+V（显式）或 semantic Paste 事件处理。
                 }
-                egui::Event::Paste(content) => {
+                egui::Event::Paste(_content) => {
                     crate::debug_log!(
                         "[EVENT] detected Paste event: {:?}",
-                        if content.is_empty() {
+                        if _content.is_empty() {
                             "empty"
                         } else {
                             "has content"
@@ -2694,8 +2694,8 @@ impl eframe::App for TerminalApp {
                             "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
                             bytes.len()
                         );
-                        if let Err(e) = ShellSession::write_to_pty(&pty, &bytes) {
-                            crate::debug_log!("[PASTE] Failed to write paste event: {}", e);
+                        if let Err(_e) = ShellSession::write_to_pty(&pty, &bytes) {
+                            crate::debug_log!("[PASTE] Failed to write paste event: {}", _e);
                         }
                     });
                 consumed_keys.insert("PasteEvent".to_string());
@@ -2939,8 +2939,8 @@ impl eframe::App for TerminalApp {
                                         .available_mime_types()
                                         .unwrap_or_default();
                                     let response = terminal.lock().build_paste_event(&mime_types);
-                                    if let Err(e) = ShellSession::write_to_pty(&pty, &response) {
-                                        crate::debug_log!("[OSC5522] Failed to write mime list response: {}", e);
+                                    if let Err(_e) = ShellSession::write_to_pty(&pty, &response) {
+                                        crate::debug_log!("[OSC5522] Failed to write mime list response: {}", _e);
                                     }
                                 }
                                 terminal::ClipboardReadKind::MimeData(mime_type) => {
@@ -2955,8 +2955,8 @@ impl eframe::App for TerminalApp {
                                         mime_type,
                                         data.len()
                                     );
-                                    if let Err(e) = ShellSession::write_to_pty(&pty, &response) {
-                                        crate::debug_log!("[OSC5522] Failed to write mime data response: {}", e);
+                                    if let Err(_e) = ShellSession::write_to_pty(&pty, &response) {
+                                        crate::debug_log!("[OSC5522] Failed to write mime data response: {}", _e);
                                     }
                                 }
                             }

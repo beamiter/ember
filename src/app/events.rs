@@ -22,9 +22,9 @@ pub fn shortcut_event_to_key_event(
             crate::debug_log!("[EVENT] converting Cut to Key::X");
             egui::Key::X
         }
-        egui::Event::Paste(ref content) => {
+        egui::Event::Paste(ref _content) => {
             crate::debug_log!("[EVENT] converting Paste to Key::V (content: {} bytes, modifiers: ctrl={} shift={} alt={})",
-                             content.len(), modifiers.ctrl, modifiers.shift, modifiers.alt);
+                             _content.len(), modifiers.ctrl, modifiers.shift, modifiers.alt);
             egui::Key::V
         }
         _ => return None,
@@ -67,17 +67,17 @@ pub fn normalize_terminal_shortcut_events(
                 crate::debug_log!("[NORMALIZE] found Cut event");
             }
             egui::Event::Key {
-                key,
-                modifiers: key_mods,
-                pressed,
+                key: _key,
+                modifiers: _key_mods,
+                pressed: _pressed,
                 ..
             } => {
                 crate::debug_log!(
                     "[NORMALIZE] found Key event: {:?} pressed={} ctrl={} shift={}",
-                    key,
-                    pressed,
-                    key_mods.ctrl,
-                    key_mods.shift
+                    _key,
+                    _pressed,
+                    _key_mods.ctrl,
+                    _key_mods.shift
                 );
             }
             _ => {}

@@ -291,8 +291,8 @@ pub struct TerminalRenderer {
 
     // Dirty-region rendering cache
     cached_instances: std::sync::Arc<Vec<gpu::instance::CellInstance>>,
-    row_instance_offsets: Vec<usize>,
-    row_instance_counts: Vec<usize>,
+    row_instance_offsets: std::sync::Arc<Vec<usize>>,
+    row_instance_counts: std::sync::Arc<Vec<usize>>,
     last_rendered_grid_version: u64,
     last_rendered_scroll_offset: usize,
     last_rendered_selection: Option<crate::terminal::Selection>,
@@ -348,8 +348,8 @@ impl TerminalRenderer {
             scroll_pixel_offset: 0.0,
             // Dirty-region rendering cache (initialized empty)
             cached_instances: std::sync::Arc::new(Vec::new()),
-            row_instance_offsets: Vec::new(),
-            row_instance_counts: Vec::new(),
+            row_instance_offsets: std::sync::Arc::new(Vec::new()),
+            row_instance_counts: std::sync::Arc::new(Vec::new()),
             last_rendered_grid_version: 0,
             last_rendered_scroll_offset: 0,
             last_rendered_selection: None,
@@ -1043,12 +1043,17 @@ impl TerminalRenderer {
         };
 
         if !gpu_rendered {
-            let mut link_map: Vec<Vec<&crate::link::Link>> = vec![Vec::new(); rows];
-            for link in links {
-                if link.line < rows {
-                    link_map[link.line].push(link);
+            let link_map: Vec<Vec<&crate::link::Link>> = if links.is_empty() {
+                Vec::new()
+            } else {
+                let mut m = vec![Vec::new(); rows];
+                for link in links {
+                    if link.line < rows {
+                        m[link.line].push(link);
+                    }
                 }
-            }
+                m
+            };
             // Fallback: CPU rendering via egui painter
             self.render_grid_cpu(
                 ui,
@@ -1322,28 +1327,38 @@ impl TerminalRenderer {
                 let glyph_offset_y_adjust =
                     ((target_cell_height - font_cell_height) * 0.5).max(0.0).round();
 
-                let mut link_map: Vec<Vec<&crate::link::Link>> = vec![Vec::new(); rows];
-                for link in links {
-                    if link.line < rows {
-                        link_map[link.line].push(link);
-                    }
-                }
-
-                let mut search_map: Vec<Vec<&crate::search::SearchMatch>> = vec![Vec::new(); rows];
-                if has_search {
-                    for m in &search_state.matches {
-                        if m.line < rows {
-                            search_map[m.line].push(m);
+                let link_map: Vec<Vec<&crate::link::Link>> = if links.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut map = vec![Vec::new(); rows];
+                    for link in links {
+                        if link.line < rows {
+                            map[link.line].push(link);
                         }
                     }
-                }
+                    map
+                };
+
+                let search_map: Vec<Vec<&crate::search::SearchMatch>> = if !has_search {
+                    Vec::new()
+                } else {
+                    let mut map = vec![Vec::new(); rows];
+                    for m in &search_state.matches {
+                        if m.line < rows {
+                            map[m.line].push(m);
+                        }
+                    }
+                    map
+                };
 
                 if need_full_rebuild {
                     // Full rebuild: clear and rebuild all
                     let instances = std::sync::Arc::make_mut(&mut self.cached_instances);
+                    let offsets = std::sync::Arc::make_mut(&mut self.row_instance_offsets);
+                    let counts = std::sync::Arc::make_mut(&mut self.row_instance_counts);
                     instances.clear();
-                    self.row_instance_offsets.clear();
-                    self.row_instance_counts.clear();
+                    offsets.clear();
+                    counts.clear();
                     instances.reserve(rows * cols);
 
                     for row_idx in 0..rows {
@@ -1368,8 +1383,8 @@ impl TerminalRenderer {
                             cols,
                         );
                         let count = instances.len() - offset;
-                        self.row_instance_offsets.push(offset);
-                        self.row_instance_counts.push(count);
+                        offsets.push(offset);
+                        counts.push(count);
                     }
                 } else {
                     // Partial rebuild: only rebuild dirty rows
@@ -1423,9 +1438,11 @@ impl TerminalRenderer {
                     if needs_relayout {
                         // Rebuild all from scratch
                         let instances = std::sync::Arc::make_mut(&mut self.cached_instances);
+                        let offsets = std::sync::Arc::make_mut(&mut self.row_instance_offsets);
+                        let counts = std::sync::Arc::make_mut(&mut self.row_instance_counts);
                         instances.clear();
-                        self.row_instance_offsets.clear();
-                        self.row_instance_counts.clear();
+                        offsets.clear();
+                        counts.clear();
                         instances.reserve(rows * cols);
                         for row_idx in 0..rows {
                             let offset = instances.len();
@@ -1449,8 +1466,8 @@ impl TerminalRenderer {
                                 cols,
                             );
                             let count = instances.len() - offset;
-                            self.row_instance_offsets.push(offset);
-                            self.row_instance_counts.push(count);
+                            offsets.push(offset);
+                            counts.push(count);
                         }
                     }
                 }
@@ -1581,7 +1598,7 @@ impl TerminalRenderer {
             };
 
             if has_search {
-                let row_matches = &search_map[row_idx];
+                let row_matches = search_map.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
                 if !row_matches.is_empty() {
                     let active_match_idx = search_state.current_match_index % search_state.matches.len();
                     for m in row_matches.iter() {
@@ -1622,7 +1639,7 @@ impl TerminalRenderer {
             };
 
             let is_link = {
-                let row_links = &link_map[row_idx];
+                let row_links = link_map.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
                 let mut found = false;
                 for link in row_links {
                     if col_idx >= link.col_start && col_idx < link.col_end {
@@ -1829,7 +1846,7 @@ impl TerminalRenderer {
                 };
 
                 let is_link = {
-                    let row_links = &link_map[row_idx];
+                    let row_links = link_map.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
                     let mut found = false;
                     for link in row_links {
                         if col_idx >= link.col_start && col_idx < link.col_end {
