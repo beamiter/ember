@@ -398,7 +398,7 @@ enum CompressedLineData {
 }
 
 impl ScrollbackLine {
-    pub fn compress(cells: Vec<TerminalCell>, is_wrapped: bool) -> Self {
+    pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
         let cols = cells.len() as u16;
         let trailing_blanks = cells.iter().rev()
             .take_while(|c| c.character == ' ' && c.foreground == Color::Default
@@ -1364,15 +1364,14 @@ impl TerminalState {
         }
     }
 
-    fn push_scrollback_line(&mut self, cells: Vec<TerminalCell>, is_wrapped: bool) {
+    fn push_scrollback_compressed(&mut self, line: ScrollbackLine) {
         if self.use_alt_buffer {
             return;
         }
-
         if self.scrollback.len() >= self.max_scrollback {
             self.scrollback.pop_front();
         }
-        self.scrollback.push_back(ScrollbackLine::compress(cells, is_wrapped));
+        self.scrollback.push_back(line);
     }
 
     fn scroll_region_down(&mut self, top: usize, bottom: usize) {
@@ -1401,11 +1400,10 @@ impl TerminalState {
         let cols = self.grid.row_len();
         let is_full_screen_region = top == 0 && bottom + 1 == self.grid.rows();
 
-        // Only snapshot the removed line if we need it for scrollback
-        let scrollback_data = if is_full_screen_region && !self.use_alt_buffer {
-            let removed_line = self.grid.get_row(top);
-            let was_wrapped = self.grid.row_wrapped[top];
-            Some((removed_line, was_wrapped))
+        // Compress the removed line directly from the grid slice before mutating,
+        // avoiding a per-line Vec allocation from get_row.
+        let scrollback_line = if is_full_screen_region && !self.use_alt_buffer {
+            Some(ScrollbackLine::compress(&self.grid[top], self.grid.row_wrapped[top]))
         } else {
             None
         };
@@ -1422,8 +1420,8 @@ impl TerminalState {
         self.dirty_region.mark_rows(top, bottom);
         self.mark_rows_dirty(top, bottom);
 
-        if let Some((removed_line, was_wrapped)) = scrollback_data {
-            self.push_scrollback_line(removed_line, was_wrapped);
+        if let Some(line) = scrollback_line {
+            self.push_scrollback_compressed(line);
         }
     }
 
@@ -2957,13 +2955,13 @@ impl TerminalState {
                 flags: StyleFlags::default(),
             };
 
-            // Snapshot first row for scrollback only when needed
+            // Compress first row directly from the grid slice before shifting,
+            // avoiding a per-line Vec allocation from get_row.
             if !self.use_alt_buffer {
-                let old_line = self.grid.get_row(0);
-                let was_wrapped = self.grid.row_wrapped[0];
+                let line = ScrollbackLine::compress(&self.grid[0], self.grid.row_wrapped[0]);
                 self.grid.shift_rows_up();
                 self.grid.fill_last_row(blank_cell);
-                self.push_scrollback_line(old_line, was_wrapped);
+                self.push_scrollback_compressed(line);
             } else {
                 self.grid.shift_rows_up();
                 self.grid.fill_last_row(blank_cell);
@@ -3424,18 +3422,20 @@ impl TerminalState {
             i += 1;
 
             if logical_line.is_empty() {
-                result.push(ScrollbackLine::compress(vec![blank_cell.clone(); new_cols], false));
+                result.push(ScrollbackLine::compress(&vec![blank_cell.clone(); new_cols], false));
                 continue;
             }
 
             let chunks: Vec<&[TerminalCell]> = logical_line.chunks(new_cols).collect();
             let num_chunks = chunks.len();
             for (ci, chunk) in chunks.into_iter().enumerate() {
-                let mut cells = chunk.to_vec();
-                if cells.len() < new_cols {
+                if chunk.len() == new_cols {
+                    result.push(ScrollbackLine::compress(chunk, ci + 1 < num_chunks));
+                } else {
+                    let mut cells = chunk.to_vec();
                     cells.resize(new_cols, blank_cell.clone());
+                    result.push(ScrollbackLine::compress(&cells, ci + 1 < num_chunks));
                 }
-                result.push(ScrollbackLine::compress(cells, ci + 1 < num_chunks));
             }
         }
 
