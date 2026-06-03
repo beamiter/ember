@@ -3075,7 +3075,10 @@ impl eframe::App for TerminalApp {
         // 1. 如果应用启用了鼠标报告（如 vim），滚轮会在下面的鼠标处理部分发送给应用
         // 2. 如果应用未启用鼠标，或在普通终端，滚轮用于查看历史
         if scroll_delta != 0.0 && !mouse_enabled {
-            self.smooth_scroll_velocity += scroll_delta * self.config.scroll_speed as f32;
+            // 0.35 阻尼系数：原始的 scroll_speed 直接乘 delta 会让单次滚轮累积约 7 倍位移，滑得太快
+            const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
+            self.smooth_scroll_velocity +=
+                scroll_delta * self.config.scroll_speed as f32 * SCROLL_VELOCITY_DAMPING;
         }
 
         // Smooth scroll physics
