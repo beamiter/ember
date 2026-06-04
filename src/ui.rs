@@ -43,7 +43,13 @@ fn key_to_terminal_sequence(
         egui::Key::Enter => Some("\r"),
         egui::Key::Escape => Some("\x1b"),
         egui::Key::Backspace => Some("\x7f"), // Send DEL (0x7f)
-        egui::Key::Tab => Some("\t"),
+        egui::Key::Tab => {
+            if modifiers.shift {
+                Some("\x1b[Z") // Shift+Tab -> backtab (CSI Z)
+            } else {
+                Some("\t")
+            }
+        }
         egui::Key::ArrowUp => {
             if application_cursor_keys {
                 Some("\x1bOA")
