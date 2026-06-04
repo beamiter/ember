@@ -40,8 +40,8 @@ pub enum FontBackendType {
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum AppRendererType {
-    #[default]
     Glow,
+    #[default]
     Wgpu,
 }
 
@@ -123,6 +123,9 @@ pub struct Config {
 
     #[serde(default = "default_subpixel_rendering")]
     pub subpixel_rendering: bool,
+
+    #[serde(default = "default_font_ligatures")]
+    pub font_ligatures: bool,
 
     /// Explicit shell path (overrides auto-detection). Useful when PATH is stripped by launchers like wofi.
     #[serde(default)]
@@ -242,6 +245,10 @@ fn default_subpixel_rendering() -> bool {
     true
 }
 
+fn default_font_ligatures() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -266,6 +273,7 @@ impl Default for Config {
             app_renderer: AppRendererType::default(),
             scroll_speed: default_scroll_speed(),
             subpixel_rendering: default_subpixel_rendering(),
+            font_ligatures: default_font_ligatures(),
             ui_scale: None,
             shell: None,
         }

@@ -750,6 +750,7 @@ impl TerminalApp {
             current_theme.clone(),
         );
         renderer.opacity = cfg.opacity;
+        renderer.font_ligatures = cfg.font_ligatures;
         renderer.gpu_rendering = cfg.gpu_rendering;
         renderer.wgpu_render_state = wgpu_render_state.clone();
 
@@ -767,6 +768,7 @@ impl TerminalApp {
                 current_theme.clone(),
             );
             pr.opacity = cfg.opacity;
+            pr.font_ligatures = cfg.font_ligatures;
             pr.gpu_rendering = cfg.gpu_rendering;
             pr.wgpu_render_state = wgpu_render_state.clone();
             pane_renderers.push(pr);
@@ -841,6 +843,7 @@ impl TerminalApp {
         self.renderer.scrollbar_visibility = self.config.scrollbar_visibility.clone();
         self.renderer.theme = self.current_theme.clone();
         self.renderer.opacity = self.config.opacity;
+        self.renderer.font_ligatures = self.config.font_ligatures;
         self.renderer.gpu_rendering = matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
             && self.config.gpu_rendering;
         self.renderer.sync_font_metrics(ctx);
@@ -852,6 +855,7 @@ impl TerminalApp {
             renderer.scrollbar_visibility = self.config.scrollbar_visibility.clone();
             renderer.theme = self.current_theme.clone();
             renderer.opacity = self.config.opacity;
+            renderer.font_ligatures = self.config.font_ligatures;
             renderer.gpu_rendering = matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
                 && self.config.gpu_rendering;
             renderer.sync_font_metrics(ctx);
@@ -897,12 +901,24 @@ impl TerminalApp {
 
                 let painter = ui.painter();
 
+                // 主题色（一次性取出，避免后续借用冲突）
+                let tb = self.renderer.theme.tabbar.clone();
+                let tb_bg = crate::theme::Theme::rgb_to_color32(tb.bg);
+                let tb_accent = crate::theme::Theme::rgb_to_color32(tb.active_border);
+                let tb_inactive_text = crate::theme::Theme::rgb_to_color32(tb.inactive_text);
+                let tb_active_text = crate::theme::Theme::rgb_to_color32(tb.active_text);
+                let tb_close_bg = crate::theme::Theme::rgb_to_color32(tb.close_btn_bg);
+                let tb_close_hover = crate::theme::Theme::rgb_to_color32(tb.close_btn_hover);
+                // 在栏背景上叠加的「悬停/活跃」填充：以中性白做低透明 tint，跨深浅主题都协调
+                let tab_hover_fill = egui::Color32::from_white_alpha(18);
+                let tab_active_fill = tb_bg.lerp_to_gamma(tb_accent, 0.16);
+
                 // 背景
                 let tab_alpha = (self.renderer.opacity * 255.0) as u8;
                 painter.rect_filled(
                     tab_rect,
                     0.0,
-                    egui::Color32::from_rgba_unmultiplied(40, 40, 40, tab_alpha),
+                    egui::Color32::from_rgba_unmultiplied(tb_bg.r(), tb_bg.g(), tb_bg.b(), tab_alpha),
                 );
 
                 // === Tab 布局常量 ===
@@ -1273,6 +1289,8 @@ impl TerminalApp {
 
                 let mut x_offset = scroll_base;
                 let active_idx = self.session_manager.active_index();
+                // 活跃指示条目标位置（非拖拽时用于滑动动画）
+                let mut active_indicator_target: Option<(f32, f32, f32)> = None;
 
                 // 绘制每个标签
                 for (i, (_, display_text, _)) in tab_infos.iter().enumerate() {
@@ -1286,33 +1304,34 @@ impl TerminalApp {
                     let is_dragging = self.dragging_tab == Some(i);
                     let is_drag_target = drag_target_idx == Some(i);
 
-                    // 计算拖拽过程中的动画位移
-                    if is_actually_dragging {
-                        if is_dragging {
-                            // 被拖拽的Tab跟随鼠标移动
-                            if let Some(start_x) = self.drag_start_pos {
-                                let offset = self.current_mouse_x - start_x;
-                                tab_rect_item = tab_rect_item.translate(egui::vec2(offset, 0.0));
+                    // 计算拖拽过程中的位移：被拖拽 tab 跟随鼠标；其余 tab 缓动让位
+                    let push_id = egui::Id::new(("tab_push", i));
+                    if is_actually_dragging && is_dragging {
+                        // 被拖拽的Tab跟随鼠标移动（即时，无缓动）
+                        if let Some(start_x) = self.drag_start_pos {
+                            let offset = self.current_mouse_x - start_x;
+                            tab_rect_item = tab_rect_item.translate(egui::vec2(offset, 0.0));
+                        }
+                        ctx.animate_value_with_time(push_id, 0.0, 0.0); // 重置让位动画
+                    } else {
+                        // 计算让位目标偏移，再缓动到该位置
+                        let mut push_target = 0.0;
+                        if is_actually_dragging {
+                            if let Some(from_idx) = self.dragging_tab {
+                                let drag_to_left = is_drag_target
+                                    && drag_target_idx.map(|t| t < from_idx).unwrap_or(false);
+                                let drag_to_right = is_drag_target
+                                    && drag_target_idx.map(|t| t > from_idx).unwrap_or(false);
+                                if drag_to_left && i > from_idx {
+                                    push_target = tab_width + tab_spacing;
+                                } else if drag_to_right && i < from_idx {
+                                    push_target = -(tab_width + tab_spacing);
+                                }
                             }
-                        } else if let Some(from_idx) = self.dragging_tab {
-                            // 其他Tabs根据拖拽目标位置进行动画插入
-                            let drag_to_left = is_drag_target
-                                && drag_target_idx.map(|t| t < from_idx).unwrap_or(false);
-                            let drag_to_right = is_drag_target
-                                && drag_target_idx.map(|t| t > from_idx).unwrap_or(false);
-
-                            if drag_to_left {
-                                if i > from_idx {
-                                    let push_offset = tab_width + tab_spacing;
-                                    tab_rect_item =
-                                        tab_rect_item.translate(egui::vec2(push_offset, 0.0));
-                                }
-                            } else if drag_to_right
-                                && i < from_idx {
-                                    let push_offset = -(tab_width + tab_spacing);
-                                    tab_rect_item =
-                                        tab_rect_item.translate(egui::vec2(push_offset, 0.0));
-                                }
+                        }
+                        let push = ctx.animate_value_with_time(push_id, push_target, 0.12);
+                        if push.abs() > 0.1 {
+                            tab_rect_item = tab_rect_item.translate(egui::vec2(push, 0.0));
                         }
                     }
 
@@ -1327,33 +1346,48 @@ impl TerminalApp {
                         self.hovered_tab_index = Some(i);
                     }
 
-                    // 背景色：无边框风格，通过背景色差异区分状态
+                    // 背景色：圆角 pill 风格，hover 强度做淡入淡出
+                    let tab_rounding = 6.0;
+                    let hover_t = ctx.animate_bool_with_time(
+                        egui::Id::new(("tab_hover", i)),
+                        (is_hovered || is_dragging) && !is_actually_dragging,
+                        0.12,
+                    );
                     let bg_color = if is_active {
-                        egui::Color32::from_rgb(50, 50, 60)
-                    } else if is_hovered || is_dragging {
-                        egui::Color32::from_rgb(55, 55, 65)
+                        // 活跃 tab：基础填充，hover 时再微亮
+                        tab_active_fill.lerp_to_gamma(tab_active_fill.blend(tab_hover_fill), hover_t)
                     } else {
-                        egui::Color32::TRANSPARENT
+                        tab_hover_fill.gamma_multiply(hover_t)
                     };
 
-                    // 绘制Tab背景（无边框）
+                    // 绘制Tab背景
                     if is_dragging && is_actually_dragging {
                         let drag_bg = if is_active {
-                            egui::Color32::from_rgba_premultiplied(50, 50, 60, 140)
+                            tab_active_fill.gamma_multiply(0.55)
                         } else {
-                            egui::Color32::from_rgba_premultiplied(55, 55, 65, 140)
+                            tab_hover_fill.gamma_multiply(0.55)
                         };
-                        clipped_painter.rect_filled(tab_rect_item, 4.0, drag_bg);
+                        clipped_painter.rect_filled(tab_rect_item, tab_rounding, drag_bg);
                     } else {
-                        clipped_painter.rect_filled(tab_rect_item, 4.0, bg_color);
+                        clipped_painter.rect_filled(tab_rect_item, tab_rounding, bg_color);
 
-                        // Active Tab 底部高亮指示线
+                        // Active Tab 底部圆角 accent 指示条
                         if is_active {
-                            clipped_painter.hline(
-                                (tab_rect_item.left() + 4.0)..=(tab_rect_item.right() - 4.0),
-                                tab_rect_item.bottom() - 1.0,
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 160, 255)),
-                            );
+                            if is_actually_dragging {
+                                // 拖拽中：指示条立即跟随，不做滑动
+                                let indicator = egui::Rect::from_min_max(
+                                    egui::pos2(tab_rect_item.left() + 6.0, tab_rect_item.bottom() - 3.0),
+                                    egui::pos2(tab_rect_item.right() - 6.0, tab_rect_item.bottom() - 1.0),
+                                );
+                                clipped_painter.rect_filled(indicator, 1.5, tb_accent);
+                            } else {
+                                // 记录目标，循环结束后用动画绘制滑动指示条
+                                active_indicator_target = Some((
+                                    tab_rect_item.left(),
+                                    tab_rect_item.right(),
+                                    tab_rect_item.bottom(),
+                                ));
+                            }
                         }
 
                         // 拖拽过程中，在目标Tab位置显示插入指示线
@@ -1367,7 +1401,7 @@ impl TerminalApp {
                             clipped_painter.vline(
                                 insert_line_x,
                                 tab_rect_item.top()..=tab_rect_item.bottom(),
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255)),
+                                egui::Stroke::new(2.0, tb_accent),
                             );
                         }
                     }
@@ -1387,9 +1421,9 @@ impl TerminalApp {
                         display_text,
                         egui::FontId::monospace(12.0),
                         if is_active {
-                            egui::Color32::WHITE
+                            tb_active_text
                         } else {
-                            egui::Color32::from_rgb(180, 180, 190)
+                            tb_inactive_text
                         },
                     );
 
@@ -1413,14 +1447,14 @@ impl TerminalApp {
                             clipped_painter.circle_filled(
                                 close_btn_rect.center(),
                                 close_btn_size / 2.0 + 2.0,
-                                egui::Color32::from_rgb(100, 50, 50),
+                                tb_close_bg,
                             );
                         }
 
                         let close_x_color = if close_btn_hovered {
-                            egui::Color32::from_rgb(255, 150, 150)
+                            tb_close_hover
                         } else {
-                            egui::Color32::from_rgb(150, 150, 150)
+                            tb_inactive_text
                         };
 
                         let cross_offset = close_btn_size / 3.0;
@@ -1455,6 +1489,25 @@ impl TerminalApp {
                     x_offset += tab_width + tab_spacing;
                 }
 
+                // 活跃指示条滑动动画（非拖拽时）
+                if let Some((target_left, target_right, bottom)) = active_indicator_target {
+                    let anim_left = ctx.animate_value_with_time(
+                        egui::Id::new("tab_indicator_left"),
+                        target_left,
+                        0.15,
+                    );
+                    let anim_right = ctx.animate_value_with_time(
+                        egui::Id::new("tab_indicator_right"),
+                        target_right,
+                        0.15,
+                    );
+                    let indicator = egui::Rect::from_min_max(
+                        egui::pos2(anim_left + 6.0, bottom - 3.0),
+                        egui::pos2(anim_right - 6.0, bottom - 1.0),
+                    );
+                    clipped_painter.rect_filled(indicator, 1.5, tb_accent);
+                }
+
                 // "+" 按钮 - 新建会话（紧跟最后一个 Tab，但不超过 clip 区域）
                 let plus_btn_x = x_offset
                     .max(tab_rect.left() + left_margin)
@@ -1472,17 +1525,17 @@ impl TerminalApp {
                 };
 
                 let plus_btn_color = if plus_btn_hovered {
-                    egui::Color32::from_rgb(55, 55, 65)
+                    tab_hover_fill
                 } else {
                     egui::Color32::TRANSPARENT
                 };
 
-                painter.rect_filled(plus_btn_rect, 4.0, plus_btn_color);
+                painter.rect_filled(plus_btn_rect, 6.0, plus_btn_color);
 
                 let plus_text_color = if plus_btn_hovered {
-                    egui::Color32::from_rgb(220, 220, 220)
+                    tb_active_text
                 } else {
-                    egui::Color32::from_rgb(180, 180, 190)
+                    tb_inactive_text
                 };
 
                 painter.text(
@@ -1522,12 +1575,12 @@ impl TerminalApp {
                 };
 
                 let close_win_bg = if close_win_hovered {
-                    egui::Color32::from_rgb(180, 50, 50)
+                    egui::Color32::from_rgb(200, 60, 55)
                 } else {
                     egui::Color32::TRANSPARENT
                 };
 
-                painter.rect_filled(close_win_rect, 4.0, close_win_bg);
+                painter.rect_filled(close_win_rect, 6.0, close_win_bg);
 
                 // 绘制 X 符号
                 let cw_cross = 5.0;
@@ -1535,7 +1588,7 @@ impl TerminalApp {
                 let cw_x_color = if close_win_hovered {
                     egui::Color32::WHITE
                 } else {
-                    egui::Color32::from_rgb(180, 180, 190)
+                    tb_inactive_text
                 };
                 painter.line_segment(
                     [
@@ -1634,9 +1687,9 @@ impl TerminalApp {
                 if let Some(divider) = divider_rect {
                     let painter = ui.painter();
                     let divider_color = if self.dragging_divider {
-                        egui::Color32::from_rgb(100, 150, 200)
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border)
                     } else {
-                        egui::Color32::from_rgb(80, 80, 80)
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border)
                     };
 
                     painter.rect_filled(divider, 0.0, divider_color);
@@ -1746,7 +1799,13 @@ impl TerminalApp {
                 .default_size([340.0, 50.0])
                 .fixed_size([340.0, 50.0])
                 .frame(egui::Frame {
-                    fill: egui::Color32::from_rgb(40, 40, 40),
+                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.search.bg),
+                    stroke: egui::Stroke::new(
+                        1.0,
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.search.border),
+                    ),
+                    corner_radius: egui::CornerRadius::same(8),
+                    inner_margin: egui::Margin::same(6),
                     ..Default::default()
                 })
                 .show(ctx, |ui| {
@@ -1827,8 +1886,13 @@ impl TerminalApp {
                 .default_size([palette_width, palette_height])
                 .fixed_size([palette_width, palette_height])
                 .frame(egui::Frame {
-                    fill: egui::Color32::from_rgb(40, 40, 40),
-                    stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
+                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
+                    stroke: egui::Stroke::new(
+                        1.0,
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
+                    ),
+                    corner_radius: egui::CornerRadius::same(10),
+                    inner_margin: egui::Margin::same(8),
                     ..Default::default()
                 })
                 .show(ctx, |ui| {
@@ -1971,7 +2035,13 @@ impl TerminalApp {
 
         // 帮助面板 UI（浮动窗口）
         let mut help_open = self.help_panel.is_open;
-        self.help_panel.show(ctx, &mut help_open);
+        self.help_panel.show(
+            ctx,
+            &mut help_open,
+            &self.command_palette,
+            &self.keybindings,
+            &self.current_theme,
+        );
         self.help_panel.is_open = help_open;
 
         // 配置面板 UI（浮动窗口）

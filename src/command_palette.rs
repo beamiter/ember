@@ -96,6 +96,11 @@ impl CommandPalette {
         }
     }
 
+    /// 所有可用命令（供帮助面板等枚举使用）
+    pub fn all_commands(&self) -> &[CommandInfo] {
+        &self.all_commands
+    }
+
     /// 构建所有可用命令列表
     fn build_commands() -> Vec<CommandInfo> {
         vec![

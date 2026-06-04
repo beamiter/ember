@@ -5,6 +5,16 @@ use egui::{Color32, FontId, Response, Ui, Vec2};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
+/// Per-column ligature override produced by shaping a printable-ASCII run.
+#[derive(Clone, Copy)]
+enum LigOverride {
+    /// This column is the anchor of a shaped (possibly multi-cell) glyph.
+    Glyph { region: gpu::font_backend::GlyphRegion },
+    /// This column is consumed by a ligature anchored at an earlier column;
+    /// suppress its foreground glyph (background/underline stay per-cell).
+    Covered,
+}
+
 /// Quantize to 1/4 pixel increments for subpixel rendering cache coherence.
 fn quantize_subpixel(v: f32) -> u8 {
     let quantized = (v * 4.0).round() as u8;
@@ -286,6 +296,8 @@ pub struct TerminalRenderer {
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
     pub opacity: f32,
+    /// Whether to enable font ligatures (rustybuzz shaping of ASCII runs)
+    pub font_ligatures: bool,
     /// Whether to use GPU-accelerated grid rendering
     pub gpu_rendering: bool,
     /// wgpu render state for GPU-accelerated grid rendering
@@ -347,6 +359,7 @@ impl TerminalRenderer {
             last_content_rect: None,
             last_ime_rect: None,
             opacity: 1.0,
+            font_ligatures: true,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             wgpu_render_state: None,
@@ -1159,12 +1172,13 @@ impl TerminalRenderer {
 
         // Draw scrollbar background and thumb
         if show_scrollbar {
+            let sb = &self.theme.scrollbar;
             let track_color = if self.dragging_scrollbar {
-                Color32::from_rgba_unmultiplied(92, 92, 100, 88)
+                crate::theme::Theme::rgba_to_color32(sb.track_drag)
             } else if scrollbar_hovered {
-                Color32::from_rgba_unmultiplied(84, 84, 92, 64)
+                crate::theme::Theme::rgba_to_color32(sb.track_hover)
             } else {
-                Color32::from_rgba_unmultiplied(72, 72, 80, 42)
+                crate::theme::Theme::rgba_to_color32(sb.track_normal)
             };
             painter.rect_filled(scrollbar_rect, 6.0, track_color);
 
@@ -1186,11 +1200,11 @@ impl TerminalRenderer {
 
                 // Visual feedback: thumb changes color when being dragged
                 let thumb_color = if self.dragging_scrollbar {
-                    Color32::from_rgba_unmultiplied(188, 188, 196, 188)
+                    crate::theme::Theme::rgba_to_color32(sb.thumb_drag)
                 } else if scrollbar_hovered {
-                    Color32::from_rgba_unmultiplied(166, 166, 176, 156)
+                    crate::theme::Theme::rgba_to_color32(sb.thumb_hover)
                 } else {
-                    Color32::from_rgba_unmultiplied(146, 146, 156, 118)
+                    crate::theme::Theme::rgba_to_color32(sb.thumb_normal)
                 };
                 painter.rect_filled(thumb_rect.shrink2(egui::vec2(1.0, 0.0)), 6.0, thumb_color);
             }
@@ -1309,6 +1323,7 @@ impl TerminalRenderer {
         }
 
         let any_dirty = dirty_rows.iter().any(|&d| d);
+        let ligatures = self.font_ligatures;
         if !any_dirty && !self.cached_instances.is_empty() {
             // Nothing changed — reuse cached instances as-is
         } else {
@@ -1385,6 +1400,7 @@ impl TerminalRenderer {
                             target_cell_width,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
+                            ligatures,
                             row_idx,
                             cols,
                         );
@@ -1420,6 +1436,7 @@ impl TerminalRenderer {
                             target_cell_width,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
+                            ligatures,
                             row_idx,
                             cols,
                         );
@@ -1468,6 +1485,7 @@ impl TerminalRenderer {
                                 target_cell_width,
                                 glyph_offset_x_adjust,
                                 glyph_offset_y_adjust,
+                                ligatures,
                                 row_idx,
                                 cols,
                             );
@@ -1576,10 +1594,64 @@ impl TerminalRenderer {
         cell_width: f32,
         glyph_offset_x_adjust: f32,
         glyph_offset_y_adjust: f32,
+        ligatures: bool,
         row_idx: usize,
         cols: usize,
     ) {
         let sel_cols = terminal.row_selection_cols(row_idx);
+
+        // Ligature pass: shape contiguous printable-ASCII runs of the same weight.
+        // Only override glyphs when shaping actually merges cells (a ligature
+        // formed); plain text keeps the per-cell path untouched. Background fills,
+        // underlines and selection remain strictly per-cell.
+        let lig_map: Vec<Option<LigOverride>> = if ligatures && gpu_res.atlas.supports_shaping() {
+            let mut map: Vec<Option<LigOverride>> = vec![None; cols];
+            let row = &grid[row_idx];
+            let is_run_char = |cell: &crate::terminal::TerminalCell| {
+                let cp = cell.character as u32;
+                (0x21..=0x7e).contains(&cp)
+                    && !cell.flags.wide()
+                    && !cell.flags.wide_continuation()
+            };
+            let mut col = 0usize;
+            while col < cols {
+                if !is_run_char(&row[col]) {
+                    col += 1;
+                    continue;
+                }
+                let bold = row[col].flags.bold();
+                let run_start = col;
+                let mut run = String::new();
+                let mut c = col;
+                while c < cols && is_run_char(&row[c]) && row[c].flags.bold() == bold {
+                    run.push(row[c].character);
+                    c += 1;
+                }
+                let run_len = c - run_start;
+                if run_len >= 2 {
+                    let cell_x = run_start as f32 * cell_width + glyph_offset_x_adjust;
+                    let subpixel_bin = quantize_subpixel(cell_x.fract().abs());
+                    let shaped = gpu_res.atlas.shape_run(&run, bold, subpixel_bin);
+                    // A merge happened only if fewer glyphs than input columns.
+                    if shaped.len() < run_len {
+                        for col2 in run_start..c {
+                            map[col2] = Some(LigOverride::Covered);
+                        }
+                        for g in &shaped {
+                            // Run is pure ASCII, so cluster byte offset == column offset.
+                            let gcol = run_start + g.cluster as usize;
+                            if gcol < cols {
+                                map[gcol] = Some(LigOverride::Glyph { region: g.region });
+                            }
+                        }
+                    }
+                }
+                col = c;
+            }
+            map
+        } else {
+            Vec::new()
+        };
 
         // Precompute the active match's identity once per row to avoid an O(matches)
         // scan per highlighted cell. A match is uniquely identified by (line, col_start).
@@ -1696,24 +1768,45 @@ impl TerminalRenderer {
                 flags |= gpu::instance::CellInstance::FLAG_STRIKETHROUGH;
             }
 
-            let (u0, v0, u1, v1, glyph_offset_x, glyph_offset_y) = if has_glyph {
-                let cell_x = col_idx as f32 * cell_width + glyph_offset_x_adjust;
-                let subpixel_bin = quantize_subpixel(cell_x.fract().abs());
-                let region = gpu_res.atlas.get_or_rasterize(cell.character, bold, subpixel_bin);
-                if region.width_px > 0.0 && region.height_px > 0.0 {
-                    (
-                        region.u0,
-                        region.v0,
-                        region.u1,
-                        region.v1,
-                        (region.bearing_x + glyph_offset_x_adjust).round(),
-                        (region.bearing_y + glyph_offset_y_adjust).round(),
-                    )
-                } else {
+            let lig = lig_map.get(col_idx).and_then(|o| o.as_ref());
+            let (u0, v0, u1, v1, glyph_offset_x, glyph_offset_y) = match lig {
+                Some(LigOverride::Covered) => {
+                    // Consumed by a ligature anchored earlier: no foreground glyph.
+                    flags &= !gpu::instance::CellInstance::FLAG_HAS_GLYPH;
                     (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                 }
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                Some(LigOverride::Glyph { region }) => {
+                    if region.width_px > 0.0 && region.height_px > 0.0 {
+                        (
+                            region.u0,
+                            region.v0,
+                            region.u1,
+                            region.v1,
+                            (region.bearing_x + glyph_offset_x_adjust).round(),
+                            (region.bearing_y + glyph_offset_y_adjust).round(),
+                        )
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    }
+                }
+                None if has_glyph => {
+                    let cell_x = col_idx as f32 * cell_width + glyph_offset_x_adjust;
+                    let subpixel_bin = quantize_subpixel(cell_x.fract().abs());
+                    let region = gpu_res.atlas.get_or_rasterize(cell.character, bold, subpixel_bin);
+                    if region.width_px > 0.0 && region.height_px > 0.0 {
+                        (
+                            region.u0,
+                            region.v0,
+                            region.u1,
+                            region.v1,
+                            (region.bearing_x + glyph_offset_x_adjust).round(),
+                            (region.bearing_y + glyph_offset_y_adjust).round(),
+                        )
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    }
+                }
+                None => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             };
 
             let [fg_r, fg_g, fg_b, fg_a] = fg_color.to_srgba_unmultiplied();

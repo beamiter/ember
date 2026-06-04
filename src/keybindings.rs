@@ -323,6 +323,32 @@ impl KeyBindings {
             .and_then(|cmd_str| cmd_str.parse::<Command>().ok())
     }
 
+    /// 反向查找：给定命令名，返回所有绑定的人类可读组合键（如 "Ctrl+Shift+T"）
+    pub fn pretty_bindings_for(&self, command: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .bindings
+            .iter()
+            .filter(|(_, cmd)| cmd.as_str() == command)
+            .map(|(key, _)| Self::prettify_binding(key))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// 将 "ctrl+shift+t" 美化为 "Ctrl+Shift+T"
+    fn prettify_binding(key: &str) -> String {
+        key.split('+')
+            .map(|tok| {
+                let mut chars = tok.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
     /// 检测快捷键冲突
     pub fn check_conflicts(&self) -> Vec<String> {
         let mut conflicts = Vec::new();

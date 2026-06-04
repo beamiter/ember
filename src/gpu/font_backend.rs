@@ -36,12 +36,16 @@ pub struct AtlasGlyphKey {
 }
 
 /// A shaped glyph from rustybuzz, ready for rendering.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ShapedGlyph {
     pub cluster: u32,
+    // Advance/offset metrics from shaping. Retained as part of the shaping API;
+    // the current monospace cluster→column placement does not consume them.
+    #[allow(dead_code)]
     pub x_advance: f32,
+    #[allow(dead_code)]
     pub x_offset: f32,
+    #[allow(dead_code)]
     pub y_offset: f32,
     pub region: GlyphRegion,
 }
@@ -58,13 +62,12 @@ pub trait FontBackend: Send + Sync {
     fn atlas_dimensions(&self) -> (u32, u32);
     fn take_needs_rebind(&mut self) -> bool;
 
-    #[allow(dead_code)]
     fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Vec<ShapedGlyph> {
         let mut glyphs = Vec::new();
-        for ch in text.chars() {
+        for (byte_idx, ch) in text.char_indices() {
             let region = self.get_or_rasterize(ch, bold, subpixel_offset);
             glyphs.push(ShapedGlyph {
-                cluster: 0,
+                cluster: byte_idx as u32,
                 x_advance: region.width_px,
                 x_offset: 0.0,
                 y_offset: 0.0,
@@ -74,7 +77,6 @@ pub trait FontBackend: Send + Sync {
         glyphs
     }
 
-    #[allow(dead_code)]
     fn supports_shaping(&self) -> bool {
         false
     }

@@ -691,10 +691,10 @@ impl FontBackend for FontdueAtlas {
         if !self.shaping_enabled || text.is_empty() {
             // Fallback: per-character rasterization
             let mut glyphs = Vec::with_capacity(text.len());
-            for ch in text.chars() {
+            for (byte_idx, ch) in text.char_indices() {
                 let region = self.get_or_rasterize(ch, bold, subpixel_offset);
                 glyphs.push(ShapedGlyph {
-                    cluster: 0,
+                    cluster: byte_idx as u32,
                     x_advance: region.width_px,
                     x_offset: 0.0,
                     y_offset: 0.0,
@@ -715,10 +715,10 @@ impl FontBackend for FontdueAtlas {
             None => {
                 // Fallback if face parsing fails
                 let mut glyphs = Vec::with_capacity(text.len());
-                for ch in text.chars() {
+                for (byte_idx, ch) in text.char_indices() {
                     let region = self.get_or_rasterize(ch, bold, subpixel_offset);
                     glyphs.push(ShapedGlyph {
-                        cluster: 0,
+                        cluster: byte_idx as u32,
                         x_advance: region.width_px,
                         x_offset: 0.0,
                         y_offset: 0.0,
