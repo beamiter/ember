@@ -6,6 +6,42 @@ use crate::{config, keybindings, layout};
 use eframe::egui;
 
 impl TerminalApp {
+    /// 处理搜索面板打开时的键盘事件（Esc 关闭、Enter 跳转、上下键浏览历史）。
+    pub fn handle_search_panel_input(&mut self) {
+        if self.search_state.is_open {
+            let events_copy = self.frame_events.clone();
+            for evt in &events_copy {
+                match evt {
+                    egui::Event::Key {
+                        key,
+                        modifiers,
+                        pressed,
+                        ..
+                    } if *pressed => match key {
+                        egui::Key::Escape => {
+                            self.search_state.close();
+                        }
+                        egui::Key::Enter => {
+                            if !modifiers.shift {
+                                self.search_state.next_match();
+                            } else {
+                                self.search_state.prev_match();
+                            }
+                        }
+                        egui::Key::ArrowUp => {
+                            self.search_state.history_prev();
+                        }
+                        egui::Key::ArrowDown => {
+                            self.search_state.history_next();
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// 处理命令调色板打开时的输入。返回 true 表示 update 应提前结束本帧。
     pub fn handle_command_palette_input(&mut self, ctx: &egui::Context) -> bool {
         if self.command_palette.is_open {

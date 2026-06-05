@@ -1142,41 +1142,11 @@ impl eframe::App for TerminalApp {
         // 获取当前活跃会话（在所有快捷键处理完后）
         let session_count_before = self.session_manager.len();
         let mut shell_exited = false;
-        let session = self.session_manager.get_active_session_mut();
 
         // Step 2.5: 搜索面板事件处理
-        if self.search_state.is_open {
-            let events_copy = self.frame_events.clone();
-            for evt in &events_copy {
-                match evt {
-                    egui::Event::Key {
-                        key,
-                        modifiers,
-                        pressed,
-                        ..
-                    } if *pressed => match key {
-                        egui::Key::Escape => {
-                            self.search_state.close();
-                        }
-                        egui::Key::Enter => {
-                            if !modifiers.shift {
-                                self.search_state.next_match();
-                            } else {
-                                self.search_state.prev_match();
-                            }
-                        }
-                        egui::Key::ArrowUp => {
-                            self.search_state.history_prev();
-                        }
-                        egui::Key::ArrowDown => {
-                            self.search_state.history_next();
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-        }
+        self.handle_search_panel_input();
+
+        let session = self.session_manager.get_active_session_mut();
 
         // Step 3: 处理复制粘贴（从配置系统或硬编码的 Ctrl+Shift+C/V）
         let events_copy = self.frame_events.clone();
