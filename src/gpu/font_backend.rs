@@ -52,6 +52,7 @@ pub struct ShapedGlyph {
 
 pub trait FontBackend: Send + Sync {
     fn get_or_rasterize(&mut self, ch: char, bold: bool, subpixel_offset: u8) -> GlyphRegion;
+    // Part of the backend trait surface; not invoked on the current render path.
     #[allow(dead_code)]
     fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue);
     fn font_metrics(&self) -> (f32, f32, f32);

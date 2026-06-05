@@ -31,8 +31,6 @@ impl ImageFormat {
 #[derive(Debug, Clone)]
 pub struct KittyImage {
     pub id: u32,
-    #[allow(dead_code)]
-    pub format: ImageFormat,
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>, // 原始或解码后的图像数据
@@ -68,13 +66,8 @@ pub struct KittyGraphicsParams {
 }
 
 /// 待传输的图像数据
-#[allow(dead_code)]
 pub struct PendingTransfer {
-    pub image_id: u32,
-    pub format: ImageFormat,
     pub chunks: Vec<Vec<u8>>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
 }
 
 /// Kitty 图像协议状态管理
@@ -193,11 +186,7 @@ impl KittyGraphicsState {
         if params.more {
             // 分块传输，需要缓存
             let pending = self.pending_transfer.get_or_insert(PendingTransfer {
-                image_id,
-                format,
                 chunks: Vec::new(),
-                width: params.width,
-                height: params.height,
             });
             pending.chunks.push(data);
         } else {
@@ -242,7 +231,6 @@ impl KittyGraphicsState {
                 image_id,
                 KittyImage {
                     id: image_id,
-                    format,
                     width,
                     height,
                     data: final_data,
@@ -353,16 +341,6 @@ impl KittyGraphicsState {
         Ok(())
     }
 
-    /// 获取性能统计
-    #[allow(dead_code)]
-    pub fn get_stats(&self) -> (u32, u64, usize) {
-        (
-            self.total_decoded,
-            self.total_bytes_processed,
-            self.images.len(),
-        )
-    }
-
     /// 获取所有放置
     pub fn get_placements(&self) -> &[KittyPlacement] {
         &self.placements
@@ -379,14 +357,6 @@ impl KittyGraphicsState {
 
     pub fn image_memory_mb(&self) -> u64 {
         self.total_image_memory / 1_000_000
-    }
-
-    /// 清除所有数据
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.images.clear();
-        self.placements.clear();
-        self.pending_transfer = None;
     }
 }
 

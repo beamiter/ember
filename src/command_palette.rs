@@ -311,12 +311,6 @@ impl CommandPalette {
     pub fn get_results(&self) -> &[(CommandInfo, i64)] {
         &self.search_results
     }
-
-    /// 获取最多显示多少条结果
-    #[allow(dead_code)]
-    pub fn max_visible_results(&self) -> usize {
-        15
-    }
 }
 
 impl Default for CommandPalette {

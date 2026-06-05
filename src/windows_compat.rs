@@ -1,4 +1,7 @@
+// Cross-platform compatibility shims. On non-Windows builds the stub
+// implementations and PlatformCapabilities are compiled but unused.
 #![allow(dead_code)]
+
 #[cfg(target_os = "windows")]
 pub mod windows_support {
     use std::path::PathBuf;

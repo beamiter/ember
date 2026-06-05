@@ -104,32 +104,10 @@ impl TerminalGrid {
         self.cols
     }
 
-    /// 获取行作Vec引用（用于兼容旧代码）
-    pub fn get_row(&self, row: usize) -> Vec<TerminalCell> {
-        let start = row * self.cols;
-        let end = start + self.cols;
-        self.cells[start..end].to_vec()
-    }
-
-    /// 返回行数（兼容 grid.len()）
-    #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.rows
-    }
-
     /// 返回行数（兼容 grid[i].len()）
     #[inline]
     pub fn row_len(&self) -> usize {
         self.cols
-    }
-
-    /// 设置整行
-    #[allow(dead_code)]
-    pub fn set_row(&mut self, row: usize, cells: Vec<TerminalCell>) {
-        let start = row * self.cols;
-        let copy_len = cells.len().min(self.cols);
-        self.cells[start..start + copy_len].copy_from_slice(&cells[..copy_len]);
     }
 
     /// 获取所有行为Vec<Vec> (用于兼容旧代码)
@@ -162,17 +140,7 @@ impl TerminalGrid {
         self.cells[start + self.cols - 1] = TerminalCell::default();
     }
 
-    /// 删除第一行，向上移动所有行，末尾补新行
-    #[allow(dead_code)]
-    pub fn remove_first_row(&mut self) -> (Vec<TerminalCell>, bool) {
-        let removed = self.get_row(0);
-        let was_wrapped = self.row_wrapped[0];
-        self.shift_rows_up();
-        (removed, was_wrapped)
-    }
-
     /// Shift all rows up by one (discard first row, blank last row).
-    /// Does not return the removed row - use get_row(0) before calling if needed.
     #[inline]
     pub fn shift_rows_up(&mut self) {
         self.cells.copy_within(self.cols.., 0);
@@ -279,11 +247,8 @@ pub enum UnderlineStyle {
     None,
     Single,
     Double,
-    #[allow(dead_code)]
     Curly,   // SGR 4:3
-    #[allow(dead_code)]
     Dotted,  // SGR 4:4
-    #[allow(dead_code)]
     Dashed,  // SGR 4:5
 }
 
@@ -443,11 +408,6 @@ impl ScrollbackLine {
                 Self::decode_cells(data, self.cols as usize)
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn cells(&self) -> Vec<TerminalCell> {
-        self.decompress()
     }
 
     fn encode_color(color: &Color, buf: &mut Vec<u8>) {
@@ -654,18 +614,18 @@ const _: () = assert!(std::mem::size_of::<TerminalCell>() == 16);
 #[derive(Clone, Debug)]
 pub struct DirtyRegion {
     pub rows: Vec<(usize, usize)>, // (row_start, row_end)，包含端点
-    #[allow(dead_code)]
-    pub col_start: usize,
-    #[allow(dead_code)]
-    pub col_end: usize,
+}
+
+impl Default for DirtyRegion {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirtyRegion {
-    pub fn new(cols: usize) -> Self {
+    pub fn new() -> Self {
         DirtyRegion {
             rows: Vec::new(),
-            col_start: 0,
-            col_end: cols,
         }
     }
 
@@ -730,25 +690,6 @@ pub enum ClipboardReadKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardReadRequest {
     pub kind: ClipboardReadKind,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct CommandZone {
-    pub prompt_start: usize,
-    pub command_start: Option<usize>,
-    pub output_start: Option<usize>,
-    pub output_end: Option<usize>,
-    pub exit_code: Option<i32>,
-}
-
-#[derive(Clone, Debug, Default)]
-enum ZoneState {
-    #[default]
-    Idle,
-    PromptStarted(usize),
-    CommandStarted(usize, usize),
-    OutputStarted(usize, usize, usize),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -874,8 +815,6 @@ pub struct TerminalState {
 
     // OSC 8 hyperlink tracking
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)
-    #[allow(dead_code)]
-    osc8_hyperlinks: Vec<crate::link::Link>, // Stored hyperlinks from OSC 8
 
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
     pub sync_output_active: bool,
@@ -885,10 +824,6 @@ pub struct TerminalState {
     pub pending_osc52_clipboard_set: Option<String>,
     // OSC 52 clipboard query pending (needs clipboard read + response)
     pub pending_osc52_clipboard_query: bool,
-
-    // OSC 133 shell integration: command zones for prompt navigation
-    pub command_zones: VecDeque<CommandZone>,
-    current_zone_state: ZoneState,
 
     // OSC 10/11/12 dynamic colors
     pub dynamic_fg: Option<(u8, u8, u8)>,
@@ -938,7 +873,7 @@ impl TerminalState {
         modes.insert(25);
         modes.insert(7);
 
-        let mut dirty_region = DirtyRegion::new(cols);
+        let mut dirty_region = DirtyRegion::new();
         // Mark all rows as dirty on initialization to ensure first frame renders correctly
         dirty_region.mark_all(rows);
 
@@ -992,13 +927,10 @@ impl TerminalState {
             row_versions: vec![1; rows],  // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
             current_hyperlink: None,
-            osc8_hyperlinks: Vec::new(),
             sync_output_active: false,
             sync_output_start: None,
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
-            command_zones: VecDeque::new(),
-            current_zone_state: ZoneState::default(),
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor_color: None,
@@ -1075,65 +1007,6 @@ impl TerminalState {
             }
         }
         None
-    }
-
-    fn handle_osc_133(&mut self, value: &str) {
-        let absolute_row = self.scrollback.len() + self.cursor_row;
-        let mark = value.chars().next().unwrap_or('\0');
-        match mark {
-            'A' => {
-                // Prompt start
-                self.current_zone_state = ZoneState::PromptStarted(absolute_row);
-            }
-            'B' => {
-                // Command start (user is typing the command)
-                if let ZoneState::PromptStarted(prompt_start) = self.current_zone_state {
-                    self.current_zone_state = ZoneState::CommandStarted(prompt_start, absolute_row);
-                }
-            }
-            'C' => {
-                // Command executed (output begins)
-                if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state {
-                    self.current_zone_state =
-                        ZoneState::OutputStarted(prompt_start, cmd_start, absolute_row);
-                }
-            }
-            'D' => {
-                // Command finished
-                let exit_code = value.get(2..).and_then(|s| s.parse::<i32>().ok());
-                match self.current_zone_state {
-                    ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
-                        let zone = CommandZone {
-                            prompt_start,
-                            command_start: Some(cmd_start),
-                            output_start: Some(out_start),
-                            output_end: Some(absolute_row),
-                            exit_code,
-                        };
-                        self.command_zones.push_back(zone);
-                        if self.command_zones.len() > 256 {
-                            self.command_zones.pop_front();
-                        }
-                    }
-                    ZoneState::CommandStarted(prompt_start, cmd_start) => {
-                        let zone = CommandZone {
-                            prompt_start,
-                            command_start: Some(cmd_start),
-                            output_start: None,
-                            output_end: Some(absolute_row),
-                            exit_code,
-                        };
-                        self.command_zones.push_back(zone);
-                        if self.command_zones.len() > 256 {
-                            self.command_zones.pop_front();
-                        }
-                    }
-                    _ => {}
-                }
-                self.current_zone_state = ZoneState::Idle;
-            }
-            _ => {}
-        }
     }
 
     fn handle_osc_52(&mut self, value: &str) {
@@ -1555,30 +1428,6 @@ impl TerminalState {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn is_focus_event_mode(&self) -> bool {
-        self.modes.contains(&1004)
-    }
-
-    #[allow(dead_code)]
-    pub fn is_bracketed_paste_mode(&self) -> bool {
-        self.modes.contains(&2004)
-    }
-
-    #[allow(dead_code)]
-    pub fn emit_focus_in(&mut self) {
-        if self.modes.contains(&1004) {
-            self.output_buffer.extend_from_slice(b"\x1b[I");
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn emit_focus_out(&mut self) {
-        if self.modes.contains(&1004) {
-            self.output_buffer.extend_from_slice(b"\x1b[O");
-        }
-    }
-
     pub fn process_input(&mut self, input: &[u8]) {
         // Fast path: if no pending escape, process input directly without allocation
         let data;
@@ -1740,8 +1589,6 @@ impl TerminalState {
                                                     self.pending_notifications.push((title, body));
                                                 }
                                             }
-                                        } else if command == "133" {
-                                            self.handle_osc_133(value);
                                         } else if command == "52" {
                                             self.handle_osc_52(value);
                                         } else if command == "5522" {
@@ -3107,11 +2954,6 @@ impl TerminalState {
     #[inline]
     fn viewport_row_to_absolute(&self, viewport_row: usize) -> usize {
         self.scrollback.len().saturating_sub(self.scroll_offset) + viewport_row
-    }
-
-    #[allow(dead_code)]
-    pub fn select_text(&mut self, anchor: (usize, usize), active: (usize, usize)) {
-        self.selection = Some(Selection { anchor, active, mode: SelectionMode::Normal });
     }
 
     /// Start a new selection at a viewport-relative position.

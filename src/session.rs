@@ -3,7 +3,6 @@ use crate::terminal::TerminalState;
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 /// Generate a unique session ID for rsh session persistence.
 pub fn generate_session_id() -> String {
@@ -17,24 +16,19 @@ pub fn generate_session_id() -> String {
 /// Session metadata - 会话元数据
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
-    pub id: Uuid,
     pub name: String,
     pub tags: Vec<String>,
     pub session_id: String,
-    pub created_at: Instant,
     pub last_active: Instant,
 }
 
 impl SessionMetadata {
     pub fn new(name: String, tags: Vec<String>) -> Self {
-        let now = Instant::now();
         SessionMetadata {
-            id: Uuid::new_v4(),
             name,
             tags,
             session_id: generate_session_id(),
-            created_at: now,
-            last_active: now,
+            last_active: Instant::now(),
         }
     }
 
@@ -75,22 +69,6 @@ impl Session {
     ) -> Self {
         let name = SessionMetadata::default_name(index);
         Session::new(name, Vec::new(), terminal, shell)
-    }
-
-    pub fn add_tag(&mut self, tag: String) {
-        if !self.metadata.tags.contains(&tag) {
-            self.metadata.tags.push(tag);
-        }
-        self.metadata.update_last_active();
-    }
-
-    pub fn remove_tag(&mut self, tag: &str) {
-        self.metadata.tags.retain(|t| t != tag);
-        self.metadata.update_last_active();
-    }
-
-    pub fn has_tag(&self, tag: &str) -> bool {
-        self.metadata.tags.contains(&tag.to_string())
     }
 
     /// 获取 shell 子进程的 PID

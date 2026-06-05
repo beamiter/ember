@@ -129,7 +129,6 @@ impl LayoutManager {
                 self.focused_pane_id = self.panes[next_idx].id;
                 true
             }
-            _ => false, // 上下左右暂不支持（MVP）
         }
     }
 
@@ -149,21 +148,6 @@ impl LayoutManager {
     /// 获取所有窗格
     pub fn panes(&self) -> &[Pane] {
         &self.panes
-    }
-
-    /// 获取可变窗格列表
-    pub fn panes_mut(&mut self) -> &mut [Pane] {
-        &mut self.panes
-    }
-
-    /// 获取焦点窗格
-    pub fn focused_pane(&self) -> Option<&Pane> {
-        self.panes.iter().find(|p| p.id == self.focused_pane_id)
-    }
-
-    /// 获取焦点窗格会话索引
-    pub fn focused_session_idx(&self) -> usize {
-        self.focused_pane().map(|p| p.session_idx).unwrap_or(0)
     }
 
     /// 计算窗格矩形（基于容器矩形和分割比例）
@@ -249,22 +233,6 @@ impl LayoutManager {
         }
     }
 
-    /// 判断坐标是否在分割线上
-    pub fn is_on_divider(&self, pos: egui::Pos2) -> bool {
-        if let Some(divider_rect) = self.get_divider_rect() {
-            divider_rect.contains(pos)
-        } else {
-            false
-        }
-    }
-
-    /// 从坐标获取窗格 ID
-    pub fn pane_at_pos(&self, pos: egui::Pos2) -> Option<PaneId> {
-        self.panes
-            .iter()
-            .find(|p| p.rect.contains(pos))
-            .map(|p| p.id)
-    }
 }
 
 /// 窗格方向
@@ -272,8 +240,4 @@ impl LayoutManager {
 pub enum PaneDirection {
     Next,
     Prev,
-    Up,
-    Down,
-    Left,
-    Right,
 }

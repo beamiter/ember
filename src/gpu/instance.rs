@@ -37,6 +37,7 @@ pub struct CellInstance {
 impl CellInstance {
     pub const FLAG_HAS_GLYPH: u32 = 1;
     pub const FLAG_WIDE: u32 = 2;
+    // Documents the flags bit layout shared with the shader; not all are read from Rust.
     #[allow(dead_code)]
     pub const UNDERLINE_SHIFT: u32 = 2;
     #[allow(dead_code)]

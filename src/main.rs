@@ -9,28 +9,22 @@ mod debug;
 mod debug_panel;
 mod gpu;
 mod help;
-#[allow(dead_code)]
 mod keybindings;
 mod kitty_graphics;
-#[allow(dead_code)]
 mod layout;
 mod link;
 mod pty;
 mod search;
-#[allow(dead_code)]
 mod search_replace;
 mod search_replace_panel;
-#[allow(dead_code)]
 mod session;
 mod session_manager;
 mod session_persistence;
 mod shell;
-#[allow(dead_code)]
 mod sidebar;
 mod terminal;
 mod theme;
 mod ui;
-#[allow(dead_code)]
 mod windows_compat;
 
 use app::events::{normalize_terminal_shortcut_events, should_restore_terminal_shortcut_event};

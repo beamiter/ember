@@ -85,15 +85,3 @@ pub fn color_256(idx: u8, theme: &Theme) -> Color32 {
         }
     }
 }
-
-#[allow(dead_code)]
-pub mod defaults {
-    use egui::Color32;
-
-    pub const FOREGROUND: Color32 = Color32::from_rgb(229, 229, 229);
-    pub const BACKGROUND: Color32 = Color32::from_rgb(29, 29, 29);
-    pub const CURSOR: Color32 = Color32::from_rgb(127, 127, 127);
-    pub fn selection() -> Color32 {
-        Color32::from_rgba_unmultiplied(200, 200, 200, 100)
-    }
-}

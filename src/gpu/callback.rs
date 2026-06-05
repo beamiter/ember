@@ -10,6 +10,7 @@ pub struct GpuResources {
     pub pipeline: GridPipeline,
     pub color_atlas_view: wgpu::TextureView,
     pub color_atlas_sampler: wgpu::Sampler,
+    // Retained to keep the GPU texture alive (color_atlas_view borrows from it); never read directly.
     #[allow(dead_code)]
     color_atlas_texture: wgpu::Texture,
     atlas_gen: u64,

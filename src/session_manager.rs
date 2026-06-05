@@ -134,96 +134,25 @@ impl SessionManager {
         &mut self.sessions[self.active_index]
     }
 
-    /// 获取当前活跃会话（不可变引用）
-    #[allow(dead_code)]
-    pub fn get_active_session(&self) -> &Session {
-        &self.sessions[self.active_index]
-    }
-
-    #[allow(dead_code)]
     /// 获取指定索引的会话（可变引用）
     pub fn get_session_mut(&mut self, index: usize) -> Option<&mut Session> {
         self.sessions.get_mut(index)
     }
 
-    #[allow(dead_code)]
-    /// 获取指定索引的会话（不可变引用）
-    pub fn get_session(&self, index: usize) -> Option<&Session> {
-        self.sessions.get(index)
-    }
-
-    #[allow(dead_code)]
     /// 获取所有会话的不可变引用
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
     }
 
-    #[allow(dead_code)]
     /// 获取所有会话的可变引用
     pub fn sessions_mut(&mut self) -> &mut [Session] {
         &mut self.sessions
     }
 
-    #[allow(dead_code)]
-    /// 会话总数
+    /// 会话总数（始终 ≥ 1，不存在空状态，故无 is_empty）
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.sessions.len()
-    }
-
-    #[allow(dead_code)]
-    /// 检查是否为空
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
-
-    #[allow(dead_code)]
-    /// 向指定会话添加标签
-    pub fn add_tag(&mut self, session_index: usize, tag: String) {
-        if let Some(session) = self.sessions.get_mut(session_index) {
-            session.add_tag(tag);
-        }
-    }
-    #[allow(dead_code)]
-
-    /// 从指定会话删除标签
-    pub fn remove_tag(&mut self, session_index: usize, tag: &str) {
-        if let Some(session) = self.sessions.get_mut(session_index) {
-            session.remove_tag(tag);
-        }
-    }
-    #[allow(dead_code)]
-
-    /// 获取包含指定标签的所有会话索引
-    pub fn get_sessions_by_tag(&self, tag: &str) -> Vec<usize> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, session)| session.has_tag(tag))
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    /// 获取所有唯一的标签
-    #[allow(dead_code)]
-    pub fn get_all_tags(&self) -> Vec<String> {
-        let mut tags = std::collections::HashSet::new();
-        for session in &self.sessions {
-            for tag in &session.metadata.tags {
-                tags.insert(tag.clone());
-            }
-        }
-        let mut result: Vec<_> = tags.into_iter().collect();
-        result.sort();
-        result
-    }
-
-    /// 重命名会话
-    #[allow(dead_code)]
-    pub fn rename_session(&mut self, session_index: usize, name: String) {
-        if let Some(session) = self.sessions.get_mut(session_index) {
-            session.metadata.name = name;
-            session.metadata.update_last_active();
-        }
     }
 
     /// 重排会话顺序（拖拽）

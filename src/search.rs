@@ -101,16 +101,6 @@ impl SearchState {
         }
     }
 
-    /// 获取当前匹配项（如果有）
-    #[allow(dead_code)]
-    pub fn current_match(&self) -> Option<SearchMatch> {
-        if self.matches.is_empty() {
-            None
-        } else {
-            Some(self.matches[self.current_match_index % self.matches.len()])
-        }
-    }
-
     /// 移动到下一个匹配项
     pub fn next_match(&mut self) {
         if !self.matches.is_empty() {
@@ -127,21 +117,6 @@ impl SearchState {
                 self.current_match_index - 1
             };
         }
-    }
-
-    /// 切换大小写敏感
-    #[allow(dead_code)]
-    pub fn toggle_case_sensitive(&mut self) {
-        self.case_sensitive = !self.case_sensitive;
-        self.current_match_index = 0;
-    }
-
-    /// 切换正则表达式模式
-    #[allow(dead_code)]
-    pub fn toggle_regex(&mut self) {
-        self.use_regex = !self.use_regex;
-        self.current_match_index = 0;
-        self.error_message = None;
     }
 
     /// 保存当前搜索词到历史
@@ -211,12 +186,6 @@ impl SearchState {
         }
     }
 
-    /// 清除搜索历史
-    #[allow(dead_code)]
-    pub fn clear_history(&mut self) {
-        self.history.clear();
-        self.history_nav_index = None;
-    }
 }
 
 /// 搜索引擎（用于在网格中进行搜索）
@@ -358,21 +327,5 @@ mod tests {
 
         state.prev_match();
         assert_eq!(state.current_match_index, 1);
-    }
-
-    #[test]
-    fn test_case_sensitive_toggle() {
-        let mut state = SearchState::new();
-        assert!(!state.case_sensitive);
-        state.toggle_case_sensitive();
-        assert!(state.case_sensitive);
-    }
-
-    #[test]
-    fn test_regex_toggle() {
-        let mut state = SearchState::new();
-        assert!(!state.use_regex);
-        state.toggle_regex();
-        assert!(state.use_regex);
     }
 }

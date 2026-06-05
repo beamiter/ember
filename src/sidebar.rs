@@ -135,27 +135,6 @@ impl Sidebar {
         false
     }
 
-    /// 获取 Git 状态（简化版 - 调用 git status）
-    pub fn get_git_status(path: &Path) -> Option<String> {
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .arg("status")
-            .arg("--porcelain")
-            .arg(path)
-            .output()
-            .ok()?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8(output.stdout).ok()?;
-            if !stdout.is_empty() {
-                return Some("●".to_string()); // 表示有改动
-            }
-        }
-
-        None
-    }
-
     /// 刷新当前目录
     pub fn refresh(&mut self) {
         self.root = Self::build_tree(&self.current_dir, 0);

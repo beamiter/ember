@@ -137,118 +137,6 @@ impl std::str::FromStr for Command {
     }
 }
 
-/// 快捷键修饰符
-#[allow(dead_code)]
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[derive(Default)]
-pub struct Modifiers {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub super_key: bool,
-}
-
-
-impl Modifiers {
-    pub fn is_none(&self) -> bool {
-        !self.ctrl && !self.shift && !self.alt && !self.super_key
-    }
-
-    pub fn count(&self) -> usize {
-        (self.ctrl as usize)
-            + (self.shift as usize)
-            + (self.alt as usize)
-            + (self.super_key as usize)
-    }
-}
-
-/// 快捷键（可配置）
-#[allow(dead_code)]
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct KeyBinding {
-    pub key: String, // "a", "Tab", "F1", 等
-    pub modifiers: Modifiers,
-    pub command: Command,
-}
-
-impl KeyBinding {
-    pub fn new(key: &str, modifiers: Modifiers, command: Command) -> Self {
-        Self {
-            key: key.to_lowercase(),
-            modifiers,
-            command,
-        }
-    }
-
-    /// 从快捷键字符串解析（格式：ctrl+shift+a, alt+F1 等）
-    pub fn from_string(binding_str: &str, command: Command) -> Result<Self, String> {
-        let binding_lower = binding_str.to_lowercase();
-        let parts: Vec<&str> = binding_lower.split('+').collect();
-
-        if parts.is_empty() {
-            return Err("Empty binding string".to_string());
-        }
-
-        let mut modifiers = Modifiers::default();
-        let mut key = "";
-
-        for (i, part) in parts.iter().enumerate() {
-            match *part {
-                "ctrl" => modifiers.ctrl = true,
-                "shift" => modifiers.shift = true,
-                "alt" => modifiers.alt = true,
-                "super" | "cmd" => modifiers.super_key = true,
-                _ => {
-                    // 最后一部分应该是按键
-                    if i == parts.len() - 1 {
-                        key = part;
-                    } else {
-                        return Err(format!("Invalid modifier or key: {}", part));
-                    }
-                }
-            }
-        }
-
-        if key.is_empty() {
-            return Err("No key specified".to_string());
-        }
-
-        Ok(Self::new(key, modifiers, command))
-    }
-
-    /// 转换为快捷键字符串表示
-    pub fn to_string(&self) -> String {
-        let mut parts = Vec::new();
-
-        if self.modifiers.ctrl {
-            parts.push("Ctrl");
-        }
-        if self.modifiers.shift {
-            parts.push("Shift");
-        }
-        if self.modifiers.alt {
-            parts.push("Alt");
-        }
-        if self.modifiers.super_key {
-            parts.push("Super");
-        }
-
-        // 按键首字母大写
-        let key = if self.key.len() == 1 {
-            self.key.to_uppercase()
-        } else {
-            format!(
-                "{}{}",
-                self.key.chars().next().unwrap().to_uppercase(),
-                &self.key[1..]
-            )
-        };
-        parts.push(&key);
-
-        parts.join("+")
-    }
-}
-
 /// 快捷键绑定集合
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyBindings {
@@ -366,22 +254,6 @@ impl KeyBindings {
             .join("+")
     }
 
-    /// 检测快捷键冲突
-    pub fn check_conflicts(&self) -> Vec<String> {
-        let mut conflicts = Vec::new();
-
-        // 如果两个不同的快捷键映射到同一个命令，不算冲突
-        // 如果一个快捷键映射到多个命令，这在 HashMap 中不会发生
-
-        for (binding, command_str) in &self.bindings {
-            if let Err(e) = command_str.parse::<Command>() {
-                conflicts.push(format!("Invalid command in binding '{}': {}", binding, e));
-            }
-        }
-
-        conflicts
-    }
-
     /// 加载配置文件，与默认配置合并
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let mut bindings = Self::default_bindings();
@@ -397,17 +269,6 @@ impl KeyBindings {
         }
 
         Ok(bindings)
-    }
-
-    /// 保存配置文件
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::config_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        Ok(())
     }
 
     /// 获取配置文件路径
@@ -437,49 +298,12 @@ mod tests {
     }
 
     #[test]
-    fn test_keybinding_from_string() {
-        let binding = KeyBinding::from_string("ctrl+shift+a", Command::EditCopy).unwrap();
-        assert!(binding.modifiers.ctrl);
-        assert!(binding.modifiers.shift);
-        assert_eq!(binding.key, "a");
-    }
-
-    #[test]
-    fn test_keybinding_display() {
-        let binding = KeyBinding::new(
-            "a",
-            Modifiers {
-                ctrl: true,
-                shift: true,
-                alt: false,
-                super_key: false,
-            },
-            Command::EditCopy,
-        );
-
-        let display = binding.to_string();
-        assert!(display.contains("Ctrl"));
-        assert!(display.contains("Shift"));
-        assert!(display.contains("A"));
-    }
-
-    #[test]
     fn test_default_bindings() {
         let bindings = KeyBindings::default_bindings();
         assert!(bindings.get_command("ctrl+shift+t").is_some());
         assert_eq!(
             bindings.get_command("ctrl+shift+t"),
             Some(Command::SessionNew)
-        );
-    }
-
-    #[test]
-    fn test_conflict_detection() {
-        let bindings = KeyBindings::default_bindings();
-        let conflicts = bindings.check_conflicts();
-        assert!(
-            conflicts.is_empty(),
-            "Default bindings should have no conflicts"
         );
     }
 

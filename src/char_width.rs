@@ -62,8 +62,8 @@ pub fn cached_char_width(ch: char) -> usize {
     })
 }
 
-/// 清除宽度缓存（调试用）
-#[allow(dead_code)]
+/// 清除宽度缓存（仅测试使用）
+#[cfg(test)]
 pub fn clear_width_cache() {
     CHAR_WIDTH_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
@@ -71,8 +71,8 @@ pub fn clear_width_cache() {
     });
 }
 
-/// 获取缓存统计信息（调试用）
-#[allow(dead_code)]
+/// 获取缓存统计信息（仅测试使用）
+#[cfg(test)]
 pub fn get_cache_stats() -> (usize, usize) {
     CHAR_WIDTH_CACHE.with(|cache| {
         let c = cache.borrow();

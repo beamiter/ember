@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 
 /// 高级搜索配置
@@ -16,15 +15,11 @@ pub struct SearchConfig {
 #[derive(Clone, Debug)]
 pub struct ReplaceOptions {
     pub replace_all: bool,
-    pub preserve_case: bool,
 }
 
 impl Default for ReplaceOptions {
     fn default() -> Self {
-        ReplaceOptions {
-            replace_all: false,
-            preserve_case: true,
-        }
+        ReplaceOptions { replace_all: false }
     }
 }
 
@@ -113,27 +108,6 @@ impl SearchAndReplaceEngine {
         };
 
         Ok((result, count))
-    }
-
-    /// 获取搜索匹配的上下文（用于预览）
-    pub fn get_match_context(text: &str, pattern: &str, context_lines: usize) -> Vec<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut result = Vec::new();
-
-        for (idx, line) in lines.iter().enumerate() {
-            if line.contains(pattern) {
-                let start = idx.saturating_sub(context_lines);
-                let end = std::cmp::min(idx + context_lines + 1, lines.len());
-
-                for i in start..end {
-                    let prefix = if i == idx { "→ " } else { "  " };
-                    result.push(format!("{}{:3}: {}", prefix, i + 1, lines[i]));
-                }
-                result.push(String::new()); // 空行分隔
-            }
-        }
-
-        result
     }
 }
 

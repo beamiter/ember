@@ -291,7 +291,6 @@ pub struct TerminalRenderer {
     last_ime_rect: Option<egui::Rect>,
     // Kitty graphics texture cache with LRU eviction (max 100 images)
     // Prevents unbounded memory growth from image sequences
-    #[allow(dead_code)]
     texture_cache: LruCache<u32, (egui::TextureHandle, u32, u32)>,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
