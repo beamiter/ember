@@ -99,6 +99,12 @@ pub fn normalize_terminal_shortcut_events(
             continue;
         }
 
+        // 既不恢复为按键也不保留：丢弃语义剪贴板事件，避免泄漏进终端
+        if matches!(event, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)) {
+            crate::debug_log!("[NORMALIZE] dropping semantic clipboard event");
+            continue;
+        }
+
         normalized_events.push(event);
     }
 

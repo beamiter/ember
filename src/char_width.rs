@@ -32,6 +32,7 @@ thread_local! {
 ///
 /// # Examples
 /// ```
+/// # use jterm2::char_width::cached_char_width;
 /// assert_eq!(cached_char_width('A'), 1);  // ASCII 字符宽度为 1
 /// assert_eq!(cached_char_width('中'), 2); // 中文字符宽度为 2
 /// ```
