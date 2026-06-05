@@ -16,11 +16,10 @@ mod kitty_graphics;
 mod layout;
 mod link;
 mod pty;
-#[allow(dead_code)]
-mod scripting;
 mod search;
 #[allow(dead_code)]
 mod search_replace;
+mod search_replace_panel;
 #[allow(dead_code)]
 mod session;
 mod session_manager;
@@ -617,6 +616,11 @@ use app::state::TerminalApp;
 
 // normalize_terminal_shortcut_events moved to app::events module
 
+/// 用单引号安全包裹路径，供发送到 shell 的 cd 命令使用
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
     let mut wrapped = Vec::with_capacity(payload.len() + 12);
     wrapped.extend_from_slice(b"\x1b[200~");
@@ -792,6 +796,12 @@ impl TerminalApp {
             current_mouse_x: 0.0,
             tab_scroll_offset: 0.0,
             search_state: search::SearchState::new(),
+            sidebar: {
+                let mut sb = sidebar::Sidebar::new();
+                sb.visible = false; // 默认隐藏，opt-in 切换
+                sb
+            },
+            search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
             cached_links: Vec::new(),
@@ -879,9 +889,113 @@ impl TerminalApp {
             .new_session(name, tags, cols, rows, self.config.scrollback_lines)
     }
 
+    /// 渲染左侧文件树侧边栏。必须在 CentralPanel 之前调用，
+    /// 否则中央区域不会正确收缩。
+    #[allow(deprecated)]
+    fn render_sidebar(&mut self, ctx: &egui::Context) {
+        if !self.sidebar.visible {
+            return;
+        }
+
+        // 树遍历期间只收集动作，闭包结束后再 mutate，规避借用冲突
+        let mut toggle_path: Option<std::path::PathBuf> = None;
+        let mut select_path: Option<std::path::PathBuf> = None;
+        let mut cd_path: Option<std::path::PathBuf> = None;
+        let mut do_refresh = false;
+
+        let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
+        egui::SidePanel::left("file_tree")
+            .resizable(true)
+            .default_width(self.sidebar.width)
+            .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Files").strong());
+                    if ui.button("⟳").on_hover_text("Refresh").clicked() {
+                        do_refresh = true;
+                    }
+                });
+                if let Some(dir) = self.sidebar.current_dir.file_name().and_then(|n| n.to_str()) {
+                    ui.label(egui::RichText::new(dir).weak().small());
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(root) = &self.sidebar.root {
+                        for child in &root.children {
+                            Self::draw_tree_node(
+                                ui,
+                                child,
+                                &self.sidebar.selected_path,
+                                &mut toggle_path,
+                                &mut select_path,
+                                &mut cd_path,
+                            );
+                        }
+                    }
+                });
+            });
+
+        // 闭包结束，安全 mutate
+        if let Some(p) = toggle_path {
+            self.sidebar.toggle_node(&p);
+        }
+        if let Some(p) = select_path {
+            self.sidebar.selected_path = Some(p);
+        }
+        if let Some(p) = cd_path {
+            let quoted = shell_single_quote(&p.to_string_lossy());
+            let cmd = format!("cd {}\n", quoted);
+            let session = self.session_manager.get_active_session_mut();
+            let _ = session.shell.write(cmd.as_bytes());
+            self.sidebar.set_current_dir(p);
+        }
+        if do_refresh {
+            self.sidebar.refresh();
+        }
+    }
+
+    /// 递归绘制文件树节点（关联函数，不持 &self 以避免借用冲突）
+    fn draw_tree_node(
+        ui: &mut egui::Ui,
+        node: &sidebar::FileTreeNode,
+        selected: &Option<std::path::PathBuf>,
+        toggle: &mut Option<std::path::PathBuf>,
+        select: &mut Option<std::path::PathBuf>,
+        cd: &mut Option<std::path::PathBuf>,
+    ) {
+        let is_selected = selected.as_deref() == Some(node.path.as_path());
+        if node.is_dir {
+            let arrow = if node.expanded { "▼" } else { "▶" };
+            let label = format!("{} 📁 {}", arrow, node.name);
+            let resp = ui.selectable_label(is_selected, label);
+            if resp.clicked() {
+                *toggle = Some(node.path.clone());
+                *select = Some(node.path.clone());
+            }
+            if resp.double_clicked() {
+                *cd = Some(node.path.clone());
+            }
+            resp.on_hover_text("单击展开/折叠，双击进入目录 (cd)");
+            if node.expanded {
+                ui.indent(node.path.to_string_lossy(), |ui| {
+                    for child in &node.children {
+                        Self::draw_tree_node(ui, child, selected, toggle, select, cd);
+                    }
+                });
+            }
+        } else {
+            let resp = ui.selectable_label(is_selected, format!("📄 {}", node.name));
+            if resp.clicked() {
+                *select = Some(node.path.clone());
+            }
+        }
+    }
+
     #[allow(deprecated)]
     fn render_ui(&mut self, ctx: &egui::Context) {
         let frame = egui::Frame::NONE.inner_margin(0.0);
+
+        self.render_sidebar(ctx);
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             // 消除 tab 栏与终端之间的间距
@@ -2081,6 +2195,36 @@ impl TerminalApp {
             }
         }
 
+        // Find & Replace 面板（对当前选中文本操作）
+        if let Some(sr_action) = self.search_replace_panel.show(ctx, &self.current_theme) {
+            // 先读取选中文本并释放终端锁，再 mutate panel/clipboard/PTY
+            let selection = {
+                let session = self.session_manager.get_active_session_mut();
+                let terminal = session.terminal.lock();
+                terminal.copy_selection()
+            };
+            match selection {
+                Some(text) => {
+                    if let Some(result) = self.search_replace_panel.apply(&text) {
+                        match sr_action {
+                            search_replace_panel::SearchReplaceAction::ReplaceToClipboard => {
+                                if let Some(clipboard) = &self.clipboard {
+                                    let _ = clipboard.copy(&result);
+                                }
+                            }
+                            search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
+                                let session = self.session_manager.get_active_session_mut();
+                                let _ = session.shell.write(result.as_bytes());
+                            }
+                        }
+                    }
+                }
+                None => {
+                    self.search_replace_panel.status = "No selection".to_string();
+                }
+            }
+        }
+
         // Debug overlay panel
         {
             let session = self.session_manager.get_active_session_mut();
@@ -2446,6 +2590,15 @@ impl eframe::App for TerminalApp {
                                         keybindings::Command::ConfigToggle => {
                                             self.config_panel.toggle(&self.config);
                                         }
+                                        keybindings::Command::SidebarToggle => {
+                                            self.sidebar.visible = !self.sidebar.visible;
+                                            if self.sidebar.visible {
+                                                self.sidebar.refresh();
+                                            }
+                                        }
+                                        keybindings::Command::SearchReplaceToggle => {
+                                            self.search_replace_panel.toggle();
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -2559,6 +2712,15 @@ impl eframe::App for TerminalApp {
                         }
                         keybindings::Command::ConfigToggle => {
                             self.config_panel.toggle(&self.config);
+                        }
+                        keybindings::Command::SidebarToggle => {
+                            self.sidebar.visible = !self.sidebar.visible;
+                            if self.sidebar.visible {
+                                self.sidebar.refresh();
+                            }
+                        }
+                        keybindings::Command::SearchReplaceToggle => {
+                            self.search_replace_panel.toggle();
                         }
                         // 其他命令在下面处理
                         _ => {}

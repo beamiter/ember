@@ -10,7 +10,9 @@ use crate::keybindings;
 use crate::layout;
 use crate::link;
 use crate::search;
+use crate::search_replace_panel;
 use crate::session_manager::SessionManager;
+use crate::sidebar;
 use crate::ui::TerminalRenderer;
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::Arc;
@@ -38,6 +40,12 @@ pub struct TerminalApp {
 
     // Search state
     pub search_state: search::SearchState,
+
+    // File-tree sidebar
+    pub sidebar: sidebar::Sidebar,
+
+    // Find & Replace (operates on selection)
+    pub search_replace_panel: search_replace_panel::SearchReplacePanel,
 
     // Link detection
     pub link_detector: link::LinkDetector,

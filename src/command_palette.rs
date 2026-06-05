@@ -167,6 +167,12 @@ impl CommandPalette {
                 "Jump to previous search match",
                 crate::keybindings::Command::SearchPrev,
             ),
+            CommandInfo::new(
+                "Find and Replace",
+                CommandCategory::Search,
+                "Open find-and-replace on the selection",
+                crate::keybindings::Command::SearchReplaceToggle,
+            ),
             // === 终端操作 ===
             CommandInfo::new(
                 "Scroll Up",
@@ -192,6 +198,12 @@ impl CommandPalette {
                 CommandCategory::Window,
                 "Close the entire application",
                 crate::keybindings::Command::WindowClose,
+            ),
+            CommandInfo::new(
+                "Toggle Sidebar",
+                CommandCategory::Window,
+                "Show/hide the file tree sidebar",
+                crate::keybindings::Command::SidebarToggle,
             ),
             // === 配置 ===
             CommandInfo::new(

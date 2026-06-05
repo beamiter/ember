@@ -80,13 +80,14 @@ impl Sidebar {
             // 仅保留前 20 个项目，避免过多
             for (name, path, is_dir) in items.iter().take(20) {
                 let node = if *is_dir && depth < 2 {
-                    // 递归构建子目录
+                    // 递归构建子目录：取子目录节点的 children 作为本节点子项
+                    // （build_tree 返回的节点 children 即该目录下的条目）
                     FileTreeNode {
                         name: name.clone(),
                         path: path.clone(),
                         is_dir: true,
                         children: Self::build_tree(path, depth + 1)
-                            .map(|n| vec![n])
+                            .map(|n| n.children)
                             .unwrap_or_default(),
                         expanded: false,
                     }

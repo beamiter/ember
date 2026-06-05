@@ -24,6 +24,7 @@ pub enum Command {
     SearchPrev,
     SearchHistoryPrev,
     SearchHistoryNext,
+    SearchReplaceToggle,
 
     // === 终端操作 ===
     TerminalSendSigint, // Ctrl+C
@@ -46,6 +47,9 @@ pub enum Command {
     ConfigOpen,
     ConfigClose,
     ConfigToggle,
+
+    // === 侧边栏 ===
+    SidebarToggle,
 }
 
 impl std::fmt::Display for Command {
@@ -64,6 +68,7 @@ impl std::fmt::Display for Command {
             Command::SearchPrev => write!(f, "search:prev"),
             Command::SearchHistoryPrev => write!(f, "search:history:prev"),
             Command::SearchHistoryNext => write!(f, "search:history:next"),
+            Command::SearchReplaceToggle => write!(f, "search:replace:toggle"),
             Command::TerminalSendSigint => write!(f, "terminal:send_sigint"),
             Command::TerminalSendEof => write!(f, "terminal:send_eof"),
             Command::TerminalClear => write!(f, "terminal:clear"),
@@ -78,6 +83,7 @@ impl std::fmt::Display for Command {
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
             Command::ConfigToggle => write!(f, "config:toggle"),
+            Command::SidebarToggle => write!(f, "sidebar:toggle"),
         }
     }
 }
@@ -99,6 +105,7 @@ impl std::str::FromStr for Command {
             "search:prev" => Ok(Command::SearchPrev),
             "search:history:prev" => Ok(Command::SearchHistoryPrev),
             "search:history:next" => Ok(Command::SearchHistoryNext),
+            "search:replace:toggle" => Ok(Command::SearchReplaceToggle),
             "terminal:send_sigint" => Ok(Command::TerminalSendSigint),
             "terminal:send_eof" => Ok(Command::TerminalSendEof),
             "terminal:clear" => Ok(Command::TerminalClear),
@@ -113,6 +120,7 @@ impl std::str::FromStr for Command {
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
             "config:toggle" => Ok(Command::ConfigToggle),
+            "sidebar:toggle" => Ok(Command::SidebarToggle),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str
@@ -298,11 +306,20 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+f".to_string(), "search:open".to_string());
+        bindings.bindings.insert(
+            "ctrl+shift+r".to_string(),
+            "search:replace:toggle".to_string(),
+        );
 
         // 配置操作
         bindings
             .bindings
             .insert("ctrl+shift+o".to_string(), "config:toggle".to_string());
+
+        // 侧边栏
+        bindings
+            .bindings
+            .insert("ctrl+shift+b".to_string(), "sidebar:toggle".to_string());
 
         // 终端操作
         bindings
