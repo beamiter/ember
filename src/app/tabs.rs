@@ -1,7 +1,738 @@
 // Tab management module
 
 use super::state::TerminalApp;
+use eframe::egui;
 
 impl TerminalApp {
-    // Tab management methods will be moved here
+    /// 渲染会话标签栏。返回 true 表示请求关闭窗口，render_ui 应据此提前返回。
+    pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
+                let tab_height = 30.0;
+                let close_btn_size = 14.0;
+                let tab_rect = egui::Rect::from_min_size(
+                    ui.cursor().left_top(),
+                    egui::vec2(ui.available_width(), tab_height),
+                );
+
+                let painter = ui.painter();
+
+                // 主题色（一次性取出，避免后续借用冲突）
+                let tb = self.renderer.theme.tabbar.clone();
+                let tb_bg = crate::theme::Theme::rgb_to_color32(tb.bg);
+                let tb_accent = crate::theme::Theme::rgb_to_color32(tb.active_border);
+                let tb_inactive_text = crate::theme::Theme::rgb_to_color32(tb.inactive_text);
+                let tb_active_text = crate::theme::Theme::rgb_to_color32(tb.active_text);
+                let tb_close_bg = crate::theme::Theme::rgb_to_color32(tb.close_btn_bg);
+                let tb_close_hover = crate::theme::Theme::rgb_to_color32(tb.close_btn_hover);
+                // 在栏背景上叠加的「悬停/活跃」填充：以中性白做低透明 tint，跨深浅主题都协调
+                let tab_hover_fill = egui::Color32::from_white_alpha(18);
+                let tab_active_fill = tb_bg.lerp_to_gamma(tb_accent, 0.16);
+
+                // 背景
+                let tab_alpha = (self.renderer.opacity * 255.0) as u8;
+                painter.rect_filled(
+                    tab_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(tb_bg.r(), tb_bg.g(), tb_bg.b(), tab_alpha),
+                );
+
+                // === Tab 布局常量 ===
+                let tab_padding = 20.0 + close_btn_size + 4.0; // 文本左右 padding + 关闭按钮
+                let min_tab_width: f32 = 60.0;
+                let max_tab_width: f32 = 200.0;
+                let active_tab_extra: f32 = 60.0;
+                let active_min_width: f32 = min_tab_width * 2.0; // 当前 session 最小宽度，更突出
+                let tab_spacing: f32 = 1.0;
+                let left_margin: f32 = 5.0;
+                let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
+
+                let active_idx_for_layout = self.session_manager.active_index();
+
+                // 文本测量闭包
+                let measure = |text: &str| -> f32 {
+                    painter
+                        .layout_no_wrap(
+                            text.to_string(),
+                            egui::FontId::monospace(12.0),
+                            egui::Color32::WHITE,
+                        )
+                        .rect
+                        .width()
+                };
+
+                // 路径缩略闭包：将 CWD 路径缩略到 max_text_w 像素以内
+                let abbreviate_path = |title: &str, max_text_w: f32| -> String {
+                    if measure(title) <= max_text_w {
+                        return title.to_string();
+                    }
+                    let (prefix, path_part) = if let Some(rest) = title.strip_prefix("~/") {
+                        ("~/", rest)
+                    } else if let Some(rest) = title.strip_prefix('/') {
+                        ("/", rest)
+                    } else {
+                        ("", title)
+                    };
+                    let parts: Vec<&str> = path_part.split('/').collect();
+                    if parts.len() <= 1 {
+                        let ellipsis = "...";
+                        let mut truncated = String::new();
+                        for ch in title.chars() {
+                            let test = format!("{}{}{}", truncated, ch, ellipsis);
+                            if measure(&test) > max_text_w {
+                                break;
+                            }
+                            truncated.push(ch);
+                        }
+                        return format!("{}{}", truncated, ellipsis);
+                    }
+                    let last = parts[parts.len() - 1];
+                    let abbreviated_middle: Vec<String> = parts[..parts.len() - 1]
+                        .iter()
+                        .map(|p| p.chars().next().map(|c| c.to_string()).unwrap_or_default())
+                        .collect();
+                    let short_path = format!("{}{}/{}", prefix, abbreviated_middle.join("/"), last);
+                    if measure(&short_path) <= max_text_w {
+                        return short_path;
+                    }
+                    let short_prefix = format!("{}{}/", prefix, abbreviated_middle.join("/"));
+                    let ellipsis = "...";
+                    let mut truncated = short_prefix.clone();
+                    for ch in last.chars() {
+                        let test = format!("{}{}{}", truncated, ch, ellipsis);
+                        if measure(&test) > max_text_w {
+                            break;
+                        }
+                        truncated.push(ch);
+                    }
+                    format!("{}{}", truncated, ellipsis)
+                };
+
+                // === 第一阶段：收集原始路径 + 为每个 tab 生成 display_text ===
+                // 活跃 tab 允许更大的文本宽度
+                let active_max_text = max_tab_width + active_tab_extra - tab_padding;
+                let inactive_max_text = max_tab_width - tab_padding;
+
+                let tab_infos: Vec<(usize, String, f32)> = self
+                    .session_manager
+                    .sessions()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, session)| {
+                        let pid = session.get_shell_pid();
+                        let tab_title = crate::session_manager::get_process_cwd(pid)
+                            .map(|cwd| {
+                                if let Ok(home) = std::env::var("HOME") {
+                                    if cwd == home {
+                                        "~".to_string()
+                                    } else if let Some(rest) = cwd.strip_prefix(&home) {
+                                        format!("~{}", rest)
+                                    } else {
+                                        cwd
+                                    }
+                                } else {
+                                    cwd
+                                }
+                            })
+                            .unwrap_or_else(|| session.metadata.name.clone());
+
+                        let max_text_w = if idx == active_idx_for_layout {
+                            active_max_text
+                        } else {
+                            inactive_max_text
+                        };
+                        let display_text = abbreviate_path(&tab_title, max_text_w);
+                        let ideal_width = if idx == active_idx_for_layout {
+                            (measure(&display_text) + tab_padding).max(active_min_width)
+                        } else {
+                            (measure(&display_text) + tab_padding)
+                                .clamp(min_tab_width, max_tab_width)
+                        };
+                        (idx, display_text, ideal_width)
+                    })
+                    .collect();
+
+                // === 第二阶段：布局分配 —— 计算每个 tab 的最终宽度 ===
+                let available_width = tab_rect.width() - left_margin - reserved_right;
+                let n = tab_infos.len();
+                let total_spacing = if n > 1 {
+                    (n - 1) as f32 * tab_spacing
+                } else {
+                    0.0
+                };
+
+                let tab_widths: Vec<f32> = {
+                    let total_ideal: f32 =
+                        tab_infos.iter().map(|(_, _, w)| w).sum::<f32>() + total_spacing;
+
+                    if total_ideal <= available_width {
+                        // 空间足够，各自用理想宽度
+                        tab_infos.iter().map(|(_, _, w)| *w).collect()
+                    } else {
+                        // 空间不足：先保障活跃 tab，压缩非活跃 tab
+                        let active_w = tab_infos
+                            .iter()
+                            .find(|(idx, _, _)| *idx == active_idx_for_layout)
+                            .map(|(_, _, w)| *w)
+                            .unwrap_or(min_tab_width);
+                        let remaining = (available_width - active_w - total_spacing).max(0.0);
+                        let inactive_count = n.saturating_sub(1);
+
+                        if inactive_count == 0 {
+                            // 只有一个 tab
+                            vec![available_width.max(min_tab_width)]
+                        } else {
+                            let per_inactive =
+                                (remaining / inactive_count as f32).max(min_tab_width);
+                            tab_infos
+                                .iter()
+                                .map(|(idx, _, w)| {
+                                    if *idx == active_idx_for_layout {
+                                        // 活跃 tab 也不能超过可用空间
+                                        active_w.min(available_width - total_spacing)
+                                    } else {
+                                        (*w).min(per_inactive).max(min_tab_width)
+                                    }
+                                })
+                                .collect()
+                        }
+                    }
+                };
+
+                // === 第三阶段：滚动偏移 —— 保证活跃 tab 可见 ===
+                {
+                    let total_width: f32 = tab_widths.iter().sum::<f32>() + total_spacing;
+                    let max_scroll = (total_width - available_width).max(0.0);
+
+                    if total_width <= available_width {
+                        self.tab_scroll_offset = 0.0;
+                    } else {
+                        // 计算活跃 tab 的位置
+                        let mut active_left: f32 = 0.0;
+                        for (i, tw) in tab_widths.iter().enumerate() {
+                            if i == active_idx_for_layout {
+                                break;
+                            }
+                            active_left += tw + tab_spacing;
+                        }
+                        let active_right = active_left
+                            + tab_widths
+                                .get(active_idx_for_layout)
+                                .copied()
+                                .unwrap_or(0.0);
+
+                        // 如果活跃 tab 左边超出可视区
+                        if active_left < self.tab_scroll_offset {
+                            self.tab_scroll_offset = active_left;
+                        }
+                        // 如果活跃 tab 右边超出可视区
+                        if active_right > self.tab_scroll_offset + available_width {
+                            self.tab_scroll_offset = active_right - available_width;
+                        }
+                        self.tab_scroll_offset = self.tab_scroll_offset.clamp(0.0, max_scroll);
+                    }
+                }
+
+                // 检测悬停位置（在绘制之前）
+                let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+                self.hovered_tab_index = None;
+
+                // 更新当前鼠标x位置（用于拖拽动画）
+                if let Some(pos) = hover_pos {
+                    self.current_mouse_x = pos.x;
+                }
+
+                // 检测鼠标释放（点击完成或拖拽结束）
+                let mouse_released =
+                    ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+                let mouse_pressed =
+                    ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+
+                // 检查是否发生了实际的拖拽（超过阈值距离）
+                let is_actually_dragging =
+                    if let (Some(_), Some(start_x)) = (self.dragging_tab, self.drag_start_pos) {
+                        if let Some(current_pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                            let distance = (current_pos.x - start_x).abs();
+                            distance > 5.0 // 5px拖拽阈值
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                // === 交互辅助：用 tab_widths 计算 tab 位置的宏 ===
+                // scroll_base: 绝对坐标 x 基准（减去滚动偏移）
+                let scroll_base = tab_rect.left() + left_margin - self.tab_scroll_offset;
+
+                // 处理拖拽结束或点击
+                if mouse_released {
+                    if is_actually_dragging {
+                        // 实际拖拽结束 - 计算drop目标并执行重排
+                        if let Some(from_idx) = self.dragging_tab {
+                            if let Some(hover_pos) = hover_pos {
+                                if tab_rect.contains(hover_pos) {
+                                    let mut x_off = scroll_base;
+                                    let mut target_idx = from_idx;
+
+                                    for (i, &tw) in tab_widths.iter().enumerate() {
+                                        if hover_pos.x >= x_off && hover_pos.x < x_off + tw {
+                                            target_idx = i;
+                                            break;
+                                        }
+                                        x_off += tw + tab_spacing;
+                                    }
+
+                                    // 执行重排
+                                    if target_idx != from_idx {
+                                        self.session_manager.reorder_sessions(from_idx, target_idx);
+                                    }
+                                }
+                            }
+                        }
+                        self.dragging_tab = None;
+                        self.drag_start_pos = None;
+                    } else {
+                        // 简单点击（没有发生实际拖拽）
+                        if let Some(click_pos) =
+                            hover_pos.or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+                        {
+                            if tab_rect.contains(click_pos) {
+                                let mut x_off = scroll_base;
+                                for (i, &tw) in tab_widths.iter().enumerate() {
+                                    let tab_rect_item = egui::Rect::from_min_size(
+                                        egui::pos2(x_off, tab_rect.top() + 5.0),
+                                        egui::vec2(tw, tab_height - 10.0),
+                                    );
+
+                                    let close_btn_rect = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            tab_rect_item.right() - close_btn_size - 3.0,
+                                            tab_rect_item.center().y - close_btn_size / 2.0,
+                                        ),
+                                        egui::vec2(close_btn_size, close_btn_size),
+                                    );
+
+                                    if close_btn_rect.contains(click_pos) {
+                                        if self.session_manager.len() > 1 {
+                                            self.session_manager.close_session(i);
+                                            self.schedule_session_save();
+                                        } else {
+                                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                            return true;
+                                        }
+                                        self.dragging_tab = None;
+                                        self.drag_start_pos = None;
+                                        break;
+                                    } else if tab_rect_item.contains(click_pos) {
+                                        self.session_manager.switch_session(i);
+                                        self.force_resize_session = true;
+                                        self.dragging_tab = None;
+                                        self.drag_start_pos = None;
+                                        break;
+                                    }
+
+                                    x_off += tw + tab_spacing;
+                                }
+                            }
+                        }
+                        // 清除拖拽状态（即使没有找到点击的tab）
+                        if self.dragging_tab.is_some() {
+                            self.dragging_tab = None;
+                            self.drag_start_pos = None;
+                        }
+                    }
+                }
+
+                // 检测拖拽开始（鼠标按下且移动）
+                if mouse_pressed {
+                    if let Some(press_pos) = ctx.input(|i| i.pointer.press_origin()) {
+                        if self.dragging_tab.is_none() {
+                            let mut x_off = scroll_base;
+                            for (i, &tw) in tab_widths.iter().enumerate() {
+                                let tab_rect_item = egui::Rect::from_min_size(
+                                    egui::pos2(x_off, tab_rect.top() + 5.0),
+                                    egui::vec2(tw, tab_height - 10.0),
+                                );
+
+                                let close_btn_rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        tab_rect_item.right() - close_btn_size - 3.0,
+                                        tab_rect_item.center().y - close_btn_size / 2.0,
+                                    ),
+                                    egui::vec2(close_btn_size, close_btn_size),
+                                );
+
+                                if tab_rect_item.contains(press_pos)
+                                    && !close_btn_rect.contains(press_pos)
+                                {
+                                    self.dragging_tab = Some(i);
+                                    self.drag_start_pos = Some(press_pos.x);
+                                    break;
+                                }
+
+                                x_off += tw + tab_spacing;
+                            }
+                        }
+                    }
+                }
+
+                // 计算拖拽过程中的动画效果
+                let mut drag_target_idx: Option<usize> = None;
+                if is_actually_dragging {
+                    if let Some(hover_pos) = hover_pos {
+                        if let Some(_from_idx) = self.dragging_tab {
+                            let mut x_off = scroll_base;
+                            for (i, &tw) in tab_widths.iter().enumerate() {
+                                if hover_pos.x >= x_off && hover_pos.x < x_off + tw {
+                                    drag_target_idx = Some(i);
+                                    break;
+                                }
+                                x_off += tw + tab_spacing;
+                            }
+                        }
+                    }
+                    // 请求持续重绘以显示动画
+                    ctx.request_repaint();
+                }
+
+                // === 渲染 Tab 栏（使用 clip rect 裁剪溢出内容）===
+                let tab_clip_rect = egui::Rect::from_min_max(
+                    egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
+                    egui::pos2(tab_rect.right() - reserved_right, tab_rect.bottom()),
+                );
+                let clipped_painter = painter.with_clip_rect(tab_clip_rect);
+
+                let mut x_offset = scroll_base;
+                let active_idx = self.session_manager.active_index();
+                // 活跃指示条目标位置（非拖拽时用于滑动动画）
+                let mut active_indicator_target: Option<(f32, f32, f32)> = None;
+
+                // 绘制每个标签
+                for (i, (_, display_text, _)) in tab_infos.iter().enumerate() {
+                    let tab_width = tab_widths[i];
+                    let mut tab_rect_item = egui::Rect::from_min_size(
+                        egui::pos2(x_offset, tab_rect.top() + 5.0),
+                        egui::vec2(tab_width, tab_height - 10.0),
+                    );
+
+                    let is_active = i == active_idx;
+                    let is_dragging = self.dragging_tab == Some(i);
+                    let is_drag_target = drag_target_idx == Some(i);
+
+                    // 计算拖拽过程中的位移：被拖拽 tab 跟随鼠标；其余 tab 缓动让位
+                    let push_id = egui::Id::new(("tab_push", i));
+                    if is_actually_dragging && is_dragging {
+                        // 被拖拽的Tab跟随鼠标移动（即时，无缓动）
+                        if let Some(start_x) = self.drag_start_pos {
+                            let offset = self.current_mouse_x - start_x;
+                            tab_rect_item = tab_rect_item.translate(egui::vec2(offset, 0.0));
+                        }
+                        ctx.animate_value_with_time(push_id, 0.0, 0.0); // 重置让位动画
+                    } else {
+                        // 计算让位目标偏移，再缓动到该位置
+                        let mut push_target = 0.0;
+                        if is_actually_dragging {
+                            if let Some(from_idx) = self.dragging_tab {
+                                let drag_to_left = is_drag_target
+                                    && drag_target_idx.map(|t| t < from_idx).unwrap_or(false);
+                                let drag_to_right = is_drag_target
+                                    && drag_target_idx.map(|t| t > from_idx).unwrap_or(false);
+                                if drag_to_left && i > from_idx {
+                                    push_target = tab_width + tab_spacing;
+                                } else if drag_to_right && i < from_idx {
+                                    push_target = -(tab_width + tab_spacing);
+                                }
+                            }
+                        }
+                        let push = ctx.animate_value_with_time(push_id, push_target, 0.12);
+                        if push.abs() > 0.1 {
+                            tab_rect_item = tab_rect_item.translate(egui::vec2(push, 0.0));
+                        }
+                    }
+
+                    // 检测悬停
+                    let is_hovered = if let Some(hover_pos) = hover_pos {
+                        tab_rect_item.contains(hover_pos) && tab_clip_rect.contains(hover_pos)
+                    } else {
+                        false
+                    };
+
+                    if is_hovered && !is_actually_dragging {
+                        self.hovered_tab_index = Some(i);
+                    }
+
+                    // 背景色：圆角 pill 风格，hover 强度做淡入淡出
+                    let tab_rounding = 6.0;
+                    let hover_t = ctx.animate_bool_with_time(
+                        egui::Id::new(("tab_hover", i)),
+                        (is_hovered || is_dragging) && !is_actually_dragging,
+                        0.12,
+                    );
+                    let bg_color = if is_active {
+                        // 活跃 tab：基础填充，hover 时再微亮
+                        tab_active_fill.lerp_to_gamma(tab_active_fill.blend(tab_hover_fill), hover_t)
+                    } else {
+                        tab_hover_fill.gamma_multiply(hover_t)
+                    };
+
+                    // 绘制Tab背景
+                    if is_dragging && is_actually_dragging {
+                        let drag_bg = if is_active {
+                            tab_active_fill.gamma_multiply(0.55)
+                        } else {
+                            tab_hover_fill.gamma_multiply(0.55)
+                        };
+                        clipped_painter.rect_filled(tab_rect_item, tab_rounding, drag_bg);
+                    } else {
+                        clipped_painter.rect_filled(tab_rect_item, tab_rounding, bg_color);
+
+                        // Active Tab 底部圆角 accent 指示条
+                        if is_active {
+                            if is_actually_dragging {
+                                // 拖拽中：指示条立即跟随，不做滑动
+                                let indicator = egui::Rect::from_min_max(
+                                    egui::pos2(tab_rect_item.left() + 6.0, tab_rect_item.bottom() - 3.0),
+                                    egui::pos2(tab_rect_item.right() - 6.0, tab_rect_item.bottom() - 1.0),
+                                );
+                                clipped_painter.rect_filled(indicator, 1.5, tb_accent);
+                            } else {
+                                // 记录目标，循环结束后用动画绘制滑动指示条
+                                active_indicator_target = Some((
+                                    tab_rect_item.left(),
+                                    tab_rect_item.right(),
+                                    tab_rect_item.bottom(),
+                                ));
+                            }
+                        }
+
+                        // 拖拽过程中，在目标Tab位置显示插入指示线
+                        if is_drag_target && is_actually_dragging {
+                            let insert_line_x =
+                                if self.current_mouse_x - tab_rect_item.center().x < 0.0 {
+                                    tab_rect_item.left()
+                                } else {
+                                    tab_rect_item.right()
+                                };
+                            clipped_painter.vline(
+                                insert_line_x,
+                                tab_rect_item.top()..=tab_rect_item.bottom(),
+                                egui::Stroke::new(2.0, tb_accent),
+                            );
+                        }
+                    }
+
+                    // 绘制文本（使用 tab 内部 clip 防止文本溢出 tab 边界）
+                    let text_clip = egui::Rect::from_min_max(
+                        tab_rect_item.left_top(),
+                        egui::pos2(
+                            tab_rect_item.right() - close_btn_size - 6.0,
+                            tab_rect_item.bottom(),
+                        ),
+                    );
+                    let text_painter = painter.with_clip_rect(text_clip.intersect(tab_clip_rect));
+                    text_painter.text(
+                        egui::pos2(tab_rect_item.left() + 10.0, tab_rect_item.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        display_text,
+                        egui::FontId::monospace(12.0),
+                        if is_active {
+                            tb_active_text
+                        } else {
+                            tb_inactive_text
+                        },
+                    );
+
+                    // 绘制关闭按钮（仅在悬停Tab时显示）
+                    let close_btn_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            tab_rect_item.right() - close_btn_size - 3.0,
+                            tab_rect_item.center().y - close_btn_size / 2.0,
+                        ),
+                        egui::vec2(close_btn_size, close_btn_size),
+                    );
+
+                    if is_hovered && !is_dragging {
+                        let close_btn_hovered = if let Some(hover_pos) = hover_pos {
+                            close_btn_rect.contains(hover_pos)
+                        } else {
+                            false
+                        };
+
+                        if close_btn_hovered {
+                            clipped_painter.circle_filled(
+                                close_btn_rect.center(),
+                                close_btn_size / 2.0 + 2.0,
+                                tb_close_bg,
+                            );
+                        }
+
+                        let close_x_color = if close_btn_hovered {
+                            tb_close_hover
+                        } else {
+                            tb_inactive_text
+                        };
+
+                        let cross_offset = close_btn_size / 3.0;
+                        clipped_painter.line_segment(
+                            [
+                                egui::pos2(
+                                    close_btn_rect.center().x - cross_offset,
+                                    close_btn_rect.center().y - cross_offset,
+                                ),
+                                egui::pos2(
+                                    close_btn_rect.center().x + cross_offset,
+                                    close_btn_rect.center().y + cross_offset,
+                                ),
+                            ],
+                            egui::Stroke::new(1.5, close_x_color),
+                        );
+                        clipped_painter.line_segment(
+                            [
+                                egui::pos2(
+                                    close_btn_rect.center().x + cross_offset,
+                                    close_btn_rect.center().y - cross_offset,
+                                ),
+                                egui::pos2(
+                                    close_btn_rect.center().x - cross_offset,
+                                    close_btn_rect.center().y + cross_offset,
+                                ),
+                            ],
+                            egui::Stroke::new(1.5, close_x_color),
+                        );
+                    }
+
+                    x_offset += tab_width + tab_spacing;
+                }
+
+                // 活跃指示条滑动动画（非拖拽时）
+                if let Some((target_left, target_right, bottom)) = active_indicator_target {
+                    let anim_left = ctx.animate_value_with_time(
+                        egui::Id::new("tab_indicator_left"),
+                        target_left,
+                        0.15,
+                    );
+                    let anim_right = ctx.animate_value_with_time(
+                        egui::Id::new("tab_indicator_right"),
+                        target_right,
+                        0.15,
+                    );
+                    let indicator = egui::Rect::from_min_max(
+                        egui::pos2(anim_left + 6.0, bottom - 3.0),
+                        egui::pos2(anim_right - 6.0, bottom - 1.0),
+                    );
+                    clipped_painter.rect_filled(indicator, 1.5, tb_accent);
+                }
+
+                // "+" 按钮 - 新建会话（紧跟最后一个 Tab，但不超过 clip 区域）
+                let plus_btn_x = x_offset
+                    .max(tab_rect.left() + left_margin)
+                    .min(tab_clip_rect.right());
+                let plus_btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(plus_btn_x + 4.0, tab_rect.top() + 5.0),
+                    egui::vec2(25.0, tab_height - 10.0),
+                );
+
+                // 检测"+"按钮悬停
+                let plus_btn_hovered = if let Some(hover_pos) = hover_pos {
+                    plus_btn_rect.contains(hover_pos)
+                } else {
+                    false
+                };
+
+                let plus_btn_color = if plus_btn_hovered {
+                    tab_hover_fill
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+
+                painter.rect_filled(plus_btn_rect, 6.0, plus_btn_color);
+
+                let plus_text_color = if plus_btn_hovered {
+                    tb_active_text
+                } else {
+                    tb_inactive_text
+                };
+
+                painter.text(
+                    plus_btn_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "+",
+                    egui::FontId::monospace(14.0),
+                    plus_text_color,
+                );
+
+                // 检测 "+" 按钮点击（在鼠标释放时）
+                if mouse_released {
+                    if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                        if plus_btn_rect.contains(click_pos) {
+                            let new_idx = self.create_session_with_current_config(None, None);
+                            self.session_manager.switch_session(new_idx);
+                            self.force_resize_session = true;
+                            self.schedule_session_save();
+                        }
+                    }
+                }
+
+                // 关闭窗口按钮（最右侧）
+                let close_win_size = 25.0;
+                let close_win_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        tab_rect.right() - close_win_size - 5.0,
+                        tab_rect.top() + 5.0,
+                    ),
+                    egui::vec2(close_win_size, tab_height - 10.0),
+                );
+
+                let close_win_hovered = if let Some(hover_pos) = hover_pos {
+                    close_win_rect.contains(hover_pos)
+                } else {
+                    false
+                };
+
+                let close_win_bg = if close_win_hovered {
+                    egui::Color32::from_rgb(200, 60, 55)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+
+                painter.rect_filled(close_win_rect, 6.0, close_win_bg);
+
+                // 绘制 X 符号
+                let cw_cross = 5.0;
+                let cw_center = close_win_rect.center();
+                let cw_x_color = if close_win_hovered {
+                    egui::Color32::WHITE
+                } else {
+                    tb_inactive_text
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(cw_center.x - cw_cross, cw_center.y - cw_cross),
+                        egui::pos2(cw_center.x + cw_cross, cw_center.y + cw_cross),
+                    ],
+                    egui::Stroke::new(1.5, cw_x_color),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(cw_center.x + cw_cross, cw_center.y - cw_cross),
+                        egui::pos2(cw_center.x - cw_cross, cw_center.y + cw_cross),
+                    ],
+                    egui::Stroke::new(1.5, cw_x_color),
+                );
+
+                // 检测关闭窗口按钮点击
+                if mouse_released {
+                    if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                        if close_win_rect.contains(click_pos) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+
+                // 向下移动光标
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), tab_height),
+                    egui::Sense::hover(),
+                );
+        false
+    }
 }
