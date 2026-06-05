@@ -2,7 +2,7 @@
 
 use super::events::build_keybinding_string;
 use super::state::TerminalApp;
-use crate::{keybindings, layout};
+use crate::{config, keybindings, layout};
 use eframe::egui;
 
 impl TerminalApp {
@@ -284,5 +284,101 @@ impl TerminalApp {
             }
         }
         false
+    }
+
+    /// 处理 IME 事件、窗口标题更新；返回当前是否存在预编辑文本。
+    pub fn handle_ime_events(&mut self, ctx: &egui::Context) -> bool {
+        let session = self.session_manager.get_active_session_mut();
+
+        // Step 1: 处理 IME 事件
+        for evt in &self.frame_events {
+            if let egui::Event::Ime(ime_event) = evt {
+                let mut terminal = session.terminal.lock();
+                match ime_event {
+                    egui::ImeEvent::Enabled => {
+                        crate::debug_log!("[IME] Enabled");
+                        terminal.ime_enabled = true;
+                    }
+                    egui::ImeEvent::Preedit(text) => {
+                        crate::debug_log!("[IME] Preedit: {:?}", text);
+                        terminal.set_preedit(text.clone(), text.len());
+                    }
+                    egui::ImeEvent::Commit(text) => {
+                        crate::debug_log!("[IME] Commit: {:?}", text);
+                        terminal.clear_preedit();
+                        if !text.is_empty() {
+                            let _ = session.shell.write(text.as_bytes());
+                        }
+                        // 不要在 commit 时置 ime_enabled = false
+                        // commit 只是确认一个字/词，不代表用户要退出中文输入模式
+                        // 只有 ImeEvent::Disabled 才是真正的 IME 关闭信号
+                    }
+                    egui::ImeEvent::Disabled => {
+                        crate::debug_log!("[IME] Disabled");
+                        terminal.ime_enabled = false;
+                        terminal.clear_preedit();
+                    }
+                }
+            }
+        }
+        // 使用 terminal 持久状态判断是否有预编辑，而不是帧局部变量
+        // 这样即使跨帧也能正确抑制 Text 事件
+        let has_preedit = {
+            let terminal = session.terminal.lock();
+            !terminal.preedit_text.is_empty()
+        };
+
+        let window_title = {
+            let terminal = session.terminal.lock();
+            terminal.window_title.clone()
+        };
+        if !window_title.is_empty() && window_title != self.last_window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));
+            self.last_window_title = window_title;
+        }
+        has_preedit
+    }
+
+    /// 处理累积的 Ctrl+滚轮字体缩放。
+    pub fn handle_font_zoom(&mut self, ctx: &egui::Context) {
+        // Step 1.5: 处理累积的Ctrl+滚轮字体缩放
+        // 检查是否有ctrl+scroll事件
+        let has_ctrl_scroll_this_frame = {
+            let ctrl_pressed = ctx.input(|i| i.modifiers.ctrl);
+            ctrl_pressed && self.frame_events.iter().any(|evt| {
+                matches!(evt, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl)
+            })
+        };
+
+        // 如果有累积值，并且（滚轮事件停止 或 累积超过1.0），则应用变化
+        if self.font_size_accumulator.abs() > 0.0 {
+            let should_apply = !has_ctrl_scroll_this_frame // 滚轮停止
+                || self.font_size_accumulator.abs() >= 1.0; // 或累积超过1.0
+
+            if should_apply {
+                let steps = self.font_size_accumulator.floor() as i32;
+                if steps != 0 {
+                    let new_font_size = config::Config::clamp_font_size(
+                        self.config.font_size + steps as f32,
+                    );
+
+                    if (new_font_size - self.config.font_size).abs() > 0.01 {
+                        self.config.font_size = new_font_size;
+                        self.apply_runtime_config(ctx);
+                        self.schedule_config_save();
+                    }
+
+                    // 保留小数部分
+                    self.font_size_accumulator -= steps as f32;
+                }
+
+                // 如果滚轮停止，清空累积器
+                if !has_ctrl_scroll_this_frame {
+                    self.font_size_accumulator = 0.0;
+                }
+            }
+        }
+
+        self.had_ctrl_scroll_last_frame = has_ctrl_scroll_this_frame;
     }
 }
