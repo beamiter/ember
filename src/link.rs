@@ -69,10 +69,10 @@ impl LinkDetector {
             r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
         ).unwrap();
 
-        // 文件路径正则：以 / 开头或 ./ ../，或包含路径分隔符的文本
-        let file_path_regex = Regex::new(
-            r"(?:^|[\s])(?:(?:/[^\s<>\[\]{}|\\^`()]*)|(?:\./[^\s<>\[\]{}|\\^`()]*)|(?:\.\./[^\s<>\[\]{}|\\^`()]*))"
-        ).unwrap();
+        // 文件路径正则：以 /、./、../ 开头(前面是行首或空白)。
+        // 用捕获组提取实际路径，避免把前导空白计入列偏移。
+        let file_path_regex =
+            Regex::new(r"(?:^|\s)(\.{0,2}/[^\s<>\[\]{}|\\^`()]*)").unwrap();
 
         Self {
             config,
@@ -108,7 +108,21 @@ impl LinkDetector {
 
         // 检测 IP 地址
         if self.config.detect_ip_addresses {
+            let bytes = line.as_bytes();
             for mat in self.ip_regex.find_iter(line) {
+                // 排除更长数字序列的子串(如版本号 1.2.3.4.5、x.1.2.3.4):
+                // 若紧邻的前一个字符是 '.',或后一个字符是 '.' 且其后仍为数字,则跳过
+                if mat.start() > 0 && bytes[mat.start() - 1] == b'.' {
+                    continue;
+                }
+                if bytes.get(mat.end()) == Some(&b'.')
+                    && bytes
+                        .get(mat.end() + 1)
+                        .is_some_and(|b| b.is_ascii_digit())
+                {
+                    continue;
+                }
+
                 let col_start = Self::byte_offset_to_char_offset(line, mat.start());
                 let col_end = Self::byte_offset_to_char_offset(line, mat.end());
                 // 避免与 URL 重复
@@ -129,10 +143,18 @@ impl LinkDetector {
 
         // 检测文件路径
         if self.config.detect_file_paths {
-            for mat in self.file_path_regex.find_iter(line) {
-                let matched_text = mat.as_str().trim();
-                let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-                let col_end = Self::byte_offset_to_char_offset(line, mat.end());
+            for caps in self.file_path_regex.captures_iter(line) {
+                let m = caps.get(1).unwrap();
+                let start_b = m.start();
+                // 剥离尾部标点(句末句号、逗号、右括号等不属于路径的一部分)
+                let trimmed = m.as_str().trim_end_matches(|c: char| {
+                    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
+                });
+                let end_b = start_b + trimmed.len();
+                let matched_text = &line[start_b..end_b];
+
+                let col_start = Self::byte_offset_to_char_offset(line, start_b);
+                let col_end = Self::byte_offset_to_char_offset(line, end_b);
 
                 // 避免与 URL 重复
                 if !links
@@ -158,19 +180,30 @@ impl LinkDetector {
     fn is_valid_file_path(text: &str) -> bool {
         let trimmed = text.trim();
 
-        if trimmed.is_empty() || matches!(trimmed, "/" | "//" | "./" | "../") {
-            return false;
-        }
-
-        if trimmed.chars().all(|ch| matches!(ch, '/' | '.')) {
+        if trimmed.is_empty() {
             return false;
         }
 
         // 必须以 / 或 ./ 或 ../ 开头
-        trimmed.starts_with('/')
+        if !(trimmed.starts_with('/')
             || trimmed.starts_with("./")
-            || trimmed.starts_with("../")
-            || (!trimmed.is_empty() && trimmed.chars().next().unwrap().is_alphabetic())
+            || trimmed.starts_with("../"))
+        {
+            return false;
+        }
+
+        // 排除 C 风格注释起始(// 行注释、/* 块注释),它们不是路径
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            return false;
+        }
+
+        // 仅由 / 和 . 组成的不是有效路径("/"、"./"、"../"、"..." 等)
+        if trimmed.chars().all(|ch| matches!(ch, '/' | '.')) {
+            return false;
+        }
+
+        // 路径中必须至少包含一个字母或数字,排除 "/*"、"/-" 之类的纯符号串
+        trimmed.chars().any(|ch| ch.is_alphanumeric())
     }
 
     /// 在当前可视内容中检测链接，支持传入row_wrapped标志以正确处理跨行链接。
@@ -377,6 +410,75 @@ mod tests {
         let links = detector.detect_links_in_line(line, 0);
 
         assert!(!links.iter().any(|l| l.link_type == LinkType::FilePath));
+    }
+
+    #[test]
+    fn test_block_comment_not_file_path() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = "code /* block comment */ end";
+        let links = detector.detect_links_in_line(line, 0);
+        assert!(!links.iter().any(|l| l.link_type == LinkType::FilePath));
+    }
+
+    #[test]
+    fn test_punct_only_not_file_path() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        // 数学/分隔符场景不应产生路径
+        for line in ["a / b", "1 / 2", "use /* or */"] {
+            let links = detector.detect_links_in_line(line, 0);
+            assert!(
+                !links.iter().any(|l| l.link_type == LinkType::FilePath),
+                "误匹配于: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_path_col_start_excludes_leading_space() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = "see /etc/hosts here";
+        let links = detector.detect_links_in_line(line, 0);
+        let p = links
+            .iter()
+            .find(|l| l.link_type == LinkType::FilePath)
+            .unwrap();
+        assert_eq!(p.text, "/etc/hosts");
+        assert_eq!(p.col_start, 4); // 指向 '/',不含前导空格
+        assert_eq!(p.col_end, 14);
+    }
+
+    #[test]
+    fn test_file_path_trailing_punctuation_stripped() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = "edit /etc/hosts.";
+        let links = detector.detect_links_in_line(line, 0);
+        let p = links
+            .iter()
+            .find(|l| l.link_type == LinkType::FilePath)
+            .unwrap();
+        assert_eq!(p.text, "/etc/hosts");
+    }
+
+    #[test]
+    fn test_version_number_not_ip() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        // 五段数字(版本号)不应被识别为 IP
+        let line = "version 1.2.3.4.5 released";
+        let links = detector.detect_links_in_line(line, 0);
+        assert!(!links.iter().any(|l| l.link_type == LinkType::IpAddress));
+    }
+
+    #[test]
+    fn test_real_ip_still_detected() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        // 独立 IP、带端口、句末 IP 仍应识别
+        for line in ["ping 192.168.1.1 ok", "host 10.0.0.1:8080", "addr 8.8.8.8."] {
+            let links = detector.detect_links_in_line(line, 0);
+            assert!(
+                links.iter().any(|l| l.link_type == LinkType::IpAddress),
+                "未识别 IP: {line}"
+            );
+        }
     }
 
     #[test]
