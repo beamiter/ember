@@ -306,14 +306,18 @@ impl Config {
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::config_path()?;
-        let config_dir = config_path.parent().unwrap();
+        let config_dir = config_path
+            .parent()
+            .ok_or("Config path has no parent directory")?;
 
         // Create config directory if it doesn't exist
         std::fs::create_dir_all(config_dir)?;
 
-        // Write config file
+        // 原子写:先写临时文件再 rename,避免进程崩溃损坏配置文件
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, content)?;
+        let tmp_path = config_path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, content)?;
+        std::fs::rename(&tmp_path, &config_path)?;
         eprintln!("[Config] Saved to {}", config_path.display());
         Ok(())
     }

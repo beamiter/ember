@@ -15,13 +15,6 @@ enum LigOverride {
     Covered,
 }
 
-/// Quantize to 1/4 pixel increments for subpixel rendering cache coherence.
-fn quantize_subpixel(v: f32) -> u8 {
-    let quantized = (v * 4.0).round() as u8;
-    (quantized % 4).min(3)
-}
-
-
 fn snapped_span(origin: f32, index: usize, cell_size: f32) -> (f32, f32) {
     let start = (origin + index as f32 * cell_size).round();
     let end = (origin + (index + 1) as f32 * cell_size).round();
@@ -1396,7 +1389,6 @@ impl TerminalRenderer {
                             default_bg,
                             self.opacity,
                             has_search,
-                            target_cell_width,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
                             ligatures,
@@ -1432,7 +1424,6 @@ impl TerminalRenderer {
                             default_bg,
                             self.opacity,
                             has_search,
-                            target_cell_width,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
                             ligatures,
@@ -1481,7 +1472,6 @@ impl TerminalRenderer {
                                 default_bg,
                                 self.opacity,
                                 has_search,
-                                target_cell_width,
                                 glyph_offset_x_adjust,
                                 glyph_offset_y_adjust,
                                 ligatures,
@@ -1590,7 +1580,6 @@ impl TerminalRenderer {
         default_bg: Color32,
         opacity: f32,
         has_search: bool,
-        cell_width: f32,
         glyph_offset_x_adjust: f32,
         glyph_offset_y_adjust: f32,
         ligatures: bool,
@@ -1628,9 +1617,9 @@ impl TerminalRenderer {
                 }
                 let run_len = c - run_start;
                 if run_len >= 2 {
-                    let cell_x = run_start as f32 * cell_width + glyph_offset_x_adjust;
-                    let subpixel_bin = quantize_subpixel(cell_x.fract().abs());
-                    let shaped = gpu_res.atlas.shape_run(&run, bold, subpixel_bin);
+                    // Subpixel horizontal positioning is handled by the fractional cell
+                    // origin + linear sampling in the shader, so a single bin suffices.
+                    let shaped = gpu_res.atlas.shape_run(&run, bold, 0);
                     // A merge happened only if fewer glyphs than input columns.
                     if shaped.len() < run_len {
                         for col2 in run_start..c {
@@ -1789,9 +1778,7 @@ impl TerminalRenderer {
                     }
                 }
                 None if has_glyph => {
-                    let cell_x = col_idx as f32 * cell_width + glyph_offset_x_adjust;
-                    let subpixel_bin = quantize_subpixel(cell_x.fract().abs());
-                    let region = gpu_res.atlas.get_or_rasterize(cell.character, bold, subpixel_bin);
+                    let region = gpu_res.atlas.get_or_rasterize(cell.character, bold, 0);
                     if region.width_px > 0.0 && region.height_px > 0.0 {
                         (
                             region.u0,

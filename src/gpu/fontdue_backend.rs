@@ -4,6 +4,14 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use super::font_backend::{FontBackend, GlyphRegion, ShapedGlyph, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
 
+/// Cache key for a shaped run: run text + style + subpixel bin.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapeCacheKey {
+    text: String,
+    bold: bool,
+    subpixel_offset: u8,
+}
+
 /// Check if character is CJK or other wide script that shouldn't use subpixel binning.
 fn is_cjk_or_wide(ch: char) -> bool {
     matches!(ch as u32,
@@ -47,6 +55,15 @@ pub struct FontdueAtlas {
     ascii_cache: HashMap<AtlasGlyphKey, GlyphRegion>,
     unicode_cache: LruCache<AtlasGlyphKey, GlyphRegion>,
     gid_cache: HashMap<GidGlyphKey, GlyphRegion>,
+    /// Cache of fully shaped runs, keyed by text+style. Holds atlas UVs, so it is
+    /// cleared whenever the atlas grows or resets (regions would otherwise be stale).
+    shape_cache: LruCache<ShapeCacheKey, Arc<Vec<ShapedGlyph>>>,
+    /// Incremented on every atlas grow/reset; used to detect a grow that happens
+    /// mid-run so we don't cache regions captured against the old atlas size.
+    atlas_generation: u64,
+    /// Set when a glyph cannot be placed even after growth (atlas at max size).
+    /// The next ensure_uploaded compacts the atlas by rebuilding from scratch.
+    needs_compaction: bool,
     dirty_rects: Vec<DirtyRect>,
     needs_full_upload: bool,
     needs_rebind: bool,
@@ -118,6 +135,9 @@ impl FontdueAtlas {
             ascii_cache: HashMap::with_capacity(1024),
             unicode_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
             gid_cache: HashMap::with_capacity(512),
+            shape_cache: LruCache::new(NonZeroUsize::new(2048).unwrap()),
+            atlas_generation: 0,
+            needs_compaction: false,
             dirty_rects: Vec::new(),
             needs_full_upload: false,
             needs_rebind: false,
@@ -146,15 +166,13 @@ impl FontdueAtlas {
     }
 
     fn prepopulate_ascii(&mut self) {
+        // Single subpixel bin: positioning is done via fractional cell origin +
+        // linear sampling at render time, so per-bin glyph copies are not needed.
         for ch in ' '..='~' {
-            for subpixel in 0..=3 {
-                self.get_or_rasterize(ch, false, subpixel);
-            }
+            self.get_or_rasterize(ch, false, 0);
         }
         for ch in ' '..='~' {
-            for subpixel in 0..=3 {
-                self.get_or_rasterize(ch, true, subpixel);
-            }
+            self.get_or_rasterize(ch, true, 0);
         }
     }
 
@@ -209,6 +227,19 @@ impl FontdueAtlas {
             region.v0 *= scale_y;
             region.v1 *= scale_y;
         }
+        // gid_cache holds shaped-glyph UVs and must be rescaled too, otherwise
+        // ligatures/shaped runs sample the wrong atlas region after a grow.
+        for region in self.gid_cache.values_mut() {
+            region.u0 *= scale_x;
+            region.u1 *= scale_x;
+            region.v0 *= scale_y;
+            region.v1 *= scale_y;
+        }
+
+        // Shaped-run cache stores UVs; drop it and bump the generation so any
+        // in-flight run does not cache regions captured against the old size.
+        self.shape_cache.clear();
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
 
         self.width = new_size;
         self.height = new_size;
@@ -247,6 +278,9 @@ impl FontdueAtlas {
 
         if !self.allocate_shelf(padded_w, padded_h) {
             if !self.grow() {
+                // Atlas is at max size and full. Request a compaction (rebuild) on
+                // the next upload so churned/evicted glyphs reclaim their shelf space.
+                self.needs_compaction = true;
                 let region = empty_glyph_region();
                 self.cache_insert(key, region);
                 return region;
@@ -413,6 +447,7 @@ impl FontdueAtlas {
 
         if !self.allocate_shelf(padded_w, padded_h) {
             if !self.grow() {
+                self.needs_compaction = true;
                 let region = empty_glyph_region();
                 self.gid_cache.insert(key, region);
                 return region;
@@ -563,6 +598,10 @@ impl FontBackend for FontdueAtlas {
         self.ascii_cache.clear();
         self.unicode_cache.clear();
         self.gid_cache.clear();
+        self.shape_cache.clear();
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
+        // Clear before the nested ensure_uploaded below so we don't re-enter compaction.
+        self.needs_compaction = false;
         self.shelf_x = 0;
         self.shelf_y = 0;
         self.shelf_height = 0;
@@ -593,6 +632,14 @@ impl FontBackend for FontdueAtlas {
     }
 
     fn ensure_uploaded(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        // Atlas filled up at max size: rebuild from scratch to reclaim the shelf
+        // space held by glyphs that were evicted from the logical caches. reset()
+        // clears needs_compaction first, so this does not recurse.
+        if self.needs_compaction {
+            self.reset(device, queue);
+            return;
+        }
+
         // Check if texture needs to be recreated
         let tex_size = self.texture.size();
         if tex_size.width != self.width || tex_size.height != self.height {
@@ -698,6 +745,23 @@ impl FontBackend for FontdueAtlas {
             return glyphs;
         }
 
+        // Fast path: identical runs recur every frame (e.g. a static prompt line).
+        // Returning the cached shaping avoids re-parsing the rustybuzz face and
+        // re-running the shaper on every dirty row. The cache is cleared whenever
+        // the atlas grows/resets, so cached regions are always current.
+        let cache_key = ShapeCacheKey {
+            text: text.to_string(),
+            bold,
+            subpixel_offset,
+        };
+        if let Some(cached) = self.shape_cache.get(&cache_key) {
+            return cached.as_ref().clone();
+        }
+
+        // Snapshot generation so we can detect a grow triggered while rasterizing
+        // glyphs below; if that happens, earlier regions are stale and must not be cached.
+        let generation_before = self.atlas_generation;
+
         let font_data = if bold {
             self.font_data_bold.as_ref().unwrap_or(&self.font_data_regular)
         } else {
@@ -745,6 +809,13 @@ impl FontBackend for FontdueAtlas {
                 y_offset: pos.y_offset as f32 * scale,
                 region,
             });
+        }
+
+        // Only cache when the atlas did not grow while rasterizing this run; a grow
+        // rescales UVs and would leave the earlier glyphs in this vec pointing at the
+        // wrong region.
+        if self.atlas_generation == generation_before {
+            self.shape_cache.put(cache_key, Arc::new(glyphs.clone()));
         }
 
         glyphs

@@ -40,7 +40,10 @@ impl TerminalApp {
             let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
             crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
-            if cols != self.cols || rows != self.rows || self.force_resize_session {
+            // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
+            // 各自按自己的 rect 尺寸 resize(否则活跃会话会被错误地撑成整窗口大小)。
+            let multi_pane = self.layout_manager.panes().len() > 1;
+            if !multi_pane && (cols != self.cols || rows != self.rows || self.force_resize_session) {
                 let session = self.session_manager.get_active_session_mut();
                 let _ = session.shell.resize(cols, rows);
                 let mut terminal = session.terminal.lock();
@@ -73,8 +76,18 @@ impl TerminalApp {
                     }
 
                     let session_idx = pane.session_idx;
+                    // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
+                    // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
+                    let (pane_cols, pane_rows) =
+                        self.pane_renderers[pane_idx].grid_dimensions(pane.rect.size());
                     if let Some(session) = self.session_manager.get_session_mut(session_idx) {
                         let mut terminal_guard = session.terminal.lock();
+                        if pane_cols != terminal_guard.grid.row_len()
+                            || pane_rows != terminal_guard.grid.rows()
+                        {
+                            terminal_guard.on_resize(pane_cols, pane_rows);
+                            let _ = session.shell.resize(pane_cols, pane_rows);
+                        }
                         let visible_cells = terminal_guard.get_visible_cells();
                         let row_wrapped = terminal_guard.get_visible_row_wrapped();
                         let links = self
@@ -139,6 +152,19 @@ impl TerminalApp {
 
                         if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
                             self.dragging_divider = false;
+                        }
+                    }
+                }
+
+                // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
+                // 那是用于拖拽调整比例的)。
+                if !self.dragging_divider
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+                {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        let on_divider = divider_rect.map(|d| d.contains(pos)).unwrap_or(false);
+                        if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
+                            self.sync_active_session_to_focused_pane();
                         }
                     }
                 }
@@ -511,7 +537,7 @@ impl TerminalApp {
                         match sr_action {
                             search_replace_panel::SearchReplaceAction::ReplaceToClipboard => {
                                 if let Some(clipboard) = &self.clipboard {
-                                    let _ = clipboard.copy(&result);
+                                    if let Err(e) = clipboard.copy(&result) { log::warn!("{}", e); }
                                 }
                             }
                             search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {

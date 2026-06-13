@@ -6,6 +6,18 @@ use crate::{config, keybindings, layout};
 use eframe::egui;
 
 impl TerminalApp {
+    /// 把全局活跃会话切换到当前焦点窗格对应的会话,使键盘输入/复制等
+    /// 路由到正确的分屏窗格。focus 变化(分屏、Next/Prev、关闭、点击)后调用。
+    pub fn sync_active_session_to_focused_pane(&mut self) {
+        if let Some(idx) = self.layout_manager.focused_session_idx() {
+            if idx != self.session_manager.active_index() {
+                self.session_manager.switch_session(idx);
+                // 触发下一帧按目标窗格尺寸重算 grid
+                self.force_resize_session = true;
+            }
+        }
+    }
+
     /// 处理搜索面板打开时的键盘事件（Esc 关闭、Enter 跳转、上下键浏览历史）。
     pub fn handle_search_panel_input(&mut self) {
         if self.search_state.is_open {
@@ -137,6 +149,7 @@ impl TerminalApp {
                                                 self.create_session_with_current_config(None, None);
                                             let _ =
                                                 self.layout_manager.split(new_session_idx, false);
+                                            self.sync_active_session_to_focused_pane();
                                             self.status_message = "Split vertically".to_string();
                                             self.schedule_session_save();
                                         }
@@ -146,6 +159,7 @@ impl TerminalApp {
                                                 self.create_session_with_current_config(None, None);
                                             let _ =
                                                 self.layout_manager.split(new_session_idx, true);
+                                            self.sync_active_session_to_focused_pane();
                                             self.status_message = "Split horizontally".to_string();
                                             self.schedule_session_save();
                                         }
@@ -154,17 +168,21 @@ impl TerminalApp {
                                             if let Err(e) = self.layout_manager.close_focused_pane()
                                             {
                                                 self.status_message = e;
+                                            } else {
+                                                self.sync_active_session_to_focused_pane();
                                             }
                                         }
                                         keybindings::Command::PaneFocusNext => {
                                             // 切换到下一个窗格
                                             self.layout_manager
                                                 .focus_pane(layout::PaneDirection::Next);
+                                            self.sync_active_session_to_focused_pane();
                                         }
                                         keybindings::Command::PaneFocusPrev => {
                                             // 切换到前一个窗格
                                             self.layout_manager
                                                 .focus_pane(layout::PaneDirection::Prev);
+                                            self.sync_active_session_to_focused_pane();
                                         }
                                         keybindings::Command::ConfigOpen => {
                                             self.config_panel.open(&self.config);

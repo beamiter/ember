@@ -66,10 +66,13 @@ impl LayoutManager {
             return Err("MVP supports max 2 panes".to_string());
         }
 
-        let new_pane = Pane::new(PaneId(self.pane_counter), session_idx);
+        let new_id = PaneId(self.pane_counter);
+        let new_pane = Pane::new(new_id, session_idx);
         self.pane_counter += 1;
 
         self.panes.push(new_pane);
+        // 新分出的窗格获得焦点(符合大多数终端的行为)
+        self.focused_pane_id = new_id;
 
         self.mode = if horizontal {
             SplitMode::HorizontalSplit { ratio: 0.5 }
@@ -148,6 +151,30 @@ impl LayoutManager {
     /// 获取所有窗格
     pub fn panes(&self) -> &[Pane] {
         &self.panes
+    }
+
+    /// 返回当前焦点窗格对应的 session 索引
+    pub fn focused_session_idx(&self) -> Option<usize> {
+        self.panes
+            .iter()
+            .find(|p| p.id == self.focused_pane_id)
+            .map(|p| p.session_idx)
+    }
+
+    /// 根据坐标设置焦点窗格,命中则返回该窗格的 session 索引。
+    /// 用于点击某个窗格时把输入焦点切换过去。
+    pub fn focus_pane_at(&mut self, pos: egui::Pos2) -> Option<usize> {
+        let hit = self
+            .panes
+            .iter()
+            .find(|p| p.rect.contains(pos))
+            .map(|p| (p.id, p.session_idx));
+        if let Some((id, idx)) = hit {
+            self.focused_pane_id = id;
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     /// 计算窗格矩形（基于容器矩形和分割比例）

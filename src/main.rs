@@ -614,10 +614,23 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
-    let mut wrapped = Vec::with_capacity(payload.len() + 12);
+fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
+    // 安全:剔除 payload 内嵌的粘贴结束序列 ESC[201~,否则恶意剪贴板可
+    // 提前结束粘贴模式并注入随后被 shell 执行的命令(bracketed-paste 注入)。
+    let end = b"\x1b[201~";
+    let mut sanitized = Vec::with_capacity(payload.len());
+    let mut i = 0;
+    while i < payload.len() {
+        if payload[i..].starts_with(end) {
+            i += end.len();
+        } else {
+            sanitized.push(payload[i]);
+            i += 1;
+        }
+    }
+    let mut wrapped = Vec::with_capacity(sanitized.len() + 12);
     wrapped.extend_from_slice(b"\x1b[200~");
-    wrapped.append(&mut payload);
+    wrapped.append(&mut sanitized);
     wrapped.extend_from_slice(b"\x1b[201~");
     wrapped
 }
@@ -1196,7 +1209,7 @@ impl eframe::App for TerminalApp {
             if let Some(clipboard) = &self.clipboard {
                 let terminal = session.terminal.lock();
                 if let Some(text) = terminal.copy_selection() {
-                    let _ = clipboard.copy(&text);
+                    if let Err(e) = clipboard.copy(&text) { log::warn!("{}", e); }
                     consumed_keys.insert("Ctrl+Shift+C".to_string());
                 }
             }
@@ -1576,7 +1589,7 @@ impl eframe::App for TerminalApp {
             let mut terminal = session.terminal.lock();
             if let Some(text) = terminal.take_osc52_clipboard_set() {
                 if let Some(clipboard) = &self.clipboard {
-                    let _ = clipboard.copy(&text);
+                    if let Err(e) = clipboard.copy(&text) { log::warn!("{}", e); }
                 }
             }
             if terminal.take_osc52_clipboard_query() {

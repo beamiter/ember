@@ -76,6 +76,14 @@ impl TerminalApp {
     }
 
     fn apply_hot_reload(&mut self, new: &config::Config) {
+        // 热重载来自磁盘上用户手改的文件,先 clamp 到合法范围,避免非法值
+        // (负 padding、>1 不透明度、0 字号等)破坏渲染。
+        let mut new = new.clone();
+        new.font_size = config::Config::clamp_font_size(new.font_size);
+        new.opacity = new.opacity.clamp(0.0, 1.0);
+        new.padding = new.padding.clamp(0.0, 100.0);
+        new.line_spacing = new.line_spacing.clamp(0.5, 3.0);
+        let new = &new;
         let old = &self.config;
 
         let font_size_changed = (new.font_size - old.font_size).abs() > 0.01;

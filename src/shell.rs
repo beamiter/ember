@@ -1,6 +1,6 @@
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
-use crossbeam::channel::{unbounded, Receiver};
+use crossbeam::channel::{bounded, Receiver};
 use eframe::egui;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +14,10 @@ pub enum ShellEvent {
     Exit(i32),
     Error(String),
 }
+
+/// 事件 channel 容量上限。每个事件最多 ~128KB(BATCH_SIZE_THRESHOLD),
+/// 256 * 128KB ≈ 32MB 为内存上界,既能吸收突发又能阻止无限堆积。
+const EVENT_CHANNEL_CAP: usize = 256;
 
 /// ShellSession 管理 PTY 和后台 I/O 线程
 pub struct ShellSession {
@@ -49,7 +53,10 @@ impl ShellSession {
                 // 在把 pty 放入 Arc<Mutex> 前获取 child_pid
                 let child_pid = pty.get_child_pid();
 
-                let (event_tx, event_rx) = unbounded::<ShellEvent>();
+                // 有界 channel 提供背压:UI 消费不及时,IO 线程会阻塞在 send 上,
+                // 停止读取 PTY → 内核 PTY 缓冲填满 → 高产出进程(如 yes)自身阻塞,
+                // 避免 unbounded channel 无限增长导致 OOM。
+                let (event_tx, event_rx) = bounded::<ShellEvent>(EVENT_CHANNEL_CAP);
                 let shutdown = Arc::new(AtomicBool::new(false));
 
                 let pty = Arc::new(Mutex::new(pty));
@@ -133,78 +140,70 @@ impl ShellSession {
 
             match Pty::wait_fd_readable(master_fd, timeout_ms) {
                 Ok(true) => {
-                    // PTY 可读，读取数据
-                    {
+                    // 锁内仅读取/累积数据并捕获终止动作;所有 send 移到锁外,
+                    // 避免有界 channel 满时持锁阻塞,与 UI 线程 write() 形成死锁。
+                    enum After {
+                        Continue,
+                        ContinueWith(ShellEvent),
+                        Stop(ShellEvent),
+                    }
+                    let after = {
                         let mut pty_guard = pty.lock();
+                        let mut after = After::Continue;
                         loop {
                             match pty_guard.read(&mut buf) {
                                 Ok(n) if n > 0 => {
                                     accumulated.extend_from_slice(&buf[..n]);
                                     if accumulated.len() >= BATCH_SIZE_THRESHOLD {
-                                        let data = std::mem::take(&mut accumulated);
-                                        if !Self::send_event(
-                                            &event_tx,
-                                            &repaint_ctx,
-                                            ShellEvent::Output(data),
-                                        ) {
-                                            return;
-                                        }
-                                        last_batch_time = std::time::Instant::now();
+                                        break;
                                     }
                                 }
                                 Ok(_) => break,
                                 Err(e) => {
                                     crate::debug_log!("[IOLoop] 读取错误: {}", e);
                                     if !pty_guard.is_alive() {
-                                        if !accumulated.is_empty() {
-                                            let data = std::mem::take(&mut accumulated);
-                                            let _ = Self::send_event(
-                                                &event_tx,
-                                                &repaint_ctx,
-                                                ShellEvent::Output(data),
-                                            );
-                                        }
-                                        match pty_guard.wait_timeout(0) {
-                                            Ok(exit_code) => {
-                                                let _ = Self::send_event(
-                                                    &event_tx,
-                                                    &repaint_ctx,
-                                                    ShellEvent::Exit(exit_code),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                let _ = Self::send_event(
-                                                    &event_tx,
-                                                    &repaint_ctx,
-                                                    ShellEvent::Error(format!(
-                                                        "Process exit error: {}",
-                                                        e
-                                                    )),
-                                                );
-                                            }
-                                        }
-                                        return;
+                                        after = After::Stop(match pty_guard.wait_timeout(0) {
+                                            Ok(exit_code) => ShellEvent::Exit(exit_code),
+                                            Err(e) => ShellEvent::Error(format!(
+                                                "Process exit error: {}",
+                                                e
+                                            )),
+                                        });
+                                    } else {
+                                        after = After::ContinueWith(ShellEvent::Error(format!(
+                                            "Read error: {}",
+                                            e
+                                        )));
                                     }
-                                    let _ = Self::send_event(
-                                        &event_tx,
-                                        &repaint_ctx,
-                                        ShellEvent::Error(format!("Read error: {}", e)),
-                                    );
                                     break;
                                 }
                             }
                         }
-                    }
-                    // Flush accumulated data immediately after draining the fd
-                    // instead of waiting for next poll timeout
+                        after
+                    };
+                    // 锁已释放,以下 send 可安全阻塞(背压生效点)
                     if !accumulated.is_empty()
-                        && last_batch_time.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
+                        && (accumulated.len() >= BATCH_SIZE_THRESHOLD
+                            || last_batch_time.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
+                            || !matches!(after, After::Continue))
                     {
                         let data = std::mem::take(&mut accumulated);
                         if !Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data)) {
                             return;
                         }
                         last_batch_time = std::time::Instant::now();
+                    }
+                    match after {
+                        After::Continue => {}
+                        After::ContinueWith(ev) => {
+                            if !Self::send_event(&event_tx, &repaint_ctx, ev) {
+                                return;
+                            }
+                        }
+                        After::Stop(ev) => {
+                            let _ = Self::send_event(&event_tx, &repaint_ctx, ev);
+                            return;
+                        }
                     }
                 }
                 Ok(false) => {
@@ -233,33 +232,31 @@ impl ShellSession {
 
             // 检查进程是否存活（250ms 检查一次，空闲时降低唤醒频率）
             if last_alive_check.elapsed() >= Duration::from_millis(ALIVE_CHECK_MS) {
-                let mut pty_guard = pty.lock();
-                if !pty_guard.is_alive() {
-                    crate::debug_log!("[IOLoop] 检测到子进程已退出");
-                    // 发送积累的数据
+                // 在锁内判定退出并取退出码,锁外再发送事件(同样为避免持锁阻塞)
+                let exit_event = {
+                    let mut pty_guard = pty.lock();
+                    if !pty_guard.is_alive() {
+                        crate::debug_log!("[IOLoop] 检测到子进程已退出");
+                        Some(match pty_guard.wait_timeout(0) {
+                            Ok(exit_code) => {
+                                crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
+                                ShellEvent::Exit(exit_code)
+                            }
+                            Err(e) => {
+                                ShellEvent::Error(format!("Process exit error: {}", e))
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                };
+                if let Some(exit_event) = exit_event {
                     if !accumulated.is_empty() {
                         let data = std::mem::take(&mut accumulated);
                         let _ =
                             Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
                     }
-                    match pty_guard.wait_timeout(0) {
-                        Ok(exit_code) => {
-                            crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
-                            let _result = Self::send_event(
-                                &event_tx,
-                                &repaint_ctx,
-                                ShellEvent::Exit(exit_code),
-                            );
-                            crate::debug_log!("[IOLoop] Exit 事件发送结果: {}", _result);
-                        }
-                        Err(e) => {
-                            let _ = Self::send_event(
-                                &event_tx,
-                                &repaint_ctx,
-                                ShellEvent::Error(format!("Process exit error: {}", e)),
-                            );
-                        }
-                    }
+                    let _ = Self::send_event(&event_tx, &repaint_ctx, exit_event);
                     return;
                 }
                 last_alive_check = std::time::Instant::now();
@@ -377,26 +374,29 @@ impl Drop for ShellSession {
         // 通知 IO 线程退出
         self.shutdown.store(true, Ordering::Relaxed);
 
-        // 直接杀死整个进程组，确保 shell 及其子进程都被清理
+        let child_pid = self.child_pid;
+        let pgid = -child_pid;
+
+        // 立即发送优雅终止信号(瞬时,不阻塞)
         // SAFETY: kill 向进程/进程组发送信号。负 PID 向进程组发送信号是标准做法。
         // child_pid 来自 fork 创建的有效进程。即使进程已退出，kill 也是安全的。
         unsafe {
-            let pgid = -self.child_pid;
-            // SIGHUP: 通知shell会话终止
-            libc::kill(pgid, libc::SIGHUP);
-            // SIGTERM: 请求优雅退出
-            libc::kill(self.child_pid, libc::SIGTERM);
-
-            // 短暂等待后强制杀死
-            std::thread::sleep(std::time::Duration::from_millis(30));
-
-            // 强制杀死残留进程
-            let _ = libc::kill(pgid, libc::SIGKILL);
-            let _ = libc::kill(self.child_pid, libc::SIGKILL);
-
-            // 回收僵尸进程
-            let mut status = 0;
-            let _ = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
+            libc::kill(pgid, libc::SIGHUP); // 通知 shell 会话终止
+            libc::kill(child_pid, libc::SIGTERM); // 请求优雅退出
         }
+
+        // 把 "等待 → SIGKILL → 回收僵尸" 放到独立线程,避免在 UI 线程 sleep 30ms。
+        // 关闭多个会话时,这能把累计阻塞从 N*30ms 降到 0。
+        let _ = thread::Builder::new()
+            .name("pty-reaper".to_string())
+            .spawn(move || unsafe {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let _ = libc::kill(pgid, libc::SIGKILL);
+                let _ = libc::kill(child_pid, libc::SIGKILL);
+                // 阻塞式 waitpid 确保僵尸进程被回收(SIGKILL 不可捕获,进程必然退出)。
+                // 若已被 io_loop 的 wait_timeout 回收,这里返回 ECHILD,无害。
+                let mut status = 0;
+                let _ = libc::waitpid(child_pid, &mut status, 0);
+            });
     }
 }

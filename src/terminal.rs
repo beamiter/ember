@@ -740,6 +740,22 @@ impl TerminalModes {
     }
 }
 
+/// DECSC/DECRC 保存的完整光标状态(含 SGR 属性、字符集、模式),
+/// 与备用屏幕缓冲使用的 saved_cursor_row/col 解耦。
+#[derive(Clone)]
+struct SavedCursorState {
+    row: usize,
+    col: usize,
+    fg: Color,
+    bg: Color,
+    flags: StyleFlags,
+    g0: Charset,
+    g1: Charset,
+    active: Charset,
+    origin_mode: bool,
+    autowrap: bool,
+}
+
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
@@ -756,6 +772,17 @@ pub struct TerminalState {
     alt_cursor_row: usize,
     alt_cursor_col: usize,
     pub cursor_shape: CursorShape,
+
+    // DECSC/DECRC 完整保存状态
+    saved_state: Option<SavedCursorState>,
+    // IRM 插入模式 (ANSI mode 4):写字符时右移而非覆盖
+    insert_mode: bool,
+    // DECOM 原点模式 (DEC private ?6):光标寻址相对滚动区域顶端
+    origin_mode: bool,
+    // 自定义制表位 (HTS/TBC),index 为列,true 表示该列是制表位
+    tab_stops: Vec<bool>,
+    // DEC 延迟换行 (Last Column Flag):写满最后一列后置位,下一个可打印字符才换行
+    pending_wrap: bool,
 
     current_fg: Color,
     current_bg: Color,
@@ -864,6 +891,79 @@ impl TerminalState {
         params
     }
 
+    /// 默认每 8 列一个制表位。
+    fn default_tab_stops(cols: usize) -> Vec<bool> {
+        (0..cols).map(|c| c % 8 == 0).collect()
+    }
+
+    /// 从给定列出发,返回下一个制表位的列(无则停在最后一列)。
+    fn next_tab_stop(&self, col: usize) -> usize {
+        let cols = self.grid.row_len();
+        let mut c = col + 1;
+        while c < cols {
+            if self.tab_stops.get(c).copied().unwrap_or(false) {
+                return c;
+            }
+            c += 1;
+        }
+        cols.saturating_sub(1)
+    }
+
+    /// DECSC / CSI s:保存完整光标状态(含 SGR、字符集、模式)。
+    fn save_cursor_state(&mut self) {
+        self.saved_state = Some(SavedCursorState {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            fg: self.current_fg,
+            bg: self.current_bg,
+            flags: self.current_flags,
+            g0: self.g0_charset,
+            g1: self.g1_charset,
+            active: self.active_charset,
+            origin_mode: self.origin_mode,
+            autowrap: self.modes.contains(&7),
+        });
+    }
+
+    /// DECRC / CSI u:恢复 save_cursor_state 保存的完整状态;
+    /// 若从未保存过,按规范复位到原点。
+    fn restore_cursor_state(&mut self) {
+        if let Some(s) = self.saved_state.clone() {
+            self.cursor_row = s.row.min(self.grid.rows().saturating_sub(1));
+            self.cursor_col = s.col.min(self.grid.row_len().saturating_sub(1));
+            self.current_fg = s.fg;
+            self.current_bg = s.bg;
+            self.current_flags = s.flags;
+            self.g0_charset = s.g0;
+            self.g1_charset = s.g1;
+            self.active_charset = s.active;
+            self.origin_mode = s.origin_mode;
+            if s.autowrap {
+                self.modes.insert(7);
+            } else {
+                self.modes.remove(&7);
+            }
+        } else {
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+        }
+    }
+
+    /// CUP/HVP 光标定位(1 基参数)。原点模式下行相对滚动区域顶端并限制在区域内。
+    fn set_cursor_position(&mut self, row_param: usize, col_param: usize) {
+        self.pending_wrap = false;
+        let col = col_param
+            .saturating_sub(1)
+            .min(self.grid.row_len().saturating_sub(1));
+        let row0 = row_param.saturating_sub(1);
+        self.cursor_row = if self.origin_mode {
+            (self.scroll_region_top + row0).min(self.scroll_region_bottom)
+        } else {
+            row0.min(self.grid.rows().saturating_sub(1))
+        };
+        self.cursor_col = col;
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let grid = TerminalGrid::new(rows, cols);
@@ -892,6 +992,11 @@ impl TerminalState {
             alt_cursor_row: 0,
             alt_cursor_col: 0,
             cursor_shape: CursorShape::default(),
+            saved_state: None,
+            insert_mode: false,
+            origin_mode: false,
+            tab_stops: Self::default_tab_stops(cols),
+            pending_wrap: false,
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_flags: StyleFlags::default(),
@@ -1096,21 +1201,77 @@ impl TerminalState {
         }
     }
 
+    /// Compose a combining mark onto the most recently written cell using NFC.
+    /// Only single-codepoint compositions are applied (the cell stores one char).
+    fn apply_combining_mark(&mut self, mark: char) {
+        if self.cursor_col == 0 {
+            return;
+        }
+        // The base glyph sits just left of the cursor; step over a wide
+        // character's continuation cell if present.
+        let mut base_col = self.cursor_col - 1;
+        if self.grid.get(self.cursor_row, base_col).flags.wide_continuation() {
+            if base_col == 0 {
+                return;
+            }
+            base_col -= 1;
+        }
+
+        let base = self.grid.get(self.cursor_row, base_col).character;
+        if base == ' ' || base == '\0' {
+            return;
+        }
+
+        let mut composed = String::with_capacity(2);
+        composed.push(base);
+        composed.push(mark);
+        let nfc: String = unicode_normalization::UnicodeNormalization::nfc(composed.as_str()).collect();
+        let mut chars = nfc.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c != base {
+                self.grid.get_mut(self.cursor_row, base_col).character = c;
+                self.dirty_region.mark_row(self.cursor_row);
+                self.mark_row_dirty(self.cursor_row);
+            }
+        }
+    }
+
     fn put_char(&mut self, ch: char) {
         let _orig_ch = ch;
         let ch = self.translate_char(ch);
         let width = crate::char_width::cached_char_width(ch);
         if width == 0 {
-            return; // Skip zero-width characters for now
+            // Zero-width characters are combining marks. Try to compose the mark
+            // onto the previously written cell (NFC). Marks with no precomposed
+            // single-codepoint form (e.g. stacked diacritics) are dropped, as the
+            // cell can only hold one char.
+            self.apply_combining_mark(ch);
+            return;
         }
 
         let cols = self.grid.row_len();
         let blank_cell = self.create_blank_cell();
+        let autowrap = self.modes.contains(&7);
 
-        // If character doesn't fit at end of line, handle based on autowrap mode
+        // Resolve a wrap deferred by the previous character (DEC Last Column Flag).
+        // The actual line break happens here, when the next printable char arrives.
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            if autowrap {
+                self.grid.row_wrapped[self.cursor_row] = true;
+                self.cursor_col = 0;
+                self.cursor_row += 1;
+                if self.cursor_row >= self.grid.rows() {
+                    self.cursor_row = self.grid.rows() - 1;
+                    self.scroll_down();
+                }
+            }
+        }
+
+        // A wide character that does not fit in the columns left on this line wraps
+        // immediately (it cannot be split across the line boundary).
         if self.cursor_col + width > cols {
-            // Only wrap to next line if autowrap mode (mode 7) is enabled
-            if self.modes.contains(&7) {
+            if autowrap {
                 self.grid.row_wrapped[self.cursor_row] = true;
                 self.cursor_col = 0;
                 self.cursor_row += 1;
@@ -1121,6 +1282,17 @@ impl TerminalState {
             } else {
                 // Autowrap disabled: clamp cursor to last column instead of wrapping
                 self.cursor_col = cols.saturating_sub(width);
+            }
+        }
+
+        // IRM (insert mode, ANSI mode 4): shift existing cells right by `width`
+        // before writing, discarding cells pushed past the end of the row.
+        if self.insert_mode {
+            for _ in 0..width {
+                if self.cursor_col < cols {
+                    self.grid
+                        .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell.clone());
+                }
             }
         }
 
@@ -1156,17 +1328,50 @@ impl TerminalState {
         }
 
         self.cursor_col += width;
+        // If we just filled the last cell, defer the wrap: keep the cursor on the
+        // last column and set the Last Column Flag. The wrap fires on the next char.
+        if self.cursor_col >= cols {
+            if autowrap {
+                self.cursor_col = cols.saturating_sub(width);
+                self.pending_wrap = true;
+            } else {
+                self.cursor_col = cols.saturating_sub(width);
+            }
+        }
         // Mark the row as dirty after writing character
         self.dirty_region.mark_row(self.cursor_row);
         self.mark_row_dirty(self.cursor_row);
     }
 
     fn put_ascii_run(&mut self, bytes: &[u8]) {
+        // Insert mode (IRM) needs per-character right-shifting, which the fast
+        // overwrite path below does not do. Fall back to put_char for each byte.
+        if self.insert_mode {
+            for &byte in bytes {
+                self.put_char(byte as char);
+            }
+            return;
+        }
+
         let cols = self.grid.row_len();
         let autowrap = self.modes.contains(&7);
         let mut pos = 0;
 
         while pos < bytes.len() {
+            // 先结算上一次写入遗留的延迟换行(DEC 末列标志)。
+            if self.pending_wrap {
+                self.pending_wrap = false;
+                if autowrap {
+                    self.grid.row_wrapped[self.cursor_row] = true;
+                    self.cursor_col = 0;
+                    self.cursor_row += 1;
+                    if self.cursor_row >= self.grid.rows() {
+                        self.cursor_row = self.grid.rows() - 1;
+                        self.scroll_down();
+                    }
+                }
+            }
+
             let remaining = cols - self.cursor_col;
             let chunk_len = (bytes.len() - pos).min(remaining);
 
@@ -1192,19 +1397,12 @@ impl TerminalState {
             self.dirty_region.mark_row(self.cursor_row);
             self.mark_row_dirty(self.cursor_row);
 
-            // Handle wrap if there's more data
-            if pos < bytes.len() && self.cursor_col >= cols {
+            // 写满末列时不立即换行,改为置延迟换行标志,
+            // 光标停在末列,等待下一个可打印字符再决定是否换行。
+            if self.cursor_col >= cols {
+                self.cursor_col = cols - 1;
                 if autowrap {
-                    self.grid.row_wrapped[self.cursor_row] = true;
-                    self.cursor_col = 0;
-                    self.cursor_row += 1;
-                    if self.cursor_row >= self.grid.rows() {
-                        self.cursor_row = self.grid.rows() - 1;
-                        self.scroll_down();
-                    }
-                } else {
-                    self.cursor_col = cols - 1;
-                    break;
+                    self.pending_wrap = true;
                 }
             }
         }
@@ -1450,6 +1648,7 @@ impl TerminalState {
                 b'\x08' | b'\x7f' => {
                     // Backspace (0x08) and Delete (0x7f) - just move cursor left
                     // Shell handles actual deletion and sends back updated display
+                    self.pending_wrap = false;
                     if self.cursor_col > 0 {
                         self.cursor_col -= 1;
                     }
@@ -1457,6 +1656,7 @@ impl TerminalState {
                 }
                 b'\n' => {
                     // Linefeed - move cursor down or scroll
+                    self.pending_wrap = false;
                     if self.cursor_row < self.scroll_region_bottom {
                         // Cursor is not at bottom of scroll region, just move down
                         self.cursor_row += 1;
@@ -1468,6 +1668,7 @@ impl TerminalState {
                     i += 1;
                 }
                 b'\r' => {
+                    self.pending_wrap = false;
                     self.cursor_col = 0;
                     i += 1;
                 }
@@ -1484,11 +1685,9 @@ impl TerminalState {
                     i += 1;
                 }
                 b'\t' => {
-                    // Tab
-                    self.cursor_col = ((self.cursor_col + 8) / 8) * 8;
-                    if self.cursor_col >= self.grid.row_len() {
-                        self.cursor_col = self.grid.row_len() - 1;
-                    }
+                    // Tab - 前进到下一个制表位(支持自定义 HTS/TBC 制表位)
+                    self.pending_wrap = false;
+                    self.cursor_col = self.next_tab_stop(self.cursor_col);
                     i += 1;
                 }
                 b'\x1b' => {
@@ -1501,15 +1700,20 @@ impl TerminalState {
 
                     match data_slice[i + 1] {
                         b'7' => {
-                            // DECSC - Save Cursor Position
-                            self.saved_cursor_row = self.cursor_row;
-                            self.saved_cursor_col = self.cursor_col;
+                            // DECSC - 保存光标(含 SGR/字符集/模式)
+                            self.save_cursor_state();
                             i += 2;
                         }
                         b'8' => {
-                            // DECRC - Restore Cursor Position
-                            self.cursor_row = self.saved_cursor_row.min(self.grid.rows() - 1);
-                            self.cursor_col = self.saved_cursor_col.min(self.grid.row_len() - 1);
+                            // DECRC - 恢复光标(含 SGR/字符集/模式)
+                            self.restore_cursor_state();
+                            i += 2;
+                        }
+                        b'H' => {
+                            // HTS - 在当前光标列设置制表位
+                            if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                                *stop = true;
+                            }
                             i += 2;
                         }
                         b']' => {
@@ -1890,6 +2094,10 @@ impl TerminalState {
         private_prefix: Option<u8>,
         intermediates: &[u8],
     ) {
+        // 显式光标定位会取消延迟换行标志(DEC 末列标志)。
+        if matches!(cmd, 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`') {
+            self.pending_wrap = false;
+        }
         match cmd {
             'A' => {
                 // Cursor up - should scroll region down if at top
@@ -1940,8 +2148,7 @@ impl TerminalState {
             'H' => {
                 let row = params.first().copied().unwrap_or(1) as usize;
                 let col = params.get(1).copied().unwrap_or(1) as usize;
-                self.cursor_row = row.saturating_sub(1).min(self.grid.rows() - 1);
-                self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+                self.set_cursor_position(row, col);
             }
             'f' => {
                 if private_prefix == Some(b'>') && intermediates.is_empty() {
@@ -1958,8 +2165,7 @@ impl TerminalState {
                 } else {
                     let row = params.first().copied().unwrap_or(1) as usize;
                     let col = params.get(1).copied().unwrap_or(1) as usize;
-                    self.cursor_row = row.saturating_sub(1).min(self.grid.rows() - 1);
-                    self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+                    self.set_cursor_position(row, col);
                 }
             }
             'J' => {
@@ -1998,6 +2204,11 @@ impl TerminalState {
                     2 => {
                         self.clear_screen();
                         // clear_screen already marks all rows as dirty
+                    }
+                    3 => {
+                        // Clear scrollback buffer (xterm extension)
+                        self.scrollback.clear();
+                        self.scroll_offset = 0;
                     }
                     _ => {}
                 }
@@ -2087,16 +2298,14 @@ impl TerminalState {
             }
             's' => {
                 if private_prefix.is_none() && intermediates.is_empty() {
-                    self.saved_cursor_row = self.cursor_row;
-                    self.saved_cursor_col = self.cursor_col;
+                    self.save_cursor_state();
                 }
             }
             'u' => {
                 if intermediates.is_empty() {
                     match private_prefix {
                         None => {
-                            self.cursor_row = self.saved_cursor_row.min(self.grid.rows() - 1);
-                            self.cursor_col = self.saved_cursor_col.min(self.grid.row_len() - 1);
+                            self.restore_cursor_state();
                         }
                         Some(b'?') => {
                             crate::debug_log!(
@@ -2204,15 +2413,35 @@ impl TerminalState {
                     }
             }
             'h' => {
-                // Set mode (DECSET)
-                for &mode in params {
-                    self.set_mode(mode);
+                // 区分 DEC 私有模式(CSI ? Pn h)与 ANSI 模式(CSI Pn h)。
+                // 否则 CSI 7h 会被误当作 DECAWM(?7),CSI 4h(IRM)也会落空。
+                match private_prefix {
+                    Some(b'?') => {
+                        for &mode in params {
+                            self.set_mode(mode);
+                        }
+                    }
+                    None => {
+                        for &mode in params {
+                            self.set_ansi_mode(mode);
+                        }
+                    }
+                    _ => {}
                 }
             }
             'l' => {
-                // Reset mode (DECRST)
-                for &mode in params {
-                    self.reset_mode(mode);
+                match private_prefix {
+                    Some(b'?') => {
+                        for &mode in params {
+                            self.reset_mode(mode);
+                        }
+                    }
+                    None => {
+                        for &mode in params {
+                            self.reset_ansi_mode(mode);
+                        }
+                    }
+                    _ => {}
                 }
             }
             'r' => {
@@ -2305,6 +2534,24 @@ impl TerminalState {
                         3 => CursorShape::Beam,
                         _ => CursorShape::Block,
                     };
+                }
+            }
+            'g' => {
+                // TBC - Tab Clear
+                match params.first().copied().unwrap_or(0) {
+                    0 => {
+                        // Clear tab stop at cursor
+                        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                            *stop = false;
+                        }
+                    }
+                    3 => {
+                        // Clear all tab stops
+                        for stop in self.tab_stops.iter_mut() {
+                            *stop = false;
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -2563,10 +2810,30 @@ impl TerminalState {
                 // Autowrap mode
                 self.modes.insert(7);
             }
+            6 => {
+                // DECOM - 原点模式:寻址相对滚动区域,光标移到区域原点
+                self.origin_mode = true;
+                self.cursor_row = self.scroll_region_top;
+                self.cursor_col = 0;
+            }
             _ => {
                 // Unknown mode, just store it
                 self.modes.insert(mode);
             }
+        }
+    }
+
+    /// ANSI 标准模式 (CSI Pn h,无 ? 前缀)。目前仅 IRM(4) 有实际效果。
+    fn set_ansi_mode(&mut self, mode: u16) {
+        if mode == 4 {
+            // IRM - 插入替换模式
+            self.insert_mode = true;
+        }
+    }
+
+    fn reset_ansi_mode(&mut self, mode: u16) {
+        if mode == 4 {
+            self.insert_mode = false;
         }
     }
 
@@ -2640,6 +2907,12 @@ impl TerminalState {
             7 => {
                 // Disable autowrap
                 self.modes.remove(&7);
+            }
+            6 => {
+                // DECOM 关闭:恢复绝对寻址,光标移到屏幕原点
+                self.origin_mode = false;
+                self.cursor_row = 0;
+                self.cursor_col = 0;
             }
             _ => {
                 // Unknown mode, just remove it
@@ -3307,10 +3580,26 @@ impl TerminalState {
         }
 
         self.scroll_offset = 0;
+        self.pending_wrap = false;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.saved_cursor_row = self.saved_cursor_row.min(rows.saturating_sub(1));
         self.saved_cursor_col = self.saved_cursor_col.min(cols.saturating_sub(1));
+
+        // Resize tab stops: keep existing stops, default new columns to every 8th.
+        if cols != self.tab_stops.len() {
+            let old_len = self.tab_stops.len();
+            self.tab_stops.resize(cols, false);
+            for c in old_len..cols {
+                self.tab_stops[c] = c % 8 == 0;
+            }
+        }
+
+        // Clamp saved cursor state (DECSC/CSI s) to new bounds.
+        if let Some(s) = self.saved_state.as_mut() {
+            s.row = s.row.min(rows.saturating_sub(1));
+            s.col = s.col.min(cols.saturating_sub(1));
+        }
         self.alt_cursor_row = self.alt_cursor_row.min(rows.saturating_sub(1));
         self.alt_cursor_col = self.alt_cursor_col.min(cols.saturating_sub(1));
         if had_full_screen_region {
@@ -3710,5 +3999,74 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b[?5522;2$y"
         );
+    }
+
+    #[test]
+    fn combining_mark_composes_onto_previous_cell() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        // 'e' followed by U+0301 (combining acute) should compose to 'é'.
+        terminal.process_input("e\u{0301}".as_bytes());
+
+        assert_eq!(terminal.grid[0][0].character, 'é');
+        // The mark consumes no column; cursor stays just past the base glyph.
+        assert_eq!(terminal.cursor_col, 1);
+        // The second column is untouched.
+        assert_eq!(terminal.grid[0][1].character, ' ');
+    }
+
+    #[test]
+    fn combining_mark_at_line_start_is_dropped() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        // A combining mark with no base character is ignored.
+        terminal.process_input("\u{0301}".as_bytes());
+
+        assert_eq!(terminal.grid[0][0].character, ' ');
+        assert_eq!(terminal.cursor_col, 0);
+    }
+
+    #[test]
+    fn pending_wrap_defers_line_break_until_next_char() {
+        let mut terminal = TerminalState::new(3, 3);
+
+        // Fill the row exactly; cursor latches at the last column (no wrap yet).
+        terminal.process_input(b"abc");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 2);
+        assert_eq!(terminal.grid[0][2].character, 'c');
+
+        // The next printable char triggers the deferred wrap.
+        terminal.process_input(b"d");
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.cursor_col, 1);
+        assert_eq!(terminal.grid[1][0].character, 'd');
+    }
+
+    #[test]
+    fn carriage_return_cancels_pending_wrap() {
+        let mut terminal = TerminalState::new(3, 3);
+
+        terminal.process_input(b"abc");
+        // CR cancels the latched wrap; the next char overwrites column 0.
+        terminal.process_input(b"\rd");
+
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 1);
+        assert_eq!(terminal.grid[0][0].character, 'd');
+    }
+
+    #[test]
+    fn pending_wrap_not_set_when_autowrap_disabled() {
+        let mut terminal = TerminalState::new(3, 3);
+
+        // Disable autowrap (DECRST 7), then overflow the row.
+        terminal.process_input(b"\x1b[?7l");
+        terminal.process_input(b"abcd");
+
+        // Without autowrap the last column is overwritten in place.
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 2);
+        assert_eq!(terminal.grid[0][2].character, 'd');
     }
 }

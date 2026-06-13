@@ -150,7 +150,9 @@ mod unix_clipboard {
                 return Ok(());
             }
 
-            Ok(())
+            Err(anyhow::anyhow!(
+                "复制失败:未找到可用的剪贴板工具 (wl-copy/xclip/xsel)"
+            ))
         }
 
         /// 从系统剪贴板粘贴文本
