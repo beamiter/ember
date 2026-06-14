@@ -900,6 +900,23 @@ impl TerminalApp {
     #[allow(deprecated)]
     fn render_sidebar(&mut self, ctx: &egui::Context) {
         if !self.sidebar.visible {
+            // 单会话(无 tab 栏)时左上角浮动展开按钮；多会话时由 tab 栏内的按钮负责，避免遮挡 tab
+            let has_tab_bar = self.session_manager.sessions().len() > 1;
+            if !has_tab_bar {
+                egui::Area::new(egui::Id::new("sidebar_show_btn"))
+                    .fixed_pos(egui::pos2(4.0, 4.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        if ui
+                            .button("☰")
+                            .on_hover_text("显示文件树 (Ctrl+Shift+B)")
+                            .clicked()
+                        {
+                            self.sidebar.visible = true;
+                            self.sidebar.refresh();
+                        }
+                    });
+            }
             return;
         }
 
@@ -908,6 +925,7 @@ impl TerminalApp {
         let mut select_path: Option<std::path::PathBuf> = None;
         let mut cd_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
+        let mut collapse = false;
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
         egui::SidePanel::left("file_tree")
@@ -916,6 +934,13 @@ impl TerminalApp {
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if ui
+                        .button("◀")
+                        .on_hover_text("隐藏文件树 (Ctrl+Shift+B)")
+                        .clicked()
+                    {
+                        collapse = true;
+                    }
                     ui.label(egui::RichText::new("Files").strong());
                     if ui.button("⟳").on_hover_text("Refresh").clicked() {
                         do_refresh = true;
@@ -957,6 +982,9 @@ impl TerminalApp {
         }
         if do_refresh {
             self.sidebar.refresh();
+        }
+        if collapse {
+            self.sidebar.visible = false;
         }
     }
 

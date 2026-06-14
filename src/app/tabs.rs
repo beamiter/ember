@@ -42,7 +42,10 @@ impl TerminalApp {
                 let active_tab_extra: f32 = 60.0;
                 let active_min_width: f32 = min_tab_width * 2.0; // 当前 session 最小宽度，更突出
                 let tab_spacing: f32 = 1.0;
-                let left_margin: f32 = 5.0;
+                let base_left_margin: f32 = 5.0;
+                // sidebar 隐藏时，在 tab 栏最左预留一个展开按钮的位置，把 tab 整体右移以免遮挡
+                let toggle_btn_w: f32 = if self.sidebar.visible { 0.0 } else { 30.0 };
+                let left_margin: f32 = base_left_margin + toggle_btn_w;
                 let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
 
                 let active_idx_for_layout = self.session_manager.active_index();
@@ -245,6 +248,41 @@ impl TerminalApp {
                     ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
                 let mouse_pressed =
                     ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+
+                // === sidebar 展开按钮（仅 sidebar 隐藏时显示，占据 tab 栏最左一格）===
+                if !self.sidebar.visible {
+                    let toggle_btn_rect = egui::Rect::from_min_size(
+                        egui::pos2(tab_rect.left() + base_left_margin, tab_rect.top() + 5.0),
+                        egui::vec2(toggle_btn_w - 4.0, tab_height - 10.0),
+                    );
+                    let btn_hovered = hover_pos
+                        .map(|p| toggle_btn_rect.contains(p))
+                        .unwrap_or(false);
+                    let btn_t = ctx.animate_bool_with_time(
+                        egui::Id::new("sidebar_toggle_btn_hover"),
+                        btn_hovered,
+                        0.12,
+                    );
+                    painter.rect_filled(toggle_btn_rect, 6.0, tab_hover_fill.gamma_multiply(btn_t));
+                    painter.text(
+                        toggle_btn_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "☰",
+                        egui::FontId::proportional(15.0),
+                        if btn_hovered {
+                            tb_active_text
+                        } else {
+                            tb_inactive_text
+                        },
+                    );
+                    if btn_hovered {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        if mouse_released {
+                            self.sidebar.visible = true;
+                            self.sidebar.refresh();
+                        }
+                    }
+                }
 
                 // 检查是否发生了实际的拖拽（超过阈值距离）
                 let is_actually_dragging =
