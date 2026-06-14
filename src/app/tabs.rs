@@ -4,6 +4,94 @@ use super::state::TerminalApp;
 use eframe::egui;
 
 impl TerminalApp {
+    /// 会话标题：优先用 shell 当前工作目录(对 HOME 做 ~ 缩写)，否则回退到会话名。
+    pub fn session_cwd_title(session: &crate::session::Session) -> String {
+        let pid = session.get_shell_pid();
+        crate::session_manager::get_process_cwd(pid)
+            .map(|cwd| {
+                if let Ok(home) = std::env::var("HOME") {
+                    if cwd == home {
+                        "~".to_string()
+                    } else if let Some(rest) = cwd.strip_prefix(&home) {
+                        format!("~{}", rest)
+                    } else {
+                        cwd
+                    }
+                } else {
+                    cwd
+                }
+            })
+            .unwrap_or_else(|| session.metadata.name.clone())
+    }
+
+    /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
+    pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
+        let active = self.session_manager.active_index();
+        let infos: Vec<(usize, String)> = self
+            .session_manager
+            .sessions()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, Self::session_cwd_title(s)))
+            .collect();
+        let multi = infos.len() > 1;
+
+        let mut switch_to: Option<usize> = None;
+        let mut close_idx: Option<usize> = None;
+        let mut new_session = false;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, title) in &infos {
+                    let is_active = *i == active;
+                    ui.horizontal(|ui| {
+                        if multi
+                            && ui
+                                .small_button("✕")
+                                .on_hover_text("关闭会话")
+                                .clicked()
+                        {
+                            close_idx = Some(*i);
+                        }
+                        let marker = if is_active { "● " } else { "  " };
+                        let resp = ui.add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::Button::selectable(
+                                is_active,
+                                format!("{}{}", marker, title),
+                            ),
+                        );
+                        if resp.clicked() {
+                            switch_to = Some(*i);
+                        }
+                    });
+                }
+            });
+
+        ui.add_space(4.0);
+        if ui.button("＋ New session").clicked() {
+            new_session = true;
+        }
+
+        if let Some(i) = switch_to {
+            self.session_manager.switch_session(i);
+            self.force_resize_session = true;
+        }
+        if let Some(i) = close_idx {
+            if self.session_manager.len() > 1 {
+                self.session_manager.close_session(i);
+                self.schedule_session_save();
+            }
+        }
+        if new_session {
+            let idx = self.create_session_with_current_config(None, None);
+            self.session_manager.switch_session(idx);
+            self.force_resize_session = true;
+            self.schedule_session_save();
+        }
+    }
+
     /// 渲染会话标签栏。返回 true 表示请求关闭窗口，render_ui 应据此提前返回。
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
                 let tab_height = 30.0;
@@ -120,22 +208,7 @@ impl TerminalApp {
                     .iter()
                     .enumerate()
                     .map(|(idx, session)| {
-                        let pid = session.get_shell_pid();
-                        let tab_title = crate::session_manager::get_process_cwd(pid)
-                            .map(|cwd| {
-                                if let Ok(home) = std::env::var("HOME") {
-                                    if cwd == home {
-                                        "~".to_string()
-                                    } else if let Some(rest) = cwd.strip_prefix(&home) {
-                                        format!("~{}", rest)
-                                    } else {
-                                        cwd
-                                    }
-                                } else {
-                                    cwd
-                                }
-                            })
-                            .unwrap_or_else(|| session.metadata.name.clone());
+                        let tab_title = Self::session_cwd_title(session);
 
                         let max_text_w = if idx == active_idx_for_layout {
                             active_max_text

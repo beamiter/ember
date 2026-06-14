@@ -898,18 +898,23 @@ impl TerminalApp {
     /// 渲染左侧文件树侧边栏。必须在 CentralPanel 之前调用，
     /// 否则中央区域不会正确收缩。
     #[allow(deprecated)]
+    /// 顶部水平 tab 栏是否应显示：仅 Top 模式且多会话时
+    fn show_top_tab_bar(&self) -> bool {
+        matches!(self.config.tab_bar_position, config::TabBarPosition::Top)
+            && self.session_manager.sessions().len() > 1
+    }
+
     fn render_sidebar(&mut self, ctx: &egui::Context) {
         if !self.sidebar.visible {
-            // 单会话(无 tab 栏)时左上角浮动展开按钮；多会话时由 tab 栏内的按钮负责，避免遮挡 tab
-            let has_tab_bar = self.session_manager.sessions().len() > 1;
-            if !has_tab_bar {
+            // 顶部 tab 栏显示时由其内部按钮负责展开侧边栏，避免遮挡 tab；否则用左上角浮动按钮
+            if !self.show_top_tab_bar() {
                 egui::Area::new(egui::Id::new("sidebar_show_btn"))
                     .fixed_pos(egui::pos2(4.0, 4.0))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
                         if ui
                             .button("☰")
-                            .on_hover_text("显示文件树 (Ctrl+Shift+B)")
+                            .on_hover_text("显示侧边栏 (Ctrl+Shift+B)")
                             .clicked()
                         {
                             self.sidebar.visible = true;
@@ -918,6 +923,13 @@ impl TerminalApp {
                     });
             }
             return;
+        }
+
+        // 侧边栏 tab 模式：允许在「会话」与「文件」视图间切换；其余模式锁定为文件视图
+        let sidebar_tab_mode =
+            matches!(self.config.tab_bar_position, config::TabBarPosition::Sidebar);
+        if !sidebar_tab_mode {
+            self.sidebar.view = sidebar::SidebarView::Files;
         }
 
         // 树遍历期间只收集动作，闭包结束后再 mutate，规避借用冲突
@@ -936,34 +948,63 @@ impl TerminalApp {
                 ui.horizontal(|ui| {
                     if ui
                         .button("◀")
-                        .on_hover_text("隐藏文件树 (Ctrl+Shift+B)")
+                        .on_hover_text("隐藏侧边栏 (Ctrl+Shift+B)")
                         .clicked()
                     {
                         collapse = true;
                     }
-                    ui.label(egui::RichText::new("Files").strong());
-                    if ui.button("⟳").on_hover_text("Refresh").clicked() {
-                        do_refresh = true;
-                    }
-                });
-                if let Some(dir) = self.sidebar.current_dir.file_name().and_then(|n| n.to_str()) {
-                    ui.label(egui::RichText::new(dir).weak().small());
-                }
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(root) = &self.sidebar.root {
-                        for child in &root.children {
-                            Self::draw_tree_node(
-                                ui,
-                                child,
-                                &self.sidebar.selected_path,
-                                &mut toggle_path,
-                                &mut select_path,
-                                &mut cd_path,
-                            );
+                    if sidebar_tab_mode {
+                        // 分区切换：会话 / 文件
+                        if ui
+                            .selectable_label(
+                                self.sidebar.view == sidebar::SidebarView::Sessions,
+                                egui::RichText::new("Sessions").strong(),
+                            )
+                            .clicked()
+                        {
+                            self.sidebar.view = sidebar::SidebarView::Sessions;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.sidebar.view == sidebar::SidebarView::Files,
+                                egui::RichText::new("Files").strong(),
+                            )
+                            .clicked()
+                        {
+                            self.sidebar.view = sidebar::SidebarView::Files;
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("Files").strong());
+                        if ui.button("⟳").on_hover_text("Refresh").clicked() {
+                            do_refresh = true;
                         }
                     }
                 });
+                ui.separator();
+
+                if self.sidebar.view == sidebar::SidebarView::Sessions {
+                    self.render_sidebar_sessions(ui);
+                } else {
+                    if let Some(dir) =
+                        self.sidebar.current_dir.file_name().and_then(|n| n.to_str())
+                    {
+                        ui.label(egui::RichText::new(dir).weak().small());
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        if let Some(root) = &self.sidebar.root {
+                            for child in &root.children {
+                                Self::draw_tree_node(
+                                    ui,
+                                    child,
+                                    &self.sidebar.selected_path,
+                                    &mut toggle_path,
+                                    &mut select_path,
+                                    &mut cd_path,
+                                );
+                            }
+                        }
+                    });
+                }
             });
 
         // 闭包结束，安全 mutate
@@ -1035,8 +1076,8 @@ impl TerminalApp {
             // 消除 tab 栏与终端之间的间距
             ui.spacing_mut().item_spacing.y = 0.0;
 
-            // 渲染会话标签栏（仅在多会话时显示，单会话进入 zen 模式）
-            let show_tab_bar = self.session_manager.sessions().len() > 1;
+            // 渲染会话标签栏（仅 Top 模式且多会话时显示；Sidebar 模式下 tab 在侧边栏内）
+            let show_tab_bar = self.show_top_tab_bar();
 
             // Tab 栏 - 绘制标签和按钮
             if show_tab_bar {

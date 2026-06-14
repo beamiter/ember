@@ -1,4 +1,4 @@
-use crate::config::{AppRendererType, Config};
+use crate::config::{AppRendererType, Config, TabBarPosition};
 use crate::theme::Theme;
 use egui::{Color32, RichText};
 
@@ -46,6 +46,7 @@ pub struct ConfigPanel {
     edit_gpu_rendering: bool,
     edit_app_renderer: AppRendererType,
     edit_ui_scale: f32,
+    edit_tab_bar_position: TabBarPosition,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
     all_fonts: Vec<String>,
@@ -82,6 +83,7 @@ impl ConfigPanel {
             edit_gpu_rendering: true,
             edit_app_renderer: AppRendererType::Glow,
             edit_ui_scale: 0.0,
+            edit_tab_bar_position: TabBarPosition::default(),
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
             available_themes: Vec::new(),
@@ -147,6 +149,7 @@ impl ConfigPanel {
         self.edit_gpu_rendering = config.gpu_rendering;
         self.edit_app_renderer = config.app_renderer;
         self.edit_ui_scale = config.ui_scale.unwrap_or(0.0);
+        self.edit_tab_bar_position = config.tab_bar_position;
     }
 
     /// Apply all buffered edit values to the given Config.
@@ -168,6 +171,7 @@ impl ConfigPanel {
         } else {
             None
         };
+        config.tab_bar_position = self.edit_tab_bar_position;
     }
 
     pub fn close(&mut self) {
@@ -537,6 +541,33 @@ impl ConfigPanel {
                 }
             });
         }
+
+        ui.separator();
+
+        // Tab bar position
+        ui.horizontal(|ui| {
+            ui.label("Tab Bar:");
+            if ui
+                .selectable_value(
+                    &mut self.edit_tab_bar_position,
+                    TabBarPosition::Top,
+                    "Top",
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+            if ui
+                .selectable_value(
+                    &mut self.edit_tab_bar_position,
+                    TabBarPosition::Sidebar,
+                    "Sidebar",
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
 
         ui.separator();
 

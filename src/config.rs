@@ -55,6 +55,16 @@ pub enum ScrollbarVisibility {
     Always,
 }
 
+/// 会话标签栏的位置:顶部水平栏 或 集成进左侧侧边栏
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum TabBarPosition {
+    #[default]
+    Top,
+    Sidebar,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -130,6 +140,10 @@ pub struct Config {
     /// Explicit shell path (overrides auto-detection). Useful when PATH is stripped by launchers like wofi.
     #[serde(default)]
     pub shell: Option<String>,
+
+    /// 会话标签栏位置:顶部水平栏(默认)或集成进左侧侧边栏
+    #[serde(default)]
+    pub tab_bar_position: TabBarPosition,
 }
 
 fn default_font_size() -> f32 {
@@ -276,6 +290,7 @@ impl Default for Config {
             font_ligatures: default_font_ligatures(),
             ui_scale: None,
             shell: None,
+            tab_bar_position: TabBarPosition::default(),
         }
     }
 }

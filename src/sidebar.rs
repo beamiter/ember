@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// 侧边栏内容视图:文件树 或 会话列表(仅在 tab 栏位于侧边栏模式时可切换)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SidebarView {
+    #[default]
+    Files,
+    Sessions,
+}
+
 /// 文件树节点
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileTreeNode {
@@ -19,6 +27,8 @@ pub struct Sidebar {
     pub current_dir: PathBuf,
     pub root: Option<FileTreeNode>,
     pub selected_path: Option<PathBuf>,
+    /// 当前侧边栏视图(侧边栏 tab 模式下用于在会话/文件间切换)
+    pub view: SidebarView,
 }
 
 impl Sidebar {
@@ -31,6 +41,7 @@ impl Sidebar {
             current_dir: current_dir.clone(),
             root: Self::build_tree(&current_dir, 0),
             selected_path: None,
+            view: SidebarView::default(),
         }
     }
 
