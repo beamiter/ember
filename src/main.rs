@@ -921,22 +921,8 @@ impl TerminalApp {
     #[allow(deprecated)]
     fn render_sidebar(&mut self, ctx: &egui::Context) {
         if !self.sidebar.visible {
-            // 顶部 tab 栏显示时由其内部按钮负责展开侧边栏，避免遮挡 tab；否则用左上角浮动按钮
-            if !self.show_top_tab_bar() {
-                egui::Area::new(egui::Id::new("sidebar_show_btn"))
-                    .fixed_pos(egui::pos2(4.0, 4.0))
-                    .order(egui::Order::Foreground)
-                    .show(ctx, |ui| {
-                        if ui
-                            .button("☰")
-                            .on_hover_text("显示侧边栏 (Ctrl+Shift+B)")
-                            .clicked()
-                        {
-                            self.sidebar.visible = true;
-                            self.sidebar.refresh();
-                        }
-                    });
-            }
+            // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
+            // 不再使用浮动按钮，避免覆盖终端内容。
             return;
         }
 
@@ -1133,6 +1119,10 @@ impl TerminalApp {
                 if self.render_tab_bar(ui, ctx) {
                     return;
                 }
+            } else {
+                // Sidebar tab 模式：仍预留精简顶部栏(含 ☰ toggle)，
+                // 避免浮动按钮覆盖终端内容造成 UI 干扰。
+                self.render_sidebar_mode_top_bar(ui, ctx);
             }
 
             self.render_terminal_content(ui, ctx);

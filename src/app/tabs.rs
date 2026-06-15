@@ -93,6 +93,66 @@ impl TerminalApp {
     }
 
     /// 渲染会话标签栏。返回 true 表示请求关闭窗口，render_ui 应据此提前返回。
+    /// Sidebar tab 模式下的精简顶部栏：仅含侧边栏 toggle(☰)，用于预留顶部空间，
+    /// 避免用浮动按钮直接覆盖终端内容造成 UI 干扰。
+    pub fn render_sidebar_mode_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let tab_height = 30.0;
+        let tab_rect = egui::Rect::from_min_size(
+            ui.cursor().left_top(),
+            egui::vec2(ui.available_width(), tab_height),
+        );
+
+        let tb = self.renderer.theme.tabbar.clone();
+        let tb_bg = crate::theme::Theme::rgb_to_color32(tb.bg);
+        let tb_inactive_text = crate::theme::Theme::rgb_to_color32(tb.inactive_text);
+        let tb_active_text = crate::theme::Theme::rgb_to_color32(tb.active_text);
+        let tab_hover_fill = egui::Color32::from_white_alpha(18);
+
+        let painter = ui.painter();
+        let tab_alpha = (self.renderer.opacity * 255.0) as u8;
+        painter.rect_filled(
+            tab_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(tb_bg.r(), tb_bg.g(), tb_bg.b(), tab_alpha),
+        );
+
+        let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+        let mouse_released = ctx.input(|i| i.pointer.any_released());
+
+        let toggle_btn_rect = egui::Rect::from_min_size(
+            egui::pos2(tab_rect.left() + 5.0, tab_rect.top() + 5.0),
+            egui::vec2(26.0, tab_height - 10.0),
+        );
+        let btn_hovered = hover_pos.map(|p| toggle_btn_rect.contains(p)).unwrap_or(false);
+        let btn_t = ctx.animate_bool_with_time(
+            egui::Id::new("sidebar_mode_toggle_btn_hover"),
+            btn_hovered,
+            0.12,
+        );
+        painter.rect_filled(toggle_btn_rect, 6.0, tab_hover_fill.gamma_multiply(btn_t));
+        painter.text(
+            toggle_btn_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "☰",
+            egui::FontId::proportional(15.0),
+            if btn_hovered { tb_active_text } else { tb_inactive_text },
+        );
+        if btn_hovered {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            if mouse_released {
+                self.sidebar.visible = !self.sidebar.visible;
+                if self.sidebar.visible {
+                    self.sidebar.refresh();
+                }
+            }
+        }
+
+        ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), tab_height),
+            egui::Sense::hover(),
+        );
+    }
+
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
                 let tab_height = 30.0;
                 let close_btn_size = 14.0;
