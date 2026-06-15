@@ -1833,9 +1833,12 @@ impl eframe::App for TerminalApp {
                 terminal.scroll(lines);
             }
 
-            self.renderer.scroll_pixel_offset = self.smooth_scroll_pixel_offset;
+            // 渲染偏移取负：shader 中 +offset 使内容上移，而 terminal.scroll(+lines)
+            // 是向历史滚动(内容下移)。两者方向必须一致，否则每跨一行就会出现约
+            // 2*行高的回跳——滚轮停下后的低速惯性阶段表现为上下抖动。
+            self.renderer.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
             for pr in &mut self.pane_renderers {
-                pr.scroll_pixel_offset = self.smooth_scroll_pixel_offset;
+                pr.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
             }
             ctx.request_repaint();
         } else if self.smooth_scroll_velocity.abs() > 0.0 {
