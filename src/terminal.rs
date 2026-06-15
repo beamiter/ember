@@ -2999,6 +2999,16 @@ impl TerminalState {
         self.max_scrollback
     }
 
+    /// 当前 scrollback 已有的行数(滚动上界)。
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// 当前是否处于备用屏幕缓冲(此时滚轮不滚动 scrollback)。
+    pub fn is_alt_buffer(&self) -> bool {
+        self.use_alt_buffer
+    }
+
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
         self.max_scrollback = max_scrollback.max(1);
 

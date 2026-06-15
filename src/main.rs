@@ -1823,14 +1823,38 @@ impl eframe::App for TerminalApp {
         // Smooth scroll physics
         if self.smooth_scroll_velocity.abs() > 0.1 {
             self.smooth_scroll_velocity *= 0.88;
-            self.smooth_scroll_pixel_offset += self.smooth_scroll_velocity;
 
             let line_h = self.renderer.line_height.max(1.0);
-            let lines = (self.smooth_scroll_pixel_offset / line_h) as isize;
-            if lines != 0 {
-                self.smooth_scroll_pixel_offset -= lines as f32 * line_h;
-                let mut terminal = session.terminal.lock();
-                terminal.scroll(lines);
+
+            // 抵达边界检测：在累积偏移前先看当前是否已到顶/到底(或处于备用屏幕)。
+            // 若惯性继续往边界外推，会出现"跨行 → scroll 被钳制 → 偏移回弹"的逐帧抖动。
+            let mut hit_boundary = {
+                let terminal = session.terminal.lock();
+                let at_top = terminal.scroll_offset >= terminal.scrollback_len();
+                let at_bottom = terminal.scroll_offset == 0;
+                let alt = terminal.is_alt_buffer();
+                alt || (self.smooth_scroll_velocity > 0.0 && at_top)
+                    || (self.smooth_scroll_velocity < 0.0 && at_bottom)
+            };
+
+            if !hit_boundary {
+                self.smooth_scroll_pixel_offset += self.smooth_scroll_velocity;
+                let lines = (self.smooth_scroll_pixel_offset / line_h) as isize;
+                if lines != 0 {
+                    self.smooth_scroll_pixel_offset -= lines as f32 * line_h;
+                    let mut terminal = session.terminal.lock();
+                    let before = terminal.scroll_offset as isize;
+                    terminal.scroll(lines);
+                    // 实际移动行数不等于请求行数 => 在本帧触及边界，立即停下惯性。
+                    if terminal.scroll_offset as isize - before != lines {
+                        hit_boundary = true;
+                    }
+                }
+            }
+
+            if hit_boundary {
+                self.smooth_scroll_velocity = 0.0;
+                self.smooth_scroll_pixel_offset = 0.0;
             }
 
             // 渲染偏移取负：shader 中 +offset 使内容上移，而 terminal.scroll(+lines)
@@ -1840,7 +1864,9 @@ impl eframe::App for TerminalApp {
             for pr in &mut self.pane_renderers {
                 pr.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
             }
-            ctx.request_repaint();
+            if !hit_boundary {
+                ctx.request_repaint();
+            }
         } else if self.smooth_scroll_velocity.abs() > 0.0 {
             self.smooth_scroll_velocity = 0.0;
             self.smooth_scroll_pixel_offset = 0.0;
