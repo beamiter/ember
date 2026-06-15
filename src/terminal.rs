@@ -862,33 +862,43 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    fn parse_csi_params(param_bytes: &[u8]) -> SmallVec<[u16; 8]> {
-        let mut params = SmallVec::new();
+    /// 解析 CSI 参数字节。
+    ///
+    /// 返回 `(params, colon_flags)`,其中 `colon_flags[k]` 表示参数 k 之前的
+    /// 分隔符是否为冒号(子参数语法,如 `4:3`)。这样调用方可区分 `4:3`
+    /// (扩展下划线样式)与 `4;3`(下划线 + 斜体两个独立 SGR)。
+    ///
+    /// 与 VT 规范一致:空字段默认为 0(`;5`→`[0,5]`、`5;`→`[5,0]`),
+    /// 完全为空的参数串返回空向量(由各处理器使用各自默认值)。
+    fn parse_csi_params(param_bytes: &[u8]) -> (SmallVec<[u16; 8]>, SmallVec<[bool; 8]>) {
+        let mut params: SmallVec<[u16; 8]> = SmallVec::new();
+        let mut colon_flags: SmallVec<[bool; 8]> = SmallVec::new();
+        if param_bytes.is_empty() {
+            return (params, colon_flags);
+        }
+
         let mut current: u16 = 0;
-        let mut has_digits = false;
+        // 当前正在累积的参数之前的分隔符是否为冒号(首个参数无前导分隔符)
+        let mut current_is_colon = false;
 
         for &byte in param_bytes {
             match byte {
                 b'0'..=b'9' => {
                     current = current.saturating_mul(10).saturating_add((byte - b'0') as u16);
-                    has_digits = true;
                 }
                 b';' | b':' => {
-                    if has_digits {
-                        params.push(current);
-                    }
+                    params.push(current);
+                    colon_flags.push(current_is_colon);
                     current = 0;
-                    has_digits = false;
+                    current_is_colon = byte == b':';
                 }
                 _ => {}
             }
         }
+        params.push(current);
+        colon_flags.push(current_is_colon);
 
-        if has_digits {
-            params.push(current);
-        }
-
-        params
+        (params, colon_flags)
     }
 
     /// 默认每 8 列一个制表位。
@@ -1204,12 +1214,16 @@ impl TerminalState {
     /// Compose a combining mark onto the most recently written cell using NFC.
     /// Only single-codepoint compositions are applied (the cell stores one char).
     fn apply_combining_mark(&mut self, mark: char) {
-        if self.cursor_col == 0 {
+        // After a char fills the last column, the wrap is deferred: the cursor
+        // stays *on* the last column with pending_wrap set, so the base glyph is
+        // at cursor_col itself rather than to its left.
+        let mut base_col = if self.pending_wrap {
+            self.cursor_col
+        } else if self.cursor_col == 0 {
             return;
-        }
-        // The base glyph sits just left of the cursor; step over a wide
-        // character's continuation cell if present.
-        let mut base_col = self.cursor_col - 1;
+        } else {
+            self.cursor_col - 1
+        };
         if self.grid.get(self.cursor_row, base_col).flags.wide_continuation() {
             if base_col == 0 {
                 return;
@@ -1455,8 +1469,9 @@ impl TerminalState {
         let src_end = bottom * cols;
         let dst = (top + 1) * cols;
         self.grid.cells.copy_within(src_start..src_end, dst);
-        // Clear top row
-        self.grid.cells[src_start..src_start + cols].fill(TerminalCell::default());
+        // Clear top row(保留当前背景色 / BCE)
+        let blank = self.create_blank_cell();
+        self.grid.cells[src_start..src_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top..bottom, top + 1);
         self.grid.row_wrapped[top] = false;
         self.dirty_region.mark_rows(top, bottom);
@@ -1484,7 +1499,9 @@ impl TerminalState {
         let dst_start = top * cols;
         self.grid.cells.copy_within(src_start..src_end, dst_start);
         let blank_start = bottom * cols;
-        self.grid.cells[blank_start..blank_start + cols].fill(TerminalCell::default());
+        // 保留当前背景色 / BCE
+        let blank = self.create_blank_cell();
+        self.grid.cells[blank_start..blank_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
         self.grid.row_wrapped[bottom] = false;
 
@@ -1657,13 +1674,12 @@ impl TerminalState {
                 b'\n' => {
                     // Linefeed - move cursor down or scroll
                     self.pending_wrap = false;
-                    if self.cursor_row < self.scroll_region_bottom {
-                        // Cursor is not at bottom of scroll region, just move down
-                        self.cursor_row += 1;
-                    } else {
-                        // Cursor is at bottom of scroll region, scroll the region
+                    if self.cursor_row == self.scroll_region_bottom {
+                        // 恰在滚动区底边距:向上滚动区域,光标保持在底行
                         self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
-                        // Cursor stays at bottom row of the scroll region
+                    } else if self.cursor_row + 1 < self.grid.rows() {
+                        // 区内或区外(底边距下方)正常下移,不滚动
+                        self.cursor_row += 1;
                     }
                     i += 1;
                 }
@@ -1896,37 +1912,43 @@ impl TerminalState {
                             i += 3;
                         }
                         b'M' => {
+                            // RI - Reverse Index:仅在恰好位于上边距时反向滚动,
+                            // 否则正常上移(在区域上方时不应滚动)。
                             i += 2;
 
-                            if self.cursor_row > self.scroll_region_top {
-                                self.cursor_row -= 1;
-                            } else if self.scroll_region_top < self.grid.rows()
-                                && self.scroll_region_bottom < self.grid.rows()
-                                && self.scroll_region_top <= self.scroll_region_bottom
-                            {
-                                self.scroll_region_down(
-                                    self.scroll_region_top,
-                                    self.scroll_region_bottom,
-                                );
+                            if self.cursor_row == self.scroll_region_top {
+                                if self.scroll_region_bottom < self.grid.rows()
+                                    && self.scroll_region_top <= self.scroll_region_bottom
+                                {
+                                    self.scroll_region_down(
+                                        self.scroll_region_top,
+                                        self.scroll_region_bottom,
+                                    );
+                                }
+                            } else {
+                                self.cursor_row = self.cursor_row.saturating_sub(1);
                             }
                         }
                         b'D' => {
+                            // IND - Index:仅在恰好位于底边距时向上滚动,
+                            // 否则正常下移(在区域下方时不应滚动)。
                             i += 2;
 
-                            if self.cursor_row < self.scroll_region_bottom {
-                                self.cursor_row += 1;
-                            } else {
+                            if self.cursor_row == self.scroll_region_bottom {
                                 self.scroll_region_up(
                                     self.scroll_region_top,
                                     self.scroll_region_bottom,
                                 );
+                            } else if self.cursor_row + 1 < self.grid.rows() {
+                                self.cursor_row += 1;
                             }
                         }
                         b'[' => {
                             i += 2;
 
-                            // Use stack arrays for CSI params (typical CSI sequences are short)
-                            let mut param_bytes = [0u8; 32];
+                            // Use stack arrays for CSI params. 256 字节足以容纳组合真彩色
+                            // SGR(如 0;1;38;2;...;48;2;... 仅 ~40 字节),避免截断丢色。
+                            let mut param_bytes = [0u8; 256];
                             let mut param_len = 0;
                             let mut intermediates = [0u8; 8];
                             let mut inter_len = 0;
@@ -1971,11 +1993,13 @@ impl TerminalState {
                                 }
                                 _ => None,
                             };
-                            let params = Self::parse_csi_params(&param_bytes[..param_len]);
+                            let (params, colon_flags) =
+                                Self::parse_csi_params(&param_bytes[..param_len]);
                             let cmd = final_byte as char;
 
                             self.handle_escape_sequence(
                                 &params,
+                                &colon_flags,
                                 cmd,
                                 private_prefix,
                                 &intermediates[..inter_len],
@@ -2090,6 +2114,7 @@ impl TerminalState {
     fn handle_escape_sequence(
         &mut self,
         params: &[u16],
+        colon_flags: &[bool],
         cmd: char,
         private_prefix: Option<u8>,
         intermediates: &[u8],
@@ -2100,25 +2125,25 @@ impl TerminalState {
         }
         match cmd {
             'A' => {
-                // Cursor up - should scroll region down if at top
+                // CUU - Cursor Up:仅移动光标,绝不滚动。
+                // 区内止于上边距,区外(上边距上方)止于屏幕顶部。
                 let n = params.first().copied().unwrap_or(1) as usize;
-
-                for _ in 0..n {
-                    if self.cursor_row > self.scroll_region_top {
-                        self.cursor_row -= 1;
-                    } else if self.scroll_region_top < self.grid.rows()
-                        && self.scroll_region_bottom < self.grid.rows()
-                    {
-                        self.scroll_region_down(
-                            self.scroll_region_top,
-                            self.scroll_region_bottom,
-                        );
-                    }
-                }
+                let floor = if self.cursor_row >= self.scroll_region_top {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
             }
             'B' => {
+                // CUD - Cursor Down:区内止于底边距,区外止于屏幕底部;不滚动。
                 let n = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.grid.rows() - 1);
+                let ceil = if self.cursor_row <= self.scroll_region_bottom {
+                    self.scroll_region_bottom
+                } else {
+                    self.grid.rows().saturating_sub(1)
+                };
+                self.cursor_row = (self.cursor_row + n).min(ceil);
             }
             'C' => {
                 let n = params.first().copied().unwrap_or(1) as usize;
@@ -2129,21 +2154,49 @@ impl TerminalState {
                 self.cursor_col = self.cursor_col.saturating_sub(n);
             }
             'E' => {
-                // Move cursor down and to start of line
+                // CNL - Cursor Next Line:下移并到行首,受底边距约束;不滚动。
                 let n = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_row = (self.cursor_row + n).min(self.grid.rows() - 1);
+                let ceil = if self.cursor_row <= self.scroll_region_bottom {
+                    self.scroll_region_bottom
+                } else {
+                    self.grid.rows().saturating_sub(1)
+                };
+                self.cursor_row = (self.cursor_row + n).min(ceil);
                 self.cursor_col = 0;
             }
             'F' => {
-                // Move cursor up and to start of line
+                // CPL - Cursor Previous Line:上移并到行首,受上边距约束;不滚动。
                 let n = params.first().copied().unwrap_or(1) as usize;
-                self.cursor_row = self.cursor_row.saturating_sub(n);
+                let floor = if self.cursor_row >= self.scroll_region_top {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
                 self.cursor_col = 0;
             }
             'G' => {
-                // Move cursor to column
+                // CHA - Move cursor to column (1-based)
                 let col = params.first().copied().unwrap_or(1) as usize;
                 self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+            }
+            '`' => {
+                // HPA - Horizontal Position Absolute(列绝对,等价 CHA)
+                let col = params.first().copied().unwrap_or(1) as usize;
+                self.cursor_col = col
+                    .saturating_sub(1)
+                    .min(self.grid.row_len().saturating_sub(1));
+            }
+            'd' => {
+                // VPA - Vertical Position Absolute(行绝对,1 基)。
+                // 原点模式下相对滚动区域顶端并限制在区域内。
+                let row = params.first().copied().unwrap_or(1) as usize;
+                let row0 = row.saturating_sub(1);
+                self.cursor_row = if self.origin_mode {
+                    (self.scroll_region_top + row0).min(self.scroll_region_bottom)
+                } else {
+                    row0.min(self.grid.rows().saturating_sub(1))
+                };
             }
             'H' => {
                 let row = params.first().copied().unwrap_or(1) as usize;
@@ -2202,8 +2255,8 @@ impl TerminalState {
                         self.mark_rows_dirty(0, self.cursor_row);
                     }
                     2 => {
-                        self.clear_screen();
-                        // clear_screen already marks all rows as dirty
+                        // ED 擦除显示不移动光标(VT 规范)
+                        self.erase_screen();
                     }
                     3 => {
                         // Clear scrollback buffer (xterm extension)
@@ -2248,6 +2301,7 @@ impl TerminalState {
             }
             'L' => {
                 let n = params.first().copied().unwrap_or(1) as usize;
+                let blank = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
@@ -2257,13 +2311,14 @@ impl TerminalState {
                         let src_end = self.scroll_region_bottom * cols;
                         let dst = (self.cursor_row + 1) * cols;
                         self.grid.cells.copy_within(src_start..src_end, dst);
-                        self.grid.cells[src_start..src_start + cols].fill(TerminalCell::default());
+                        self.grid.cells[src_start..src_start + cols].fill(blank);
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
             'M' => {
                 let n = params.first().copied().unwrap_or(1) as usize;
+                let blank = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
                         && self.cursor_row <= self.scroll_region_bottom
@@ -2274,7 +2329,7 @@ impl TerminalState {
                         let dst = self.cursor_row * cols;
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         let blank_start = self.scroll_region_bottom * cols;
-                        self.grid.cells[blank_start..blank_start + cols].fill(TerminalCell::default());
+                        self.grid.cells[blank_start..blank_start + cols].fill(blank);
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
@@ -2293,7 +2348,7 @@ impl TerminalState {
                     }
                 } else {
                     // SGR - Select Graphic Rendition
-                    self.handle_sgr(params);
+                    self.handle_sgr(params, colon_flags);
                 }
             }
             's' => {
@@ -2463,9 +2518,16 @@ impl TerminalState {
                     self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
                 }
 
-                // Move cursor to home position when setting scroll region
-                self.cursor_row = 0;
+                // Move cursor to home position when setting scroll region. In
+                // origin mode (DECOM) home is the top of the scroll region, not
+                // the absolute top of the screen.
+                self.cursor_row = if self.origin_mode {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
                 self.cursor_col = 0;
+                self.pending_wrap = false;
             }
             '@' => {
                 // ICH - Insert Character(s)
@@ -2558,7 +2620,7 @@ impl TerminalState {
         }
     }
 
-    fn handle_sgr(&mut self, params: &[u16]) {
+    fn handle_sgr(&mut self, params: &[u16], colon_flags: &[bool]) {
         if params.is_empty() {
             self.current_flags = StyleFlags::default();
             self.current_fg = Color::Default;
@@ -2579,7 +2641,12 @@ impl TerminalState {
                 2 => self.current_flags.set_dim(true),
                 3 => self.current_flags.set_italic(true),
                 4 => {
-                    if i + 1 < params.len() && params[i + 1] <= 5 {
+                    // 仅当下一个参数是冒号子参数(`4:x`)时才作为扩展下划线样式;
+                    // 分号分隔的 `4;x` 中 x 是独立 SGR(如 4;1 = 下划线+粗体),不能吞。
+                    let next_is_substyle = i + 1 < params.len()
+                        && colon_flags.get(i + 1).copied().unwrap_or(false)
+                        && params[i + 1] <= 5;
+                    if next_is_substyle {
                         let style = params[i + 1];
                         self.current_flags.set_underline(match style {
                             0 => UnderlineStyle::None,
@@ -2730,7 +2797,9 @@ impl TerminalState {
         }
     }
 
-    fn clear_screen(&mut self) {
+    /// 擦除整个屏幕单元格(保留当前背景色),不移动光标。
+    /// 供 ED(`CSI 2J`)使用 —— 按 VT 规范擦除显示不得移动光标。
+    fn erase_screen(&mut self) {
         let bg_color = self.current_bg;
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
@@ -2742,11 +2811,16 @@ impl TerminalState {
                 };
             }
         }
-        self.cursor_row = 0;
-        self.cursor_col = 0;
         // Mark all rows as dirty
         self.dirty_region.mark_all(self.grid.rows());
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+    }
+
+    /// 擦除屏幕并把光标归位到左上角。供切换备用缓冲区等场景使用。
+    fn clear_screen(&mut self) {
+        self.erase_screen();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
     }
 
     fn set_mode(&mut self, mode: u16) {
@@ -3666,7 +3740,7 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardReadKind, Color, TerminalState};
+    use super::{ClipboardReadKind, Color, TerminalState, UnderlineStyle};
 
     #[test]
     fn resize_preserves_full_screen_scroll_region() {
@@ -3798,6 +3872,65 @@ mod tests {
         assert_eq!(terminal.grid[0][1].character, 'r');
         assert_eq!(terminal.grid[0][2].character, 'c');
         assert_eq!(terminal.grid[0][0].foreground, Color::Rgb(81, 175, 239));
+    }
+
+    #[test]
+    fn sgr_underline_with_semicolon_keeps_following_attr() {
+        // `4;1` 是两个独立 SGR(下划线 + 粗体),分号不得被吞。
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[4;1mA");
+        let cell = &terminal.grid[0][0];
+        assert_eq!(cell.flags.underline(), UnderlineStyle::Single);
+        assert!(cell.flags.bold(), "粗体不应被下划线吞掉");
+    }
+
+    #[test]
+    fn sgr_underline_colon_substyle_is_extended() {
+        // `4:3` 冒号子参数 = curly 下划线,且不应附带粗体。
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[4:3mA");
+        let cell = &terminal.grid[0][0];
+        assert_eq!(cell.flags.underline(), UnderlineStyle::Curly);
+        assert!(!cell.flags.bold());
+    }
+
+    #[test]
+    fn csi_empty_leading_param_defaults() {
+        // `\x1b[;3H` 应定位到第 1 行第 3 列(空字段默认 1)。
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[;3HX");
+        assert_eq!(terminal.grid[0][2].character, 'X');
+    }
+
+    #[test]
+    fn ed_clear_screen_does_not_move_cursor() {
+        // ED(`\x1b[2J`)不得移动光标。
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input(b"\x1b[2;3H"); // row2,col3
+        terminal.process_input(b"\x1b[2J");
+        terminal.process_input(b"X");
+        assert_eq!(terminal.grid[1][2].character, 'X');
+    }
+
+    #[test]
+    fn vpa_and_hpa_position_cursor() {
+        let mut terminal = TerminalState::new(8, 4);
+        terminal.process_input(b"\x1b[3d"); // VPA -> row 3
+        terminal.process_input(b"\x1b[5`"); // HPA -> col 5
+        terminal.process_input(b"Z");
+        assert_eq!(terminal.grid[2][4].character, 'Z');
+    }
+
+    #[test]
+    fn cuu_does_not_scroll_at_top_margin() {
+        // 在滚动区顶部执行 CUU 不应滚动内容。
+        let mut terminal = TerminalState::new(8, 4);
+        terminal.process_input(b"\x1b[2;4r"); // 滚动区 2..4
+        terminal.process_input(b"\x1b[2;1HABC"); // 在区顶写入
+        terminal.process_input(b"\x1b[2;1H\x1b[A"); // 回到区顶再 CUU
+        // 内容应原地保留,不被向下滚动
+        assert_eq!(terminal.grid[1][0].character, 'A');
+        assert_eq!(terminal.grid[1][1].character, 'B');
     }
 
     #[test]

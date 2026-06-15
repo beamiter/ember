@@ -299,15 +299,32 @@ impl Config {
     pub fn load() -> Self {
         if let Ok(config_path) = Self::config_path() {
             if config_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&config_path) {
-                    if let Ok(config) = toml::from_str::<Config>(&content) {
-                        eprintln!("[Config] Loaded from {}", config_path.display());
-                        eprintln!("[Config] Font: {}", config.font_family);
-                        return config;
-                    } else {
+                match std::fs::read_to_string(&config_path) {
+                    Ok(content) => match toml::from_str::<Config>(&content) {
+                        Ok(config) => {
+                            eprintln!("[Config] Loaded from {}", config_path.display());
+                            eprintln!("[Config] Font: {}", config.font_family);
+                            return config;
+                        }
+                        Err(e) => {
+                            // 显示具体的解析错误(含行列/原因),便于用户修正配置;
+                            // 否则会静默回退到默认值,用户的设置被忽略却毫不知情。
+                            eprintln!(
+                                "[Config] WARNING: failed to parse {}: {}",
+                                config_path.display(),
+                                e
+                            );
+                            eprintln!(
+                                "[Config] WARNING: your settings are ignored, using defaults. \
+                                 Fix the file above to apply them."
+                            );
+                        }
+                    },
+                    Err(e) => {
                         eprintln!(
-                            "[Config] Failed to parse config file: {}",
-                            config_path.display()
+                            "[Config] WARNING: failed to read {}: {}",
+                            config_path.display(),
+                            e
                         );
                     }
                 }
@@ -328,11 +345,19 @@ impl Config {
         // Create config directory if it doesn't exist
         std::fs::create_dir_all(config_dir)?;
 
-        // 原子写:先写临时文件再 rename,避免进程崩溃损坏配置文件
+        // 原子写:先写临时文件、fsync 落盘,再 rename,避免崩溃/掉电后得到损坏或空的配置。
+        use std::io::Write;
         let content = toml::to_string_pretty(self)?;
         let tmp_path = config_path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, content)?;
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp_path, &config_path)?;
+        if let Ok(dir) = std::fs::File::open(config_dir) {
+            let _ = dir.sync_all();
+        }
         eprintln!("[Config] Saved to {}", config_path.display());
         Ok(())
     }

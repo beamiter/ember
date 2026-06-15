@@ -73,7 +73,18 @@ pub struct FontdueAtlas {
     cached_ascent: f32,
     cached_descent: f32,
     cached_advance_width: f32,
+    /// 预解析的 rustybuzz Face,避免每次 shape 缓存未命中都重新解析整份字体
+    /// (from_slice 会解析所有字体表,是大量输出时的主要 CPU 开销)。
+    /// SAFETY: 这两个 Face 借用下方 font_data_* Arc 持有的字节。这些 Arc 在
+    /// atlas 整个生命周期内只在 new() 中赋值一次、绝不重赋值或改动,且堆缓冲指针
+    /// 稳定。Face 字段声明在 font_data_* 之前,因此先于其析构。借用被 transmute
+    /// 为 'static 仅用于存储,绝不对外暴露。
+    shape_face_regular: Option<rustybuzz::Face<'static>>,
+    shape_face_bold: Option<rustybuzz::Face<'static>>,
+    // 必须保留:为上面的 shape_face_* 提供底层字节存储,即使不再被直接读取。
+    #[allow(dead_code)]
     font_data_regular: Arc<Vec<u8>>,
+    #[allow(dead_code)]
     font_data_bold: Option<Arc<Vec<u8>>>,
     shaping_enabled: bool,
     // Subpixel rendering
@@ -120,7 +131,25 @@ impl FontdueAtlas {
             .map(|face| face.tables().gsub.is_some())
             .unwrap_or(false);
 
+        // SAFETY: 这些 Face 借用 font_data_regular/font_data_bold 两个 Arc<Vec<u8>>
+        // 持有的字节。它们与对应的 Arc 一同存储在同一个结构体中，且：
+        //   1. font_data_* 在构造后不再被改写（更换字体时整个 atlas 重建）；
+        //   2. shape_face_* 在结构体字段顺序中位于 font_data_* 之前，
+        //      因此 Drop 时先释放 Face，再释放底层 Arc，避免悬垂引用。
+        let shape_face_regular = rustybuzz::Face::from_slice(
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(font_data_arc.as_slice()) },
+            0,
+        );
+        let shape_face_bold = font_data_bold_arc.as_ref().and_then(|arc| {
+            rustybuzz::Face::from_slice(
+                unsafe { std::mem::transmute::<&[u8], &'static [u8]>(arc.as_slice()) },
+                0,
+            )
+        });
+
         let mut atlas = FontdueAtlas {
+            shape_face_regular,
+            shape_face_bold,
             font_regular,
             font_bold,
             fallback_fonts,
@@ -762,16 +791,47 @@ impl FontBackend for FontdueAtlas {
         // glyphs below; if that happens, earlier regions are stale and must not be cached.
         let generation_before = self.atlas_generation;
 
-        let font_data = if bold {
-            self.font_data_bold.as_ref().unwrap_or(&self.font_data_regular)
+        // 使用构造时预解析好的 Face，避免每次缓存未命中都重新解析整个字体。
+        let face = if bold {
+            self.shape_face_bold
+                .as_ref()
+                .or(self.shape_face_regular.as_ref())
         } else {
-            &self.font_data_regular
+            self.shape_face_regular.as_ref()
         };
 
-        let face = match rustybuzz::Face::from_slice(font_data, 0) {
-            Some(f) => f,
+        // 收集本次整形得到的字形信息为自有数据，随后即可释放对 Face（&self）的借用，
+        // 以便调用需要 &mut self 的 rasterize_gid。
+        let shaped: Option<Vec<(u16, u32, f32, f32, f32)>> = face.map(|face| {
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(text);
+
+            let glyph_buffer = rustybuzz::shape(face, &[], buffer);
+            let infos = glyph_buffer.glyph_infos();
+            let positions = glyph_buffer.glyph_positions();
+
+            let upem = face.units_per_em() as f32;
+            let scale = self.font_size_px / upem;
+
+            infos
+                .iter()
+                .zip(positions.iter())
+                .map(|(info, pos)| {
+                    (
+                        info.glyph_id as u16,
+                        info.cluster,
+                        pos.x_advance as f32 * scale,
+                        pos.x_offset as f32 * scale,
+                        pos.y_offset as f32 * scale,
+                    )
+                })
+                .collect()
+        });
+
+        let shaped = match shaped {
+            Some(s) => s,
             None => {
-                // Fallback if face parsing fails
+                // 字体未能解析时退回逐字符光栅化。
                 let mut glyphs = Vec::with_capacity(text.len());
                 for (byte_idx, ch) in text.char_indices() {
                     let region = self.get_or_rasterize(ch, bold, subpixel_offset);
@@ -787,26 +847,15 @@ impl FontBackend for FontdueAtlas {
             }
         };
 
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
-        buffer.push_str(text);
-
-        let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
-        let infos = glyph_buffer.glyph_infos();
-        let positions = glyph_buffer.glyph_positions();
-
-        let upem = face.units_per_em() as f32;
-        let scale = self.font_size_px / upem;
-
-        let mut glyphs = Vec::with_capacity(infos.len());
-        for (info, pos) in infos.iter().zip(positions.iter()) {
-            let gid = info.glyph_id as u16;
+        let mut glyphs = Vec::with_capacity(shaped.len());
+        for (gid, cluster, x_advance, x_offset, y_offset) in shaped {
             let region = self.rasterize_gid(gid, bold, subpixel_offset);
 
             glyphs.push(ShapedGlyph {
-                cluster: info.cluster,
-                x_advance: pos.x_advance as f32 * scale,
-                x_offset: pos.x_offset as f32 * scale,
-                y_offset: pos.y_offset as f32 * scale,
+                cluster,
+                x_advance,
+                x_offset,
+                y_offset,
                 region,
             });
         }

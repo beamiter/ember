@@ -595,11 +595,13 @@ fn main() -> Result<(), eframe::Error> {
             let initial_theme = theme::Theme::get_theme(&cfg_clone.theme).unwrap_or_default();
             apply_theme_visuals(&cc.egui_ctx, &initial_theme);
 
-            Ok(Box::new(TerminalApp::new(
+            TerminalApp::new(
                 &cfg_clone,
                 cc.egui_ctx.clone(),
                 cc.wgpu_render_state.clone(),
-            )))
+            )
+            .map(|app| Box::new(app) as Box<dyn eframe::App>)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
         }),
     )
 }
@@ -667,7 +669,7 @@ impl TerminalApp {
         cfg: &config::Config,
         repaint_ctx: egui::Context,
         wgpu_render_state: Option<egui_wgpu::RenderState>,
-    ) -> Self {
+    ) -> std::result::Result<Self, String> {
         let (cols, rows) = clamp_terminal_dimensions(cfg.cols, cfg.rows);
         crate::debug_log!(
             "[INIT] terminal dimensions cfg=({}, {}) clamped=({}, {})",
@@ -723,8 +725,20 @@ impl TerminalApp {
                     "✗ Failed to start shell with saved cwd, falling back: {}",
                     e
                 );
-                ShellSession::new(cols, rows, configured_shell.as_deref(), repaint_ctx.clone())
-                    .unwrap_or_else(|e| panic!("Cannot create shell session: {}", e))
+                match ShellSession::new(
+                    cols,
+                    rows,
+                    configured_shell.as_deref(),
+                    repaint_ctx.clone(),
+                ) {
+                    Ok(session) => session,
+                    Err(e2) => {
+                        return Err(format!(
+                            "Cannot create shell session: {} (after fallback from: {})",
+                            e2, e
+                        ));
+                    }
+                }
             }
         };
 
@@ -784,7 +798,7 @@ impl TerminalApp {
             pane_renderers.push(pr);
         }
 
-        TerminalApp {
+        Ok(TerminalApp {
             session_manager,
             input_queue: Arc::new(ParkingMutex::new(Vec::new())),
             renderer,
@@ -813,6 +827,7 @@ impl TerminalApp {
             cached_links: Vec::new(),
             cached_links_grid_version: 0,
             cached_links_scroll_offset: 0,
+            cached_links_session_idx: usize::MAX,
             keybindings,
             command_palette: command_palette::CommandPalette::new(),
             force_resize_session: false,
@@ -840,7 +855,7 @@ impl TerminalApp {
             config_last_check: std::time::Instant::now(),
             smooth_scroll_velocity: 0.0,
             smooth_scroll_pixel_offset: 0.0,
-        }
+        })
     }
 
     fn apply_runtime_config(&mut self, ctx: &egui::Context) {
@@ -895,15 +910,15 @@ impl TerminalApp {
             .new_session(name, tags, cols, rows, self.config.scrollback_lines)
     }
 
+    /// 顶部水平 tab 栏是否应显示：Top 模式下始终显示。
+    /// 即便只有一个会话也保留，因为栏内含有侧边栏 toggle 控件。
+    fn show_top_tab_bar(&self) -> bool {
+        matches!(self.config.tab_bar_position, config::TabBarPosition::Top)
+    }
+
     /// 渲染左侧文件树侧边栏。必须在 CentralPanel 之前调用，
     /// 否则中央区域不会正确收缩。
     #[allow(deprecated)]
-    /// 顶部水平 tab 栏是否应显示：仅 Top 模式且多会话时
-    fn show_top_tab_bar(&self) -> bool {
-        matches!(self.config.tab_bar_position, config::TabBarPosition::Top)
-            && self.session_manager.sessions().len() > 1
-    }
-
     fn render_sidebar(&mut self, ctx: &egui::Context) {
         if !self.sidebar.visible {
             // 顶部 tab 栏显示时由其内部按钮负责展开侧边栏，避免遮挡 tab；否则用左上角浮动按钮
@@ -938,6 +953,7 @@ impl TerminalApp {
         let mut cd_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
         let mut collapse = false;
+        let mut toggle_tab_pos = false;
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
         egui::SidePanel::left("file_tree")
@@ -979,6 +995,27 @@ impl TerminalApp {
                             do_refresh = true;
                         }
                     }
+                    // 标签栏位置切换：顶部 ⇄ 侧边栏（右对齐）
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let (label, hover) = match self.config.tab_bar_position {
+                                config::TabBarPosition::Top => {
+                                    ("⬓顶", "标签栏在顶部 — 点击移入侧边栏")
+                                }
+                                config::TabBarPosition::Sidebar => {
+                                    ("⬒栏", "标签栏在侧边栏 — 点击移到顶部")
+                                }
+                            };
+                            if ui
+                                .button(egui::RichText::new(label).small())
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                toggle_tab_pos = true;
+                            }
+                        },
+                    );
                 });
                 ui.separator();
 
@@ -1026,6 +1063,18 @@ impl TerminalApp {
         }
         if collapse {
             self.sidebar.visible = false;
+        }
+        if toggle_tab_pos {
+            self.config.tab_bar_position = match self.config.tab_bar_position {
+                config::TabBarPosition::Top => config::TabBarPosition::Sidebar,
+                config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
+            };
+            // 切回顶部模式时把侧边栏视图复位到文件视图，避免停留在 Sessions
+            if matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
+                self.sidebar.view = sidebar::SidebarView::Files;
+            }
+            self.config_panel.sync_from_config(&self.config);
+            self.schedule_config_save();
         }
     }
 
@@ -1932,12 +1981,14 @@ impl eframe::App for TerminalApp {
 
             if grid_version != self.cached_links_grid_version
                 || scroll_offset != self.cached_links_scroll_offset
+                || active_session_idx != self.cached_links_session_idx
             {
                 let visible_cells = terminal.get_visible_cells();
                 let row_wrapped = terminal.get_visible_row_wrapped();
                 self.cached_links = self.link_detector.detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
                 self.cached_links_grid_version = grid_version;
                 self.cached_links_scroll_offset = scroll_offset;
+                self.cached_links_session_idx = active_session_idx;
             }
             drop(terminal);
 

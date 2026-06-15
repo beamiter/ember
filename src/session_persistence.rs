@@ -30,8 +30,9 @@ impl SessionsSnapshot {
         }
     }
 
-    /// 保存到文件（原子写入）
+    /// 保存到文件（原子写入 + fsync 持久化）
     pub fn save(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
         let json = serde_json::to_string_pretty(self)?;
         let tmp_path = path.with_file_name(
             path.file_name()
@@ -39,11 +40,23 @@ impl SessionsSnapshot {
                 .map(|name| format!("{}.tmp", name))
                 .unwrap_or_else(|| "session_history.json.tmp".to_string()),
         );
-        std::fs::write(&tmp_path, &json)?;
+        // 写入临时文件并 fsync:rename 只保证元数据原子性,若数据块未落盘,
+        // 崩溃/掉电后可能得到一个空或被截断的文件。必须先 sync_all 再 rename。
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp_path, path).or_else(|_| {
             let _ = std::fs::remove_file(path);
             std::fs::rename(&tmp_path, path)
         })?;
+        // fsync 父目录,确保 rename 这条目录项本身也持久化。
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         eprintln!("[SessionPersistence] Sessions saved to {}", path.display());
         Ok(())
     }

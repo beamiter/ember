@@ -452,7 +452,26 @@ impl TerminalRenderer {
             return Some(handle.clone());
         }
 
-        // Create new texture from image data
+        // Create new texture from image data.
+        // 防御性校验：image.data 应为 width*height*4 字节的 RGBA。
+        // from_rgba_unmultiplied 内部 assert，不匹配会 panic 整个进程，故先校验。
+        let expected = (image.width as usize)
+            .checked_mul(image.height as usize)
+            .and_then(|px| px.checked_mul(4));
+        match expected {
+            Some(n) if n == image.data.len() => {}
+            _ => {
+                log::warn!(
+                    "[KITTY_GRAPHICS] Skip texture for image {}: {}x{} expects {:?} bytes, got {}",
+                    image_id,
+                    image.width,
+                    image.height,
+                    expected,
+                    image.data.len()
+                );
+                return None;
+            }
+        }
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
             [image.width as usize, image.height as usize],
             &image.data,

@@ -152,13 +152,24 @@ impl ShellSession {
                         let mut after = After::Continue;
                         loop {
                             match pty_guard.read(&mut buf) {
-                                Ok(n) if n > 0 => {
+                                Ok(crate::pty::ReadOutcome::Data(n)) => {
                                     accumulated.extend_from_slice(&buf[..n]);
                                     if accumulated.len() >= BATCH_SIZE_THRESHOLD {
                                         break;
                                     }
                                 }
-                                Ok(_) => break,
+                                Ok(crate::pty::ReadOutcome::WouldBlock) => break,
+                                Ok(crate::pty::ReadOutcome::Eof) => {
+                                    // 从端已关闭:子进程退出。立即回收并停止,
+                                    // 不再回到外层 poll(POLLHUP 会持续就绪导致忙等)。
+                                    after = After::Stop(match pty_guard.wait_timeout(0) {
+                                        Ok(exit_code) => ShellEvent::Exit(exit_code),
+                                        Err(e) => {
+                                            ShellEvent::Error(format!("Process exit error: {}", e))
+                                        }
+                                    });
+                                    break;
+                                }
                                 Err(e) => {
                                     crate::debug_log!("[IOLoop] 读取错误: {}", e);
                                     if !pty_guard.is_alive() {
@@ -292,21 +303,16 @@ impl ShellSession {
             {
                 let mut pty = pty.lock();
                 match pty.write(&data[offset..]) {
-                    Ok(n) if n > 0 => {
+                    Ok(crate::pty::WriteOutcome::Written(n)) if n > 0 => {
                         offset += n;
-                        continue; // 写成功，立刻尝试写更多
+                        continue; // 写成功(可能 partial)，立刻尝试写剩余部分
                     }
-                    Ok(_) => break, // wrote 0
+                    Ok(crate::pty::WriteOutcome::Written(_)) => break, // wrote 0
+                    Ok(crate::pty::WriteOutcome::WouldBlock) => {
+                        // 缓冲区满，需要 poll 等待可写 — 释放锁（落到下面）
+                    }
                     Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("Resource temporarily unavailable")
-                            || msg.contains("WouldBlock")
-                            || msg.contains("EAGAIN")
-                        {
-                            // 缓冲区满，需要 poll 等待 — 先释放锁（落到下面）
-                        } else {
-                            return Err(format!("Write error: {}", e));
-                        }
+                        return Err(format!("Write error: {}", e));
                     }
                 }
             }
@@ -374,29 +380,23 @@ impl Drop for ShellSession {
         // 通知 IO 线程退出
         self.shutdown.store(true, Ordering::Relaxed);
 
-        let child_pid = self.child_pid;
-        let pgid = -child_pid;
-
-        // 立即发送优雅终止信号(瞬时,不阻塞)
-        // SAFETY: kill 向进程/进程组发送信号。负 PID 向进程组发送信号是标准做法。
-        // child_pid 来自 fork 创建的有效进程。即使进程已退出，kill 也是安全的。
-        unsafe {
-            libc::kill(pgid, libc::SIGHUP); // 通知 shell 会话终止
-            libc::kill(child_pid, libc::SIGTERM); // 请求优雅退出
+        // 所有发信号/回收都经由 Pty 的互斥锁,与 io_loop 的回收路径串行化;
+        // 并且仅在子进程尚未被回收(exit_code_cached 为空)时才 kill。
+        // 这样杜绝了"先被 io_loop reap、PID 被复用、随后 kill 误杀无辜进程"的竞争。
+        {
+            let mut pty = self.pty.lock();
+            pty.signal_terminate(); // 瞬时:SIGHUP 进程组 + SIGTERM
         }
 
-        // 把 "等待 → SIGKILL → 回收僵尸" 放到独立线程,避免在 UI 线程 sleep 30ms。
-        // 关闭多个会话时,这能把累计阻塞从 N*30ms 降到 0。
+        // 把 "等待 → SIGKILL → 回收僵尸" 放到独立线程,避免在 UI 线程 sleep。
+        // 关闭多个会话时,这能把累计阻塞降到接近 0。reaper 持有 Pty 的 Arc,
+        // 保证 Pty 在回收完成前不被释放。
+        let pty = Arc::clone(&self.pty);
         let _ = thread::Builder::new()
             .name("pty-reaper".to_string())
-            .spawn(move || unsafe {
+            .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(30));
-                let _ = libc::kill(pgid, libc::SIGKILL);
-                let _ = libc::kill(child_pid, libc::SIGKILL);
-                // 阻塞式 waitpid 确保僵尸进程被回收(SIGKILL 不可捕获,进程必然退出)。
-                // 若已被 io_loop 的 wait_timeout 回收,这里返回 ECHILD,无害。
-                let mut status = 0;
-                let _ = libc::waitpid(child_pid, &mut status, 0);
+                pty.lock().force_kill_and_reap();
             });
     }
 }

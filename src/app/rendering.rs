@@ -553,8 +553,8 @@ impl TerminalApp {
             }
         }
 
-        // Debug overlay panel
-        {
+        // Debug overlay panel — only gather stats (and lock the terminal) when open.
+        if self.debug_panel.is_open {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
             let grid_cols = terminal.grid.cols();

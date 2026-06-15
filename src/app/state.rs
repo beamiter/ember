@@ -53,6 +53,9 @@ pub struct TerminalApp {
     pub cached_links: Vec<link::Link>,
     pub cached_links_grid_version: u64,
     pub cached_links_scroll_offset: usize,
+    /// 缓存所属的活跃会话索引;切换 pane/会话时需失效,
+    /// 否则不同终端碰巧相同的 grid_version 会复用上一个会话的过期链接。
+    pub cached_links_session_idx: usize,
 
     // Keybindings
     pub keybindings: keybindings::KeyBindings,

@@ -205,18 +205,57 @@ impl KittyGraphicsState {
                 data
             };
 
-            // 获取或计算图像尺寸
+            // 获取尺寸并把数据统一归一化为 RGBA(每像素 4 字节),
+            // 并严格校验长度，避免后续 egui::ColorImage::from_rgba_unmultiplied
+            // 的内部 assert 因尺寸/数据不匹配而 panic 整个应用。
             let (width, height) = match format {
-                ImageFormat::Png | ImageFormat::Jpeg => {
-                    // 对于压缩格式，先解码以获取尺寸
+                // Webp 同样是压缩格式，交给 image 解码（原先按原始格式处理会渲染错乱）
+                ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Webp => {
                     let (decoded_data, w, h) = self.decode_compressed_image(final_data, format)?;
                     final_data = decoded_data;
                     (w, h)
                 }
-                ImageFormat::Webp | ImageFormat::Rgb | ImageFormat::Rgba => {
-                    // 对于原始格式，必须从参数获取尺寸
+                ImageFormat::Rgb => {
                     let w = params.width.ok_or("Missing width for raw image format")?;
                     let h = params.height.ok_or("Missing height for raw image format")?;
+                    let px = (w as usize)
+                        .checked_mul(h as usize)
+                        .ok_or("Image dimensions overflow")?;
+                    let expected = px.checked_mul(3).ok_or("Image dimensions overflow")?;
+                    if final_data.len() < expected {
+                        return Err(format!(
+                            "RGB data too short: got {} bytes, need {} for {}x{}",
+                            final_data.len(),
+                            expected,
+                            w,
+                            h
+                        ));
+                    }
+                    // 展开 RGB -> RGBA(alpha=255)
+                    let mut rgba = Vec::with_capacity(px * 4);
+                    for chunk in final_data[..expected].chunks_exact(3) {
+                        rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+                    }
+                    final_data = rgba;
+                    (w, h)
+                }
+                ImageFormat::Rgba => {
+                    let w = params.width.ok_or("Missing width for raw image format")?;
+                    let h = params.height.ok_or("Missing height for raw image format")?;
+                    let px = (w as usize)
+                        .checked_mul(h as usize)
+                        .ok_or("Image dimensions overflow")?;
+                    let expected = px.checked_mul(4).ok_or("Image dimensions overflow")?;
+                    if final_data.len() < expected {
+                        return Err(format!(
+                            "RGBA data too short: got {} bytes, need {} for {}x{}",
+                            final_data.len(),
+                            expected,
+                            w,
+                            h
+                        ));
+                    }
+                    final_data.truncate(expected);
                     (w, h)
                 }
             };
