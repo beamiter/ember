@@ -144,6 +144,14 @@ pub struct Config {
     /// 会话标签栏位置:顶部水平栏(默认)或集成进左侧侧边栏
     #[serde(default)]
     pub tab_bar_position: TabBarPosition,
+
+    /// 侧边栏 tab 模式下记住的视图(会话/文件)。默认显示会话,用户切换后会被持久化。
+    #[serde(default = "default_sidebar_view")]
+    pub sidebar_view: crate::sidebar::SidebarView,
+}
+
+fn default_sidebar_view() -> crate::sidebar::SidebarView {
+    crate::sidebar::SidebarView::Sessions
 }
 
 fn default_font_size() -> f32 {
@@ -291,6 +299,7 @@ impl Default for Config {
             ui_scale: None,
             shell: None,
             tab_bar_position: TabBarPosition::default(),
+            sidebar_view: default_sidebar_view(),
         }
     }
 }

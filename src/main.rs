@@ -819,6 +819,7 @@ impl TerminalApp {
             sidebar: {
                 let mut sb = sidebar::Sidebar::new();
                 sb.visible = false; // 默认隐藏，opt-in 切换
+                sb.view = cfg.sidebar_view; // 恢复上次记住的视图(默认会话)
                 sb
             },
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
@@ -940,6 +941,7 @@ impl TerminalApp {
         let mut do_refresh = false;
         let mut collapse = false;
         let mut toggle_tab_pos = false;
+        let mut view_changed = false;
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
         egui::SidePanel::left("file_tree")
@@ -965,6 +967,7 @@ impl TerminalApp {
                             .clicked()
                         {
                             self.sidebar.view = sidebar::SidebarView::Sessions;
+                            view_changed = true;
                         }
                         if ui
                             .selectable_label(
@@ -974,6 +977,7 @@ impl TerminalApp {
                             .clicked()
                         {
                             self.sidebar.view = sidebar::SidebarView::Files;
+                            view_changed = true;
                         }
                     } else {
                         ui.label(egui::RichText::new("Files").strong());
@@ -1050,14 +1054,22 @@ impl TerminalApp {
         if collapse {
             self.sidebar.visible = false;
         }
+        if view_changed {
+            // 记住用户在侧边栏 tab 模式下选择的视图，下次默认沿用
+            self.config.sidebar_view = self.sidebar.view;
+            self.schedule_config_save();
+        }
         if toggle_tab_pos {
             self.config.tab_bar_position = match self.config.tab_bar_position {
                 config::TabBarPosition::Top => config::TabBarPosition::Sidebar,
                 config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
             };
-            // 切回顶部模式时把侧边栏视图复位到文件视图，避免停留在 Sessions
             if matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
+                // 切回顶部模式时把侧边栏视图复位到文件视图，避免停留在 Sessions
                 self.sidebar.view = sidebar::SidebarView::Files;
+            } else {
+                // 切入侧边栏模式时恢复上次记住的视图(默认会话)
+                self.sidebar.view = self.config.sidebar_view;
             }
             self.config_panel.sync_from_config(&self.config);
             self.schedule_config_save();
