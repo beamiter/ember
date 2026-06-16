@@ -1852,6 +1852,12 @@ impl TerminalState {
                                                     _e
                                                 );
                                             }
+                                            let kitty_responses =
+                                                self.kitty_graphics.take_responses();
+                                            if !kitty_responses.is_empty() {
+                                                self.output_buffer
+                                                    .extend_from_slice(&kitty_responses);
+                                            }
                                         }
                                     }
 

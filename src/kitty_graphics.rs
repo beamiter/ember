@@ -80,6 +80,8 @@ pub struct KittyGraphicsState {
     total_bytes_processed: u64,
     total_image_memory: u64,
     access_order: std::collections::VecDeque<u32>,
+    /// Protocol responses (e.g. query replies) awaiting transmission to the PTY.
+    pending_responses: Vec<u8>,
 }
 
 impl KittyGraphicsState {
@@ -93,7 +95,13 @@ impl KittyGraphicsState {
             total_bytes_processed: 0,
             total_image_memory: 0,
             access_order: std::collections::VecDeque::new(),
+            pending_responses: Vec::new(),
         }
+    }
+
+    /// Drain any protocol responses (query replies) for transmission to the PTY.
+    pub fn take_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_responses)
     }
 
     fn enforce_image_limits(&mut self) {
@@ -371,12 +379,23 @@ impl KittyGraphicsState {
     }
 
     /// 处理查询操作 (a=q)
-    fn handle_query(&mut self, _params: KittyGraphicsParams) -> Result<(), String> {
-        // 返回支持的格式
-        // ESC_DCS ? kitty 0 ; png ; jpeg ; rgb ; rgba ESC_ST
-        let response = "\x1bP?kitty 0;png;jpeg;rgb;rgba\x1b\\";
-        log::info!("[KITTY_GRAPHICS] Query response: {}", response);
-        // 实际应用中需要将此回复发送给应用程序
+    ///
+    /// Apps probe protocol support by sending a query with an image id/number;
+    /// the terminal must answer with an APC `OK` response (and must NOT store
+    /// the image). The response echoes back whichever identifier the app used.
+    fn handle_query(&mut self, params: KittyGraphicsParams) -> Result<(), String> {
+        let id_field = if let Some(id) = params.image_id {
+            format!("i={id}")
+        } else if let Some(num) = params.image_number {
+            format!("I={num}")
+        } else {
+            // No identifier to correlate the reply with; reply with i=0 so the
+            // app still learns the protocol is supported.
+            "i=0".to_string()
+        };
+        let response = format!("\x1b_G{id_field};OK\x1b\\");
+        self.pending_responses.extend_from_slice(response.as_bytes());
+        log::info!("[KITTY_GRAPHICS] Query response: {id_field};OK");
         Ok(())
     }
 
