@@ -103,6 +103,7 @@ impl FontdueAtlas {
         fallback_font_data: &[Vec<u8>],
         font_size_px: f32,
         font_weight: f32,
+        subpixel_rendering: bool,
     ) -> Self {
         let settings = fontdue::FontSettings {
             ..Default::default()
@@ -182,7 +183,7 @@ impl FontdueAtlas {
             font_data_regular: font_data_arc,
             font_data_bold: font_data_bold_arc,
             shaping_enabled,
-            subpixel_rendering: true,
+            subpixel_rendering,
         };
 
         atlas.prepopulate_ascii();

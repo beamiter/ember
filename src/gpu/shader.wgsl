@@ -68,9 +68,21 @@ fn vs_main(
         mix(quad_min.y, quad_max.y, qy),
     );
 
+    // Snap the foreground glyph quad to the integer physical-pixel grid so the
+    // 1:1 atlas→screen sampling stays crisp (fractional cell origins otherwise get
+    // softened by the linear sampler). Snap is derived from the grid position only,
+    // excluding the smooth-scroll offset, so scrolling still translates continuously.
+    // Background fills are left unsnapped to keep cells tiling seamlessly.
+    var snap = vec2<f32>(0.0, 0.0);
+    if foreground_pass && has_glyph {
+        let origin_x = f32(col_row.x) * u.cell_width + glyph_offset.x;
+        let origin_y = f32(col_row.y) * u.cell_height + glyph_offset.y;
+        snap = vec2<f32>(round(origin_x) - origin_x, round(origin_y) - origin_y);
+    }
+
     // Cell position in physical pixels relative to viewport origin (with smooth scroll offset)
-    let px = f32(col_row.x) * u.cell_width + px_in_cell.x;
-    let py = f32(col_row.y) * u.cell_height + px_in_cell.y - u.scroll_pixel_offset;
+    let px = f32(col_row.x) * u.cell_width + px_in_cell.x + snap.x;
+    let py = f32(col_row.y) * u.cell_height + px_in_cell.y - u.scroll_pixel_offset + snap.y;
 
     // Convert to NDC (viewport is set to content_rect by egui-wgpu)
     let ndc_x = (px / u.viewport_width) * 2.0 - 1.0;

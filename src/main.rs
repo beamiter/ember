@@ -252,6 +252,7 @@ fn create_font_backend(
                 fallback_font_data,
                 font_size_px,
                 cfg.font_weight,
+                cfg.subpixel_rendering,
             ))
         }
         config::FontBackendType::AbGlyph => {

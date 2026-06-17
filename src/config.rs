@@ -277,7 +277,7 @@ fn default_scroll_speed() -> u32 {
 }
 
 fn default_subpixel_rendering() -> bool {
-    true
+    false
 }
 
 fn default_font_ligatures() -> bool {
