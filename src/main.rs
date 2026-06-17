@@ -917,6 +917,26 @@ impl TerminalApp {
         matches!(self.config.tab_bar_position, config::TabBarPosition::Top)
     }
 
+    /// 切换标签栏位置(顶部 ⇄ 侧边栏)，并同步侧边栏视图与配置。
+    /// 由顶栏内的位置切换按钮调用(两种模式下均可触发)。
+    fn toggle_tab_bar_position(&mut self) {
+        self.config.tab_bar_position = match self.config.tab_bar_position {
+            config::TabBarPosition::Top => config::TabBarPosition::Sidebar,
+            config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
+        };
+        if matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
+            // 切回顶部模式时把侧边栏视图复位到文件视图，避免停留在 Sessions
+            self.sidebar.view = sidebar::SidebarView::Files;
+        } else {
+            // 标签移入侧边栏：恢复上次记住的视图并确保侧边栏可见，否则标签不可达
+            self.sidebar.view = self.config.sidebar_view;
+            self.sidebar.visible = true;
+            self.sidebar.refresh();
+        }
+        self.config_panel.sync_from_config(&self.config);
+        self.schedule_config_save();
+    }
+
     /// 渲染左侧文件树侧边栏。必须在 CentralPanel 之前调用，
     /// 否则中央区域不会正确收缩。
     #[allow(deprecated)]
@@ -939,8 +959,6 @@ impl TerminalApp {
         let mut select_path: Option<std::path::PathBuf> = None;
         let mut cd_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
-        let mut collapse = false;
-        let mut toggle_tab_pos = false;
         let mut view_changed = false;
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
@@ -950,13 +968,6 @@ impl TerminalApp {
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .button("◀")
-                        .on_hover_text("隐藏侧边栏 (Ctrl+Shift+B)")
-                        .clicked()
-                    {
-                        collapse = true;
-                    }
                     if sidebar_tab_mode {
                         // 分区切换：会话 / 文件
                         if ui
@@ -985,27 +996,6 @@ impl TerminalApp {
                             do_refresh = true;
                         }
                     }
-                    // 标签栏位置切换：顶部 ⇄ 侧边栏（右对齐）
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let (label, hover) = match self.config.tab_bar_position {
-                                config::TabBarPosition::Top => {
-                                    ("⬓顶", "标签栏在顶部 — 点击移入侧边栏")
-                                }
-                                config::TabBarPosition::Sidebar => {
-                                    ("⬒栏", "标签栏在侧边栏 — 点击移到顶部")
-                                }
-                            };
-                            if ui
-                                .button(egui::RichText::new(label).small())
-                                .on_hover_text(hover)
-                                .clicked()
-                            {
-                                toggle_tab_pos = true;
-                            }
-                        },
-                    );
                 });
                 ui.separator();
 
@@ -1051,27 +1041,9 @@ impl TerminalApp {
         if do_refresh {
             self.sidebar.refresh();
         }
-        if collapse {
-            self.sidebar.visible = false;
-        }
         if view_changed {
             // 记住用户在侧边栏 tab 模式下选择的视图，下次默认沿用
             self.config.sidebar_view = self.sidebar.view;
-            self.schedule_config_save();
-        }
-        if toggle_tab_pos {
-            self.config.tab_bar_position = match self.config.tab_bar_position {
-                config::TabBarPosition::Top => config::TabBarPosition::Sidebar,
-                config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
-            };
-            if matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
-                // 切回顶部模式时把侧边栏视图复位到文件视图，避免停留在 Sessions
-                self.sidebar.view = sidebar::SidebarView::Files;
-            } else {
-                // 切入侧边栏模式时恢复上次记住的视图(默认会话)
-                self.sidebar.view = self.config.sidebar_view;
-            }
-            self.config_panel.sync_from_config(&self.config);
             self.schedule_config_save();
         }
     }
@@ -1117,26 +1089,34 @@ impl TerminalApp {
     fn render_ui(&mut self, ctx: &egui::Context) {
         let frame = egui::Frame::NONE.inner_margin(0.0);
 
+        // 顶部栏(全宽)：必须在 render_sidebar 之前声明，egui 会把先声明的面板
+        // 分配到容器边缘的完整范围 —— 因此顶栏横跨整个窗口，侧边栏落在其下方，
+        // 而不是侧边栏贯穿到顶部。
+        let mut close_requested = false;
+        egui::TopBottomPanel::top("top_bar")
+            .frame(egui::Frame::NONE)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // Top 模式：完整水平标签栏(含 ☰ 与位置切换控件)。
+                // Sidebar 模式：精简顶栏(仅 ☰ 与位置切换控件)，标签在侧边栏内。
+                if self.show_top_tab_bar() {
+                    if self.render_tab_bar(ui, ctx) {
+                        close_requested = true;
+                    }
+                } else {
+                    self.render_sidebar_mode_top_bar(ui, ctx);
+                }
+            });
+        if close_requested {
+            return;
+        }
+
+        // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
         self.render_sidebar(ctx);
 
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            // 消除 tab 栏与终端之间的间距
             ui.spacing_mut().item_spacing.y = 0.0;
-
-            // 渲染会话标签栏（仅 Top 模式且多会话时显示；Sidebar 模式下 tab 在侧边栏内）
-            let show_tab_bar = self.show_top_tab_bar();
-
-            // Tab 栏 - 绘制标签和按钮
-            if show_tab_bar {
-                if self.render_tab_bar(ui, ctx) {
-                    return;
-                }
-            } else {
-                // Sidebar tab 模式：仍预留精简顶部栏(含 ☰ toggle)，
-                // 避免浮动按钮覆盖终端内容造成 UI 干扰。
-                self.render_sidebar_mode_top_bar(ui, ctx);
-            }
-
             self.render_terminal_content(ui, ctx);
         });
 
