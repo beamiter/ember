@@ -4,6 +4,17 @@ use super::state::TerminalApp;
 use eframe::egui;
 
 impl TerminalApp {
+    /// 关闭指定会话,并同步修正分屏窗格保存的 session_idx,避免删除后索引错位。
+    /// 返回是否真的关闭了会话。
+    pub fn close_session_synced(&mut self, index: usize) -> bool {
+        if !self.session_manager.close_session(index) {
+            return false;
+        }
+        let fallback = self.session_manager.active_index();
+        self.layout_manager.on_session_removed(index, fallback);
+        true
+    }
+
     /// 会话标题：优先用 shell 当前工作目录(对 HOME 做 ~ 缩写)，否则回退到会话名。
     pub fn session_cwd_title(session: &crate::session::Session) -> String {
         let pid = session.get_shell_pid();
@@ -80,7 +91,7 @@ impl TerminalApp {
         }
         if let Some(i) = close_idx {
             if self.session_manager.len() > 1 {
-                self.session_manager.close_session(i);
+                self.close_session_synced(i);
                 self.schedule_session_save();
             }
         }
@@ -484,7 +495,7 @@ impl TerminalApp {
 
                                     if close_btn_rect.contains(click_pos) {
                                         if self.session_manager.len() > 1 {
-                                            self.session_manager.close_session(i);
+                                            self.close_session_synced(i);
                                             self.schedule_session_save();
                                         } else {
                                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

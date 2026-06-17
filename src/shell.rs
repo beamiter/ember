@@ -1,6 +1,6 @@
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
-use crossbeam::channel::{bounded, Receiver};
+use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use eframe::egui;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +25,9 @@ pub struct ShellSession {
     event_rx: Receiver<ShellEvent>,
     child_pid: i32,            // 存储 shell 子进程的 PID
     shutdown: Arc<AtomicBool>, // 通知 IO 线程退出
+    // 所有 PTY 写入都经此 channel 交给单一 writer 线程串行执行,保证每条消息原子写入、
+    // 互不交错(否则键盘输入与异步粘贴会逐块交错,劈开括号粘贴标记 ESC[200~..201~)。
+    write_tx: Sender<Vec<u8>>,
 }
 
 impl ShellSession {
@@ -68,11 +71,30 @@ impl ShellSession {
                     Self::io_loop(pty_clone, event_tx, repaint_ctx_clone, shutdown_clone);
                 });
 
+                // 单一 writer 线程:串行执行所有 PTY 写入,保证消息级原子性。
+                // unbounded 避免 UI 线程在入队时阻塞;实际数据很快被排空。
+                let (write_tx, write_rx) = unbounded::<Vec<u8>>();
+                let pty_writer = Arc::clone(&pty);
+                let shutdown_writer = Arc::clone(&shutdown);
+                let _ = thread::Builder::new()
+                    .name("pty-writer".to_string())
+                    .spawn(move || {
+                        while let Ok(data) = write_rx.recv() {
+                            if shutdown_writer.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if let Err(e) = Self::write_to_pty(&pty_writer, &data) {
+                                eprintln!("[ERROR] Failed to write to PTY: {}", e);
+                            }
+                        }
+                    });
+
                 Ok(ShellSession {
                     pty,
                     event_rx,
                     child_pid,
                     shutdown,
+                    write_tx,
                 })
             }
             Err(e) => Err(format!("Failed to create shell session: {}", e)),
@@ -146,6 +168,8 @@ impl ShellSession {
                         Continue,
                         ContinueWith(ShellEvent),
                         Stop(ShellEvent),
+                        // EOF:退出码须在锁外用非阻塞 reap 获取,避免持锁阻塞 waitpid 死锁
+                        StopEof,
                     }
                     let after = {
                         let mut pty_guard = pty.lock();
@@ -160,14 +184,10 @@ impl ShellSession {
                                 }
                                 Ok(crate::pty::ReadOutcome::WouldBlock) => break,
                                 Ok(crate::pty::ReadOutcome::Eof) => {
-                                    // 从端已关闭:子进程退出。立即回收并停止,
-                                    // 不再回到外层 poll(POLLHUP 会持续就绪导致忙等)。
-                                    after = After::Stop(match pty_guard.wait_timeout(0) {
-                                        Ok(exit_code) => ShellEvent::Exit(exit_code),
-                                        Err(e) => {
-                                            ShellEvent::Error(format!("Process exit error: {}", e))
-                                        }
-                                    });
+                                    // 从端已关闭:子进程通常即将退出。停止读取(POLLHUP 会持续
+                                    // 就绪导致忙等),退出码在锁外用非阻塞 reap 获取 —— 不能在此
+                                    // 持锁调用阻塞式 wait,否则 daemon 化场景会与 UI 写入死锁。
+                                    after = After::StopEof;
                                     break;
                                 }
                                 Err(e) => {
@@ -213,6 +233,16 @@ impl ShellSession {
                         }
                         After::Stop(ev) => {
                             let _ = Self::send_event(&event_tx, &repaint_ctx, ev);
+                            return;
+                        }
+                        After::StopEof => {
+                            // 锁外非阻塞回收,避免持锁阻塞 waitpid 死锁(见 reap_with_grace)
+                            let exit_code = pty.lock().reap_with_grace();
+                            let _ = Self::send_event(
+                                &event_tx,
+                                &repaint_ctx,
+                                ShellEvent::Exit(exit_code),
+                            );
                             return;
                         }
                     }
@@ -275,11 +305,9 @@ impl ShellSession {
         }
     }
 
-    /// 处理大数据写入：循环写入并在 poll 等待时释放锁，避免与 io_loop 死锁
-    pub(crate) fn write_to_pty(
-        pty: &Arc<Mutex<Pty>>,
-        data: &[u8],
-    ) -> std::result::Result<(), String> {
+    /// 处理大数据写入：循环写入并在 poll 等待时释放锁，避免与 io_loop 死锁。
+    /// 仅由 writer 线程调用,保证全局只有一个写者 —— 字节流不会与其他写入交错。
+    fn write_to_pty(pty: &Arc<Mutex<Pty>>, data: &[u8]) -> std::result::Result<(), String> {
         let mut offset = 0;
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(10);
@@ -332,21 +360,22 @@ impl ShellSession {
         Ok(())
     }
 
-    /// 向 shell 发送输入数据（例如用户输入）
+    /// 向 shell 发送输入数据（例如用户输入）。入队到单一 writer 线程,立即返回。
     pub fn write(&self, data: &[u8]) -> std::result::Result<(), String> {
-        Self::write_to_pty(&self.pty, data)
+        self.write_tx
+            .send(data.to_vec())
+            .map_err(|_| "PTY writer thread has stopped".to_string())
     }
 
-    /// 在后台线程发送大块数据，避免阻塞 UI 更新循环。
+    /// 发送大块数据(如粘贴)。同样经由单一 writer 线程串行写入,不会与按键输入交错。
     pub fn write_async(&self, data: Vec<u8>) {
-        let pty = Arc::clone(&self.pty);
-        let _ = thread::Builder::new()
-            .name("pty-async-writer".to_string())
-            .spawn(move || {
-                if let Err(e) = Self::write_to_pty(&pty, &data) {
-                    eprintln!("[ERROR] Failed to write to PTY asynchronously: {}", e);
-                }
-            });
+        let _ = self.write_tx.send(data);
+    }
+
+    /// 返回写入队列的发送端,供需要先做阻塞 I/O(如读剪贴板)再写 PTY 的后台线程使用。
+    /// 经由它入队的数据同样被 writer 线程串行写入,保证不与其他写入交错。
+    pub fn write_sender(&self) -> Sender<Vec<u8>> {
+        self.write_tx.clone()
     }
 
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
@@ -360,10 +389,6 @@ impl ShellSession {
         self.child_pid
     }
 
-    /// 获取可克隆的 PTY writer（用于延迟写入命令）
-    pub fn pty_writer(&self) -> Arc<Mutex<Pty>> {
-        Arc::clone(&self.pty)
-    }
 }
 
 impl Drop for ShellSession {

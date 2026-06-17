@@ -69,6 +69,8 @@ impl TerminalApp {
                     }
                     Err(e) => {
                         eprintln!("[Config] Hot-reload parse error: {}", e);
+                        // 同时在状态栏提示用户,避免改坏配置后毫无反馈、误以为已生效。
+                        self.status_message = format!("配置解析失败,已沿用旧配置: {}", e);
                     }
                 }
             }
@@ -83,6 +85,8 @@ impl TerminalApp {
         new.opacity = new.opacity.clamp(0.0, 1.0);
         new.padding = new.padding.clamp(0.0, 100.0);
         new.line_spacing = new.line_spacing.clamp(0.5, 3.0);
+        // scroll_speed 为 0 会让滚轮完全失效,过大则一格滚太多;钳到合理范围。
+        new.scroll_speed = new.scroll_speed.clamp(1, 50);
         let new = &new;
         let old = &self.config;
 

@@ -148,6 +148,19 @@ pub struct Config {
     /// 侧边栏 tab 模式下记住的视图(会话/文件)。默认显示会话,用户切换后会被持久化。
     #[serde(default = "default_sidebar_view")]
     pub sidebar_view: crate::sidebar::SidebarView,
+
+    /// 允许程序通过 OSC 52 写入系统剪贴板(默认允许)。
+    #[serde(default = "default_true")]
+    pub osc52_clipboard_write: bool,
+
+    /// 允许程序通过 OSC 52 读取系统剪贴板(默认禁止)。
+    /// 读取会把剪贴板内容回传给终端内运行的程序,存在隐私/安全风险,故默认关闭。
+    #[serde(default)]
+    pub osc52_clipboard_read: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_sidebar_view() -> crate::sidebar::SidebarView {
@@ -300,6 +313,8 @@ impl Default for Config {
             shell: None,
             tab_bar_position: TabBarPosition::default(),
             sidebar_view: default_sidebar_view(),
+            osc52_clipboard_write: true,
+            osc52_clipboard_read: false,
         }
     }
 }

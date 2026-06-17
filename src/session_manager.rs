@@ -87,7 +87,12 @@ impl SessionManager {
 
         self.sessions.remove(index);
 
-        // 调整活跃会话索引
+        // 调整活跃会话索引:
+        // - 关闭的是活跃会话之前的会话:活跃会话整体左移一位,索引需 -1 才能继续指向同一会话。
+        // - 关闭的就是活跃会话:索引保持不变,自然指向原先的下一个会话(下方再做越界钳制)。
+        if index < self.active_index {
+            self.active_index -= 1;
+        }
         if self.active_index >= self.sessions.len() {
             self.active_index = self.sessions.len() - 1;
         }

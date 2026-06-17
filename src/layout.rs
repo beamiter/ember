@@ -101,6 +101,20 @@ impl LayoutManager {
         Ok(())
     }
 
+    /// 某个会话被关闭后,修正所有窗格保存的 session_idx。
+    /// 会话向量在 `removed_idx` 处删除一项后,其后所有会话索引整体 -1;
+    /// 指向被删会话的窗格回退到 `fallback_idx`(关闭后的新活跃会话),
+    /// 避免悬空/越界索引导致渲染错位。
+    pub fn on_session_removed(&mut self, removed_idx: usize, fallback_idx: usize) {
+        for pane in &mut self.panes {
+            if pane.session_idx == removed_idx {
+                pane.session_idx = fallback_idx;
+            } else if pane.session_idx > removed_idx {
+                pane.session_idx -= 1;
+            }
+        }
+    }
+
     /// 切换焦点窗格（通过方向）
     pub fn focus_pane(&mut self, direction: PaneDirection) -> bool {
         if self.panes.len() == 1 {

@@ -54,7 +54,10 @@ pub struct FontdueAtlas {
     shelf_height: u32,
     ascii_cache: HashMap<AtlasGlyphKey, GlyphRegion>,
     unicode_cache: LruCache<AtlasGlyphKey, GlyphRegion>,
-    gid_cache: HashMap<GidGlyphKey, GlyphRegion>,
+    /// 整形字形(gid)→图集区域缓存。用 LRU 而非裸 HashMap,避免大量不同
+    /// 连字/PUA 图标长期累积导致无界增长。淘汰项遗留的货架死空间会在图集填满
+    /// 触发 reset 重建时一并回收(见 needs_compaction)。
+    gid_cache: LruCache<GidGlyphKey, GlyphRegion>,
     /// Cache of fully shaped runs, keyed by text+style. Holds atlas UVs, so it is
     /// cleared whenever the atlas grows or resets (regions would otherwise be stale).
     shape_cache: LruCache<ShapeCacheKey, Arc<Vec<ShapedGlyph>>>,
@@ -163,7 +166,7 @@ impl FontdueAtlas {
             shelf_height: 0,
             ascii_cache: HashMap::with_capacity(1024),
             unicode_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
-            gid_cache: HashMap::with_capacity(512),
+            gid_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
             shape_cache: LruCache::new(NonZeroUsize::new(2048).unwrap()),
             atlas_generation: 0,
             needs_compaction: false,
@@ -258,7 +261,7 @@ impl FontdueAtlas {
         }
         // gid_cache holds shaped-glyph UVs and must be rescaled too, otherwise
         // ligatures/shaped runs sample the wrong atlas region after a grow.
-        for region in self.gid_cache.values_mut() {
+        for (_, region) in self.gid_cache.iter_mut() {
             region.u0 *= scale_x;
             region.u1 *= scale_x;
             region.v0 *= scale_y;
@@ -465,7 +468,7 @@ impl FontdueAtlas {
 
         if glyph_bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
             let region = empty_glyph_region();
-            self.gid_cache.insert(key, region);
+            self.gid_cache.put(key, region);
             return region;
         }
 
@@ -478,12 +481,12 @@ impl FontdueAtlas {
             if !self.grow() {
                 self.needs_compaction = true;
                 let region = empty_glyph_region();
-                self.gid_cache.insert(key, region);
+                self.gid_cache.put(key, region);
                 return region;
             }
             if !self.allocate_shelf(padded_w, padded_h) {
                 let region = empty_glyph_region();
-                self.gid_cache.insert(key, region);
+                self.gid_cache.put(key, region);
                 return region;
             }
         }
@@ -532,7 +535,7 @@ impl FontdueAtlas {
             bearing_x,
             bearing_y,
         };
-        self.gid_cache.insert(key, region);
+        self.gid_cache.put(key, region);
         region
     }
 }
@@ -677,6 +680,10 @@ impl FontBackend for FontdueAtlas {
             self.view = view;
             self.sampler = sampler;
             self.needs_full_upload = true;
+            // 纹理/view/sampler 已被替换,旧绑定组仍引用已失效的资源,必须重建。
+            // grow() 在 CPU 阶段就更新了 self.width,使 callback 的 old==new 尺寸比较
+            // 失效,因此重建信号必须在此显式置位,不能依赖尺寸比较。
+            self.needs_rebind = true;
         }
 
         // Full upload when atlas was resized or texture recreated

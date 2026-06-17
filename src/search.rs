@@ -224,23 +224,38 @@ impl SearchEngine {
             query.to_lowercase()
         };
 
+        let query_char_len = search_query.chars().count();
+
         for (line_idx, line) in grid.iter().enumerate() {
-            let line_str = Self::grid_line_to_string(line);
+            let (line_str, col_map) = Self::grid_line_to_string(line);
+            let total_cols = line.len();
             let search_line = if case_sensitive {
-                line_str.clone()
+                line_str
             } else {
                 line_str.to_lowercase()
             };
 
-            let mut start_pos = 0;
-            while let Some(pos) = search_line[start_pos..].find(&search_query) {
-                let actual_pos = start_pos + pos;
+            let mut start_byte = 0;
+            while let Some(rel) = search_line[start_byte..].find(&search_query) {
+                let match_byte = start_byte + rel;
+                // 字节偏移 → 字符索引 → 网格列号(col_map 已跳过宽字符续接单元)。
+                let start_char = search_line[..match_byte].chars().count();
+                let col_start = col_map.get(start_char).copied().unwrap_or(total_cols);
+                let col_end = col_map
+                    .get(start_char + query_char_len)
+                    .copied()
+                    .unwrap_or(total_cols);
                 matches.push(SearchMatch {
                     line: line_idx,
-                    col_start: actual_pos,
-                    col_end: actual_pos + search_query.len(),
+                    col_start,
+                    col_end,
                 });
-                start_pos = actual_pos + 1;
+                // 前进到下一个字符边界:既能找到重叠匹配,又不会切到多字节字符中间导致 panic。
+                let step = search_line[match_byte..]
+                    .chars()
+                    .next()
+                    .map_or(1, |c| c.len_utf8());
+                start_byte = match_byte + step;
             }
         }
 
@@ -269,13 +284,19 @@ impl SearchEngine {
         };
 
         for (line_idx, line) in grid.iter().enumerate() {
-            let line_str = Self::grid_line_to_string(line);
+            let (line_str, col_map) = Self::grid_line_to_string(line);
+            let total_cols = line.len();
 
             for mat in regex.find_iter(&line_str) {
+                // regex 返回字节偏移,需转成字符索引再映射到网格列号。
+                let start_char = line_str[..mat.start()].chars().count();
+                let end_char = line_str[..mat.end()].chars().count();
+                let col_start = col_map.get(start_char).copied().unwrap_or(total_cols);
+                let col_end = col_map.get(end_char).copied().unwrap_or(total_cols);
                 matches.push(SearchMatch {
                     line: line_idx,
-                    col_start: mat.start(),
-                    col_end: mat.end(),
+                    col_start,
+                    col_end,
                 });
             }
         }
@@ -283,9 +304,20 @@ impl SearchEngine {
         (matches, None)
     }
 
-    /// 将网格行转换为字符串
-    fn grid_line_to_string(line: &[crate::terminal::TerminalCell]) -> String {
-        line.iter().map(|cell| cell.character).collect()
+    /// 将网格行转换为字符串,并返回每个字符对应的网格列号。
+    /// 跳过宽字符的续接单元(否则相邻宽字符间会被插入空格导致匹配失败),
+    /// 因此字符索引与字节偏移都不再等于列号,需经 col_map 映射。
+    fn grid_line_to_string(line: &[crate::terminal::TerminalCell]) -> (String, Vec<usize>) {
+        let mut s = String::with_capacity(line.len());
+        let mut col_map = Vec::with_capacity(line.len());
+        for (col, cell) in line.iter().enumerate() {
+            if cell.flags.wide_continuation() {
+                continue;
+            }
+            s.push(cell.character);
+            col_map.push(col);
+        }
+        (s, col_map)
     }
 }
 

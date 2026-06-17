@@ -99,7 +99,7 @@ impl TerminalApp {
                                             if self.session_manager.len() > 1 {
                                                 let active_idx =
                                                     self.session_manager.active_index();
-                                                self.session_manager.close_session(active_idx);
+                                                self.close_session_synced(active_idx);
                                                 self.schedule_session_save();
                                             } else {
                                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -273,7 +273,7 @@ impl TerminalApp {
                         }
                         keybindings::Command::SessionClose => {
                             if self.session_manager.len() > 1 {
-                                self.session_manager.close_session(active_session_idx);
+                                self.close_session_synced(active_session_idx);
                                 self.schedule_session_save();
                             } else {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -355,7 +355,10 @@ impl TerminalApp {
                     }
                     egui::ImeEvent::Preedit(text) => {
                         crate::debug_log!("[IME] Preedit: {:?}", text);
-                        terminal.set_preedit(text.clone(), text.len());
+                        // 光标位置用字符数而非字节数:CJK 预编辑文本每字符多字节,
+                        // 用 byte len 会让光标落到错误(过大)的位置。
+                        let cursor = text.chars().count();
+                        terminal.set_preedit(text.clone(), cursor);
                     }
                     egui::ImeEvent::Commit(text) => {
                         crate::debug_log!("[IME] Commit: {:?}", text);

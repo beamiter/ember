@@ -140,22 +140,6 @@ impl TerminalGrid {
         self.cells[start + self.cols - 1] = TerminalCell::default();
     }
 
-    /// Shift all rows up by one (discard first row, blank last row).
-    #[inline]
-    pub fn shift_rows_up(&mut self) {
-        self.cells.copy_within(self.cols.., 0);
-        let last_start = (self.rows - 1) * self.cols;
-        self.cells[last_start..].fill(TerminalCell::default());
-        self.row_wrapped.copy_within(1.., 0);
-        self.row_wrapped[self.rows - 1] = false;
-    }
-
-    /// 用blank_cell填充末尾一行
-    pub fn fill_last_row(&mut self, cell: TerminalCell) {
-        let last_start = (self.rows - 1) * self.cols;
-        self.cells[last_start..].fill(cell);
-    }
-
     /// 是否为空
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -179,6 +163,29 @@ impl TerminalGrid {
         self.row_wrapped = new_wrapped;
         self.rows = new_rows;
         self.cols = new_cols;
+    }
+
+    /// 向上滚动 n 行:丢弃顶部 n 行,其余行上移,底部补 blank。缩小高度前调用,
+    /// 把底部内容(光标行/近期输出)上移保留;调用方负责把被丢弃的顶部行存入 scrollback。
+    pub fn scroll_up_by(&mut self, n: usize, blank: TerminalCell) {
+        if n == 0 {
+            return;
+        }
+        if n >= self.rows {
+            self.cells.fill(blank);
+            for w in self.row_wrapped.iter_mut() {
+                *w = false;
+            }
+            return;
+        }
+        let cols = self.cols;
+        self.cells.copy_within(n * cols.., 0);
+        let keep = (self.rows - n) * cols;
+        self.cells[keep..].fill(blank);
+        self.row_wrapped.copy_within(n.., 0);
+        for w in self.row_wrapped[self.rows - n..].iter_mut() {
+            *w = false;
+        }
     }
 
     /// 获取mut访问所有行
@@ -1272,13 +1279,7 @@ impl TerminalState {
         if self.pending_wrap {
             self.pending_wrap = false;
             if autowrap {
-                self.grid.row_wrapped[self.cursor_row] = true;
-                self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row >= self.grid.rows() {
-                    self.cursor_row = self.grid.rows() - 1;
-                    self.scroll_down();
-                }
+                self.wrap_to_next_line();
             }
         }
 
@@ -1286,13 +1287,7 @@ impl TerminalState {
         // immediately (it cannot be split across the line boundary).
         if self.cursor_col + width > cols {
             if autowrap {
-                self.grid.row_wrapped[self.cursor_row] = true;
-                self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row >= self.grid.rows() {
-                    self.cursor_row = self.grid.rows() - 1;
-                    self.scroll_down();
-                }
+                self.wrap_to_next_line();
             } else {
                 // Autowrap disabled: clamp cursor to last column instead of wrapping
                 self.cursor_col = cols.saturating_sub(width);
@@ -1376,13 +1371,7 @@ impl TerminalState {
             if self.pending_wrap {
                 self.pending_wrap = false;
                 if autowrap {
-                    self.grid.row_wrapped[self.cursor_row] = true;
-                    self.cursor_col = 0;
-                    self.cursor_row += 1;
-                    if self.cursor_row >= self.grid.rows() {
-                        self.cursor_row = self.grid.rows() - 1;
-                        self.scroll_down();
-                    }
+                    self.wrap_to_next_line();
                 }
             }
 
@@ -1419,6 +1408,20 @@ impl TerminalState {
                     self.pending_wrap = true;
                 }
             }
+        }
+    }
+
+    /// 自动换行时推进到下一行,受 DECSTBM 滚动区底边距约束(与 LF 行为一致)。
+    /// 恰在底边距时区域上滚(全屏区会把顶行压入 scrollback);否则在网格内下移光标。
+    /// 此前换行只与 grid.rows() 比较并调用全屏 scroll_down(),会让区内文本溢出到
+    /// 底边距下方,破坏 pager/分屏 TUI 布局。
+    fn wrap_to_next_line(&mut self) {
+        self.grid.row_wrapped[self.cursor_row] = true;
+        self.cursor_col = 0;
+        if self.cursor_row == self.scroll_region_bottom {
+            self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
+        } else if self.cursor_row + 1 < self.grid.rows() {
+            self.cursor_row += 1;
         }
     }
 
@@ -1643,6 +1646,40 @@ impl TerminalState {
         }
     }
 
+    /// 处理一个 UTF-8 多字节引导字节。`expected` 是该序列总长度(2/3/4)。
+    /// - 缓冲区剩余字节不足:把引导字节暂存,等待下一批输入续接(跨 PTY 读边界)。
+    /// - 续接字节齐全且合法:解码并写入字符;非法则输出替换字符 U+FFFD。
+    /// - 续接字节非法(不是 10xxxxxx):序列残缺,输出 U+FFFD 且只消费引导字节本身,
+    ///   让那个意外字节按自身规则重新处理。
+    fn consume_utf8_lead(&mut self, byte: u8, expected: u8, data: &[u8], i: &mut usize) {
+        let need = expected as usize;
+        if *i + need > data.len() {
+            // 不完整:剩余字节不够,暂存等待下一批
+            self.utf8_buf[0] = byte;
+            self.utf8_len = 1;
+            self.utf8_expected = expected;
+            *i += 1;
+            return;
+        }
+
+        let all_continuation = (1..need).all(|k| (data[*i + k] & 0xC0) == 0x80);
+        if all_continuation {
+            match std::str::from_utf8(&data[*i..*i + need]) {
+                Ok(s) => {
+                    if let Some(ch) = s.chars().next() {
+                        self.put_char(ch);
+                    }
+                }
+                Err(_) => self.put_char('\u{FFFD}'),
+            }
+            *i += need;
+        } else {
+            // 引导字节后紧跟非续接字节:残缺序列
+            self.put_char('\u{FFFD}');
+            *i += 1;
+        }
+    }
+
     pub fn process_input(&mut self, input: &[u8]) {
         // Fast path: if no pending escape, process input directly without allocation
         let data;
@@ -1661,14 +1698,26 @@ impl TerminalState {
         while i < data_slice.len() {
             let byte = data_slice[i];
 
+            // 存在未完成的多字节 UTF-8 序列,而当前字节不是续接字节(10xxxxxx):
+            // 说明前一个序列残缺,按 Unicode 建议输出替换字符 U+FFFD 并复位,
+            // 然后正常处理当前字节,避免残缺序列被静默吞掉或污染后续解析。
+            if self.utf8_len > 0 && (byte & 0xC0) != 0x80 {
+                self.put_char('\u{FFFD}');
+                self.utf8_len = 0;
+            }
+
             match byte {
-                b'\x08' | b'\x7f' => {
-                    // Backspace (0x08) and Delete (0x7f) - just move cursor left
-                    // Shell handles actual deletion and sends back updated display
+                b'\x08' => {
+                    // Backspace (0x08) - move cursor left.
+                    // Shell handles actual deletion and sends back updated display.
                     self.pending_wrap = false;
                     if self.cursor_col > 0 {
                         self.cursor_col -= 1;
                     }
+                    i += 1;
+                }
+                b'\x7f' => {
+                    // DEL (0x7f) 在输出流中按 ECMA-48 应被忽略,不能当作退格移动光标。
                     i += 1;
                 }
                 b'\n' => {
@@ -2037,78 +2086,35 @@ impl TerminalState {
                 }
                 // UTF-8 multi-byte sequences: try to consume all bytes eagerly
                 0xC2..=0xDF => {
-                    let expected: u8 = 2;
-                    if i + 1 < data_slice.len() && (data_slice[i + 1] & 0xC0) == 0x80 {
-                        let buf = [byte, data_slice[i + 1], 0, 0];
-                        if let Ok(s) = std::str::from_utf8(&buf[..2]) {
-                            if let Some(ch) = s.chars().next() {
-                                self.put_char(ch);
-                            }
-                        }
-                        i += 2;
-                    } else {
-                        self.utf8_buf[0] = byte;
-                        self.utf8_len = 1;
-                        self.utf8_expected = expected;
-                        i += 1;
-                    }
+                    self.consume_utf8_lead(byte, 2, data_slice, &mut i);
                 }
                 0xE0..=0xEF => {
-                    let expected: u8 = 3;
-                    if i + 2 < data_slice.len()
-                        && (data_slice[i + 1] & 0xC0) == 0x80
-                        && (data_slice[i + 2] & 0xC0) == 0x80
-                    {
-                        let buf = [byte, data_slice[i + 1], data_slice[i + 2], 0];
-                        if let Ok(s) = std::str::from_utf8(&buf[..3]) {
-                            if let Some(ch) = s.chars().next() {
-                                self.put_char(ch);
-                            }
-                        }
-                        i += 3;
-                    } else {
-                        self.utf8_buf[0] = byte;
-                        self.utf8_len = 1;
-                        self.utf8_expected = expected;
-                        i += 1;
-                    }
+                    self.consume_utf8_lead(byte, 3, data_slice, &mut i);
                 }
                 0xF0..=0xF4 => {
-                    let expected: u8 = 4;
-                    if i + 3 < data_slice.len()
-                        && (data_slice[i + 1] & 0xC0) == 0x80
-                        && (data_slice[i + 2] & 0xC0) == 0x80
-                        && (data_slice[i + 3] & 0xC0) == 0x80
-                    {
-                        let buf = [byte, data_slice[i + 1], data_slice[i + 2], data_slice[i + 3]];
-                        if let Ok(s) = std::str::from_utf8(&buf[..4]) {
-                            if let Some(ch) = s.chars().next() {
-                                self.put_char(ch);
-                            }
-                        }
-                        i += 4;
-                    } else {
-                        self.utf8_buf[0] = byte;
-                        self.utf8_len = 1;
-                        self.utf8_expected = expected;
-                        i += 1;
-                    }
+                    self.consume_utf8_lead(byte, 4, data_slice, &mut i);
                 }
                 _ => {
+                    // 到这里 byte 要么是续接字节(由上方的残缺检测保证此时确有进行中的序列),
+                    // 要么是非法的 UTF-8 引导字节(0xC0/0xC1/0xF5..=0xFF)。
                     if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
                         self.utf8_buf[self.utf8_len as usize] = byte;
                         self.utf8_len += 1;
                         if self.utf8_len == self.utf8_expected {
-                            if let Ok(s) =
-                                std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize])
-                            {
-                                if let Some(ch) = s.chars().next() {
-                                    self.put_char(ch);
+                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
+                                Ok(s) => {
+                                    if let Some(ch) = s.chars().next() {
+                                        self.put_char(ch);
+                                    }
                                 }
+                                // 长度够但内容非法(如过长编码/代理区):输出替换字符。
+                                Err(_) => self.put_char('\u{FFFD}'),
                             }
                             self.utf8_len = 0;
                         }
                     } else {
+                        // 孤立的续接字节或非法引导字节。
+                        self.put_char('\u{FFFD}');
                         self.utf8_len = 0;
                     }
                     i += 1;
@@ -2505,8 +2511,9 @@ impl TerminalState {
                     _ => {}
                 }
             }
-            'r' => {
-                // Set scroll region (DECSTBM)
+            'r' if private_prefix.is_none() => {
+                // Set scroll region (DECSTBM)。带私有前缀(如 CSI ? Pm r 的 XTRESTORE)
+                // 不是 DECSTBM,不能误设滚动区域,故仅在无前缀时处理。
                 let top = params.first().copied().unwrap_or(1) as usize;
                 let bottom = params.get(1).copied().unwrap_or(self.grid.rows() as u16) as usize;
 
@@ -2626,6 +2633,39 @@ impl TerminalState {
         }
     }
 
+    /// 解析从下标 `i`(38/48/58)开始的扩展颜色子序列,返回 `(颜色, 最后消费的下标)`。
+    /// 同时支持分号传统形式(`38;2;r;g;b`)与冒号 ITU 形式(`38:2:r:g:b` 或
+    /// 带颜色空间字段的 `38:2:cs:r:g:b`)。冒号形式靠 colon_flags 识别,并据子参数
+    /// 个数决定是否跳过颜色空间字段,避免把 cs 当成 r 而整体错位。
+    fn parse_sgr_extended_color(
+        params: &[u16],
+        colon_flags: &[bool],
+        i: usize,
+    ) -> Option<(Color, usize)> {
+        match params.get(i + 1).copied()? {
+            5 => {
+                let idx = params.get(i + 2).copied()? as u8;
+                Some((Color::Indexed(idx), i + 2))
+            }
+            2 => {
+                // 计算从 i 起的冒号连续子参数组长度(组内各参数 colon_flag 为 true)。
+                let mut end = i + 1;
+                while end < params.len() && colon_flags.get(end).copied().unwrap_or(false) {
+                    end += 1;
+                }
+                let colon_form = colon_flags.get(i + 1).copied().unwrap_or(false);
+                // 冒号形式且组长 >=6 表示存在颜色空间字段(38,2,cs,r,g,b),r 偏移为 3;
+                // 否则(传统分号形式或无 cs 的冒号形式)r 偏移为 2。
+                let r_off = if colon_form && (end - i) >= 6 { 3 } else { 2 };
+                let r = params.get(i + r_off).copied()?;
+                let g = params.get(i + r_off + 1).copied()?;
+                let b = params.get(i + r_off + 2).copied()?;
+                Some((Color::Rgb(r as u8, g as u8, b as u8), i + r_off + 2))
+            }
+            _ => None,
+        }
+    }
+
     fn handle_sgr(&mut self, params: &[u16], colon_flags: &[bool]) {
         if params.is_empty() {
             self.current_flags = StyleFlags::default();
@@ -2738,65 +2778,35 @@ impl TerminalState {
                     };
                     self.global_bg = self.current_bg; // Update global background
                 }
-                // Extended color support: 38;5;n (256 color) and 38;2;r;g;b (RGB)
+                // 扩展前景色:38;5;n / 38;2;r;g;b 及对应冒号形式
                 38 => {
-                    if i + 2 < params.len() {
-                        match params[i + 1] {
-                            5 => {
-                                // 256 color mode
-                                self.current_fg = Color::Indexed(params[i + 2] as u8);
-                                i += 2;
-                            }
-                            2 => {
-                                // RGB mode
-                                if i + 4 < params.len() {
-                                    self.current_fg = Color::Rgb(
-                                        params[i + 2] as u8,
-                                        params[i + 3] as u8,
-                                        params[i + 4] as u8,
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some((color, last)) =
+                        Self::parse_sgr_extended_color(params, colon_flags, i)
+                    {
+                        self.current_fg = color;
+                        i = last;
                     }
                 }
+                // 扩展背景色
                 48 => {
-                    if i + 2 < params.len() {
-                        match params[i + 1] {
-                            5 => {
-                                // 256 color mode for background
-                                self.current_bg = Color::Indexed(params[i + 2] as u8);
-                                self.global_bg = self.current_bg; // Update global background
-                                crate::debug_log!(
-                                    "[CSI] Background color (256-color) set to: index {}",
-                                    params[i + 2]
-                                );
-                                i += 2;
-                            }
-                            2 => {
-                                // RGB mode for background
-                                if i + 4 < params.len() {
-                                    self.current_bg = Color::Rgb(
-                                        params[i + 2] as u8,
-                                        params[i + 3] as u8,
-                                        params[i + 4] as u8,
-                                    );
-                                    self.global_bg = self.current_bg; // Update global background
-                                    crate::debug_log!(
-                                        "[CSI] Background color (RGB) set to: ({}, {}, {})",
-                                        params[i + 2],
-                                        params[i + 3],
-                                        params[i + 4]
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some((color, last)) =
+                        Self::parse_sgr_extended_color(params, colon_flags, i)
+                    {
+                        self.current_bg = color;
+                        self.global_bg = self.current_bg;
+                        i = last;
                     }
                 }
+                // 58 设置下划线颜色 / 59 复位。当前渲染管线未存储独立下划线颜色,
+                // 故仅正确消费其子参数,避免颜色分量泄漏成后续 SGR 码被误解析。
+                58 => {
+                    if let Some((_color, last)) =
+                        Self::parse_sgr_extended_color(params, colon_flags, i)
+                    {
+                        i = last;
+                    }
+                }
+                59 => {}
                 _ => {}
             }
             i += 1;
@@ -2829,6 +2839,72 @@ impl TerminalState {
         self.cursor_col = 0;
     }
 
+    /// 切入备用屏幕缓冲。`save_cursor` 控制是否保存主屏光标(1049/1048 语义),
+    /// `clear` 控制切入后是否清屏(1047/1049 语义)。已在备用屏则无操作。
+    fn enter_alt_screen(&mut self, save_cursor: bool, clear: bool) {
+        if self.use_alt_buffer {
+            return;
+        }
+        if save_cursor {
+            self.saved_cursor_row = self.cursor_row;
+            self.saved_cursor_col = self.cursor_col;
+        }
+        // 备用屏不显示 scrollback
+        self.scroll_offset = 0;
+        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.alt_cursor_row = self.cursor_row;
+        self.alt_cursor_col = self.cursor_col;
+        std::mem::swap(
+            &mut self.keyboard_enhancement_flags,
+            &mut self.alt_keyboard_enhancement_flags,
+        );
+        std::mem::swap(
+            &mut self.keyboard_enhancement_stack,
+            &mut self.alt_keyboard_enhancement_stack,
+        );
+        self.use_alt_buffer = true;
+        if clear {
+            self.clear_screen();
+        }
+    }
+
+    /// 切回主屏幕缓冲。`restore_cursor` 控制是否恢复进入备用屏前保存的光标(1049 语义)。
+    /// 不在备用屏则无操作。
+    fn exit_alt_screen(&mut self, restore_cursor: bool) {
+        if !self.use_alt_buffer {
+            return;
+        }
+        self.alt_cursor_row = self.cursor_row;
+        self.alt_cursor_col = self.cursor_col;
+        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        if restore_cursor {
+            self.cursor_row = self.saved_cursor_row;
+            self.cursor_col = self.saved_cursor_col;
+        }
+        std::mem::swap(
+            &mut self.keyboard_enhancement_flags,
+            &mut self.alt_keyboard_enhancement_flags,
+        );
+        std::mem::swap(
+            &mut self.keyboard_enhancement_stack,
+            &mut self.alt_keyboard_enhancement_stack,
+        );
+        self.use_alt_buffer = false;
+
+        // 重置 SGR 属性,防止备用屏颜色泄漏到主屏
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
+        self.global_bg = Color::Default;
+        self.current_flags = StyleFlags::default();
+
+        // 交换缓冲后强制整屏重绘(+rows+1 触发 ui.rs 的 grid_version_jumped)
+        self.grid_version += self.grid.rows() as u64 + 1;
+        for row_ver in &mut self.row_versions {
+            *row_ver = self.grid_version;
+        }
+        self.dirty_region.mark_all(self.grid.rows());
+    }
+
     fn set_mode(&mut self, mode: u16) {
         match mode {
             25 => {
@@ -2851,34 +2927,25 @@ impl TerminalState {
                 // SGR mouse reporting format
                 self.modes.insert(mode);
             }
+            47 => {
+                // 备用屏(无保存光标、无清屏)
+                self.enter_alt_screen(false, false);
+                self.modes.insert(47);
+            }
+            1047 => {
+                // 备用屏(切入时清屏)
+                self.enter_alt_screen(false, true);
+                self.modes.insert(1047);
+            }
+            1048 => {
+                // 仅保存光标(等价 DECSC)
+                self.saved_cursor_row = self.cursor_row;
+                self.saved_cursor_col = self.cursor_col;
+            }
             1049 => {
-                // Alternate screen buffer
-                if !self.use_alt_buffer {
-                    // Save main buffer state (cursor position)
-                    self.saved_cursor_row = self.cursor_row;
-                    self.saved_cursor_col = self.cursor_col;
-
-                    // Reset scroll offset so we don't show scrollback in alt buffer
-                    self.scroll_offset = 0;
-
-                    // Switch to alternate buffer
-                    std::mem::swap(&mut self.grid, &mut self.alt_grid);
-                    self.alt_cursor_row = self.cursor_row;
-                    self.alt_cursor_col = self.cursor_col;
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_flags,
-                        &mut self.alt_keyboard_enhancement_flags,
-                    );
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_stack,
-                        &mut self.alt_keyboard_enhancement_stack,
-                    );
-                    self.use_alt_buffer = true;
-
-                    // Clear alt buffer and move cursor to home
-                    self.clear_screen();
-                    self.modes.insert(1049);
-                }
+                // 备用屏:保存光标 + 切入 + 清屏
+                self.enter_alt_screen(true, true);
+                self.modes.insert(1049);
             }
             2026 => {
                 // Synchronized output: suppress rendering until cleared
@@ -2939,42 +3006,25 @@ impl TerminalState {
                 // Disable SGR mouse reporting format
                 self.modes.remove(&mode);
             }
+            47 => {
+                // 退出备用屏(不恢复光标)
+                self.exit_alt_screen(false);
+                self.modes.remove(&47);
+            }
+            1047 => {
+                // 退出备用屏(不恢复光标)
+                self.exit_alt_screen(false);
+                self.modes.remove(&1047);
+            }
+            1048 => {
+                // 仅恢复光标(等价 DECRC)
+                self.cursor_row = self.saved_cursor_row.min(self.grid.rows().saturating_sub(1));
+                self.cursor_col = self.saved_cursor_col.min(self.grid.row_len().saturating_sub(1));
+            }
             1049 => {
-                // Restore main screen buffer
-                if self.use_alt_buffer {
-                    // Save alt buffer state (cursor position)
-                    self.alt_cursor_row = self.cursor_row;
-                    self.alt_cursor_col = self.cursor_col;
-
-                    // Switch back to main buffer
-                    std::mem::swap(&mut self.grid, &mut self.alt_grid);
-                    self.cursor_row = self.saved_cursor_row;
-                    self.cursor_col = self.saved_cursor_col;
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_flags,
-                        &mut self.alt_keyboard_enhancement_flags,
-                    );
-                    std::mem::swap(
-                        &mut self.keyboard_enhancement_stack,
-                        &mut self.alt_keyboard_enhancement_stack,
-                    );
-                    self.use_alt_buffer = false;
-                    self.modes.remove(&1049);
-
-                    // Reset SGR attributes to prevent alternate screen colors from bleeding through
-                    self.current_fg = Color::Default;
-                    self.current_bg = Color::Default;
-                    self.global_bg = Color::Default;
-                    self.current_flags = StyleFlags::default();
-
-                    // Mark all rows dirty after grid swap to force full re-render
-                    // Increment by rows+1 to trigger grid_version_jumped in ui.rs
-                    self.grid_version += self.grid.rows() as u64 + 1;
-                    for row_ver in &mut self.row_versions {
-                        *row_ver = self.grid_version;
-                    }
-                    self.dirty_region.mark_all(self.grid.rows());
-                }
+                // 退出备用屏并恢复进入前保存的光标
+                self.exit_alt_screen(true);
+                self.modes.remove(&1049);
             }
             2026 => {
                 // End synchronized output: force full render
@@ -3149,40 +3199,6 @@ impl TerminalState {
 
     pub fn take_clipboard_read_requests(&mut self) -> Vec<ClipboardReadRequest> {
         std::mem::take(&mut self.pending_clipboard_requests)
-    }
-
-    fn scroll_down(&mut self) {
-        if self.grid.rows() > 0 {
-            crate::debug_log!(
-                "[SCROLL] scroll_down() in buffer (alt={})",
-                self.use_alt_buffer
-            );
-            let bg_color = self.current_bg;
-            let blank_cell = TerminalCell {
-                character: ' ',
-                foreground: Color::Default,
-                background: bg_color,
-                flags: StyleFlags::default(),
-            };
-
-            // Compress first row directly from the grid slice before shifting,
-            // avoiding a per-line Vec allocation from get_row.
-            if !self.use_alt_buffer {
-                let line = ScrollbackLine::compress(&self.grid[0], self.grid.row_wrapped[0]);
-                self.grid.shift_rows_up();
-                self.grid.fill_last_row(blank_cell);
-                self.push_scrollback_compressed(line);
-            } else {
-                self.grid.shift_rows_up();
-                self.grid.fill_last_row(blank_cell);
-            }
-
-            self.dirty_region.mark_all(self.grid.rows());
-            let version = self.grid_version;
-            for v in self.row_versions.iter_mut() {
-                *v = version;
-            }
-        }
     }
 
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
@@ -3659,6 +3675,26 @@ impl TerminalState {
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
 
         let blank_cell = self.create_blank_cell();
+
+        // 缩小高度时,grid.resize 默认保留顶部行、丢弃底部(含光标行与近期输出),
+        // 导致缩小窗口丢失最新输出。改为把顶部溢出行压入 scrollback 并将内容上移,
+        // 尽量保留底部内容并保持光标可见(与 xterm/kitty 一致)。仅处理主屏 ——
+        // 备用屏应用会在 SIGWINCH 后自行重绘,无需保留。
+        if rows < old_rows && !self.use_alt_buffer && !self.grid.is_empty() {
+            let need = old_rows - rows;
+            // 最多从顶部移除到光标所在行,避免把光标行本身推入 scrollback;
+            // 剩余需移除的行位于光标下方,由随后的 grid.resize 截断(通常为空白)。
+            let from_top = need.min(self.cursor_row);
+            if from_top > 0 {
+                for r in 0..from_top {
+                    let line =
+                        ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
+                    self.push_scrollback_compressed(line);
+                }
+                self.grid.scroll_up_by(from_top, blank_cell.clone());
+                self.cursor_row -= from_top;
+            }
+        }
 
         self.grid.resize(rows, cols, blank_cell.clone());
         self.alt_grid.resize(rows, cols, blank_cell.clone());

@@ -1420,7 +1420,7 @@ impl eframe::App for TerminalApp {
                 // 应用支持粘贴事件协议，发送 MIME 类型列表，让应用请求
                 crate::debug_log!("[PASTE] app supports paste events, building paste event");
                 let terminal = Arc::clone(&session.terminal);
-                let pty = session.shell.pty_writer();
+                let write_tx = session.shell.write_sender();
                 let _ = std::thread::Builder::new()
                     .name("paste-event-sender".to_string())
                     .spawn(move || {
@@ -1433,9 +1433,7 @@ impl eframe::App for TerminalApp {
                             "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
                             bytes.len()
                         );
-                        if let Err(_e) = ShellSession::write_to_pty(&pty, &bytes) {
-                            crate::debug_log!("[PASTE] Failed to write paste event: {}", _e);
-                        }
+                        let _ = write_tx.send(bytes);
                     });
                 consumed_keys.insert("PasteEvent".to_string());
             } else {
@@ -1662,7 +1660,7 @@ impl eframe::App for TerminalApp {
 
             if self.clipboard.is_some() && !clipboard_requests.is_empty() {
                 let terminal = Arc::clone(&session.terminal);
-                let pty = session.shell.pty_writer();
+                let write_tx = session.shell.write_sender();
                 let _ = std::thread::Builder::new()
                     .name("clipboard-request-handler".to_string())
                     .spawn(move || {
@@ -1678,9 +1676,7 @@ impl eframe::App for TerminalApp {
                                         .available_mime_types()
                                         .unwrap_or_default();
                                     let response = terminal.lock().build_paste_event(&mime_types);
-                                    if let Err(_e) = ShellSession::write_to_pty(&pty, &response) {
-                                        crate::debug_log!("[OSC5522] Failed to write mime list response: {}", _e);
-                                    }
+                                    let _ = write_tx.send(response);
                                 }
                                 terminal::ClipboardReadKind::MimeData(mime_type) => {
                                     let data = clipboard.read_mime(&mime_type).unwrap_or_default();
@@ -1694,9 +1690,7 @@ impl eframe::App for TerminalApp {
                                         mime_type,
                                         data.len()
                                     );
-                                    if let Err(_e) = ShellSession::write_to_pty(&pty, &response) {
-                                        crate::debug_log!("[OSC5522] Failed to write mime data response: {}", _e);
-                                    }
+                                    let _ = write_tx.send(response);
                                 }
                             }
                         }
@@ -1708,17 +1702,22 @@ impl eframe::App for TerminalApp {
         {
             let mut terminal = session.terminal.lock();
             if let Some(text) = terminal.take_osc52_clipboard_set() {
-                if let Some(clipboard) = &self.clipboard {
-                    if let Err(e) = clipboard.copy(&text) { log::warn!("{}", e); }
+                if self.config.osc52_clipboard_write {
+                    if let Some(clipboard) = &self.clipboard {
+                        if let Err(e) = clipboard.copy(&text) { log::warn!("{}", e); }
+                    }
                 }
             }
             if terminal.take_osc52_clipboard_query() {
-                let content = self
-                    .clipboard
-                    .as_ref()
-                    .and_then(|c| c.paste().ok())
-                    .unwrap_or_default();
-                terminal.respond_osc52_clipboard(&content);
+                // 读取剪贴板会把内容回传给终端内程序,默认禁止,需显式开启。
+                if self.config.osc52_clipboard_read {
+                    let content = self
+                        .clipboard
+                        .as_ref()
+                        .and_then(|c| c.paste().ok())
+                        .unwrap_or_default();
+                    terminal.respond_osc52_clipboard(&content);
+                }
             }
         }
 
@@ -1728,7 +1727,9 @@ impl eframe::App for TerminalApp {
             let notifications: Vec<_> = terminal.pending_notifications.drain(..).collect();
             drop(terminal);
             for (title, body) in notifications {
+                // `--` 终止选项解析,防止以 `-`/`--` 开头的标题或正文被当作 notify-send 选项注入。
                 let _ = std::process::Command::new("notify-send")
+                    .arg("--")
                     .arg(&title)
                     .arg(&body)
                     .spawn();
@@ -2137,7 +2138,7 @@ impl eframe::App for TerminalApp {
             );
             if session_count_before > 1 {
                 // Close the current session if there are multiple sessions
-                self.session_manager.close_session(active_session_idx);
+                self.close_session_synced(active_session_idx);
                 self.schedule_session_save();
                 crate::debug_log!(
                     "[SHELL EXIT] closed session, remaining: {}",

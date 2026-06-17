@@ -1335,6 +1335,10 @@ impl TerminalRenderer {
 
         let any_dirty = dirty_rows.iter().any(|&d| d);
         let ligatures = self.font_ligatures;
+        // 记录是否在脏行打补丁阶段触发了整表重建(宽字符出现/消失导致行实例数变化)。
+        // 一旦发生,后续行的偏移已整体平移,必须全量上传 GPU buffer;否则只传脏行会让
+        // buffer 残留旧布局,渲染错乱。见末尾 use_partial_upload 的计算。
+        let mut did_full_relayout = false;
         if !any_dirty && !self.cached_instances.is_empty() {
             // Nothing changed — reuse cached instances as-is
         } else {
@@ -1468,6 +1472,7 @@ impl TerminalRenderer {
                     self.row_instances_scratch = row_scratch;
 
                     if needs_relayout {
+                        did_full_relayout = true;
                         // Rebuild all from scratch
                         let instances = std::sync::Arc::make_mut(&mut self.cached_instances);
                         let offsets = std::sync::Arc::make_mut(&mut self.row_instance_offsets);
@@ -1548,7 +1553,7 @@ impl TerminalRenderer {
             row_offsets: self.row_instance_offsets.clone(),
             row_counts: self.row_instance_counts.clone(),
             dirty_rows,
-            use_partial_upload: !need_full_rebuild && any_dirty,
+            use_partial_upload: !need_full_rebuild && !did_full_relayout && any_dirty,
         };
 
         let foreground_callback = gpu::callback::GridForegroundCallback {

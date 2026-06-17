@@ -25,35 +25,64 @@ mod unix_clipboard {
         "STRING",
     ];
 
-    /// Execute command with timeout to prevent hanging on slow clipboard operations
+    /// Execute command with timeout to prevent hanging on slow clipboard operations.
+    /// 关键:超时后必须 kill 子进程并 join 读取线程,否则挂死的剪贴板工具
+    /// (如卡住的 wl-paste)会把进程和线程一并泄漏。
     fn command_output_with_timeout(
         program: &str,
         args: &[&str],
         timeout: Duration,
     ) -> Option<Vec<u8>> {
+        use std::io::Read;
         use std::sync::mpsc;
         use std::thread;
+        use std::time::Instant;
 
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        // 在独立线程读 stdout,防止输出超过管道缓冲时死锁
+        let mut stdout = child.stdout.take();
         let (tx, rx) = mpsc::channel();
-        let program = program.to_string();
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-
-        thread::spawn(move || {
-            let result = Command::new(&program)
-                .args(&args)
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if output.status.success() {
-                        Some(output.stdout)
-                    } else {
-                        None
-                    }
-                });
-            let _ = tx.send(result);
+        let reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout.take() {
+                let _ = out.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
         });
 
-        rx.recv_timeout(timeout).ok().flatten()
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let buf = rx.recv().ok();
+                    let _ = reader.join();
+                    return if status.success() { buf } else { None };
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // 超时:杀掉子进程,回收资源,join 读取线程
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = reader.join();
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+            }
+        }
     }
 
     fn command_output(program: &str, args: &[&str]) -> Option<Vec<u8>> {

@@ -178,6 +178,105 @@ impl AbGlyphAtlas {
         self.dirty_rects.clear();
         true
     }
+
+    /// 为 w×h 的字形腾出货架空间。依次尝试:当前货架 → 扩容(无损,保留全部
+    /// 像素)→ 重新打包(回收 LRU 淘汰字形遗留的死空间)。返回是否成功。
+    fn ensure_space(&mut self, w: u32, h: u32) -> bool {
+        if self.allocate_shelf(w, h) {
+            return true;
+        }
+        // 优先扩容:无损且简单。单次翻倍可能仍不够放下超大字形,故循环。
+        while self.grow() {
+            if self.allocate_shelf(w, h) {
+                return true;
+            }
+        }
+        // 已达最大尺寸无法再扩容:重打包回收死空间后做最后一次尝试。
+        // 若重打包后仍放不下,说明存活字形总量真的超过了图集容量(极罕见)。
+        self.compact();
+        self.allocate_shelf(w, h)
+    }
+
+    /// 重新打包所有存活字形(ASCII 永久缓存 + Unicode LRU),回收被 LRU 淘汰
+    /// 字形遗留、却永不归还的货架死空间。仅在 grow 到上限后调用。
+    fn compact(&mut self) {
+        let ascii_entries: Vec<(AtlasGlyphKey, GlyphRegion)> =
+            self.ascii_cache.iter().map(|(k, v)| (*k, *v)).collect();
+        // LruCache::iter 从最近到最旧;反转后按最旧→最新重插,保持 LRU 顺序。
+        let mut unicode_entries: Vec<(AtlasGlyphKey, GlyphRegion)> =
+            self.unicode_cache.iter().map(|(k, v)| (*k, *v)).collect();
+        unicode_entries.reverse();
+
+        let old_width = self.width;
+        let old_height = self.height;
+        let old_bitmap = std::mem::take(&mut self.bitmap);
+
+        // 全新位图与货架布局,清空缓存后逐个重插。
+        self.bitmap = vec![0u8; (old_width * old_height * 4) as usize];
+        self.shelf_x = 0;
+        self.shelf_y = 0;
+        self.shelf_height = 0;
+        self.ascii_cache.clear();
+        self.unicode_cache.clear();
+
+        for (key, region) in ascii_entries.into_iter().chain(unicode_entries) {
+            self.replace_glyph(&old_bitmap, old_width, old_height, key, region);
+        }
+
+        self.needs_full_upload = true;
+        self.dirty_rects.clear();
+    }
+
+    /// 在重打包过程中,将单个存活字形的像素从旧位图复制到新货架,并更新 UV。
+    fn replace_glyph(
+        &mut self,
+        old_bitmap: &[u8],
+        old_width: u32,
+        old_height: u32,
+        key: AtlasGlyphKey,
+        region: GlyphRegion,
+    ) {
+        let glyph_w = region.width_px.round() as u32;
+        let glyph_h = region.height_px.round() as u32;
+        // 不占用货架的字形(空字形 / 无轮廓的 advance 记录,UV 全为 0):原样保留。
+        if glyph_w == 0 || glyph_h == 0 || region.u1 <= region.u0 {
+            self.cache_insert(key, region);
+            return;
+        }
+
+        let src_x = (region.u0 * old_width as f32).round() as u32;
+        let src_y = (region.v0 * old_height as f32).round() as u32;
+
+        let padded_w = glyph_w + GLYPH_PADDING * 2;
+        let padded_h = glyph_h + GLYPH_PADDING * 2;
+        if !self.allocate_shelf(padded_w, padded_h) {
+            // 重打包后仍放不下:丢弃该字形(下次用到会重新光栅化)。
+            self.cache_insert(key, empty_glyph_region());
+            return;
+        }
+
+        let dst_x = self.shelf_x - padded_w + GLYPH_PADDING;
+        let dst_y = self.shelf_y + GLYPH_PADDING;
+
+        for row in 0..glyph_h {
+            let src_start = (((src_y + row) * old_width + src_x) * 4) as usize;
+            let dst_start = (((dst_y + row) * self.width + dst_x) * 4) as usize;
+            let len = (glyph_w * 4) as usize;
+            if src_start + len <= old_bitmap.len() && dst_start + len <= self.bitmap.len() {
+                self.bitmap[dst_start..dst_start + len]
+                    .copy_from_slice(&old_bitmap[src_start..src_start + len]);
+            }
+        }
+
+        let new_region = GlyphRegion {
+            u0: dst_x as f32 / self.width as f32,
+            v0: dst_y as f32 / self.height as f32,
+            u1: (dst_x + glyph_w) as f32 / self.width as f32,
+            v1: (dst_y + glyph_h) as f32 / self.height as f32,
+            ..region
+        };
+        self.cache_insert(key, new_region);
+    }
 }
 
 impl FontBackend for AbGlyphAtlas {
@@ -253,17 +352,10 @@ impl FontBackend for AbGlyphAtlas {
             let padded_w = glyph_w + GLYPH_PADDING * 2;
             let padded_h = glyph_h + GLYPH_PADDING * 2;
 
-            if !self.allocate_shelf(padded_w, padded_h) {
-                if !self.grow() {
-                    let region = empty_glyph_region();
-                    self.cache_insert(key, region);
-                    return region;
-                }
-                if !self.allocate_shelf(padded_w, padded_h) {
-                    let region = empty_glyph_region();
-                    self.cache_insert(key, region);
-                    return region;
-                }
+            if !self.ensure_space(padded_w, padded_h) {
+                let region = empty_glyph_region();
+                self.cache_insert(key, region);
+                return region;
             }
 
             let atlas_x = self.shelf_x - padded_w;
@@ -371,6 +463,8 @@ impl FontBackend for AbGlyphAtlas {
             self.view = view;
             self.sampler = sampler;
             self.needs_full_upload = true;
+            // 纹理/view/sampler 已被替换,旧绑定组引用已失效,必须重建(见 fontdue 同处说明)。
+            self.needs_rebind = true;
         }
 
         // Full upload when atlas was resized or texture recreated
