@@ -88,14 +88,27 @@ impl TerminalApp {
                             terminal_guard.on_resize(pane_cols, pane_rows);
                             let _ = session.shell.resize(pane_cols, pane_rows);
                         }
-                        let visible_cells = terminal_guard.get_visible_cells();
-                        let row_wrapped = terminal_guard.get_visible_row_wrapped();
-                        let links = self
-                            .link_detector
-                            .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
-
-                        // 获取当前窗格的渲染器
+                        // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
+                        // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
+                        let grid_version = terminal_guard.get_grid_version();
+                        let scroll_offset = terminal_guard.scroll_offset;
                         let renderer = &mut self.pane_renderers[pane_idx];
+                        if grid_version != renderer.cached_links_grid_version
+                            || scroll_offset != renderer.cached_links_scroll_offset
+                        {
+                            let visible_cells = terminal_guard.get_visible_cells();
+                            let row_wrapped = terminal_guard.get_visible_row_wrapped();
+                            renderer.cached_links = std::sync::Arc::new(
+                                self.link_detector.detect_links_in_visible_cells_with_wrapping(
+                                    &visible_cells,
+                                    &row_wrapped,
+                                ),
+                            );
+                            renderer.cached_links_grid_version = grid_version;
+                            renderer.cached_links_scroll_offset = scroll_offset;
+                        }
+                        // O(1) clone Arc,规避 &mut renderer 与 &renderer.cached_links 借用冲突。
+                        let links = renderer.cached_links.clone();
 
                         // 在指定矩形内渲染（多窗格模式专用方法）
                         renderer.render_in_rect(

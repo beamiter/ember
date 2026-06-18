@@ -40,6 +40,34 @@ struct GidGlyphKey {
     subpixel_offset: u8,
 }
 
+/// 自包含的整形字体:`face` 借用同结构体内 `_data` Arc 持有的字节。
+/// 把"face 的 'static 生命周期是伪造的、实际借用 _data"这一不安全不变量
+/// 局部化到这里——字段顺序(face 在 _data 之前)是该不变量的一部分,使 face
+/// 先于底层字节析构,避免悬垂引用。除 `new()` 外不应在别处重建这种借用关系。
+struct ShapingFont {
+    face: rustybuzz::Face<'static>,
+    // 必须保留:为 face 提供底层字节存储。声明在 face 之后以保证后析构。
+    #[allow(dead_code)]
+    _data: Arc<Vec<u8>>,
+}
+
+impl ShapingFont {
+    fn new(data: Arc<Vec<u8>>) -> Option<Self> {
+        // SAFETY: 将借用提升为 'static 仅用于与底层 Arc 一同存储在本结构体内。
+        // `_data` 在 ShapingFont 存活期间保持该 Arc 不被释放,Arc<Vec<u8>> 的堆缓冲
+        // 指针稳定(内容绝不改写)。`face` 字段先于 `_data` 声明,析构顺序正确。
+        let face = rustybuzz::Face::from_slice(
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(data.as_slice()) },
+            0,
+        )?;
+        Some(ShapingFont { face, _data: data })
+    }
+
+    fn face(&self) -> &rustybuzz::Face<'static> {
+        &self.face
+    }
+}
+
 pub struct FontdueAtlas {
     font_regular: fontdue::Font,
     font_bold: Option<fontdue::Font>,
@@ -76,19 +104,11 @@ pub struct FontdueAtlas {
     cached_ascent: f32,
     cached_descent: f32,
     cached_advance_width: f32,
-    /// 预解析的 rustybuzz Face,避免每次 shape 缓存未命中都重新解析整份字体
+    /// 预解析的 rustybuzz 整形字体,避免每次 shape 缓存未命中都重新解析整份字体
     /// (from_slice 会解析所有字体表,是大量输出时的主要 CPU 开销)。
-    /// SAFETY: 这两个 Face 借用下方 font_data_* Arc 持有的字节。这些 Arc 在
-    /// atlas 整个生命周期内只在 new() 中赋值一次、绝不重赋值或改动,且堆缓冲指针
-    /// 稳定。Face 字段声明在 font_data_* 之前,因此先于其析构。借用被 transmute
-    /// 为 'static 仅用于存储,绝不对外暴露。
-    shape_face_regular: Option<rustybuzz::Face<'static>>,
-    shape_face_bold: Option<rustybuzz::Face<'static>>,
-    // 必须保留:为上面的 shape_face_* 提供底层字节存储,即使不再被直接读取。
-    #[allow(dead_code)]
-    font_data_regular: Arc<Vec<u8>>,
-    #[allow(dead_code)]
-    font_data_bold: Option<Arc<Vec<u8>>>,
+    /// 底层字节存储与生命周期不变量见 [`ShapingFont`]。
+    shape_regular: Option<ShapingFont>,
+    shape_bold: Option<ShapingFont>,
     shaping_enabled: bool,
     // Subpixel rendering
     subpixel_rendering: bool,
@@ -135,25 +155,13 @@ impl FontdueAtlas {
             .map(|face| face.tables().gsub.is_some())
             .unwrap_or(false);
 
-        // SAFETY: 这些 Face 借用 font_data_regular/font_data_bold 两个 Arc<Vec<u8>>
-        // 持有的字节。它们与对应的 Arc 一同存储在同一个结构体中，且：
-        //   1. font_data_* 在构造后不再被改写（更换字体时整个 atlas 重建）；
-        //   2. shape_face_* 在结构体字段顺序中位于 font_data_* 之前，
-        //      因此 Drop 时先释放 Face，再释放底层 Arc，避免悬垂引用。
-        let shape_face_regular = rustybuzz::Face::from_slice(
-            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(font_data_arc.as_slice()) },
-            0,
-        );
-        let shape_face_bold = font_data_bold_arc.as_ref().and_then(|arc| {
-            rustybuzz::Face::from_slice(
-                unsafe { std::mem::transmute::<&[u8], &'static [u8]>(arc.as_slice()) },
-                0,
-            )
-        });
+        // 整形字体的不安全借用关系封装在 ShapingFont 内(见其定义)。
+        let shape_regular = ShapingFont::new(font_data_arc);
+        let shape_bold = font_data_bold_arc.and_then(ShapingFont::new);
 
         let mut atlas = FontdueAtlas {
-            shape_face_regular,
-            shape_face_bold,
+            shape_regular,
+            shape_bold,
             font_regular,
             font_bold,
             fallback_fonts,
@@ -180,8 +188,6 @@ impl FontdueAtlas {
             cached_ascent,
             cached_descent,
             cached_advance_width,
-            font_data_regular: font_data_arc,
-            font_data_bold: font_data_bold_arc,
             shaping_enabled,
             subpixel_rendering,
         };
@@ -801,12 +807,13 @@ impl FontBackend for FontdueAtlas {
 
         // 使用构造时预解析好的 Face，避免每次缓存未命中都重新解析整个字体。
         let face = if bold {
-            self.shape_face_bold
+            self.shape_bold
                 .as_ref()
-                .or(self.shape_face_regular.as_ref())
+                .or(self.shape_regular.as_ref())
         } else {
-            self.shape_face_regular.as_ref()
-        };
+            self.shape_regular.as_ref()
+        }
+        .map(ShapingFont::face);
 
         // 收集本次整形得到的字形信息为自有数据，随后即可释放对 Face（&self）的借用，
         // 以便调用需要 &mut self 的 rasterize_gid。

@@ -144,7 +144,7 @@ impl LinkDetector {
         // 检测文件路径
         if self.config.detect_file_paths {
             for caps in self.file_path_regex.captures_iter(line) {
-                let m = caps.get(1).unwrap();
+                let Some(m) = caps.get(1) else { continue };
                 let start_b = m.start();
                 // 剥离尾部标点(句末句号、逗号、右括号等不属于路径的一部分)
                 let trimmed = m.as_str().trim_end_matches(|c: char| {

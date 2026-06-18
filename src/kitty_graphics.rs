@@ -271,6 +271,15 @@ impl KittyGraphicsState {
             let data_size = final_data.len() as u64;
             self.total_decoded += 1;
             self.total_bytes_processed += data_size;
+
+            // 若同一 image_id 已存在，先移除旧条目，避免内存计数泄漏与 LRU 顺序错乱
+            if let Some(old) = self.images.remove(&image_id) {
+                self.total_image_memory = self
+                    .total_image_memory
+                    .saturating_sub(old.data.len() as u64);
+                self.access_order.retain(|&id| id != image_id);
+            }
+
             self.total_image_memory += data_size;
             self.access_order.push_back(image_id);
 

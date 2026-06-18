@@ -1,0 +1,1374 @@
+use super::*;
+
+impl super::TerminalState {
+    pub fn process_input(&mut self, input: &[u8]) {
+        // Fast path: if no pending escape, process input directly without allocation
+        let data;
+        let data_slice: &[u8] = if self.pending_escape.is_empty() {
+            input
+        } else {
+            // Slow path: merge pending escape with new input
+            let mut combined = std::mem::take(&mut self.pending_escape);
+            combined.extend_from_slice(input);
+            data = combined;
+            &data
+        };
+
+        let mut i = 0;
+
+        while i < data_slice.len() {
+            let byte = data_slice[i];
+
+            // 存在未完成的多字节 UTF-8 序列,而当前字节不是续接字节(10xxxxxx):
+            // 说明前一个序列残缺,按 Unicode 建议输出替换字符 U+FFFD 并复位,
+            // 然后正常处理当前字节,避免残缺序列被静默吞掉或污染后续解析。
+            if self.utf8_len > 0 && (byte & 0xC0) != 0x80 {
+                self.put_char('\u{FFFD}');
+                self.utf8_len = 0;
+            }
+
+            match byte {
+                b'\x08' => {
+                    // Backspace (0x08) - move cursor left.
+                    // Shell handles actual deletion and sends back updated display.
+                    self.pending_wrap = false;
+                    if self.cursor_col > 0 {
+                        self.cursor_col -= 1;
+                    }
+                    i += 1;
+                }
+                b'\x7f' => {
+                    // DEL (0x7f) 在输出流中按 ECMA-48 应被忽略,不能当作退格移动光标。
+                    i += 1;
+                }
+                b'\n' => {
+                    // Linefeed - move cursor down or scroll
+                    self.pending_wrap = false;
+                    if self.cursor_row == self.scroll_region_bottom {
+                        // 恰在滚动区底边距:向上滚动区域,光标保持在底行
+                        self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
+                    } else if self.cursor_row + 1 < self.grid.rows() {
+                        // 区内或区外(底边距下方)正常下移,不滚动
+                        self.cursor_row += 1;
+                    }
+                    i += 1;
+                }
+                b'\r' => {
+                    self.pending_wrap = false;
+                    self.cursor_col = 0;
+                    i += 1;
+                }
+                b'\x0e' => {
+                    self.active_charset = self.g1_charset;
+                    i += 1;
+                }
+                b'\x0f' => {
+                    self.active_charset = self.g0_charset;
+                    i += 1;
+                }
+                b'\x07' => {
+                    // Bell - ignore
+                    i += 1;
+                }
+                b'\t' => {
+                    // Tab - 前进到下一个制表位(支持自定义 HTS/TBC 制表位)
+                    self.pending_wrap = false;
+                    self.cursor_col = self.next_tab_stop(self.cursor_col);
+                    i += 1;
+                }
+                b'\x1b' => {
+                    let esc_start = i;
+
+                    if i + 1 >= data_slice.len() {
+                        self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                        break;
+                    }
+
+                    match data_slice[i + 1] {
+                        b'7' => {
+                            // DECSC - 保存光标(含 SGR/字符集/模式)
+                            self.save_cursor_state();
+                            i += 2;
+                        }
+                        b'8' => {
+                            // DECRC - 恢复光标(含 SGR/字符集/模式)
+                            self.restore_cursor_state();
+                            i += 2;
+                        }
+                        b'H' => {
+                            // HTS - 在当前光标列设置制表位
+                            if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                                *stop = true;
+                            }
+                            i += 2;
+                        }
+                        b']' => {
+                            i += 2;
+
+                            let payload_start = i;
+
+                            let mut terminated = false;
+                            while i < data_slice.len() {
+                                if data_slice[i] == 0x07 {
+                                    i += 1;
+                                    terminated = true;
+                                    break;
+                                } else if i + 1 < data_slice.len()
+                                    && data_slice[i] == 0x1b
+                                    && data_slice[i + 1] == 0x5c
+                                {
+                                    i += 2;
+                                    terminated = true;
+                                    break;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+
+                            if !terminated {
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                break;
+                            }
+
+                            let payload_end = if data_slice[i - 1] == 0x07 { i - 1 } else { i - 2 };
+                            if payload_end >= payload_start {
+                                if let Ok(payload) =
+                                    std::str::from_utf8(&data_slice[payload_start..payload_end])
+                                {
+                                    if let Some((command, value)) = payload.split_once(';') {
+                                        if command == "0" || command == "2" {
+                                            self.window_title.clear();
+                                            self.window_title.push_str(value);
+                                        } else if command == "8" {
+                                            // OSC 8 - Hyperlinks
+                                            // Format: ESC ] 8 ; params ; URI ST
+                                            // params can include id=<identifier>
+                                            // Empty URI = close hyperlink
+                                            if let Some((params, uri)) = value.split_once(';') {
+                                                if uri.is_empty() {
+                                                    // Close hyperlink
+                                                    self.current_hyperlink = None;
+                                                } else {
+                                                    // Open hyperlink
+                                                    let id = params
+                                                        .split(':')
+                                                        .find_map(|p| p.strip_prefix("id="))
+                                                        .map(|s| s.to_string());
+                                                    self.current_hyperlink = Some((uri.to_string(), id));
+                                                }
+                                            } else if value.is_empty() {
+                                                // OSC 8 ; ; (close hyperlink)
+                                                self.current_hyperlink = None;
+                                            }
+                                        } else if command == "10" || command == "11" || command == "12" {
+                                            self.handle_osc_color(command, value);
+                                        } else if command == "9" {
+                                            // Desktop notification (iTerm2/ConEmu)
+                                            if self.pending_notifications.len() < 8 {
+                                                let title = "jterm2".to_string();
+                                                let body = value.chars().take(256).collect();
+                                                self.pending_notifications.push((title, body));
+                                            }
+                                        } else if command == "777" {
+                                            // rxvt notification: 777;notify;title;body
+                                            let parts: Vec<&str> = value.splitn(3, ';').collect();
+                                            if parts.len() >= 2 && parts[0] == "notify" {
+                                                let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
+                                                let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                                                if self.pending_notifications.len() < 8 {
+                                                    self.pending_notifications.push((title, body));
+                                                }
+                                            }
+                                        } else if command == "52" {
+                                            self.handle_osc_52(value);
+                                        } else if command == "5522" {
+                                            let (metadata, osc_payload) =
+                                                if let Some((metadata, osc_payload)) =
+                                                    value.split_once(';')
+                                                {
+                                                    (metadata, Some(osc_payload))
+                                                } else {
+                                                    (value, None)
+                                                };
+                                            self.handle_osc_5522(metadata, osc_payload);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        b'P' | b'X' | b'^' | b'_' => {
+                            i += 2;
+
+                            let mut terminated = false;
+                            let dcs_start = i;
+                            while i < data_slice.len() {
+                                if i + 1 < data_slice.len() && data_slice[i] == 0x1b && data_slice[i + 1] == 0x5c {
+                                    // Extract DCS payload
+                                    let payload = &data_slice[dcs_start..i];
+
+                                    // Check if this is a Kitty graphics protocol DCS
+                                    if let Ok(payload_str) = std::str::from_utf8(payload) {
+                                        // Kitty graphics protocol starts with @ or other specific markers
+                                        if payload_str.starts_with('@')
+                                            || payload_str.contains("a=")
+                                            || payload_str.starts_with("kitty")
+                                        {
+                                            if let Err(_e) = self
+                                                .kitty_graphics
+                                                .parse_graphics_payload(payload_str)
+                                            {
+                                                crate::debug_log!(
+                                                    "[DCS] Kitty graphics error: {}",
+                                                    _e
+                                                );
+                                            }
+                                            let kitty_responses =
+                                                self.kitty_graphics.take_responses();
+                                            if !kitty_responses.is_empty() {
+                                                self.output_buffer
+                                                    .extend_from_slice(&kitty_responses);
+                                            }
+                                        }
+                                    }
+
+                                    i += 2;
+                                    terminated = true;
+                                    break;
+                                }
+                                i += 1;
+                            }
+
+                            if !terminated {
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                break;
+                            }
+                        }
+                        b'>' => {
+                            // ESC > - DECKPNM (Keypad Numeric Mode) or other private sequence
+                            // Just skip it and any following bytes that are part of it
+                            i += 2;
+                        }
+                        b'<' => {
+                            // ESC < - DECKPM (Keypad Application Mode) or other private sequence
+                            // Just skip it
+                            i += 2;
+                        }
+                        b'=' => {
+                            // ESC = - DECKPAM (Keypad Application Mode)
+                            // Just skip it
+                            i += 2;
+                        }
+                        b'(' | b')' => {
+                            if i + 2 >= data_slice.len() {
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                break;
+                            }
+
+                            // Character set selection: ESC ( X or ESC ) X
+                            // data_slice[i] = ESC, data_slice[i+1] = '(' or ')', data_slice[i+2] = designator
+                            let is_g0 = data_slice[i + 1] == b'(';
+                            let designator = data_slice[i + 2];
+                            let charset = Self::charset_from_designator(designator);
+
+                            crate::debug_log!(
+                                "[CHARSET] ESC {} designator={} (0x{:02x}) charset={:?}",
+                                if is_g0 { '(' } else { ')' },
+                                designator as char,
+                                designator,
+                                charset
+                            );
+
+                            if is_g0 {
+                                self.g0_charset = charset;
+                                self.active_charset = self.g0_charset;
+                            } else {
+                                self.g1_charset = charset;
+                            }
+
+                            i += 3;
+                        }
+                        b'M' => {
+                            // RI - Reverse Index:仅在恰好位于上边距时反向滚动,
+                            // 否则正常上移(在区域上方时不应滚动)。
+                            i += 2;
+
+                            if self.cursor_row == self.scroll_region_top {
+                                if self.scroll_region_bottom < self.grid.rows()
+                                    && self.scroll_region_top <= self.scroll_region_bottom
+                                {
+                                    self.scroll_region_down(
+                                        self.scroll_region_top,
+                                        self.scroll_region_bottom,
+                                    );
+                                }
+                            } else {
+                                self.cursor_row = self.cursor_row.saturating_sub(1);
+                            }
+                        }
+                        b'D' => {
+                            // IND - Index:仅在恰好位于底边距时向上滚动,
+                            // 否则正常下移(在区域下方时不应滚动)。
+                            i += 2;
+
+                            if self.cursor_row == self.scroll_region_bottom {
+                                self.scroll_region_up(
+                                    self.scroll_region_top,
+                                    self.scroll_region_bottom,
+                                );
+                            } else if self.cursor_row + 1 < self.grid.rows() {
+                                self.cursor_row += 1;
+                            }
+                        }
+                        b'[' => {
+                            i += 2;
+
+                            // Use stack arrays for CSI params. 256 字节足以容纳组合真彩色
+                            // SGR(如 0;1;38;2;...;48;2;... 仅 ~40 字节),避免截断丢色。
+                            let mut param_bytes = [0u8; 256];
+                            let mut param_len = 0;
+                            let mut intermediates = [0u8; 8];
+                            let mut inter_len = 0;
+                            let mut final_byte = None;
+
+                            while i < data_slice.len() {
+                                match data_slice[i] {
+                                    0x30..=0x3f => {
+                                        if param_len < param_bytes.len() {
+                                            param_bytes[param_len] = data_slice[i];
+                                            param_len += 1;
+                                        }
+                                    }
+                                    0x20..=0x2f => {
+                                        if inter_len < intermediates.len() {
+                                            intermediates[inter_len] = data_slice[i];
+                                            inter_len += 1;
+                                        }
+                                    }
+                                    0x40..=0x7e => {
+                                        final_byte = Some(data_slice[i]);
+                                        break;
+                                    }
+                                    _ => break,
+                                }
+                                i += 1;
+                            }
+
+                            let Some(final_byte) = final_byte else {
+                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                break;
+                            };
+
+                            let private_prefix = match param_bytes.first().copied() {
+                                Some(prefix @ (b'<' | b'=' | b'>' | b'?')) => {
+                                    // Shift remaining params left
+                                    for j in 0..param_len - 1 {
+                                        param_bytes[j] = param_bytes[j + 1];
+                                    }
+                                    param_len -= 1;
+                                    Some(prefix)
+                                }
+                                _ => None,
+                            };
+                            let (params, colon_flags) =
+                                Self::parse_csi_params(&param_bytes[..param_len]);
+                            let cmd = final_byte as char;
+
+                            self.handle_escape_sequence(
+                                &params,
+                                &colon_flags,
+                                cmd,
+                                private_prefix,
+                                &intermediates[..inter_len],
+                            );
+                            i += 1;
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+                32..=126 => {
+                    // ASCII fast path: scan for run of printable ASCII and process in bulk
+                    if self.utf8_len == 0 && self.active_charset == Charset::Ascii {
+                        let run_start = i;
+                        i += 1;
+                        while i < data_slice.len() {
+                            let b = data_slice[i];
+                            if b < 32 || b > 126 {
+                                break;
+                            }
+                            i += 1;
+                        }
+                        self.put_ascii_run(&data_slice[run_start..i]);
+                    } else {
+                        self.put_char(byte as char);
+                        i += 1;
+                    }
+                }
+                // UTF-8 multi-byte sequences: try to consume all bytes eagerly
+                0xC2..=0xDF => {
+                    self.consume_utf8_lead(byte, 2, data_slice, &mut i);
+                }
+                0xE0..=0xEF => {
+                    self.consume_utf8_lead(byte, 3, data_slice, &mut i);
+                }
+                0xF0..=0xF4 => {
+                    self.consume_utf8_lead(byte, 4, data_slice, &mut i);
+                }
+                _ => {
+                    // 到这里 byte 要么是续接字节(由上方的残缺检测保证此时确有进行中的序列),
+                    // 要么是非法的 UTF-8 引导字节(0xC0/0xC1/0xF5..=0xFF)。
+                    if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
+                        self.utf8_buf[self.utf8_len as usize] = byte;
+                        self.utf8_len += 1;
+                        if self.utf8_len == self.utf8_expected {
+                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
+                                Ok(s) => {
+                                    if let Some(ch) = s.chars().next() {
+                                        self.put_char(ch);
+                                    }
+                                }
+                                // 长度够但内容非法(如过长编码/代理区):输出替换字符。
+                                Err(_) => self.put_char('\u{FFFD}'),
+                            }
+                            self.utf8_len = 0;
+                        }
+                    } else {
+                        // 孤立的续接字节或非法引导字节。
+                        self.put_char('\u{FFFD}');
+                        self.utf8_len = 0;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    pub(super) fn handle_escape_sequence(
+        &mut self,
+        params: &[u16],
+        colon_flags: &[bool],
+        cmd: char,
+        private_prefix: Option<u8>,
+        intermediates: &[u8],
+    ) {
+        // 显式光标定位会取消延迟换行标志(DEC 末列标志)。
+        if matches!(cmd, 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`') {
+            self.pending_wrap = false;
+        }
+        match cmd {
+            'A' => {
+                // CUU - Cursor Up:仅移动光标,绝不滚动。
+                // 区内止于上边距,区外(上边距上方)止于屏幕顶部。
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let floor = if self.cursor_row >= self.scroll_region_top {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
+            }
+            'B' => {
+                // CUD - Cursor Down:区内止于底边距,区外止于屏幕底部;不滚动。
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let ceil = if self.cursor_row <= self.scroll_region_bottom {
+                    self.scroll_region_bottom
+                } else {
+                    self.grid.rows().saturating_sub(1)
+                };
+                self.cursor_row = (self.cursor_row + n).min(ceil);
+            }
+            'C' => {
+                let n = params.first().copied().unwrap_or(1) as usize;
+                self.cursor_col = (self.cursor_col + n).min(self.grid.row_len() - 1);
+            }
+            'D' => {
+                let n = params.first().copied().unwrap_or(1) as usize;
+                self.cursor_col = self.cursor_col.saturating_sub(n);
+            }
+            'E' => {
+                // CNL - Cursor Next Line:下移并到行首,受底边距约束;不滚动。
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let ceil = if self.cursor_row <= self.scroll_region_bottom {
+                    self.scroll_region_bottom
+                } else {
+                    self.grid.rows().saturating_sub(1)
+                };
+                self.cursor_row = (self.cursor_row + n).min(ceil);
+                self.cursor_col = 0;
+            }
+            'F' => {
+                // CPL - Cursor Previous Line:上移并到行首,受上边距约束;不滚动。
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let floor = if self.cursor_row >= self.scroll_region_top {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
+                self.cursor_col = 0;
+            }
+            'G' => {
+                // CHA - Move cursor to column (1-based)
+                let col = params.first().copied().unwrap_or(1) as usize;
+                self.cursor_col = col.saturating_sub(1).min(self.grid.row_len() - 1);
+            }
+            '`' => {
+                // HPA - Horizontal Position Absolute(列绝对,等价 CHA)
+                let col = params.first().copied().unwrap_or(1) as usize;
+                self.cursor_col = col
+                    .saturating_sub(1)
+                    .min(self.grid.row_len().saturating_sub(1));
+            }
+            'd' => {
+                // VPA - Vertical Position Absolute(行绝对,1 基)。
+                // 原点模式下相对滚动区域顶端并限制在区域内。
+                let row = params.first().copied().unwrap_or(1) as usize;
+                let row0 = row.saturating_sub(1);
+                self.cursor_row = if self.origin_mode {
+                    (self.scroll_region_top + row0).min(self.scroll_region_bottom)
+                } else {
+                    row0.min(self.grid.rows().saturating_sub(1))
+                };
+            }
+            'H' => {
+                let row = params.first().copied().unwrap_or(1) as usize;
+                let col = params.get(1).copied().unwrap_or(1) as usize;
+                self.set_cursor_position(row, col);
+            }
+            'f' => {
+                if private_prefix == Some(b'>') && intermediates.is_empty() {
+                    let resource = params.first().copied().unwrap_or(0);
+                    let value = params.get(1).copied().unwrap_or(0);
+                    if resource == 4 {
+                        crate::debug_log!(
+                            "[XTFMTKEYS] formatOtherKeys={} previous={}",
+                            value,
+                            self.xterm_format_other_keys
+                        );
+                        self.xterm_format_other_keys = value;
+                    }
+                } else {
+                    let row = params.first().copied().unwrap_or(1) as usize;
+                    let col = params.get(1).copied().unwrap_or(1) as usize;
+                    self.set_cursor_position(row, col);
+                }
+            }
+            'J' => {
+                match params.first().copied().unwrap_or(0) {
+                    0 => {
+                        // Clear from cursor to end of display
+                        for col in self.cursor_col..self.grid.row_len() {
+                            self.clear_cell(self.cursor_row, col);
+                        }
+                        for row in (self.cursor_row + 1)..self.grid.rows() {
+                            for col in 0..self.grid.row_len() {
+                                self.clear_cell(row, col);
+                            }
+                        }
+                        // Mark affected rows as dirty
+                        self.dirty_region
+                            .mark_rows(self.cursor_row, self.grid.rows().saturating_sub(1));
+                        self.mark_rows_dirty(self.cursor_row, self.grid.rows().saturating_sub(1));
+                    }
+                    1 => {
+                        // Clear from start to cursor
+                        for row in 0..=self.cursor_row {
+                            let end_col = if row == self.cursor_row {
+                                self.cursor_col + 1
+                            } else {
+                                self.grid.row_len()
+                            };
+                            for col in 0..end_col {
+                                self.clear_cell(row, col);
+                            }
+                        }
+                        // Mark affected rows as dirty
+                        self.dirty_region.mark_rows(0, self.cursor_row);
+                        self.mark_rows_dirty(0, self.cursor_row);
+                    }
+                    2 => {
+                        // ED 擦除显示不移动光标(VT 规范)
+                        self.erase_screen();
+                    }
+                    3 => {
+                        // Clear scrollback buffer (xterm extension)
+                        self.scrollback.clear();
+                        self.scroll_offset = 0;
+                    }
+                    _ => {}
+                }
+            }
+            'K' => {
+                // Clear line
+                match params.first().copied().unwrap_or(0) {
+                    0 => {
+                        // Clear from cursor to end of line
+                        for col in self.cursor_col..self.grid.row_len() {
+                            self.clear_cell(self.cursor_row, col);
+                        }
+                        // Mark the line as dirty
+                        self.dirty_region.mark_row(self.cursor_row);
+                        self.mark_row_dirty(self.cursor_row);
+                    }
+                    1 => {
+                        // Clear from start of line to cursor
+                        for col in 0..=self.cursor_col {
+                            self.clear_cell(self.cursor_row, col);
+                        }
+                        // Mark the line as dirty
+                        self.dirty_region.mark_row(self.cursor_row);
+                        self.mark_row_dirty(self.cursor_row);
+                    }
+                    2 => {
+                        // Clear entire line
+                        for col in 0..self.grid.row_len() {
+                            self.clear_cell(self.cursor_row, col);
+                        }
+                        // Mark the line as dirty
+                        self.dirty_region.mark_row(self.cursor_row);
+                        self.mark_row_dirty(self.cursor_row);
+                    }
+                    _ => {}
+                }
+            }
+            'L' => {
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let blank = self.create_blank_cell();
+                for _ in 0..n {
+                    if self.cursor_row >= self.scroll_region_top
+                        && self.cursor_row <= self.scroll_region_bottom
+                    {
+                        let cols = self.grid.row_len();
+                        let src_start = self.cursor_row * cols;
+                        let src_end = self.scroll_region_bottom * cols;
+                        let dst = (self.cursor_row + 1) * cols;
+                        self.grid.cells.copy_within(src_start..src_end, dst);
+                        self.grid.cells[src_start..src_start + cols].fill(blank);
+                    }
+                }
+                self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
+            }
+            'M' => {
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let blank = self.create_blank_cell();
+                for _ in 0..n {
+                    if self.cursor_row >= self.scroll_region_top
+                        && self.cursor_row <= self.scroll_region_bottom
+                    {
+                        let cols = self.grid.row_len();
+                        let src_start = (self.cursor_row + 1) * cols;
+                        let src_end = (self.scroll_region_bottom + 1) * cols;
+                        let dst = self.cursor_row * cols;
+                        self.grid.cells.copy_within(src_start..src_end, dst);
+                        let blank_start = self.scroll_region_bottom * cols;
+                        self.grid.cells[blank_start..blank_start + cols].fill(blank);
+                    }
+                }
+                self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
+            }
+            'm' => {
+                if private_prefix == Some(b'>') && intermediates.is_empty() {
+                    let resource = params.first().copied().unwrap_or(0);
+                    let value = params.get(1).copied().unwrap_or(0);
+                    if resource == 4 {
+                        crate::debug_log!(
+                            "[XTMODKEYS] modifyOtherKeys={} previous={}",
+                            value,
+                            self.xterm_modify_other_keys
+                        );
+                        self.xterm_modify_other_keys = value;
+                    }
+                } else {
+                    // SGR - Select Graphic Rendition
+                    self.handle_sgr(params, colon_flags);
+                }
+            }
+            's' => {
+                if private_prefix.is_none() && intermediates.is_empty() {
+                    self.save_cursor_state();
+                }
+            }
+            'u' => {
+                if intermediates.is_empty() {
+                    match private_prefix {
+                        None => {
+                            self.restore_cursor_state();
+                        }
+                        Some(b'?') => {
+                            crate::debug_log!(
+                                "[KEYBOARD_PROTO] query current kitty flags -> {}",
+                                self.keyboard_enhancement_flags
+                            );
+                            let response = format!("\x1b[?{}u", self.keyboard_enhancement_flags);
+                            self.output_buffer.extend_from_slice(response.as_bytes());
+                        }
+                        Some(b'=') => {
+                            let flags = params.first().copied().unwrap_or(0);
+                            let mode = params.get(1).copied().unwrap_or(1);
+                            crate::debug_log!(
+                                "[KEYBOARD_PROTO] set kitty flags flags={} mode={} previous={}",
+                                flags,
+                                mode,
+                                self.keyboard_enhancement_flags
+                            );
+                            self.set_keyboard_enhancement_flags(flags, mode);
+                            crate::debug_log!(
+                                "[KEYBOARD_PROTO] new kitty flags={}",
+                                self.keyboard_enhancement_flags
+                            );
+                        }
+                        Some(b'>') => {
+                            let flags = params.first().copied().unwrap_or(0);
+                            crate::debug_log!(
+                                "[KEYBOARD_PROTO] push kitty flags current={} new={}",
+                                self.keyboard_enhancement_flags,
+                                flags
+                            );
+                            self.push_keyboard_enhancement_flags(flags);
+                        }
+                        Some(b'<') => {
+                            let count = params.first().copied().unwrap_or(1) as usize;
+                            crate::debug_log!(
+                                "[KEYBOARD_PROTO] pop kitty flags count={} current={} stack_depth={}",
+                                count,
+                                self.keyboard_enhancement_flags,
+                                self.keyboard_enhancement_stack.len()
+                            );
+                            self.pop_keyboard_enhancement_flags(count);
+                            crate::debug_log!(
+                                "[KEYBOARD_PROTO] new kitty flags={}",
+                                self.keyboard_enhancement_flags
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            'S' => {
+                // Scroll up (Scroll Up, SU) - content moves up, new lines appear at bottom
+                let n = params.first().copied().unwrap_or(1) as usize;
+                // Scroll within the scroll region by moving lines
+                for _ in 0..n {
+                    self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
+                }
+            }
+            'T' => {
+                // Scroll down (Scroll Down, SD) - content moves down, new lines appear at top
+                let n = params.first().copied().unwrap_or(1) as usize;
+                for _ in 0..n {
+                    self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
+                }
+            }
+            'n' => {
+                // DSR - Device Status Report
+                // ESC[6n requests cursor position
+                if params.first().copied().unwrap_or(0) == 6 {
+                    // Respond with CPR (Cursor Position Report): ESC[row;colR
+                    // Row and Col are 1-indexed
+                    let row = (self.cursor_row + 1) as u16;
+                    let col = (self.cursor_col + 1) as u16;
+
+                    // Send cursor position response back to PTY
+                    let response = format!("\x1b[{};{}R", row, col);
+                    self.output_buffer.extend(response.as_bytes());
+                }
+            }
+            'c' => {
+                if intermediates.is_empty() {
+                    match private_prefix {
+                        None => {
+                            crate::debug_log!("[DA] primary device attributes request");
+                            self.output_buffer
+                                .extend_from_slice(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
+                        }
+                        Some(b'>') => {
+                            crate::debug_log!("[DA] secondary device attributes request");
+                            self.output_buffer
+                                .extend_from_slice(SECONDARY_DEVICE_ATTRIBUTES_RESPONSE);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            'p' => {
+                if private_prefix == Some(b'?') && intermediates == [b'$']
+                    && params.first().copied() == Some(5522) {
+                        let state = if self.modes.contains(&5522) { 1 } else { 2 };
+                        let response = format!("\x1b[?5522;{}$y", state);
+                        crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
+                        self.output_buffer.extend_from_slice(response.as_bytes());
+                    }
+            }
+            'h' => {
+                // 区分 DEC 私有模式(CSI ? Pn h)与 ANSI 模式(CSI Pn h)。
+                // 否则 CSI 7h 会被误当作 DECAWM(?7),CSI 4h(IRM)也会落空。
+                match private_prefix {
+                    Some(b'?') => {
+                        for &mode in params {
+                            self.set_mode(mode);
+                        }
+                    }
+                    None => {
+                        for &mode in params {
+                            self.set_ansi_mode(mode);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            'l' => {
+                match private_prefix {
+                    Some(b'?') => {
+                        for &mode in params {
+                            self.reset_mode(mode);
+                        }
+                    }
+                    None => {
+                        for &mode in params {
+                            self.reset_ansi_mode(mode);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            'r' if private_prefix.is_none() => {
+                // Set scroll region (DECSTBM)。带私有前缀(如 CSI ? Pm r 的 XTRESTORE)
+                // 不是 DECSTBM,不能误设滚动区域,故仅在无前缀时处理。
+                let top = params.first().copied().unwrap_or(1) as usize;
+                let bottom = params.get(1).copied().unwrap_or(self.grid.rows() as u16) as usize;
+
+                // Convert from 1-indexed to 0-indexed, and clamp to valid range
+                self.scroll_region_top = top
+                    .saturating_sub(1)
+                    .min(self.grid.rows().saturating_sub(1));
+                self.scroll_region_bottom = bottom
+                    .saturating_sub(1)
+                    .min(self.grid.rows().saturating_sub(1));
+
+                // If range is invalid, reset to full screen
+                if self.scroll_region_top > self.scroll_region_bottom {
+                    self.scroll_region_top = 0;
+                    self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+                }
+
+                // Move cursor to home position when setting scroll region. In
+                // origin mode (DECOM) home is the top of the scroll region, not
+                // the absolute top of the screen.
+                self.cursor_row = if self.origin_mode {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
+                self.cursor_col = 0;
+                self.pending_wrap = false;
+            }
+            '@' => {
+                // ICH - Insert Character(s)
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let cols = self.grid.row_len();
+                let blank_cell = self.create_blank_cell();
+                if self.cursor_col < cols {
+                    // Insert n blank cells at cursor position, shifting content right
+                    // insert_cell_in_row shifts cells right and discards the last cell
+                    for _ in 0..n {
+                        if self.cursor_col < cols {
+                            self.grid.insert_cell_in_row(
+                                self.cursor_row,
+                                self.cursor_col,
+                                blank_cell.clone(),
+                            );
+                        }
+                    }
+                    // Mark row as dirty after modification
+                    self.mark_row_dirty(self.cursor_row);
+                }
+            }
+            'P' => {
+                // DCH - Delete Character(s)
+                let n = params.first().copied().unwrap_or(1) as usize;
+                let blank_cell = self.create_blank_cell();
+                for _ in 0..n {
+                    if self.cursor_col < self.grid.row_len() {
+                        self.grid
+                            .remove_cell_from_row(self.cursor_row, self.cursor_col);
+                        // Fill the last cell with proper blank (remove_cell_from_row uses default)
+                        let last_col = self.grid.row_len() - 1;
+                        *self.grid.get_mut(self.cursor_row, last_col) = blank_cell.clone();
+                    }
+                }
+                // Mark row as dirty after modification
+                self.mark_row_dirty(self.cursor_row);
+            }
+            'X' => {
+                // ECH - Erase Character(s)
+                let n = params.first().copied().unwrap_or(1) as usize;
+                for i in 0..n {
+                    let col = self.cursor_col + i;
+                    if col < self.grid.row_len() {
+                        self.clear_cell(self.cursor_row, col);
+                    } else {
+                        break;
+                    }
+                }
+                // Mark row as dirty after modification
+                self.mark_row_dirty(self.cursor_row);
+            }
+            'q' => {
+                if private_prefix == Some(b'>') && intermediates.is_empty()
+                    && params.first().copied().unwrap_or(0) == 0 {
+                        crate::debug_log!("[XTVERSION] report terminal version request");
+                        self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
+                    }
+
+                // DECSCUSR - Set cursor style
+                if private_prefix.is_none() && intermediates == [b' '] {
+                    let shape = params.first().copied().unwrap_or(0) as u8;
+                    self.cursor_shape = match shape {
+                        0 | 1 => CursorShape::Block,
+                        2 => CursorShape::Underline,
+                        3 => CursorShape::Beam,
+                        _ => CursorShape::Block,
+                    };
+                }
+            }
+            'g' => {
+                // TBC - Tab Clear
+                match params.first().copied().unwrap_or(0) {
+                    0 => {
+                        // Clear tab stop at cursor
+                        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                            *stop = false;
+                        }
+                    }
+                    3 => {
+                        // Clear all tab stops
+                        for stop in self.tab_stops.iter_mut() {
+                            *stop = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 解析从下标 `i`(38/48/58)开始的扩展颜色子序列,返回 `(颜色, 最后消费的下标)`。
+    /// 同时支持分号传统形式(`38;2;r;g;b`)与冒号 ITU 形式(`38:2:r:g:b` 或
+    /// 带颜色空间字段的 `38:2:cs:r:g:b`)。冒号形式靠 colon_flags 识别,并据子参数
+    /// 个数决定是否跳过颜色空间字段,避免把 cs 当成 r 而整体错位。
+    pub(super) fn parse_sgr_extended_color(
+        params: &[u16],
+        colon_flags: &[bool],
+        i: usize,
+    ) -> Option<(Color, usize)> {
+        match params.get(i + 1).copied()? {
+            5 => {
+                let idx = params.get(i + 2).copied()? as u8;
+                Some((Color::Indexed(idx), i + 2))
+            }
+            2 => {
+                // 计算从 i 起的冒号连续子参数组长度(组内各参数 colon_flag 为 true)。
+                let mut end = i + 1;
+                while end < params.len() && colon_flags.get(end).copied().unwrap_or(false) {
+                    end += 1;
+                }
+                let colon_form = colon_flags.get(i + 1).copied().unwrap_or(false);
+                // 冒号形式且组长 >=6 表示存在颜色空间字段(38,2,cs,r,g,b),r 偏移为 3;
+                // 否则(传统分号形式或无 cs 的冒号形式)r 偏移为 2。
+                let r_off = if colon_form && (end - i) >= 6 { 3 } else { 2 };
+                let r = params.get(i + r_off).copied()?;
+                let g = params.get(i + r_off + 1).copied()?;
+                let b = params.get(i + r_off + 2).copied()?;
+                Some((Color::Rgb(r as u8, g as u8, b as u8), i + r_off + 2))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn handle_sgr(&mut self, params: &[u16], colon_flags: &[bool]) {
+        if params.is_empty() {
+            self.current_flags = StyleFlags::default();
+            self.current_fg = Color::Default;
+            self.current_bg = Color::Default;
+            return;
+        }
+
+        let mut i = 0;
+        while i < params.len() {
+            let param = params[i];
+            match param {
+                0 => {
+                    self.current_flags = StyleFlags::default();
+                    self.current_fg = Color::Default;
+                    self.current_bg = Color::Default;
+                }
+                1 => self.current_flags.set_bold(true),
+                2 => self.current_flags.set_dim(true),
+                3 => self.current_flags.set_italic(true),
+                4 => {
+                    // 仅当下一个参数是冒号子参数(`4:x`)时才作为扩展下划线样式;
+                    // 分号分隔的 `4;x` 中 x 是独立 SGR(如 4;1 = 下划线+粗体),不能吞。
+                    let next_is_substyle = i + 1 < params.len()
+                        && colon_flags.get(i + 1).copied().unwrap_or(false)
+                        && params[i + 1] <= 5;
+                    if next_is_substyle {
+                        let style = params[i + 1];
+                        self.current_flags.set_underline(match style {
+                            0 => UnderlineStyle::None,
+                            1 => UnderlineStyle::Single,
+                            2 => UnderlineStyle::Double,
+                            3 => UnderlineStyle::Curly,
+                            4 => UnderlineStyle::Dotted,
+                            5 => UnderlineStyle::Dashed,
+                            _ => UnderlineStyle::Single,
+                        });
+                        i += 1;
+                    } else {
+                        self.current_flags.set_underline(UnderlineStyle::Single);
+                    }
+                }
+                5 => self.current_flags.set_blink(true),
+                7 => self.current_flags.set_inverse(true),
+                9 => self.current_flags.set_strikethrough(true),
+                21 => self.current_flags.set_underline(UnderlineStyle::Double),
+                22 => {
+                    self.current_flags.set_bold(false);
+                    self.current_flags.set_dim(false);
+                }
+                23 => self.current_flags.set_italic(false),
+                24 => self.current_flags.set_underline(UnderlineStyle::None),
+                25 => self.current_flags.set_blink(false),
+                27 => self.current_flags.set_inverse(false),
+                29 => self.current_flags.set_strikethrough(false),
+                39 => self.current_fg = Color::Default,
+                30..=37 => {
+                    self.current_fg = match param {
+                        30 => Color::Black,
+                        31 => Color::Red,
+                        32 => Color::Green,
+                        33 => Color::Yellow,
+                        34 => Color::Blue,
+                        35 => Color::Magenta,
+                        36 => Color::Cyan,
+                        37 => Color::White,
+                        _ => Color::Default,
+                    };
+                }
+                49 => self.current_bg = Color::Default,
+                40..=47 => {
+                    self.current_bg = match param {
+                        40 => Color::Black,
+                        41 => Color::Red,
+                        42 => Color::Green,
+                        43 => Color::Yellow,
+                        44 => Color::Blue,
+                        45 => Color::Magenta,
+                        46 => Color::Cyan,
+                        47 => Color::White,
+                        _ => Color::Default,
+                    };
+                    self.global_bg = self.current_bg; // Update global background
+                    crate::debug_log!("[CSI] Background color set to: {:?}", self.current_bg);
+                }
+                90..=97 => {
+                    self.current_fg = match param {
+                        90 => Color::BrightBlack,
+                        91 => Color::BrightRed,
+                        92 => Color::BrightGreen,
+                        93 => Color::BrightYellow,
+                        94 => Color::BrightBlue,
+                        95 => Color::BrightMagenta,
+                        96 => Color::BrightCyan,
+                        97 => Color::BrightWhite,
+                        _ => Color::Default,
+                    };
+                }
+                100..=107 => {
+                    self.current_bg = match param {
+                        100 => Color::BrightBlack,
+                        101 => Color::BrightRed,
+                        102 => Color::BrightGreen,
+                        103 => Color::BrightYellow,
+                        104 => Color::BrightBlue,
+                        105 => Color::BrightMagenta,
+                        106 => Color::BrightCyan,
+                        107 => Color::BrightWhite,
+                        _ => Color::Default,
+                    };
+                    self.global_bg = self.current_bg; // Update global background
+                }
+                // 扩展前景色:38;5;n / 38;2;r;g;b 及对应冒号形式
+                38 => {
+                    if let Some((color, last)) =
+                        Self::parse_sgr_extended_color(params, colon_flags, i)
+                    {
+                        self.current_fg = color;
+                        i = last;
+                    }
+                }
+                // 扩展背景色
+                48 => {
+                    if let Some((color, last)) =
+                        Self::parse_sgr_extended_color(params, colon_flags, i)
+                    {
+                        self.current_bg = color;
+                        self.global_bg = self.current_bg;
+                        i = last;
+                    }
+                }
+                // 58 设置下划线颜色 / 59 复位。当前渲染管线未存储独立下划线颜色,
+                // 故仅正确消费其子参数,避免颜色分量泄漏成后续 SGR 码被误解析。
+                58 => {
+                    if let Some((_color, last)) =
+                        Self::parse_sgr_extended_color(params, colon_flags, i)
+                    {
+                        i = last;
+                    }
+                }
+                59 => {}
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// 擦除整个屏幕单元格(保留当前背景色),不移动光标。
+    /// 供 ED(`CSI 2J`)使用 —— 按 VT 规范擦除显示不得移动光标。
+    pub(super) fn erase_screen(&mut self) {
+        let bg_color = self.current_bg;
+        for row in self.grid.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = TerminalCell {
+                    character: ' ',
+                    foreground: Color::Default,
+                    background: bg_color,
+                    flags: StyleFlags::default(),
+                };
+            }
+        }
+        // Mark all rows as dirty
+        self.dirty_region.mark_all(self.grid.rows());
+        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+    }
+
+    /// 擦除屏幕并把光标归位到左上角。供切换备用缓冲区等场景使用。
+    pub(super) fn clear_screen(&mut self) {
+        self.erase_screen();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    /// 切入备用屏幕缓冲。`save_cursor` 控制是否保存主屏光标(1049/1048 语义),
+    /// `clear` 控制切入后是否清屏(1047/1049 语义)。已在备用屏则无操作。
+    pub(super) fn enter_alt_screen(&mut self, save_cursor: bool, clear: bool) {
+        if self.use_alt_buffer {
+            return;
+        }
+        if save_cursor {
+            self.saved_cursor_row = self.cursor_row;
+            self.saved_cursor_col = self.cursor_col;
+        }
+        // 备用屏不显示 scrollback
+        self.scroll_offset = 0;
+        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.alt_cursor_row = self.cursor_row;
+        self.alt_cursor_col = self.cursor_col;
+        std::mem::swap(
+            &mut self.keyboard_enhancement_flags,
+            &mut self.alt_keyboard_enhancement_flags,
+        );
+        std::mem::swap(
+            &mut self.keyboard_enhancement_stack,
+            &mut self.alt_keyboard_enhancement_stack,
+        );
+        self.use_alt_buffer = true;
+        if clear {
+            self.clear_screen();
+        }
+    }
+
+    /// 切回主屏幕缓冲。`restore_cursor` 控制是否恢复进入备用屏前保存的光标(1049 语义)。
+    /// 不在备用屏则无操作。
+    pub(super) fn exit_alt_screen(&mut self, restore_cursor: bool) {
+        if !self.use_alt_buffer {
+            return;
+        }
+        self.alt_cursor_row = self.cursor_row;
+        self.alt_cursor_col = self.cursor_col;
+        std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        if restore_cursor {
+            self.cursor_row = self.saved_cursor_row;
+            self.cursor_col = self.saved_cursor_col;
+        }
+        std::mem::swap(
+            &mut self.keyboard_enhancement_flags,
+            &mut self.alt_keyboard_enhancement_flags,
+        );
+        std::mem::swap(
+            &mut self.keyboard_enhancement_stack,
+            &mut self.alt_keyboard_enhancement_stack,
+        );
+        self.use_alt_buffer = false;
+
+        // 重置 SGR 属性,防止备用屏颜色泄漏到主屏
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
+        self.global_bg = Color::Default;
+        self.current_flags = StyleFlags::default();
+
+        // 交换缓冲后强制整屏重绘(+rows+1 触发 ui.rs 的 grid_version_jumped)
+        self.grid_version += self.grid.rows() as u64 + 1;
+        for row_ver in &mut self.row_versions {
+            *row_ver = self.grid_version;
+        }
+        self.dirty_region.mark_all(self.grid.rows());
+    }
+
+    pub(super) fn set_mode(&mut self, mode: u16) {
+        match mode {
+            25 => {
+                // Show cursor (mode 25)
+                self.modes.insert(25);
+            }
+            1004 => {
+                // Focus event reporting
+                self.modes.insert(1004);
+            }
+            2004 => {
+                // Bracketed paste mode
+                self.modes.insert(2004);
+            }
+            1000..=1003 => {
+                // Mouse reporting modes
+                self.modes.insert(mode);
+            }
+            1006 => {
+                // SGR mouse reporting format
+                self.modes.insert(mode);
+            }
+            47 => {
+                // 备用屏(无保存光标、无清屏)
+                self.enter_alt_screen(false, false);
+                self.modes.insert(47);
+            }
+            1047 => {
+                // 备用屏(切入时清屏)
+                self.enter_alt_screen(false, true);
+                self.modes.insert(1047);
+            }
+            1048 => {
+                // 仅保存光标(等价 DECSC)
+                self.saved_cursor_row = self.cursor_row;
+                self.saved_cursor_col = self.cursor_col;
+            }
+            1049 => {
+                // 备用屏:保存光标 + 切入 + 清屏
+                self.enter_alt_screen(true, true);
+                self.modes.insert(1049);
+            }
+            2026 => {
+                // Synchronized output: suppress rendering until cleared
+                self.modes.insert(2026);
+                self.sync_output_active = true;
+                self.sync_output_start = Some(std::time::Instant::now());
+            }
+            7 => {
+                // Autowrap mode
+                self.modes.insert(7);
+            }
+            6 => {
+                // DECOM - 原点模式:寻址相对滚动区域,光标移到区域原点
+                self.origin_mode = true;
+                self.cursor_row = self.scroll_region_top;
+                self.cursor_col = 0;
+            }
+            _ => {
+                // Unknown mode, just store it
+                self.modes.insert(mode);
+            }
+        }
+    }
+
+    /// ANSI 标准模式 (CSI Pn h,无 ? 前缀)。目前仅 IRM(4) 有实际效果。
+    pub(super) fn set_ansi_mode(&mut self, mode: u16) {
+        if mode == 4 {
+            // IRM - 插入替换模式
+            self.insert_mode = true;
+        }
+    }
+
+    pub(super) fn reset_ansi_mode(&mut self, mode: u16) {
+        if mode == 4 {
+            self.insert_mode = false;
+        }
+    }
+
+    pub(super) fn reset_mode(&mut self, mode: u16) {
+        match mode {
+            25 => {
+                // Hide cursor
+                self.modes.remove(&25);
+            }
+            1004 => {
+                // Disable focus event reporting
+                self.modes.remove(&1004);
+            }
+            2004 => {
+                // Disable bracketed paste mode
+                self.modes.remove(&2004);
+            }
+            1000..=1003 => {
+                // Disable mouse reporting
+                self.modes.remove(&mode);
+            }
+            1006 => {
+                // Disable SGR mouse reporting format
+                self.modes.remove(&mode);
+            }
+            47 => {
+                // 退出备用屏(不恢复光标)
+                self.exit_alt_screen(false);
+                self.modes.remove(&47);
+            }
+            1047 => {
+                // 退出备用屏(不恢复光标)
+                self.exit_alt_screen(false);
+                self.modes.remove(&1047);
+            }
+            1048 => {
+                // 仅恢复光标(等价 DECRC)
+                self.cursor_row = self.saved_cursor_row.min(self.grid.rows().saturating_sub(1));
+                self.cursor_col = self.saved_cursor_col.min(self.grid.row_len().saturating_sub(1));
+            }
+            1049 => {
+                // 退出备用屏并恢复进入前保存的光标
+                self.exit_alt_screen(true);
+                self.modes.remove(&1049);
+            }
+            2026 => {
+                // End synchronized output: force full render
+                self.modes.remove(&2026);
+                self.sync_output_active = false;
+                self.sync_output_start = None;
+                self.dirty_region.mark_all(self.grid.rows());
+                self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+            }
+            7 => {
+                // Disable autowrap
+                self.modes.remove(&7);
+            }
+            6 => {
+                // DECOM 关闭:恢复绝对寻址,光标移到屏幕原点
+                self.origin_mode = false;
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+            }
+            _ => {
+                // Unknown mode, just remove it
+                self.modes.remove(&mode);
+            }
+        }
+    }
+}

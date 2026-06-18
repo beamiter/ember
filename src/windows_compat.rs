@@ -37,6 +37,11 @@ pub mod windows_support {
                 fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> i32;
             }
 
+            // SAFETY: GetStdHandle/GetConsoleMode/SetConsoleMode 是 Win32 `extern "system"`
+            // FFI,上面声明的签名与 Windows API 一致(调用约定 stdcall,参数类型匹配)。
+            // stdout_handle 在使用前已判 null(返回 last_os_error)。传给 GetConsoleMode 的
+            // `&mut mode`/`&mut input_mode` 指向栈上有效 u32,满足 `lpMode: *mut u32` 要求。
+            // 句柄为进程标准流,无并发改写。
             unsafe {
                 let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
                 let stdin_handle = GetStdHandle(STD_INPUT_HANDLE);

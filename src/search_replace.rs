@@ -71,7 +71,12 @@ impl SearchAndReplaceEngine {
                 }
             }
             // Copy a single UTF-8 character from the original text.
-            let ch = text[i..].chars().next().unwrap();
+            // text.get 避免 i 落在非字符边界时的切片 panic(mlen 理论上总落边界,
+            // 但此处容错跳过一字节,绝不 panic)。
+            let Some(ch) = text.get(i..).and_then(|s| s.chars().next()) else {
+                i += 1;
+                continue;
+            };
             result.push(ch);
             i += ch.len_utf8();
         }

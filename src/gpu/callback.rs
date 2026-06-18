@@ -2,7 +2,18 @@ use super::font_backend::FontBackend;
 use super::instance::{CellInstance, GridUniforms};
 use super::pipeline::GridPipeline;
 use egui_wgpu::CallbackResources;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// GpuResources 缺失只可能源于初始化 bug。每帧 panic 会让整个程序崩溃且无信息,
+/// 改为首帧 log::error 一次后静默跳过该帧绘制(最多黑屏)。
+static MISSING_RESOURCES_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_missing_resources(site: &str) {
+    if !MISSING_RESOURCES_LOGGED.swap(true, Ordering::Relaxed) {
+        log::error!("GpuResources missing in {site}; skipping GPU draw this frame");
+    }
+}
 
 /// GPU resources stored in egui_wgpu's CallbackResources (TypeMap).
 pub struct GpuResources {
@@ -54,7 +65,7 @@ pub struct GridBackgroundCallback {
     pub instance_count: u32,
     pub row_offsets: Arc<Vec<usize>>,
     pub row_counts: Arc<Vec<usize>>,
-    pub dirty_rows: Vec<bool>,
+    pub dirty_rows: Arc<Vec<bool>>,
     pub use_partial_upload: bool,
 }
 
@@ -67,7 +78,13 @@ impl egui_wgpu::CallbackTrait for GridBackgroundCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let res = callback_resources.get_mut::<GpuResources>().unwrap();
+        let res = match callback_resources.get_mut::<GpuResources>() {
+            Some(r) => r,
+            None => {
+                log_missing_resources("GridBackgroundCallback::prepare");
+                return Vec::new();
+            }
+        };
 
         let old_tex_size = res.atlas.atlas_dimensions();
         res.atlas.ensure_uploaded(device, queue);
@@ -110,7 +127,13 @@ impl egui_wgpu::CallbackTrait for GridBackgroundCallback {
         if self.instance_count == 0 {
             return;
         }
-        let res = callback_resources.get::<GpuResources>().unwrap();
+        let res = match callback_resources.get::<GpuResources>() {
+            Some(r) => r,
+            None => {
+                log_missing_resources("GridBackgroundCallback::paint");
+                return;
+            }
+        };
         render_pass.set_pipeline(res.pipeline.pipeline());
         render_pass.set_bind_group(0, &res.pipeline.background_bind_group, &[]);
         render_pass.set_vertex_buffer(0, res.pipeline.instance_buffer().slice(..));
@@ -133,7 +156,13 @@ impl egui_wgpu::CallbackTrait for GridForegroundCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let res = callback_resources.get_mut::<GpuResources>().unwrap();
+        let res = match callback_resources.get_mut::<GpuResources>() {
+            Some(r) => r,
+            None => {
+                log_missing_resources("GridForegroundCallback::prepare");
+                return Vec::new();
+            }
+        };
         res.pipeline.update_uniforms(queue, &self.uniforms);
         Vec::new()
     }
@@ -147,7 +176,13 @@ impl egui_wgpu::CallbackTrait for GridForegroundCallback {
         if self.instance_count == 0 {
             return;
         }
-        let res = callback_resources.get::<GpuResources>().unwrap();
+        let res = match callback_resources.get::<GpuResources>() {
+            Some(r) => r,
+            None => {
+                log_missing_resources("GridForegroundCallback::paint");
+                return;
+            }
+        };
         render_pass.set_pipeline(res.pipeline.pipeline());
         render_pass.set_bind_group(0, &res.pipeline.foreground_bind_group, &[]);
         render_pass.set_vertex_buffer(0, res.pipeline.instance_buffer().slice(..));

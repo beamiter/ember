@@ -33,7 +33,8 @@ pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> Color32
         Color::Indexed(idx) => color_256(idx, theme),
         Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         _ => {
-            let idx = ansi_index(color).unwrap();
+            // 具名 ANSI 色必命中 ansi_index;兜底 7(white) 仅防未来新增 Color 变体漏配。
+            let idx = ansi_index(color).unwrap_or(7);
             // VTE4: bold + standard color (0-7) promotes to bright variant (8-15)
             let idx = if bold && idx < 8 { idx + 8 } else { idx };
             theme.ansi_color(idx)
@@ -59,7 +60,8 @@ pub fn resolve_bg(color: Color, theme: &Theme) -> Color32 {
         Color::Indexed(idx) => color_256(idx, theme),
         Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         _ => {
-            let idx = ansi_index(color).unwrap();
+            // 具名 ANSI 色必命中;兜底 0(black) 仅防未来新增 Color 变体漏配。
+            let idx = ansi_index(color).unwrap_or(0);
             theme.ansi_color(idx)
         }
     }

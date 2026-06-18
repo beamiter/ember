@@ -137,6 +137,9 @@ impl ShellSession {
         let mut accumulated = Vec::with_capacity(BATCH_SIZE_THRESHOLD);
         let mut last_alive_check = std::time::Instant::now();
         let mut last_batch_time = std::time::Instant::now();
+        // PTY 主从端关闭但进程未退出时 read 会持续返回 EIO,每次 readable 唤醒都报错会
+        // 向 UI 刷屏。首次报告后静默,直到成功读到数据(瞬时错误恢复)才允许再次报告。
+        let mut read_error_reported = false;
 
         crate::debug_log!("[IOLoop] 后台 I/O 线程启动 (P3 批处理优化)");
 
@@ -177,6 +180,7 @@ impl ShellSession {
                         loop {
                             match pty_guard.read(&mut buf) {
                                 Ok(crate::pty::ReadOutcome::Data(n)) => {
+                                    read_error_reported = false;
                                     accumulated.extend_from_slice(&buf[..n]);
                                     if accumulated.len() >= BATCH_SIZE_THRESHOLD {
                                         break;
@@ -200,7 +204,10 @@ impl ShellSession {
                                                 e
                                             )),
                                         });
-                                    } else {
+                                    } else if !read_error_reported {
+                                        // 仅首次报告;后续重复 EIO 静默,由 250ms alive
+                                        // check 兜底触发退出,避免向 UI 刷屏。
+                                        read_error_reported = true;
                                         after = After::ContinueWith(ShellEvent::Error(format!(
                                             "Read error: {}",
                                             e

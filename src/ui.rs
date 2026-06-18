@@ -299,6 +299,13 @@ pub struct TerminalRenderer {
     /// Sub-line pixel offset for smooth scrolling animation
     pub scroll_pixel_offset: f32,
 
+    /// Per-pane 链接检测缓存(多窗格路径用)。单窗格走 App 上的缓存,多窗格每个
+    /// pane 一份,仅当 grid_version/scroll_offset 变化时重建,避免每帧重做检测+String 分配。
+    /// 用 Arc 以便渲染前 O(1) clone 出来,规避 &mut self 与字段 & 的借用冲突。
+    pub cached_links: std::sync::Arc<Vec<crate::link::Link>>,
+    pub cached_links_grid_version: u64,
+    pub cached_links_scroll_offset: usize,
+
     // Dirty-region rendering cache
     cached_instances: std::sync::Arc<Vec<gpu::instance::CellInstance>>,
     row_instance_offsets: std::sync::Arc<Vec<usize>>,
@@ -312,7 +319,7 @@ pub struct TerminalRenderer {
     last_rendered_cols: usize,
     last_rendered_rows: usize,
     last_rendered_terminal_ptr: usize,
-    dirty_rows_buffer: Vec<bool>,
+    dirty_rows: std::sync::Arc<Vec<bool>>,
     changed_rows_buffer: Vec<usize>,
     row_instances_scratch: Vec<gpu::instance::CellInstance>,
     cached_atlas_w: f32,
@@ -357,6 +364,10 @@ impl TerminalRenderer {
             wgpu_render_state: None,
             cursor_move_input: Vec::new(),
             scroll_pixel_offset: 0.0,
+            cached_links: std::sync::Arc::new(Vec::new()),
+            // u64::MAX 作哨兵,保证首帧必定重建链接缓存。
+            cached_links_grid_version: u64::MAX,
+            cached_links_scroll_offset: usize::MAX,
             // Dirty-region rendering cache (initialized empty)
             cached_instances: std::sync::Arc::new(Vec::new()),
             row_instance_offsets: std::sync::Arc::new(Vec::new()),
@@ -370,7 +381,7 @@ impl TerminalRenderer {
             last_rendered_cols: 0,
             last_rendered_rows: 0,
             last_rendered_terminal_ptr: 0,
-            dirty_rows_buffer: Vec::new(),
+            dirty_rows: std::sync::Arc::new(Vec::new()),
             changed_rows_buffer: Vec::new(),
             row_instances_scratch: Vec::new(),
             cached_atlas_w: 1.0,
@@ -1278,7 +1289,9 @@ impl TerminalRenderer {
             || self.last_rendered_scroll_offset != current_scroll_offset
             || grid_version_jumped;
 
-        let mut dirty_rows = std::mem::take(&mut self.dirty_rows_buffer);
+        // 跨帧复用 dirty_rows 缓冲:make_mut 在上一帧 callback 已 drop(refcount==1)时
+        // 原地复用底层 buffer,避免每帧重新分配 Vec<bool>。
+        let dirty_rows = std::sync::Arc::make_mut(&mut self.dirty_rows);
         dirty_rows.clear();
         dirty_rows.resize(rows, false);
 
@@ -1297,8 +1310,8 @@ impl TerminalRenderer {
             // Selection overlay changes
             if self.last_rendered_selection != current_selection {
                 // Mark rows affected by old and new selection
-                Self::mark_selection_rows(&self.last_rendered_selection, rows, &mut dirty_rows, terminal);
-                Self::mark_selection_rows(&current_selection, rows, &mut dirty_rows, terminal);
+                Self::mark_selection_rows(&self.last_rendered_selection, rows, dirty_rows.as_mut_slice(), terminal);
+                Self::mark_selection_rows(&current_selection, rows, dirty_rows.as_mut_slice(), terminal);
             }
 
             // Search overlay changes - only mark matching lines dirty
@@ -1523,7 +1536,10 @@ impl TerminalRenderer {
         for m in &search_state.matches {
             self.last_search_match_lines.push(m.line);
         }
-        self.last_rendered_hovered_link = hovered_link.clone();
+        // 绝大多数帧 hovered_link 不变,先比较再 clone 以省去 String 堆分配。
+        if self.last_rendered_hovered_link != *hovered_link {
+            self.last_rendered_hovered_link = hovered_link.clone();
+        }
         self.last_rendered_cols = cols;
         self.last_rendered_rows = rows;
 
@@ -1552,7 +1568,7 @@ impl TerminalRenderer {
             instance_count,
             row_offsets: self.row_instance_offsets.clone(),
             row_counts: self.row_instance_counts.clone(),
-            dirty_rows,
+            dirty_rows: self.dirty_rows.clone(),
             use_partial_upload: !need_full_rebuild && !did_full_relayout && any_dirty,
         };
 
