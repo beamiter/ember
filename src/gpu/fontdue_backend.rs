@@ -110,6 +110,9 @@ pub struct FontdueAtlas {
     shape_regular: Option<ShapingFont>,
     shape_bold: Option<ShapingFont>,
     shaping_enabled: bool,
+    /// Reusable rustybuzz buffer to avoid allocating one per shape miss. Held
+    /// in an Option so we can `take` it across the consume-by-shape boundary.
+    shape_buffer: Option<rustybuzz::UnicodeBuffer>,
     // Subpixel rendering
     subpixel_rendering: bool,
 }
@@ -162,6 +165,7 @@ impl FontdueAtlas {
         let mut atlas = FontdueAtlas {
             shape_regular,
             shape_bold,
+            shape_buffer: Some(rustybuzz::UnicodeBuffer::new()),
             font_regular,
             font_bold,
             fallback_fonts,
@@ -771,7 +775,12 @@ impl FontBackend for FontdueAtlas {
         self.shaping_enabled
     }
 
-    fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Vec<ShapedGlyph> {
+    fn shape_run(
+        &mut self,
+        text: &str,
+        bold: bool,
+        subpixel_offset: u8,
+    ) -> Arc<Vec<ShapedGlyph>> {
         if !self.shaping_enabled || text.is_empty() {
             // Fallback: per-character rasterization
             let mut glyphs = Vec::with_capacity(text.len());
@@ -785,11 +794,11 @@ impl FontBackend for FontdueAtlas {
                     region,
                 });
             }
-            return glyphs;
+            return Arc::new(glyphs);
         }
 
         // Fast path: identical runs recur every frame (e.g. a static prompt line).
-        // Returning the cached shaping avoids re-parsing the rustybuzz face and
+        // Returning the cached Arc avoids re-parsing the rustybuzz face and
         // re-running the shaper on every dirty row. The cache is cleared whenever
         // the atlas grows/resets, so cached regions are always current.
         let cache_key = ShapeCacheKey {
@@ -798,7 +807,7 @@ impl FontBackend for FontdueAtlas {
             subpixel_offset,
         };
         if let Some(cached) = self.shape_cache.get(&cache_key) {
-            return cached.as_ref().clone();
+            return Arc::clone(cached);
         }
 
         // Snapshot generation so we can detect a grow triggered while rasterizing
@@ -816,9 +825,13 @@ impl FontBackend for FontdueAtlas {
         .map(ShapingFont::face);
 
         // 收集本次整形得到的字形信息为自有数据，随后即可释放对 Face（&self）的借用，
-        // 以便调用需要 &mut self 的 rasterize_gid。
+        // 以便调用需要 &mut self 的 rasterize_gid。复用 UnicodeBuffer 避免每次
+        // 缓存未命中都新分配一个。
         let shaped: Option<Vec<(u16, u32, f32, f32, f32)>> = face.map(|face| {
-            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            let mut buffer = self
+                .shape_buffer
+                .take()
+                .unwrap_or_else(rustybuzz::UnicodeBuffer::new);
             buffer.push_str(text);
 
             let glyph_buffer = rustybuzz::shape(face, &[], buffer);
@@ -828,7 +841,7 @@ impl FontBackend for FontdueAtlas {
             let upem = face.units_per_em() as f32;
             let scale = self.font_size_px / upem;
 
-            infos
+            let collected: Vec<_> = infos
                 .iter()
                 .zip(positions.iter())
                 .map(|(info, pos)| {
@@ -840,7 +853,10 @@ impl FontBackend for FontdueAtlas {
                         pos.y_offset as f32 * scale,
                     )
                 })
-                .collect()
+                .collect();
+            // Return the buffer to the pool for the next miss.
+            self.shape_buffer = Some(glyph_buffer.clear());
+            collected
         });
 
         let shaped = match shaped {
@@ -858,7 +874,7 @@ impl FontBackend for FontdueAtlas {
                         region,
                     });
                 }
-                return glyphs;
+                return Arc::new(glyphs);
             }
         };
 
@@ -875,13 +891,14 @@ impl FontBackend for FontdueAtlas {
             });
         }
 
+        let arc = Arc::new(glyphs);
         // Only cache when the atlas did not grow while rasterizing this run; a grow
         // rescales UVs and would leave the earlier glyphs in this vec pointing at the
         // wrong region.
         if self.atlas_generation == generation_before {
-            self.shape_cache.put(cache_key, Arc::new(glyphs.clone()));
+            self.shape_cache.put(cache_key, Arc::clone(&arc));
         }
 
-        glyphs
+        arc
     }
 }

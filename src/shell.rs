@@ -1,6 +1,6 @@
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
-use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam::channel::{bounded, Receiver, Sender};
 use eframe::egui;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,12 @@ pub enum ShellEvent {
 /// 事件 channel 容量上限。每个事件最多 ~128KB(BATCH_SIZE_THRESHOLD),
 /// 256 * 128KB ≈ 32MB 为内存上界,既能吸收突发又能阻止无限堆积。
 const EVENT_CHANNEL_CAP: usize = 256;
+
+/// 写入 channel 容量。粘贴等大写入会落进单一 writer 线程串行执行,
+/// 上界用于防止 UI 线程在 writer 阻塞(PTY 满) 时无界堆积。1024 项足以
+/// 吸收正常突发(粘贴一次只占 1 项),粘贴回压时 try_send 会快速失败而不
+/// 静默积压。
+const WRITE_CHANNEL_CAP: usize = 1024;
 
 /// ShellSession 管理 PTY 和后台 I/O 线程
 pub struct ShellSession {
@@ -72,8 +78,9 @@ impl ShellSession {
                 });
 
                 // 单一 writer 线程:串行执行所有 PTY 写入,保证消息级原子性。
-                // unbounded 避免 UI 线程在入队时阻塞;实际数据很快被排空。
-                let (write_tx, write_rx) = unbounded::<Vec<u8>>();
+                // bounded:writer 阻塞(PTY 缓冲满) 时为 UI 线程提供回压,而非
+                // 让无界 channel 默默吃内存。
+                let (write_tx, write_rx) = bounded::<Vec<u8>>(WRITE_CHANNEL_CAP);
                 let pty_writer = Arc::clone(&pty);
                 let shutdown_writer = Arc::clone(&shutdown);
                 let _ = thread::Builder::new()
@@ -243,8 +250,16 @@ impl ShellSession {
                             return;
                         }
                         After::StopEof => {
-                            // 锁外非阻塞回收,避免持锁阻塞 waitpid 死锁(见 reap_with_grace)
-                            let exit_code = pty.lock().reap_with_grace();
+                            // 锁外做有界轮询:在每次 try_reap 后释放锁,避免 30ms
+                            // sleep 期间阻塞 UI 线程的 resize/write。
+                            let mut exit_code = -1;
+                            for _ in 0..30 {
+                                if let Some(code) = pty.lock().try_reap() {
+                                    exit_code = code;
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
                             let _ = Self::send_event(
                                 &event_tx,
                                 &repaint_ctx,

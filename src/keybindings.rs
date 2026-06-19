@@ -32,6 +32,8 @@ pub enum Command {
     TerminalClear,      // Ctrl+L
     TerminalScrollUp,
     TerminalScrollDown,
+    TerminalJumpPrevCommand,
+    TerminalJumpNextCommand,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+D
@@ -74,6 +76,8 @@ impl std::fmt::Display for Command {
             Command::TerminalClear => write!(f, "terminal:clear"),
             Command::TerminalScrollUp => write!(f, "terminal:scroll_up"),
             Command::TerminalScrollDown => write!(f, "terminal:scroll_down"),
+            Command::TerminalJumpPrevCommand => write!(f, "terminal:jump_prev_command"),
+            Command::TerminalJumpNextCommand => write!(f, "terminal:jump_next_command"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -111,6 +115,8 @@ impl std::str::FromStr for Command {
             "terminal:clear" => Ok(Command::TerminalClear),
             "terminal:scroll_up" => Ok(Command::TerminalScrollUp),
             "terminal:scroll_down" => Ok(Command::TerminalScrollDown),
+            "terminal:jump_prev_command" => Ok(Command::TerminalJumpPrevCommand),
+            "terminal:jump_next_command" => Ok(Command::TerminalJumpNextCommand),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -216,6 +222,16 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+down".to_string(), "terminal:scroll_down".to_string());
+
+        // OSC 133 命令跳转：上一/下一个 shell 提示符
+        bindings.bindings.insert(
+            "ctrl+shift+up".to_string(),
+            "terminal:jump_prev_command".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+down".to_string(),
+            "terminal:jump_next_command".to_string(),
+        );
 
         bindings
     }

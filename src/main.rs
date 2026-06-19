@@ -617,6 +617,18 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// True when a clipboard paste should ask the user to confirm before being
+/// sent to the PTY. Trips on:
+/// - any newline (`\n` after CRLF normalization), since the most common
+///   foot-gun is a multi-line block that runs commands without review;
+/// - large payloads (> [`PASTE_CONFIRM_THRESHOLD_BYTES`]) that the user
+///   probably wants to look at before unleashing.
+/// Bracketed-paste mode is *not* enough on its own: the receiving program
+/// (e.g. plain `bash`) may still execute on the first newline.
+fn should_confirm_paste(text: &str) -> bool {
+    text.contains('\n') || text.len() > crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES
+}
+
 fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
     // 安全:剔除 payload 内嵌的粘贴结束序列 ESC[201~,否则恶意剪贴板可
     // 提前结束粘贴模式并注入随后被 shell 执行的命令(bracketed-paste 注入)。
@@ -857,6 +869,7 @@ impl TerminalApp {
             config_last_check: std::time::Instant::now(),
             smooth_scroll_velocity: 0.0,
             smooth_scroll_pixel_offset: 0.0,
+            pending_paste_confirm: None,
         })
     }
 
@@ -1254,6 +1267,10 @@ impl eframe::App for TerminalApp {
         // Step 2.5: 搜索面板事件处理
         self.handle_search_panel_input();
 
+        // Snapshot active session index before mutably borrowing session_manager;
+        // we use it to tag pending-paste confirmations so they only deliver to
+        // the same tab if the user hasn't switched away.
+        let active_session_idx_for_paste = self.session_manager.active_index();
         let session = self.session_manager.get_active_session_mut();
 
         // Step 3: 处理复制粘贴（从配置系统或硬编码的 Ctrl+Shift+C/V）
@@ -1324,26 +1341,30 @@ impl eframe::App for TerminalApp {
                     match content {
                         ClipboardContent::Text(text) => {
                             crate::debug_log!("[PASTE] content type: TEXT ({} chars)", text.len());
-                            // 文本内容：按原来的方式处理（支持括号粘贴）
-                            let bytes = text.replace("\r\n", "\n").into_bytes();
-                            if !bytes.is_empty() {
+                            let normalized = text.replace("\r\n", "\n");
+                            if !normalized.is_empty() {
                                 let bracketed_paste = {
                                     let terminal = session.terminal.lock();
                                     terminal.is_bracketed_paste_enabled()
                                 };
-
-                                crate::debug_log!(
-                                    "[PASTE] sending {} bytes (bracketed={})",
-                                    bytes.len(),
-                                    bracketed_paste
-                                );
-                                let paste_bytes = if bracketed_paste {
-                                    wrap_bracketed_paste(bytes)
+                                if should_confirm_paste(&normalized) {
+                                    self.pending_paste_confirm =
+                                        Some(crate::app::state::PendingPasteConfirm {
+                                            text: normalized,
+                                            session_idx: active_session_idx_for_paste,
+                                            bracketed: bracketed_paste,
+                                        });
+                                    consumed_keys.insert("Ctrl+Shift+V".to_string());
                                 } else {
-                                    bytes
-                                };
-                                let _ = session.shell.write(&paste_bytes);
-                                consumed_keys.insert("Ctrl+Shift+V".to_string());
+                                    let bytes = normalized.into_bytes();
+                                    let paste_bytes = if bracketed_paste {
+                                        wrap_bracketed_paste(bytes)
+                                    } else {
+                                        bytes
+                                    };
+                                    let _ = session.shell.write(&paste_bytes);
+                                    consumed_keys.insert("Ctrl+Shift+V".to_string());
+                                }
                             } else {
                                 crate::debug_log!("[PASTE] text content is empty");
                             }
@@ -1435,26 +1456,30 @@ impl eframe::App for TerminalApp {
                                     "[PASTE] fallback: TEXT content ({} chars)",
                                     text.len()
                                 );
-                                // 文本内容：按原来的方式处理（支持括号粘贴）
-                                let bytes = text.replace("\r\n", "\n").into_bytes();
-                                if !bytes.is_empty() {
+                                let normalized = text.replace("\r\n", "\n");
+                                if !normalized.is_empty() {
                                     let bracketed_paste = {
                                         let terminal = session.terminal.lock();
                                         terminal.is_bracketed_paste_enabled()
                                     };
-
-                                    crate::debug_log!(
-                                        "[PASTE] fallback: sending text {} bytes (bracketed={})",
-                                        bytes.len(),
-                                        bracketed_paste
-                                    );
-                                    let paste_bytes = if bracketed_paste {
-                                        wrap_bracketed_paste(bytes)
+                                    if should_confirm_paste(&normalized) {
+                                        self.pending_paste_confirm =
+                                            Some(crate::app::state::PendingPasteConfirm {
+                                                text: normalized,
+                                                session_idx: active_session_idx_for_paste,
+                                                bracketed: bracketed_paste,
+                                            });
+                                        consumed_keys.insert("PasteEvent".to_string());
                                     } else {
-                                        bytes
-                                    };
-                                    let _ = session.shell.write(&paste_bytes);
-                                    consumed_keys.insert("PasteEvent".to_string());
+                                        let bytes = normalized.into_bytes();
+                                        let paste_bytes = if bracketed_paste {
+                                            wrap_bracketed_paste(bytes)
+                                        } else {
+                                            bytes
+                                        };
+                                        let _ = session.shell.write(&paste_bytes);
+                                        consumed_keys.insert("PasteEvent".to_string());
+                                    }
                                 } else {
                                     crate::debug_log!("[PASTE] fallback: text is empty");
                                 }

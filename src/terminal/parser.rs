@@ -1,6 +1,26 @@
 use super::*;
 
 impl super::TerminalState {
+    /// Carry an unfinished escape across PTY read batches, but cap total size
+    /// to avoid unbounded growth on malformed/binary streams that never send a
+    /// terminator. On overflow the buffer is dropped (parser drops back to a
+    /// clean state) — the alternative would be to keep partial data that we
+    /// already know is too big to ever match.
+    fn stash_pending_escape(&mut self, tail: &[u8]) {
+        let new_len = self.pending_escape.len().saturating_add(tail.len());
+        if new_len > MAX_PENDING_ESCAPE {
+            crate::debug_log!(
+                "[PARSER] pending_escape exceeded {} bytes (have {}, +{}); discarding",
+                MAX_PENDING_ESCAPE,
+                self.pending_escape.len(),
+                tail.len()
+            );
+            self.pending_escape.clear();
+            return;
+        }
+        self.pending_escape.extend_from_slice(tail);
+    }
+
     pub fn process_input(&mut self, input: &[u8]) {
         // Fast path: if no pending escape, process input directly without allocation
         let data;
@@ -80,7 +100,7 @@ impl super::TerminalState {
                     let esc_start = i;
 
                     if i + 1 >= data_slice.len() {
-                        self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                        self.stash_pending_escape(&data_slice[esc_start..]);
                         break;
                     }
 
@@ -126,7 +146,7 @@ impl super::TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.stash_pending_escape(&data_slice[esc_start..]);
                                 break;
                             }
 
@@ -139,6 +159,16 @@ impl super::TerminalState {
                                         if command == "0" || command == "2" {
                                             self.window_title.clear();
                                             self.window_title.push_str(value);
+                                        } else if command == "7" {
+                                            // OSC 7 — current working directory.
+                                            // Format: file://hostname/path (path is %-encoded).
+                                            // We accept either the full URL or a bare path.
+                                            self.current_working_dir =
+                                                Self::decode_osc7_cwd(value);
+                                            crate::debug_log!(
+                                                "[OSC7] cwd set to {:?}",
+                                                self.current_working_dir
+                                            );
                                         } else if command == "8" {
                                             // OSC 8 - Hyperlinks
                                             // Format: ESC ] 8 ; params ; URI ST
@@ -181,6 +211,28 @@ impl super::TerminalState {
                                             }
                                         } else if command == "52" {
                                             self.handle_osc_52(value);
+                                        } else if command == "133" {
+                                            // OSC 133 (FinalTerm) shell integration:
+                                            //   A           prompt start
+                                            //   B           prompt end / command line begins
+                                            //   C           command output begins
+                                            //   D[;<exit>]  command finished, optional exit code
+                                            // We only act on A (record a mark) and D (attach
+                                            // the exit code). B/C are accepted but ignored.
+                                            let mut parts = value.split(';');
+                                            let kind = parts.next().unwrap_or("");
+                                            match kind {
+                                                "A" => {
+                                                    self.record_prompt_start();
+                                                }
+                                                "D" => {
+                                                    let exit = parts
+                                                        .next()
+                                                        .and_then(|s| s.trim().parse::<i32>().ok());
+                                                    self.record_command_exit(exit);
+                                                }
+                                                _ => {}
+                                            }
                                         } else if command == "5522" {
                                             let (metadata, osc_payload) =
                                                 if let Some((metadata, osc_payload)) =
@@ -239,7 +291,7 @@ impl super::TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.stash_pending_escape(&data_slice[esc_start..]);
                                 break;
                             }
                         }
@@ -260,7 +312,7 @@ impl super::TerminalState {
                         }
                         b'(' | b')' => {
                             if i + 2 >= data_slice.len() {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.stash_pending_escape(&data_slice[esc_start..]);
                                 break;
                             }
 
@@ -354,7 +406,7 @@ impl super::TerminalState {
                             }
 
                             let Some(final_byte) = final_byte else {
-                                self.pending_escape.extend_from_slice(&data_slice[esc_start..]);
+                                self.stash_pending_escape(&data_slice[esc_start..]);
                                 break;
                             };
 
@@ -633,13 +685,19 @@ impl super::TerminalState {
                 }
             }
             'L' => {
+                // IL — insert N blank lines at cursor. After (region_height)
+                // iterations the entire region is blank, so cap N there to
+                // avoid O(N · region · cols) work for adversarial N=65535.
                 let n = params.first().copied().unwrap_or(1) as usize;
-                let blank = self.create_blank_cell();
-                for _ in 0..n {
-                    if self.cursor_row >= self.scroll_region_top
-                        && self.cursor_row <= self.scroll_region_bottom
-                    {
-                        let cols = self.grid.row_len();
+                if self.cursor_row >= self.scroll_region_top
+                    && self.cursor_row <= self.scroll_region_bottom
+                {
+                    let region_height =
+                        self.scroll_region_bottom - self.cursor_row + 1;
+                    let n = n.min(region_height);
+                    let blank = self.create_blank_cell();
+                    let cols = self.grid.row_len();
+                    for _ in 0..n {
                         let src_start = self.cursor_row * cols;
                         let src_end = self.scroll_region_bottom * cols;
                         let dst = (self.cursor_row + 1) * cols;
@@ -650,13 +708,17 @@ impl super::TerminalState {
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
             'M' => {
+                // DL — delete N lines at cursor. Same cap logic as IL.
                 let n = params.first().copied().unwrap_or(1) as usize;
-                let blank = self.create_blank_cell();
-                for _ in 0..n {
-                    if self.cursor_row >= self.scroll_region_top
-                        && self.cursor_row <= self.scroll_region_bottom
-                    {
-                        let cols = self.grid.row_len();
+                if self.cursor_row >= self.scroll_region_top
+                    && self.cursor_row <= self.scroll_region_bottom
+                {
+                    let region_height =
+                        self.scroll_region_bottom - self.cursor_row + 1;
+                    let n = n.min(region_height);
+                    let blank = self.create_blank_cell();
+                    let cols = self.grid.row_len();
+                    for _ in 0..n {
                         let src_start = (self.cursor_row + 1) * cols;
                         let src_end = (self.scroll_region_bottom + 1) * cols;
                         let dst = self.cursor_row * cols;
@@ -746,16 +808,26 @@ impl super::TerminalState {
                 }
             }
             'S' => {
-                // Scroll up (Scroll Up, SU) - content moves up, new lines appear at bottom
+                // SU — Scroll Up. Cap to region height: more would just blank
+                // an already-blank region while doing O(rows) work each step.
                 let n = params.first().copied().unwrap_or(1) as usize;
-                // Scroll within the scroll region by moving lines
+                let region_height = self
+                    .scroll_region_bottom
+                    .saturating_sub(self.scroll_region_top)
+                    + 1;
+                let n = n.min(region_height);
                 for _ in 0..n {
                     self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
                 }
             }
             'T' => {
-                // Scroll down (Scroll Down, SD) - content moves down, new lines appear at top
+                // SD — Scroll Down. Same cap as SU.
                 let n = params.first().copied().unwrap_or(1) as usize;
+                let region_height = self
+                    .scroll_region_bottom
+                    .saturating_sub(self.scroll_region_top)
+                    + 1;
+                let n = n.min(region_height);
                 for _ in 0..n {
                     self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
                 }
@@ -864,41 +936,38 @@ impl super::TerminalState {
                 self.pending_wrap = false;
             }
             '@' => {
-                // ICH - Insert Character(s)
+                // ICH - Insert Character(s). Cap N to remaining columns; further
+                // iterations would just keep dropping the rightmost cell.
                 let n = params.first().copied().unwrap_or(1) as usize;
                 let cols = self.grid.row_len();
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
-                    // Insert n blank cells at cursor position, shifting content right
-                    // insert_cell_in_row shifts cells right and discards the last cell
+                    let n = n.min(cols - self.cursor_col);
                     for _ in 0..n {
-                        if self.cursor_col < cols {
-                            self.grid.insert_cell_in_row(
-                                self.cursor_row,
-                                self.cursor_col,
-                                blank_cell.clone(),
-                            );
-                        }
+                        self.grid.insert_cell_in_row(
+                            self.cursor_row,
+                            self.cursor_col,
+                            blank_cell.clone(),
+                        );
                     }
-                    // Mark row as dirty after modification
                     self.mark_row_dirty(self.cursor_row);
                 }
             }
             'P' => {
-                // DCH - Delete Character(s)
+                // DCH - Delete Character(s). Cap N to remaining columns.
                 let n = params.first().copied().unwrap_or(1) as usize;
+                let cols = self.grid.row_len();
                 let blank_cell = self.create_blank_cell();
-                for _ in 0..n {
-                    if self.cursor_col < self.grid.row_len() {
+                if self.cursor_col < cols {
+                    let n = n.min(cols - self.cursor_col);
+                    for _ in 0..n {
                         self.grid
                             .remove_cell_from_row(self.cursor_row, self.cursor_col);
-                        // Fill the last cell with proper blank (remove_cell_from_row uses default)
-                        let last_col = self.grid.row_len() - 1;
+                        let last_col = cols - 1;
                         *self.grid.get_mut(self.cursor_row, last_col) = blank_cell.clone();
                     }
+                    self.mark_row_dirty(self.cursor_row);
                 }
-                // Mark row as dirty after modification
-                self.mark_row_dirty(self.cursor_row);
             }
             'X' => {
                 // ECH - Erase Character(s)

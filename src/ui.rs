@@ -1649,7 +1649,9 @@ impl TerminalRenderer {
                 }
                 let bold = row[col].flags.bold();
                 let run_start = col;
-                let mut run = String::new();
+                // Pre-size to the remaining row width: the run is pure ASCII so
+                // (cols - col) bytes is a tight upper bound — single allocation.
+                let mut run = String::with_capacity(cols - col);
                 let mut c = col;
                 while c < cols && is_run_char(&row[c]) && row[c].flags.bold() == bold {
                     run.push(row[c].character);
@@ -1665,7 +1667,7 @@ impl TerminalRenderer {
                         for col2 in run_start..c {
                             map[col2] = Some(LigOverride::Covered);
                         }
-                        for g in &shaped {
+                        for g in shaped.iter() {
                             // Run is pure ASCII, so cluster byte offset == column offset.
                             let gcol = run_start + g.cluster as usize;
                             if gcol < cols {

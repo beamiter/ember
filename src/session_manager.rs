@@ -47,11 +47,16 @@ impl SessionManager {
         let name = name.unwrap_or_else(|| format!("Session {}", self.sessions.len() + 1));
         let tags = tags.unwrap_or_default();
 
-        // 从当前活跃会话的 shell 进程获取工作目录
+        // 优先使用 shell 通过 OSC 7 报告的 cwd(SSH/tmux 等场景下 /proc 不能反
+        // 映远端进程真实目录);否则退回 /proc/[pid]/cwd。
         let cwd = if !self.sessions.is_empty() {
             let active_session = &self.sessions[self.active_index];
-            let pid = active_session.get_shell_pid();
-            get_process_cwd(pid)
+            let osc7 = active_session
+                .terminal
+                .lock()
+                .current_working_dir
+                .clone();
+            osc7.or_else(|| get_process_cwd(active_session.get_shell_pid()))
         } else {
             None
         };

@@ -56,6 +56,29 @@ const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
+/// Hard cap on bytes carried across PTY read batches inside an unfinished
+/// OSC/DCS/CSI escape. Any well-formed sequence is far below this; a
+/// runaway/binary stream that never sends a terminator (BEL/ST/final byte)
+/// would otherwise grow `pending_escape` without bound.
+pub const MAX_PENDING_ESCAPE: usize = 4 * 1024 * 1024;
+
+/// Hard cap on tracked OSC 133 command marks. Each mark is a few u64s, so
+/// 1024 ≈ 32 KiB; well beyond any reasonable session's prompt count, but
+/// bounded so a malicious shell can't grow this without limit.
+pub const MAX_COMMAND_MARKS: usize = 1024;
+
+/// One entry recorded by an OSC 133-aware shell. `line_id` is the monotonic
+/// id of the row where the prompt began; we resolve it to a current
+/// scrollback/grid row at navigation time, since scrollback indices shift
+/// when old lines get evicted.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandMark {
+    /// Monotonic line id of the prompt row, equal to total_lines_scrolled
+    /// at record time plus the prompt's viewport row.
+    pub line_id: u64,
+    /// Exit code reported by `OSC 133;D;<n>`. None until the command exits.
+    pub exit_code: Option<i32>,
+}
 
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     (
@@ -199,6 +222,12 @@ pub struct TerminalState {
     current_bg: Color,
     current_flags: StyleFlags,
     pub window_title: String,
+    /// Working directory reported by the shell via OSC 7
+    /// (`ESC ] 7 ; file://host/path ST`). Optional because many shells need
+    /// PROMPT_COMMAND wiring to emit it. When absent the session manager
+    /// falls back to /proc/[pid]/cwd. Survives across shell PWD changes —
+    /// each prompt re-emits OSC 7.
+    pub current_working_dir: Option<String>,
 
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
@@ -270,4 +299,15 @@ pub struct TerminalState {
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,
+
+    /// Total lines ever pushed into `scrollback` (does not decrement on
+    /// `pop_front`). Combined with current `scrollback.len()`, lets us
+    /// translate a stable `line_id` back to a current scrollback index even
+    /// after old lines have been evicted.
+    pub total_lines_scrolled: u64,
+
+    /// OSC 133 command boundaries recorded by FinalTerm-aware shells. FIFO,
+    /// capped at `MAX_COMMAND_MARKS`. Marks pointing to lines that have been
+    /// evicted from scrollback are pruned lazily during navigation.
+    pub command_marks: VecDeque<CommandMark>,
 }

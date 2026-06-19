@@ -17,6 +17,25 @@ use crate::ui::TerminalRenderer;
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::Arc;
 
+/// Text from the clipboard waiting for the user to confirm before being
+/// written to the active session. Created when a paste contains a newline or
+/// exceeds [`PASTE_CONFIRM_THRESHOLD_BYTES`]: pasting `rm -rf …` followed by
+/// a newline would otherwise execute immediately.
+pub struct PendingPasteConfirm {
+    pub text: String,
+    /// Session that initiated the paste; we only deliver if it is still the
+    /// active session at confirm time (otherwise the user has switched tabs
+    /// and probably no longer intends the paste).
+    pub session_idx: usize,
+    pub bracketed: bool,
+}
+
+/// Show the confirmation dialog when the paste contains a newline (the most
+/// common foot-gun: pasting a multi-line block that runs commands without
+/// review) or when the paste is large enough that the user probably wants
+/// to verify what's about to enter the shell.
+pub const PASTE_CONFIRM_THRESHOLD_BYTES: usize = 4 * 1024;
+
 /// Main application state
 pub struct TerminalApp {
     pub session_manager: SessionManager,
@@ -127,4 +146,9 @@ pub struct TerminalApp {
     // Smooth scrolling
     pub smooth_scroll_velocity: f32,
     pub smooth_scroll_pixel_offset: f32,
+
+    /// Holds a paste payload waiting for user confirmation. Populated by the
+    /// paste handlers when [`should_confirm_paste`] returns true; cleared by
+    /// the modal renderer on confirm/cancel.
+    pub pending_paste_confirm: Option<PendingPasteConfirm>,
 }

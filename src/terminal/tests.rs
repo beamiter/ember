@@ -448,6 +448,83 @@
     }
 
     #[test]
+    fn osc_133_a_records_command_mark_at_cursor_row() {
+        let mut terminal = TerminalState::new(8, 4);
+
+        terminal.process_input(b"hello\n");
+        terminal.process_input(b"\x1b]133;A\x07");
+
+        assert_eq!(terminal.command_marks.len(), 1);
+        let mark = terminal.command_marks[0];
+        assert_eq!(mark.exit_code, None);
+        // Cursor is on row 1 (after the LF) so line_id == 1.
+        assert_eq!(mark.line_id, 1);
+    }
+
+    #[test]
+    fn osc_133_d_attaches_exit_code_to_last_mark() {
+        let mut terminal = TerminalState::new(8, 4);
+
+        terminal.process_input(b"\x1b]133;A\x07");
+        terminal.process_input(b"\x1b]133;D;42\x07");
+
+        assert_eq!(terminal.command_marks.len(), 1);
+        assert_eq!(terminal.command_marks[0].exit_code, Some(42));
+    }
+
+    #[test]
+    fn osc_133_d_without_exit_code_leaves_none() {
+        let mut terminal = TerminalState::new(8, 4);
+
+        terminal.process_input(b"\x1b]133;A\x07");
+        terminal.process_input(b"\x1b]133;D\x07");
+
+        assert_eq!(terminal.command_marks.len(), 1);
+        assert_eq!(terminal.command_marks[0].exit_code, None);
+    }
+
+    #[test]
+    fn jump_to_prev_command_scrolls_into_history() {
+        let mut terminal = TerminalState::new(8, 3);
+        // Fill enough history that the first prompt rolls into scrollback.
+        terminal.process_input(b"\x1b]133;A\x07$ a\n");
+        terminal.process_input(b"out1\n");
+        terminal.process_input(b"\x1b]133;A\x07$ b\n");
+        terminal.process_input(b"out2\n");
+        terminal.process_input(b"\x1b]133;A\x07$ c\n");
+
+        // We should now have 3 marks. The latest one is on the live grid
+        // (top of viewport in the live view), so jumping prev should scroll
+        // up to land on the second prompt.
+        assert!(terminal.command_marks.len() >= 2);
+        let scroll_before = terminal.scroll_offset;
+        let jumped = terminal.jump_to_prev_command();
+        assert!(jumped, "expected jump_to_prev_command to succeed");
+        assert!(
+            terminal.scroll_offset > scroll_before,
+            "scroll_offset should advance into scrollback"
+        );
+    }
+
+    #[test]
+    fn jump_to_next_command_returns_to_live_view() {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input(b"\x1b]133;A\x07a\n");
+        terminal.process_input(b"out\n");
+        terminal.process_input(b"\x1b]133;A\x07b\n");
+        terminal.process_input(b"out\n");
+
+        // Scroll up far enough that we're definitely above the latest mark.
+        terminal.scroll(10);
+        assert!(terminal.scroll_offset > 0);
+
+        // Next-command jump should bring us back to the live tail.
+        let jumped = terminal.jump_to_next_command();
+        assert!(jumped);
+        assert_eq!(terminal.scroll_offset, 0);
+    }
+
+    #[test]
     fn pending_wrap_not_set_when_autowrap_disabled() {
         let mut terminal = TerminalState::new(3, 3);
 

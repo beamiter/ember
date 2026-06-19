@@ -150,6 +150,7 @@ impl super::TerminalState {
             current_bg: Color::Default,
             current_flags: StyleFlags::default(),
             window_title: String::new(),
+            current_working_dir: None,
             global_bg: Color::Default,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -189,6 +190,8 @@ impl super::TerminalState {
             dynamic_bg: None,
             dynamic_cursor_color: None,
             pending_notifications: Vec::new(),
+            total_lines_scrolled: 0,
+            command_marks: VecDeque::new(),
         }
     }
 
@@ -240,8 +243,57 @@ impl super::TerminalState {
         }
     }
 
+    /// Decode OSC 7 working-directory payload to a local filesystem path.
+    /// Accepts either `file://host/path` (path is percent-encoded) or a raw
+    /// path. Returns None if the payload is empty or malformed.
+    pub(super) fn decode_osc7_cwd(value: &str) -> Option<String> {
+        let path_part = if let Some(rest) = value.strip_prefix("file://") {
+            // Skip optional hostname segment.
+            match rest.find('/') {
+                Some(i) => &rest[i..],
+                None => return None,
+            }
+        } else if value.starts_with('/') {
+            value
+        } else {
+            return None;
+        };
+        // Percent-decode. We don't pull in a url crate — the alphabet is small.
+        let bytes = path_part.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                let byte = u8::from_str_radix(hex, 16).ok()?;
+                out.push(byte);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        let s = String::from_utf8(out).ok()?;
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
     pub(super) fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
-        // Parse rgb:RR/GG/BB or rgb:RRRR/GGGG/BBBB or #RRGGBB
+        // Parse rgb:RR/GG/BB / rgb:RRRR/GGGG/BBBB / rgb:R/G/B / rgb:RRR/GGG/BBB / #RRGGBB
+        // Per XParseColor, each component is 1..=4 hex digits and is left-aligned
+        // into a 16-bit field (i.e. component value * (2^16-1) / (2^bits-1)),
+        // then truncated to 8 bits. The previous scale=1 fallback for 1/3-digit
+        // components produced a u8 cast of e.g. 0xFFF=4095, which wraps to 255
+        // for full-on but is wrong for any partial value.
+        fn scale_to_u8(value: u16, hex_digits: usize) -> u8 {
+            // Range of n hex digits is [0, 16^n - 1].
+            let max_n: u32 = (1u32 << (hex_digits * 4)).saturating_sub(1).max(1);
+            // Scale value to 0..=255, rounding to nearest.
+            (((value as u32) * 255 + max_n / 2) / max_n) as u8
+        }
         if let Some(hex) = spec.strip_prefix('#') {
             if hex.len() == 6 {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -251,13 +303,20 @@ impl super::TerminalState {
             }
         } else if let Some(rgb) = spec.strip_prefix("rgb:") {
             let parts: Vec<&str> = rgb.split('/').collect();
-            if parts.len() == 3 {
+            if parts.len() == 3
+                && (1..=4).contains(&parts[0].len())
+                && parts[0].len() == parts[1].len()
+                && parts[1].len() == parts[2].len()
+            {
+                let digits = parts[0].len();
                 let r = u16::from_str_radix(parts[0], 16).ok()?;
                 let g = u16::from_str_radix(parts[1], 16).ok()?;
                 let b = u16::from_str_radix(parts[2], 16).ok()?;
-                // Normalize to 8-bit
-                let scale = if parts[0].len() == 4 { 257 } else { 1 };
-                return Some(((r / scale) as u8, (g / scale) as u8, (b / scale) as u8));
+                return Some((
+                    scale_to_u8(r, digits),
+                    scale_to_u8(g, digits),
+                    scale_to_u8(b, digits),
+                ));
             }
         }
         None
@@ -266,15 +325,34 @@ impl super::TerminalState {
     pub(super) fn handle_osc_52(&mut self, value: &str) {
         // OSC 52 format: <selection>;<base64-data>
         // selection: c=clipboard, p=primary, s=select (we treat all as clipboard)
-        // data: ? means query, base64 means set
+        // data: ? means query, base64 means set.
+        //
+        // Cap on payload size: a remote process should not be able to push
+        // arbitrary multi-MB blobs into the host clipboard. xterm uses 100 KB
+        // by default; we match that.
+        const OSC52_MAX_BYTES: usize = 100 * 1024;
         if let Some((_sel, data)) = value.split_once(';') {
             if data == "?" {
-                // Query: signal main loop to read clipboard and respond
                 self.pending_osc52_clipboard_query = true;
             } else if !data.is_empty() {
-                // Set: decode base64 and store for main loop to apply
+                if data.len() > OSC52_MAX_BYTES.saturating_mul(4) / 3 + 8 {
+                    // Reject before even attempting to decode.
+                    crate::debug_log!(
+                        "[OSC52] rejecting clipboard set: encoded {} bytes exceeds limit",
+                        data.len()
+                    );
+                    return;
+                }
                 if let Some(decoded) = Self::decode_base64(data) {
-                    self.pending_osc52_clipboard_set = Some(decoded);
+                    if decoded.len() <= OSC52_MAX_BYTES {
+                        self.pending_osc52_clipboard_set = Some(decoded);
+                    } else {
+                        crate::debug_log!(
+                            "[OSC52] rejecting clipboard set: decoded {} bytes exceeds {}",
+                            decoded.len(),
+                            OSC52_MAX_BYTES
+                        );
+                    }
                 }
             }
         }
@@ -592,6 +670,7 @@ impl super::TerminalState {
             self.scrollback.pop_front();
         }
         self.scrollback.push_back(line);
+        self.total_lines_scrolled = self.total_lines_scrolled.saturating_add(1);
     }
 
     pub(super) fn scroll_region_down(&mut self, top: usize, bottom: usize) {
@@ -848,6 +927,164 @@ impl super::TerminalState {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+    }
+
+    /// Current line id of the row the cursor is on. `line_id` is monotonic
+    /// across the session and survives scrollback eviction; it can be
+    /// translated back to a viewport/scrollback index via
+    /// [`Self::line_id_to_scrollback_index`].
+    fn current_cursor_line_id(&self) -> u64 {
+        self.total_lines_scrolled
+            .saturating_add(self.cursor_row as u64)
+    }
+
+    /// Translate a recorded `line_id` to its current `scrollback` index, or
+    /// `None` if the line has been evicted (or now lives in the live grid,
+    /// which means it's already on screen).
+    fn line_id_to_scrollback_index(&self, line_id: u64) -> Option<usize> {
+        if line_id >= self.total_lines_scrolled {
+            // Line is either in the live grid (>= total_lines_scrolled) or
+            // hasn't happened yet (impossible via this API). The grid is
+            // already on screen, so caller can scroll to bottom.
+            return None;
+        }
+        let first_scrollback_line_id =
+            self.total_lines_scrolled.saturating_sub(self.scrollback.len() as u64);
+        if line_id < first_scrollback_line_id {
+            // Evicted from scrollback.
+            return None;
+        }
+        Some((line_id - first_scrollback_line_id) as usize)
+    }
+
+    /// Drop marks that point to lines no longer in scrollback. Called
+    /// lazily before navigation rather than on every scrollback push.
+    fn prune_evicted_marks(&mut self) {
+        let first_scrollback_line_id = self
+            .total_lines_scrolled
+            .saturating_sub(self.scrollback.len() as u64);
+        while self
+            .command_marks
+            .front()
+            .map(|m| m.line_id < first_scrollback_line_id)
+            .unwrap_or(false)
+        {
+            self.command_marks.pop_front();
+        }
+    }
+
+    /// Record an OSC 133;A boundary at the current cursor row. Called from
+    /// the parser when a FinalTerm-aware shell emits the prompt-start mark.
+    pub(super) fn record_prompt_start(&mut self) {
+        // Bypass the alt buffer entirely (less / vim emit no marks; if they
+        // did, they'd contaminate the main-screen history).
+        if self.use_alt_buffer {
+            return;
+        }
+        let line_id = self.current_cursor_line_id();
+
+        // Coalesce: if the most recent mark is on the same row (e.g., shell
+        // sent A twice for the same prompt) just keep the latest.
+        if let Some(last) = self.command_marks.back_mut() {
+            if last.line_id == line_id {
+                last.exit_code = None;
+                return;
+            }
+        }
+
+        if self.command_marks.len() >= MAX_COMMAND_MARKS {
+            self.command_marks.pop_front();
+        }
+        self.command_marks.push_back(CommandMark {
+            line_id,
+            exit_code: None,
+        });
+    }
+
+    /// Attach an exit code to the most recently recorded prompt mark.
+    /// Called for OSC 133;D[;<code>].
+    pub(super) fn record_command_exit(&mut self, exit_code: Option<i32>) {
+        if let Some(last) = self.command_marks.back_mut() {
+            last.exit_code = exit_code;
+        }
+    }
+
+    /// Scroll the viewport so the row at `line_id` lands at the top of
+    /// the visible area (or as close as possible). Returns true if the
+    /// jump did anything.
+    fn scroll_to_line_id(&mut self, line_id: u64) -> bool {
+        if let Some(scrollback_idx) = self.line_id_to_scrollback_index(line_id) {
+            // Target a scrollback row; scroll_offset = scrollback.len() - idx
+            // puts that row at the top of the viewport.
+            let new_offset = self.scrollback.len().saturating_sub(scrollback_idx);
+            self.scroll_offset = new_offset.min(self.scrollback.len());
+            true
+        } else if line_id >= self.total_lines_scrolled {
+            // Already in the live grid; just snap to the bottom.
+            self.scroll_offset = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the viewport to the prompt mark immediately before the
+    /// currently-visible top row. Returns true on a successful jump.
+    pub fn jump_to_prev_command(&mut self) -> bool {
+        if self.use_alt_buffer {
+            return false;
+        }
+        self.prune_evicted_marks();
+
+        // The "current top" line id of the viewport.
+        let top_line_id = self
+            .total_lines_scrolled
+            .saturating_sub(self.scroll_offset as u64);
+
+        // Find the latest mark strictly before the current top.
+        let target = self
+            .command_marks
+            .iter()
+            .rev()
+            .find(|m| m.line_id < top_line_id)
+            .copied();
+
+        match target {
+            Some(mark) => self.scroll_to_line_id(mark.line_id),
+            None => false,
+        }
+    }
+
+    /// Move the viewport to the next prompt mark after the currently-visible
+    /// top row. Returns true on a successful jump.
+    pub fn jump_to_next_command(&mut self) -> bool {
+        if self.use_alt_buffer {
+            return false;
+        }
+        self.prune_evicted_marks();
+
+        let top_line_id = self
+            .total_lines_scrolled
+            .saturating_sub(self.scroll_offset as u64);
+
+        let target = self
+            .command_marks
+            .iter()
+            .find(|m| m.line_id > top_line_id)
+            .copied();
+
+        match target {
+            Some(mark) => self.scroll_to_line_id(mark.line_id),
+            None => {
+                // No further mark; if we were scrolled up, snap to live view.
+                if self.scroll_offset != 0 {
+                    self.scroll_offset = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<String> {

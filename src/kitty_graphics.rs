@@ -68,7 +68,15 @@ pub struct KittyGraphicsParams {
 /// 待传输的图像数据
 pub struct PendingTransfer {
     pub chunks: Vec<Vec<u8>>,
+    pub bytes: usize,
 }
+
+/// Hard cap on bytes buffered while waiting for a Kitty graphics
+/// chunked-transfer terminator (`m=0`). Without this a peer that keeps
+/// sending `m=1` chunks but never closes the transfer would grow
+/// `pending_transfer` without bound; the per-image `MAX_KITTY_CACHE_MB`
+/// only kicks in after the transfer completes.
+const MAX_PENDING_TRANSFER_BYTES: usize = (MAX_KITTY_CACHE_MB as usize) * 1024 * 1024;
 
 /// Kitty 图像协议状态管理
 pub struct KittyGraphicsState {
@@ -192,10 +200,21 @@ impl KittyGraphicsState {
         };
 
         if params.more {
-            // 分块传输，需要缓存
+            // 分块传输，需要缓存。对累积大小做硬上限,防止恶意/异常
+            // 流持续发 m=1 但永不发 m=0 时无界堆积。
             let pending = self.pending_transfer.get_or_insert(PendingTransfer {
                 chunks: Vec::new(),
+                bytes: 0,
             });
+            let new_bytes = pending.bytes.saturating_add(data.len());
+            if new_bytes > MAX_PENDING_TRANSFER_BYTES {
+                self.pending_transfer = None;
+                return Err(format!(
+                    "Pending Kitty transfer exceeded {} MiB; dropping",
+                    MAX_KITTY_CACHE_MB
+                ));
+            }
+            pending.bytes = new_bytes;
             pending.chunks.push(data);
         } else {
             // 最后一块或单块传输
@@ -203,7 +222,7 @@ impl KittyGraphicsState {
 
             // 合并所有块
             let mut final_data = if let Some(pending) = pending {
-                let mut combined = Vec::new();
+                let mut combined = Vec::with_capacity(pending.bytes + data.len());
                 for chunk in pending.chunks {
                     combined.extend_from_slice(&chunk);
                 }

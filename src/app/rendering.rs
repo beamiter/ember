@@ -206,17 +206,17 @@ impl TerminalApp {
                     // 从原始 MouseWheel 事件中提取 delta（因为 smooth_scroll_delta 被 egui 消费了）
                     let mut scroll_delta_from_event = 0.0;
                     if ctrl_pressed_render {
-                        let all_events = ui.input(|i| i.events.clone());
-                        for evt in &all_events {
-                            if let egui::Event::MouseWheel {
-                                delta, modifiers, ..
-                            } = evt
-                            {
-                                if modifiers.ctrl {
-                                    scroll_delta_from_event += delta.y;
-                                }
-                            }
-                        }
+                        scroll_delta_from_event = ui.input(|i| {
+                            i.events
+                                .iter()
+                                .filter_map(|evt| match evt {
+                                    egui::Event::MouseWheel {
+                                        delta, modifiers, ..
+                                    } if modifiers.ctrl => Some(delta.y),
+                                    _ => None,
+                                })
+                                .sum()
+                        });
                     }
 
                     // Ctrl+滚轮字体缩放（积累事件而不是立即应用）
@@ -499,6 +499,9 @@ impl TerminalApp {
         );
         self.help_panel.is_open = help_open;
 
+        // 危险粘贴确认弹窗:含换行或超过阈值时,先让用户预览并按"粘贴 / 取消"。
+        self.show_paste_confirm_dialog(ctx);
+
         // 配置面板 UI（浮动窗口）
         let config_actions = self.config_panel.show(ctx, &self.current_theme);
         for action in config_actions {
@@ -595,5 +598,122 @@ impl TerminalApp {
                 frame_budget_kb,
             );
         }
+    }
+
+    fn show_paste_confirm_dialog(&mut self, ctx: &egui::Context) {
+        // Snapshot what we need from the pending paste and decide outside of
+        // the dialog closure so we can mutably touch session_manager / shell
+        // without holding any borrow on self.pending_paste_confirm.
+        let Some(pending) = self.pending_paste_confirm.as_ref() else {
+            return;
+        };
+
+        let panel_bg = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
+        let text_color = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.text);
+        let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
+
+        let line_count = pending.text.lines().count();
+        let byte_len = pending.text.len();
+        // First few lines as a preview; truncate long single lines too.
+        let preview: String = pending
+            .text
+            .lines()
+            .take(8)
+            .map(|l| {
+                if l.len() > 200 {
+                    format!("{}…", &l[..200])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated_preview = line_count > 8 || pending.text.len() != preview.len();
+
+        let mut decision: Option<bool> = None;
+        // Some(true) = paste, Some(false) = cancel.
+        egui::Window::new("⚠ 确认粘贴")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(egui::Frame {
+                fill: panel_bg,
+                stroke: egui::Stroke::new(1.0, border),
+                corner_radius: egui::CornerRadius::same(10),
+                inner_margin: egui::Margin::same(14),
+                ..Default::default()
+            })
+            .show(ctx, |ui| {
+                ui.set_max_width(640.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "粘贴包含 {} 行 / {} 字节,执行前请确认内容:",
+                        line_count, byte_len
+                    ))
+                    .color(text_color),
+                );
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style())
+                    .stroke(egui::Stroke::new(1.0, border))
+                    .show(ui, |ui| {
+                        ui.set_min_width(600.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&preview)
+                                            .monospace()
+                                            .color(text_color),
+                                    )
+                                    .wrap(),
+                                );
+                                if truncated_preview {
+                                    ui.label(
+                                        egui::RichText::new("…(预览已截断)").color(text_color),
+                                    );
+                                }
+                            });
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        decision = Some(false);
+                    }
+                    if ui.button("粘贴").clicked() {
+                        decision = Some(true);
+                    }
+                });
+                // Esc / Enter shortcuts.
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    decision = Some(false);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    decision = Some(true);
+                }
+            });
+
+        let Some(confirmed) = decision else {
+            return;
+        };
+        let pending = self
+            .pending_paste_confirm
+            .take()
+            .expect("pending was Some");
+        if !confirmed {
+            return;
+        }
+        // 只在仍是同一个 tab 时投递,避免误粘到刚切换过去的会话。
+        if self.session_manager.active_index() != pending.session_idx {
+            return;
+        }
+        let bytes = pending.text.into_bytes();
+        let paste_bytes = if pending.bracketed {
+            crate::wrap_bracketed_paste(bytes)
+        } else {
+            bytes
+        };
+        let session = self.session_manager.get_active_session_mut();
+        let _ = session.shell.write(&paste_bytes);
     }
 }

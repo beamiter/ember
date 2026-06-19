@@ -142,6 +142,24 @@ impl TerminalApp {
                                                 terminal.scroll(-3);
                                             }
                                         }
+                                        keybindings::Command::TerminalJumpPrevCommand => {
+                                            let session =
+                                                self.session_manager.get_active_session_mut();
+                                            let mut terminal = session.terminal.lock();
+                                            if !terminal.jump_to_prev_command() {
+                                                self.status_message =
+                                                    "No previous command mark".to_string();
+                                            }
+                                        }
+                                        keybindings::Command::TerminalJumpNextCommand => {
+                                            let session =
+                                                self.session_manager.get_active_session_mut();
+                                            let mut terminal = session.terminal.lock();
+                                            if !terminal.jump_to_next_command() {
+                                                self.status_message =
+                                                    "No next command mark".to_string();
+                                            }
+                                        }
                                         // 分屏命令处理
                                         keybindings::Command::TerminalSplitVertical => {
                                             // 垂直分割（左右）
@@ -310,6 +328,20 @@ impl TerminalApp {
                             let mut terminal = session.terminal.lock();
                             if !terminal.is_alt_buffer_active() {
                                 terminal.scroll(-3);
+                            }
+                        }
+                        keybindings::Command::TerminalJumpPrevCommand => {
+                            let session = self.session_manager.get_active_session_mut();
+                            let mut terminal = session.terminal.lock();
+                            if !terminal.jump_to_prev_command() {
+                                self.status_message = "No previous command mark".to_string();
+                            }
+                        }
+                        keybindings::Command::TerminalJumpNextCommand => {
+                            let session = self.session_manager.get_active_session_mut();
+                            let mut terminal = session.terminal.lock();
+                            if !terminal.jump_to_next_command() {
+                                self.status_message = "No next command mark".to_string();
                             }
                         }
                         keybindings::Command::ConfigOpen => {

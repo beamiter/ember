@@ -469,33 +469,27 @@ mod unix_pty {
             }
         }
 
-        /// EOF 后的非阻塞回收。收到 EOF(slave 全部关闭)时,子进程通常会在极短时间内
-        /// 退出,因此用 WNOHANG 做有界轮询(最多 ~30ms)以拿到准确退出码,但绝不无限
-        /// 阻塞 —— 否则 daemon 化场景(关闭 std fd 却继续运行)会让持锁的 io_loop 永久
-        /// 卡在 waitpid 上,与 UI 线程的 PTY 写入形成死锁。
-        /// 返回值:已退出 → 真实退出码并缓存;ECHILD → 0 并缓存;仍在运行 → -1 且不缓存
-        /// (保留 Drop 路径 SIGKILL/回收的能力)。
-        pub fn reap_with_grace(&mut self) -> i32 {
+        /// 单次非阻塞 waitpid。已退出/ECHILD → Some(code); 仍在运行 → None。
+        /// 调用方应在锁外做有界轮询,把 sleep 排除在 Pty 临界区之外,避免 UI
+        /// 线程的 resize/write 在子进程退出窗口内被阻塞数十毫秒。
+        pub fn try_reap(&mut self) -> Option<i32> {
             if let Some(code) = self.exit_code_cached {
-                return code;
+                return Some(code);
             }
             // SAFETY: WNOHANG 非阻塞 waitpid;status 为有效栈变量,child_pid 来自 fork。
-            for _ in 0..30 {
-                unsafe {
-                    let mut status = 0;
-                    let r = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-                    if r > 0 {
-                        self.cache_status(status);
-                        return self.exit_code_cached.unwrap_or(-1);
-                    } else if r < 0 {
-                        // ECHILD 等:已被回收。
-                        self.exit_code_cached = Some(0);
-                        return 0;
-                    }
+            unsafe {
+                let mut status = 0;
+                let r = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
+                if r > 0 {
+                    self.cache_status(status);
+                    Some(self.exit_code_cached.unwrap_or(-1))
+                } else if r < 0 {
+                    self.exit_code_cached = Some(0);
+                    Some(0)
+                } else {
+                    None
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            -1 // 仍在运行(daemon 化):占位退出码,不缓存,留给 Drop reaper 兜底
         }
 
         pub fn wait_timeout(&mut self, _timeout_ms: u64) -> Result<i32> {
@@ -583,8 +577,8 @@ mod windows_pty {
             false
         }
 
-        pub fn reap_with_grace(&mut self) -> i32 {
-            -1
+        pub fn try_reap(&mut self) -> Option<i32> {
+            None
         }
 
         pub fn wait_timeout(&mut self, _timeout_ms: u64) -> Result<i32> {

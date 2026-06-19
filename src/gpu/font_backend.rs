@@ -63,7 +63,12 @@ pub trait FontBackend: Send + Sync {
     fn atlas_dimensions(&self) -> (u32, u32);
     fn take_needs_rebind(&mut self) -> bool;
 
-    fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Vec<ShapedGlyph> {
+    fn shape_run(
+        &mut self,
+        text: &str,
+        bold: bool,
+        subpixel_offset: u8,
+    ) -> std::sync::Arc<Vec<ShapedGlyph>> {
         let mut glyphs = Vec::new();
         for (byte_idx, ch) in text.char_indices() {
             let region = self.get_or_rasterize(ch, bold, subpixel_offset);
@@ -75,7 +80,7 @@ pub trait FontBackend: Send + Sync {
                 region,
             });
         }
-        glyphs
+        std::sync::Arc::new(glyphs)
     }
 
     fn supports_shaping(&self) -> bool {
