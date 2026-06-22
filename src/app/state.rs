@@ -151,4 +151,7 @@ pub struct TerminalApp {
     /// paste handlers when [`should_confirm_paste`] returns true; cleared by
     /// the modal renderer on confirm/cancel.
     pub pending_paste_confirm: Option<PendingPasteConfirm>,
+
+    /// 粘贴确认对话框里"不再询问"复选框的临时状态(跨帧保留,直到对话框关闭)。
+    pub paste_dont_ask_again: bool,
 }

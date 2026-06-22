@@ -157,6 +157,10 @@ pub struct Config {
     /// 读取会把剪贴板内容回传给终端内运行的程序,存在隐私/安全风险,故默认关闭。
     #[serde(default)]
     pub osc52_clipboard_read: bool,
+
+    /// 粘贴多行/大块内容时弹窗确认(默认开启)。用户可在确认对话框里选择不再询问。
+    #[serde(default = "default_true")]
+    pub paste_confirm: bool,
 }
 
 fn default_true() -> bool {
@@ -315,6 +319,7 @@ impl Default for Config {
             sidebar_view: default_sidebar_view(),
             osc52_clipboard_write: true,
             osc52_clipboard_read: false,
+            paste_confirm: true,
         }
     }
 }

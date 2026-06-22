@@ -631,6 +631,8 @@ impl TerminalApp {
         let truncated_preview = line_count > 8 || pending.text.len() != preview.len();
 
         let mut decision: Option<bool> = None;
+        // 通过引用让 checkbox 在 self 上持久(对话框可能跨多帧)。
+        let mut dont_ask_again = self.paste_dont_ask_again;
         // Some(true) = paste, Some(false) = cancel.
         egui::Window::new("⚠ 确认粘贴")
             .collapsible(false)
@@ -676,6 +678,8 @@ impl TerminalApp {
                             });
                     });
                 ui.add_space(8.0);
+                ui.checkbox(&mut dont_ask_again, "不再询问(可在配置里重新开启)");
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("取消").clicked() {
                         decision = Some(false);
@@ -693,9 +697,20 @@ impl TerminalApp {
                 }
             });
 
+        self.paste_dont_ask_again = dont_ask_again;
+
         let Some(confirmed) = decision else {
             return;
         };
+        // 用户做出选择后:若勾选"不再询问"则关掉确认对话框并落盘。
+        // 取消粘贴时也尊重选择,符合"我不想再被打扰"的语义。
+        if dont_ask_again && self.config.paste_confirm {
+            self.config.paste_confirm = false;
+            if let Err(e) = self.config.save() {
+                eprintln!("[Config] failed to save paste_confirm preference: {}", e);
+            }
+        }
+        self.paste_dont_ask_again = false;
         let pending = self
             .pending_paste_confirm
             .take()

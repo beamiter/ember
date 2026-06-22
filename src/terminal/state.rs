@@ -1568,12 +1568,26 @@ impl super::TerminalState {
                     cols.saturating_sub(1)
                 };
 
+                // 行是否因到达行末被自动换行(软换行)。复制时软换行不应插入 \n,
+                // 否则像 URL 这种被终端宽度截断的字符串会被切断成多段。
+                let row_wrapped = if abs_row < scrollback_len {
+                    self.scrollback[abs_row].is_wrapped
+                } else {
+                    let grid_row = abs_row - scrollback_len;
+                    self.grid
+                        .row_wrapped
+                        .get(grid_row)
+                        .copied()
+                        .unwrap_or(false)
+                };
+
+                let mut line_buf = String::new();
                 if abs_row < scrollback_len {
                     // Read from scrollback
                     let line = self.scrollback[abs_row].decompress();
                     for col in start_col..=end_col.min(line.len().saturating_sub(1)) {
                         if !line[col].flags.wide_continuation() {
-                            result.push(line[col].character);
+                            line_buf.push(line[col].character);
                         }
                     }
                 } else {
@@ -1583,13 +1597,22 @@ impl super::TerminalState {
                         for col in start_col..=end_col {
                             let cell = self.grid.get(grid_row, col);
                             if !cell.flags.wide_continuation() {
-                                result.push(cell.character);
+                                line_buf.push(cell.character);
                             }
                         }
                     }
                 }
 
-                if abs_row < end.0 {
+                // 软换行(URL 等被终端宽度截断)拼接时去掉尾部填充空白,
+                // 避免还原后的字符串里夹杂大段空格。
+                if row_wrapped && abs_row < end.0 {
+                    let trimmed_len = line_buf.trim_end_matches(' ').len();
+                    line_buf.truncate(trimmed_len);
+                }
+
+                result.push_str(&line_buf);
+
+                if abs_row < end.0 && !row_wrapped {
                     result.push('\n');
                 }
             }

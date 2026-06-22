@@ -870,6 +870,7 @@ impl TerminalApp {
             smooth_scroll_velocity: 0.0,
             smooth_scroll_pixel_offset: 0.0,
             pending_paste_confirm: None,
+            paste_dont_ask_again: false,
         })
     }
 
@@ -1347,7 +1348,9 @@ impl eframe::App for TerminalApp {
                                     let terminal = session.terminal.lock();
                                     terminal.is_bracketed_paste_enabled()
                                 };
-                                if should_confirm_paste(&normalized) {
+                                if self.config.paste_confirm
+                                    && should_confirm_paste(&normalized)
+                                {
                                     self.pending_paste_confirm =
                                         Some(crate::app::state::PendingPasteConfirm {
                                             text: normalized,
@@ -1462,7 +1465,9 @@ impl eframe::App for TerminalApp {
                                         let terminal = session.terminal.lock();
                                         terminal.is_bracketed_paste_enabled()
                                     };
-                                    if should_confirm_paste(&normalized) {
+                                    if self.config.paste_confirm
+                                        && should_confirm_paste(&normalized)
+                                    {
                                         self.pending_paste_confirm =
                                             Some(crate::app::state::PendingPasteConfirm {
                                                 text: normalized,
