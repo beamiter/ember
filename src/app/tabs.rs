@@ -54,28 +54,40 @@ impl TerminalApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
+                let row_h = ui.spacing().interact_size.y;
                 for (i, title) in &infos {
                     let is_active = *i == active;
                     ui.horizontal(|ui| {
-                        if multi
-                            && ui
-                                .small_button("✕")
-                                .on_hover_text("关闭会话")
-                                .clicked()
-                        {
-                            close_idx = Some(*i);
-                        }
-                        let marker = if is_active { "● " } else { "  " };
-                        let resp = ui.add_sized(
-                            [ui.available_width(), 0.0],
-                            egui::Button::selectable(
-                                is_active,
-                                format!("{}{}", marker, title),
-                            ),
+                        // 让 horizontal 内的控件按行高居中,避免关闭按钮(较小)
+                        // 与标题按钮(较高)对齐到不同基线。
+                        ui.set_min_height(row_h);
+                        ui.with_layout(
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                if multi {
+                                    let close_resp = ui
+                                        .add_sized(
+                                            [row_h, row_h],
+                                            egui::Button::new("✕").small(),
+                                        )
+                                        .on_hover_text("关闭会话");
+                                    if close_resp.clicked() {
+                                        close_idx = Some(*i);
+                                    }
+                                }
+                                let marker = if is_active { "● " } else { "  " };
+                                let resp = ui.add_sized(
+                                    [ui.available_width(), row_h],
+                                    egui::Button::selectable(
+                                        is_active,
+                                        format!("{}{}", marker, title),
+                                    ),
+                                );
+                                if resp.clicked() {
+                                    switch_to = Some(*i);
+                                }
+                            },
                         );
-                        if resp.clicked() {
-                            switch_to = Some(*i);
-                        }
                     });
                 }
             });
