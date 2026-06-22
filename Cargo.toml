@@ -52,12 +52,8 @@ incremental = true
 [profile.dev.package."*"]
 opt-level = 1
 
-[profile.release]
-# 启用 LTO (Link Time Optimization) 提升性能
-lto = "thin"
-# 剥离调试符号减小二进制大小
-strip = true
-# 单个代码生成单元以最大化优化（会增加编译时间）
-codegen-units = 1
-# 启用更激进的优化
-opt-level = 3
+# [profile.release]
+# lto = "thin"
+# strip = true
+# codegen-units = 1
+# opt-level = 3
