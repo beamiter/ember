@@ -36,6 +36,7 @@ impl TerminalApp {
     }
 
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
+    /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
         let active = self.session_manager.active_index();
         let infos: Vec<(usize, String)> = self
@@ -50,6 +51,18 @@ impl TerminalApp {
         let mut switch_to: Option<usize> = None;
         let mut close_idx: Option<usize> = None;
         let mut new_session = false;
+        let mut reorder: Option<(usize, usize)> = None;
+
+        // 拖拽阈值与顶部 tab bar 保持一致(5px),用 y 轴判断
+        let ctx = ui.ctx().clone();
+        let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let is_actually_dragging = match (self.dragging_tab, self.drag_start_pos, pointer_pos) {
+            (Some(_), Some(start_y), Some(p)) => (p.y - start_y).abs() > 5.0,
+            _ => false,
+        };
+
+        // 收集本帧每行的矩形,渲染后用于命中检测/插入指示线
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(infos.len());
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
@@ -57,9 +70,8 @@ impl TerminalApp {
                 let row_h = ui.spacing().interact_size.y;
                 for (i, title) in &infos {
                     let is_active = *i == active;
-                    ui.horizontal(|ui| {
-                        // 让 horizontal 内的控件按行高居中,避免关闭按钮(较小)
-                        // 与标题按钮(较高)对齐到不同基线。
+                    let is_dragging_this = self.dragging_tab == Some(*i);
+                    let row_resp = ui.horizontal(|ui| {
                         ui.set_min_height(row_h);
                         ui.with_layout(
                             egui::Layout::left_to_right(egui::Align::Center),
@@ -76,27 +88,130 @@ impl TerminalApp {
                                     }
                                 }
                                 let marker = if is_active { "● " } else { "  " };
-                                let resp = ui.add_sized(
-                                    [ui.available_width(), row_h],
-                                    egui::Button::selectable(
-                                        is_active,
-                                        format!("{}{}", marker, title),
+                                // 拖拽中的源 tab 略微淡化
+                                let dim = is_dragging_this && is_actually_dragging;
+                                let btn = egui::Button::selectable(
+                                    is_active,
+                                    egui::RichText::new(format!("{}{}", marker, title)).color(
+                                        if dim {
+                                            ui.visuals().weak_text_color()
+                                        } else if is_active {
+                                            ui.visuals().strong_text_color()
+                                        } else {
+                                            ui.visuals().text_color()
+                                        },
                                     ),
-                                );
-                                if resp.clicked() {
+                                )
+                                .sense(egui::Sense::click_and_drag());
+                                let resp = ui.add_sized([ui.available_width(), row_h], btn);
+
+                                // 拖拽开始:仅在按下且尚未跟踪时记录起点
+                                if resp.drag_started() {
+                                    self.dragging_tab = Some(*i);
+                                    self.drag_start_pos = resp
+                                        .interact_pointer_pos()
+                                        .or(pointer_pos)
+                                        .map(|p| p.y);
+                                }
+                                // 简单点击(没越过阈值):切换 tab
+                                if resp.clicked() && !is_actually_dragging {
                                     switch_to = Some(*i);
                                 }
                             },
                         );
                     });
+                    row_rects.push((*i, row_resp.response.rect));
                 }
             });
+
+        // 拖拽结束:松开鼠标
+        let any_released = ctx.input(|i| i.pointer.any_released());
+        if any_released {
+            if is_actually_dragging {
+                if let (Some(from_idx), Some(p)) = (self.dragging_tab, pointer_pos) {
+                    // 找到光标所在行;否则若超出列表,夹到最后一行
+                    let mut target_idx = from_idx;
+                    let mut matched = false;
+                    for (idx, rect) in &row_rects {
+                        if p.y >= rect.top() && p.y < rect.bottom() {
+                            target_idx = *idx;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        if let Some((idx, rect)) = row_rects.last() {
+                            if p.y >= rect.bottom() {
+                                target_idx = *idx;
+                            }
+                        }
+                        if let Some((idx, rect)) = row_rects.first() {
+                            if p.y < rect.top() {
+                                target_idx = *idx;
+                            }
+                        }
+                    }
+                    if target_idx != from_idx {
+                        reorder = Some((from_idx, target_idx));
+                    }
+                }
+            }
+            self.dragging_tab = None;
+            self.drag_start_pos = None;
+        }
+
+        // 拖拽过程中绘制插入指示线
+        if is_actually_dragging {
+            if let (Some(from_idx), Some(p)) = (self.dragging_tab, pointer_pos) {
+                let accent = crate::theme::Theme::rgb_to_color32(
+                    self.renderer.theme.tabbar.active_border,
+                );
+                let painter = ui.painter();
+                let mut drawn = false;
+                for (idx, rect) in &row_rects {
+                    if p.y >= rect.top() && p.y < rect.bottom() {
+                        // 按光标在行内的上/下半决定插入到该行上沿还是下沿
+                        let line_y = if p.y - rect.center().y < 0.0 {
+                            rect.top()
+                        } else {
+                            rect.bottom()
+                        };
+                        let _ = idx;
+                        painter.hline(
+                            rect.left()..=rect.right(),
+                            line_y,
+                            egui::Stroke::new(2.0, accent),
+                        );
+                        drawn = true;
+                        break;
+                    }
+                }
+                if !drawn {
+                    if let Some((_, rect)) = row_rects.last() {
+                        if p.y >= rect.bottom() {
+                            painter.hline(
+                                rect.left()..=rect.right(),
+                                rect.bottom(),
+                                egui::Stroke::new(2.0, accent),
+                            );
+                        }
+                    }
+                }
+                let _ = from_idx;
+                // 拖拽中持续重绘
+                ctx.request_repaint();
+            }
+        }
 
         ui.add_space(4.0);
         if ui.button("＋ New session").clicked() {
             new_session = true;
         }
 
+        if let Some((from_idx, to_idx)) = reorder {
+            self.session_manager.reorder_sessions(from_idx, to_idx);
+            self.schedule_session_save();
+        }
         if let Some(i) = switch_to {
             self.session_manager.switch_session(i);
             self.force_resize_session = true;
