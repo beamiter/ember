@@ -537,3 +537,38 @@
         assert_eq!(terminal.cursor_col, 2);
         assert_eq!(terminal.grid[0][2].character, 'd');
     }
+
+    #[test]
+    fn decrc_restores_pending_wrap_so_right_prompt_does_not_drop_cursor() {
+        // Repro for the starship cmd_duration / RPROMPT issue:
+        // 左 prompt 后 ESC 7,移到右侧写满末列(置位 pending_wrap),
+        // ESC 8 恢复光标。VT510 规范下 DECRC 必须恢复保存时的 Last Column
+        // Flag(此处为 false),否则后续字符(zsh-autosuggestions ghost text)
+        // 会立刻触发换行,在屏底引发滚动,看上去光标多下移一行。
+        let mut terminal = TerminalState::new(6, 3); // 6 cols × 3 rows
+
+        // 左 prompt 写到第 0 行第 2 列,保存光标(pending_wrap=false)
+        terminal.process_input(b"P>");
+        terminal.process_input(b"\x1b7");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 2);
+        assert!(!terminal.pending_wrap);
+
+        // 移到末列写入,触发 pending_wrap(末列延迟换行)
+        terminal.process_input(b"\x1b[6GR");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 5);
+        assert!(terminal.pending_wrap);
+
+        // 恢复光标:应同时恢复 pending_wrap=false
+        terminal.process_input(b"\x1b8");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 2);
+        assert!(!terminal.pending_wrap, "DECRC must restore the Last Column Flag");
+
+        // 下一字符不应再触发换行
+        terminal.process_input(b"x");
+        assert_eq!(terminal.cursor_row, 0);
+        assert_eq!(terminal.cursor_col, 3);
+        assert_eq!(terminal.grid[0][2].character, 'x');
+    }

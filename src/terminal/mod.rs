@@ -188,6 +188,11 @@ struct SavedCursorState {
     active: Charset,
     origin_mode: bool,
     autowrap: bool,
+    // VT510: DECSC 须保存 Last Column Flag(延迟换行标志),DECRC 须恢复。
+    // 否则右 prompt(如 starship cmd_duration)写到末列后 pending_wrap=true,
+    // 经 CSI u/ESC 8 恢复光标到 prompt 之后,下一字符(如 zsh-autosuggestions 的
+    // ghost 文本)会立刻触发换行,在屏底触发滚动,光标看似下移一行。
+    pending_wrap: bool,
 }
 
 pub struct TerminalState {

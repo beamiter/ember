@@ -71,6 +71,7 @@ impl super::TerminalState {
             active: self.active_charset,
             origin_mode: self.origin_mode,
             autowrap: self.modes.contains(&7),
+            pending_wrap: self.pending_wrap,
         });
     }
 
@@ -92,9 +93,11 @@ impl super::TerminalState {
             } else {
                 self.modes.remove(&7);
             }
+            self.pending_wrap = s.pending_wrap;
         } else {
             self.cursor_row = 0;
             self.cursor_col = 0;
+            self.pending_wrap = false;
         }
     }
 
