@@ -9,6 +9,9 @@ pub struct SessionSnapshot {
     pub cwd: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 用户在 tab 上双击重命名后的显示名;Some 时覆盖 CWD-derived 标题。
+    #[serde(default)]
+    pub custom_name: Option<String>,
 }
 
 /// 会话列表快照
@@ -137,12 +140,14 @@ mod tests {
                 tags: vec!["dev".to_string()],
                 cwd: Some("/home/user".to_string()),
                 session_id: Some("123-456".to_string()),
+                custom_name: None,
             },
             SessionSnapshot {
                 name: "Session 2".to_string(),
                 tags: vec!["test".to_string()],
                 cwd: Some("/tmp".to_string()),
                 session_id: None,
+                custom_name: None,
             },
         ];
 

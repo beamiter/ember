@@ -32,6 +32,7 @@ impl TerminalApp {
                     } if *pressed => match key {
                         egui::Key::Escape => {
                             self.search_state.close();
+                            self.save_ui_history();
                         }
                         egui::Key::Enter => {
                             if !modifiers.shift {
@@ -79,6 +80,8 @@ impl TerminalApp {
                             egui::Key::Enter => {
                                 if let Some(command) = self.command_palette.get_selected_command() {
                                     self.command_palette.execute_command(command.clone());
+                                    // 持久化最近命令,避免 crash/Force-quit 丢失 MRU。
+                                    self.save_ui_history();
                                     self.command_palette.close();
                                     // 执行命令
                                     match command {
@@ -87,6 +90,7 @@ impl TerminalApp {
                                         }
                                         keybindings::Command::SearchClose => {
                                             self.search_state.close();
+                                            self.save_ui_history();
                                         }
                                         keybindings::Command::SessionNew => {
                                             let new_idx =
@@ -126,6 +130,13 @@ impl TerminalApp {
                                                 self.force_resize_session = true;
                                             }
                                         }
+                                        keybindings::Command::SessionPrevActive => {
+                                            if self.session_manager.switch_to_previous_active() {
+                                                self.force_resize_session = true;
+                                            } else {
+                                                self.set_status("No previous session to switch to");
+                                            }
+                                        }
                                         keybindings::Command::TerminalScrollUp => {
                                             let session =
                                                 self.session_manager.get_active_session_mut();
@@ -143,21 +154,25 @@ impl TerminalApp {
                                             }
                                         }
                                         keybindings::Command::TerminalJumpPrevCommand => {
-                                            let session =
-                                                self.session_manager.get_active_session_mut();
-                                            let mut terminal = session.terminal.lock();
-                                            if !terminal.jump_to_prev_command() {
-                                                self.status_message =
-                                                    "No previous command mark".to_string();
+                                            let jumped = {
+                                                let session =
+                                                    self.session_manager.get_active_session_mut();
+                                                let mut terminal = session.terminal.lock();
+                                                terminal.jump_to_prev_command()
+                                            };
+                                            if !jumped {
+                                                self.set_status("No previous command mark");
                                             }
                                         }
                                         keybindings::Command::TerminalJumpNextCommand => {
-                                            let session =
-                                                self.session_manager.get_active_session_mut();
-                                            let mut terminal = session.terminal.lock();
-                                            if !terminal.jump_to_next_command() {
-                                                self.status_message =
-                                                    "No next command mark".to_string();
+                                            let jumped = {
+                                                let session =
+                                                    self.session_manager.get_active_session_mut();
+                                                let mut terminal = session.terminal.lock();
+                                                terminal.jump_to_next_command()
+                                            };
+                                            if !jumped {
+                                                self.set_status("No next command mark");
                                             }
                                         }
                                         // 分屏命令处理
@@ -168,7 +183,7 @@ impl TerminalApp {
                                             let _ =
                                                 self.layout_manager.split(new_session_idx, false);
                                             self.sync_active_session_to_focused_pane();
-                                            self.status_message = "Split vertically".to_string();
+                                            self.set_status("Split vertically");
                                             self.schedule_session_save();
                                         }
                                         keybindings::Command::TerminalSplitHorizontal => {
@@ -178,14 +193,14 @@ impl TerminalApp {
                                             let _ =
                                                 self.layout_manager.split(new_session_idx, true);
                                             self.sync_active_session_to_focused_pane();
-                                            self.status_message = "Split horizontally".to_string();
+                                            self.set_status("Split horizontally");
                                             self.schedule_session_save();
                                         }
                                         keybindings::Command::TerminalClosePane => {
                                             // 关闭当前窗格
                                             if let Err(e) = self.layout_manager.close_focused_pane()
                                             {
-                                                self.status_message = e;
+                                                self.set_status(e);
                                             } else {
                                                 self.sync_active_session_to_focused_pane();
                                             }
@@ -282,6 +297,7 @@ impl TerminalApp {
                         }
                         keybindings::Command::SearchClose => {
                             self.search_state.close();
+                            self.save_ui_history();
                         }
                         keybindings::Command::SessionNew => {
                             let new_idx = self.create_session_with_current_config(None, None);
@@ -314,6 +330,13 @@ impl TerminalApp {
                             if n < 9 {
                                 self.session_manager.switch_session(n);
                                 self.force_resize_session = true;
+                            }
+                        }
+                        keybindings::Command::SessionPrevActive => {
+                            if self.session_manager.switch_to_previous_active() {
+                                self.force_resize_session = true;
+                            } else {
+                                self.set_status("No previous session to switch to");
                             }
                         }
                         keybindings::Command::TerminalScrollUp => {

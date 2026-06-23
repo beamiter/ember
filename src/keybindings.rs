@@ -12,6 +12,7 @@ pub enum Command {
     SessionNext,
     SessionPrev,
     SessionJump(usize), // 跳转到第 N 个会话 (0-8)
+    SessionPrevActive,  // 在最近两个会话间快速来回(类似 Vim Ctrl+^)
 
     // === 编辑操作 ===
     EditCopy,
@@ -62,6 +63,7 @@ impl std::fmt::Display for Command {
             Command::SessionNext => write!(f, "session:next"),
             Command::SessionPrev => write!(f, "session:prev"),
             Command::SessionJump(n) => write!(f, "session:jump:{}", n),
+            Command::SessionPrevActive => write!(f, "session:prev_active"),
             Command::EditCopy => write!(f, "edit:copy"),
             Command::EditPaste => write!(f, "edit:paste"),
             Command::SearchOpen => write!(f, "search:open"),
@@ -101,6 +103,7 @@ impl std::str::FromStr for Command {
             "session:close" => Ok(Command::SessionClose),
             "session:next" => Ok(Command::SessionNext),
             "session:prev" => Ok(Command::SessionPrev),
+            "session:prev_active" => Ok(Command::SessionPrevActive),
             "edit:copy" => Ok(Command::EditCopy),
             "edit:paste" => Ok(Command::EditPaste),
             "search:open" => Ok(Command::SearchOpen),
@@ -180,6 +183,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+pageup".to_string(), "session:prev".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+`".to_string(), "session:prev_active".to_string());
 
         // 会话切换（数字快捷键）
         for i in 0..9 {

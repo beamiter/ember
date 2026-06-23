@@ -2,6 +2,7 @@
 
 use super::state::TerminalApp;
 use crate::config;
+use crate::history_persistence;
 use crate::session_persistence;
 
 impl TerminalApp {
@@ -24,6 +25,21 @@ impl TerminalApp {
     pub fn schedule_session_save(&mut self) {
         self.session_save_pending = true;
         self.session_save_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    }
+
+    /// 即时持久化命令面板最近命令 + 搜索历史。两者都很小,无需 debounce。
+    /// 写盘失败只记日志,不影响交互(下次启动顶多丢一次新增项)。
+    pub fn save_ui_history(&self) {
+        if let Ok(path) = config::Config::ui_history_path() {
+            let snapshot = history_persistence::HistorySnapshot {
+                version: 1,
+                recent_commands: self.command_palette.recent_commands_snapshot(),
+                search_history: self.search_state.history.iter().cloned().collect(),
+            };
+            if let Err(e) = snapshot.save(&path) {
+                eprintln!("[HistoryPersistence] Failed to save: {}", e);
+            }
+        }
     }
 
     pub fn flush_session_save(&mut self) {
@@ -71,6 +87,8 @@ impl TerminalApp {
                         eprintln!("[Config] Hot-reload parse error: {}", e);
                         // 同时在状态栏提示用户,避免改坏配置后毫无反馈、误以为已生效。
                         self.status_message = format!("配置解析失败,已沿用旧配置: {}", e);
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
                     }
                 }
             }

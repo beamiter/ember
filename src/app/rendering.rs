@@ -2,7 +2,7 @@
 
 use super::state::TerminalApp;
 use crate::{
-    command_palette, config, config_panel, keybindings, layout, search, search_replace_panel, theme,
+    command_palette, config, config_panel, layout, search, search_replace_panel, theme,
 };
 use eframe::egui;
 
@@ -250,9 +250,9 @@ impl TerminalApp {
             egui::Window::new("Search")
                 .title_bar(false)
                 .resizable(false)
-                .default_pos(egui::pos2(ctx.available_rect().right() - 350.0, 60.0))
-                .default_size([340.0, 50.0])
-                .fixed_size([340.0, 50.0])
+                .default_pos(egui::pos2(ctx.available_rect().right() - 430.0, 60.0))
+                .default_size([420.0, 50.0])
+                .fixed_size([420.0, 50.0])
                 .frame(egui::Frame {
                     fill: crate::theme::Theme::rgb_to_color32(self.current_theme.search.bg),
                     stroke: egui::Stroke::new(
@@ -275,7 +275,22 @@ impl TerminalApp {
                             self.search_state.search_focused = false;
                         }
 
-                        if search_response.changed() {
+                        // Aa / .* 切换按钮:用 selectable_label 表达 on/off 状态。
+                        // 切换后需要立刻按新选项重新搜索,否则用户看不到效果。
+                        let case_btn = ui
+                            .selectable_label(self.search_state.case_sensitive, "Aa")
+                            .on_hover_text("区分大小写 (Match Case)");
+                        if case_btn.clicked() {
+                            self.search_state.case_sensitive = !self.search_state.case_sensitive;
+                        }
+                        let regex_btn = ui
+                            .selectable_label(self.search_state.use_regex, ".*")
+                            .on_hover_text("正则表达式 (Regex)");
+                        if regex_btn.clicked() {
+                            self.search_state.use_regex = !self.search_state.use_regex;
+                        }
+
+                        if search_response.changed() || case_btn.clicked() || regex_btn.clicked() {
                             // 重新搜索
                             let session = self.session_manager.get_active_session_mut();
                             let terminal = session.terminal.lock();
@@ -313,6 +328,7 @@ impl TerminalApp {
                         // 关闭按钮
                         if ui.button("✕").clicked() {
                             self.search_state.close();
+                            self.save_ui_history();
                         }
                     });
 
@@ -428,22 +444,17 @@ impl TerminalApp {
                                         );
                                     });
 
-                                    // 快捷键显示
-                                    let keybinding_str = self
+                                    // 快捷键显示 — 走 pretty_bindings_for 统一美化:
+                                    // 之前直接展示原始小写 "ctrl+shift+f",这里改为 "Ctrl+Shift+F",
+                                    // 与帮助面板保持一致。
+                                    let pretty = self
                                         .keybindings
-                                        .bindings
-                                        .iter()
-                                        .find(|(_, cmd)| {
-                                            if let Ok(parsed_cmd) =
-                                                cmd.parse::<keybindings::Command>()
-                                            {
-                                                parsed_cmd == cmd_info.command
-                                            } else {
-                                                false
-                                            }
-                                        })
-                                        .map(|(binding, _)| binding.clone())
-                                        .unwrap_or_else(|| "No binding".to_string());
+                                        .pretty_bindings_for(&cmd_info.command.to_string());
+                                    let keybinding_str = if pretty.is_empty() {
+                                        "No binding".to_string()
+                                    } else {
+                                        pretty.join(" / ")
+                                    };
 
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -569,6 +580,10 @@ impl TerminalApp {
             }
         }
 
+        // 状态 toast(右下角)——把分散在 input/main/window 里写入 status_message
+        // 的反馈集中显示;过期由 current_status_for_display 内部判定后清理。
+        self.render_status_toast(ctx);
+
         // Debug overlay panel — only gather stats (and lock the terminal) when open.
         if self.debug_panel.is_open {
             let session = self.session_manager.get_active_session_mut();
@@ -598,6 +613,62 @@ impl TerminalApp {
                 frame_budget_kb,
             );
         }
+    }
+
+    /// 状态消息 toast。固定锚在屏幕右下角,过期后下一帧自动消失。
+    /// 之前 status_message 被多处写入却没有渲染端,所有反馈都被悄悄丢弃。
+    fn render_status_toast(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.current_status_for_display().map(|s| s.to_string()) else {
+            return;
+        };
+        // 临近过期时淡出,避免突兀消失。
+        let fade_alpha: f32 = if let Some(deadline) = self.status_expires_at {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs_f32();
+            // 最后 350ms 做线性淡出
+            (remaining / 0.35).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if fade_alpha <= 0.0 {
+            return;
+        }
+
+        let panel_bg = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
+        let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
+        let text_color = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.text);
+        let alpha = (fade_alpha * 230.0) as u8;
+        let bg = egui::Color32::from_rgba_unmultiplied(
+            panel_bg.r(),
+            panel_bg.g(),
+            panel_bg.b(),
+            alpha,
+        );
+
+        egui::Area::new(egui::Id::new("status_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame {
+                    fill: bg,
+                    stroke: egui::Stroke::new(1.0, border),
+                    corner_radius: egui::CornerRadius::same(8),
+                    inner_margin: egui::Margin::symmetric(12, 8),
+                    ..Default::default()
+                }
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(message)
+                            .color(text_color.gamma_multiply(fade_alpha))
+                            .size(12.0),
+                    );
+                });
+            });
+
+        // 还在显示期间持续重绘,保证淡出/到期清理及时生效。
+        ctx.request_repaint();
     }
 
     fn show_paste_confirm_dialog(&mut self, ctx: &egui::Context) {

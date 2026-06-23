@@ -20,6 +20,13 @@ pub struct SessionMetadata {
     pub tags: Vec<String>,
     pub session_id: String,
     pub last_active: Instant,
+    /// 后台会话在用户未查看期间是否有新输出。切换到该会话时清零。
+    /// 用作 tab 上的活动指示点,避免用户在多 tab 间反复切换确认。
+    pub unseen_output: bool,
+    /// 用户通过双击 tab 显式重命名后保留的标题。Some 时覆盖 CWD-derived
+    /// 标题(仍由 session_cwd_title 读取);None 表示沿用默认推导。空字符串
+    /// 视同 None,由提交逻辑负责规范化,避免 UI 显示空标签。
+    pub custom_name: Option<String>,
 }
 
 impl SessionMetadata {
@@ -29,6 +36,8 @@ impl SessionMetadata {
             tags,
             session_id: generate_session_id(),
             last_active: Instant::now(),
+            unseen_output: false,
+            custom_name: None,
         }
     }
 

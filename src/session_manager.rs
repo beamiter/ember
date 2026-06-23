@@ -20,6 +20,10 @@ pub struct SessionManager {
     active_index: usize,
     repaint_ctx: egui::Context,
     configured_shell: Option<String>,
+    /// 最近一次被切走的会话的稳定 ID。用于 SessionPrevActive
+    /// (类似 Vim 的 Ctrl+^) 在两个 tab 间快速来回。存 session_id 而非
+    /// index,避免增删/重排后索引漂移导致跳错。
+    previous_session_id: Option<String>,
 }
 
 impl SessionManager {
@@ -30,6 +34,7 @@ impl SessionManager {
             active_index: 0,
             repaint_ctx,
             configured_shell,
+            previous_session_id: None,
         }
     }
 
@@ -108,13 +113,52 @@ impl SessionManager {
     /// 切换到指定会话
     pub fn switch_session(&mut self, index: usize) -> bool {
         if index < self.sessions.len() {
+            // 仅在真正切走时记录前一个会话的稳定 ID,供 SessionPrevActive 反跳。
+            // 跳同一个 tab 不算切换,否则 Ctrl+` 反跳会失去意义。
+            if index != self.active_index {
+                if let Some(prev) = self.sessions.get(self.active_index) {
+                    self.previous_session_id = Some(prev.metadata.session_id.clone());
+                }
+            }
             self.active_index = index;
             if let Some(session) = self.sessions.get_mut(index) {
                 session.metadata.update_last_active();
+                // 切到该会话即视为"已查看",清掉活动指示点。
+                session.metadata.unseen_output = false;
             }
             true
         } else {
             false
+        }
+    }
+
+    /// 跳到最近一次被切走的会话(若仍存在)。返回是否成功跳转。
+    pub fn switch_to_previous_active(&mut self) -> bool {
+        let Some(prev_id) = self.previous_session_id.clone() else {
+            return false;
+        };
+        let target = self
+            .sessions
+            .iter()
+            .position(|s| s.metadata.session_id == prev_id);
+        match target {
+            Some(idx) if idx != self.active_index => self.switch_session(idx),
+            _ => false,
+        }
+    }
+
+    /// 扫描所有后台会话:若其 shell 事件通道有未消费数据,标记 unseen_output。
+    /// 主循环每帧只 drain active session,这里用通道非空作为"后台有产出"的代理。
+    pub fn refresh_unseen_flags(&mut self) {
+        let active = self.active_index;
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            if i == active {
+                s.metadata.unseen_output = false;
+                continue;
+            }
+            if !s.shell.events().is_empty() {
+                s.metadata.unseen_output = true;
+            }
         }
     }
 
@@ -195,6 +239,7 @@ impl SessionManager {
                     tags: s.metadata.tags.clone(),
                     cwd,
                     session_id: Some(s.metadata.session_id.clone()),
+                    custom_name: s.metadata.custom_name.clone(),
                 }
             })
             .collect()
@@ -211,6 +256,7 @@ impl SessionManager {
             if let Some(session) = self.sessions.get_mut(0) {
                 session.metadata.name = first.name.clone();
                 session.metadata.tags = first.tags.clone();
+                session.metadata.custom_name = first.custom_name.clone();
                 if let Some(ref sid) = first.session_id {
                     session.metadata.session_id = sid.clone();
                 }
@@ -228,6 +274,7 @@ impl SessionManager {
                     if let Some(sid) = snap.session_id {
                         session.metadata.session_id = sid;
                     }
+                    session.metadata.custom_name = snap.custom_name;
                     self.sessions.push(session);
                 }
                 Err(e) => {

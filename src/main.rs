@@ -9,6 +9,7 @@ mod debug;
 mod debug_panel;
 mod gpu;
 mod help;
+mod history_persistence;
 mod keybindings;
 mod kitty_graphics;
 mod layout;
@@ -811,6 +812,18 @@ impl TerminalApp {
             pane_renderers.push(pr);
         }
 
+        // 命令面板/搜索历史:启动时一次性读盘,失败回 Default(load 已吞日志)。
+        let history = config::Config::ui_history_path()
+            .map(|p| history_persistence::HistorySnapshot::load(&p))
+            .unwrap_or_default();
+
+        let mut command_palette = command_palette::CommandPalette::new();
+        command_palette.restore_recent_commands(history.recent_commands);
+        let mut search_state = search::SearchState::new();
+        for entry in history.search_history.into_iter().take(50) {
+            search_state.history.push_back(entry);
+        }
+
         Ok(TerminalApp {
             session_manager,
             input_queue: Arc::new(ParkingMutex::new(Vec::new())),
@@ -822,13 +835,15 @@ impl TerminalApp {
             cursor_visible: true,
             last_activity_time: std::time::Instant::now(),
             status_message: String::new(),
+            status_expires_at: None,
             last_window_title: String::new(),
             hovered_tab_index: None,
             dragging_tab: None,
             drag_start_pos: None,
             current_mouse_x: 0.0,
             tab_scroll_offset: 0.0,
-            search_state: search::SearchState::new(),
+            renaming_tab: None,
+            search_state,
             sidebar: {
                 let mut sb = sidebar::Sidebar::new();
                 sb.visible = false; // 默认隐藏，opt-in 切换
@@ -843,7 +858,7 @@ impl TerminalApp {
             cached_links_scroll_offset: 0,
             cached_links_session_idx: usize::MAX,
             keybindings,
-            command_palette: command_palette::CommandPalette::new(),
+            command_palette,
             force_resize_session: false,
             current_theme,
             layout_manager,
@@ -1326,9 +1341,22 @@ impl eframe::App for TerminalApp {
 
         if saw_ctrl_shift_c {
             if let Some(clipboard) = &self.clipboard {
-                let terminal = session.terminal.lock();
-                if let Some(text) = terminal.copy_selection() {
-                    if let Err(e) = clipboard.copy(&text) { log::warn!("{}", e); }
+                let copied = {
+                    let terminal = session.terminal.lock();
+                    terminal.copy_selection()
+                };
+                if let Some(text) = copied {
+                    let n = text.chars().count();
+                    let (msg, dur) = match clipboard.copy(&text) {
+                        Ok(_) => (format!("已复制 {} 个字符", n), Duration::from_millis(1800)),
+                        Err(e) => {
+                            log::warn!("{}", e);
+                            ("复制失败".to_string(), Duration::from_secs(3))
+                        }
+                    };
+                    // 直接写字段以避开 &mut self(session 仍持有可变借用)。
+                    self.status_message = msg;
+                    self.status_expires_at = Some(std::time::Instant::now() + dur);
                     consumed_keys.insert("Ctrl+Shift+C".to_string());
                 }
             }
@@ -1619,12 +1647,16 @@ impl eframe::App for TerminalApp {
                     Ok(ShellEvent::Exit(code)) => {
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
                         self.status_message = format!("Shell exited with code: {}", code);
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(6));
                         has_new_output = true;
                         shell_exited = true;
                         break;
                     }
                     Ok(ShellEvent::Error(e)) => {
                         self.status_message = format!("Error: {}", e);
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(6));
                         has_new_output = true;
                         break;
                     }
@@ -1654,7 +1686,8 @@ impl eframe::App for TerminalApp {
             let mut terminal = session.terminal.lock();
             terminal.process_batch(&accumulated_data);
             terminal.check_sync_output_timeout();
-            self.status_message.clear();
+            // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
+            // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
             // 有输出时更新最后活动时间
             self.last_activity_time = std::time::Instant::now();
         }
@@ -2070,19 +2103,45 @@ impl eframe::App for TerminalApp {
                 }
             }
 
+            // 链接悬停提示:在指针右下方画一个浮层显示完整 URL 和 Ctrl+Click 操作提示。
+            // OSC8 等链接显示的"文本"可能与真实目标不同(例如 "click here"),
+            // 鼠标悬停透出真实跳转目标,避免用户被诱导点击未知链接。
+            if let Some(ref link) = self.hovered_link {
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    egui::Area::new(egui::Id::new("link_hover_tooltip"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(pos + egui::vec2(14.0, 18.0))
+                        .interactable(false)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_max_width(520.0);
+                                ui.label(
+                                    egui::RichText::new(&link.text).monospace(),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Ctrl+Click 打开")
+                                        .small()
+                                        .weak(),
+                                );
+                            });
+                        });
+                }
+            }
+
             // 处理 Ctrl+Click 打开链接
             if ctx.input(|i| {
                 i.pointer.button_clicked(egui::PointerButton::Primary) && i.modifiers.ctrl
             }) {
-                if let Some(link) = &self.hovered_link {
-                    match link::open_link(link) {
-                        Ok(_) => {
-                            self.status_message = format!("Opened: {}", link.text);
-                        }
-                        Err(e) => {
-                            self.status_message = format!("Failed to open link: {}", e);
-                        }
-                    }
+                if let Some(link) = self.hovered_link.clone() {
+                    let (msg, dur) = match link::open_link(&link) {
+                        Ok(_) => (format!("Opened: {}", link.text), Duration::from_millis(2500)),
+                        Err(e) => (
+                            format!("Failed to open link: {}", e),
+                            Duration::from_secs(4),
+                        ),
+                    };
+                    self.status_message = msg;
+                    self.status_expires_at = Some(std::time::Instant::now() + dur);
                 }
             }
         }

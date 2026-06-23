@@ -129,6 +129,12 @@ impl CommandPalette {
                 "Switch to the previous session",
                 crate::keybindings::Command::SessionPrev,
             ),
+            CommandInfo::new(
+                "Last Active Session",
+                CommandCategory::Session,
+                "Switch back to the most recently focused session",
+                crate::keybindings::Command::SessionPrevActive,
+            ),
             // === 编辑操作 ===
             CommandInfo::new(
                 "Copy",
@@ -310,6 +316,20 @@ impl CommandPalette {
     /// 获取所有搜索结果（用于 UI 显示）
     pub fn get_results(&self) -> &[(CommandInfo, i64)] {
         &self.search_results
+    }
+
+    /// 持久化用:取出最近命令快照(最近的在前)。
+    pub fn recent_commands_snapshot(&self) -> Vec<crate::keybindings::Command> {
+        self.recent_commands.iter().cloned().collect()
+    }
+
+    /// 持久化恢复:从磁盘读出的列表(最近的在前)灌回内部队列,超长则截断。
+    /// 校验上限避免被手改后的脏数据撑大内存。
+    pub fn restore_recent_commands(&mut self, list: Vec<crate::keybindings::Command>) {
+        self.recent_commands.clear();
+        for cmd in list.into_iter().take(self.max_recent) {
+            self.recent_commands.push_back(cmd);
+        }
     }
 }
 

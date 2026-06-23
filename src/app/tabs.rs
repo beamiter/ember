@@ -15,8 +15,14 @@ impl TerminalApp {
         true
     }
 
-    /// 会话标题：优先用 shell 当前工作目录(对 HOME 做 ~ 缩写)，否则回退到会话名。
+    /// 会话标题:用户双击重命名设置的 custom_name 优先;否则用 shell 当前工作
+    /// 目录(对 HOME 做 ~ 缩写);最后回退到会话名。
     pub fn session_cwd_title(session: &crate::session::Session) -> String {
+        if let Some(ref custom) = session.metadata.custom_name {
+            if !custom.is_empty() {
+                return custom.clone();
+            }
+        }
         let pid = session.get_shell_pid();
         crate::session_manager::get_process_cwd(pid)
             .map(|cwd| {
@@ -38,13 +44,14 @@ impl TerminalApp {
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
+        self.session_manager.refresh_unseen_flags();
         let active = self.session_manager.active_index();
-        let infos: Vec<(usize, String)> = self
+        let infos: Vec<(usize, String, bool)> = self
             .session_manager
             .sessions()
             .iter()
             .enumerate()
-            .map(|(i, s)| (i, Self::session_cwd_title(s)))
+            .map(|(i, s)| (i, Self::session_cwd_title(s), s.metadata.unseen_output))
             .collect();
         let multi = infos.len() > 1;
 
@@ -52,6 +59,10 @@ impl TerminalApp {
         let mut close_idx: Option<usize> = None;
         let mut new_session = false;
         let mut reorder: Option<(usize, usize)> = None;
+        let mut begin_rename: Option<usize> = None;
+        // 提交/取消重命名需要在循环外处理,这里只收集事件,避免与 self 借用冲突。
+        let mut commit_rename: Option<(usize, String)> = None;
+        let mut cancel_rename = false;
 
         // 拖拽阈值与顶部 tab bar 保持一致(5px),用 y 轴判断
         let ctx = ui.ctx().clone();
@@ -68,9 +79,11 @@ impl TerminalApp {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 let row_h = ui.spacing().interact_size.y;
-                for (i, title) in &infos {
+                for (i, title, unseen) in &infos {
                     let is_active = *i == active;
                     let is_dragging_this = self.dragging_tab == Some(*i);
+                    let is_renaming_this =
+                        self.renaming_tab.as_ref().map(|(idx, _)| *idx) == Some(*i);
                     let row_resp = ui.horizontal(|ui| {
                         ui.set_min_height(row_h);
                         ui.with_layout(
@@ -87,35 +100,75 @@ impl TerminalApp {
                                         close_idx = Some(*i);
                                     }
                                 }
-                                let marker = if is_active { "● " } else { "  " };
-                                // 拖拽中的源 tab 略微淡化
-                                let dim = is_dragging_this && is_actually_dragging;
-                                let btn = egui::Button::selectable(
-                                    is_active,
-                                    egui::RichText::new(format!("{}{}", marker, title)).color(
-                                        if dim {
-                                            ui.visuals().weak_text_color()
-                                        } else if is_active {
-                                            ui.visuals().strong_text_color()
-                                        } else {
-                                            ui.visuals().text_color()
-                                        },
-                                    ),
-                                )
-                                .sense(egui::Sense::click_and_drag());
-                                let resp = ui.add_sized([ui.available_width(), row_h], btn);
+                                if is_renaming_this {
+                                    // 重命名输入框:取出当前 buf,绘制 TextEdit,事件落入 commit/cancel
+                                    let mut buf = self
+                                        .renaming_tab
+                                        .as_ref()
+                                        .map(|(_, b)| b.clone())
+                                        .unwrap_or_default();
+                                    let edit = egui::TextEdit::singleline(&mut buf)
+                                        .desired_width(ui.available_width())
+                                        .hint_text("(空=清除自定义名)");
+                                    let r = ui.add_sized(
+                                        [ui.available_width(), row_h],
+                                        edit,
+                                    );
+                                    r.request_focus();
+                                    // 同步回 self
+                                    if let Some((_, ref mut existing)) = self.renaming_tab {
+                                        *existing = buf.clone();
+                                    }
+                                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    let lost_focus =
+                                        r.lost_focus() && !enter && !esc;
+                                    if enter {
+                                        commit_rename = Some((*i, buf));
+                                    } else if esc || lost_focus {
+                                        cancel_rename = true;
+                                    }
+                                } else {
+                                    // 活动指示:活跃 tab 用实心圆;后台 tab 有未查看输出时用 accent 圆点提醒。
+                                    let marker = if is_active {
+                                        "● "
+                                    } else if *unseen {
+                                        "• "
+                                    } else {
+                                        "  "
+                                    };
+                                    // 拖拽中的源 tab 略微淡化
+                                    let dim = is_dragging_this && is_actually_dragging;
+                                    let btn = egui::Button::selectable(
+                                        is_active,
+                                        egui::RichText::new(format!("{}{}", marker, title)).color(
+                                            if dim {
+                                                ui.visuals().weak_text_color()
+                                            } else if is_active {
+                                                ui.visuals().strong_text_color()
+                                            } else {
+                                                ui.visuals().text_color()
+                                            },
+                                        ),
+                                    )
+                                    .sense(egui::Sense::click_and_drag());
+                                    let resp = ui
+                                        .add_sized([ui.available_width(), row_h], btn)
+                                        .on_hover_text("双击重命名");
 
-                                // 拖拽开始:仅在按下且尚未跟踪时记录起点
-                                if resp.drag_started() {
-                                    self.dragging_tab = Some(*i);
-                                    self.drag_start_pos = resp
-                                        .interact_pointer_pos()
-                                        .or(pointer_pos)
-                                        .map(|p| p.y);
-                                }
-                                // 简单点击(没越过阈值):切换 tab
-                                if resp.clicked() && !is_actually_dragging {
-                                    switch_to = Some(*i);
+                                    // 拖拽开始:仅在按下且尚未跟踪时记录起点
+                                    if resp.drag_started() {
+                                        self.dragging_tab = Some(*i);
+                                        self.drag_start_pos = resp
+                                            .interact_pointer_pos()
+                                            .or(pointer_pos)
+                                            .map(|p| p.y);
+                                    }
+                                    if resp.double_clicked() {
+                                        begin_rename = Some(*i);
+                                    } else if resp.clicked() && !is_actually_dragging {
+                                        switch_to = Some(*i);
+                                    }
                                 }
                             },
                         );
@@ -209,6 +262,8 @@ impl TerminalApp {
         }
 
         if let Some((from_idx, to_idx)) = reorder {
+            // 重排后索引会漂移,正在编辑的重命名失效,避免提交到错的会话
+            self.renaming_tab = None;
             self.session_manager.reorder_sessions(from_idx, to_idx);
             self.schedule_session_save();
         }
@@ -218,6 +273,7 @@ impl TerminalApp {
         }
         if let Some(i) = close_idx {
             if self.session_manager.len() > 1 {
+                self.renaming_tab = None;
                 self.close_session_synced(i);
                 self.schedule_session_save();
             }
@@ -228,6 +284,44 @@ impl TerminalApp {
             self.force_resize_session = true;
             self.schedule_session_save();
         }
+        if let Some(i) = begin_rename {
+            let initial = self
+                .session_manager
+                .sessions()
+                .get(i)
+                .map(|s| {
+                    s.metadata
+                        .custom_name
+                        .clone()
+                        .unwrap_or_else(|| Self::session_cwd_title(s))
+                })
+                .unwrap_or_default();
+            self.renaming_tab = Some((i, initial));
+        }
+        if let Some((i, new_name)) = commit_rename {
+            self.apply_rename(i, new_name);
+        } else if cancel_rename {
+            self.renaming_tab = None;
+        }
+    }
+
+    /// 应用 tab 重命名:trim 后写入 custom_name(空串等同清除自定义名,回退到 CWD 标题)。
+    /// 触发持久化,确保下次启动保留用户标签。
+    pub fn apply_rename(&mut self, i: usize, raw: String) {
+        let trimmed = raw.trim().to_string();
+        if let Some(s) = self.session_manager.get_session_mut(i) {
+            s.metadata.custom_name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.clone())
+            };
+            // name 字段同时同步,既影响 fallback 也用于持久化里的 name 字段。
+            if !trimmed.is_empty() {
+                s.metadata.name = trimmed;
+            }
+        }
+        self.renaming_tab = None;
+        self.schedule_session_save();
     }
 
     /// 渲染会话标签栏。返回 true 表示请求关闭窗口，render_ui 应据此提前返回。
@@ -318,6 +412,7 @@ impl TerminalApp {
     }
 
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
+                self.session_manager.refresh_unseen_flags();
                 let tab_height = 30.0;
                 let close_btn_size = 14.0;
                 let tab_rect = egui::Rect::from_min_size(
@@ -426,6 +521,13 @@ impl TerminalApp {
                 // 活跃 tab 允许更大的文本宽度
                 let active_max_text = max_tab_width + active_tab_extra - tab_padding;
                 let inactive_max_text = max_tab_width - tab_padding;
+
+                let tab_unseen: Vec<bool> = self
+                    .session_manager
+                    .sessions()
+                    .iter()
+                    .map(|s| s.metadata.unseen_output)
+                    .collect();
 
                 let tab_infos: Vec<(usize, String, f32)> = self
                     .session_manager
@@ -546,6 +648,11 @@ impl TerminalApp {
                     ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
                 let mouse_pressed =
                     ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+                // 双击 tab 进入重命名:此处只检测,具体哪一个 tab 在循环里命中后处理。
+                let mouse_double_clicked =
+                    ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+                let mut begin_rename_idx: Option<usize> = None;
+                let mut renaming_rect: Option<egui::Rect> = None;
 
                 // === 顶栏左侧控件：☰ 侧边栏开关 + ⬓ 标签栏位置切换（始终显示）===
                 {
@@ -891,26 +998,58 @@ impl TerminalApp {
                         }
                     }
 
-                    // 绘制文本（使用 tab 内部 clip 防止文本溢出 tab 边界）
-                    let text_clip = egui::Rect::from_min_max(
-                        tab_rect_item.left_top(),
-                        egui::pos2(
-                            tab_rect_item.right() - close_btn_size - 6.0,
-                            tab_rect_item.bottom(),
-                        ),
-                    );
-                    let text_painter = painter.with_clip_rect(text_clip.intersect(tab_clip_rect));
-                    text_painter.text(
-                        egui::pos2(tab_rect_item.left() + 10.0, tab_rect_item.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        display_text,
-                        egui::FontId::monospace(12.0),
-                        if is_active {
-                            tb_active_text
-                        } else {
-                            tb_inactive_text
-                        },
-                    );
+                    // 双击检测:落在本 tab 矩形且可见 -> 进入重命名
+                    let is_renaming_this =
+                        self.renaming_tab.as_ref().map(|(idx, _)| *idx) == Some(i);
+                    if is_renaming_this {
+                        renaming_rect = Some(tab_rect_item);
+                    }
+                    if mouse_double_clicked && !is_actually_dragging {
+                        if let Some(p) = hover_pos {
+                            if tab_rect_item.contains(p) && tab_clip_rect.contains(p) {
+                                begin_rename_idx = Some(i);
+                            }
+                        }
+                    }
+
+                    // 后台 tab 有未查看输出:在标题左侧画 accent 小圆点提示。
+                    // 活跃 tab 已是聚焦态,无需额外提示。
+                    let has_unseen = !is_active && tab_unseen.get(i).copied().unwrap_or(false);
+                    let text_left_x = if has_unseen {
+                        let dot_center = egui::pos2(
+                            tab_rect_item.left() + 8.0,
+                            tab_rect_item.center().y,
+                        );
+                        clipped_painter.circle_filled(dot_center, 2.5, tb_accent);
+                        tab_rect_item.left() + 16.0
+                    } else {
+                        tab_rect_item.left() + 10.0
+                    };
+
+                    // 重命名中:跳过文本绘制,留给后续 TextEdit 覆盖,避免文字重叠
+                    if !is_renaming_this {
+                        // 绘制文本（使用 tab 内部 clip 防止文本溢出 tab 边界）
+                        let text_clip = egui::Rect::from_min_max(
+                            tab_rect_item.left_top(),
+                            egui::pos2(
+                                tab_rect_item.right() - close_btn_size - 6.0,
+                                tab_rect_item.bottom(),
+                            ),
+                        );
+                        let text_painter =
+                            painter.with_clip_rect(text_clip.intersect(tab_clip_rect));
+                        text_painter.text(
+                            egui::pos2(text_left_x, tab_rect_item.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            display_text,
+                            egui::FontId::monospace(12.0),
+                            if is_active {
+                                tb_active_text
+                            } else {
+                                tb_inactive_text
+                            },
+                        );
+                    }
 
                     // 绘制关闭按钮（仅在悬停Tab时显示）
                     let close_btn_rect = egui::Rect::from_min_size(
@@ -1104,6 +1243,68 @@ impl TerminalApp {
                     egui::vec2(ui.available_width(), tab_height),
                     egui::Sense::hover(),
                 );
+
+        // 进入重命名:用 begin_rename_idx 标记的会话当前标题做初值。
+        if let Some(i) = begin_rename_idx {
+            let initial = self
+                .session_manager
+                .sessions()
+                .get(i)
+                .map(|s| {
+                    s.metadata
+                        .custom_name
+                        .clone()
+                        .unwrap_or_else(|| Self::session_cwd_title(s))
+                })
+                .unwrap_or_default();
+            self.renaming_tab = Some((i, initial));
+        }
+
+        // 渲染重命名输入框:Area 覆盖在 tab 矩形上方,foreground 层级保证可见。
+        // commit(Enter)写入 custom_name + 持久化;cancel(Esc/失焦)放弃。
+        if let (Some((idx, _)), Some(rect)) = (self.renaming_tab.clone(), renaming_rect) {
+            let mut buf = self
+                .renaming_tab
+                .as_ref()
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default();
+            let mut do_commit = false;
+            let mut do_cancel = false;
+            egui::Area::new(egui::Id::new(("tab_rename_overlay", idx)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.left_top())
+                .show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(
+                        rect.size(),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let r = ui.add_sized(
+                                rect.size(),
+                                egui::TextEdit::singleline(&mut buf)
+                                    .desired_width(rect.width() - 8.0)
+                                    .font(egui::FontId::monospace(12.0))
+                                    .hint_text("空=清除自定义名"),
+                            );
+                            r.request_focus();
+                            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if enter {
+                                do_commit = true;
+                            } else if esc || (r.lost_focus() && !enter) {
+                                do_cancel = true;
+                            }
+                        },
+                    );
+                });
+            if do_commit {
+                self.apply_rename(idx, buf);
+            } else if do_cancel {
+                self.renaming_tab = None;
+            } else if let Some((_, ref mut existing)) = self.renaming_tab {
+                *existing = buf;
+            }
+        }
+
         false
     }
 }

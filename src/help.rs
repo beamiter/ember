@@ -67,23 +67,23 @@ impl HelpPanel {
                 for category in categories {
                     let cat_color = Self::category_color(category, theme);
 
-                    // 该类别下、且当前已绑定快捷键的命令
-                    let mut rows: Vec<(String, String)> = palette
-                        .all_commands()
-                        .iter()
-                        .filter(|c| c.category == category)
-                        .filter_map(|c| {
-                            let binds = keybindings.pretty_bindings_for(&c.command.to_string());
-                            if binds.is_empty() {
-                                None
-                            } else {
-                                Some((c.name.clone(), binds.join(" / ")))
-                            }
-                        })
-                        .collect();
-                    rows.sort();
+                    // 该类别下所有命令:有绑定的排前,未绑定的标灰显示在后面,
+                    // 让用户也能发现"可通过命令面板执行的能力",而不是被快捷键
+                    // 配置筛掉。
+                    let mut bound: Vec<(String, String)> = Vec::new();
+                    let mut unbound: Vec<String> = Vec::new();
+                    for c in palette.all_commands().iter().filter(|c| c.category == category) {
+                        let binds = keybindings.pretty_bindings_for(&c.command.to_string());
+                        if binds.is_empty() {
+                            unbound.push(c.name.clone());
+                        } else {
+                            bound.push((c.name.clone(), binds.join(" / ")));
+                        }
+                    }
+                    bound.sort();
+                    unbound.sort();
 
-                    if rows.is_empty() {
+                    if bound.is_empty() && unbound.is_empty() {
                         continue;
                     }
 
@@ -96,7 +96,7 @@ impl HelpPanel {
                     );
                     ui.separator();
 
-                    for (name, keys) in rows {
+                    for (name, keys) in bound {
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 [150.0, 18.0],
@@ -105,6 +105,17 @@ impl HelpPanel {
                                 ),
                             );
                             ui.label(RichText::new(name).color(text_color));
+                        });
+                    }
+                    for name in unbound {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [150.0, 18.0],
+                                egui::Label::new(
+                                    RichText::new("(未绑定)").monospace().color(dim_color),
+                                ),
+                            );
+                            ui.label(RichText::new(name).color(dim_color));
                         });
                     }
                 }

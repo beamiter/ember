@@ -48,6 +48,10 @@ pub struct TerminalApp {
     pub cursor_visible: bool,
     pub last_activity_time: std::time::Instant,
     pub status_message: String,
+    /// 状态消息过期时间。None 表示没有待显示的提示;Some 表示在该时刻之前
+    /// 应作为 toast 显示。过期后由渲染端读取并清空 `status_message`,避免
+    /// 早先"每帧清空"的写法把瞬时反馈吞掉。
+    pub status_expires_at: Option<std::time::Instant>,
     pub last_window_title: String,
 
     // Tab UI state
@@ -56,6 +60,10 @@ pub struct TerminalApp {
     pub drag_start_pos: Option<f32>,
     pub current_mouse_x: f32,
     pub tab_scroll_offset: f32,
+    /// 双击 tab 进入重命名:(会话索引, 编辑中的名称缓冲)。提交时写入
+    /// session.metadata.name 并触发持久化;Esc 放弃。重排/关闭等结构性
+    /// 操作会顺手清空,避免索引漂移后继续提交到错误的会话。
+    pub renaming_tab: Option<(usize, String)>,
 
     // Search state
     pub search_state: search::SearchState,
@@ -154,4 +162,33 @@ pub struct TerminalApp {
 
     /// 粘贴确认对话框里"不再询问"复选框的临时状态(跨帧保留,直到对话框关闭)。
     pub paste_dont_ask_again: bool,
+}
+
+impl TerminalApp {
+    /// 设置短暂的状态提示(默认 2.5 秒后自动隐藏)。多次调用会重置计时器。
+    /// 主线程的所有反馈消息(分屏、跳转命令、复制等)都应走这里,避免再
+    /// 出现"写了 status_message 却没人显示"的悄悄丢弃。
+    pub fn set_status<S: Into<String>>(&mut self, msg: S) {
+        self.set_status_for(msg, std::time::Duration::from_millis(2500));
+    }
+
+    pub fn set_status_for<S: Into<String>>(&mut self, msg: S, dur: std::time::Duration) {
+        self.status_message = msg.into();
+        self.status_expires_at = Some(std::time::Instant::now() + dur);
+    }
+
+    /// 取当前应当显示的提示(若仍在有效期);到期则清空。
+    pub fn current_status_for_display(&mut self) -> Option<&str> {
+        if let Some(deadline) = self.status_expires_at {
+            if std::time::Instant::now() >= deadline {
+                self.status_message.clear();
+                self.status_expires_at = None;
+            }
+        }
+        if self.status_message.is_empty() {
+            None
+        } else {
+            Some(self.status_message.as_str())
+        }
+    }
 }
