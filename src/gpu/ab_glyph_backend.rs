@@ -1,8 +1,11 @@
+use super::font_backend::{
+    alpha_from_coverage, create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey,
+    DirtyRect, FontBackend, GlyphRegion, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE,
+};
 use ab_glyph::{point, Font, FontVec, GlyphId, PxScale, ScaleFont};
-use std::collections::HashMap;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use super::font_backend::{FontBackend, GlyphRegion, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
 
 fn is_cjk_or_wide(ch: char) -> bool {
     matches!(ch as u32,
@@ -281,8 +284,16 @@ impl AbGlyphAtlas {
 
 impl FontBackend for AbGlyphAtlas {
     fn get_or_rasterize(&mut self, ch: char, bold: bool, subpixel_offset: u8) -> GlyphRegion {
-        let effective_subpixel = if is_cjk_or_wide(ch) { 0 } else { subpixel_offset };
-        let key = AtlasGlyphKey { ch, bold, subpixel_offset: effective_subpixel };
+        let effective_subpixel = if is_cjk_or_wide(ch) {
+            0
+        } else {
+            subpixel_offset
+        };
+        let key = AtlasGlyphKey {
+            ch,
+            bold,
+            subpixel_offset: effective_subpixel,
+        };
 
         // Tier 1: ASCII permanent cache (never evicted)
         if (ch as u32) < 128 {
@@ -377,7 +388,8 @@ impl FontBackend for AbGlyphAtlas {
             });
 
             // Record dirty rectangle (with padding)
-            self.dirty_rects.push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
+            self.dirty_rects
+                .push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
 
             // Apply subpixel offset to bearing_x: 0 → 0.0px, 1 → 0.25px, 2 → 0.5px, 3 → 0.75px
             let subpixel_shift = match subpixel_offset {

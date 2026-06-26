@@ -39,8 +39,8 @@ use shell::{ShellEvent, ShellSession};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use terminal::{clamp_terminal_dimensions, TerminalState};
 use ui::TerminalRenderer;
@@ -116,9 +116,10 @@ fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
         )
     } else {
         data.iter()
-                .map(|b| format!("{:02X}", b))
-                .collect::<Vec<_>>()
-                .join(" ").to_string()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_string()
     };
     crate::debug_log!(
         "[MIME] unknown format ({}bytes): {}",
@@ -244,29 +245,25 @@ fn create_font_backend(
     font_size_px: f32,
 ) -> Box<dyn gpu::font_backend::FontBackend> {
     match cfg.font_backend {
-        config::FontBackendType::Fontdue => {
-            Box::new(gpu::fontdue_backend::FontdueAtlas::new(
-                device,
-                queue,
-                font_bytes,
-                bold_font_data,
-                fallback_font_data,
-                font_size_px,
-                cfg.font_weight,
-                cfg.subpixel_rendering,
-            ))
-        }
-        config::FontBackendType::AbGlyph => {
-            Box::new(gpu::ab_glyph_backend::AbGlyphAtlas::new(
-                device,
-                queue,
-                font_bytes,
-                bold_font_data,
-                fallback_font_data,
-                font_size_px,
-                cfg.font_weight,
-            ))
-        }
+        config::FontBackendType::Fontdue => Box::new(gpu::fontdue_backend::FontdueAtlas::new(
+            device,
+            queue,
+            font_bytes,
+            bold_font_data,
+            fallback_font_data,
+            font_size_px,
+            cfg.font_weight,
+            cfg.subpixel_rendering,
+        )),
+        config::FontBackendType::AbGlyph => Box::new(gpu::ab_glyph_backend::AbGlyphAtlas::new(
+            device,
+            queue,
+            font_bytes,
+            bold_font_data,
+            fallback_font_data,
+            font_size_px,
+            cfg.font_weight,
+        )),
     }
 }
 
@@ -483,23 +480,33 @@ fn configure_fonts_and_gpu(
             &fallback_font_data,
             font_size_px,
         );
-        let color_atlas_placeholder = render_state.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("color_atlas_init"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let color_atlas_view = color_atlas_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
-        let color_atlas_sampler = render_state.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("color_atlas_sampler_init"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let color_atlas_placeholder =
+            render_state
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("color_atlas_init"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+        let color_atlas_view =
+            color_atlas_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_atlas_sampler = render_state
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("color_atlas_sampler_init"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
 
         let pipeline = gpu::pipeline::GridPipeline::new(
             &render_state.device,
@@ -518,7 +525,8 @@ fn configure_fonts_and_gpu(
             gpu_res.atlas = atlas;
             gpu_res.pipeline = pipeline;
         } else {
-            let gpu_resources = gpu::callback::GpuResources::new(atlas, pipeline, &render_state.device);
+            let gpu_resources =
+                gpu::callback::GpuResources::new(atlas, pipeline, &render_state.device);
             renderer.callback_resources.insert(gpu_resources);
         }
 
@@ -589,9 +597,9 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(move |cc| {
             let cfg_clone = cfg.clone();
             // Set UI scale: use config value if provided, otherwise use native DPI
-            let scale = cfg_clone.ui_scale.unwrap_or_else(|| {
-                cc.egui_ctx.native_pixels_per_point().unwrap_or(1.0)
-            });
+            let scale = cfg_clone
+                .ui_scale
+                .unwrap_or_else(|| cc.egui_ctx.native_pixels_per_point().unwrap_or(1.0));
             cc.egui_ctx.set_pixels_per_point(scale);
             configure_fonts_and_gpu(&cc.egui_ctx, cc.wgpu_render_state.as_ref(), &cfg_clone);
             let initial_theme = theme::Theme::get_theme(&cfg_clone.theme).unwrap_or_default();
@@ -891,9 +899,10 @@ impl TerminalApp {
 
     fn apply_runtime_config(&mut self, ctx: &egui::Context) {
         // Apply UI scale: use config value if provided, otherwise use native DPI
-        let scale = self.config.ui_scale.unwrap_or_else(|| {
-            ctx.native_pixels_per_point().unwrap_or(1.0)
-        });
+        let scale = self
+            .config
+            .ui_scale
+            .unwrap_or_else(|| ctx.native_pixels_per_point().unwrap_or(1.0));
         ctx.set_pixels_per_point(scale);
 
         configure_fonts_and_gpu(ctx, self.renderer.wgpu_render_state.as_ref(), &self.config);
@@ -906,8 +915,9 @@ impl TerminalApp {
         self.renderer.theme = self.current_theme.clone();
         self.renderer.opacity = self.config.opacity;
         self.renderer.font_ligatures = self.config.font_ligatures;
-        self.renderer.gpu_rendering = matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
-            && self.config.gpu_rendering;
+        self.renderer.gpu_rendering =
+            matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
+                && self.config.gpu_rendering;
         self.renderer.sync_font_metrics(ctx);
 
         for renderer in &mut self.pane_renderers {
@@ -918,8 +928,9 @@ impl TerminalApp {
             renderer.theme = self.current_theme.clone();
             renderer.opacity = self.config.opacity;
             renderer.font_ligatures = self.config.font_ligatures;
-            renderer.gpu_rendering = matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
-                && self.config.gpu_rendering;
+            renderer.gpu_rendering =
+                matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
+                    && self.config.gpu_rendering;
             renderer.sync_font_metrics(ctx);
         }
 
@@ -978,8 +989,10 @@ impl TerminalApp {
         }
 
         // 侧边栏 tab 模式：允许在「会话」与「文件」视图间切换；其余模式锁定为文件视图
-        let sidebar_tab_mode =
-            matches!(self.config.tab_bar_position, config::TabBarPosition::Sidebar);
+        let sidebar_tab_mode = matches!(
+            self.config.tab_bar_position,
+            config::TabBarPosition::Sidebar
+        );
         if !sidebar_tab_mode {
             self.sidebar.view = sidebar::SidebarView::Files;
         }
@@ -1032,8 +1045,11 @@ impl TerminalApp {
                 if self.sidebar.view == sidebar::SidebarView::Sessions {
                     self.render_sidebar_sessions(ui);
                 } else {
-                    if let Some(dir) =
-                        self.sidebar.current_dir.file_name().and_then(|n| n.to_str())
+                    if let Some(dir) = self
+                        .sidebar
+                        .current_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
                     {
                         ui.label(egui::RichText::new(dir).weak().small());
                     }
@@ -1376,9 +1392,7 @@ impl eframe::App for TerminalApp {
                                     let terminal = session.terminal.lock();
                                     terminal.is_bracketed_paste_enabled()
                                 };
-                                if self.config.paste_confirm
-                                    && should_confirm_paste(&normalized)
-                                {
+                                if self.config.paste_confirm && should_confirm_paste(&normalized) {
                                     self.pending_paste_confirm =
                                         Some(crate::app::state::PendingPasteConfirm {
                                             text: normalized,
@@ -1716,9 +1730,8 @@ impl eframe::App for TerminalApp {
                         for request in clipboard_requests {
                             match request.kind {
                                 terminal::ClipboardReadKind::MimeList => {
-                                    let mime_types = clipboard
-                                        .available_mime_types()
-                                        .unwrap_or_default();
+                                    let mime_types =
+                                        clipboard.available_mime_types().unwrap_or_default();
                                     let response = terminal.lock().build_paste_event(&mime_types);
                                     let _ = write_tx.send(response);
                                 }
@@ -1748,7 +1761,9 @@ impl eframe::App for TerminalApp {
             if let Some(text) = terminal.take_osc52_clipboard_set() {
                 if self.config.osc52_clipboard_write {
                     if let Some(clipboard) = &self.clipboard {
-                        if let Err(e) = clipboard.copy(&text) { log::warn!("{}", e); }
+                        if let Err(e) = clipboard.copy(&text) {
+                            log::warn!("{}", e);
+                        }
                     }
                 }
             }
@@ -1824,23 +1839,24 @@ impl eframe::App for TerminalApp {
 
         // Step 9: 滚动处理
         // 优化：批量处理键盘滚动，只获取一次锁
-        let scroll_amount = if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl) {
-            Some(-3)
-        } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl) {
-            Some(3)
-        } else if ctx.input(|i| i.key_pressed(egui::Key::PageUp) && !i.modifiers.ctrl) {
-            let terminal = session.terminal.lock();
-            let (_, rows) = terminal.get_dimensions();
-            drop(terminal);
-            Some(rows as isize)
-        } else if ctx.input(|i| i.key_pressed(egui::Key::PageDown) && !i.modifiers.ctrl) {
-            let terminal = session.terminal.lock();
-            let (_, rows) = terminal.get_dimensions();
-            drop(terminal);
-            Some(-(rows as isize))
-        } else {
-            None
-        };
+        let scroll_amount =
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl) {
+                Some(-3)
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl) {
+                Some(3)
+            } else if ctx.input(|i| i.key_pressed(egui::Key::PageUp) && !i.modifiers.ctrl) {
+                let terminal = session.terminal.lock();
+                let (_, rows) = terminal.get_dimensions();
+                drop(terminal);
+                Some(rows as isize)
+            } else if ctx.input(|i| i.key_pressed(egui::Key::PageDown) && !i.modifiers.ctrl) {
+                let terminal = session.terminal.lock();
+                let (_, rows) = terminal.get_dimensions();
+                drop(terminal);
+                Some(-(rows as isize))
+            } else {
+                None
+            };
 
         if let Some(amount) = scroll_amount {
             let mut terminal = session.terminal.lock();
@@ -2031,7 +2047,9 @@ impl eframe::App for TerminalApp {
                     });
 
                     for button_num in button_released {
-                        if let Some(report) = terminal.get_mouse_release_report(button_num, col, row) {
+                        if let Some(report) =
+                            terminal.get_mouse_release_report(button_num, col, row)
+                        {
                             reports.push(report);
                         }
                     }
@@ -2061,7 +2079,9 @@ impl eframe::App for TerminalApp {
             {
                 let visible_cells = terminal.get_visible_cells();
                 let row_wrapped = terminal.get_visible_row_wrapped();
-                self.cached_links = self.link_detector.detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
+                self.cached_links = self
+                    .link_detector
+                    .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
                 self.cached_links_grid_version = grid_version;
                 self.cached_links_scroll_offset = scroll_offset;
                 self.cached_links_session_idx = active_session_idx;
@@ -2115,14 +2135,8 @@ impl eframe::App for TerminalApp {
                         .show(ctx, |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_max_width(520.0);
-                                ui.label(
-                                    egui::RichText::new(&link.text).monospace(),
-                                );
-                                ui.label(
-                                    egui::RichText::new("Ctrl+Click 打开")
-                                        .small()
-                                        .weak(),
-                                );
+                                ui.label(egui::RichText::new(&link.text).monospace());
+                                ui.label(egui::RichText::new("Ctrl+Click 打开").small().weak());
                             });
                         });
                 }
@@ -2134,7 +2148,10 @@ impl eframe::App for TerminalApp {
             }) {
                 if let Some(link) = self.hovered_link.clone() {
                     let (msg, dur) = match link::open_link(&link) {
-                        Ok(_) => (format!("Opened: {}", link.text), Duration::from_millis(2500)),
+                        Ok(_) => (
+                            format!("Opened: {}", link.text),
+                            Duration::from_millis(2500),
+                        ),
                         Err(e) => (
                             format!("Failed to open link: {}", e),
                             Duration::from_secs(4),

@@ -9,7 +9,9 @@ impl super::TerminalState {
     ///
     /// 与 VT 规范一致:空字段默认为 0(`;5`→`[0,5]`、`5;`→`[5,0]`),
     /// 完全为空的参数串返回空向量(由各处理器使用各自默认值)。
-    pub(super) fn parse_csi_params(param_bytes: &[u8]) -> (SmallVec<[u16; 8]>, SmallVec<[bool; 8]>) {
+    pub(super) fn parse_csi_params(
+        param_bytes: &[u8],
+    ) -> (SmallVec<[u16; 8]>, SmallVec<[bool; 8]>) {
         let mut params: SmallVec<[u16; 8]> = SmallVec::new();
         let mut colon_flags: SmallVec<[bool; 8]> = SmallVec::new();
         if param_bytes.is_empty() {
@@ -23,7 +25,9 @@ impl super::TerminalState {
         for &byte in param_bytes {
             match byte {
                 b'0'..=b'9' => {
-                    current = current.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                    current = current
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as u16);
                 }
                 b';' | b':' => {
                     params.push(current);
@@ -182,7 +186,7 @@ impl super::TerminalState {
             grid_version: 1,
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
             // This ensures dirty tracking works correctly even with scrollback
-            row_versions: vec![1; rows],  // Use 'rows' here since grid.rows() == rows at init
+            row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
             current_hyperlink: None,
             sync_output_active: false,
@@ -444,7 +448,12 @@ impl super::TerminalState {
         } else {
             self.cursor_col - 1
         };
-        if self.grid.get(self.cursor_row, base_col).flags.wide_continuation() {
+        if self
+            .grid
+            .get(self.cursor_row, base_col)
+            .flags
+            .wide_continuation()
+        {
             if base_col == 0 {
                 return;
             }
@@ -459,7 +468,8 @@ impl super::TerminalState {
         let mut composed = String::with_capacity(2);
         composed.push(base);
         composed.push(mark);
-        let nfc: String = unicode_normalization::UnicodeNormalization::nfc(composed.as_str()).collect();
+        let nfc: String =
+            unicode_normalization::UnicodeNormalization::nfc(composed.as_str()).collect();
         let mut chars = nfc.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
             if c != base {
@@ -512,8 +522,11 @@ impl super::TerminalState {
         if self.insert_mode {
             for _ in 0..width {
                 if self.cursor_col < cols {
-                    self.grid
-                        .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell.clone());
+                    self.grid.insert_cell_in_row(
+                        self.cursor_row,
+                        self.cursor_col,
+                        blank_cell.clone(),
+                    );
                 }
             }
         }
@@ -523,13 +536,16 @@ impl super::TerminalState {
             && self
                 .grid
                 .get(self.cursor_row, self.cursor_col)
-                .flags.wide_continuation()
+                .flags
+                .wide_continuation()
         {
             *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell.clone();
         }
 
         // If current position has a wide character, clear its continuation cell
-        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide() && self.cursor_col + 1 < cols {
+        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide()
+            && self.cursor_col + 1 < cols
+        {
             *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell.clone();
         }
 
@@ -651,7 +667,11 @@ impl super::TerminalState {
         vec![self.create_blank_cell(); cols]
     }
 
-    pub(super) fn normalize_line_width(&self, mut line: Vec<TerminalCell>, cols: usize) -> Vec<TerminalCell> {
+    pub(super) fn normalize_line_width(
+        &self,
+        mut line: Vec<TerminalCell>,
+        cols: usize,
+    ) -> Vec<TerminalCell> {
         match line.len().cmp(&cols) {
             std::cmp::Ordering::Equal => line,
             std::cmp::Ordering::Greater => {
@@ -706,7 +726,10 @@ impl super::TerminalState {
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
         let scrollback_line = if is_full_screen_region && !self.use_alt_buffer {
-            Some(ScrollbackLine::compress(&self.grid[top], self.grid.row_wrapped[top]))
+            Some(ScrollbackLine::compress(
+                &self.grid[top],
+                self.grid.row_wrapped[top],
+            ))
         } else {
             None
         };
@@ -951,8 +974,9 @@ impl super::TerminalState {
             // already on screen, so caller can scroll to bottom.
             return None;
         }
-        let first_scrollback_line_id =
-            self.total_lines_scrolled.saturating_sub(self.scrollback.len() as u64);
+        let first_scrollback_line_id = self
+            .total_lines_scrolled
+            .saturating_sub(self.scrollback.len() as u64);
         if line_id < first_scrollback_line_id {
             // Evicted from scrollback.
             return None;
@@ -1109,9 +1133,9 @@ impl super::TerminalState {
         } else {
             // Standard xterm format: CSI M button col row (raw bytes)
             // Col and row are offset by 32 (space character)
-            let button_byte = 32 + button ;
-            let col_byte = 32 + (col as u8).min(223) ;
-            let row_byte = 32 + (row as u8).min(223) ;
+            let button_byte = 32 + button;
+            let col_byte = 32 + (col as u8).min(223);
+            let row_byte = 32 + (row as u8).min(223);
             Some(format!(
                 "\x1b[M{}{}{}",
                 button_byte as char, col_byte as char, row_byte as char
@@ -1120,7 +1144,8 @@ impl super::TerminalState {
     }
 
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
-        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003) {
+        if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
+        {
             return None;
         }
 
@@ -1249,8 +1274,11 @@ impl super::TerminalState {
                             dst.extend_from_slice(chunk);
                         }
                     }
-                    self.visible_cells_cache =
-                        Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
+                    self.visible_cells_cache = Some((
+                        self.grid_version,
+                        self.scroll_offset,
+                        std::sync::Arc::clone(&arc),
+                    ));
                     return arc;
                 }
                 // 仍被他处共享,无法原地复用;放回供下方 fallback 分支重建。
@@ -1265,12 +1293,16 @@ impl super::TerminalState {
             // Slow path: reflow scrollback
             let blank_cell = self.create_blank_cell();
 
-            let mut start_idx = self.scrollback.len().saturating_sub(self.scroll_offset + rows);
+            let mut start_idx = self
+                .scrollback
+                .len()
+                .saturating_sub(self.scroll_offset + rows);
             while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
                 start_idx -= 1;
             }
             let end_idx = self.scrollback.len();
-            let to_reflow: Vec<ScrollbackLine> = self.scrollback
+            let to_reflow: Vec<ScrollbackLine> = self
+                .scrollback
                 .iter()
                 .skip(start_idx)
                 .take(end_idx - start_idx)
@@ -1280,7 +1312,10 @@ impl super::TerminalState {
             let reflowed = Self::reflow_lines(&to_reflow, cols, &blank_cell);
             let skip = reflowed.len().saturating_sub(self.scroll_offset + rows);
             let visible_start = skip + (reflowed.len() - skip).saturating_sub(self.scroll_offset);
-            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..].iter().map(|l| l.decompress()).collect();
+            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..]
+                .iter()
+                .map(|l| l.decompress())
+                .collect();
 
             if result.len() > rows {
                 result.truncate(rows);
@@ -1312,7 +1347,11 @@ impl super::TerminalState {
             },
             None => std::sync::Arc::new(cells),
         };
-        self.visible_cells_cache = Some((self.grid_version, self.scroll_offset, std::sync::Arc::clone(&arc)));
+        self.visible_cells_cache = Some((
+            self.grid_version,
+            self.scroll_offset,
+            std::sync::Arc::clone(&arc),
+        ));
         arc
     }
 
@@ -1354,7 +1393,11 @@ impl super::TerminalState {
         self.start_selection_with_mode(viewport_pos, SelectionMode::Block);
     }
 
-    pub(super) fn start_selection_with_mode(&mut self, viewport_pos: (usize, usize), mode: SelectionMode) {
+    pub(super) fn start_selection_with_mode(
+        &mut self,
+        viewport_pos: (usize, usize),
+        mode: SelectionMode,
+    ) {
         let abs = (
             self.viewport_row_to_absolute(viewport_pos.0),
             viewport_pos.1,
@@ -1650,13 +1693,22 @@ impl super::TerminalState {
 
     pub(super) fn strip_trailing_blanks(cells: &[TerminalCell]) -> &[TerminalCell] {
         let mut end = cells.len();
-        while end > 0 && cells[end - 1].character == ' ' && cells[end - 1].background == Color::Default && !cells[end - 1].flags.wide() && !cells[end - 1].flags.wide_continuation() {
+        while end > 0
+            && cells[end - 1].character == ' '
+            && cells[end - 1].background == Color::Default
+            && !cells[end - 1].flags.wide()
+            && !cells[end - 1].flags.wide_continuation()
+        {
             end -= 1;
         }
         &cells[..end]
     }
 
-    pub(super) fn reflow_lines(lines: &[ScrollbackLine], new_cols: usize, blank_cell: &TerminalCell) -> Vec<ScrollbackLine> {
+    pub(super) fn reflow_lines(
+        lines: &[ScrollbackLine],
+        new_cols: usize,
+        blank_cell: &TerminalCell,
+    ) -> Vec<ScrollbackLine> {
         let mut result = Vec::new();
         let len = lines.len();
         let mut i = 0;
@@ -1675,7 +1727,10 @@ impl super::TerminalState {
             i += 1;
 
             if logical_line.is_empty() {
-                result.push(ScrollbackLine::compress(&vec![blank_cell.clone(); new_cols], false));
+                result.push(ScrollbackLine::compress(
+                    &vec![blank_cell.clone(); new_cols],
+                    false,
+                ));
                 continue;
             }
 
@@ -1719,8 +1774,7 @@ impl super::TerminalState {
             let from_top = need.min(self.cursor_row);
             if from_top > 0 {
                 for r in 0..from_top {
-                    let line =
-                        ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
+                    let line = ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
                     self.push_scrollback_compressed(line);
                 }
                 self.grid.scroll_up_by(from_top, blank_cell.clone());

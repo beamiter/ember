@@ -71,8 +71,7 @@ impl LinkDetector {
 
         // 文件路径正则：以 /、./、../ 开头(前面是行首或空白)。
         // 用捕获组提取实际路径，避免把前导空白计入列偏移。
-        let file_path_regex =
-            Regex::new(r"(?:^|\s)(\.{0,2}/[^\s<>\[\]{}|\\^`()]*)").unwrap();
+        let file_path_regex = Regex::new(r"(?:^|\s)(\.{0,2}/[^\s<>\[\]{}|\\^`()]*)").unwrap();
 
         Self {
             config,
@@ -116,9 +115,7 @@ impl LinkDetector {
                     continue;
                 }
                 if bytes.get(mat.end()) == Some(&b'.')
-                    && bytes
-                        .get(mat.end() + 1)
-                        .is_some_and(|b| b.is_ascii_digit())
+                    && bytes.get(mat.end() + 1).is_some_and(|b| b.is_ascii_digit())
                 {
                     continue;
                 }
@@ -148,7 +145,10 @@ impl LinkDetector {
                 let start_b = m.start();
                 // 剥离尾部标点(句末句号、逗号、右括号等不属于路径的一部分)
                 let trimmed = m.as_str().trim_end_matches(|c: char| {
-                    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
+                    matches!(
+                        c,
+                        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
+                    )
                 });
                 let end_b = start_b + trimmed.len();
                 let matched_text = &line[start_b..end_b];
@@ -185,10 +185,7 @@ impl LinkDetector {
         }
 
         // 必须以 / 或 ./ 或 ../ 开头
-        if !(trimmed.starts_with('/')
-            || trimmed.starts_with("./")
-            || trimmed.starts_with("../"))
-        {
+        if !(trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../")) {
             return false;
         }
 

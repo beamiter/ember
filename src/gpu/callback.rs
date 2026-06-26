@@ -31,7 +31,11 @@ impl GpuResources {
     pub fn new(atlas: Box<dyn FontBackend>, pipeline: GridPipeline, device: &wgpu::Device) -> Self {
         let color_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("color_atlas_placeholder"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -39,7 +43,8 @@ impl GpuResources {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let color_atlas_view = color_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_atlas_view =
+            color_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let color_atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("color_atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -94,8 +99,11 @@ impl egui_wgpu::CallbackTrait for GridBackgroundCallback {
             res.atlas_gen += 1;
             let (view, sampler) = res.atlas.gpu_resources();
             res.pipeline.rebuild_bind_group(
-                device, view, sampler,
-                &res.color_atlas_view, &res.color_atlas_sampler,
+                device,
+                view,
+                sampler,
+                &res.color_atlas_view,
+                &res.color_atlas_sampler,
             );
         }
 

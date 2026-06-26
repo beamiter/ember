@@ -9,7 +9,9 @@ use std::num::NonZeroUsize;
 #[derive(Clone, Copy)]
 enum LigOverride {
     /// This column is the anchor of a shaped (possibly multi-cell) glyph.
-    Glyph { region: gpu::font_backend::GlyphRegion },
+    Glyph {
+        region: gpu::font_backend::GlyphRegion,
+    },
     /// This column is consumed by a ligature anchored at an earlier column;
     /// suppress its foreground glyph (background/underline stay per-cell).
     Covered,
@@ -495,7 +497,8 @@ impl TerminalRenderer {
 
         // Cache it (LRU will auto-evict oldest if at capacity)
         let result = handle.clone();
-        self.texture_cache.put(image_id, (handle, image.width, image.height));
+        self.texture_cache
+            .put(image_id, (handle, image.width, image.height));
         Some(result)
     }
 
@@ -739,35 +742,36 @@ impl TerminalRenderer {
             };
 
         // Compute thumb rect and related values for interaction
-        let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> = if !terminal.scrollback.is_empty()
-        {
-            let total_lines = terminal.scrollback.len() + rows;
-            let visible_lines = rows;
-            if total_lines > visible_lines {
-                let scrollbar_height = scrollbar_rect.height();
-                let thumb_height = ((visible_lines as f32 / total_lines as f32) * scrollbar_height)
-                    .clamp(Self::MIN_THUMB_HEIGHT, scrollbar_height);
-                // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
-                let thumb_y = scrollbar_height
-                    - thumb_height
-                    - (terminal.scroll_offset as f32 / terminal.scrollback.len() as f32)
-                        * (scrollbar_height - thumb_height);
-                let thumb_rect = egui::Rect::from_min_size(
-                    egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
-                    egui::vec2(scrollbar_width, thumb_height),
-                );
-                Some((
-                    thumb_rect,
-                    scrollbar_height,
-                    thumb_height,
-                    terminal.scrollback.len() as f32,
-                ))
+        let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> =
+            if !terminal.scrollback.is_empty() {
+                let total_lines = terminal.scrollback.len() + rows;
+                let visible_lines = rows;
+                if total_lines > visible_lines {
+                    let scrollbar_height = scrollbar_rect.height();
+                    let thumb_height = ((visible_lines as f32 / total_lines as f32)
+                        * scrollbar_height)
+                        .clamp(Self::MIN_THUMB_HEIGHT, scrollbar_height);
+                    // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
+                    let thumb_y = scrollbar_height
+                        - thumb_height
+                        - (terminal.scroll_offset as f32 / terminal.scrollback.len() as f32)
+                            * (scrollbar_height - thumb_height);
+                    let thumb_rect = egui::Rect::from_min_size(
+                        egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
+                        egui::vec2(scrollbar_width, thumb_height),
+                    );
+                    Some((
+                        thumb_rect,
+                        scrollbar_height,
+                        thumb_height,
+                        terminal.scrollback.len() as f32,
+                    ))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Handle mouse events for text selection
         // Track selection start on initial mouse down
@@ -1130,10 +1134,8 @@ impl TerminalRenderer {
                     egui::pos2(x, y),
                     Vec2::new(cell_width, snapped_height),
                 );
-                let block_cursor_rect = cell_rect.shrink2(egui::vec2(
-                    (cell_width * 0.24).clamp(1.5, 3.0),
-                    0.5,
-                ));
+                let block_cursor_rect =
+                    cell_rect.shrink2(egui::vec2((cell_width * 0.24).clamp(1.5, 3.0), 0.5));
 
                 match &terminal.cursor_shape {
                     crate::terminal::CursorShape::Block => {
@@ -1163,7 +1165,10 @@ impl TerminalRenderer {
                     }
                     crate::terminal::CursorShape::Beam => {
                         painter.line_segment(
-                            [egui::pos2(x + 0.25, y), egui::pos2(x + 0.25, y + line_height)],
+                            [
+                                egui::pos2(x + 0.25, y),
+                                egui::pos2(x + 0.25, y + line_height),
+                            ],
                             egui::Stroke::new(0.8, self.theme.cursor_color()),
                         );
                     }
@@ -1280,7 +1285,8 @@ impl TerminalRenderer {
         };
 
         // Detect major screen changes (e.g., alternate screen switch)
-        let grid_version_jumped = current_grid_version > self.last_rendered_grid_version + rows as u64;
+        let grid_version_jumped =
+            current_grid_version > self.last_rendered_grid_version + rows as u64;
 
         let need_full_rebuild = self.cached_instances.is_empty()
             || self.last_rendered_terminal_ptr != terminal_ptr
@@ -1300,7 +1306,10 @@ impl TerminalRenderer {
         } else {
             // Grid content changes - reuse changed_rows_buffer for collection
             self.changed_rows_buffer.clear();
-            terminal.get_dirty_rows(self.last_rendered_grid_version, &mut self.changed_rows_buffer);
+            terminal.get_dirty_rows(
+                self.last_rendered_grid_version,
+                &mut self.changed_rows_buffer,
+            );
             for &r in &self.changed_rows_buffer {
                 if r < rows {
                     dirty_rows[r] = true;
@@ -1310,8 +1319,18 @@ impl TerminalRenderer {
             // Selection overlay changes
             if self.last_rendered_selection != current_selection {
                 // Mark rows affected by old and new selection
-                Self::mark_selection_rows(&self.last_rendered_selection, rows, dirty_rows.as_mut_slice(), terminal);
-                Self::mark_selection_rows(&current_selection, rows, dirty_rows.as_mut_slice(), terminal);
+                Self::mark_selection_rows(
+                    &self.last_rendered_selection,
+                    rows,
+                    dirty_rows.as_mut_slice(),
+                    terminal,
+                );
+                Self::mark_selection_rows(
+                    &current_selection,
+                    rows,
+                    dirty_rows.as_mut_slice(),
+                    terminal,
+                );
             }
 
             // Search overlay changes - only mark matching lines dirty
@@ -1371,10 +1390,12 @@ impl TerminalRenderer {
                 let font_cell_width = advance;
                 let font_cell_height = ascent - descent;
                 // Round adjustments to integer pixels to prevent blur from linear filtering
-                let glyph_offset_x_adjust =
-                    ((target_cell_width - font_cell_width) * 0.5).max(0.0).round();
-                let glyph_offset_y_adjust =
-                    ((target_cell_height - font_cell_height) * 0.5).max(0.0).round();
+                let glyph_offset_x_adjust = ((target_cell_width - font_cell_width) * 0.5)
+                    .max(0.0)
+                    .round();
+                let glyph_offset_y_adjust = ((target_cell_height - font_cell_height) * 0.5)
+                    .max(0.0)
+                    .round();
 
                 let link_map: Vec<Vec<&crate::link::Link>> = if links.is_empty() {
                     Vec::new()
@@ -1521,7 +1542,6 @@ impl TerminalRenderer {
                         }
                     }
                 }
-
             } // drop renderer write lock
         }
 
@@ -1597,7 +1617,10 @@ impl TerminalRenderer {
         if let Some(sel) = selection {
             let min_abs = sel.anchor.0.min(sel.active.0);
             let max_abs = sel.anchor.0.max(sel.active.0);
-            let scrollback_offset = terminal.scrollback.len().saturating_sub(terminal.scroll_offset);
+            let scrollback_offset = terminal
+                .scrollback
+                .len()
+                .saturating_sub(terminal.scroll_offset);
             let start = min_abs.max(scrollback_offset) - scrollback_offset;
             let end = max_abs.saturating_sub(scrollback_offset);
             for r in start..=end.min(rows.saturating_sub(1)) {
@@ -1637,9 +1660,7 @@ impl TerminalRenderer {
             let row = &grid[row_idx];
             let is_run_char = |cell: &crate::terminal::TerminalCell| {
                 let cp = cell.character as u32;
-                (0x21..=0x7e).contains(&cp)
-                    && !cell.flags.wide()
-                    && !cell.flags.wide_continuation()
+                (0x21..=0x7e).contains(&cp) && !cell.flags.wide() && !cell.flags.wide_continuation()
             };
             let mut col = 0usize;
             while col < cols {
@@ -1781,18 +1802,29 @@ impl TerminalRenderer {
                 flags |= gpu::instance::CellInstance::FLAG_WIDE;
             }
             // Encode underline style in bits 2-4
-            let underline_style = if is_link && cell.flags.underline() == crate::terminal::UnderlineStyle::None {
-                crate::terminal::UnderlineStyle::Single
-            } else {
-                cell.flags.underline()
-            };
+            let underline_style =
+                if is_link && cell.flags.underline() == crate::terminal::UnderlineStyle::None {
+                    crate::terminal::UnderlineStyle::Single
+                } else {
+                    cell.flags.underline()
+                };
             match underline_style {
                 crate::terminal::UnderlineStyle::None => {}
-                crate::terminal::UnderlineStyle::Single => flags |= gpu::instance::CellInstance::UNDERLINE_SINGLE,
-                crate::terminal::UnderlineStyle::Double => flags |= gpu::instance::CellInstance::UNDERLINE_DOUBLE,
-                crate::terminal::UnderlineStyle::Curly => flags |= gpu::instance::CellInstance::UNDERLINE_CURLY,
-                crate::terminal::UnderlineStyle::Dotted => flags |= gpu::instance::CellInstance::UNDERLINE_DOTTED,
-                crate::terminal::UnderlineStyle::Dashed => flags |= gpu::instance::CellInstance::UNDERLINE_DASHED,
+                crate::terminal::UnderlineStyle::Single => {
+                    flags |= gpu::instance::CellInstance::UNDERLINE_SINGLE
+                }
+                crate::terminal::UnderlineStyle::Double => {
+                    flags |= gpu::instance::CellInstance::UNDERLINE_DOUBLE
+                }
+                crate::terminal::UnderlineStyle::Curly => {
+                    flags |= gpu::instance::CellInstance::UNDERLINE_CURLY
+                }
+                crate::terminal::UnderlineStyle::Dotted => {
+                    flags |= gpu::instance::CellInstance::UNDERLINE_DOTTED
+                }
+                crate::terminal::UnderlineStyle::Dashed => {
+                    flags |= gpu::instance::CellInstance::UNDERLINE_DASHED
+                }
             }
             if has_strikethrough {
                 flags |= gpu::instance::CellInstance::FLAG_STRIKETHROUGH;
@@ -1995,7 +2027,8 @@ impl TerminalRenderer {
                     }
                     found
                 };
-                let has_underline = cell.flags.underline() != crate::terminal::UnderlineStyle::None || is_link;
+                let has_underline =
+                    cell.flags.underline() != crate::terminal::UnderlineStyle::None || is_link;
                 let has_strikethrough = cell.flags.strikethrough();
                 let is_wide = cell.flags.wide();
 
@@ -2004,11 +2037,9 @@ impl TerminalRenderer {
                     font_id.size *= 1.1;
                 }
 
-                let galley = ui.painter().layout_no_wrap(
-                    cell.character.to_string(),
-                    font_id,
-                    fg_color,
-                );
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(cell.character.to_string(), font_id, fg_color);
                 let (cx, cw) = snapped_span(content_rect.left(), col_idx, char_width);
                 let text_y = y + (snapped_height - galley.size().y) / 2.0;
                 let cell_w = if is_wide {
@@ -2132,9 +2163,10 @@ impl TerminalRenderer {
 
                     // Skip Kitty encoding for alphanumeric when there's a corresponding Text event
                     // (Text event already sent the correct character with proper shift/caps handling)
-                    if text_from_events.as_ref().is_some_and(|t| {
-                        t.len() == 1 && t.as_bytes()[0].is_ascii_alphanumeric()
-                    }) {
+                    if text_from_events
+                        .as_ref()
+                        .is_some_and(|t| t.len() == 1 && t.as_bytes()[0].is_ascii_alphanumeric())
+                    {
                         continue;
                     }
 
@@ -2144,7 +2176,10 @@ impl TerminalRenderer {
                         t.len() == 1 && t.as_bytes()[0].is_ascii_uppercase() && !modifiers.shift
                     });
                     let effective_modifiers = if caps_lock {
-                        egui::Modifiers { shift: true, ..*modifiers }
+                        egui::Modifiers {
+                            shift: true,
+                            ..*modifiers
+                        }
                     } else {
                         *modifiers
                     };
@@ -2168,7 +2203,11 @@ impl TerminalRenderer {
                     }
 
                     // Handle normal key sequences
-                    let seq = key_to_terminal_sequence(*key, effective_modifiers, application_cursor_keys);
+                    let seq = key_to_terminal_sequence(
+                        *key,
+                        effective_modifiers,
+                        application_cursor_keys,
+                    );
 
                     if let Some(s) = seq {
                         input.extend(s.as_bytes());

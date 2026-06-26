@@ -88,7 +88,10 @@ impl GridPipeline {
         });
 
         let fs_entry = if target_format.is_srgb() {
-            eprintln!("[GPU] sRGB framebuffer {:?}, using fs_main_linear", target_format);
+            eprintln!(
+                "[GPU] sRGB framebuffer {:?}, using fs_main_linear",
+                target_format
+            );
             "fs_main_linear"
         } else {
             "fs_main_gamma"
@@ -317,14 +320,28 @@ impl GridPipeline {
                 }
             } else if let Some(start_row) = upload_start {
                 // Flush span [start_row..row_idx)
-                self.upload_row_span(queue, instances, row_offsets, row_counts, start_row, row_idx);
+                self.upload_row_span(
+                    queue,
+                    instances,
+                    row_offsets,
+                    row_counts,
+                    start_row,
+                    row_idx,
+                );
                 upload_start = None;
             }
         }
 
         // Flush trailing span if any
         if let Some(start_row) = upload_start {
-            self.upload_row_span(queue, instances, row_offsets, row_counts, start_row, dirty_rows.len());
+            self.upload_row_span(
+                queue,
+                instances,
+                row_offsets,
+                row_counts,
+                start_row,
+                dirty_rows.len(),
+            );
         }
     }
 
@@ -339,9 +356,7 @@ impl GridPipeline {
         end_row: usize,
     ) {
         let instance_offset = row_offsets[start_row];
-        let instance_count: usize = (start_row..end_row)
-            .map(|r| row_counts[r])
-            .sum();
+        let instance_count: usize = (start_row..end_row).map(|r| row_counts[r]).sum();
 
         if instance_count == 0 {
             return;

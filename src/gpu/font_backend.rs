@@ -22,7 +22,12 @@ pub struct DirtyRect {
 
 impl DirtyRect {
     pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -132,7 +137,13 @@ pub fn create_gpu_resources(
     (texture, view, sampler)
 }
 
-pub fn upload_bitmap(queue: &wgpu::Queue, texture: &wgpu::Texture, bitmap: &[u8], width: u32, height: u32) {
+pub fn upload_bitmap(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    bitmap: &[u8],
+    width: u32,
+    height: u32,
+) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,

@@ -33,7 +33,11 @@ mod unix_pty {
     /// 异步信号安全地向 stderr 写一条静态消息(fork 后、execve 前只能用此类调用)。
     /// SAFETY: 仅调用 write(2),它在 POSIX 异步信号安全函数列表中。
     unsafe fn write_stderr(msg: &[u8]) {
-        let _ = libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+        );
     }
 
     fn is_executable(path: &Path) -> bool {
@@ -57,7 +61,10 @@ mod unix_pty {
             if is_executable(Path::new(path)) {
                 return path.to_string();
             }
-            eprintln!("[PTY] Configured shell '{}' is not executable, falling back", path);
+            eprintln!(
+                "[PTY] Configured shell '{}' is not executable, falling back",
+                path
+            );
         }
 
         // Priority 2: rsh (preferred shell with advanced features)
@@ -324,8 +331,7 @@ mod unix_pty {
             // SAFETY: self.master 是有效的文件描述符，data.as_ptr() 指向有效的内存，
             // data.len() 是正确的长度。write 系统调用不会超出缓冲区边界。
             loop {
-                let n =
-                    unsafe { libc::write(self.master, data.as_ptr() as *const _, data.len()) };
+                let n = unsafe { libc::write(self.master, data.as_ptr() as *const _, data.len()) };
                 if n >= 0 {
                     return Ok(WriteOutcome::Written(n as usize));
                 }
@@ -456,8 +462,7 @@ mod unix_pty {
                         self.cache_status(status);
                         break;
                     } else if r < 0
-                        && std::io::Error::last_os_error().kind()
-                            == std::io::ErrorKind::Interrupted
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                     {
                         continue; // EINTR:重试
                     } else {

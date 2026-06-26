@@ -1,15 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 /// 高级搜索配置
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SearchConfig {
     pub use_regex: bool,
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub multi_line: bool,
 }
-
 
 /// 替换选项
 #[derive(Clone, Debug)]
@@ -209,9 +207,14 @@ mod tests {
         };
         let options = ReplaceOptions { replace_all: true };
 
-        let (result, count) =
-            SearchAndReplaceEngine::search_and_replace("cat category cat", "cat", "dog", &config, &options)
-                .unwrap();
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "cat category cat",
+            "cat",
+            "dog",
+            &config,
+            &options,
+        )
+        .unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(result, "dog category dog");
@@ -225,9 +228,14 @@ mod tests {
         };
         let options = ReplaceOptions { replace_all: true };
 
-        let (result, count) =
-            SearchAndReplaceEngine::search_and_replace("Foo FOO foo", "foo", "bar", &config, &options)
-                .unwrap();
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "Foo FOO foo",
+            "foo",
+            "bar",
+            &config,
+            &options,
+        )
+        .unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(result, "bar bar bar");
@@ -243,9 +251,14 @@ mod tests {
         };
         let options = ReplaceOptions { replace_all: true };
 
-        let (result, count) =
-            SearchAndReplaceEngine::search_and_replace("Err error ERRORS", "err", "X", &config, &options)
-                .unwrap();
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "Err error ERRORS",
+            "err",
+            "X",
+            &config,
+            &options,
+        )
+        .unwrap();
 
         // "Err" matches (whole word, case-insensitive); "error" and "ERRORS"
         // do not because of the word boundary.

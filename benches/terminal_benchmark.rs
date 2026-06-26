@@ -95,8 +95,14 @@ fn bench_string_operations(c: &mut Criterion) {
     group.bench_function("key_to_string", |b| {
         use egui::Key;
         let keys = vec![
-            Key::A, Key::B, Key::F1, Key::Enter, Key::Escape,
-            Key::ArrowUp, Key::Home, Key::Delete
+            Key::A,
+            Key::B,
+            Key::F1,
+            Key::Enter,
+            Key::Escape,
+            Key::ArrowUp,
+            Key::Home,
+            Key::Delete,
         ];
         b.iter(|| {
             for key in &keys {
@@ -121,7 +127,7 @@ fn bench_link_detection(c: &mut Criterion) {
     ];
 
     group.bench_function("detect_links", |b| {
-        use jterm2::link::{LinkDetector, LinkDetectionConfig};
+        use jterm2::link::{LinkDetectionConfig, LinkDetector};
         let _detector = LinkDetector::new(LinkDetectionConfig::default());
 
         b.iter(|| {

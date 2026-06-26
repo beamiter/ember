@@ -10,9 +10,9 @@ env_logger = "0.11"
 crossbeam = "0.8"
 parking_lot = "0.12"
 anyhow = "1.0"
-egui = "0.34.2"
-eframe = { version = "0.34.2", default-features = false, features = ["default_fonts", "wgpu", "glow", "wayland", "x11"] }
-egui-wgpu = "0.34.2"
+egui = "0.35.0"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "glow", "wayland", "x11"] }
+egui-wgpu = "0.35.0"
 wgpu = "29.0.3"
 bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"

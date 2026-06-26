@@ -273,7 +273,6 @@ impl LayoutManager {
             _ => None,
         }
     }
-
 }
 
 /// 窗格方向

@@ -1,18 +1,16 @@
 // Rendering coordination module
 
 use super::state::TerminalApp;
-use crate::{
-    command_palette, config, config_panel, layout, search, search_replace_panel, theme,
-};
+use crate::{command_palette, config, config_panel, layout, search, search_replace_panel, theme};
 use eframe::egui;
 
 impl TerminalApp {
     /// 自适应帧预算：根据帧时间动态调整处理量
     pub fn adjust_frame_budget(&mut self) {
         const TARGET_FRAME_MS: f64 = 16.0; // 目标 60 FPS
-        const MIN_BUDGET: usize = 8192;    // 最小 8KB
-        const MAX_BUDGET: usize = 131072;  // 最大 128KB
-        const ADJUST_RATE: f64 = 0.1;      // 调整速率 10%
+        const MIN_BUDGET: usize = 8192; // 最小 8KB
+        const MAX_BUDGET: usize = 131072; // 最大 128KB
+        const ADJUST_RATE: f64 = 0.1; // 调整速率 10%
 
         let avg_frame_ms = self.debug_panel.get_avg_frame_time_ms();
 
@@ -35,212 +33,215 @@ impl TerminalApp {
     }
 
     pub fn render_terminal_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-            // 终端显示区域
-            self.renderer.sync_font_metrics(ctx);
-            let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
-            crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
+        // 终端显示区域
+        self.renderer.sync_font_metrics(ctx);
+        let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
+        crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
-            // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
-            // 各自按自己的 rect 尺寸 resize(否则活跃会话会被错误地撑成整窗口大小)。
-            let multi_pane = self.layout_manager.panes().len() > 1;
-            if !multi_pane && (cols != self.cols || rows != self.rows || self.force_resize_session) {
-                let session = self.session_manager.get_active_session_mut();
-                let _ = session.shell.resize(cols, rows);
-                let mut terminal = session.terminal.lock();
-                terminal.on_resize(cols, rows);
-                self.cols = cols;
-                self.rows = rows;
-                if self.force_resize_session {
-                    // Session 切换时重置 renderer 的 IME 状态缓存
-                    // 这样下一帧会重新发送 IMEAllowed(true)，确保 IME 不会丢失
-                    self.renderer.reset_ime_state();
-                }
-                self.force_resize_session = false;
+        // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
+        // 各自按自己的 rect 尺寸 resize(否则活跃会话会被错误地撑成整窗口大小)。
+        let multi_pane = self.layout_manager.panes().len() > 1;
+        if !multi_pane && (cols != self.cols || rows != self.rows || self.force_resize_session) {
+            let session = self.session_manager.get_active_session_mut();
+            let _ = session.shell.resize(cols, rows);
+            let mut terminal = session.terminal.lock();
+            terminal.on_resize(cols, rows);
+            self.cols = cols;
+            self.rows = rows;
+            if self.force_resize_session {
+                // Session 切换时重置 renderer 的 IME 状态缓存
+                // 这样下一帧会重新发送 IMEAllowed(true)，确保 IME 不会丢失
+                self.renderer.reset_ime_state();
             }
+            self.force_resize_session = false;
+        }
 
-            // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
-            if self.layout_manager.panes().len() > 1 {
-                let available_rect = ui.available_rect_before_wrap();
+        // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
+        if self.layout_manager.panes().len() > 1 {
+            let available_rect = ui.available_rect_before_wrap();
 
-                // 计算窗格矩形
-                self.layout_manager.compute_pane_rects(available_rect);
+            // 计算窗格矩形
+            self.layout_manager.compute_pane_rects(available_rect);
 
-                // 获取所有窗格信息
-                let panes = self.layout_manager.panes().to_vec();
-                let divider_rect = self.layout_manager.get_divider_rect();
+            // 获取所有窗格信息
+            let panes = self.layout_manager.panes().to_vec();
+            let divider_rect = self.layout_manager.get_divider_rect();
 
-                // 为每个窗格渲染
-                for (pane_idx, pane) in panes.iter().enumerate() {
-                    if pane_idx >= self.pane_renderers.len() {
-                        break;
-                    }
-
-                    let session_idx = pane.session_idx;
-                    // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
-                    // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
-                    let (pane_cols, pane_rows) =
-                        self.pane_renderers[pane_idx].grid_dimensions(pane.rect.size());
-                    if let Some(session) = self.session_manager.get_session_mut(session_idx) {
-                        let mut terminal_guard = session.terminal.lock();
-                        if pane_cols != terminal_guard.grid.row_len()
-                            || pane_rows != terminal_guard.grid.rows()
-                        {
-                            terminal_guard.on_resize(pane_cols, pane_rows);
-                            let _ = session.shell.resize(pane_cols, pane_rows);
-                        }
-                        // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
-                        // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
-                        let grid_version = terminal_guard.get_grid_version();
-                        let scroll_offset = terminal_guard.scroll_offset;
-                        let renderer = &mut self.pane_renderers[pane_idx];
-                        if grid_version != renderer.cached_links_grid_version
-                            || scroll_offset != renderer.cached_links_scroll_offset
-                        {
-                            let visible_cells = terminal_guard.get_visible_cells();
-                            let row_wrapped = terminal_guard.get_visible_row_wrapped();
-                            renderer.cached_links = std::sync::Arc::new(
-                                self.link_detector.detect_links_in_visible_cells_with_wrapping(
-                                    &visible_cells,
-                                    &row_wrapped,
-                                ),
-                            );
-                            renderer.cached_links_grid_version = grid_version;
-                            renderer.cached_links_scroll_offset = scroll_offset;
-                        }
-                        // O(1) clone Arc,规避 &mut renderer 与 &renderer.cached_links 借用冲突。
-                        let links = renderer.cached_links.clone();
-
-                        // 在指定矩形内渲染（多窗格模式专用方法）
-                        renderer.render_in_rect(
-                            ui,
-                            &mut terminal_guard,
-                            self.cursor_visible,
-                            &self.search_state,
-                            &links,
-                            &self.hovered_link,
-                            pane.rect,
-                        );
-                    }
+            // 为每个窗格渲染
+            for (pane_idx, pane) in panes.iter().enumerate() {
+                if pane_idx >= self.pane_renderers.len() {
+                    break;
                 }
 
-                // 绘制分隔线
-                if let Some(divider) = divider_rect {
-                    let painter = ui.painter();
-                    let divider_color = if self.dragging_divider {
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border)
-                    } else {
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border)
-                    };
-
-                    painter.rect_filled(divider, 0.0, divider_color);
-
-                    // 处理分隔线拖拽
-                    if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-                        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                            if divider.contains(pos) {
-                                self.dragging_divider = true;
-                            }
-                        }
-                    }
-
-                    if self.dragging_divider {
-                        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                            // 计算新的分割比例
-                            match self.layout_manager.mode {
-                                layout::SplitMode::VerticalSplit { .. } => {
-                                    let delta = pos.x - divider.center().x;
-                                    let total_width = available_rect.width();
-                                    let ratio_delta = delta / total_width * 0.1; // 降低灵敏度
-                                    self.layout_manager.adjust_split_ratio(ratio_delta);
-                                }
-                                layout::SplitMode::HorizontalSplit { .. } => {
-                                    let delta = pos.y - divider.center().y;
-                                    let total_height = available_rect.height();
-                                    let ratio_delta = delta / total_height * 0.1;
-                                    self.layout_manager.adjust_split_ratio(ratio_delta);
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
-                            self.dragging_divider = false;
-                        }
-                    }
-                }
-
-                // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
-                // 那是用于拖拽调整比例的)。
-                if !self.dragging_divider
-                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
-                {
-                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                        let on_divider = divider_rect.map(|d| d.contains(pos)).unwrap_or(false);
-                        if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
-                            self.sync_active_session_to_focused_pane();
-                        }
-                    }
-                }
-            } else {
-                // 单窗格渲染（原有逻辑）
-                {
-                    let session = self.session_manager.get_active_session_mut();
+                let session_idx = pane.session_idx;
+                // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
+                // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
+                let (pane_cols, pane_rows) =
+                    self.pane_renderers[pane_idx].grid_dimensions(pane.rect.size());
+                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
                     let mut terminal_guard = session.terminal.lock();
-
-                    // 获取链接列表用于渲染（使用缓存）
+                    if pane_cols != terminal_guard.grid.row_len()
+                        || pane_rows != terminal_guard.grid.rows()
+                    {
+                        terminal_guard.on_resize(pane_cols, pane_rows);
+                        let _ = session.shell.resize(pane_cols, pane_rows);
+                    }
+                    // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
+                    // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
                     let grid_version = terminal_guard.get_grid_version();
                     let scroll_offset = terminal_guard.scroll_offset;
-
-                    if grid_version != self.cached_links_grid_version
-                        || scroll_offset != self.cached_links_scroll_offset
+                    let renderer = &mut self.pane_renderers[pane_idx];
+                    if grid_version != renderer.cached_links_grid_version
+                        || scroll_offset != renderer.cached_links_scroll_offset
                     {
                         let visible_cells = terminal_guard.get_visible_cells();
                         let row_wrapped = terminal_guard.get_visible_row_wrapped();
-                        self.cached_links = self.link_detector.detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
-                        self.cached_links_grid_version = grid_version;
-                        self.cached_links_scroll_offset = scroll_offset;
+                        renderer.cached_links = std::sync::Arc::new(
+                            self.link_detector
+                                .detect_links_in_visible_cells_with_wrapping(
+                                    &visible_cells,
+                                    &row_wrapped,
+                                ),
+                        );
+                        renderer.cached_links_grid_version = grid_version;
+                        renderer.cached_links_scroll_offset = scroll_offset;
                     }
-                    // 在渲染终端之前读取滚轮值和 Ctrl 键状态
-                    let ctrl_pressed_render = ui.input(|i| i.modifiers.ctrl);
+                    // O(1) clone Arc,规避 &mut renderer 与 &renderer.cached_links 借用冲突。
+                    let links = renderer.cached_links.clone();
 
-                    // 从原始 MouseWheel 事件中提取 delta（因为 smooth_scroll_delta 被 egui 消费了）
-                    let mut scroll_delta_from_event = 0.0;
-                    if ctrl_pressed_render {
-                        scroll_delta_from_event = ui.input(|i| {
-                            i.events
-                                .iter()
-                                .filter_map(|evt| match evt {
-                                    egui::Event::MouseWheel {
-                                        delta, modifiers, ..
-                                    } if modifiers.ctrl => Some(delta.y),
-                                    _ => None,
-                                })
-                                .sum()
-                        });
-                    }
-
-                    // Ctrl+滚轮字体缩放（积累事件而不是立即应用）
-                    if scroll_delta_from_event != 0.0 && ctrl_pressed_render {
-                        let font_size_delta = if scroll_delta_from_event > 0.0 {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        // 积累字体大小变化
-                        self.font_size_accumulator += font_size_delta;
-                        self.had_ctrl_scroll_last_frame = true;
-                    }
-
-                    self.renderer.render(
+                    // 在指定矩形内渲染（多窗格模式专用方法）
+                    renderer.render_in_rect(
                         ui,
                         &mut terminal_guard,
                         self.cursor_visible,
                         &self.search_state,
-                        &self.cached_links,
+                        &links,
                         &self.hovered_link,
+                        pane.rect,
                     );
                 }
             }
+
+            // 绘制分隔线
+            if let Some(divider) = divider_rect {
+                let painter = ui.painter();
+                let divider_color = if self.dragging_divider {
+                    crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border)
+                } else {
+                    crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border)
+                };
+
+                painter.rect_filled(divider, 0.0, divider_color);
+
+                // 处理分隔线拖拽
+                if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        if divider.contains(pos) {
+                            self.dragging_divider = true;
+                        }
+                    }
+                }
+
+                if self.dragging_divider {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        // 计算新的分割比例
+                        match self.layout_manager.mode {
+                            layout::SplitMode::VerticalSplit { .. } => {
+                                let delta = pos.x - divider.center().x;
+                                let total_width = available_rect.width();
+                                let ratio_delta = delta / total_width * 0.1; // 降低灵敏度
+                                self.layout_manager.adjust_split_ratio(ratio_delta);
+                            }
+                            layout::SplitMode::HorizontalSplit { .. } => {
+                                let delta = pos.y - divider.center().y;
+                                let total_height = available_rect.height();
+                                let ratio_delta = delta / total_height * 0.1;
+                                self.layout_manager.adjust_split_ratio(ratio_delta);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+                        self.dragging_divider = false;
+                    }
+                }
+            }
+
+            // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
+            // 那是用于拖拽调整比例的)。
+            if !self.dragging_divider
+                && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+            {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    let on_divider = divider_rect.map(|d| d.contains(pos)).unwrap_or(false);
+                    if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
+                        self.sync_active_session_to_focused_pane();
+                    }
+                }
+            }
+        } else {
+            // 单窗格渲染（原有逻辑）
+            {
+                let session = self.session_manager.get_active_session_mut();
+                let mut terminal_guard = session.terminal.lock();
+
+                // 获取链接列表用于渲染（使用缓存）
+                let grid_version = terminal_guard.get_grid_version();
+                let scroll_offset = terminal_guard.scroll_offset;
+
+                if grid_version != self.cached_links_grid_version
+                    || scroll_offset != self.cached_links_scroll_offset
+                {
+                    let visible_cells = terminal_guard.get_visible_cells();
+                    let row_wrapped = terminal_guard.get_visible_row_wrapped();
+                    self.cached_links = self
+                        .link_detector
+                        .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
+                    self.cached_links_grid_version = grid_version;
+                    self.cached_links_scroll_offset = scroll_offset;
+                }
+                // 在渲染终端之前读取滚轮值和 Ctrl 键状态
+                let ctrl_pressed_render = ui.input(|i| i.modifiers.ctrl);
+
+                // 从原始 MouseWheel 事件中提取 delta（因为 smooth_scroll_delta 被 egui 消费了）
+                let mut scroll_delta_from_event = 0.0;
+                if ctrl_pressed_render {
+                    scroll_delta_from_event = ui.input(|i| {
+                        i.events
+                            .iter()
+                            .filter_map(|evt| match evt {
+                                egui::Event::MouseWheel {
+                                    delta, modifiers, ..
+                                } if modifiers.ctrl => Some(delta.y),
+                                _ => None,
+                            })
+                            .sum()
+                    });
+                }
+
+                // Ctrl+滚轮字体缩放（积累事件而不是立即应用）
+                if scroll_delta_from_event != 0.0 && ctrl_pressed_render {
+                    let font_size_delta = if scroll_delta_from_event > 0.0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    // 积累字体大小变化
+                    self.font_size_accumulator += font_size_delta;
+                    self.had_ctrl_scroll_last_frame = true;
+                }
+
+                self.renderer.render(
+                    ui,
+                    &mut terminal_guard,
+                    self.cursor_visible,
+                    &self.search_state,
+                    &self.cached_links,
+                    &self.hovered_link,
+                );
+            }
+        }
     }
 
     #[allow(deprecated)]
@@ -564,7 +565,9 @@ impl TerminalApp {
                         match sr_action {
                             search_replace_panel::SearchReplaceAction::ReplaceToClipboard => {
                                 if let Some(clipboard) = &self.clipboard {
-                                    if let Err(e) = clipboard.copy(&result) { log::warn!("{}", e); }
+                                    if let Err(e) = clipboard.copy(&result) {
+                                        log::warn!("{}", e);
+                                    }
                                 }
                             }
                             search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
@@ -639,12 +642,8 @@ impl TerminalApp {
         let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
         let text_color = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.text);
         let alpha = (fade_alpha * 230.0) as u8;
-        let bg = egui::Color32::from_rgba_unmultiplied(
-            panel_bg.r(),
-            panel_bg.g(),
-            panel_bg.b(),
-            alpha,
-        );
+        let bg =
+            egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
 
         egui::Area::new(egui::Id::new("status_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
@@ -735,9 +734,7 @@ impl TerminalApp {
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(&preview)
-                                            .monospace()
-                                            .color(text_color),
+                                        egui::RichText::new(&preview).monospace().color(text_color),
                                     )
                                     .wrap(),
                                 );
@@ -782,10 +779,7 @@ impl TerminalApp {
             }
         }
         self.paste_dont_ask_again = false;
-        let pending = self
-            .pending_paste_confirm
-            .take()
-            .expect("pending was Some");
+        let pending = self.pending_paste_confirm.take().expect("pending was Some");
         if !confirmed {
             return;
         }

@@ -72,7 +72,11 @@ impl HelpPanel {
                     // 配置筛掉。
                     let mut bound: Vec<(String, String)> = Vec::new();
                     let mut unbound: Vec<String> = Vec::new();
-                    for c in palette.all_commands().iter().filter(|c| c.category == category) {
+                    for c in palette
+                        .all_commands()
+                        .iter()
+                        .filter(|c| c.category == category)
+                    {
                         let binds = keybindings.pretty_bindings_for(&c.command.to_string());
                         if binds.is_empty() {
                             unbound.push(c.name.clone());
@@ -100,9 +104,7 @@ impl HelpPanel {
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 [150.0, 18.0],
-                                egui::Label::new(
-                                    RichText::new(keys).monospace().color(cat_color),
-                                ),
+                                egui::Label::new(RichText::new(keys).monospace().color(cat_color)),
                             );
                             ui.label(RichText::new(name).color(text_color));
                         });

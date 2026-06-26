@@ -1,8 +1,12 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use super::font_backend::{
+    alpha_from_coverage, create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey,
+    DirtyRect, FontBackend, GlyphRegion, ShapedGlyph, GLYPH_PADDING, INITIAL_ATLAS_SIZE,
+    MAX_ATLAS_SIZE,
+};
 use lru::LruCache;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use super::font_backend::{FontBackend, GlyphRegion, ShapedGlyph, AtlasGlyphKey, DirtyRect, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE, create_gpu_resources, upload_bitmap, empty_glyph_region, alpha_from_coverage};
+use std::sync::Arc;
 
 /// Cache key for a shaped run: run text + style + subpixel bin.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -345,7 +349,13 @@ impl FontdueAtlas {
 
         if use_subpixel {
             self.rasterize_subpixel(
-                metrics, glyph_bitmap, glyph_w, glyph_h, bx, by, weight_boost,
+                metrics,
+                glyph_bitmap,
+                glyph_w,
+                glyph_h,
+                bx,
+                by,
+                weight_boost,
             );
         } else {
             for gy in 0..glyph_h {
@@ -367,7 +377,8 @@ impl FontdueAtlas {
         }
 
         // Record dirty rectangle (with padding)
-        self.dirty_rects.push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
+        self.dirty_rects
+            .push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
 
         let subpixel_shift = match key.subpixel_offset {
             1 => 0.25,
@@ -426,8 +437,11 @@ impl FontdueAtlas {
                 }
 
                 // R subpixel: centered at -1/3 pixel offset
-                let r_cov = samples[0] * W[0] + samples[1] * W[1] + samples[2] * W[2]
-                    + samples[3] * W[3] + samples[4] * W[4];
+                let r_cov = samples[0] * W[0]
+                    + samples[1] * W[1]
+                    + samples[2] * W[2]
+                    + samples[3] * W[3]
+                    + samples[4] * W[4];
                 // G subpixel: centered at 0
                 let g_cov = {
                     let src_idx = (gy * glyph_w + gx) as usize;
@@ -443,8 +457,11 @@ impl FontdueAtlas {
                     let cov = glyph_bitmap[src_idx] as f32 / 255.0;
                     b_samples[i as usize] = (cov * weight_boost).min(1.0);
                 }
-                let b_cov = b_samples[0] * W[0] + b_samples[1] * W[1] + b_samples[2] * W[2]
-                    + b_samples[3] * W[3] + b_samples[4] * W[4];
+                let b_cov = b_samples[0] * W[0]
+                    + b_samples[1] * W[1]
+                    + b_samples[2] * W[2]
+                    + b_samples[3] * W[3]
+                    + b_samples[4] * W[4];
 
                 let r = alpha_from_coverage(r_cov);
                 let g = alpha_from_coverage(g_cov);
@@ -464,7 +481,11 @@ impl FontdueAtlas {
     }
 
     fn rasterize_gid(&mut self, gid: u16, bold: bool, subpixel_offset: u8) -> GlyphRegion {
-        let key = GidGlyphKey { gid, bold, subpixel_offset };
+        let key = GidGlyphKey {
+            gid,
+            bold,
+            subpixel_offset,
+        };
         if let Some(&region) = self.gid_cache.get(&key) {
             return region;
         }
@@ -525,7 +546,8 @@ impl FontdueAtlas {
             }
         }
 
-        self.dirty_rects.push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
+        self.dirty_rects
+            .push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
 
         let subpixel_shift = match subpixel_offset {
             1 => 0.25,
@@ -554,8 +576,16 @@ impl FontdueAtlas {
 impl FontBackend for FontdueAtlas {
     fn get_or_rasterize(&mut self, ch: char, bold: bool, subpixel_offset: u8) -> GlyphRegion {
         // Force CJK characters to always use subpixel bin 0 (no subpixel variation needed)
-        let effective_subpixel = if is_cjk_or_wide(ch) { 0 } else { subpixel_offset };
-        let key = AtlasGlyphKey { ch, bold, subpixel_offset: effective_subpixel };
+        let effective_subpixel = if is_cjk_or_wide(ch) {
+            0
+        } else {
+            subpixel_offset
+        };
+        let key = AtlasGlyphKey {
+            ch,
+            bold,
+            subpixel_offset: effective_subpixel,
+        };
 
         // Tier 1: ASCII permanent cache (never evicted)
         if (ch as u32) < 128 {
@@ -663,7 +693,10 @@ impl FontBackend for FontdueAtlas {
         let (asc, desc) = Self::compute_metrics(&self.font_regular, self.font_size_px);
         self.cached_ascent = asc;
         self.cached_descent = desc;
-        self.cached_advance_width = self.font_regular.metrics('0', self.font_size_px).advance_width;
+        self.cached_advance_width = self
+            .font_regular
+            .metrics('0', self.font_size_px)
+            .advance_width;
 
         self.prepopulate_ascii();
         self.ensure_uploaded(device, queue);
@@ -671,7 +704,11 @@ impl FontBackend for FontdueAtlas {
     }
 
     fn font_metrics(&self) -> (f32, f32, f32) {
-        (self.cached_ascent, self.cached_descent, self.cached_advance_width)
+        (
+            self.cached_ascent,
+            self.cached_descent,
+            self.cached_advance_width,
+        )
     }
 
     fn ensure_uploaded(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -775,12 +812,7 @@ impl FontBackend for FontdueAtlas {
         self.shaping_enabled
     }
 
-    fn shape_run(
-        &mut self,
-        text: &str,
-        bold: bool,
-        subpixel_offset: u8,
-    ) -> Arc<Vec<ShapedGlyph>> {
+    fn shape_run(&mut self, text: &str, bold: bool, subpixel_offset: u8) -> Arc<Vec<ShapedGlyph>> {
         if !self.shaping_enabled || text.is_empty() {
             // Fallback: per-character rasterization
             let mut glyphs = Vec::with_capacity(text.len());
@@ -816,9 +848,7 @@ impl FontBackend for FontdueAtlas {
 
         // 使用构造时预解析好的 Face，避免每次缓存未命中都重新解析整个字体。
         let face = if bold {
-            self.shape_bold
-                .as_ref()
-                .or(self.shape_regular.as_ref())
+            self.shape_bold.as_ref().or(self.shape_regular.as_ref())
         } else {
             self.shape_regular.as_ref()
         }

@@ -114,7 +114,8 @@ impl KittyGraphicsState {
 
     fn enforce_image_limits(&mut self) {
         while self.images.len() > MAX_KITTY_IMAGES
-            || self.total_image_memory > MAX_KITTY_CACHE_MB * 1024 * 1024 {
+            || self.total_image_memory > MAX_KITTY_CACHE_MB * 1024 * 1024
+        {
             if let Some(oldest_id) = self.access_order.pop_front() {
                 if let Some(img) = self.images.remove(&oldest_id) {
                     self.total_image_memory -= img.data.len() as u64;
@@ -422,7 +423,8 @@ impl KittyGraphicsState {
             "i=0".to_string()
         };
         let response = format!("\x1b_G{id_field};OK\x1b\\");
-        self.pending_responses.extend_from_slice(response.as_bytes());
+        self.pending_responses
+            .extend_from_slice(response.as_bytes());
         log::info!("[KITTY_GRAPHICS] Query response: {id_field};OK");
         Ok(())
     }

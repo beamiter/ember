@@ -470,9 +470,8 @@ impl TerminalApp {
             if should_apply {
                 let steps = self.font_size_accumulator.floor() as i32;
                 if steps != 0 {
-                    let new_font_size = config::Config::clamp_font_size(
-                        self.config.font_size + steps as f32,
-                    );
+                    let new_font_size =
+                        config::Config::clamp_font_size(self.config.font_size + steps as f32);
 
                     if (new_font_size - self.config.font_size).abs() > 0.01 {
                         self.config.font_size = new_font_size;

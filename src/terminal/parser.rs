@@ -150,7 +150,11 @@ impl super::TerminalState {
                                 break;
                             }
 
-                            let payload_end = if data_slice[i - 1] == 0x07 { i - 1 } else { i - 2 };
+                            let payload_end = if data_slice[i - 1] == 0x07 {
+                                i - 1
+                            } else {
+                                i - 2
+                            };
                             if payload_end >= payload_start {
                                 if let Ok(payload) =
                                     std::str::from_utf8(&data_slice[payload_start..payload_end])
@@ -163,8 +167,7 @@ impl super::TerminalState {
                                             // OSC 7 — current working directory.
                                             // Format: file://hostname/path (path is %-encoded).
                                             // We accept either the full URL or a bare path.
-                                            self.current_working_dir =
-                                                Self::decode_osc7_cwd(value);
+                                            self.current_working_dir = Self::decode_osc7_cwd(value);
                                             crate::debug_log!(
                                                 "[OSC7] cwd set to {:?}",
                                                 self.current_working_dir
@@ -184,13 +187,17 @@ impl super::TerminalState {
                                                         .split(':')
                                                         .find_map(|p| p.strip_prefix("id="))
                                                         .map(|s| s.to_string());
-                                                    self.current_hyperlink = Some((uri.to_string(), id));
+                                                    self.current_hyperlink =
+                                                        Some((uri.to_string(), id));
                                                 }
                                             } else if value.is_empty() {
                                                 // OSC 8 ; ; (close hyperlink)
                                                 self.current_hyperlink = None;
                                             }
-                                        } else if command == "10" || command == "11" || command == "12" {
+                                        } else if command == "10"
+                                            || command == "11"
+                                            || command == "12"
+                                        {
                                             self.handle_osc_color(command, value);
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
@@ -203,8 +210,18 @@ impl super::TerminalState {
                                             // rxvt notification: 777;notify;title;body
                                             let parts: Vec<&str> = value.splitn(3, ';').collect();
                                             if parts.len() >= 2 && parts[0] == "notify" {
-                                                let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
-                                                let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                                                let title = parts
+                                                    .get(1)
+                                                    .unwrap_or(&"")
+                                                    .chars()
+                                                    .take(256)
+                                                    .collect();
+                                                let body = parts
+                                                    .get(2)
+                                                    .unwrap_or(&"")
+                                                    .chars()
+                                                    .take(256)
+                                                    .collect();
                                                 if self.pending_notifications.len() < 8 {
                                                     self.pending_notifications.push((title, body));
                                                 }
@@ -254,7 +271,10 @@ impl super::TerminalState {
                             let mut terminated = false;
                             let dcs_start = i;
                             while i < data_slice.len() {
-                                if i + 1 < data_slice.len() && data_slice[i] == 0x1b && data_slice[i + 1] == 0x5c {
+                                if i + 1 < data_slice.len()
+                                    && data_slice[i] == 0x1b
+                                    && data_slice[i + 1] == 0x5c
+                                {
                                     // Extract DCS payload
                                     let payload = &data_slice[dcs_start..i];
 
@@ -505,7 +525,10 @@ impl super::TerminalState {
         intermediates: &[u8],
     ) {
         // 显式光标定位会取消延迟换行标志(DEC 末列标志)。
-        if matches!(cmd, 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`') {
+        if matches!(
+            cmd,
+            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`'
+        ) {
             self.pending_wrap = false;
         }
         match cmd {
@@ -692,8 +715,7 @@ impl super::TerminalState {
                 if self.cursor_row >= self.scroll_region_top
                     && self.cursor_row <= self.scroll_region_bottom
                 {
-                    let region_height =
-                        self.scroll_region_bottom - self.cursor_row + 1;
+                    let region_height = self.scroll_region_bottom - self.cursor_row + 1;
                     let n = n.min(region_height);
                     let blank = self.create_blank_cell();
                     let cols = self.grid.row_len();
@@ -713,8 +735,7 @@ impl super::TerminalState {
                 if self.cursor_row >= self.scroll_region_top
                     && self.cursor_row <= self.scroll_region_bottom
                 {
-                    let region_height =
-                        self.scroll_region_bottom - self.cursor_row + 1;
+                    let region_height = self.scroll_region_bottom - self.cursor_row + 1;
                     let n = n.min(region_height);
                     let blank = self.create_blank_cell();
                     let cols = self.grid.row_len();
@@ -864,13 +885,15 @@ impl super::TerminalState {
                 }
             }
             'p' => {
-                if private_prefix == Some(b'?') && intermediates == [b'$']
-                    && params.first().copied() == Some(5522) {
-                        let state = if self.modes.contains(&5522) { 1 } else { 2 };
-                        let response = format!("\x1b[?5522;{}$y", state);
-                        crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
-                        self.output_buffer.extend_from_slice(response.as_bytes());
-                    }
+                if private_prefix == Some(b'?')
+                    && intermediates == [b'$']
+                    && params.first().copied() == Some(5522)
+                {
+                    let state = if self.modes.contains(&5522) { 1 } else { 2 };
+                    let response = format!("\x1b[?5522;{}$y", state);
+                    crate::debug_log!("[OSC5522] DECRQM query -> {}", response);
+                    self.output_buffer.extend_from_slice(response.as_bytes());
+                }
             }
             'h' => {
                 // 区分 DEC 私有模式(CSI ? Pn h)与 ANSI 模式(CSI Pn h)。
@@ -889,21 +912,19 @@ impl super::TerminalState {
                     _ => {}
                 }
             }
-            'l' => {
-                match private_prefix {
-                    Some(b'?') => {
-                        for &mode in params {
-                            self.reset_mode(mode);
-                        }
+            'l' => match private_prefix {
+                Some(b'?') => {
+                    for &mode in params {
+                        self.reset_mode(mode);
                     }
-                    None => {
-                        for &mode in params {
-                            self.reset_ansi_mode(mode);
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                None => {
+                    for &mode in params {
+                        self.reset_ansi_mode(mode);
+                    }
+                }
+                _ => {}
+            },
             'r' if private_prefix.is_none() => {
                 // Set scroll region (DECSTBM)。带私有前缀(如 CSI ? Pm r 的 XTRESTORE)
                 // 不是 DECSTBM,不能误设滚动区域,故仅在无前缀时处理。
@@ -984,11 +1005,13 @@ impl super::TerminalState {
                 self.mark_row_dirty(self.cursor_row);
             }
             'q' => {
-                if private_prefix == Some(b'>') && intermediates.is_empty()
-                    && params.first().copied().unwrap_or(0) == 0 {
-                        crate::debug_log!("[XTVERSION] report terminal version request");
-                        self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
-                    }
+                if private_prefix == Some(b'>')
+                    && intermediates.is_empty()
+                    && params.first().copied().unwrap_or(0) == 0
+                {
+                    crate::debug_log!("[XTVERSION] report terminal version request");
+                    self.output_buffer.extend_from_slice(XTERM_VERSION_RESPONSE);
+                }
 
                 // DECSCUSR - Set cursor style
                 if private_prefix.is_none() && intermediates == [b' '] {
@@ -1408,8 +1431,12 @@ impl super::TerminalState {
             }
             1048 => {
                 // 仅恢复光标(等价 DECRC)
-                self.cursor_row = self.saved_cursor_row.min(self.grid.rows().saturating_sub(1));
-                self.cursor_col = self.saved_cursor_col.min(self.grid.row_len().saturating_sub(1));
+                self.cursor_row = self
+                    .saved_cursor_row
+                    .min(self.grid.rows().saturating_sub(1));
+                self.cursor_col = self
+                    .saved_cursor_col
+                    .min(self.grid.row_len().saturating_sub(1));
             }
             1049 => {
                 // 退出备用屏并恢复进入前保存的光标

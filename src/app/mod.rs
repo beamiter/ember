@@ -6,4 +6,3 @@ pub mod rendering;
 pub mod state;
 pub mod tabs;
 pub mod window;
-

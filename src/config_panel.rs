@@ -355,10 +355,9 @@ impl ConfigPanel {
                     .desired_width(200.0)
                     .hint_text("Filter fonts..."),
             );
-            if !self.font_filter.is_empty()
-                && ui.small_button("x").clicked() {
-                    self.font_filter.clear();
-                }
+            if !self.font_filter.is_empty() && ui.small_button("x").clicked() {
+                self.font_filter.clear();
+            }
         });
 
         ui.horizontal(|ui| {
@@ -548,11 +547,7 @@ impl ConfigPanel {
         ui.horizontal(|ui| {
             ui.label("Tab Bar:");
             if ui
-                .selectable_value(
-                    &mut self.edit_tab_bar_position,
-                    TabBarPosition::Top,
-                    "Top",
-                )
+                .selectable_value(&mut self.edit_tab_bar_position, TabBarPosition::Top, "Top")
                 .changed()
             {
                 self.has_changes = true;
@@ -918,9 +913,11 @@ impl ConfigPanel {
         if self.edit_app_renderer == AppRendererType::Glow {
             let muted = ui.visuals().weak_text_color();
             ui.label(
-                RichText::new("Glow uses less memory. Terminal GPU rendering is disabled in this mode.")
-                    .size(11.0)
-                    .color(muted),
+                RichText::new(
+                    "Glow uses less memory. Terminal GPU rendering is disabled in this mode.",
+                )
+                .size(11.0)
+                .color(muted),
             );
         }
 
@@ -997,9 +994,7 @@ fn color_row_rgba(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4]) -> bool {
 
 // Helper: compact color button (for ANSI grid)
 fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool {
-    
-    ui
-        .color_edit_button_srgb(color)
+    ui.color_edit_button_srgb(color)
         .on_hover_text(tooltip)
         .changed()
 }

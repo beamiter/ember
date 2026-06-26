@@ -52,14 +52,14 @@ impl TerminalGrid {
             .collect()
     }
 
-
     /// 在行内指定列插入一个cell，右侧cell右移，末尾cell被丢弃
     pub fn insert_cell_in_row(&mut self, row: usize, col: usize, cell: TerminalCell) {
         if row >= self.rows || col >= self.cols {
             return;
         }
         let start = row * self.cols;
-        self.cells.copy_within(start + col..start + self.cols - 1, start + col + 1);
+        self.cells
+            .copy_within(start + col..start + self.cols - 1, start + col + 1);
         self.cells[start + col] = cell;
     }
 
@@ -69,7 +69,8 @@ impl TerminalGrid {
             return;
         }
         let start = row * self.cols;
-        self.cells.copy_within(start + col + 1..start + self.cols, start + col);
+        self.cells
+            .copy_within(start + col + 1..start + self.cols, start + col);
         // Fill last cell with default
         self.cells[start + self.cols - 1] = TerminalCell::default();
     }
@@ -171,26 +172,23 @@ pub enum Color {
     Default,
 }
 
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub enum CursorShape {
     #[default]
-    Block,     // 0 or 1 - block cursor (default)
+    Block, // 0 or 1 - block cursor (default)
     Underline, // 2 - underline cursor
     Beam,      // 3 - beam/vertical line cursor
 }
 
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum UnderlineStyle {
     #[default]
     None,
     Single,
     Double,
-    Curly,   // SGR 4:3
-    Dotted,  // SGR 4:4
-    Dashed,  // SGR 4:5
+    Curly,  // SGR 4:3
+    Dotted, // SGR 4:4
+    Dashed, // SGR 4:5
 }
 
 /// Packed style flags in a u16 bitfield (includes wide character bits).
@@ -235,12 +233,18 @@ const WIDE_CONT_BIT: u16 = 1 << 10;
 
 impl StyleFlags {
     #[inline(always)]
-    pub fn new() -> Self { Self(0) }
+    pub fn new() -> Self {
+        Self(0)
+    }
 
     #[inline(always)]
-    pub fn bold(&self) -> bool { self.0 & BOLD_BIT != 0 }
+    pub fn bold(&self) -> bool {
+        self.0 & BOLD_BIT != 0
+    }
     #[inline(always)]
-    pub fn italic(&self) -> bool { self.0 & ITALIC_BIT != 0 }
+    pub fn italic(&self) -> bool {
+        self.0 & ITALIC_BIT != 0
+    }
     #[inline(always)]
     pub fn underline(&self) -> UnderlineStyle {
         match (self.0 & UNDERLINE_MASK) >> UNDERLINE_SHIFT {
@@ -253,41 +257,103 @@ impl StyleFlags {
         }
     }
     #[inline(always)]
-    pub fn inverse(&self) -> bool { self.0 & INVERSE_BIT != 0 }
+    pub fn inverse(&self) -> bool {
+        self.0 & INVERSE_BIT != 0
+    }
     #[inline(always)]
-    pub fn dim(&self) -> bool { self.0 & DIM_BIT != 0 }
+    pub fn dim(&self) -> bool {
+        self.0 & DIM_BIT != 0
+    }
     #[inline(always)]
-    pub fn blink(&self) -> bool { self.0 & BLINK_BIT != 0 }
+    pub fn blink(&self) -> bool {
+        self.0 & BLINK_BIT != 0
+    }
     #[inline(always)]
-    pub fn strikethrough(&self) -> bool { self.0 & STRIKETHROUGH_BIT != 0 }
+    pub fn strikethrough(&self) -> bool {
+        self.0 & STRIKETHROUGH_BIT != 0
+    }
     #[inline(always)]
-    pub fn wide(&self) -> bool { self.0 & WIDE_BIT != 0 }
+    pub fn wide(&self) -> bool {
+        self.0 & WIDE_BIT != 0
+    }
     #[inline(always)]
-    pub fn wide_continuation(&self) -> bool { self.0 & WIDE_CONT_BIT != 0 }
+    pub fn wide_continuation(&self) -> bool {
+        self.0 & WIDE_CONT_BIT != 0
+    }
 
     #[inline(always)]
-    pub fn set_bold(&mut self, v: bool) { if v { self.0 |= BOLD_BIT; } else { self.0 &= !BOLD_BIT; } }
+    pub fn set_bold(&mut self, v: bool) {
+        if v {
+            self.0 |= BOLD_BIT;
+        } else {
+            self.0 &= !BOLD_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_italic(&mut self, v: bool) { if v { self.0 |= ITALIC_BIT; } else { self.0 &= !ITALIC_BIT; } }
+    pub fn set_italic(&mut self, v: bool) {
+        if v {
+            self.0 |= ITALIC_BIT;
+        } else {
+            self.0 &= !ITALIC_BIT;
+        }
+    }
     #[inline(always)]
     pub fn set_underline(&mut self, v: UnderlineStyle) {
         self.0 = (self.0 & !UNDERLINE_MASK) | ((v as u16) << UNDERLINE_SHIFT);
     }
     #[inline(always)]
-    pub fn set_inverse(&mut self, v: bool) { if v { self.0 |= INVERSE_BIT; } else { self.0 &= !INVERSE_BIT; } }
+    pub fn set_inverse(&mut self, v: bool) {
+        if v {
+            self.0 |= INVERSE_BIT;
+        } else {
+            self.0 &= !INVERSE_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_dim(&mut self, v: bool) { if v { self.0 |= DIM_BIT; } else { self.0 &= !DIM_BIT; } }
+    pub fn set_dim(&mut self, v: bool) {
+        if v {
+            self.0 |= DIM_BIT;
+        } else {
+            self.0 &= !DIM_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_blink(&mut self, v: bool) { if v { self.0 |= BLINK_BIT; } else { self.0 &= !BLINK_BIT; } }
+    pub fn set_blink(&mut self, v: bool) {
+        if v {
+            self.0 |= BLINK_BIT;
+        } else {
+            self.0 &= !BLINK_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_strikethrough(&mut self, v: bool) { if v { self.0 |= STRIKETHROUGH_BIT; } else { self.0 &= !STRIKETHROUGH_BIT; } }
+    pub fn set_strikethrough(&mut self, v: bool) {
+        if v {
+            self.0 |= STRIKETHROUGH_BIT;
+        } else {
+            self.0 &= !STRIKETHROUGH_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_wide(&mut self, v: bool) { if v { self.0 |= WIDE_BIT; } else { self.0 &= !WIDE_BIT; } }
+    pub fn set_wide(&mut self, v: bool) {
+        if v {
+            self.0 |= WIDE_BIT;
+        } else {
+            self.0 &= !WIDE_BIT;
+        }
+    }
     #[inline(always)]
-    pub fn set_wide_continuation(&mut self, v: bool) { if v { self.0 |= WIDE_CONT_BIT; } else { self.0 &= !WIDE_CONT_BIT; } }
+    pub fn set_wide_continuation(&mut self, v: bool) {
+        if v {
+            self.0 |= WIDE_CONT_BIT;
+        } else {
+            self.0 &= !WIDE_CONT_BIT;
+        }
+    }
 
     #[inline(always)]
-    pub fn is_default_style(&self) -> bool { self.0 & 0x1FF == 0 }
+    pub fn is_default_style(&self) -> bool {
+        self.0 & 0x1FF == 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -306,18 +372,27 @@ enum CompressedLineData {
 impl ScrollbackLine {
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
         let cols = cells.len() as u16;
-        let trailing_blanks = cells.iter().rev()
-            .take_while(|c| c.character == ' ' && c.foreground == Color::Default
-                && c.background == Color::Default && c.flags.is_default_style()
-                && !c.flags.wide() && !c.flags.wide_continuation())
+        let trailing_blanks = cells
+            .iter()
+            .rev()
+            .take_while(|c| {
+                c.character == ' '
+                    && c.foreground == Color::Default
+                    && c.background == Color::Default
+                    && c.flags.is_default_style()
+                    && !c.flags.wide()
+                    && !c.flags.wide_continuation()
+            })
             .count();
 
         let active_len = cells.len() - trailing_blanks;
-        let all_default_attrs = cells[..active_len].iter().all(|c|
-            c.foreground == Color::Default && c.background == Color::Default
-            && c.flags.is_default_style()
-            && !c.flags.wide() && !c.flags.wide_continuation()
-        );
+        let all_default_attrs = cells[..active_len].iter().all(|c| {
+            c.foreground == Color::Default
+                && c.background == Color::Default
+                && c.flags.is_default_style()
+                && !c.flags.wide()
+                && !c.flags.wide_continuation()
+        });
 
         if all_default_attrs {
             let text: String = cells[..active_len].iter().map(|c| c.character).collect();
@@ -339,15 +414,17 @@ impl ScrollbackLine {
     pub fn decompress(&self) -> Vec<TerminalCell> {
         match &self.data {
             CompressedLineData::Plain(text, trailing) => {
-                let mut cells: Vec<TerminalCell> = text.chars()
-                    .map(|ch| TerminalCell { character: ch, ..Default::default() })
+                let mut cells: Vec<TerminalCell> = text
+                    .chars()
+                    .map(|ch| TerminalCell {
+                        character: ch,
+                        ..Default::default()
+                    })
                     .collect();
                 cells.resize(cells.len() + *trailing as usize, TerminalCell::default());
                 cells
             }
-            CompressedLineData::Encoded(data) => {
-                Self::decode_cells(data, self.cols as usize)
-            }
+            CompressedLineData::Encoded(data) => Self::decode_cells(data, self.cols as usize),
         }
     }
 
@@ -370,13 +447,23 @@ impl ScrollbackLine {
             Color::BrightMagenta => buf.push(14),
             Color::BrightCyan => buf.push(15),
             Color::BrightWhite => buf.push(16),
-            Color::Indexed(i) => { buf.push(17); buf.push(*i); }
-            Color::Rgb(r, g, b) => { buf.push(18); buf.push(*r); buf.push(*g); buf.push(*b); }
+            Color::Indexed(i) => {
+                buf.push(17);
+                buf.push(*i);
+            }
+            Color::Rgb(r, g, b) => {
+                buf.push(18);
+                buf.push(*r);
+                buf.push(*g);
+                buf.push(*b);
+            }
         }
     }
 
     fn decode_color(data: &[u8], pos: &mut usize) -> Color {
-        if *pos >= data.len() { return Color::Default; }
+        if *pos >= data.len() {
+            return Color::Default;
+        }
         let tag = data[*pos];
         *pos += 1;
         match tag {
@@ -415,8 +502,12 @@ impl ScrollbackLine {
 
     fn encode_flags(flags: &StyleFlags) -> u8 {
         let mut f = 0u8;
-        if flags.bold() { f |= 1; }
-        if flags.italic() { f |= 2; }
+        if flags.bold() {
+            f |= 1;
+        }
+        if flags.italic() {
+            f |= 2;
+        }
         match flags.underline() {
             UnderlineStyle::None => {}
             UnderlineStyle::Single => f |= 4,
@@ -425,9 +516,15 @@ impl ScrollbackLine {
             UnderlineStyle::Dotted => f |= 16,
             UnderlineStyle::Dashed => f |= 20,
         }
-        if flags.inverse() { f |= 32; }
-        if flags.dim() { f |= 64; }
-        if flags.strikethrough() { f |= 128; }
+        if flags.inverse() {
+            f |= 32;
+        }
+        if flags.dim() {
+            f |= 64;
+        }
+        if flags.strikethrough() {
+            f |= 128;
+        }
         f
     }
 
@@ -463,8 +560,10 @@ impl ScrollbackLine {
             let mut run = 1u8;
             while (run as u16) < 255 && (i + run as usize) < cells.len() {
                 let next = &cells[i + run as usize];
-                if next.character == cell.character && next.foreground == cell.foreground
-                    && next.background == cell.background && next.flags == cell.flags
+                if next.character == cell.character
+                    && next.foreground == cell.foreground
+                    && next.background == cell.background
+                    && next.flags == cell.flags
                 {
                     run += 1;
                 } else {
@@ -479,7 +578,8 @@ impl ScrollbackLine {
             Self::encode_color(&cell.background, &mut buf);
             let f = Self::encode_flags(&cell.flags);
             buf.push(f);
-            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 } | if cell.flags.wide_continuation() { 2 } else { 0 };
+            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 }
+                | if cell.flags.wide_continuation() { 2 } else { 0 };
             buf.push(wide_bits);
             buf.push(run);
 
@@ -494,7 +594,9 @@ impl ScrollbackLine {
         while pos < data.len() {
             let ch_len = data[pos] as usize;
             pos += 1;
-            if pos + ch_len > data.len() { break; }
+            if pos + ch_len > data.len() {
+                break;
+            }
             let ch = std::str::from_utf8(&data[pos..pos + ch_len])
                 .ok()
                 .and_then(|s| s.chars().next())
@@ -565,9 +667,7 @@ impl Default for DirtyRegion {
 
 impl DirtyRegion {
     pub fn new() -> Self {
-        DirtyRegion {
-            rows: Vec::new(),
-        }
+        DirtyRegion { rows: Vec::new() }
     }
 
     /// 标记某一行为脏
@@ -599,5 +699,4 @@ impl DirtyRegion {
     pub fn clear(&mut self) {
         self.rows.clear();
     }
-
 }

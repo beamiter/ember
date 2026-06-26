@@ -4,7 +4,10 @@ use super::state::TerminalApp;
 use eframe::egui;
 
 /// 检查是否应该恢复终端快捷键事件
-pub fn should_restore_terminal_shortcut_event(ctx: &egui::Context, modifiers: egui::Modifiers) -> bool {
+pub fn should_restore_terminal_shortcut_event(
+    ctx: &egui::Context,
+    modifiers: egui::Modifiers,
+) -> bool {
     !ctx.text_edit_focused() && modifiers.command && !modifiers.alt
 }
 
@@ -90,7 +93,10 @@ pub fn normalize_terminal_shortcut_events(
         }
 
         if restore_shortcuts
-            && matches!(event, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_))
+            && matches!(
+                event,
+                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+            )
         {
             if let Some(key_event) = shortcut_event_to_key_event(event, modifiers) {
                 crate::debug_log!("[NORMALIZE] converted to Key event via restore_shortcuts");
@@ -100,7 +106,10 @@ pub fn normalize_terminal_shortcut_events(
         }
 
         // 既不恢复为按键也不保留：丢弃语义剪贴板事件，避免泄漏进终端
-        if matches!(event, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)) {
+        if matches!(
+            event,
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+        ) {
             crate::debug_log!("[NORMALIZE] dropping semantic clipboard event");
             continue;
         }

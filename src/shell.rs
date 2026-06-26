@@ -305,9 +305,7 @@ impl ShellSession {
                                 crate::debug_log!("[IOLoop] 子进程退出码: {}", exit_code);
                                 ShellEvent::Exit(exit_code)
                             }
-                            Err(e) => {
-                                ShellEvent::Error(format!("Process exit error: {}", e))
-                            }
+                            Err(e) => ShellEvent::Error(format!("Process exit error: {}", e)),
                         })
                     } else {
                         None
@@ -316,8 +314,7 @@ impl ShellSession {
                 if let Some(exit_event) = exit_event {
                     if !accumulated.is_empty() {
                         let data = std::mem::take(&mut accumulated);
-                        let _ =
-                            Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
+                        let _ = Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
                     }
                     let _ = Self::send_event(&event_tx, &repaint_ctx, exit_event);
                     return;
@@ -410,7 +407,6 @@ impl ShellSession {
     pub fn get_child_pid(&self) -> i32 {
         self.child_pid
     }
-
 }
 
 impl Drop for ShellSession {
