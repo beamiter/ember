@@ -56,7 +56,12 @@ impl TerminalApp {
     }
 
     /// 处理命令调色板打开时的输入。返回 true 表示 update 应提前结束本帧。
-    pub fn handle_command_palette_input(&mut self, ctx: &egui::Context) -> bool {
+    pub fn handle_command_palette_input(&mut self, root_ui: &mut egui::Ui) -> bool {
+        // 命令调色板既要消费 egui::Context 上的输入/视口操作,又要触发立即重绘(render_ui)
+        // ——后者在 egui 0.35 起需要 &mut Ui。这里克隆 Context(Arc 引用计数,几乎零成本)
+        // 同时保留对 root_ui 的可变借用,二者无冲突。
+        let ctx_owned = root_ui.ctx().clone();
+        let ctx = &ctx_owned;
         if self.command_palette.is_open {
             let events_copy = self.frame_events.clone();
             for evt in &events_copy {
@@ -252,7 +257,7 @@ impl TerminalApp {
             if self.command_palette.is_open {
                 // 获取命令调色板选中的命令，但不执行（仅在按 Enter 时执行）
                 // render_ui 中会显示调色板
-                self.render_ui(ctx);
+                self.render_ui(root_ui);
                 return true;
             }
         }
@@ -403,17 +408,26 @@ impl TerminalApp {
         for evt in &self.frame_events {
             if let egui::Event::Ime(ime_event) = evt {
                 let mut terminal = session.terminal.lock();
+                #[allow(deprecated)]
                 match ime_event {
                     egui::ImeEvent::Enabled => {
                         crate::debug_log!("[IME] Enabled");
                         terminal.ime_enabled = true;
                     }
-                    egui::ImeEvent::Preedit(text) => {
+                    egui::ImeEvent::Preedit { text, .. } => {
                         crate::debug_log!("[IME] Preedit: {:?}", text);
-                        // 光标位置用字符数而非字节数:CJK 预编辑文本每字符多字节,
-                        // 用 byte len 会让光标落到错误(过大)的位置。
-                        let cursor = text.chars().count();
-                        terminal.set_preedit(text.clone(), cursor);
+                        // egui 0.35 起 Enabled/Disabled 不再触发,改由 Preedit 的 text 是否为空来表达
+                        // IME 活跃状态:非空 = 输入中,空 = 已退出。
+                        if text.is_empty() {
+                            terminal.ime_enabled = false;
+                            terminal.clear_preedit();
+                        } else {
+                            terminal.ime_enabled = true;
+                            // 光标位置用字符数而非字节数:CJK 预编辑文本每字符多字节,
+                            // 用 byte len 会让光标落到错误(过大)的位置。
+                            let cursor = text.chars().count();
+                            terminal.set_preedit(text.clone(), cursor);
+                        }
                     }
                     egui::ImeEvent::Commit(text) => {
                         crate::debug_log!("[IME] Commit: {:?}", text);

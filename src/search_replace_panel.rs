@@ -64,7 +64,7 @@ impl SearchReplacePanel {
         egui::Window::new("Find & Replace")
             .title_bar(false)
             .resizable(false)
-            .default_pos(egui::pos2(ctx.available_rect().right() - 360.0, 120.0))
+            .default_pos(egui::pos2(ctx.viewport_rect().right() - 360.0, 120.0))
             .default_size([350.0, 120.0])
             .frame(egui::Frame {
                 fill: Theme::rgb_to_color32(theme.search.bg),

@@ -981,7 +981,7 @@ impl TerminalApp {
     /// 渲染左侧文件树侧边栏。必须在 CentralPanel 之前调用，
     /// 否则中央区域不会正确收缩。
     #[allow(deprecated)]
-    fn render_sidebar(&mut self, ctx: &egui::Context) {
+    fn render_sidebar(&mut self, root_ui: &mut egui::Ui) {
         if !self.sidebar.visible {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
             // 不再使用浮动按钮，避免覆盖终端内容。
@@ -1005,11 +1005,11 @@ impl TerminalApp {
         let mut view_changed = false;
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
-        egui::SidePanel::left("file_tree")
+        egui::Panel::left("file_tree")
             .resizable(true)
-            .default_width(self.sidebar.width)
+            .default_size(self.sidebar.width)
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     if sidebar_tab_mode {
                         // 分区切换：会话 / 文件
@@ -1132,17 +1132,23 @@ impl TerminalApp {
     }
 
     #[allow(deprecated)]
-    fn render_ui(&mut self, ctx: &egui::Context) {
+    fn render_ui(&mut self, root_ui: &mut egui::Ui) {
+        // egui 0.35 起 Panel/CentralPanel 都改成在 Ui 上 .show(ui, ...) 调用;
+        // 但仍有部分代码(浮窗 Window、各种 input/viewport 操作)需要 &Context,
+        // 这里克隆一份作为局部 ctx 供下游使用(Arc 引用计数,几乎零成本)。
+        let ctx_owned = root_ui.ctx().clone();
+        let ctx = &ctx_owned;
+
         let frame = egui::Frame::NONE.inner_margin(0.0);
 
         // 顶部栏(全宽)：必须在 render_sidebar 之前声明，egui 会把先声明的面板
         // 分配到容器边缘的完整范围 —— 因此顶栏横跨整个窗口，侧边栏落在其下方，
         // 而不是侧边栏贯穿到顶部。
         let mut close_requested = false;
-        egui::TopBottomPanel::top("top_bar")
+        egui::Panel::top("top_bar")
             .frame(egui::Frame::NONE)
             .resizable(false)
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 // Top 模式：完整水平标签栏(含 ☰ 与位置切换控件)。
                 // Sidebar 模式：精简顶栏(仅 ☰ 与位置切换控件)，标签在侧边栏内。
@@ -1159,9 +1165,9 @@ impl TerminalApp {
         }
 
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
-        self.render_sidebar(ctx);
+        self.render_sidebar(root_ui);
 
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(frame).show(root_ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             self.render_terminal_content(ui, ctx);
         });
@@ -1177,10 +1183,6 @@ impl eframe::App for TerminalApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Fully transparent clear color to support window-level opacity
         [0.0, 0.0, 0.0, 0.0]
-    }
-
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // UI handled in update()
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -1241,7 +1243,14 @@ impl eframe::App for TerminalApp {
         );
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.35 起将原来的 App::update 拆成了 `logic` 和 `ui` 两段:
+        // 这里把整个 update 的逻辑迁到 ui 中。许多下游代码(viewport 命令、输入查询、重绘请求)
+        // 仍需要 &Context,从 root_ui 上 clone 一份(Arc 引用计数,几乎零成本)即可,
+        // 与 root_ui 的可变借用互不冲突。
+        let ctx_owned = root_ui.ctx().clone();
+        let ctx = &ctx_owned;
+
         // 检查是否收到退出信号（SIGINT/SIGTERM）
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             crate::debug_log!("[SIGNAL] Shutdown requested, exiting gracefully");
@@ -1284,7 +1293,7 @@ impl eframe::App for TerminalApp {
             self.debug_panel.toggle();
         }
 
-        if self.handle_command_palette_input(ctx) {
+        if self.handle_command_palette_input(root_ui) {
             return;
         }
 
@@ -2174,7 +2183,7 @@ impl eframe::App for TerminalApp {
         drop(session);
 
         // 渲染 UI
-        self.render_ui(ctx);
+        self.render_ui(root_ui);
 
         // channel 中还有未处理的数据时，立即请求下一帧继续处理
         if has_more_data {

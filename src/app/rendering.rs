@@ -251,7 +251,7 @@ impl TerminalApp {
             egui::Window::new("Search")
                 .title_bar(false)
                 .resizable(false)
-                .default_pos(egui::pos2(ctx.available_rect().right() - 430.0, 60.0))
+                .default_pos(egui::pos2(ctx.viewport_rect().right() - 430.0, 60.0))
                 .default_size([420.0, 50.0])
                 .fixed_size([420.0, 50.0])
                 .frame(egui::Frame {
@@ -342,7 +342,7 @@ impl TerminalApp {
 
         // 命令调色板 UI（中央弹窗）
         if self.command_palette.is_open {
-            let screen_rect = ctx.screen_rect();
+            let screen_rect = ctx.viewport_rect();
             let palette_width = 600.0;
             let palette_height = 400.0;
             let palette_pos = egui::pos2(
