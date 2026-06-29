@@ -1167,10 +1167,12 @@ impl TerminalApp {
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
         self.render_sidebar(root_ui);
 
-        egui::CentralPanel::default().frame(frame).show(root_ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            self.render_terminal_content(ui, ctx);
-        });
+        egui::CentralPanel::default()
+            .frame(frame)
+            .show(root_ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                self.render_terminal_content(ui, ctx);
+            });
 
         self.render_floating_panels(ctx);
     }
