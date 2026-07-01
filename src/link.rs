@@ -69,9 +69,9 @@ impl LinkDetector {
             r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
         ).unwrap();
 
-        // 文件路径正则：以 /、./、../ 开头(前面是行首或空白)。
+        // 文件路径正则：以 /、./、../、~/ 开头(前面是行首或空白)。
         // 用捕获组提取实际路径，避免把前导空白计入列偏移。
-        let file_path_regex = Regex::new(r"(?:^|\s)(\.{0,2}/[^\s<>\[\]{}|\\^`()]*)").unwrap();
+        let file_path_regex = Regex::new(r"(?:^|\s)((?:\.{0,2}|~)/[^\s<>\[\]{}|\\^`()]*)").unwrap();
 
         Self {
             config,
@@ -184,8 +184,12 @@ impl LinkDetector {
             return false;
         }
 
-        // 必须以 / 或 ./ 或 ../ 开头
-        if !(trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../")) {
+        // 必须以 /、./、../ 或 ~/ 开头
+        if !(trimmed.starts_with('/')
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed.starts_with("~/"))
+        {
             return false;
         }
 
@@ -398,6 +402,21 @@ mod tests {
         let links = detector.detect_links_in_line(line, 0);
 
         assert!(links.iter().any(|l| l.link_type == LinkType::FilePath));
+    }
+
+    #[test]
+    fn test_home_relative_file_path_detection() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = "Open ~/notes/todo.md";
+        let links = detector.detect_links_in_line(line, 0);
+
+        let p = links
+            .iter()
+            .find(|l| l.link_type == LinkType::FilePath)
+            .unwrap();
+        assert_eq!(p.text, "~/notes/todo.md");
+        assert_eq!(p.col_start, 5);
+        assert_eq!(p.col_end, 20);
     }
 
     #[test]

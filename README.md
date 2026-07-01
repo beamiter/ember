@@ -58,7 +58,7 @@ Configuration file: `~/.config/jterm2/config.toml`
 Key settings:
 - `font_size` - Base font size
 - `font_family` - Primary font family
-- `font_fallback` - Fallback fonts for unicode
+- `font_fallback` - Fallback fonts for Unicode
 - `theme` - Color scheme name
 - `ui_scale` - UI scaling factor
 - `scroll_speed` - Mouse wheel scroll speed
@@ -80,20 +80,20 @@ Key settings:
 ### Core Components
 
 - **main.rs** - Application entry point, main event loop
-- **terminal.rs** - VTE state machine, ANSI escape sequence parsing
-- **ui.rs** - GPU-accelerated renderer, UI layout
-- **shell.rs** - PTY management, subprocess handling
-- **session_manager.rs** - Multi-session coordination
-- **theme.rs** - Color scheme system
+- **src/terminal/mod.rs** - VTE state machine, ANSI escape sequence parsing
+- **src/ui.rs** - GPU-accelerated renderer, UI layout
+- **src/shell.rs** - PTY management, subprocess handling
+- **src/session_manager.rs** - Multi-session coordination
+- **src/theme.rs** - Color scheme system
 - **gpu/** - WGPU rendering pipeline
 
 ### Rendering Pipeline
 
-1. VTE parser updates grid state (terminal.rs)
-2. Dirty-region detection compares grid versions (ui.rs)
-3. Changed cells compiled to GPU instances (gpu/instance.rs)
+1. VTE parser updates grid state (`src/terminal/mod.rs`)
+2. Dirty-region detection compares grid versions (`src/ui.rs`)
+3. Changed cells compiled to GPU instances (`src/gpu/instance.rs`)
 4. Instances uploaded to vertex buffer
-5. WGPU draws using instanced rendering (gpu/renderer.rs)
+5. WGPU draws using instanced rendering (`src/gpu/pipeline.rs` and `src/gpu/callback.rs`)
 
 ### Performance Design
 
