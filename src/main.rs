@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use terminal::{clamp_terminal_dimensions, TerminalState};
-use ui::TerminalRenderer;
+use ui::{grid_position_from_content, TerminalRenderer};
 
 // 全局标志，用于信号处理
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1960,23 +1960,20 @@ impl eframe::App for TerminalApp {
 
                 // 获取鼠标位置信息
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                    let screen_rect = ctx.viewport_rect();
                     let char_width = self.renderer.char_width;
                     let line_height = self.renderer.line_height;
-
-                    let clamped_x = (pos.x - screen_rect.left()).max(0.0);
-                    let clamped_y = (pos.y - screen_rect.top()).max(0.0);
-
-                    let col = if char_width > 0.0 {
-                        ((clamped_x / char_width) as usize).min(self.cols - 1)
-                    } else {
-                        0
-                    };
-                    let row = if line_height > 0.0 {
-                        ((clamped_y / line_height) as usize).min(self.rows - 1)
-                    } else {
-                        0
-                    };
+                    let content_rect = self
+                        .renderer
+                        .last_content_rect
+                        .unwrap_or_else(|| ctx.viewport_rect());
+                    let (row, col) = grid_position_from_content(
+                        pos,
+                        content_rect,
+                        char_width,
+                        line_height,
+                        self.cols,
+                        self.rows,
+                    );
 
                     // 处理鼠标滚轮（当启用鼠标报告时）
                     let line_h = self.renderer.line_height.max(1.0);

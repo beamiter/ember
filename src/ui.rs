@@ -35,6 +35,31 @@ fn cursor_rect(
     egui::Rect::from_min_size(egui::pos2(x, y), Vec2::new(width, height))
 }
 
+pub(crate) fn grid_position_from_content(
+    pos: egui::Pos2,
+    content_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let clamped_x = (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
+    let clamped_y = (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
+
+    let col = if char_width > 0.0 {
+        ((clamped_x / char_width) as usize).min(cols.saturating_sub(1))
+    } else {
+        0
+    };
+    let row = if line_height > 0.0 {
+        ((clamped_y / line_height) as usize).min(rows.saturating_sub(1))
+    } else {
+        0
+    };
+
+    (row, col)
+}
+
 fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -114,6 +139,45 @@ fn key_to_terminal_sequence(
         egui::Key::F11 => Some("\x1b[23~"),
         egui::Key::F12 => Some("\x1b[24~"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_position_uses_content_origin() {
+        let content_rect =
+            egui::Rect::from_min_size(egui::pos2(12.0, 36.0), egui::vec2(800.0, 400.0));
+
+        let (row, col) = grid_position_from_content(
+            egui::pos2(12.0 + 4.0 * 8.0, 36.0 + 2.0 * 20.0),
+            content_rect,
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+
+        assert_eq!((row, col), (2, 4));
+    }
+
+    #[test]
+    fn grid_position_clamps_to_grid_bounds() {
+        let content_rect =
+            egui::Rect::from_min_size(egui::pos2(12.0, 36.0), egui::vec2(800.0, 400.0));
+
+        let (row, col) = grid_position_from_content(
+            egui::pos2(2000.0, 2000.0),
+            content_rect,
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+
+        assert_eq!((row, col), (19, 99));
     }
 }
 
@@ -836,21 +900,14 @@ impl TerminalRenderer {
 
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x && !terminal.is_mouse_enabled() {
-                    let clamped_x =
-                        (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y =
-                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
-
-                    let click_col = if char_width > 0.0 {
-                        ((clamped_x / char_width) as usize).min(cols - 1)
-                    } else {
-                        0
-                    };
-                    let click_row = if line_height > 0.0 {
-                        ((clamped_y / line_height) as usize).min(rows - 1)
-                    } else {
-                        0
-                    };
+                    let (click_row, click_col) = grid_position_from_content(
+                        pos,
+                        content_rect,
+                        char_width,
+                        line_height,
+                        cols,
+                        rows,
+                    );
 
                     let (cursor_row, cursor_col) = terminal.get_cursor_pos();
 
