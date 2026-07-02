@@ -406,6 +406,9 @@ fn configure_fonts_and_gpu(
         &mut fonts,
         &mut loaded_font_paths,
         &[
+            // Prefer plain TTF/OTF fallbacks for the terminal GPU atlas. Some
+            // rasterizers used below do not accept TTC collections directly.
+            "Droid Sans Fallback",
             "Noto Sans CJK SC",
             "Noto Sans CJK",
             "Source Han Sans SC",
@@ -413,12 +416,13 @@ fn configure_fonts_and_gpu(
             "AR PL UMing CN",
         ],
         &[
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/wenquanyi/wqy-zenhei.ttc",
             "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJKsc-Regular.otf",
-            "/usr/share/fonts/wenquanyi/wqy-zenhei.ttc",
         ],
         "cjk",
         &[egui::FontFamily::Monospace, egui::FontFamily::Proportional],

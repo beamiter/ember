@@ -192,6 +192,15 @@ mod unix_pty {
                     b"TERM_PROGRAM_VERSION",
                     b"VTE_VERSION",
                 ];
+                const LOCALE_KEYS: [&[u8]; 3] = [b"LANG", b"LC_ALL", b"LC_CTYPE"];
+                let has_utf8_locale = std::env::vars_os().any(|(k, v)| {
+                    let k_bytes = k.as_bytes();
+                    if !LOCALE_KEYS.iter().any(|lk| *lk == k_bytes) {
+                        return false;
+                    }
+                    let value = v.to_string_lossy().to_ascii_lowercase();
+                    value.contains("utf-8") || value.contains("utf8")
+                });
                 let mut env_cstrings: Vec<CString> = Vec::new();
                 let mut has_less = false;
                 for (k, v) in std::env::vars_os() {
@@ -200,6 +209,9 @@ mod unix_pty {
                         has_less = true;
                     }
                     if OVERRIDDEN.iter().any(|ok| *ok == k_bytes) {
+                        continue;
+                    }
+                    if !has_utf8_locale && LOCALE_KEYS.iter().any(|lk| *lk == k_bytes) {
                         continue;
                     }
                     let mut entry = Vec::with_capacity(k_bytes.len() + 1 + v.len());
@@ -218,6 +230,10 @@ mod unix_pty {
                     CString::new(format!("TERM_PROGRAM_VERSION={}", TERM_PROGRAM_VERSION)).unwrap(),
                 );
                 env_cstrings.push(CString::new(format!("VTE_VERSION={}", VTE_VERSION)).unwrap());
+                if !has_utf8_locale {
+                    env_cstrings.push(CString::new("LANG=C.UTF-8").unwrap());
+                    env_cstrings.push(CString::new("LC_CTYPE=C.UTF-8").unwrap());
+                }
                 // LESS=FR(不含 -X)让 git 等正确使用备用屏幕;仅在用户未设置时添加。
                 if !has_less {
                     env_cstrings.push(CString::new("LESS=FR").unwrap());
