@@ -691,7 +691,8 @@ impl TerminalApp {
             .take(8)
             .map(|l| {
                 if l.len() > 200 {
-                    format!("{}…", &l[..200])
+                    let clipped: String = l.chars().take(200).collect();
+                    format!("{}…", clipped)
                 } else {
                     l.to_string()
                 }
