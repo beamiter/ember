@@ -277,6 +277,34 @@ fn kitty_modifier_value(modifiers: egui::Modifiers) -> u8 {
     bits + 1
 }
 
+fn consumed_key_name(key: egui::Key, modifiers: egui::Modifiers) -> String {
+    let mut parts = Vec::new();
+    if modifiers.ctrl {
+        parts.push("Ctrl");
+    }
+    if modifiers.shift {
+        parts.push("Shift");
+    }
+    if modifiers.alt {
+        parts.push("Alt");
+    }
+    if modifiers.mac_cmd || (modifiers.command && !modifiers.ctrl) {
+        parts.push("Cmd");
+    }
+    parts.push(match key {
+        egui::Key::Insert => "Insert",
+        egui::Key::C => "C",
+        egui::Key::V => "V",
+        egui::Key::X => "X",
+        egui::Key::Plus => "Plus",
+        egui::Key::Equals => "Equals",
+        egui::Key::Minus => "Minus",
+        egui::Key::Num0 => "0",
+        _ => return String::new(),
+    });
+    parts.join("+")
+}
+
 fn kitty_encode_key_event(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -933,8 +961,22 @@ impl TerminalRenderer {
             }
         }
 
+        // Triple-click: select the whole visual line, like VTE terminals.
+        if response.triple_clicked() && !self.dragging_scrollbar {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if pos.x < scrollbar_x {
+                    let clamped_y =
+                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
+                    let row = if line_height > 0.0 {
+                        ((clamped_y / line_height) as usize).min(rows - 1)
+                    } else {
+                        0
+                    };
+                    terminal.select_line_at(row);
+                }
+            }
         // Double-click: select word at cursor position
-        if response.double_clicked() && !self.dragging_scrollbar {
+        } else if response.double_clicked() && !self.dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x {
                     let clamped_x =
@@ -2158,7 +2200,7 @@ impl TerminalRenderer {
         &self,
         _ctx: &egui::Context,
         input: &mut Vec<u8>,
-        _consumed_keys: &std::collections::HashSet<&str>,
+        consumed_keys: &std::collections::HashSet<&str>,
         suppress_text_events: bool,
         keyboard_enhancement_flags: u16,
         report_all_keys_mode: bool,
@@ -2208,6 +2250,11 @@ impl TerminalRenderer {
                     modifiers,
                     ..
                 } => {
+                    let consumed_name = consumed_key_name(*key, *modifiers);
+                    if !consumed_name.is_empty() && consumed_keys.contains(consumed_name.as_str()) {
+                        continue;
+                    }
+
                     // Skip Ctrl+Shift+C/V/X - these will be handled in main.rs for copy/paste
                     if modifiers.ctrl && modifiers.shift && !modifiers.alt {
                         match key {

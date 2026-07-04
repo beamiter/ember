@@ -610,23 +610,8 @@ impl FontBackend for FontdueAtlas {
         let glyph_index = font.lookup_glyph_index(ch);
         let has_glyph = glyph_index != 0;
 
-        // Check if this is a Nerd Font icon (Private Use Area)
-        let is_nerd_font_char = matches!(ch as u32,
-            0xE000..=0xF8FF |     // Private Use Area (common Nerd Font range)
-            0xF0000..=0xFFFFD |   // Supplementary Private Use Area-A
-            0x100000..=0x10FFFD   // Supplementary Private Use Area-B
-        );
-
         // If no glyph in primary font (or we want fallback for missing chars), try fallback fonts
         if !has_glyph && ch != ' ' && !ch.is_control() {
-            // For Nerd Font characters, ONLY use primary font even if glyph_index is 0
-            // Don't fall back to CJK fonts which won't have icon glyphs
-            if is_nerd_font_char {
-                let (metrics, glyph_bitmap) = font.rasterize(ch, self.font_size_px);
-                return self.rasterize_and_place(&metrics, &glyph_bitmap, bold, key);
-            }
-
-            // For non-Nerd-Font chars, try fallback fonts (CJK, etc.)
             for fb in &self.fallback_fonts {
                 let fb_glyph_index = fb.lookup_glyph_index(ch);
                 if fb_glyph_index != 0 {

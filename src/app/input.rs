@@ -222,6 +222,10 @@ impl TerminalApp {
                                                 .focus_pane(layout::PaneDirection::Prev);
                                             self.sync_active_session_to_focused_pane();
                                         }
+                                        keybindings::Command::WindowClose => {
+                                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                            return true;
+                                        }
                                         keybindings::Command::ConfigOpen => {
                                             self.config_panel.open(&self.config);
                                             self.config_panel.edit_debug_overlay =
@@ -372,6 +376,46 @@ impl TerminalApp {
                                 self.status_message = "No next command mark".to_string();
                             }
                         }
+                        keybindings::Command::TerminalSplitVertical => {
+                            let new_session_idx =
+                                self.create_session_with_current_config(None, None);
+                            let _ = self.layout_manager.split(new_session_idx, false);
+                            self.sync_active_session_to_focused_pane();
+                            self.set_status("Split vertically");
+                            self.schedule_session_save();
+                        }
+                        keybindings::Command::TerminalSplitHorizontal => {
+                            let new_session_idx =
+                                self.create_session_with_current_config(None, None);
+                            let _ = self.layout_manager.split(new_session_idx, true);
+                            self.sync_active_session_to_focused_pane();
+                            self.set_status("Split horizontally");
+                            self.schedule_session_save();
+                        }
+                        keybindings::Command::TerminalClosePane => {
+                            if let Err(e) = self.layout_manager.close_focused_pane() {
+                                if self.session_manager.len() > 1 {
+                                    self.close_session_synced(active_session_idx);
+                                    self.schedule_session_save();
+                                } else {
+                                    self.set_status(e);
+                                }
+                            } else {
+                                self.sync_active_session_to_focused_pane();
+                            }
+                        }
+                        keybindings::Command::PaneFocusNext => {
+                            self.layout_manager.focus_pane(layout::PaneDirection::Next);
+                            self.sync_active_session_to_focused_pane();
+                        }
+                        keybindings::Command::PaneFocusPrev => {
+                            self.layout_manager.focus_pane(layout::PaneDirection::Prev);
+                            self.sync_active_session_to_focused_pane();
+                        }
+                        keybindings::Command::WindowClose => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return true;
+                        }
                         keybindings::Command::ConfigOpen => {
                             self.config_panel.open(&self.config);
                             self.config_panel.edit_debug_overlay = self.debug_panel.is_open;
@@ -391,9 +435,10 @@ impl TerminalApp {
                         keybindings::Command::SearchReplaceToggle => {
                             self.search_replace_panel.toggle();
                         }
-                        // 其他命令在下面处理
-                        _ => {}
+                        // 复制/粘贴等命令由 main.rs 后续专用路径处理，避免在这里提前吞掉。
+                        _ => continue,
                     }
+                    return true;
                 }
             }
         }
@@ -467,6 +512,45 @@ impl TerminalApp {
 
     /// 处理累积的 Ctrl+滚轮字体缩放。
     pub fn handle_font_zoom(&mut self, ctx: &egui::Context) {
+        let mut keyboard_delta = 0.0;
+        let mut reset_font_size = false;
+        ctx.input(|i| {
+            for evt in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    modifiers,
+                    pressed: true,
+                    ..
+                } = evt
+                {
+                    if modifiers.ctrl && !modifiers.alt {
+                        match key {
+                            egui::Key::Plus => keyboard_delta += 1.0,
+                            egui::Key::Equals if !modifiers.shift => keyboard_delta += 1.0,
+                            egui::Key::Minus if !modifiers.shift => keyboard_delta -= 1.0,
+                            egui::Key::Num0 if !modifiers.shift => reset_font_size = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        if reset_font_size || keyboard_delta != 0.0 {
+            let target_size = if reset_font_size {
+                config::Config::default().font_size
+            } else {
+                self.config.font_size + keyboard_delta
+            };
+            let new_font_size = config::Config::clamp_font_size(target_size);
+            if (new_font_size - self.config.font_size).abs() > 0.01 {
+                self.config.font_size = new_font_size;
+                self.apply_runtime_config(ctx);
+                self.schedule_config_save();
+            }
+            self.font_size_accumulator = 0.0;
+        }
+
         // Step 1.5: 处理累积的Ctrl+滚轮字体缩放
         // 检查是否有ctrl+scroll事件
         let has_ctrl_scroll_this_frame = {

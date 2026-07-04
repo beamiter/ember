@@ -201,6 +201,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+v".to_string(), "edit:paste".to_string());
+        bindings
+            .bindings
+            .insert("shift+insert".to_string(), "edit:paste".to_string());
 
         // 搜索操作
         bindings
@@ -214,7 +217,7 @@ impl KeyBindings {
         // 配置操作
         bindings
             .bindings
-            .insert("ctrl+shift+o".to_string(), "config:toggle".to_string());
+            .insert("ctrl+shift+,".to_string(), "config:toggle".to_string());
 
         // 侧边栏
         bindings
@@ -228,6 +231,28 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+down".to_string(), "terminal:scroll_down".to_string());
+        // Terminator-compatible pane/window shortcuts.
+        bindings.bindings.insert(
+            "ctrl+shift+o".to_string(),
+            "terminal:split_horizontal".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+e".to_string(),
+            "terminal:split_vertical".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+w".to_string(),
+            "terminal:close_pane".to_string(),
+        );
+        bindings
+            .bindings
+            .insert("alt+right".to_string(), "pane:focus_next".to_string());
+        bindings
+            .bindings
+            .insert("alt+left".to_string(), "pane:focus_prev".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+q".to_string(), "window:close".to_string());
 
         // OSC 133 命令跳转：上一/下一个 shell 提示符
         bindings.bindings.insert(
@@ -326,6 +351,26 @@ mod tests {
         assert_eq!(
             bindings.get_command("ctrl+shift+t"),
             Some(Command::SessionNew)
+        );
+        assert_eq!(
+            bindings.get_command("shift+insert"),
+            Some(Command::EditPaste)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+o"),
+            Some(Command::TerminalSplitHorizontal)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+e"),
+            Some(Command::TerminalSplitVertical)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+w"),
+            Some(Command::TerminalClosePane)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+q"),
+            Some(Command::WindowClose)
         );
     }
 

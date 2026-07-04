@@ -303,6 +303,47 @@ fn load_first_matching_font(
     false
 }
 
+fn load_matching_fallback_fonts(
+    fonts: &mut egui::FontDefinitions,
+    loaded_paths: &mut HashMap<String, String>,
+    family_candidates: &[&str],
+    path_candidates: &[&str],
+    font_name_prefix: &str,
+    families: &[egui::FontFamily],
+) -> Vec<String> {
+    let mut seen_paths = HashSet::new();
+    let mut resolved_paths = Vec::new();
+
+    for family in family_candidates {
+        if let Some(path) = fontconfig_match_file(family) {
+            if seen_paths.insert(path.clone()) {
+                resolved_paths.push(path);
+            }
+        }
+    }
+
+    for path in path_candidates {
+        let path = (*path).to_owned();
+        if seen_paths.insert(path.clone()) {
+            resolved_paths.push(path);
+        }
+    }
+
+    let mut loaded_names = Vec::new();
+    for (idx, path) in resolved_paths.iter().enumerate() {
+        let font_name = format!("{}_{}", font_name_prefix, idx);
+        if load_font_from_path(fonts, loaded_paths, path, &font_name, families, false) {
+            if let Some(name) = loaded_paths.get(path) {
+                if !loaded_names.iter().any(|loaded| loaded == name) {
+                    loaded_names.push(name.clone());
+                }
+            }
+        }
+    }
+
+    loaded_names
+}
+
 /// 从 PNG 数据中提取宽度和高度
 fn extract_png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() < 24 {
@@ -402,7 +443,7 @@ fn configure_fonts_and_gpu(
         );
     }
 
-    let cjk_loaded = load_first_matching_font(
+    let cjk_fallbacks = load_matching_fallback_fonts(
         &mut fonts,
         &mut loaded_font_paths,
         &[
@@ -426,22 +467,53 @@ fn configure_fonts_and_gpu(
         ],
         "cjk",
         &[egui::FontFamily::Monospace, egui::FontFamily::Proportional],
-        false,
     );
 
-    if !cjk_loaded {
+    if cjk_fallbacks.is_empty() {
         eprintln!("[Fonts] Warning: no CJK fallback font file could be loaded");
+    }
+
+    let symbol_fallbacks = load_matching_fallback_fonts(
+        &mut fonts,
+        &mut loaded_font_paths,
+        &[
+            "Symbols Nerd Font Mono",
+            "Symbols Nerd Font",
+            "Noto Sans Symbols 2",
+            "Noto Sans Symbols",
+            "DejaVu Sans",
+            "Noto Emoji",
+        ],
+        &[
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+            "/usr/share/fonts/NerdFonts/SymbolsNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/NerdFonts/SymbolsNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/SymbolsNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+            "/usr/share/fonts/truetype/nerd-fonts/SymbolsNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf",
+        ],
+        "symbols",
+        &[egui::FontFamily::Monospace, egui::FontFamily::Proportional],
+    );
+
+    if symbol_fallbacks.is_empty() {
+        eprintln!("[Fonts] Warning: no symbol fallback font file could be loaded");
     }
 
     let mono_font_data: Option<Vec<u8>> = fonts
         .font_data
         .get("monospace_unicode")
         .map(|fd| fd.font.to_vec());
-    let fallback_font_data: Vec<Vec<u8>> = fonts
-        .font_data
-        .get("cjk")
-        .map(|fd| vec![fd.font.to_vec()])
-        .unwrap_or_default();
+    let fallback_font_data: Vec<Vec<u8>> = cjk_fallbacks
+        .iter()
+        .chain(symbol_fallbacks.iter())
+        .filter_map(|font_name| fonts.font_data.get(font_name))
+        .map(|fd| fd.font.to_vec())
+        .collect();
 
     // Try to load bold variant of the configured monospace font
     let bold_font_data: Option<Vec<u8>> = {
@@ -640,6 +712,42 @@ fn shell_single_quote(s: &str) -> String {
 /// (e.g. plain `bash`) may still execute on the first newline.
 fn should_confirm_paste(text: &str) -> bool {
     text.contains('\n') || text.len() > crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES
+}
+
+fn paste_text_into_session(
+    session: &mut Session,
+    text: String,
+    active_session_idx: usize,
+    paste_confirm: bool,
+    pending_paste_confirm: &mut Option<crate::app::state::PendingPasteConfirm>,
+) -> bool {
+    let normalized = text.replace("\r\n", "\n");
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let bracketed_paste = {
+        let terminal = session.terminal.lock();
+        terminal.is_bracketed_paste_enabled()
+    };
+
+    if paste_confirm && should_confirm_paste(&normalized) {
+        *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
+            text: normalized,
+            session_idx: active_session_idx,
+            bracketed: bracketed_paste,
+        });
+    } else {
+        let bytes = normalized.into_bytes();
+        let paste_bytes = if bracketed_paste {
+            wrap_bracketed_paste(bytes)
+        } else {
+            bytes
+        };
+        let _ = session.shell.write(&paste_bytes);
+    }
+
+    true
 }
 
 fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
@@ -1110,7 +1218,7 @@ impl TerminalApp {
         let is_selected = selected.as_deref() == Some(node.path.as_path());
         if node.is_dir {
             let arrow = if node.expanded { "▼" } else { "▶" };
-            let label = format!("{} 📁 {}", arrow, node.name);
+            let label = format!("{} {}/", arrow, node.name);
             let resp = ui.selectable_label(is_selected, label);
             if resp.clicked() {
                 *toggle = Some(node.path.clone());
@@ -1128,7 +1236,7 @@ impl TerminalApp {
                 });
             }
         } else {
-            let resp = ui.selectable_label(is_selected, format!("📄 {}", node.name));
+            let resp = ui.selectable_label(is_selected, format!("  {}", node.name));
             if resp.clicked() {
                 *select = Some(node.path.clone());
             }
@@ -1326,6 +1434,8 @@ impl eframe::App for TerminalApp {
 
         let mut saw_ctrl_shift_c = false;
         let mut saw_ctrl_shift_v = false;
+        let mut saw_shift_insert = false;
+        let mut saw_font_zoom_key: Option<&'static str> = None;
         let mut saw_semantic_paste = false;
 
         for evt in &events_copy {
@@ -1345,6 +1455,28 @@ impl eframe::App for TerminalApp {
                         if *key == egui::Key::V && modifiers.ctrl && modifiers.shift {
                             crate::debug_log!("[EVENT] detected Ctrl+Shift+V (pressed=true)");
                             saw_ctrl_shift_v = true;
+                        }
+                        if *key == egui::Key::Insert && modifiers.shift && !modifiers.ctrl {
+                            crate::debug_log!("[EVENT] detected Shift+Insert (pressed=true)");
+                            saw_shift_insert = true;
+                        }
+                        if modifiers.ctrl && !modifiers.alt {
+                            match key {
+                                egui::Key::Plus if modifiers.shift => {
+                                    saw_font_zoom_key = Some("Ctrl+Shift+Plus")
+                                }
+                                egui::Key::Plus => saw_font_zoom_key = Some("Ctrl+Plus"),
+                                egui::Key::Equals if !modifiers.shift => {
+                                    saw_font_zoom_key = Some("Ctrl+Equals")
+                                }
+                                egui::Key::Minus if !modifiers.shift => {
+                                    saw_font_zoom_key = Some("Ctrl+Minus")
+                                }
+                                egui::Key::Num0 if !modifiers.shift => {
+                                    saw_font_zoom_key = Some("Ctrl+0")
+                                }
+                                _ => {}
+                            }
                         }
                     }
 
@@ -1393,38 +1525,27 @@ impl eframe::App for TerminalApp {
             }
         }
 
-        if saw_ctrl_shift_v {
-            crate::debug_log!("[PASTE] ===== Ctrl+Shift+V triggered =====");
+        if saw_ctrl_shift_v || saw_shift_insert {
+            let paste_key = if saw_shift_insert {
+                "Shift+Insert"
+            } else {
+                "Ctrl+Shift+V"
+            };
+            crate::debug_log!("[PASTE] ===== {} triggered =====", paste_key);
             if let Some(clipboard) = &self.clipboard {
                 crate::debug_log!("[PASTE] clipboard available");
                 if let Ok(content) = clipboard.paste_contents() {
                     match content {
                         ClipboardContent::Text(text) => {
                             crate::debug_log!("[PASTE] content type: TEXT ({} chars)", text.len());
-                            let normalized = text.replace("\r\n", "\n");
-                            if !normalized.is_empty() {
-                                let bracketed_paste = {
-                                    let terminal = session.terminal.lock();
-                                    terminal.is_bracketed_paste_enabled()
-                                };
-                                if self.config.paste_confirm && should_confirm_paste(&normalized) {
-                                    self.pending_paste_confirm =
-                                        Some(crate::app::state::PendingPasteConfirm {
-                                            text: normalized,
-                                            session_idx: active_session_idx_for_paste,
-                                            bracketed: bracketed_paste,
-                                        });
-                                    consumed_keys.insert("Ctrl+Shift+V".to_string());
-                                } else {
-                                    let bytes = normalized.into_bytes();
-                                    let paste_bytes = if bracketed_paste {
-                                        wrap_bracketed_paste(bytes)
-                                    } else {
-                                        bytes
-                                    };
-                                    let _ = session.shell.write(&paste_bytes);
-                                    consumed_keys.insert("Ctrl+Shift+V".to_string());
-                                }
+                            if paste_text_into_session(
+                                session,
+                                text,
+                                active_session_idx_for_paste,
+                                self.config.paste_confirm,
+                                &mut self.pending_paste_confirm,
+                            ) {
+                                consumed_keys.insert(paste_key.to_string());
                             } else {
                                 crate::debug_log!("[PASTE] text content is empty");
                             }
@@ -1446,7 +1567,7 @@ impl eframe::App for TerminalApp {
                                     crate::debug_log!("[KITTY] Ctrl+Shift+V pasting {} bytes with mime_type={}, packet_size={}",
                                                     bytes.len(), mime_type, paste_packet.len());
                                     session.shell.write_async(paste_packet);
-                                    consumed_keys.insert("Ctrl+Shift+V".to_string());
+                                    consumed_keys.insert(paste_key.to_string());
                                 } else {
                                     crate::debug_log!(
                                         "[PASTE] MIME type NOT detected, ignoring binary data"
@@ -1463,7 +1584,11 @@ impl eframe::App for TerminalApp {
             } else {
                 crate::debug_log!("[PASTE] clipboard not available");
             }
-            crate::debug_log!("[PASTE] ===== Ctrl+Shift+V finished =====");
+            crate::debug_log!("[PASTE] ===== {} finished =====", paste_key);
+        }
+
+        if let Some(key_name) = saw_font_zoom_key {
+            consumed_keys.insert(key_name.to_string());
         }
 
         if saw_semantic_paste {
@@ -1886,6 +2011,34 @@ impl eframe::App for TerminalApp {
             terminal.is_mouse_enabled()
         };
 
+        let middle_paste_requested = !mouse_enabled
+            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle))
+            && ctx
+                .input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()))
+                .is_some_and(|pos| {
+                    self.renderer
+                        .last_content_rect
+                        .is_some_and(|rect| rect.contains(pos))
+                });
+
+        if middle_paste_requested {
+            if let Some(clipboard) = &self.clipboard {
+                let primary_text = clipboard.paste_primary().unwrap_or_default();
+                let text = if primary_text.is_empty() {
+                    clipboard.paste().unwrap_or_default()
+                } else {
+                    primary_text
+                };
+                let _ = paste_text_into_session(
+                    session,
+                    text,
+                    active_session_idx_for_paste,
+                    self.config.paste_confirm,
+                    &mut self.pending_paste_confirm,
+                );
+            }
+        }
+
         // 鼠标滚轮处理：
         // 1. 如果应用启用了鼠标报告（如 vim），滚轮会在下面的鼠标处理部分发送给应用
         // 2. 如果应用未启用鼠标，或在普通终端，滚轮用于查看历史
@@ -2187,6 +2340,23 @@ impl eframe::App for TerminalApp {
 
         // 渲染 UI
         self.render_ui(root_ui);
+
+        if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+            let selection_for_primary = {
+                let session = self.session_manager.get_active_session_mut();
+                let terminal = session.terminal.lock();
+                if terminal.is_mouse_enabled() {
+                    None
+                } else {
+                    terminal.copy_selection()
+                }
+            };
+            if let (Some(clipboard), Some(text)) = (&self.clipboard, selection_for_primary) {
+                if !text.is_empty() {
+                    let _ = clipboard.copy_primary(&text);
+                }
+            }
+        }
 
         // channel 中还有未处理的数据时，立即请求下一帧继续处理
         if has_more_data {

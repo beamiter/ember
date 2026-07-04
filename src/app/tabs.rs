@@ -84,15 +84,24 @@ impl TerminalApp {
                     let is_dragging_this = self.dragging_tab == Some(*i);
                     let is_renaming_this =
                         self.renaming_tab.as_ref().map(|(idx, _)| *idx) == Some(*i);
+                    let row_rect = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        egui::vec2(ui.available_width(), row_h),
+                    );
+                    let row_hovered = pointer_pos.map(|p| row_rect.contains(p)).unwrap_or(false);
                     let row_resp = ui.horizontal(|ui| {
                         ui.set_min_height(row_h);
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             if multi {
-                                let close_resp = ui
-                                    .add_sized([row_h, row_h], egui::Button::new("✕").small())
-                                    .on_hover_text("关闭会话");
-                                if close_resp.clicked() {
-                                    close_idx = Some(*i);
+                                if row_hovered {
+                                    let close_resp = ui
+                                        .add_sized([row_h, row_h], egui::Button::new("✕").small())
+                                        .on_hover_text("关闭会话");
+                                    if close_resp.clicked() {
+                                        close_idx = Some(*i);
+                                    }
+                                } else {
+                                    ui.add_space(row_h);
                                 }
                             }
                             if is_renaming_this {
@@ -120,14 +129,8 @@ impl TerminalApp {
                                     cancel_rename = true;
                                 }
                             } else {
-                                // 活动指示:活跃 tab 用实心圆;后台 tab 有未查看输出时用 accent 圆点提醒。
-                                let marker = if is_active {
-                                    "● "
-                                } else if *unseen {
-                                    "• "
-                                } else {
-                                    "  "
-                                };
+                                // 后台 tab 有未查看输出时用圆点提醒。
+                                let marker = if !is_active && *unseen { "• " } else { "  " };
                                 // 拖拽中的源 tab 略微淡化
                                 let dim = is_dragging_this && is_actually_dragging;
                                 let btn = egui::Button::selectable(
@@ -399,6 +402,53 @@ impl TerminalApp {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             if mouse_released {
                 self.toggle_tab_bar_position();
+            }
+        }
+
+        // 关闭窗口按钮（最右侧，与顶部 tab 模式保持一致）
+        let close_win_size = 25.0;
+        let close_win_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                tab_rect.right() - close_win_size - 5.0,
+                tab_rect.top() + 5.0,
+            ),
+            egui::vec2(close_win_size, tab_height - 10.0),
+        );
+        let close_win_hovered = hover_pos
+            .map(|p| close_win_rect.contains(p))
+            .unwrap_or(false);
+        let close_win_bg = if close_win_hovered {
+            egui::Color32::from_rgb(200, 60, 55)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect_filled(close_win_rect, 6.0, close_win_bg);
+
+        let cw_cross = 5.0;
+        let cw_center = close_win_rect.center();
+        let cw_x_color = if close_win_hovered {
+            egui::Color32::WHITE
+        } else {
+            tb_inactive_text
+        };
+        painter.line_segment(
+            [
+                egui::pos2(cw_center.x - cw_cross, cw_center.y - cw_cross),
+                egui::pos2(cw_center.x + cw_cross, cw_center.y + cw_cross),
+            ],
+            egui::Stroke::new(1.5, cw_x_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(cw_center.x + cw_cross, cw_center.y - cw_cross),
+                egui::pos2(cw_center.x - cw_cross, cw_center.y + cw_cross),
+            ],
+            egui::Stroke::new(1.5, cw_x_color),
+        );
+        if close_win_hovered {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            if mouse_released {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
 

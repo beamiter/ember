@@ -1596,6 +1596,37 @@ impl super::TerminalState {
         });
     }
 
+    pub fn select_line_at(&mut self, row: usize) {
+        let visible = self.get_visible_cells();
+        if row >= visible.len() {
+            return;
+        }
+
+        let line = &visible[row];
+        let mut right = line.len().saturating_sub(1);
+        while right > 0 {
+            let cell = &line[right];
+            if !cell.flags.wide_continuation() && cell.character != ' ' {
+                break;
+            }
+            right -= 1;
+        }
+
+        if line
+            .get(right)
+            .is_some_and(|cell| cell.flags.wide() && right + 1 < line.len())
+        {
+            right += 1;
+        }
+
+        let abs_row = self.viewport_row_to_absolute(row);
+        self.selection = Some(Selection {
+            anchor: (abs_row, 0),
+            active: (abs_row, right),
+            mode: SelectionMode::Normal,
+        });
+    }
+
     pub(super) fn select_extended_token_span(
         line: &[TerminalCell],
         start_col: usize,

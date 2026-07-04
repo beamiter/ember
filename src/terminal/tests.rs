@@ -440,6 +440,16 @@ fn double_click_excludes_wrapping_punctuation() {
 }
 
 #[test]
+fn triple_click_selects_visual_line_without_padding() {
+    let mut terminal = TerminalState::new(16, 2);
+
+    terminal.process_input(b"hello line");
+    terminal.select_line_at(0);
+
+    assert_eq!(terminal.copy_selection().as_deref(), Some("hello line"));
+}
+
+#[test]
 fn bracketed_paste_mode_is_tracked() {
     let mut terminal = TerminalState::new(8, 2);
 

@@ -142,8 +142,16 @@ mod unix_clipboard {
         command_output("wl-paste", &["--no-newline", "--type", mime_type])
     }
 
+    fn read_wayland_primary_text() -> Option<Vec<u8>> {
+        command_output("wl-paste", &["--primary", "--no-newline"])
+    }
+
     fn read_xclip_type(mime_type: &str) -> Option<Vec<u8>> {
         command_output("xclip", &["-selection", "clipboard", "-o", "-t", mime_type])
+    }
+
+    fn read_xclip_primary_text() -> Option<Vec<u8>> {
+        command_output("xclip", &["-selection", "primary", "-o"])
     }
 
     fn read_text_from_bytes(bytes: Vec<u8>) -> ClipboardContent {
@@ -181,6 +189,33 @@ mod unix_clipboard {
 
             Err(anyhow::anyhow!(
                 "复制失败:未找到可用的剪贴板工具 (wl-copy/xclip/xsel)"
+            ))
+        }
+
+        /// Copy text to the X11/Wayland PRIMARY selection. VTE terminals update
+        /// this selection while selecting text so middle-click paste feels native.
+        pub fn copy_primary(&self, text: &str) -> Result<()> {
+            if detect_wayland_clipboard()
+                && command_with_stdin(
+                    "wl-copy",
+                    &["--primary", "--type", "text/plain;charset=utf-8"],
+                    text.as_bytes(),
+                )
+                .is_some()
+            {
+                return Ok(());
+            }
+
+            if command_with_stdin("xclip", &["-selection", "primary"], text.as_bytes()).is_some() {
+                return Ok(());
+            }
+
+            if command_with_stdin("xsel", &["--primary", "--input"], text.as_bytes()).is_some() {
+                return Ok(());
+            }
+
+            Err(anyhow::anyhow!(
+                "复制 PRIMARY 失败:未找到可用的剪贴板工具 (wl-copy/xclip/xsel)"
             ))
         }
 
@@ -258,6 +293,24 @@ mod unix_clipboard {
             Ok(ClipboardContent::Text(String::new()))
         }
 
+        pub fn paste_primary(&self) -> Result<String> {
+            if detect_wayland_clipboard() {
+                if let Some(bytes) = read_wayland_primary_text() {
+                    return Ok(String::from_utf8_lossy(&bytes).into_owned());
+                }
+            }
+
+            if let Some(bytes) = read_xclip_primary_text() {
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
+            }
+
+            if let Some(bytes) = command_output("xsel", &["--primary", "--output"]) {
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
+            }
+
+            Ok(String::new())
+        }
+
         pub fn available_mime_types(&self) -> Result<Vec<String>> {
             if detect_wayland_clipboard() {
                 if let Some(types) = wl_list_types() {
@@ -317,9 +370,17 @@ mod windows_clipboard {
             Ok(())
         }
 
+        pub fn copy_primary(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+
         pub fn paste(&self) -> Result<String> {
             // Windows 剪贴板实现（需要 winapi）
             // 暂时实现为占位符
+            Ok(String::new())
+        }
+
+        pub fn paste_primary(&self) -> Result<String> {
             Ok(String::new())
         }
 
