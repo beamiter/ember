@@ -664,7 +664,15 @@ impl super::TerminalState {
                     }
                     2 => {
                         // ED 擦除显示不移动光标(VT 规范)
-                        self.archive_visible_screen_to_scrollback();
+                        if self.sync_output_active {
+                            if self.use_alt_buffer {
+                                self.archive_visible_screen_to_scrollback_with_options(true, true);
+                            } else {
+                                self.archive_primary_screen_unless_last_synced_snapshot();
+                            }
+                        } else {
+                            self.archive_visible_screen_to_scrollback();
+                        }
                         self.erase_screen();
                     }
                     3 => {
@@ -1452,8 +1460,12 @@ impl super::TerminalState {
             }
             2026 => {
                 // End synchronized output: force full render
-                let allow_alt_scrollback = self.use_alt_buffer;
-                self.archive_visible_screen_to_scrollback_with_options(allow_alt_scrollback, true);
+                if self.use_alt_buffer {
+                    self.archive_visible_screen_to_scrollback_with_options(true, true);
+                } else {
+                    self.last_synced_primary_screen_snapshot =
+                        self.visible_screen_snapshot().unwrap_or_default();
+                }
                 self.modes.remove(&2026);
                 self.sync_output_active = false;
                 self.sync_output_start = None;

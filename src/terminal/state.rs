@@ -192,6 +192,7 @@ impl super::TerminalState {
             sync_output_active: false,
             sync_output_start: None,
             last_archived_screen_snapshot: Vec::new(),
+            last_synced_primary_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
             dynamic_fg: None,
@@ -700,6 +701,36 @@ impl super::TerminalState {
         self.archive_visible_screen_to_scrollback_with_options(false, false);
     }
 
+    pub(super) fn visible_screen_snapshot(&self) -> Option<Vec<String>> {
+        if self.grid.rows() == 0 {
+            return None;
+        }
+
+        let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
+        let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
+        let (Some(first), Some(last)) = (first, last) else {
+            return None;
+        };
+
+        Some(
+            (first..=last)
+                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
+                .collect(),
+        )
+    }
+
+    pub(super) fn archive_primary_screen_unless_last_synced_snapshot(&mut self) {
+        let Some(snapshot) = self.visible_screen_snapshot() else {
+            return;
+        };
+
+        if snapshot == self.last_synced_primary_screen_snapshot {
+            return;
+        }
+
+        self.archive_visible_screen_to_scrollback();
+    }
+
     pub(super) fn archive_visible_screen_to_scrollback_with_options(
         &mut self,
         allow_alt_buffer: bool,
@@ -716,9 +747,7 @@ impl super::TerminalState {
         };
 
         if dedupe_snapshot {
-            let snapshot: Vec<String> = (first..=last)
-                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
-                .collect();
+            let snapshot = self.visible_screen_snapshot().unwrap_or_default();
             if snapshot == self.last_archived_screen_snapshot {
                 return;
             }
@@ -929,11 +958,12 @@ impl super::TerminalState {
         if self.sync_output_active {
             if let Some(start) = self.sync_output_start {
                 if start.elapsed() > std::time::Duration::from_secs(1) {
-                    let allow_alt_scrollback = self.use_alt_buffer;
-                    self.archive_visible_screen_to_scrollback_with_options(
-                        allow_alt_scrollback,
-                        true,
-                    );
+                    if self.use_alt_buffer {
+                        self.archive_visible_screen_to_scrollback_with_options(true, true);
+                    } else {
+                        self.last_synced_primary_screen_snapshot =
+                            self.visible_screen_snapshot().unwrap_or_default();
+                    }
                     self.sync_output_active = false;
                     self.sync_output_start = None;
                     self.modes.remove(&2026);

@@ -292,6 +292,7 @@ pub struct TerminalState {
     pub sync_output_active: bool,
     sync_output_start: Option<std::time::Instant>,
     last_archived_screen_snapshot: Vec<String>,
+    last_synced_primary_screen_snapshot: Vec<String>,
 
     // OSC 52 clipboard set requests (selection_param, decoded_text)
     pub pending_osc52_clipboard_set: Option<String>,

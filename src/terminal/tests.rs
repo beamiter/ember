@@ -49,6 +49,53 @@ fn codex_resume_style_output_populates_scrollback() {
 }
 
 #[test]
+fn synchronized_primary_screen_redraws_do_not_fill_scrollback() {
+    let mut terminal = TerminalState::new(24, 4);
+
+    for seconds in 1..=3 {
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1H\x1b[2J");
+        terminal.process_input(b">_ OpenAI Codex\r\n");
+        terminal.process_input(format!("Booting MCP server ({seconds}s)").as_bytes());
+        terminal.process_input(b"\x1b[?2026l");
+    }
+
+    assert_eq!(
+        terminal.scrollback_len(),
+        0,
+        "primary-screen synchronized redraws should not be recorded as history"
+    );
+}
+
+#[test]
+fn synchronized_primary_screen_entry_preserves_existing_history() {
+    let mut terminal = TerminalState::new(24, 4);
+
+    terminal.process_input(b"previous log\r\nshell prompt");
+    terminal.process_input(b"\x1b[?2026h\x1b[1;1H\x1b[2J");
+    terminal.process_input(b">_ OpenAI Codex\r\nBooting MCP server");
+    terminal.process_input(b"\x1b[?2026l");
+    terminal.process_input(b"\x1b[?2026h\x1b[1;1H\x1b[2J");
+    terminal.process_input(b">_ OpenAI Codex\r\nBooting MCP server");
+    terminal.process_input(b"\x1b[?2026l");
+
+    assert_eq!(terminal.scrollback_len(), 2);
+    let history: Vec<String> = terminal
+        .scrollback
+        .iter()
+        .map(|line| {
+            line.decompress()
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(history, ["previous log", "shell prompt"]);
+}
+
+#[test]
 fn synchronized_alt_screen_snapshots_can_be_scrolled() {
     let mut terminal = TerminalState::new(12, 3);
 
