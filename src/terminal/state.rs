@@ -191,6 +191,7 @@ impl super::TerminalState {
             current_hyperlink: None,
             sync_output_active: false,
             sync_output_start: None,
+            last_archived_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
             dynamic_fg: None,
@@ -685,8 +686,61 @@ impl super::TerminalState {
         }
     }
 
+    pub(super) fn line_is_blank(&self, row: usize) -> bool {
+        let blank = self.create_blank_cell();
+        self.grid[row].iter().all(|cell| {
+            cell.character == blank.character
+                && cell.foreground == blank.foreground
+                && cell.background == blank.background
+                && cell.flags == blank.flags
+        })
+    }
+
+    pub(super) fn archive_visible_screen_to_scrollback(&mut self) {
+        self.archive_visible_screen_to_scrollback_with_options(false, false);
+    }
+
+    pub(super) fn archive_visible_screen_to_scrollback_with_options(
+        &mut self,
+        allow_alt_buffer: bool,
+        dedupe_snapshot: bool,
+    ) {
+        if (self.use_alt_buffer && !allow_alt_buffer) || self.grid.rows() == 0 {
+            return;
+        }
+
+        let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
+        let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
+        let (Some(first), Some(last)) = (first, last) else {
+            return;
+        };
+
+        if dedupe_snapshot {
+            let snapshot: Vec<String> = (first..=last)
+                .map(|row| self.grid[row].iter().map(|cell| cell.character).collect())
+                .collect();
+            if snapshot == self.last_archived_screen_snapshot {
+                return;
+            }
+            self.last_archived_screen_snapshot = snapshot;
+        }
+
+        for row in first..=last {
+            let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
+            self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
+        }
+    }
+
     pub(super) fn push_scrollback_compressed(&mut self, line: ScrollbackLine) {
-        if self.use_alt_buffer {
+        self.push_scrollback_compressed_with_options(line, false);
+    }
+
+    pub(super) fn push_scrollback_compressed_with_options(
+        &mut self,
+        line: ScrollbackLine,
+        allow_alt_buffer: bool,
+    ) {
+        if self.use_alt_buffer && !allow_alt_buffer {
             return;
         }
         if self.scrollback.len() >= self.max_scrollback {
@@ -725,14 +779,16 @@ impl super::TerminalState {
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
-        let scrollback_line = if is_full_screen_region && !self.use_alt_buffer {
-            Some(ScrollbackLine::compress(
-                &self.grid[top],
-                self.grid.row_wrapped[top],
-            ))
-        } else {
-            None
-        };
+        let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
+        let scrollback_line =
+            if is_full_screen_region && (!self.use_alt_buffer || allow_alt_scrollback) {
+                Some(ScrollbackLine::compress(
+                    &self.grid[top],
+                    self.grid.row_wrapped[top],
+                ))
+            } else {
+                None
+            };
 
         let src_start = (top + 1) * cols;
         let src_end = (bottom + 1) * cols;
@@ -749,7 +805,7 @@ impl super::TerminalState {
         self.mark_rows_dirty(top, bottom);
 
         if let Some(line) = scrollback_line {
-            self.push_scrollback_compressed(line);
+            self.push_scrollback_compressed_with_options(line, allow_alt_scrollback);
         }
     }
 
@@ -873,6 +929,11 @@ impl super::TerminalState {
         if self.sync_output_active {
             if let Some(start) = self.sync_output_start {
                 if start.elapsed() > std::time::Duration::from_secs(1) {
+                    let allow_alt_scrollback = self.use_alt_buffer;
+                    self.archive_visible_screen_to_scrollback_with_options(
+                        allow_alt_scrollback,
+                        true,
+                    );
                     self.sync_output_active = false;
                     self.sync_output_start = None;
                     self.modes.remove(&2026);
@@ -1668,8 +1729,10 @@ impl super::TerminalState {
     }
 
     pub fn scroll(&mut self, lines: isize) {
-        // Don't scroll scrollback when in alternate screen buffer (less, vim, git log, etc.)
-        if self.use_alt_buffer {
+        // Don't scroll ordinary alternate-screen apps (less, vim, git log, etc.).
+        // Synchronized TUIs such as Codex may archive snapshots into local
+        // scrollback, in which case wheel/scrollbar navigation should work.
+        if self.use_alt_buffer && self.scrollback.is_empty() {
             return;
         }
 

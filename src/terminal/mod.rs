@@ -291,6 +291,7 @@ pub struct TerminalState {
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
     pub sync_output_active: bool,
     sync_output_start: Option<std::time::Instant>,
+    last_archived_screen_snapshot: Vec<String>,
 
     // OSC 52 clipboard set requests (selection_param, decoded_text)
     pub pending_osc52_clipboard_set: Option<String>,

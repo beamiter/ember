@@ -664,6 +664,7 @@ impl super::TerminalState {
                     }
                     2 => {
                         // ED 擦除显示不移动光标(VT 规范)
+                        self.archive_visible_screen_to_scrollback();
                         self.erase_screen();
                     }
                     3 => {
@@ -928,8 +929,14 @@ impl super::TerminalState {
             'r' if private_prefix.is_none() => {
                 // Set scroll region (DECSTBM)。带私有前缀(如 CSI ? Pm r 的 XTRESTORE)
                 // 不是 DECSTBM,不能误设滚动区域,故仅在无前缀时处理。
-                let top = params.first().copied().unwrap_or(1) as usize;
-                let bottom = params.get(1).copied().unwrap_or(self.grid.rows() as u16) as usize;
+                let top = match params.first().copied().unwrap_or(1) {
+                    0 => 1,
+                    v => v as usize,
+                };
+                let bottom = match params.get(1).copied().unwrap_or(self.grid.rows() as u16) {
+                    0 => self.grid.rows(),
+                    v => v as usize,
+                };
 
                 // Convert from 1-indexed to 0-indexed, and clamp to valid range
                 self.scroll_region_top = top
@@ -1445,6 +1452,8 @@ impl super::TerminalState {
             }
             2026 => {
                 // End synchronized output: force full render
+                let allow_alt_scrollback = self.use_alt_buffer;
+                self.archive_visible_screen_to_scrollback_with_options(allow_alt_scrollback, true);
                 self.modes.remove(&2026);
                 self.sync_output_active = false;
                 self.sync_output_start = None;

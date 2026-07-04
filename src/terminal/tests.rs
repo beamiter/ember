@@ -11,6 +11,81 @@ fn resize_preserves_full_screen_scroll_region() {
 }
 
 #[test]
+fn decstbm_zero_bottom_defaults_to_full_screen() {
+    let mut terminal = TerminalState::new(4, 4);
+
+    terminal.process_input(b"\x1b[1;0r");
+
+    assert_eq!(terminal.scroll_region_top, 0);
+    assert_eq!(terminal.scroll_region_bottom, 3);
+}
+
+#[test]
+fn codex_resume_style_output_populates_scrollback() {
+    let mut terminal = TerminalState::new(8, 3);
+
+    terminal.process_input(b"\x1b[?2026h\x1b[1;0r\x1b[1;1H");
+    terminal.process_input(b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\n");
+    terminal.process_input(b"\x1b[?2026l");
+
+    assert!(
+        terminal.scrollback_len() >= 3,
+        "expected resumed TUI output to enter scrollback"
+    );
+
+    terminal.scroll(2);
+    let visible = terminal.get_visible_cells();
+    let text: String = visible[0]
+        .iter()
+        .map(|cell| cell.character)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+
+    assert!(
+        text.starts_with("line-"),
+        "expected scrollback viewport to show historical output, got {text:?}"
+    );
+}
+
+#[test]
+fn synchronized_alt_screen_snapshots_can_be_scrolled() {
+    let mut terminal = TerminalState::new(12, 3);
+
+    terminal.process_input(b"\x1b[?1049h");
+    assert!(terminal.is_alt_buffer_active());
+
+    terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+    terminal.process_input(b"first page\r\nalpha\r\nomega");
+    terminal.process_input(b"\x1b[?2026l");
+    terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+    terminal.process_input(b"second page\r\nbeta\r\ndone ");
+    terminal.process_input(b"\x1b[?2026l");
+
+    assert!(
+        terminal.scrollback_len() >= 6,
+        "expected synchronized alt-screen snapshots in scrollback"
+    );
+
+    terminal.scroll(3);
+    assert!(terminal.scroll_offset > 0);
+    let visible = terminal.get_visible_cells();
+    let text = visible
+        .iter()
+        .flat_map(|row| {
+            row.iter()
+                .map(|cell| cell.character)
+                .chain(std::iter::once('\n'))
+        })
+        .collect::<String>();
+
+    assert!(
+        text.contains("first page") || text.contains("second page"),
+        "expected archived synchronized screen content, got {text:?}"
+    );
+}
+
+#[test]
 fn linefeed_at_bottom_pushes_to_scrollback_for_full_screen_region() {
     let mut terminal = TerminalState::new(4, 2);
     terminal.grid[0][0].character = 'A';
