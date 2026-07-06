@@ -268,7 +268,9 @@ impl TerminalApp {
         false
     }
 
-    /// 处理可配置快捷键派发。返回 true 表示请求关闭窗口，update 应提前返回。
+    /// 处理可配置快捷键派发。返回 true 仅表示 update 应提前返回
+    /// （例如请求关闭窗口）。普通快捷键会从本帧事件里移除，避免继续透传给 PTY，
+    /// 但仍允许本帧继续渲染，防止透明窗口被 clear 后空一帧。
     pub fn handle_keybindings(&mut self, ctx: &egui::Context, active_session_idx: usize) -> bool {
         // 收集所有按下的快捷键
         let pressed_keys: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
@@ -438,7 +440,18 @@ impl TerminalApp {
                         // 复制/粘贴等命令由 main.rs 后续专用路径处理，避免在这里提前吞掉。
                         _ => continue,
                     }
-                    return true;
+                    self.frame_events.retain(|evt| {
+                        !matches!(
+                            evt,
+                            egui::Event::Key {
+                                key: event_key,
+                                modifiers: event_modifiers,
+                                pressed: true,
+                                ..
+                            } if *event_key == key && *event_modifiers == modifiers
+                        )
+                    });
+                    return false;
                 }
             }
         }
