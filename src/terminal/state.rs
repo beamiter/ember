@@ -804,13 +804,17 @@ impl super::TerminalState {
         }
 
         let cols = self.grid.row_len();
-        let is_full_screen_region = top == 0 && bottom + 1 == self.grid.rows();
+        // VTE saves lines scrolled off the top margin into scrollback whenever
+        // the scrolling region starts at the first screen row. The bottom margin
+        // may be above the last row so TUIs can keep prompts/status lines fixed
+        // while the history area scrolls.
+        let scrolls_off_screen_top = top == 0;
 
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
         let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
         let scrollback_line =
-            if is_full_screen_region && (!self.use_alt_buffer || allow_alt_scrollback) {
+            if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
                 Some(ScrollbackLine::compress(
                     &self.grid[top],
                     self.grid.row_wrapped[top],

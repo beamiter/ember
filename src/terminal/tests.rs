@@ -67,6 +67,37 @@ fn synchronized_primary_screen_redraws_do_not_fill_scrollback() {
 }
 
 #[test]
+fn top_margin_scroll_region_pushes_scrolled_lines_to_scrollback() {
+    let mut terminal = TerminalState::new(24, 6);
+
+    terminal.process_input(b"\x1b[1;4r\x1b[1;1H");
+    terminal.process_input(b"hist-1\r\nhist-2\r\nhist-3\r\nhist-4\r\nhist-5\r\n");
+    terminal.process_input(b"\x1b[r\x1b[5;1Hprompt\r\nstatus");
+
+    let history: Vec<String> = terminal
+        .scrollback
+        .iter()
+        .map(|line| {
+            line.decompress()
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        history,
+        ["hist-1", "hist-2"],
+        "expected lines scrolled off a top-anchored region to remain scrollable"
+    );
+
+    assert_eq!(terminal.grid[4][0].character, 'p');
+    assert_eq!(terminal.grid[5][0].character, 's');
+}
+
+#[test]
 fn synchronized_primary_screen_entry_preserves_existing_history() {
     let mut terminal = TerminalState::new(24, 4);
 
