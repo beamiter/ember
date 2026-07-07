@@ -1716,6 +1716,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
+                alt_screen,
             ) = {
                 let terminal = session.terminal.lock();
                 (
@@ -1724,6 +1725,7 @@ impl eframe::App for TerminalApp {
                     terminal.xterm_modify_other_keys(),
                     terminal.xterm_format_other_keys(),
                     terminal.is_application_cursor_keys(),
+                    terminal.is_alt_buffer_active(),
                 )
             };
             // 转换 consumed_keys 为需要的格式（HashSet<&str>）
@@ -1739,6 +1741,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
+                alt_screen,
                 &self.frame_events,
             );
         }

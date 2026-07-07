@@ -68,10 +68,13 @@ fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
     application_cursor_keys: bool,
+    alt_screen: bool,
 ) -> Option<&'static str> {
     if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd || modifiers.command_only() {
         return None;
     }
+
+    let application_navigation_keys = application_cursor_keys || alt_screen;
 
     match key {
         egui::Key::Enter => Some("\r"),
@@ -85,42 +88,42 @@ fn key_to_terminal_sequence(
             }
         }
         egui::Key::ArrowUp => {
-            if application_cursor_keys {
+            if application_navigation_keys {
                 Some("\x1bOA")
             } else {
                 Some("\x1b[A")
             }
         }
         egui::Key::ArrowDown => {
-            if application_cursor_keys {
+            if application_navigation_keys {
                 Some("\x1bOB")
             } else {
                 Some("\x1b[B")
             }
         }
         egui::Key::ArrowRight => {
-            if application_cursor_keys {
+            if application_navigation_keys {
                 Some("\x1bOC")
             } else {
                 Some("\x1b[C")
             }
         }
         egui::Key::ArrowLeft => {
-            if application_cursor_keys {
+            if application_navigation_keys {
                 Some("\x1bOD")
             } else {
                 Some("\x1b[D")
             }
         }
         egui::Key::Home => {
-            if application_cursor_keys {
+            if application_navigation_keys {
                 Some("\x1bOH")
             } else {
                 Some("\x1b[H")
             }
         }
         egui::Key::End => {
-            if application_cursor_keys {
+            if application_navigation_keys {
                 Some("\x1bOF")
             } else {
                 Some("\x1b[F")
@@ -165,6 +168,24 @@ mod tests {
         );
 
         assert_eq!((row, col), (2, 4));
+    }
+
+    #[test]
+    fn cursor_keys_use_application_sequences_in_alt_screen() {
+        let modifiers = egui::Modifiers::default();
+
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false, false),
+            Some("\x1b[A")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false, true),
+            Some("\x1bOA")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true, false),
+            Some("\x1bOB")
+        );
     }
 
     #[test]
@@ -2207,6 +2228,7 @@ impl TerminalRenderer {
         xterm_modify_other_keys: u16,
         xterm_format_other_keys: u16,
         application_cursor_keys: bool,
+        alt_screen: bool,
         events: &[egui::Event],
     ) {
         let report_all_keys = report_all_keys_mode || (keyboard_enhancement_flags & 0b1000) != 0;
@@ -2311,6 +2333,7 @@ impl TerminalRenderer {
                         *key,
                         effective_modifiers,
                         application_cursor_keys,
+                        alt_screen,
                     );
 
                     if let Some(s) = seq {
