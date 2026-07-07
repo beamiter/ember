@@ -23,6 +23,10 @@ fn snapped_span(origin: f32, index: usize, cell_size: f32) -> (f32, f32) {
     (start, (end - start).max(1.0))
 }
 
+fn hovered_link_color() -> Color32 {
+    Color32::from_rgb(100, 200, 255)
+}
+
 fn cursor_rect(
     rect: egui::Rect,
     row: usize,
@@ -1878,11 +1882,9 @@ impl TerminalRenderer {
                     if col_idx >= link.col_start && col_idx < link.col_end {
                         let is_hovered_link =
                             hovered_link.as_ref().map(|l| l == *link).unwrap_or(false);
-                        fg_color = if is_hovered_link {
-                            Color32::from_rgb(100, 200, 255)
-                        } else {
-                            Color32::from_rgb(50, 150, 255)
-                        };
+                        if is_hovered_link {
+                            fg_color = hovered_link_color();
+                        }
                         found = true;
                         break;
                     }
@@ -2115,11 +2117,9 @@ impl TerminalRenderer {
                         if col_idx >= link.col_start && col_idx < link.col_end {
                             let is_hovered_link =
                                 hovered_link.as_ref().map(|l| l == *link).unwrap_or(false);
-                            fg_color = if is_hovered_link {
-                                Color32::from_rgb(100, 200, 255)
-                            } else {
-                                Color32::from_rgb(50, 150, 255)
-                            };
+                            if is_hovered_link {
+                                fg_color = hovered_link_color();
+                            }
                             found = true;
                             break;
                         }
