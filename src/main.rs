@@ -28,7 +28,10 @@ mod theme;
 mod ui;
 mod windows_compat;
 
-use app::events::{normalize_terminal_shortcut_events, should_restore_terminal_shortcut_event};
+use app::events::{
+    normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
+    should_restore_terminal_shortcut_event,
+};
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
 use eframe::egui;
@@ -1313,36 +1316,7 @@ impl eframe::App for TerminalApp {
         // It calls `return` after checking clipboard, so neither Paste nor Key::V pressed
         // appears in raw_input — only Key::V released survives.
         // Detect this case and inject Key::V pressed so the terminal receives 0x16.
-        let has_ctrl_v_release = raw_input.events.iter().any(|evt| {
-            matches!(evt,
-                egui::Event::Key { key: egui::Key::V, pressed: false, modifiers, .. }
-                if modifiers.ctrl && !modifiers.shift
-            )
-        });
-        let has_ctrl_v_press = raw_input.events.iter().any(|evt| {
-            matches!(evt,
-                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
-                if modifiers.ctrl && !modifiers.shift
-            )
-        });
-        let has_paste_event = raw_input
-            .events
-            .iter()
-            .any(|evt| matches!(evt, egui::Event::Paste(_)));
-
-        if has_ctrl_v_release && !has_ctrl_v_press && !has_paste_event {
-            // Insert Key::V pressed before the release event
-            raw_input.events.insert(
-                0,
-                egui::Event::Key {
-                    key: egui::Key::V,
-                    physical_key: Some(egui::Key::V),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: raw_input.modifiers,
-                },
-            );
-        }
+        restore_missing_image_paste_key_event(&mut raw_input.events);
 
         // egui-winit turns Ctrl/Cmd+C/X/V into semantic clipboard events and skips the
         // corresponding Key press. Restore those as Key events so the terminal can receive
@@ -2459,7 +2433,10 @@ impl Drop for TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::events::{normalize_terminal_shortcut_events, shortcut_event_to_key_event};
+    use crate::app::events::{
+        normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
+        shortcut_event_to_key_event,
+    };
     use eframe::egui;
 
     #[test]
@@ -2535,5 +2512,61 @@ mod tests {
         normalize_terminal_shortcut_events(&mut events, modifiers, true, true);
 
         assert_eq!(events, vec![egui::Event::Paste("ignored".to_owned())]);
+    }
+
+    #[test]
+    fn image_only_clipboard_restores_ctrl_v_with_release_modifiers() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers,
+        }];
+
+        assert!(restore_missing_image_paste_key_event(&mut events));
+        assert_eq!(
+            events[0],
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }
+        );
+    }
+
+    #[test]
+    fn image_paste_restoration_does_not_duplicate_existing_paste_input() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: false,
+                repeat: false,
+                modifiers,
+            },
+        ];
+
+        assert!(!restore_missing_image_paste_key_event(&mut events));
+        assert_eq!(events.len(), 2);
     }
 }

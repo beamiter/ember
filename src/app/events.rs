@@ -122,6 +122,51 @@ pub fn normalize_terminal_shortcut_events(
     crate::debug_log!("[NORMALIZE] output: {} events", events.len());
 }
 
+/// Restore a Ctrl+V press swallowed by egui-winit for image-only clipboards.
+///
+/// egui-winit emits only the release event when its text clipboard lookup has
+/// no data. The modifier state carried by that event is authoritative: the
+/// aggregate modifier snapshot may already have lost Ctrl.
+pub fn restore_missing_image_paste_key_event(events: &mut Vec<egui::Event>) -> bool {
+    let ctrl_v_release_modifiers = events.iter().find_map(|event| match event {
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed: false,
+            modifiers,
+            ..
+        } if modifiers.ctrl && !modifiers.shift => Some(*modifiers),
+        _ => None,
+    });
+    let has_ctrl_v_press = events.iter().any(|event| {
+        matches!(event,
+            egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
+            if modifiers.ctrl && !modifiers.shift
+        )
+    });
+    let has_paste_event = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)));
+
+    let Some(modifiers) = ctrl_v_release_modifiers else {
+        return false;
+    };
+    if has_ctrl_v_press || has_paste_event {
+        return false;
+    }
+
+    events.insert(
+        0,
+        egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        },
+    );
+    true
+}
+
 /// 将 egui::Key 转换为字符串表示（零分配版本）
 pub fn key_to_string(key: egui::Key) -> Option<&'static str> {
     match key {
