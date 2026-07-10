@@ -1392,19 +1392,27 @@ impl eframe::App for TerminalApp {
         if ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.ctrl && i.modifiers.shift) {
             if self.command_palette.is_open {
                 self.command_palette.close();
+                self.set_status("命令面板已关闭");
             } else {
                 self.command_palette.open();
+                self.set_status("命令面板已打开，直接输入即可搜索命令");
             }
         }
 
         // 帮助面板快捷键 (Ctrl+?)
         if ctx.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.ctrl) {
             self.help_panel.toggle();
+            self.set_status(if self.help_panel.is_open {
+                "快捷键帮助已打开，按 Ctrl+? 可关闭"
+            } else {
+                "快捷键帮助已关闭"
+            });
         }
 
         // Debug overlay 快捷键 (F12)
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
             self.debug_panel.toggle();
+            self.set_status("调试信息已切换");
         }
 
         if self.handle_command_palette_input(root_ui) {

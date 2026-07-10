@@ -62,7 +62,32 @@ impl HelpPanel {
             })
             .show(ctx, |ui| {
                 ui.heading(RichText::new("JTerm2 快捷键").size(18.0).color(text_color));
-                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("从这里开始：用命令面板发现功能，用本页查找快捷键。")
+                        .size(12.0)
+                        .color(dim_color),
+                );
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [150.0, 18.0],
+                        egui::Label::new(
+                            RichText::new("Ctrl+Shift+P").monospace().color(text_color),
+                        ),
+                    );
+                    ui.label(RichText::new("打开命令面板，搜索全部功能").color(text_color));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [150.0, 18.0],
+                        egui::Label::new(
+                            RichText::new("Ctrl+?").monospace().color(text_color),
+                        ),
+                    );
+                    ui.label(RichText::new("打开或关闭本快捷键帮助").color(text_color));
+                });
+                ui.separator();
 
                 for category in categories {
                     let cat_color = Self::category_color(category, theme);
