@@ -2515,8 +2515,8 @@ mod tests {
     }
 
     #[test]
-    fn image_only_clipboard_restores_ctrl_v_with_release_modifiers() {
-        let modifiers = egui::Modifiers {
+    fn image_only_clipboard_restores_ctrl_v_after_ctrl_is_released() {
+        let expected_modifiers = egui::Modifiers {
             ctrl: true,
             command: true,
             ..Default::default()
@@ -2526,7 +2526,8 @@ mod tests {
             physical_key: Some(egui::Key::V),
             pressed: false,
             repeat: false,
-            modifiers,
+            // This is what arrives when Ctrl is released before V.
+            modifiers: egui::Modifiers::NONE,
         }];
 
         assert!(restore_missing_image_paste_key_event(&mut events));
@@ -2537,7 +2538,7 @@ mod tests {
                 physical_key: Some(egui::Key::V),
                 pressed: true,
                 repeat: false,
-                modifiers,
+                modifiers: expected_modifiers,
             }
         );
     }

@@ -125,16 +125,17 @@ pub fn normalize_terminal_shortcut_events(
 /// Restore a Ctrl+V press swallowed by egui-winit for image-only clipboards.
 ///
 /// egui-winit emits only the release event when its text clipboard lookup has
-/// no data. The modifier state carried by that event is authoritative: the
-/// aggregate modifier snapshot may already have lost Ctrl.
+/// no data. This also happens when Ctrl has already been released by the time
+/// V's release reaches us, so the missing shortcut is identified from the
+/// absent press/Paste events rather than its release modifiers.
 pub fn restore_missing_image_paste_key_event(events: &mut Vec<egui::Event>) -> bool {
-    let ctrl_v_release_modifiers = events.iter().find_map(|event| match event {
+    let v_release_modifiers = events.iter().find_map(|event| match event {
         egui::Event::Key {
             key: egui::Key::V,
             pressed: false,
             modifiers,
             ..
-        } if modifiers.ctrl && !modifiers.shift => Some(*modifiers),
+        } if !modifiers.shift => Some(*modifiers),
         _ => None,
     });
     let has_ctrl_v_press = events.iter().any(|event| {
@@ -147,12 +148,18 @@ pub fn restore_missing_image_paste_key_event(events: &mut Vec<egui::Event>) -> b
         .iter()
         .any(|event| matches!(event, egui::Event::Paste(_)));
 
-    let Some(modifiers) = ctrl_v_release_modifiers else {
+    let Some(mut modifiers) = v_release_modifiers else {
         return false;
     };
     if has_ctrl_v_press || has_paste_event {
         return false;
     }
+
+    // egui's global modifiers may be clear if Ctrl was released first. We are
+    // restoring a swallowed Ctrl+V, so explicitly restore both fields used by
+    // egui on Linux/Windows for the Ctrl modifier.
+    modifiers.ctrl = true;
+    modifiers.command = true;
 
     events.insert(
         0,
