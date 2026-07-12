@@ -81,9 +81,7 @@ impl HelpPanel {
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [150.0, 18.0],
-                        egui::Label::new(
-                            RichText::new("Ctrl+?").monospace().color(text_color),
-                        ),
+                        egui::Label::new(RichText::new("Ctrl+?").monospace().color(text_color)),
                     );
                     ui.label(RichText::new("打开或关闭本快捷键帮助").color(text_color));
                 });

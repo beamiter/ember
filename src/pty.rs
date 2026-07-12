@@ -195,8 +195,7 @@ mod unix_pty {
                         let bash_path = bash_path.unwrap();
                         let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
                         (
-                            CString::new(bash_path)
-                                .map_err(|_| anyhow!("Invalid bash path"))?,
+                            CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
                             vec![
                                 CString::new("bash").unwrap(),
                                 CString::new("-ic").unwrap(),
