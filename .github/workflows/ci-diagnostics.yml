@@ -32,5 +32,7 @@ jobs:
           path: |
             rustfmt.patch
             Cargo.lock
+            src/help.rs
+            src/pty.rs
           if-no-files-found: error
           retention-days: 1
