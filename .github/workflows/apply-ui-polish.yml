@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - agent/ui-polish-floating-panels
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
