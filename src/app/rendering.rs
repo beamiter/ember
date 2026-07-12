@@ -248,12 +248,22 @@ impl TerminalApp {
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
         // 搜索面板 UI（浮动窗口，右上角）
         if self.search_state.is_open {
+            let screen_rect = ctx.viewport_rect();
+            let search_width = (screen_rect.width() - 24.0).clamp(300.0, 520.0);
+            let search_height = if self.search_state.error_message.is_some() {
+                82.0
+            } else {
+                52.0
+            };
             egui::Window::new("Search")
                 .title_bar(false)
                 .resizable(false)
-                .default_pos(egui::pos2(ctx.viewport_rect().right() - 430.0, 60.0))
-                .default_size([420.0, 50.0])
-                .fixed_size([420.0, 50.0])
+                .default_pos(egui::pos2(
+                    (screen_rect.right() - search_width - 12.0).max(screen_rect.left() + 12.0),
+                    screen_rect.top() + 48.0,
+                ))
+                .default_size([search_width, search_height])
+                .fixed_size([search_width, search_height])
                 .frame(egui::Frame {
                     fill: crate::theme::Theme::rgb_to_color32(self.current_theme.search.bg),
                     stroke: egui::Stroke::new(
@@ -319,15 +329,19 @@ impl TerminalApp {
                         }
 
                         // 上一个/下一个 按钮
-                        if ui.button("↑").clicked() {
+                        if ui
+                            .button("↑")
+                            .on_hover_text("Previous match (Shift+Enter)")
+                            .clicked()
+                        {
                             self.search_state.prev_match();
                         }
-                        if ui.button("↓").clicked() {
+                        if ui.button("↓").on_hover_text("Next match (Enter)").clicked() {
                             self.search_state.next_match();
                         }
 
                         // 关闭按钮
-                        if ui.button("✕").clicked() {
+                        if ui.button("✕").on_hover_text("Close search (Esc)").clicked() {
                             self.search_state.close();
                             self.save_ui_history();
                         }
@@ -343,17 +357,17 @@ impl TerminalApp {
         // 命令调色板 UI（中央弹窗）
         if self.command_palette.is_open {
             let screen_rect = ctx.viewport_rect();
-            let palette_width = 600.0;
-            let palette_height = 400.0;
+            let palette_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
+            let palette_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
             let palette_pos = egui::pos2(
-                (screen_rect.width() - palette_width) / 2.0,
-                (screen_rect.height() - palette_height) / 3.0,
+                screen_rect.center().x - palette_width / 2.0,
+                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
             );
 
             egui::Window::new("Command Palette")
                 .title_bar(false)
                 .resizable(false)
-                .movable(true)
+                .movable(false)
                 .default_pos(palette_pos)
                 .default_size([palette_width, palette_height])
                 .fixed_size([palette_width, palette_height])
@@ -400,7 +414,10 @@ impl TerminalApp {
                                 let is_selected = idx == selected_index;
 
                                 let bg_color = if is_selected {
-                                    egui::Color32::from_rgb(70, 70, 80)
+                                    crate::theme::Theme::rgb_to_color32(
+                                        self.current_theme.tabbar.active_border,
+                                    )
+                                    .gamma_multiply(0.18)
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
@@ -441,7 +458,7 @@ impl TerminalApp {
                                         ui.label(
                                             egui::RichText::new(&cmd_info.description)
                                                 .size(10.0)
-                                                .color(egui::Color32::from_rgb(150, 150, 150)),
+                                                .color(ui.visuals().weak_text_color()),
                                         );
                                     });
 
@@ -483,7 +500,7 @@ impl TerminalApp {
                             if results.is_empty() {
                                 ui.label(
                                     egui::RichText::new("No commands found")
-                                        .color(egui::Color32::from_rgb(150, 150, 150)),
+                                        .color(ui.visuals().weak_text_color()),
                                 );
                             }
                         });
@@ -494,7 +511,7 @@ impl TerminalApp {
                         ui.label(
                             egui::RichText::new("↑↓ Navigate  Enter Execute  Esc Cancel")
                                 .size(10.0)
-                                .color(egui::Color32::from_rgb(100, 100, 100)),
+                                .color(ui.visuals().weak_text_color()),
                         );
                     });
                 });
