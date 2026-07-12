@@ -1,0 +1,1 @@
+Temporary bootstrap marker for the UI polish pull request. The branch workflow removes this file before committing the final source changes.
