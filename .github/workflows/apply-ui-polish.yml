@@ -1,0 +1,140 @@
+name: Apply UI polish
+
+on:
+  push:
+    branches:
+      - agent/ui-polish-floating-panels
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/ui-polish-floating-panels
+          fetch-depth: 0
+
+      - name: Update floating panel UI
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/app/rendering.rs")
+          text = path.read_text()
+
+          replacements = [
+              (
+                  '''        if self.search_state.is_open {
+              egui::Window::new("Search")
+                  .title_bar(false)
+                  .resizable(false)
+                  .default_pos(egui::pos2(ctx.viewport_rect().right() - 430.0, 60.0))
+                  .default_size([420.0, 50.0])
+                  .fixed_size([420.0, 50.0])''',
+                  '''        if self.search_state.is_open {
+              let screen_rect = ctx.viewport_rect();
+              let search_width = (screen_rect.width() - 24.0).clamp(300.0, 520.0);
+              let search_height = if self.search_state.error_message.is_some() {
+                  82.0
+              } else {
+                  52.0
+              };
+              egui::Window::new("Search")
+                  .title_bar(false)
+                  .resizable(false)
+                  .default_pos(egui::pos2(
+                      (screen_rect.right() - search_width - 12.0)
+                          .max(screen_rect.left() + 12.0),
+                      screen_rect.top() + 48.0,
+                  ))
+                  .default_size([search_width, search_height])
+                  .fixed_size([search_width, search_height])''',
+              ),
+              (
+                  '''                        if ui.button("↑").clicked() {
+                            self.search_state.prev_match();
+                        }
+                        if ui.button("↓").clicked() {
+                            self.search_state.next_match();
+                        }
+
+                        // 关闭按钮
+                        if ui.button("✕").clicked() {''',
+                  '''                        if ui
+                            .button("↑")
+                            .on_hover_text("Previous match (Shift+Enter)")
+                            .clicked()
+                        {
+                            self.search_state.prev_match();
+                        }
+                        if ui
+                            .button("↓")
+                            .on_hover_text("Next match (Enter)")
+                            .clicked()
+                        {
+                            self.search_state.next_match();
+                        }
+
+                        // 关闭按钮
+                        if ui
+                            .button("✕")
+                            .on_hover_text("Close search (Esc)")
+                            .clicked()
+                        {''',
+              ),
+              (
+                  '''            let palette_width = 600.0;
+            let palette_height = 400.0;
+            let palette_pos = egui::pos2(
+                (screen_rect.width() - palette_width) / 2.0,
+                (screen_rect.height() - palette_height) / 3.0,
+            );''',
+                  '''            let palette_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
+            let palette_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
+            let palette_pos = egui::pos2(
+                screen_rect.center().x - palette_width / 2.0,
+                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
+            );''',
+              ),
+              ('.movable(true)', '.movable(false)'),
+              (
+                  'let bg_color = if is_selected {\n                                    egui::Color32::from_rgb(70, 70, 80)',
+                  'let bg_color = if is_selected {\n                                    crate::theme::Theme::rgb_to_color32(\n                                        self.current_theme.tabbar.active_border,\n                                    )\n                                    .gamma_multiply(0.18)',
+              ),
+              (
+                  '.color(egui::Color32::from_rgb(150, 150, 150)),',
+                  '.color(ui.visuals().weak_text_color()),',
+              ),
+              (
+                  '.color(egui::Color32::from_rgb(100, 100, 100)),',
+                  '.color(ui.visuals().weak_text_color()),',
+              ),
+          ]
+
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f"expected source block not found: {old[:80]!r}")
+              text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+
+          rm -f .github/workflows/apply-ui-polish.yml
+          cargo fmt --all
+
+      - name: Commit changes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Polish floating panels"
+          git push origin HEAD:agent/ui-polish-floating-panels
+
+      - name: Validate
+        run: cargo check
