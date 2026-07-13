@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use jterm2::terminal::TerminalState;
+use std::hint::black_box;
 
 /// Benchmark ANSI escape sequence parsing
 fn bench_ansi_parsing(c: &mut Criterion) {

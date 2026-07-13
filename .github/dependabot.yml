@@ -10,6 +10,13 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
+    # egui-wgpu exposes WGPU types in callback traits, so WGPU cannot be
+    # upgraded independently. Major graphics-stack upgrades must be reviewed
+    # and performed together with egui/eframe.
+    ignore:
+      - dependency-name: "wgpu"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: github-actions
     directory: "/"

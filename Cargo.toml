@@ -13,7 +13,9 @@ anyhow = "1.0"
 egui = "0.35.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "glow", "wayland", "x11"] }
 egui-wgpu = "0.35.0"
-wgpu = "30.0.0"
+# Keep this aligned with egui-wgpu/eframe 0.35. A second wgpu major version
+# makes callback trait types incompatible even when their names are identical.
+wgpu = "=29.0.4"
 bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 fontdue = "0.9"
