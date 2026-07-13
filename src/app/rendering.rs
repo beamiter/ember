@@ -8,8 +8,13 @@ impl TerminalApp {
     /// 自适应帧预算：根据帧时间动态调整处理量
     pub fn adjust_frame_budget(&mut self) {
         const TARGET_FRAME_MS: f64 = 16.0; // 目标 60 FPS
-        const MIN_BUDGET: usize = 8192; // 最小 8KB
-        const MAX_BUDGET: usize = 131072; // 最大 128KB
+
+        // TUI applications such as Codex commonly redraw a whole screen at
+        // once. A 64 KiB starting point keeps those updates responsive, while
+        // the adaptive controller can still back off when parsing/rendering
+        // pushes the frame over budget.
+        const MIN_BUDGET: usize = 16384; // 最小 16KB
+        const MAX_BUDGET: usize = 262144; // 最大 256KB
         const ADJUST_RATE: f64 = 0.1; // 调整速率 10%
 
         let avg_frame_ms = self.debug_panel.get_avg_frame_time_ms();
@@ -618,8 +623,8 @@ impl TerminalApp {
             let kitty_memory_mb = terminal.kitty_graphics.image_memory_mb();
             let scrollback_max = terminal.max_scrollback();
             drop(terminal);
+            let pending_output_bytes = session.pending_output.len();
             let session_count = self.session_manager.len();
-            let pending_output_bytes = self.pending_output.len();
             let texture_cache_size = self.renderer.texture_cache_len();
             let frame_budget_kb = self.adaptive_frame_budget / 1024;
             self.debug_panel.show(

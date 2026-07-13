@@ -55,6 +55,13 @@ pub struct Session {
     pub metadata: SessionMetadata,
     pub terminal: Arc<ParkingMutex<TerminalState>>,
     pub shell: ShellSession,
+    /// PTY output that exceeded the per-frame parsing budget.
+    ///
+    /// This must live on the session rather than on `TerminalApp`: a tab switch
+    /// can happen between frames, and feeding the old tab's remaining ANSI
+    /// stream into the newly active terminal corrupts both its screen and its
+    /// terminal modes.
+    pub pending_output: Vec<u8>,
 }
 
 impl Session {
@@ -68,6 +75,7 @@ impl Session {
             metadata: SessionMetadata::new(name, tags),
             terminal,
             shell,
+            pending_output: Vec::new(),
         }
     }
 

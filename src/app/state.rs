@@ -126,9 +126,6 @@ pub struct TerminalApp {
     // Lock file to detect running instances
     pub _lock_file: Option<std::fs::File>,
 
-    // 每帧字节限制溢出的缓冲区，下一帧继续处理
-    pub pending_output: Vec<u8>,
-
     // 鼠标报告模式下的滚轮累积器
     pub mouse_scroll_accumulator: f32,
 

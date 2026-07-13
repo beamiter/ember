@@ -1003,13 +1003,12 @@ impl TerminalApp {
             session_save_pending: true, // 启动后立即保存一次（确保首次运行就有记录）
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             _lock_file: lock_file,
-            pending_output: Vec::new(),
             mouse_scroll_accumulator: 0.0,
             font_size_accumulator: 0.0,
             had_ctrl_scroll_last_frame: false,
             frame_events: Vec::new(),
             keyboard_input_buffer: Vec::new(),
-            adaptive_frame_budget: 32768, // 初始值 32KB
+            adaptive_frame_budget: 65536, // 初始值 64KB
             config_last_mtime: config::Config::config_mtime(),
             config_last_check: std::time::Instant::now(),
             smooth_scroll_velocity: 0.0,
@@ -1368,6 +1367,8 @@ impl eframe::App for TerminalApp {
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
 
+        // Keybindings may switch tabs. This index is only valid while handling
+        // the keybinding itself; take a fresh snapshot immediately afterwards.
         let active_session_idx = self.session_manager.active_index();
         let has_preedit = self.handle_ime_events(ctx);
 
@@ -1410,6 +1411,8 @@ impl eframe::App for TerminalApp {
             return;
         }
 
+        let active_session_idx = self.session_manager.active_index();
+
         // 获取当前活跃会话（在所有快捷键处理完后）
         let session_count_before = self.session_manager.len();
         let mut shell_exited = false;
@@ -1420,7 +1423,7 @@ impl eframe::App for TerminalApp {
         // Snapshot active session index before mutably borrowing session_manager;
         // we use it to tag pending-paste confirmations so they only deliver to
         // the same tab if the user hasn't switched away.
-        let active_session_idx_for_paste = self.session_manager.active_index();
+        let active_session_idx_for_paste = active_session_idx;
         let session = self.session_manager.get_active_session_mut();
 
         // Step 3: 处理复制粘贴（从配置系统或硬编码的 Ctrl+Shift+C/V）
@@ -1772,14 +1775,16 @@ impl eframe::App for TerminalApp {
 
         // Step 6: 处理 shell 事件
         // 关键：限制每帧处理的总字节数，防止大量 ANSI 数据阻塞 UI 线程导致假死。
-        // 超出限制的数据保存到 pending_output，下一帧继续处理。
+        // 超出限制的数据保存到当前 session 自己的 pending_output，
+        // 下一帧继续处理。绝不能放在 TerminalApp 全局缓冲中：帧间切 tab
+        // 会把旧 session 的 ANSI 字节流喂给新 session，造成串屏和终端模式污染。
         // 使用自适应帧预算，根据帧时间动态调整
         let mut has_new_output = false;
         let max_bytes_per_frame = self.adaptive_frame_budget;
         let mut has_more_data = false;
 
         // 先取回上一帧未处理完的数据
-        let mut accumulated_data = std::mem::take(&mut self.pending_output);
+        let mut accumulated_data = std::mem::take(&mut session.pending_output);
         if !accumulated_data.is_empty() {
             has_new_output = true;
         }
@@ -1825,7 +1830,7 @@ impl eframe::App for TerminalApp {
 
         // 如果累积数据超过帧限制，将多余部分保存到下一帧
         if accumulated_data.len() > max_bytes_per_frame {
-            self.pending_output = accumulated_data.split_off(max_bytes_per_frame);
+            session.pending_output = accumulated_data.split_off(max_bytes_per_frame);
             has_more_data = true;
         }
         // 也检查 channel 中是否还有数据
