@@ -44,6 +44,8 @@ pub struct LayoutManager {
 }
 
 impl LayoutManager {
+    const MAX_PANES: usize = 2;
+
     /// 创建单窗格布局
     pub fn new(session_idx: usize) -> Self {
         let pane = Pane::new(PaneId(0), session_idx);
@@ -57,13 +59,8 @@ impl LayoutManager {
 
     /// 分割窗格（垂直/水平）
     pub fn split(&mut self, session_idx: usize, horizontal: bool) -> Result<(), String> {
-        if self.panes.len() >= 4 {
-            return Err("Maximum 4 panes reached".to_string());
-        }
-
-        // 只支持最多 2 个窗格（MVP）
-        if self.panes.len() >= 2 {
-            return Err("MVP supports max 2 panes".to_string());
+        if !self.can_split() {
+            return Err(format!("Maximum {} panes reached", Self::MAX_PANES));
         }
 
         let new_id = PaneId(self.pane_counter);
@@ -81,6 +78,35 @@ impl LayoutManager {
         };
 
         Ok(())
+    }
+
+    /// 当前布局是否还能继续分屏。调用方应在创建新 shell 前检查，避免分屏
+    /// 已满时产生一个用户没有请求的孤立会话。
+    pub fn can_split(&self) -> bool {
+        self.panes.len() < Self::MAX_PANES
+    }
+
+    /// 让某个会话出现在当前布局中：若它已经在某个窗格中则只移动焦点，
+    /// 否则用它替换当前焦点窗格。用于 tab 切换时保持“活跃会话 = 可见焦点窗格”。
+    pub fn show_session(&mut self, session_idx: usize) {
+        if let Some(pane) = self
+            .panes
+            .iter()
+            .find(|pane| pane.session_idx == session_idx)
+        {
+            self.focused_pane_id = pane.id;
+            return;
+        }
+
+        let focused_index = self
+            .panes
+            .iter()
+            .position(|pane| pane.id == self.focused_pane_id)
+            .unwrap_or(0);
+        if let Some(pane) = self.panes.get_mut(focused_index) {
+            pane.session_idx = session_idx;
+            self.focused_pane_id = pane.id;
+        }
     }
 
     /// 关闭当前焦点的窗格
@@ -106,11 +132,70 @@ impl LayoutManager {
     /// 指向被删会话的窗格回退到 `fallback_idx`(关闭后的新活跃会话),
     /// 避免悬空/越界索引导致渲染错位。
     pub fn on_session_removed(&mut self, removed_idx: usize, fallback_idx: usize) {
+        let removed_focused_pane = self
+            .panes
+            .iter()
+            .any(|pane| pane.id == self.focused_pane_id && pane.session_idx == removed_idx);
+
+        // 分屏时关闭一个正在显示的会话，应同时收起对应窗格。把它改指向
+        // fallback 会造成两个窗格显示同一会话，并留下无法理解的空分屏。
+        if self.panes.len() > 1
+            && self
+                .panes
+                .iter()
+                .any(|pane| pane.session_idx == removed_idx)
+        {
+            self.panes.retain(|pane| pane.session_idx != removed_idx);
+        }
+
         for pane in &mut self.panes {
             if pane.session_idx == removed_idx {
                 pane.session_idx = fallback_idx;
             } else if pane.session_idx > removed_idx {
                 pane.session_idx -= 1;
+            }
+        }
+
+        if self.panes.len() == 1 {
+            self.mode = SplitMode::Single;
+        }
+        if removed_focused_pane
+            || !self
+                .panes
+                .iter()
+                .any(|pane| pane.id == self.focused_pane_id)
+        {
+            if let Some(pane) = self.panes.first() {
+                self.focused_pane_id = pane.id;
+            }
+        }
+    }
+
+    /// 会话 tab 重排后同步窗格中保存的索引，使窗格继续显示同一个会话。
+    pub fn on_session_reordered(&mut self, from_idx: usize, to_idx: usize) {
+        if from_idx == to_idx {
+            return;
+        }
+        for pane in &mut self.panes {
+            pane.session_idx = if pane.session_idx == from_idx {
+                to_idx
+            } else if from_idx < to_idx && pane.session_idx > from_idx && pane.session_idx <= to_idx
+            {
+                pane.session_idx - 1
+            } else if to_idx < from_idx && pane.session_idx >= to_idx && pane.session_idx < from_idx
+            {
+                pane.session_idx + 1
+            } else {
+                pane.session_idx
+            };
+        }
+    }
+
+    /// 新会话插入 tab 向量后，原会话在插入点及其后的索引整体右移。
+    pub fn on_session_inserted(&mut self, inserted_idx: usize) {
+        for pane in &mut self.panes {
+            if pane.session_idx >= inserted_idx {
+                pane.session_idx += 1;
             }
         }
     }
@@ -280,4 +365,67 @@ impl LayoutManager {
 pub enum PaneDirection {
     Next,
     Prev,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn showing_session_focuses_existing_pane_or_replaces_focused_pane() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+
+        layout.show_session(0);
+        assert_eq!(layout.focused_session_idx(), Some(0));
+        assert_eq!(layout.panes[1].session_idx, 1);
+
+        layout.show_session(2);
+        assert_eq!(layout.focused_session_idx(), Some(2));
+        assert_eq!(layout.panes[0].session_idx, 2);
+        assert_eq!(layout.panes[1].session_idx, 1);
+    }
+
+    #[test]
+    fn removing_visible_session_collapses_duplicate_split() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+
+        layout.on_session_removed(1, 0);
+
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.mode, SplitMode::Single);
+        assert_eq!(layout.focused_session_idx(), Some(0));
+    }
+
+    #[test]
+    fn reordering_sessions_preserves_pane_identity() {
+        let mut layout = LayoutManager::new(1);
+        layout.split(3, false).unwrap();
+
+        layout.on_session_reordered(1, 3);
+
+        assert_eq!(layout.panes[0].session_idx, 3);
+        assert_eq!(layout.panes[1].session_idx, 2);
+    }
+
+    #[test]
+    fn inserting_session_keeps_existing_panes_on_their_sessions() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(2, false).unwrap();
+
+        layout.on_session_inserted(1);
+
+        assert_eq!(layout.panes[0].session_idx, 0);
+        assert_eq!(layout.panes[1].session_idx, 3);
+    }
+
+    #[test]
+    fn split_limit_is_reported_before_creating_more_work() {
+        let mut layout = LayoutManager::new(0);
+        assert!(layout.can_split());
+        layout.split(1, true).unwrap();
+        assert!(!layout.can_split());
+        assert!(layout.split(2, true).is_err());
+    }
 }

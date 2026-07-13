@@ -171,18 +171,20 @@ impl SessionManager {
 
     /// 切换到下一个会话
     pub fn switch_to_next_session(&mut self) -> usize {
-        self.active_index = (self.active_index + 1) % self.sessions.len();
-        self.active_index
+        let next = (self.active_index + 1) % self.sessions.len();
+        self.switch_session(next);
+        next
     }
 
     /// 切换到前一个会话
     pub fn switch_to_prev_session(&mut self) -> usize {
-        if self.active_index == 0 {
-            self.active_index = self.sessions.len() - 1;
+        let previous = if self.active_index == 0 {
+            self.sessions.len() - 1
         } else {
-            self.active_index -= 1;
-        }
-        self.active_index
+            self.active_index - 1
+        };
+        self.switch_session(previous);
+        previous
     }
 
     /// 获取当前活跃会话的索引

@@ -12,7 +12,24 @@ impl TerminalApp {
         }
         let fallback = self.session_manager.active_index();
         self.layout_manager.on_session_removed(index, fallback);
+        self.layout_manager.show_session(fallback);
+        self.force_resize_session = true;
+        if self.search_state.is_open {
+            self.refresh_search_matches();
+        }
         true
+    }
+
+    /// 重排 tab 并同步分屏窗格保存的会话索引。
+    pub fn reorder_sessions_synced(&mut self, from_idx: usize, to_idx: usize) {
+        if from_idx == to_idx
+            || from_idx >= self.session_manager.len()
+            || to_idx >= self.session_manager.len()
+        {
+            return;
+        }
+        self.session_manager.reorder_sessions(from_idx, to_idx);
+        self.layout_manager.on_session_reordered(from_idx, to_idx);
     }
 
     /// 会话标题:用户双击重命名设置的 custom_name 优先;否则用 shell 当前工作
@@ -254,12 +271,11 @@ impl TerminalApp {
         if let Some((from_idx, to_idx)) = reorder {
             // 重排后索引会漂移,正在编辑的重命名失效,避免提交到错的会话
             self.renaming_tab = None;
-            self.session_manager.reorder_sessions(from_idx, to_idx);
+            self.reorder_sessions_synced(from_idx, to_idx);
             self.schedule_session_save();
         }
         if let Some(i) = switch_to {
-            self.session_manager.switch_session(i);
-            self.force_resize_session = true;
+            self.activate_session(i);
         }
         if let Some(i) = close_idx {
             if self.session_manager.len() > 1 {
@@ -270,8 +286,7 @@ impl TerminalApp {
         }
         if new_session {
             let idx = self.create_session_with_current_config(None, None);
-            self.session_manager.switch_session(idx);
-            self.force_resize_session = true;
+            self.activate_session(idx);
             self.schedule_session_save();
         }
         if let Some(i) = begin_rename {
@@ -805,7 +820,7 @@ impl TerminalApp {
 
                             // 执行重排
                             if target_idx != from_idx {
-                                self.session_manager.reorder_sessions(from_idx, target_idx);
+                                self.reorder_sessions_synced(from_idx, target_idx);
                             }
                         }
                     }
@@ -844,8 +859,7 @@ impl TerminalApp {
                                 self.drag_start_pos = None;
                                 break;
                             } else if tab_rect_item.contains(click_pos) {
-                                self.session_manager.switch_session(i);
-                                self.force_resize_session = true;
+                                self.activate_session(i);
                                 self.dragging_tab = None;
                                 self.drag_start_pos = None;
                                 break;
@@ -1208,8 +1222,7 @@ impl TerminalApp {
             if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
                 if plus_btn_rect.contains(click_pos) {
                     let new_idx = self.create_session_with_current_config(None, None);
-                    self.session_manager.switch_session(new_idx);
-                    self.force_resize_session = true;
+                    self.activate_session(new_idx);
                     self.schedule_session_save();
                 }
             }

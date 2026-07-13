@@ -49,6 +49,11 @@ pub struct SearchState {
 
     /// 搜索错误消息（正则表达式编译错误等）
     pub error_message: Option<String>,
+
+    /// 当前结果所属的终端版本/会话。用于输出或 tab 变化后按需刷新，
+    /// 避免搜索面板显示旧会话的匹配计数与高亮。
+    pub results_grid_version: Option<u64>,
+    pub results_session_idx: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,15 +85,15 @@ impl SearchState {
             history_nav_index: None,
             last_query: String::new(),
             error_message: None,
+            results_grid_version: None,
+            results_session_idx: None,
         }
     }
 
-    /// 打开或关闭搜索面板
-    pub fn toggle(&mut self) {
-        self.is_open = !self.is_open;
-        if self.is_open {
-            self.search_focused = true;
-        }
+    /// 打开并聚焦搜索。重复调用保持打开，而不是意外切换为关闭。
+    pub fn open(&mut self) {
+        self.is_open = true;
+        self.search_focused = true;
     }
 
     /// 关闭搜索面板
@@ -216,45 +221,37 @@ impl SearchEngine {
         case_sensitive: bool,
     ) -> Vec<SearchMatch> {
         let mut matches = Vec::new();
-
-        let search_query = if case_sensitive {
-            query.to_string()
-        } else {
-            query.to_lowercase()
-        };
-
-        let query_char_len = search_query.chars().count();
+        // 在原字符串上做 Unicode 大小写不敏感匹配。整行 `to_lowercase()` 会让
+        // 某些字符展开成多个码位（例如 İ → i + 组合点），从而把后续匹配映射
+        // 到错误的终端列。转义后的字面量正则既保留原始字节偏移，也支持 Unicode。
+        let mut builder = RegexBuilder::new(&regex::escape(query));
+        builder.case_insensitive(!case_sensitive);
+        let regex = builder
+            .build()
+            .expect("an escaped literal must compile as a regex");
 
         for (line_idx, line) in grid.iter().enumerate() {
             let (line_str, col_map) = Self::grid_line_to_string(line);
             let total_cols = line.len();
-            let search_line = if case_sensitive {
-                line_str
-            } else {
-                line_str.to_lowercase()
-            };
 
             let mut start_byte = 0;
-            while let Some(rel) = search_line[start_byte..].find(&search_query) {
-                let match_byte = start_byte + rel;
+            while let Some(found) = regex.find_at(&line_str, start_byte) {
                 // 字节偏移 → 字符索引 → 网格列号(col_map 已跳过宽字符续接单元)。
-                let start_char = search_line[..match_byte].chars().count();
+                let start_char = line_str[..found.start()].chars().count();
+                let end_char = line_str[..found.end()].chars().count();
                 let col_start = col_map.get(start_char).copied().unwrap_or(total_cols);
-                let col_end = col_map
-                    .get(start_char + query_char_len)
-                    .copied()
-                    .unwrap_or(total_cols);
+                let col_end = col_map.get(end_char).copied().unwrap_or(total_cols);
                 matches.push(SearchMatch {
                     line: line_idx,
                     col_start,
                     col_end,
                 });
                 // 前进到下一个字符边界:既能找到重叠匹配,又不会切到多字节字符中间导致 panic。
-                let step = search_line[match_byte..]
+                let step = line_str[found.start()..]
                     .chars()
                     .next()
                     .map_or(1, |c| c.len_utf8());
-                start_byte = match_byte + step;
+                start_byte = found.start() + step;
             }
         }
 
@@ -325,13 +322,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_search_state_toggle() {
+    fn test_search_state_open_and_close() {
         let mut state = SearchState::new();
         assert!(!state.is_open);
-        state.toggle();
+        state.open();
         assert!(state.is_open);
-        state.toggle();
+        state.close();
         assert!(!state.is_open);
+    }
+
+    #[test]
+    fn opening_search_is_idempotent() {
+        let mut state = SearchState::new();
+        state.open();
+        state.open();
+        assert!(state.is_open);
+        assert!(state.search_focused);
     }
 
     #[test]
@@ -358,5 +364,39 @@ mod tests {
 
         state.prev_match();
         assert_eq!(state.current_match_index, 1);
+    }
+
+    #[test]
+    fn case_insensitive_search_keeps_columns_after_unicode_case_expansion() {
+        let mut grid = crate::terminal::TerminalGrid::new(1, 3);
+        grid.get_mut(0, 0).character = 'İ';
+        grid.get_mut(0, 1).character = 'x';
+
+        let (matches, error) = SearchEngine::search(&grid, "x", false, false);
+
+        assert!(error.is_none());
+        assert_eq!(
+            matches,
+            vec![SearchMatch {
+                line: 0,
+                col_start: 1,
+                col_end: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn plaintext_search_still_finds_overlapping_matches() {
+        let mut grid = crate::terminal::TerminalGrid::new(1, 3);
+        for col in 0..3 {
+            grid.get_mut(0, col).character = 'a';
+        }
+
+        let (matches, error) = SearchEngine::search(&grid, "aa", false, true);
+
+        assert!(error.is_none());
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].col_start, 0);
+        assert_eq!(matches[1].col_start, 1);
     }
 }

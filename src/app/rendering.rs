@@ -1,7 +1,7 @@
 // Rendering coordination module
 
 use super::state::TerminalApp;
-use crate::{command_palette, config, config_panel, layout, search, search_replace_panel, theme};
+use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
 
 impl TerminalApp {
@@ -246,6 +246,21 @@ impl TerminalApp {
 
     #[allow(deprecated)]
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
+        let search_needs_refresh = if self.search_state.is_open {
+            let session_idx = self.session_manager.active_index();
+            let grid_version = {
+                let session = self.session_manager.get_active_session_mut();
+                session.terminal.lock().get_grid_version()
+            };
+            self.search_state.results_session_idx != Some(session_idx)
+                || self.search_state.results_grid_version != Some(grid_version)
+        } else {
+            false
+        };
+        if search_needs_refresh {
+            self.refresh_search_matches();
+        }
+
         // 搜索面板 UI（浮动窗口，右上角）
         if self.search_state.is_open {
             let screen_rect = ctx.viewport_rect();
@@ -302,19 +317,7 @@ impl TerminalApp {
                         }
 
                         if search_response.changed() || case_btn.clicked() || regex_btn.clicked() {
-                            // 重新搜索
-                            let session = self.session_manager.get_active_session_mut();
-                            let terminal = session.terminal.lock();
-                            let (matches, error) = search::SearchEngine::search(
-                                &terminal.grid,
-                                &self.search_state.query,
-                                self.search_state.use_regex,
-                                self.search_state.case_sensitive,
-                            );
-                            drop(terminal);
-                            self.search_state.matches = matches;
-                            self.search_state.error_message = error;
-                            self.search_state.current_match_index = 0;
+                            self.refresh_search_matches();
                         }
 
                         // 显示匹配计数

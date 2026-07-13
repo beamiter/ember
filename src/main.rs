@@ -65,8 +65,14 @@ fn setup_signal_handlers() {
     // SAFETY: signal 注册信号处理器。handle_signal 是 extern "C" 函数，
     // 符合 sighandler_t 的签名要求。处理器只做最小工作（设置原子标志），是信号安全的。
     unsafe {
-        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -915,8 +921,9 @@ impl TerminalApp {
         renderer.gpu_rendering = cfg.gpu_rendering;
         renderer.wgpu_render_state = wgpu_render_state.clone();
 
-        // Initialize layout manager with first session
-        let layout_manager = layout::LayoutManager::new(0);
+        // 恢复会话后从真正的活跃 tab 初始化布局，避免首次分屏时把旧的
+        // Session 1 错当成当前窗格内容。
+        let layout_manager = layout::LayoutManager::new(session_manager.active_index());
 
         // Create additional renderers for multi-pane support (start with empty)
         let mut pane_renderers = Vec::new();
@@ -1063,8 +1070,14 @@ impl TerminalApp {
         tags: Option<Vec<String>>,
     ) -> usize {
         let (cols, rows) = clamp_terminal_dimensions(self.cols, self.rows);
-        self.session_manager
-            .new_session(name, tags, cols, rows, self.config.scrollback_lines)
+        let old_len = self.session_manager.len();
+        let new_idx =
+            self.session_manager
+                .new_session(name, tags, cols, rows, self.config.scrollback_lines);
+        if self.session_manager.len() > old_len {
+            self.layout_manager.on_session_inserted(new_idx);
+        }
+        new_idx
     }
 
     /// 顶部水平 tab 栏是否应显示：Top 模式下始终显示。

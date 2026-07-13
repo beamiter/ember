@@ -2,18 +2,104 @@
 
 use super::events::build_keybinding_string;
 use super::state::TerminalApp;
-use crate::{config, keybindings, layout};
+use crate::{config, keybindings, layout, search};
 use eframe::egui;
 
 impl TerminalApp {
+    /// 切换活跃会话并同步分屏布局。若目标已在某个窗格中则聚焦它，否则
+    /// 将目标显示在当前焦点窗格，避免 tab 高亮、键盘输入和可见内容分离。
+    pub fn activate_session(&mut self, index: usize) -> bool {
+        if !self.session_manager.switch_session(index) {
+            return false;
+        }
+        self.layout_manager.show_session(index);
+        self.force_resize_session = true;
+        if self.search_state.is_open {
+            self.refresh_search_matches();
+        }
+        true
+    }
+
+    /// 针对当前活跃会话重算搜索结果，并记录结果所属的 grid/session 版本。
+    pub(super) fn refresh_search_matches(&mut self) {
+        let session_idx = self.session_manager.active_index();
+        let (matches, error, grid_version) = {
+            let session = self.session_manager.get_active_session_mut();
+            let terminal = session.terminal.lock();
+            let (matches, error) = search::SearchEngine::search(
+                &terminal.grid,
+                &self.search_state.query,
+                self.search_state.use_regex,
+                self.search_state.case_sensitive,
+            );
+            (matches, error, terminal.get_grid_version())
+        };
+        self.search_state.matches = matches;
+        self.search_state.error_message = error;
+        self.search_state.current_match_index = 0;
+        self.search_state.results_grid_version = Some(grid_version);
+        self.search_state.results_session_idx = Some(session_idx);
+    }
+
+    fn activate_next_session(&mut self) {
+        let index = self.session_manager.switch_to_next_session();
+        self.activate_session(index);
+    }
+
+    fn activate_prev_session(&mut self) {
+        let index = self.session_manager.switch_to_prev_session();
+        self.activate_session(index);
+    }
+
+    fn activate_previous_session(&mut self) -> bool {
+        if !self.session_manager.switch_to_previous_active() {
+            return false;
+        }
+        let index = self.session_manager.active_index();
+        self.activate_session(index)
+    }
+
+    /// 创建并分出一个新终端。先检查布局容量，避免达到上限后仍启动一个
+    /// 孤立 shell；创建失败也不会把当前会话重复显示在两个窗格中。
+    fn split_terminal(&mut self, horizontal: bool) {
+        if !self.layout_manager.can_split() {
+            self.set_status("Maximum 2 panes reached");
+            return;
+        }
+
+        let active_idx = self.session_manager.active_index();
+        self.layout_manager.show_session(active_idx);
+        let old_len = self.session_manager.len();
+        let new_session_idx = self.create_session_with_current_config(None, None);
+        if self.session_manager.len() == old_len {
+            self.set_status("Failed to create session for split");
+            return;
+        }
+
+        match self.layout_manager.split(new_session_idx, horizontal) {
+            Ok(()) => {
+                self.sync_active_session_to_focused_pane();
+                self.set_status(if horizontal {
+                    "Split horizontally"
+                } else {
+                    "Split vertically"
+                });
+                self.schedule_session_save();
+            }
+            Err(error) => {
+                // 容量已预检；若布局状态意外变化，回滚刚创建的会话。
+                self.close_session_synced(new_session_idx);
+                self.set_status(error);
+            }
+        }
+    }
+
     /// 把全局活跃会话切换到当前焦点窗格对应的会话,使键盘输入/复制等
     /// 路由到正确的分屏窗格。focus 变化(分屏、Next/Prev、关闭、点击)后调用。
     pub fn sync_active_session_to_focused_pane(&mut self) {
         if let Some(idx) = self.layout_manager.focused_session_idx() {
             if idx != self.session_manager.active_index() {
-                self.session_manager.switch_session(idx);
-                // 触发下一帧按目标窗格尺寸重算 grid
-                self.force_resize_session = true;
+                self.activate_session(idx);
             }
         }
     }
@@ -91,7 +177,8 @@ impl TerminalApp {
                                     // 执行命令
                                     match command {
                                         keybindings::Command::SearchOpen => {
-                                            self.search_state.toggle();
+                                            self.search_state.open();
+                                            self.refresh_search_matches();
                                         }
                                         keybindings::Command::SearchClose => {
                                             self.search_state.close();
@@ -100,8 +187,7 @@ impl TerminalApp {
                                         keybindings::Command::SessionNew => {
                                             let new_idx =
                                                 self.create_session_with_current_config(None, None);
-                                            self.session_manager.switch_session(new_idx);
-                                            self.force_resize_session = true;
+                                            self.activate_session(new_idx);
                                             self.schedule_session_save();
                                         }
                                         keybindings::Command::SessionClose => {
@@ -122,23 +208,18 @@ impl TerminalApp {
                                             // EOF (Ctrl+D)
                                         }
                                         keybindings::Command::SessionNext => {
-                                            self.session_manager.switch_to_next_session();
-                                            self.force_resize_session = true;
+                                            self.activate_next_session();
                                         }
                                         keybindings::Command::SessionPrev => {
-                                            self.session_manager.switch_to_prev_session();
-                                            self.force_resize_session = true;
+                                            self.activate_prev_session();
                                         }
                                         keybindings::Command::SessionJump(n) => {
                                             if n < 9 {
-                                                self.session_manager.switch_session(n);
-                                                self.force_resize_session = true;
+                                                self.activate_session(n);
                                             }
                                         }
                                         keybindings::Command::SessionPrevActive => {
-                                            if self.session_manager.switch_to_previous_active() {
-                                                self.force_resize_session = true;
-                                            } else {
+                                            if !self.activate_previous_session() {
                                                 self.set_status("No previous session to switch to");
                                             }
                                         }
@@ -182,24 +263,10 @@ impl TerminalApp {
                                         }
                                         // 分屏命令处理
                                         keybindings::Command::TerminalSplitVertical => {
-                                            // 垂直分割（左右）
-                                            let new_session_idx =
-                                                self.create_session_with_current_config(None, None);
-                                            let _ =
-                                                self.layout_manager.split(new_session_idx, false);
-                                            self.sync_active_session_to_focused_pane();
-                                            self.set_status("Split vertically");
-                                            self.schedule_session_save();
+                                            self.split_terminal(false);
                                         }
                                         keybindings::Command::TerminalSplitHorizontal => {
-                                            // 水平分割（上下）
-                                            let new_session_idx =
-                                                self.create_session_with_current_config(None, None);
-                                            let _ =
-                                                self.layout_manager.split(new_session_idx, true);
-                                            self.sync_active_session_to_focused_pane();
-                                            self.set_status("Split horizontally");
-                                            self.schedule_session_save();
+                                            self.split_terminal(true);
                                         }
                                         keybindings::Command::TerminalClosePane => {
                                             // 关闭当前窗格
@@ -304,7 +371,8 @@ impl TerminalApp {
                 if let Some(command) = command {
                     match command {
                         keybindings::Command::SearchOpen => {
-                            self.search_state.toggle();
+                            self.search_state.open();
+                            self.refresh_search_matches();
                         }
                         keybindings::Command::SearchClose => {
                             self.search_state.close();
@@ -312,8 +380,7 @@ impl TerminalApp {
                         }
                         keybindings::Command::SessionNew => {
                             let new_idx = self.create_session_with_current_config(None, None);
-                            self.session_manager.switch_session(new_idx);
-                            self.force_resize_session = true;
+                            self.activate_session(new_idx);
                             self.schedule_session_save();
                         }
                         keybindings::Command::SessionClose => {
@@ -330,23 +397,18 @@ impl TerminalApp {
                             let _ = session.shell.write(&[0x04]); // EOF (Ctrl+D)
                         }
                         keybindings::Command::SessionNext => {
-                            self.session_manager.switch_to_next_session();
-                            self.force_resize_session = true;
+                            self.activate_next_session();
                         }
                         keybindings::Command::SessionPrev => {
-                            self.session_manager.switch_to_prev_session();
-                            self.force_resize_session = true;
+                            self.activate_prev_session();
                         }
                         keybindings::Command::SessionJump(n) => {
                             if n < 9 {
-                                self.session_manager.switch_session(n);
-                                self.force_resize_session = true;
+                                self.activate_session(n);
                             }
                         }
                         keybindings::Command::SessionPrevActive => {
-                            if self.session_manager.switch_to_previous_active() {
-                                self.force_resize_session = true;
-                            } else {
+                            if !self.activate_previous_session() {
                                 self.set_status("No previous session to switch to");
                             }
                         }
@@ -379,20 +441,10 @@ impl TerminalApp {
                             }
                         }
                         keybindings::Command::TerminalSplitVertical => {
-                            let new_session_idx =
-                                self.create_session_with_current_config(None, None);
-                            let _ = self.layout_manager.split(new_session_idx, false);
-                            self.sync_active_session_to_focused_pane();
-                            self.set_status("Split vertically");
-                            self.schedule_session_save();
+                            self.split_terminal(false);
                         }
                         keybindings::Command::TerminalSplitHorizontal => {
-                            let new_session_idx =
-                                self.create_session_with_current_config(None, None);
-                            let _ = self.layout_manager.split(new_session_idx, true);
-                            self.sync_active_session_to_focused_pane();
-                            self.set_status("Split horizontally");
-                            self.schedule_session_save();
+                            self.split_terminal(true);
                         }
                         keybindings::Command::TerminalClosePane => {
                             if let Err(e) = self.layout_manager.close_focused_pane() {
