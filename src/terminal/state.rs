@@ -1890,6 +1890,14 @@ impl super::TerminalState {
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
 
         let blank_cell = self.create_blank_cell();
+        // `grid` is always the active screen (the buffers are swapped on
+        // DECSET/DECRST 47/1047/1049), while `alt_grid` is the hidden screen.
+        // Only the active screen may inherit the application's current SGR
+        // background when it grows. Reusing that cell for the hidden screen
+        // lets a full-screen app such as Vim paint its background into the
+        // saved primary screen during a resize; the leaked block then becomes
+        // visible after Vim exits.
+        let inactive_blank_cell = TerminalCell::default();
 
         // 缩小高度时,grid.resize 默认保留顶部行、丢弃底部(含光标行与近期输出),
         // 导致缩小窗口丢失最新输出。改为把顶部溢出行压入 scrollback 并将内容上移,
@@ -1911,7 +1919,7 @@ impl super::TerminalState {
         }
 
         self.grid.resize(rows, cols, blank_cell.clone());
-        self.alt_grid.resize(rows, cols, blank_cell.clone());
+        self.alt_grid.resize(rows, cols, inactive_blank_cell);
 
         // CRITICAL: Sync row_versions size with grid size to prevent dirty mark loss
         // When grid grows, we need to extend row_versions; when it shrinks, truncate it

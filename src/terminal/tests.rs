@@ -11,6 +11,26 @@ fn resize_preserves_full_screen_scroll_region() {
 }
 
 #[test]
+fn alt_screen_resize_does_not_leak_background_into_primary_screen() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"main\x1b[?1049h\x1b[44m");
+
+    // Vim and similar full-screen applications resize while a non-default
+    // background is active. The visible alternate screen should inherit it,
+    // but the saved primary screen must remain independent.
+    terminal.on_resize(8, 3);
+    assert_eq!(terminal.grid[0][4].background, Color::Blue);
+    assert_eq!(terminal.grid[2][0].background, Color::Blue);
+
+    terminal.process_input(b"\x1b[?1049l");
+
+    assert!(!terminal.is_alt_buffer_active());
+    assert_eq!(terminal.grid[0][0].character, 'm');
+    assert_eq!(terminal.grid[0][4].background, Color::Default);
+    assert_eq!(terminal.grid[2][0].background, Color::Default);
+}
+
+#[test]
 fn decstbm_zero_bottom_defaults_to_full_screen() {
     let mut terminal = TerminalState::new(4, 4);
 
