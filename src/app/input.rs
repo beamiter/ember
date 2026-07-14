@@ -60,7 +60,17 @@ pub(crate) fn ctrl_wheel_zoom_delta(events: &[egui::Event]) -> f32 {
             _ => None,
         })
         .sum();
-    total.signum()
+
+    // `Iterator::sum::<f32>()` uses -0.0 as its empty-sum identity, and
+    // `(-0.0_f32).signum()` is -1.0. Calling `signum` directly would therefore
+    // zoom out once on every frame that contains no Ctrl+wheel input.
+    if total > 0.0 {
+        1.0
+    } else if total < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
 }
 
 impl TerminalApp {
@@ -811,6 +821,30 @@ mod tests {
             phase: egui::TouchPhase::Move,
         };
         assert_eq!(ctrl_wheel_zoom_delta(&[zoom, plain]), 1.0);
+    }
+
+    #[test]
+    fn absent_or_balanced_ctrl_wheel_does_not_zoom() {
+        assert_eq!(ctrl_wheel_zoom_delta(&[]), 0.0);
+
+        let plain = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        };
+        assert_eq!(ctrl_wheel_zoom_delta(&[plain]), 0.0);
+
+        let ctrl_wheel = |delta_y| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, delta_y),
+            modifiers: egui::Modifiers::CTRL,
+            phase: egui::TouchPhase::Move,
+        };
+        assert_eq!(
+            ctrl_wheel_zoom_delta(&[ctrl_wheel(1.0), ctrl_wheel(-1.0)]),
+            0.0
+        );
     }
 
     #[test]
