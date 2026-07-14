@@ -5,15 +5,375 @@ use super::state::TerminalApp;
 use crate::{config, keybindings, layout, search};
 use eframe::egui;
 
+/// Central input-routing decision for UI surfaces that own keyboard input.
+/// Keep this pure so regressions (especially Enter/Escape leaking into the PTY)
+/// can be covered without constructing a PTY-backed [`TerminalApp`].
+pub(crate) fn should_block_terminal_input(
+    search_open: bool,
+    config_open: bool,
+    replace_open: bool,
+    paste_confirmation_open: bool,
+    command_palette_open: bool,
+    text_edit_focused: bool,
+) -> bool {
+    search_open
+        || config_open
+        || replace_open
+        || paste_confirmation_open
+        || command_palette_open
+        || text_edit_focused
+}
+
+pub(crate) fn routed_terminal_events(
+    events: &[egui::Event],
+    terminal_input_blocked: bool,
+) -> Vec<egui::Event> {
+    if terminal_input_blocked {
+        Vec::new()
+    } else {
+        events.to_vec()
+    }
+}
+
+/// Legacy viewport scrolling is intentionally limited to PageUp/PageDown.
+/// Ctrl+Up/Ctrl+Down are configurable commands and must not also be handled by
+/// a second hard-coded path.
+pub(crate) fn viewport_scroll_delta(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    rows: usize,
+) -> Option<isize> {
+    match key {
+        egui::Key::PageUp if !modifiers.ctrl => Some(rows as isize),
+        egui::Key::PageDown if !modifiers.ctrl => Some(-(rows as isize)),
+        _ => None,
+    }
+}
+
+pub(crate) fn ctrl_wheel_zoom_delta(events: &[egui::Event]) -> f32 {
+    let total: f32 = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel {
+                delta, modifiers, ..
+            } if modifiers.ctrl && !modifiers.alt => Some(delta.y),
+            _ => None,
+        })
+        .sum();
+    total.signum()
+}
+
 impl TerminalApp {
+    pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
+        should_block_terminal_input(
+            self.search_state.is_open,
+            self.config_panel.is_open,
+            self.search_replace_panel.is_open,
+            self.pending_paste_confirm.is_some(),
+            self.command_palette.is_open,
+            ctx.text_edit_focused(),
+        )
+    }
+
+    fn copy_active_selection(&mut self) {
+        let selected = {
+            let session = self.session_manager.get_active_session_mut();
+            session.terminal.lock().copy_selection()
+        };
+
+        let Some(text) = selected else {
+            self.set_status("Nothing selected");
+            return;
+        };
+        let char_count = text.chars().count();
+        match self
+            .clipboard
+            .as_ref()
+            .map(|clipboard| clipboard.copy(&text))
+        {
+            Some(Ok(())) => self.set_status(format!("Copied {} characters", char_count)),
+            Some(Err(error)) => self.set_status_for(
+                format!("Copy failed: {}", error),
+                std::time::Duration::from_secs(4),
+            ),
+            None => self.set_status("Clipboard is unavailable"),
+        }
+    }
+
+    fn paste_active_clipboard(&mut self) {
+        let Some(clipboard) = &self.clipboard else {
+            self.set_status("Clipboard is unavailable");
+            return;
+        };
+        let content = match clipboard.paste_contents() {
+            Ok(content) => content,
+            Err(error) => {
+                self.set_status_for(
+                    format!("Paste failed: {}", error),
+                    std::time::Duration::from_secs(4),
+                );
+                return;
+            }
+        };
+
+        match content {
+            crate::clipboard::ClipboardContent::Text(text) => {
+                let session = self.session_manager.get_active_session_mut();
+                match crate::paste_text_into_session(
+                    session,
+                    text,
+                    self.config.paste_confirm,
+                    &mut self.pending_paste_confirm,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => self.set_status("Clipboard contains no text"),
+                    Err(error) => self.set_status_for(
+                        format!("Paste failed: {error}"),
+                        std::time::Duration::from_secs(4),
+                    ),
+                }
+            }
+            crate::clipboard::ClipboardContent::Binary(_) => self.set_status_for(
+                "Image paste requires an OSC 5522-aware application",
+                std::time::Duration::from_secs(4),
+            ),
+        }
+    }
+
+    /// The one execution path for commands, independent of whether they came
+    /// from a configurable keybinding or the command palette. `true` means the
+    /// application requested that the viewport close.
+    pub(crate) fn dispatch_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: keybindings::Command,
+    ) -> bool {
+        match command {
+            keybindings::Command::SessionNew => {
+                let new_idx = self.create_session_with_current_config(None, None);
+                self.activate_session(new_idx);
+                self.schedule_session_save();
+            }
+            keybindings::Command::SessionClose => {
+                if self.session_manager.len() > 1 {
+                    let active_idx = self.session_manager.active_index();
+                    self.close_session_synced(active_idx);
+                    self.schedule_session_save();
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return true;
+                }
+            }
+            keybindings::Command::SessionNext => self.activate_next_session(),
+            keybindings::Command::SessionPrev => self.activate_prev_session(),
+            keybindings::Command::SessionJump(index) => {
+                if !self.activate_session(index) {
+                    self.set_status(format!("Session {} is not available", index + 1));
+                }
+            }
+            keybindings::Command::SessionPrevActive => {
+                if !self.activate_previous_session() {
+                    self.set_status("No previous session to switch to");
+                }
+            }
+            keybindings::Command::EditCopy => self.copy_active_selection(),
+            keybindings::Command::EditPaste => self.paste_active_clipboard(),
+            keybindings::Command::SearchOpen => {
+                self.search_state.open();
+                self.refresh_search_matches();
+            }
+            keybindings::Command::SearchClose => {
+                self.search_state.close();
+                self.save_ui_history();
+            }
+            keybindings::Command::SearchNext => self.search_state.next_match(),
+            keybindings::Command::SearchPrev => self.search_state.prev_match(),
+            keybindings::Command::SearchHistoryPrev => {
+                self.search_state.history_prev();
+                self.refresh_search_matches();
+            }
+            keybindings::Command::SearchHistoryNext => {
+                self.search_state.history_next();
+                self.refresh_search_matches();
+            }
+            keybindings::Command::SearchReplaceToggle => self.search_replace_panel.toggle(),
+            keybindings::Command::TerminalSendSigint => {
+                if !self
+                    .session_manager
+                    .get_active_session_mut()
+                    .queue_input(&[0x03])
+                {
+                    self.set_status("Terminal input retry buffer is full");
+                }
+            }
+            keybindings::Command::TerminalSendEof => {
+                if !self
+                    .session_manager
+                    .get_active_session_mut()
+                    .queue_input(&[0x04])
+                {
+                    self.set_status("Terminal input retry buffer is full");
+                }
+            }
+            keybindings::Command::TerminalClear => {
+                if !self
+                    .session_manager
+                    .get_active_session_mut()
+                    .queue_input(&[0x0c])
+                {
+                    self.set_status("Terminal input retry buffer is full");
+                }
+            }
+            keybindings::Command::TerminalScrollUp => {
+                let mut terminal = self
+                    .session_manager
+                    .get_active_session_mut()
+                    .terminal
+                    .lock();
+                if !terminal.is_alt_buffer_active() {
+                    terminal.scroll(3);
+                }
+            }
+            keybindings::Command::TerminalScrollDown => {
+                let mut terminal = self
+                    .session_manager
+                    .get_active_session_mut()
+                    .terminal
+                    .lock();
+                if !terminal.is_alt_buffer_active() {
+                    terminal.scroll(-3);
+                }
+            }
+            keybindings::Command::TerminalJumpPrevMark => {
+                let jumped = self
+                    .session_manager
+                    .get_active_session_mut()
+                    .terminal
+                    .lock()
+                    .jump_to_prev_command();
+                if !jumped {
+                    self.set_status("No previous command mark");
+                }
+            }
+            keybindings::Command::TerminalJumpNextMark => {
+                let jumped = self
+                    .session_manager
+                    .get_active_session_mut()
+                    .terminal
+                    .lock()
+                    .jump_to_next_command();
+                if !jumped {
+                    self.set_status("No next command mark");
+                }
+            }
+            keybindings::Command::TerminalSplitVertical => self.split_terminal(false),
+            keybindings::Command::TerminalSplitHorizontal => self.split_terminal(true),
+            keybindings::Command::TerminalClosePane => {
+                if let Err(error) = self.layout_manager.close_focused_pane() {
+                    if self.session_manager.len() > 1 {
+                        let active_idx = self.session_manager.active_index();
+                        self.close_session_synced(active_idx);
+                        self.schedule_session_save();
+                    } else {
+                        self.set_status(error);
+                    }
+                } else {
+                    self.sync_active_session_to_focused_pane();
+                }
+            }
+            keybindings::Command::PaneFocusNext => {
+                if !self.layout_manager.focus_pane(layout::PaneDirection::Next) {
+                    self.set_status("Only one pane is open");
+                }
+                self.sync_active_session_to_focused_pane();
+            }
+            keybindings::Command::PaneFocusPrev => {
+                if !self.layout_manager.focus_pane(layout::PaneDirection::Prev) {
+                    self.set_status("Only one pane is open");
+                }
+                self.sync_active_session_to_focused_pane();
+            }
+            keybindings::Command::WindowClose => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return true;
+            }
+            keybindings::Command::ConfigOpen => {
+                self.config_panel.open(&self.config);
+                self.config_panel.edit_debug_overlay = self.debug_panel.is_open;
+            }
+            keybindings::Command::ConfigClose => self.config_panel.close(),
+            keybindings::Command::ConfigToggle => self.config_panel.toggle(&self.config),
+            keybindings::Command::DebugToggle => {
+                self.debug_panel.toggle();
+                self.set_status("Debug overlay toggled");
+            }
+            keybindings::Command::SidebarToggle => {
+                self.sidebar.visible = !self.sidebar.visible;
+                if self.sidebar.visible {
+                    self.sidebar.refresh();
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn dispatch_palette_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: keybindings::Command,
+    ) -> bool {
+        self.command_palette.execute_command(command.clone());
+        self.command_palette.close();
+        self.save_ui_history();
+        self.dispatch_command(ctx, command)
+    }
+
     /// 切换活跃会话并同步分屏布局。若目标已在某个窗格中则聚焦它，否则
     /// 将目标显示在当前焦点窗格，避免 tab 高亮、键盘输入和可见内容分离。
     pub fn activate_session(&mut self, index: usize) -> bool {
+        let target_session_id = self
+            .session_manager
+            .sessions()
+            .get(index)
+            .map(|session| session.metadata.session_id.clone());
         if !self.session_manager.switch_session(index) {
             return false;
         }
         self.layout_manager.show_session(index);
         self.force_resize_session = true;
+        self.smooth_scroll_velocity = 0.0;
+        self.smooth_scroll_pixel_offset = 0.0;
+        // Application mouse reporting remains routed to the press-time PTY.
+        // A local text selection cannot safely continue after its pane/tab is
+        // replaced, so cancel it while retaining capture until button-up; this
+        // also prevents PRIMARY from being overwritten by the new session.
+        let cancelled_local_terminal = self
+            .terminal_mouse_capture
+            .as_mut()
+            .filter(|capture| {
+                !capture.reported_to_app && target_session_id.as_ref() != Some(&capture.session_id)
+            })
+            .map(|capture| {
+                capture.local_selection_cancelled = true;
+                std::sync::Arc::clone(&capture.terminal)
+            });
+        if let Some(terminal) = cancelled_local_terminal {
+            terminal.lock().selection = None;
+            self.renderer.cancel_local_selection_capture();
+            for renderer in &mut self.pane_renderers {
+                renderer.cancel_local_selection_capture();
+            }
+        } else if self.terminal_mouse_capture.is_none() {
+            self.last_terminal_mouse_motion = None;
+        }
+        self.renderer.scroll_pixel_offset = 0.0;
+        self.renderer.cursor_move_input.clear();
+        self.renderer.cursor_move_terminal_ptr = None;
+        for renderer in &mut self.pane_renderers {
+            renderer.scroll_pixel_offset = 0.0;
+            renderer.cursor_move_input.clear();
+            renderer.cursor_move_terminal_ptr = None;
+        }
         if self.search_state.is_open {
             self.refresh_search_matches();
         }
@@ -141,204 +501,50 @@ impl TerminalApp {
         }
     }
 
-    /// 处理命令调色板打开时的输入。返回 true 表示 update 应提前结束本帧。
-    pub fn handle_command_palette_input(&mut self, root_ui: &mut egui::Ui) -> bool {
-        // 命令调色板既要消费 egui::Context 上的输入/视口操作,又要触发立即重绘(render_ui)
-        // ——后者在 egui 0.35 起需要 &mut Ui。这里克隆 Context(Arc 引用计数,几乎零成本)
-        // 同时保留对 root_ui 的可变借用,二者无冲突。
-        let ctx_owned = root_ui.ctx().clone();
-        let ctx = &ctx_owned;
-        if self.command_palette.is_open {
-            let events_copy = self.frame_events.clone();
-            for evt in &events_copy {
-                match evt {
-                    egui::Event::Key {
-                        key,
-                        modifiers: _,
-                        pressed,
-                        ..
-                    } if *pressed => {
-                        match key {
-                            egui::Key::Escape => {
-                                self.command_palette.close();
-                            }
-                            egui::Key::ArrowUp => {
-                                self.command_palette.select_prev();
-                            }
-                            egui::Key::ArrowDown => {
-                                self.command_palette.select_next();
-                            }
-                            egui::Key::Enter => {
-                                if let Some(command) = self.command_palette.get_selected_command() {
-                                    self.command_palette.execute_command(command.clone());
-                                    // 持久化最近命令,避免 crash/Force-quit 丢失 MRU。
-                                    self.save_ui_history();
-                                    self.command_palette.close();
-                                    // 执行命令
-                                    match command {
-                                        keybindings::Command::SearchOpen => {
-                                            self.search_state.open();
-                                            self.refresh_search_matches();
-                                        }
-                                        keybindings::Command::SearchClose => {
-                                            self.search_state.close();
-                                            self.save_ui_history();
-                                        }
-                                        keybindings::Command::SessionNew => {
-                                            let new_idx =
-                                                self.create_session_with_current_config(None, None);
-                                            self.activate_session(new_idx);
-                                            self.schedule_session_save();
-                                        }
-                                        keybindings::Command::SessionClose => {
-                                            if self.session_manager.len() > 1 {
-                                                let active_idx =
-                                                    self.session_manager.active_index();
-                                                self.close_session_synced(active_idx);
-                                                self.schedule_session_save();
-                                            } else {
-                                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                                return true;
-                                            }
-                                        }
-                                        keybindings::Command::TerminalSendEof => {
-                                            let session =
-                                                self.session_manager.get_active_session_mut();
-                                            let _ = session.shell.write(&[0x04]);
-                                            // EOF (Ctrl+D)
-                                        }
-                                        keybindings::Command::SessionNext => {
-                                            self.activate_next_session();
-                                        }
-                                        keybindings::Command::SessionPrev => {
-                                            self.activate_prev_session();
-                                        }
-                                        keybindings::Command::SessionJump(n) => {
-                                            if n < 9 {
-                                                self.activate_session(n);
-                                            }
-                                        }
-                                        keybindings::Command::SessionPrevActive => {
-                                            if !self.activate_previous_session() {
-                                                self.set_status("No previous session to switch to");
-                                            }
-                                        }
-                                        keybindings::Command::TerminalScrollUp => {
-                                            let session =
-                                                self.session_manager.get_active_session_mut();
-                                            let mut terminal = session.terminal.lock();
-                                            if !terminal.is_alt_buffer_active() {
-                                                terminal.scroll(3);
-                                            }
-                                        }
-                                        keybindings::Command::TerminalScrollDown => {
-                                            let session =
-                                                self.session_manager.get_active_session_mut();
-                                            let mut terminal = session.terminal.lock();
-                                            if !terminal.is_alt_buffer_active() {
-                                                terminal.scroll(-3);
-                                            }
-                                        }
-                                        keybindings::Command::TerminalJumpPrevCommand => {
-                                            let jumped = {
-                                                let session =
-                                                    self.session_manager.get_active_session_mut();
-                                                let mut terminal = session.terminal.lock();
-                                                terminal.jump_to_prev_command()
-                                            };
-                                            if !jumped {
-                                                self.set_status("No previous command mark");
-                                            }
-                                        }
-                                        keybindings::Command::TerminalJumpNextCommand => {
-                                            let jumped = {
-                                                let session =
-                                                    self.session_manager.get_active_session_mut();
-                                                let mut terminal = session.terminal.lock();
-                                                terminal.jump_to_next_command()
-                                            };
-                                            if !jumped {
-                                                self.set_status("No next command mark");
-                                            }
-                                        }
-                                        // 分屏命令处理
-                                        keybindings::Command::TerminalSplitVertical => {
-                                            self.split_terminal(false);
-                                        }
-                                        keybindings::Command::TerminalSplitHorizontal => {
-                                            self.split_terminal(true);
-                                        }
-                                        keybindings::Command::TerminalClosePane => {
-                                            // 关闭当前窗格
-                                            if let Err(e) = self.layout_manager.close_focused_pane()
-                                            {
-                                                self.set_status(e);
-                                            } else {
-                                                self.sync_active_session_to_focused_pane();
-                                            }
-                                        }
-                                        keybindings::Command::PaneFocusNext => {
-                                            // 切换到下一个窗格
-                                            self.layout_manager
-                                                .focus_pane(layout::PaneDirection::Next);
-                                            self.sync_active_session_to_focused_pane();
-                                        }
-                                        keybindings::Command::PaneFocusPrev => {
-                                            // 切换到前一个窗格
-                                            self.layout_manager
-                                                .focus_pane(layout::PaneDirection::Prev);
-                                            self.sync_active_session_to_focused_pane();
-                                        }
-                                        keybindings::Command::WindowClose => {
-                                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                            return true;
-                                        }
-                                        keybindings::Command::ConfigOpen => {
-                                            self.config_panel.open(&self.config);
-                                            self.config_panel.edit_debug_overlay =
-                                                self.debug_panel.is_open;
-                                        }
-                                        keybindings::Command::ConfigClose => {
-                                            self.config_panel.close();
-                                        }
-                                        keybindings::Command::ConfigToggle => {
-                                            self.config_panel.toggle(&self.config);
-                                        }
-                                        keybindings::Command::SidebarToggle => {
-                                            self.sidebar.visible = !self.sidebar.visible;
-                                            if self.sidebar.visible {
-                                                self.sidebar.refresh();
-                                            }
-                                        }
-                                        keybindings::Command::SearchReplaceToggle => {
-                                            self.search_replace_panel.toggle();
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    /// Handle palette-owned keys without ending the frame. PTY parsing,
+    /// protocol replies and persistence must continue while the overlay stays
+    /// open, otherwise a full event channel back-pressures the foreground job.
+    /// Returns `(close_viewport, palette_owned_this_frame)`.
+    pub fn handle_command_palette_input(&mut self, ctx: &egui::Context) -> (bool, bool) {
+        if !self.command_palette.is_open {
+            return (false, false);
+        }
 
-            // 如果调色板打开，不处理其他快捷键
-            if self.command_palette.is_open {
-                // 获取命令调色板选中的命令，但不执行（仅在按 Enter 时执行）
-                // render_ui 中会显示调色板
-                self.render_ui(root_ui);
-                return true;
+        let events_copy = self.frame_events.clone();
+        let mut selected_command = None;
+        for evt in &events_copy {
+            let egui::Event::Key {
+                key, pressed: true, ..
+            } = evt
+            else {
+                continue;
+            };
+            match key {
+                egui::Key::Escape => self.command_palette.close(),
+                egui::Key::ArrowUp => self.command_palette.select_prev(),
+                egui::Key::ArrowDown => self.command_palette.select_next(),
+                egui::Key::Enter => {
+                    selected_command = self.command_palette.get_selected_command();
+                    break;
+                }
+                _ => {}
             }
         }
-        false
+
+        let close_requested = selected_command
+            .map(|command| self.dispatch_palette_command(ctx, command))
+            .unwrap_or(false);
+        (close_requested, true)
     }
 
     /// 处理可配置快捷键派发。返回 true 仅表示 update 应提前返回
     /// （例如请求关闭窗口）。普通快捷键会从本帧事件里移除，避免继续透传给 PTY，
     /// 但仍允许本帧继续渲染，防止透明窗口被 clear 后空一帧。
-    pub fn handle_keybindings(&mut self, ctx: &egui::Context, active_session_idx: usize) -> bool {
+    pub fn handle_keybindings(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_input_blocked: bool,
+    ) -> bool {
         // 收集所有按下的快捷键
         let pressed_keys: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
             i.events
@@ -369,128 +575,23 @@ impl TerminalApp {
                     command
                 );
                 if let Some(command) = command {
-                    match command {
-                        keybindings::Command::SearchOpen => {
-                            self.search_state.open();
-                            self.refresh_search_matches();
-                        }
-                        keybindings::Command::SearchClose => {
-                            self.search_state.close();
-                            self.save_ui_history();
-                        }
-                        keybindings::Command::SessionNew => {
-                            let new_idx = self.create_session_with_current_config(None, None);
-                            self.activate_session(new_idx);
-                            self.schedule_session_save();
-                        }
-                        keybindings::Command::SessionClose => {
-                            if self.session_manager.len() > 1 {
-                                self.close_session_synced(active_session_idx);
-                                self.schedule_session_save();
-                            } else {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                return true;
+                    if terminal_input_blocked {
+                        let modal_command = match command {
+                            keybindings::Command::SearchClose
+                            | keybindings::Command::SearchNext
+                            | keybindings::Command::SearchPrev
+                            | keybindings::Command::SearchHistoryPrev
+                            | keybindings::Command::SearchHistoryNext => self.search_state.is_open,
+                            keybindings::Command::ConfigClose
+                            | keybindings::Command::ConfigToggle => self.config_panel.is_open,
+                            keybindings::Command::SearchReplaceToggle => {
+                                self.search_replace_panel.is_open
                             }
+                            _ => false,
+                        };
+                        if !modal_command {
+                            continue;
                         }
-                        keybindings::Command::TerminalSendEof => {
-                            let session = self.session_manager.get_active_session_mut();
-                            let _ = session.shell.write(&[0x04]); // EOF (Ctrl+D)
-                        }
-                        keybindings::Command::SessionNext => {
-                            self.activate_next_session();
-                        }
-                        keybindings::Command::SessionPrev => {
-                            self.activate_prev_session();
-                        }
-                        keybindings::Command::SessionJump(n) => {
-                            if n < 9 {
-                                self.activate_session(n);
-                            }
-                        }
-                        keybindings::Command::SessionPrevActive => {
-                            if !self.activate_previous_session() {
-                                self.set_status("No previous session to switch to");
-                            }
-                        }
-                        keybindings::Command::TerminalScrollUp => {
-                            let session = self.session_manager.get_active_session_mut();
-                            let mut terminal = session.terminal.lock();
-                            if !terminal.is_alt_buffer_active() {
-                                terminal.scroll(3);
-                            }
-                        }
-                        keybindings::Command::TerminalScrollDown => {
-                            let session = self.session_manager.get_active_session_mut();
-                            let mut terminal = session.terminal.lock();
-                            if !terminal.is_alt_buffer_active() {
-                                terminal.scroll(-3);
-                            }
-                        }
-                        keybindings::Command::TerminalJumpPrevCommand => {
-                            let session = self.session_manager.get_active_session_mut();
-                            let mut terminal = session.terminal.lock();
-                            if !terminal.jump_to_prev_command() {
-                                self.status_message = "No previous command mark".to_string();
-                            }
-                        }
-                        keybindings::Command::TerminalJumpNextCommand => {
-                            let session = self.session_manager.get_active_session_mut();
-                            let mut terminal = session.terminal.lock();
-                            if !terminal.jump_to_next_command() {
-                                self.status_message = "No next command mark".to_string();
-                            }
-                        }
-                        keybindings::Command::TerminalSplitVertical => {
-                            self.split_terminal(false);
-                        }
-                        keybindings::Command::TerminalSplitHorizontal => {
-                            self.split_terminal(true);
-                        }
-                        keybindings::Command::TerminalClosePane => {
-                            if let Err(e) = self.layout_manager.close_focused_pane() {
-                                if self.session_manager.len() > 1 {
-                                    self.close_session_synced(active_session_idx);
-                                    self.schedule_session_save();
-                                } else {
-                                    self.set_status(e);
-                                }
-                            } else {
-                                self.sync_active_session_to_focused_pane();
-                            }
-                        }
-                        keybindings::Command::PaneFocusNext => {
-                            self.layout_manager.focus_pane(layout::PaneDirection::Next);
-                            self.sync_active_session_to_focused_pane();
-                        }
-                        keybindings::Command::PaneFocusPrev => {
-                            self.layout_manager.focus_pane(layout::PaneDirection::Prev);
-                            self.sync_active_session_to_focused_pane();
-                        }
-                        keybindings::Command::WindowClose => {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            return true;
-                        }
-                        keybindings::Command::ConfigOpen => {
-                            self.config_panel.open(&self.config);
-                            self.config_panel.edit_debug_overlay = self.debug_panel.is_open;
-                        }
-                        keybindings::Command::ConfigClose => {
-                            self.config_panel.close();
-                        }
-                        keybindings::Command::ConfigToggle => {
-                            self.config_panel.toggle(&self.config);
-                        }
-                        keybindings::Command::SidebarToggle => {
-                            self.sidebar.visible = !self.sidebar.visible;
-                            if self.sidebar.visible {
-                                self.sidebar.refresh();
-                            }
-                        }
-                        keybindings::Command::SearchReplaceToggle => {
-                            self.search_replace_panel.toggle();
-                        }
-                        // 复制/粘贴等命令由 main.rs 后续专用路径处理，避免在这里提前吞掉。
-                        _ => continue,
                     }
                     self.frame_events.retain(|evt| {
                         !matches!(
@@ -503,7 +604,7 @@ impl TerminalApp {
                             } if *event_key == key && *event_modifiers == modifiers
                         )
                     });
-                    return false;
+                    return self.dispatch_command(ctx, command);
                 }
             }
         }
@@ -542,8 +643,13 @@ impl TerminalApp {
                     egui::ImeEvent::Commit(text) => {
                         crate::debug_log!("[IME] Commit: {:?}", text);
                         terminal.clear_preedit();
-                        if !text.is_empty() {
-                            let _ = session.shell.write(text.as_bytes());
+                        drop(terminal);
+                        if !text.is_empty() && !session.queue_input(text.as_bytes()) {
+                            log::warn!("terminal input retry buffer full; IME commit retained by neither PTY nor UI");
+                            self.status_message =
+                                "终端输入重试缓冲区已满，IME 文本未发送".to_string();
+                            self.status_expires_at =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
                         }
                         // 不要在 commit 时置 ime_enabled = false
                         // commit 只是确认一个字/词，不代表用户要退出中文输入模式
@@ -601,6 +707,10 @@ impl TerminalApp {
             }
         });
 
+        // Route Ctrl+wheel here for both single- and multi-pane layouts. The
+        // terminal scroll paths explicitly ignore the same events below.
+        self.font_size_accumulator += ctrl_wheel_zoom_delta(&self.frame_events);
+
         if reset_font_size || keyboard_delta != 0.0 {
             let target_size = if reset_font_size {
                 config::Config::default().font_size
@@ -654,5 +764,95 @@ impl TerminalApp {
         }
 
         self.had_ctrl_scroll_last_frame = has_ctrl_scroll_this_frame;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_ui_surfaces_block_terminal_input() {
+        assert!(!should_block_terminal_input(
+            false, false, false, false, false, false
+        ));
+        assert!(should_block_terminal_input(
+            false, false, true, false, false, false
+        ));
+        assert!(should_block_terminal_input(
+            false, false, false, true, false, false
+        ));
+        assert!(should_block_terminal_input(
+            false, false, false, false, true, false
+        ));
+        assert!(should_block_terminal_input(
+            false, false, false, false, false, true
+        ));
+        assert!(should_block_terminal_input(
+            true, false, false, false, false, false
+        ));
+        assert!(should_block_terminal_input(
+            false, true, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn ctrl_wheel_is_classified_as_zoom_not_terminal_scroll() {
+        let zoom = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 12.0),
+            modifiers: egui::Modifiers::CTRL,
+            phase: egui::TouchPhase::Move,
+        };
+        let plain = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -20.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        };
+        assert_eq!(ctrl_wheel_zoom_delta(&[zoom, plain]), 1.0);
+    }
+
+    #[test]
+    fn configurable_ctrl_arrows_have_no_legacy_second_scroll() {
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(viewport_scroll_delta(egui::Key::ArrowUp, ctrl, 24), None);
+        assert_eq!(viewport_scroll_delta(egui::Key::ArrowDown, ctrl, 24), None);
+
+        assert_eq!(
+            viewport_scroll_delta(egui::Key::PageUp, egui::Modifiers::NONE, 24),
+            Some(24)
+        );
+        assert_eq!(
+            viewport_scroll_delta(egui::Key::PageDown, egui::Modifiers::NONE, 24),
+            Some(-24)
+        );
+    }
+
+    #[test]
+    fn modal_enter_and_escape_are_not_routed_to_the_terminal() {
+        let events = vec![
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+
+        assert!(routed_terminal_events(&events, true).is_empty());
+        assert_eq!(routed_terminal_events(&events, false).len(), 2);
     }
 }

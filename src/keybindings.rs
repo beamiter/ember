@@ -33,12 +33,12 @@ pub enum Command {
     TerminalClear,      // Ctrl+L
     TerminalScrollUp,
     TerminalScrollDown,
-    TerminalJumpPrevCommand,
-    TerminalJumpNextCommand,
+    TerminalJumpPrevMark,
+    TerminalJumpNextMark,
 
     // === 分屏操作 ===
-    TerminalSplitVertical,   // Ctrl+Shift+D
-    TerminalSplitHorizontal, // Ctrl+Shift+E
+    TerminalSplitVertical,   // Ctrl+Shift+E
+    TerminalSplitHorizontal, // Ctrl+Shift+O
     TerminalClosePane,       // Ctrl+Shift+W
     PaneFocusNext,           // Alt+Tab
     PaneFocusPrev,           // Alt+Shift+Tab
@@ -50,6 +50,7 @@ pub enum Command {
     ConfigOpen,
     ConfigClose,
     ConfigToggle,
+    DebugToggle,
 
     // === 侧边栏 ===
     SidebarToggle,
@@ -78,8 +79,8 @@ impl std::fmt::Display for Command {
             Command::TerminalClear => write!(f, "terminal:clear"),
             Command::TerminalScrollUp => write!(f, "terminal:scroll_up"),
             Command::TerminalScrollDown => write!(f, "terminal:scroll_down"),
-            Command::TerminalJumpPrevCommand => write!(f, "terminal:jump_prev_command"),
-            Command::TerminalJumpNextCommand => write!(f, "terminal:jump_next_command"),
+            Command::TerminalJumpPrevMark => write!(f, "terminal:jump_prev_command"),
+            Command::TerminalJumpNextMark => write!(f, "terminal:jump_next_command"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -89,6 +90,7 @@ impl std::fmt::Display for Command {
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
             Command::ConfigToggle => write!(f, "config:toggle"),
+            Command::DebugToggle => write!(f, "debug:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
         }
     }
@@ -118,8 +120,8 @@ impl std::str::FromStr for Command {
             "terminal:clear" => Ok(Command::TerminalClear),
             "terminal:scroll_up" => Ok(Command::TerminalScrollUp),
             "terminal:scroll_down" => Ok(Command::TerminalScrollDown),
-            "terminal:jump_prev_command" => Ok(Command::TerminalJumpPrevCommand),
-            "terminal:jump_next_command" => Ok(Command::TerminalJumpNextCommand),
+            "terminal:jump_prev_command" => Ok(Command::TerminalJumpPrevMark),
+            "terminal:jump_next_command" => Ok(Command::TerminalJumpNextMark),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -129,6 +131,7 @@ impl std::str::FromStr for Command {
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
             "config:toggle" => Ok(Command::ConfigToggle),
+            "debug:toggle" => Ok(Command::DebugToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
@@ -187,11 +190,12 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+`".to_string(), "session:prev_active".to_string());
 
-        // 会话切换（数字快捷键）
+        // 会话切换（用户可见编号从 1 开始）。Ctrl+0 保留给字号复位，
+        // 避免一次按键同时切换会话并重置字号。
         for i in 0..9 {
             bindings
                 .bindings
-                .insert(format!("ctrl+{}", i), format!("session:jump:{}", i));
+                .insert(format!("ctrl+{}", i + 1), format!("session:jump:{}", i));
         }
 
         // 编辑操作
@@ -218,6 +222,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+,".to_string(), "config:toggle".to_string());
+        bindings
+            .bindings
+            .insert("f12".to_string(), "debug:toggle".to_string());
 
         // 侧边栏
         bindings
@@ -372,11 +379,22 @@ mod tests {
             bindings.get_command("ctrl+shift+q"),
             Some(Command::WindowClose)
         );
+        assert_eq!(bindings.get_command("ctrl+0"), None);
+        assert_eq!(
+            bindings.get_command("ctrl+1"),
+            Some(Command::SessionJump(0))
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+9"),
+            Some(Command::SessionJump(8))
+        );
+        assert_eq!(bindings.get_command("f12"), Some(Command::DebugToggle));
     }
 
     #[test]
     fn test_command_display() {
         assert_eq!(Command::SessionNew.to_string(), "session:new");
         assert_eq!(Command::SessionJump(3).to_string(), "session:jump:3");
+        assert_eq!(Command::DebugToggle.to_string(), "debug:toggle");
     }
 }

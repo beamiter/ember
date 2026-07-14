@@ -6,14 +6,14 @@ const TERM_PROGRAM_NAME: &str = "jterm2";
 const TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VTE_VERSION: &str = "7802";
 
-/// PTY 读取结果。必须区分 EOF 与 WouldBlock:EOF 表示从端已关闭
-/// (子进程退出),读循环应停止;WouldBlock 表示暂无数据,应继续 poll 等待。
-/// 二者混为 Ok(0) 会导致 EOF 后忙等,直到下次存活检查才退出 —— 期间 CPU 跑满。
+/// PTY 读取结果。流关闭与子进程退出必须分开判断：Linux 的 EIO/Hangup
+/// 只说明当前没有 slave fd，子进程仍可能存活；只有 waitpid 才能确认退出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOutcome {
     Data(usize),
     WouldBlock,
     Eof,
+    Hangup,
 }
 
 /// PTY 写入结果。区分"写入了 n 字节(可能少于请求,即 partial write)"与
@@ -29,6 +29,20 @@ mod unix_pty {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
+
+    /// Retry an interrupted syscall while preserving every other error for
+    /// the caller to classify. In particular, waitpid errors other than
+    /// ECHILD must not be mistaken for a successfully reaped child.
+    pub(super) fn retry_on_eintr<T>(
+        mut operation: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        loop {
+            match operation() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
 
     /// 异步信号安全地向 stderr 写一条静态消息(fork 后、execve 前只能用此类调用)。
     /// SAFETY: 仅调用 write(2),它在 POSIX 异步信号安全函数列表中。
@@ -191,8 +205,7 @@ mod unix_pty {
                 };
 
                 let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
-                    if shell_name == "rsh" && bash_path.is_some() {
-                        let bash_path = bash_path.unwrap();
+                    if let Some(bash_path) = bash_path {
                         let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
                         (
                             CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
@@ -241,7 +254,7 @@ mod unix_pty {
                 const LOCALE_KEYS: [&[u8]; 3] = [b"LANG", b"LC_ALL", b"LC_CTYPE"];
                 let has_utf8_locale = std::env::vars_os().any(|(k, v)| {
                     let k_bytes = k.as_bytes();
-                    if !LOCALE_KEYS.iter().any(|lk| *lk == k_bytes) {
+                    if !LOCALE_KEYS.contains(&k_bytes) {
                         return false;
                     }
                     let value = v.to_string_lossy().to_ascii_lowercase();
@@ -254,10 +267,10 @@ mod unix_pty {
                     if k_bytes == b"LESS" {
                         has_less = true;
                     }
-                    if OVERRIDDEN.iter().any(|ok| *ok == k_bytes) {
+                    if OVERRIDDEN.contains(&k_bytes) {
                         continue;
                     }
-                    if !has_utf8_locale && LOCALE_KEYS.iter().any(|lk| *lk == k_bytes) {
+                    if !has_utf8_locale && LOCALE_KEYS.contains(&k_bytes) {
                         continue;
                     }
                     let mut entry = Vec::with_capacity(k_bytes.len() + 1 + v.len());
@@ -418,6 +431,13 @@ mod unix_pty {
                     return Ok(ReadOutcome::Eof);
                 } else {
                     let err = std::io::Error::last_os_error();
+                    // Linux PTY masters report EIO (rather than read(2) == 0)
+                    // once the final slave fd closes. Keep it distinct from
+                    // process exit: the reader must stop polling this fd and
+                    // waitpid at a bounded cadence, not fabricate an exit code.
+                    if err.raw_os_error() == Some(libc::EIO) {
+                        return Ok(ReadOutcome::Hangup);
+                    }
                     match err.kind() {
                         std::io::ErrorKind::Interrupted => continue, // EINTR:重试
                         std::io::ErrorKind::WouldBlock => return Ok(ReadOutcome::WouldBlock),
@@ -473,20 +493,35 @@ mod unix_pty {
 
             // SAFETY: waitpid 使用 WNOHANG 非阻塞检查子进程状态。
             // status 是有效的栈变量，child_pid 是有效的进程 ID。
-            unsafe {
-                let mut status = 0;
-                let result = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-                if result == 0 {
-                    true // 子进程还活着
-                } else if result > 0 {
+            let mut status = 0;
+            let child_pid = self.child_pid;
+            let result = retry_on_eintr(|| {
+                // SAFETY: WNOHANG is non-blocking; status is a valid mutable
+                // integer and child_pid belongs to this Pty instance.
+                let result = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                if result < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(result)
+                }
+            });
+            match result {
+                Ok(0) => true,
+                Ok(_) => {
                     // 子进程已退出且刚刚被本次调用回收 —— 必须缓存退出码,
                     // 否则会留下"已 reap 但未标记"的窗口,导致后续 kill 误杀复用 PID。
                     self.cache_status(status);
                     false
-                } else {
-                    // ECHILD 等:进程已不存在/已被回收。
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
                     self.exit_code_cached = Some(0);
                     false
+                }
+                Err(error) => {
+                    // Conservatively keep the process live: an unrelated
+                    // waitpid failure is not evidence that the PID was reaped.
+                    log::warn!("waitpid(WNOHANG) failed while checking PTY child: {error}");
+                    true
                 }
             }
         }
@@ -544,16 +579,29 @@ mod unix_pty {
                 return Some(code);
             }
             // SAFETY: WNOHANG 非阻塞 waitpid;status 为有效栈变量,child_pid 来自 fork。
-            unsafe {
-                let mut status = 0;
-                let r = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-                if r > 0 {
+            let mut status = 0;
+            let child_pid = self.child_pid;
+            let result = retry_on_eintr(|| {
+                // SAFETY: see is_alive above.
+                let result = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                if result < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(result)
+                }
+            });
+            match result {
+                Ok(0) => None,
+                Ok(_) => {
                     self.cache_status(status);
                     Some(self.exit_code_cached.unwrap_or(-1))
-                } else if r < 0 {
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
                     self.exit_code_cached = Some(0);
                     Some(0)
-                } else {
+                }
+                Err(error) => {
+                    log::warn!("waitpid(WNOHANG) failed while reaping PTY child: {error}");
                     None
                 }
             }
@@ -670,6 +718,31 @@ pub use windows_pty::Pty;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn retry_on_eintr_retries_only_interrupted_errors() {
+        let mut attempts = 0;
+        let result = super::unix_pty::retry_on_eintr(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts, 3);
+
+        let mut attempts = 0;
+        let error = super::unix_pty::retry_on_eintr::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ECHILD))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(attempts, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {

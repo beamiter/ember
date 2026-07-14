@@ -1,6 +1,8 @@
+#[cfg(debug_assertions)]
 use std::sync::OnceLock;
 
 // Only called from the debug_log! macro, which compiles to a no-op in release builds.
+#[cfg(debug_assertions)]
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
 

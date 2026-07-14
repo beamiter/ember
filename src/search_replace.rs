@@ -10,15 +10,9 @@ pub struct SearchConfig {
 }
 
 /// 替换选项
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ReplaceOptions {
     pub replace_all: bool,
-}
-
-impl Default for ReplaceOptions {
-    fn default() -> Self {
-        ReplaceOptions { replace_all: false }
-    }
 }
 
 /// 搜索和替换引擎
@@ -183,8 +177,7 @@ mod tests {
     #[test]
     fn test_replace_all() {
         let config = SearchConfig::default();
-        let mut options = ReplaceOptions::default();
-        options.replace_all = true;
+        let options = ReplaceOptions { replace_all: true };
 
         let (result, count) = SearchAndReplaceEngine::search_and_replace(
             "hello world hello",

@@ -1,7 +1,7 @@
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use smallvec::SmallVec;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
@@ -62,6 +62,16 @@ pub const MAX_TERMINAL_ROWS: usize = 512;
 /// would otherwise grow `pending_escape` without bound.
 pub const MAX_PENDING_ESCAPE: usize = 4 * 1024 * 1024;
 
+/// Clipboard reads triggered by Kitty paste events are capabilities, not a
+/// general permission to inspect the host clipboard. Keep the capability
+/// short-lived and bound all protocol-controlled collections.
+const OSC_5522_PASTE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_PENDING_CLIPBOARD_REQUESTS: usize = 8;
+const MAX_OSC_5522_MIME_TYPES: usize = 64;
+const MAX_OSC_5522_MIME_LEN: usize = 256;
+
+type VisibleCellsCache = (u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>);
+
 /// Hard cap on tracked OSC 133 command marks. Each mark is a few u64s, so
 /// 1024 ≈ 32 KiB; well beyond any reasonable session's prompt count, but
 /// bounded so a malicious shell can't grow this without limit.
@@ -117,13 +127,19 @@ enum Charset {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardReadKind {
-    MimeList,
     MimeData(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardReadRequest {
     pub kind: ClipboardReadKind,
+}
+
+#[derive(Debug)]
+struct PendingPasteGrant {
+    token: String,
+    offered_mimes: HashSet<String>,
+    expires_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -134,6 +150,10 @@ struct TerminalModes {
 impl TerminalModes {
     const fn bit_index(mode: u16) -> Option<u32> {
         match mode {
+            // DECCKM — application cursor keys. Keep this independent from
+            // alternate-screen modes: full-screen applications explicitly
+            // opt into the SS3 cursor-key sequences with CSI ? 1 h.
+            1 => Some(13),
             7 => Some(0),
             25 => Some(1),
             1000 => Some(2),
@@ -230,7 +250,7 @@ pub struct TerminalState {
     /// Working directory reported by the shell via OSC 7
     /// (`ESC ] 7 ; file://host/path ST`). Optional because many shells need
     /// PROMPT_COMMAND wiring to emit it. When absent the session manager
-    /// falls back to /proc/[pid]/cwd. Survives across shell PWD changes —
+    /// falls back to `/proc/<pid>/cwd`. Survives across shell PWD changes —
     /// each prompt re-emits OSC 7.
     pub current_working_dir: Option<String>,
 
@@ -248,6 +268,13 @@ pub struct TerminalState {
 
     // Incomplete escape sequence buffer across PTY reads
     pending_escape: Vec<u8>,
+    // Kitty APCs are streamed separately so fragmented multi-megabyte payloads
+    // are appended and scanned once instead of rebuilding/rescanning the whole
+    // escape on every PTY read.
+    pending_apc: Vec<u8>,
+    pending_apc_scan_from: usize,
+    discarding_oversized_apc: bool,
+    discarding_apc_prev_escape: bool,
 
     g0_charset: Charset,
     g1_charset: Charset,
@@ -270,7 +297,7 @@ pub struct TerminalState {
     xterm_modify_other_keys: u16,
     xterm_format_other_keys: u16,
     pending_clipboard_requests: Vec<ClipboardReadRequest>,
-    pending_paste_password: Option<String>,
+    pending_paste_grant: Option<PendingPasteGrant>,
 
     // Kitty graphics protocol support
     pub kitty_graphics: KittyGraphicsState,
@@ -283,7 +310,7 @@ pub struct TerminalState {
     pub row_versions: Vec<u64>, // 每行的修改版本号
 
     // Cached visible cells to avoid per-frame cloning
-    visible_cells_cache: Option<(u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>)>,
+    visible_cells_cache: Option<VisibleCellsCache>,
 
     // OSC 8 hyperlink tracking
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)

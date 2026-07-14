@@ -132,6 +132,8 @@ impl super::TerminalState {
         let mut dirty_region = DirtyRegion::new();
         // Mark all rows as dirty on initialization to ensure first frame renders correctly
         dirty_region.mark_all(rows);
+        let mut kitty_graphics = KittyGraphicsState::new();
+        kitty_graphics.resize(cols, rows);
 
         TerminalState {
             grid,
@@ -163,6 +165,10 @@ impl super::TerminalState {
             utf8_len: 0,
             utf8_expected: 0,
             pending_escape: Vec::new(),
+            pending_apc: Vec::new(),
+            pending_apc_scan_from: 0,
+            discarding_oversized_apc: false,
+            discarding_apc_prev_escape: false,
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: Charset::Ascii,
@@ -180,8 +186,8 @@ impl super::TerminalState {
             xterm_modify_other_keys: 0,
             xterm_format_other_keys: 0,
             pending_clipboard_requests: Vec::new(),
-            pending_paste_password: None,
-            kitty_graphics: KittyGraphicsState::new(),
+            pending_paste_grant: None,
+            kitty_graphics,
             dirty_region,
             grid_version: 1,
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
@@ -254,14 +260,17 @@ impl super::TerminalState {
 
     /// Decode OSC 7 working-directory payload to a local filesystem path.
     /// Accepts either `file://host/path` (path is percent-encoded) or a raw
-    /// path. Returns None if the payload is empty or malformed.
+    /// path. A non-local hostname is rejected: persisting an SSH server's
+    /// `/etc` as a local cwd would restore the next session in the wrong host
+    /// directory. Returns None if the payload is empty or malformed.
     pub(super) fn decode_osc7_cwd(value: &str) -> Option<String> {
         let path_part = if let Some(rest) = value.strip_prefix("file://") {
-            // Skip optional hostname segment.
-            match rest.find('/') {
-                Some(i) => &rest[i..],
-                None => return None,
+            let slash = rest.find('/')?;
+            let host = &rest[..slash];
+            if !Self::osc7_host_is_local(host) {
+                return None;
             }
+            &rest[slash..]
         } else if value.starts_with('/') {
             value
         } else {
@@ -288,6 +297,18 @@ impl super::TerminalState {
         } else {
             Some(s)
         }
+    }
+
+    fn osc7_host_is_local(host: &str) -> bool {
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        let local_hostname = std::env::var("HOSTNAME").ok().or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|hostname| hostname.trim().to_string())
+        });
+        local_hostname.is_some_and(|local| host.eq_ignore_ascii_case(&local))
     }
 
     pub(super) fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
@@ -367,22 +388,20 @@ impl super::TerminalState {
         }
     }
 
-    pub(super) fn handle_osc_5522(&mut self, metadata: &str, _payload: Option<&str>) {
-        crate::debug_log!("[OSC5522] metadata={} payload={:?}", metadata, _payload);
+    pub(super) fn handle_osc_5522(&mut self, metadata: &str, payload: Option<&str>) {
+        crate::debug_log!("[OSC5522] metadata={} payload={:?}", metadata, payload);
 
         let mut message_type = None;
-        let mut mime = None;
         let mut password = None;
+        let mut human_name = None;
 
         for part in metadata.split(':') {
             if let Some(value) = part.strip_prefix("type=") {
                 message_type = Some(value);
-            } else if let Some(value) = part.strip_prefix("mime=") {
-                mime = Self::decode_base64(value);
-            } else if let Some(value) = part.strip_prefix("password=") {
-                password = Self::decode_base64(value);
             } else if let Some(value) = part.strip_prefix("pw=") {
                 password = Self::decode_base64(value);
+            } else if let Some(value) = part.strip_prefix("name=") {
+                human_name = Self::decode_base64(value);
             }
         }
 
@@ -390,21 +409,86 @@ impl super::TerminalState {
             return;
         }
 
-        let kind = if let Some(mime_type) = mime {
-            if let Some(expected) = &self.pending_paste_password {
-                if password.as_deref() != Some(expected.as_str()) {
-                    self.append_osc_5522_status("type=read:status=EPERM", None);
-                    return;
-                }
-            }
-            self.pending_paste_password = None;
-            ClipboardReadKind::MimeData(mime_type)
-        } else {
-            ClipboardReadKind::MimeList
+        // Per the OSC 5522 protocol, the third field is base64-encoded and is
+        // either "." (list types) or a space-separated MIME request. This
+        // implementation intentionally supports one MIME per paste grant for
+        // now; accepting arbitrary direct reads would require a permission UI.
+        let Some(request) = payload.and_then(Self::decode_base64) else {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
         };
 
+        if request == "." {
+            // Clipboard type enumeration is itself a host read. jterm2 sends
+            // the sanitized MIME list proactively only after an actual user
+            // paste, together with a short-lived capability. A PTY-originated
+            // discovery request must not spawn host clipboard helpers.
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        }
+
+        let mut requested_mimes = request.split_ascii_whitespace();
+        let Some(mime_type) = requested_mimes.next() else {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        };
+        if requested_mimes.next().is_some() || !Self::is_valid_osc_5522_mime(mime_type) {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        }
+
+        if !self.is_paste_events_enabled() {
+            self.pending_paste_grant = None;
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        }
+
+        let Some(grant) = self.pending_paste_grant.as_ref() else {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        };
+        if std::time::Instant::now() >= grant.expires_at {
+            self.pending_paste_grant = None;
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        }
+        if password.as_deref() != Some(grant.token.as_str())
+            || human_name.as_deref() != Some("Paste event")
+        {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        }
+
+        // Consume the capability before any asynchronous clipboard I/O is
+        // queued. A valid token is single-use and cannot be replayed or raced.
+        let Some(grant) = self.pending_paste_grant.take() else {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        };
+        if !grant.offered_mimes.contains(mime_type) {
+            self.append_osc_5522_status("type=read:status=EPERM", None);
+            return;
+        }
+
+        self.queue_clipboard_request(ClipboardReadKind::MimeData(mime_type.to_string()));
+    }
+
+    fn queue_clipboard_request(&mut self, kind: ClipboardReadKind) {
+        if self.pending_clipboard_requests.len() >= MAX_PENDING_CLIPBOARD_REQUESTS {
+            self.append_osc_5522_status("type=read:status=EBUSY", None);
+            return;
+        }
         self.pending_clipboard_requests
             .push(ClipboardReadRequest { kind });
+    }
+
+    fn is_valid_osc_5522_mime(mime: &str) -> bool {
+        !mime.is_empty()
+            && mime.len() <= MAX_OSC_5522_MIME_LEN
+            && mime.is_ascii()
+            && !mime
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
     }
 
     pub(super) fn set_keyboard_enhancement_flags(&mut self, flags: u16, mode: u16) {
@@ -524,11 +608,8 @@ impl super::TerminalState {
         if self.insert_mode {
             for _ in 0..width {
                 if self.cursor_col < cols {
-                    self.grid.insert_cell_in_row(
-                        self.cursor_row,
-                        self.cursor_col,
-                        blank_cell.clone(),
-                    );
+                    self.grid
+                        .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell);
                 }
             }
         }
@@ -541,14 +622,14 @@ impl super::TerminalState {
                 .flags
                 .wide_continuation()
         {
-            *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell.clone();
+            *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell;
         }
 
         // If current position has a wide character, clear its continuation cell
         if self.grid.get(self.cursor_row, self.cursor_col).flags.wide()
             && self.cursor_col + 1 < cols
         {
-            *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell.clone();
+            *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell;
         }
 
         // Write character
@@ -794,6 +875,7 @@ impl super::TerminalState {
         self.grid.cells[src_start..src_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top..bottom, top + 1);
         self.grid.row_wrapped[top] = false;
+        self.kitty_graphics.scroll_region_down(top, bottom, 1);
         self.dirty_region.mark_rows(top, bottom);
         self.mark_rows_dirty(top, bottom);
     }
@@ -833,6 +915,12 @@ impl super::TerminalState {
         self.grid.cells[blank_start..blank_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
         self.grid.row_wrapped[bottom] = false;
+        self.kitty_graphics.scroll_region_up(
+            top,
+            bottom,
+            1,
+            scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback),
+        );
 
         self.dirty_region.mark_rows(top, bottom);
         self.mark_rows_dirty(top, bottom);
@@ -894,11 +982,11 @@ impl super::TerminalState {
         };
         // If clearing a continuation cell, also clear the wide character body
         if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
-            *self.grid.get_mut(row, col - 1) = blank_cell.clone();
+            *self.grid.get_mut(row, col - 1) = blank_cell;
         }
         // If clearing a wide character body, also clear the continuation cell
         if self.grid.get(row, col).flags.wide() && col + 1 < cols {
-            *self.grid.get_mut(row, col + 1) = blank_cell.clone();
+            *self.grid.get_mut(row, col + 1) = blank_cell;
         }
         *self.grid.get_mut(row, col) = blank_cell;
     }
@@ -947,14 +1035,6 @@ impl super::TerminalState {
         let q = self.pending_osc52_clipboard_query;
         self.pending_osc52_clipboard_query = false;
         q
-    }
-
-    pub fn respond_osc52_clipboard(&mut self, content: &str) {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        self.output_buffer.extend_from_slice(b"\x1b]52;c;");
-        self.output_buffer.extend_from_slice(encoded.as_bytes());
-        self.output_buffer.extend_from_slice(Self::osc_terminator());
     }
 
     /// Check if sync output timed out (>1s) and auto-clear if so
@@ -1014,6 +1094,17 @@ impl super::TerminalState {
 }
 
 impl super::TerminalState {
+    pub(super) fn hard_reset(&mut self) {
+        let cols = self.grid.row_len();
+        let rows = self.grid.rows();
+        let max_scrollback = self.max_scrollback;
+        let cell_size = self.kitty_graphics.cell_size_pixels();
+        *self = Self::new(cols, rows);
+        self.set_max_scrollback(max_scrollback);
+        self.kitty_graphics
+            .set_cell_size_pixels(cell_size.0, cell_size.1);
+    }
+
     pub fn max_scrollback(&self) -> usize {
         self.max_scrollback
     }
@@ -1030,6 +1121,8 @@ impl super::TerminalState {
 
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
         self.max_scrollback = max_scrollback.max(1);
+        self.kitty_graphics
+            .set_max_scrollback_rows(self.max_scrollback);
 
         while self.scrollback.len() > self.max_scrollback {
             self.scrollback.pop_front();
@@ -1209,7 +1302,7 @@ impl super::TerminalState {
         }
     }
 
-    pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
+    pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         // Check if any mouse reporting mode is enabled
         if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
         {
@@ -1222,23 +1315,24 @@ impl super::TerminalState {
         if self.modes.contains(&1006) {
             // SGR format: CSI < button ; x ; y M (button press) or m (button release)
             // For now, we'll generate press events (M) - release tracking would need more state
-            let x = (col as u32 + 1).min(255); // 1-indexed, max 255
-            let y = (row as u32 + 1).min(255); // 1-indexed, max 255
-            Some(format!("\x1b[<{};{};{}M", button, x, y))
+            // Decimal SGR coordinates are not subject to the one-byte legacy
+            // protocol limit. Keep them 1-indexed without truncating at 255.
+            let x = col.saturating_add(1);
+            let y = row.saturating_add(1);
+            Some(format!("\x1b[<{};{};{}M", button, x, y).into_bytes())
         } else {
             // Standard xterm format: CSI M button col row (raw bytes)
-            // Col and row are offset by 32 (space character)
-            let button_byte = 32 + button;
-            let col_byte = 32 + (col as u8).min(223);
-            let row_byte = 32 + (row as u8).min(223);
-            Some(format!(
-                "\x1b[M{}{}{}",
-                button_byte as char, col_byte as char, row_byte as char
-            ))
+            // Coordinates are 1-indexed, offset by 32, and capped at 223 so
+            // the encoded value fits in one byte. Clamp before narrowing to
+            // u8; casting first makes coordinates >= 256 wrap around.
+            let button_byte = button.saturating_add(32);
+            let col_byte = 32 + col.saturating_add(1).min(223) as u8;
+            let row_byte = 32 + row.saturating_add(1).min(223) as u8;
+            Some(vec![b'\x1b', b'[', b'M', button_byte, col_byte, row_byte])
         }
     }
 
-    pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<String> {
+    pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         if !self.modes.contains(&1000) && !self.modes.contains(&1002) && !self.modes.contains(&1003)
         {
             return None;
@@ -1246,23 +1340,26 @@ impl super::TerminalState {
 
         if self.modes.contains(&1006) {
             // SGR format: lowercase 'm' for release
-            let x = (col as u32 + 1).min(255);
-            let y = (row as u32 + 1).min(255);
-            Some(format!("\x1b[<{};{};{}m", button, x, y))
+            let x = col.saturating_add(1);
+            let y = row.saturating_add(1);
+            Some(format!("\x1b[<{};{};{}m", button, x, y).into_bytes())
         } else {
             // Standard xterm: release is button 3
             let button_byte = 32 + 3u8;
-            let col_byte = 32 + (col as u8).min(223);
-            let row_byte = 32 + (row as u8).min(223);
-            Some(format!(
-                "\x1b[M{}{}{}",
-                button_byte as char, col_byte as char, row_byte as char
-            ))
+            let col_byte = 32 + col.saturating_add(1).min(223) as u8;
+            let row_byte = 32 + row.saturating_add(1).min(223) as u8;
+            Some(vec![b'\x1b', b'[', b'M', button_byte, col_byte, row_byte])
         }
     }
 
     pub fn is_mouse_enabled(&self) -> bool {
         self.modes.contains(&1000) || self.modes.contains(&1002) || self.modes.contains(&1003)
+    }
+
+    /// 1002 reports motion only while a button is held; 1003 reports all
+    /// pointer motion. Mode 1000 is press/release only.
+    pub fn should_report_mouse_motion(&self, button_down: bool) -> bool {
+        self.modes.contains(&1003) || (button_down && self.modes.contains(&1002))
     }
 
     pub fn is_alt_buffer_active(&self) -> bool {
@@ -1297,15 +1394,27 @@ impl super::TerminalState {
         self.modes.contains(&2031) || (self.keyboard_enhancement_flags & 0b1000) != 0
     }
 
-    pub fn build_paste_event(&mut self, mime_types: &[String]) -> Vec<u8> {
-        let password = uuid::Uuid::new_v4().to_string();
-        self.pending_paste_password = Some(password.clone());
-        let encoded_password =
-            base64::engine::general_purpose::STANDARD.encode(password.as_bytes());
+    fn sanitized_osc_5522_mimes(mime_types: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        mime_types
+            .iter()
+            .filter(|mime| Self::is_valid_osc_5522_mime(mime))
+            .filter(|mime| seen.insert((*mime).clone()))
+            .take(MAX_OSC_5522_MIME_TYPES)
+            .cloned()
+            .collect()
+    }
+
+    fn build_osc_5522_mime_list(mime_types: &[String], password: Option<&str>) -> Vec<u8> {
         let mut output = Vec::new();
 
-        output.extend_from_slice(b"\x1b]5522;type=read:status=OK:password=");
-        output.extend_from_slice(encoded_password.as_bytes());
+        output.extend_from_slice(b"\x1b]5522;type=read:status=OK");
+        if let Some(password) = password {
+            let encoded_password =
+                base64::engine::general_purpose::STANDARD.encode(password.as_bytes());
+            output.extend_from_slice(b":pw=");
+            output.extend_from_slice(encoded_password.as_bytes());
+        }
         output.extend_from_slice(Self::osc_terminator());
 
         for mime_type in mime_types {
@@ -1318,6 +1427,25 @@ impl super::TerminalState {
 
         output.extend_from_slice(b"\x1b]5522;type=read:status=DONE\x1b\\");
         output
+    }
+
+    /// Build the unsolicited MIME list sent only after a real user paste
+    /// action. The returned password grants one short-lived read of one of the
+    /// MIME types in this exact list.
+    pub fn build_paste_event(&mut self, mime_types: &[String]) -> Vec<u8> {
+        if !self.is_paste_events_enabled() {
+            self.pending_paste_grant = None;
+            return Vec::new();
+        }
+
+        let mime_types = Self::sanitized_osc_5522_mimes(mime_types);
+        let token = uuid::Uuid::new_v4().to_string();
+        self.pending_paste_grant = Some(PendingPasteGrant {
+            token: token.clone(),
+            offered_mimes: mime_types.iter().cloned().collect(),
+            expires_at: std::time::Instant::now() + OSC_5522_PASTE_GRANT_TTL,
+        });
+        Self::build_osc_5522_mime_list(&mime_types, Some(&token))
     }
 
     pub fn take_clipboard_read_requests(&mut self) -> Vec<ClipboardReadRequest> {
@@ -1757,9 +1885,9 @@ impl super::TerminalState {
                 if abs_row < scrollback_len {
                     // Read from scrollback
                     let line = self.scrollback[abs_row].decompress();
-                    for col in start_col..=end_col.min(line.len().saturating_sub(1)) {
-                        if !line[col].flags.wide_continuation() {
-                            line_buf.push(line[col].character);
+                    for cell in line.iter().take(end_col.saturating_add(1)).skip(start_col) {
+                        if !cell.flags.wide_continuation() {
+                            line_buf.push(cell.character);
                         }
                     }
                 } else {
@@ -1856,7 +1984,7 @@ impl super::TerminalState {
 
             if logical_line.is_empty() {
                 result.push(ScrollbackLine::compress(
-                    &vec![blank_cell.clone(); new_cols],
+                    &vec![*blank_cell; new_cols],
                     false,
                 ));
                 continue;
@@ -1869,7 +1997,7 @@ impl super::TerminalState {
                     result.push(ScrollbackLine::compress(chunk, ci + 1 < num_chunks));
                 } else {
                     let mut cells = chunk.to_vec();
-                    cells.resize(new_cols, blank_cell.clone());
+                    cells.resize(new_cols, *blank_cell);
                     result.push(ScrollbackLine::compress(&cells, ci + 1 < num_chunks));
                 }
             }
@@ -1913,13 +2041,16 @@ impl super::TerminalState {
                     let line = ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
                     self.push_scrollback_compressed(line);
                 }
-                self.grid.scroll_up_by(from_top, blank_cell.clone());
+                self.grid.scroll_up_by(from_top, blank_cell);
+                self.kitty_graphics
+                    .scroll_region_up(0, old_rows.saturating_sub(1), from_top, true);
                 self.cursor_row -= from_top;
             }
         }
 
-        self.grid.resize(rows, cols, blank_cell.clone());
+        self.grid.resize(rows, cols, blank_cell);
         self.alt_grid.resize(rows, cols, inactive_blank_cell);
+        self.kitty_graphics.resize(cols, rows);
 
         // CRITICAL: Sync row_versions size with grid size to prevent dirty mark loss
         // When grid grows, we need to extend row_versions; when it shrinks, truncate it

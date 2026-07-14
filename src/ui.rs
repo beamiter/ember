@@ -5,6 +5,28 @@ use egui::{Color32, FontId, Response, Ui, Vec2};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
+/// Kitty reserves the lower half of the i32 z-index range for images that
+/// must sit beneath non-default cell backgrounds. Other negative values sit
+/// above cell backgrounds but below glyphs and decorations.
+#[derive(Clone, Copy)]
+enum KittyImageLayer {
+    BelowCellBackgrounds,
+    BelowText,
+    AboveText,
+}
+
+impl KittyImageLayer {
+    const BACKGROUND_CUTOFF: i32 = i32::MIN / 2;
+
+    fn contains(self, z_index: i32) -> bool {
+        match self {
+            Self::BelowCellBackgrounds => z_index < Self::BACKGROUND_CUTOFF,
+            Self::BelowText => (Self::BACKGROUND_CUTOFF..0).contains(&z_index),
+            Self::AboveText => z_index >= 0,
+        }
+    }
+}
+
 /// Per-column ligature override produced by shaping a printable-ASCII run.
 #[derive(Clone, Copy)]
 enum LigOverride {
@@ -64,17 +86,34 @@ pub(crate) fn grid_position_from_content(
     (row, col)
 }
 
+fn local_selection_capture_after_press(
+    current_terminal: Option<usize>,
+    rendered_terminal: usize,
+    mouse_reporting: bool,
+    interaction_enabled: bool,
+    hovered: bool,
+    primary_pressed: bool,
+    shift: bool,
+) -> Option<usize> {
+    if !interaction_enabled {
+        None
+    } else if hovered && primary_pressed {
+        (!mouse_reporting || shift).then_some(rendered_terminal)
+    } else if current_terminal == Some(rendered_terminal) {
+        current_terminal
+    } else {
+        None
+    }
+}
+
 fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
     application_cursor_keys: bool,
-    alt_screen: bool,
 ) -> Option<&'static str> {
     if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd || modifiers.command_only() {
         return None;
     }
-
-    let application_navigation_keys = application_cursor_keys || alt_screen;
 
     match key {
         egui::Key::Enter => Some("\r"),
@@ -88,42 +127,42 @@ fn key_to_terminal_sequence(
             }
         }
         egui::Key::ArrowUp => {
-            if application_navigation_keys {
+            if application_cursor_keys {
                 Some("\x1bOA")
             } else {
                 Some("\x1b[A")
             }
         }
         egui::Key::ArrowDown => {
-            if application_navigation_keys {
+            if application_cursor_keys {
                 Some("\x1bOB")
             } else {
                 Some("\x1b[B")
             }
         }
         egui::Key::ArrowRight => {
-            if application_navigation_keys {
+            if application_cursor_keys {
                 Some("\x1bOC")
             } else {
                 Some("\x1b[C")
             }
         }
         egui::Key::ArrowLeft => {
-            if application_navigation_keys {
+            if application_cursor_keys {
                 Some("\x1bOD")
             } else {
                 Some("\x1b[D")
             }
         }
         egui::Key::Home => {
-            if application_navigation_keys {
+            if application_cursor_keys {
                 Some("\x1bOH")
             } else {
                 Some("\x1b[H")
             }
         }
         egui::Key::End => {
-            if application_navigation_keys {
+            if application_cursor_keys {
                 Some("\x1bOF")
             } else {
                 Some("\x1b[F")
@@ -146,63 +185,6 @@ fn key_to_terminal_sequence(
         egui::Key::F11 => Some("\x1b[23~"),
         egui::Key::F12 => Some("\x1b[24~"),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grid_position_uses_content_origin() {
-        let content_rect =
-            egui::Rect::from_min_size(egui::pos2(12.0, 36.0), egui::vec2(800.0, 400.0));
-
-        let (row, col) = grid_position_from_content(
-            egui::pos2(12.0 + 4.0 * 8.0, 36.0 + 2.0 * 20.0),
-            content_rect,
-            8.0,
-            20.0,
-            100,
-            20,
-        );
-
-        assert_eq!((row, col), (2, 4));
-    }
-
-    #[test]
-    fn cursor_keys_use_application_sequences_in_alt_screen() {
-        let modifiers = egui::Modifiers::default();
-
-        assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false, false),
-            Some("\x1b[A")
-        );
-        assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false, true),
-            Some("\x1bOA")
-        );
-        assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true, false),
-            Some("\x1bOB")
-        );
-    }
-
-    #[test]
-    fn grid_position_clamps_to_grid_bounds() {
-        let content_rect =
-            egui::Rect::from_min_size(egui::pos2(12.0, 36.0), egui::vec2(800.0, 400.0));
-
-        let (row, col) = grid_position_from_content(
-            egui::pos2(2000.0, 2000.0),
-            content_rect,
-            8.0,
-            20.0,
-            100,
-            20,
-        );
-
-        assert_eq!((row, col), (19, 99));
     }
 }
 
@@ -342,10 +324,7 @@ fn kitty_encode_key_event(
     }
 
     let codepoint = kitty_text_key_code(key)?;
-    let should_encode = report_all_keys
-        || modifiers.ctrl
-        || modifiers.alt
-        || (modifiers.command && !modifiers.ctrl);
+    let should_encode = report_all_keys || modifiers.ctrl || modifiers.alt || modifiers.command;
     if !should_encode {
         return None;
     }
@@ -366,8 +345,7 @@ fn xterm_encode_modify_other_keys(
 ) -> Option<String> {
     let codepoint = text_key_code(key, modifiers)?;
     let modifier_value = kitty_modifier_value(modifiers);
-    let has_non_shift_modifier =
-        modifiers.ctrl || modifiers.alt || (modifiers.command && !modifiers.ctrl);
+    let has_non_shift_modifier = modifiers.ctrl || modifiers.alt || modifiers.command;
     let should_encode = if report_all_keys {
         modifier_value > 1
     } else {
@@ -396,14 +374,18 @@ pub struct TerminalRenderer {
     pub padding: f32,
     pub line_spacing: f32,
     pub dragging_scrollbar: bool,
+    /// Stable terminal identity selected by a local primary-button press.
+    /// This locks Shift bypass through release and prevents a renderer reused
+    /// by another tab/pane from applying an in-flight drag to the new terminal.
+    local_selection_terminal: Option<usize>,
     pub scrollbar_visibility: crate::config::ScrollbarVisibility,
     pub theme: crate::theme::Theme,
     requested_initial_focus: bool,
     ime_enabled: bool,
     last_ime_rect: Option<egui::Rect>,
-    // Kitty graphics texture cache with LRU eviction (max 100 images)
-    // Prevents unbounded memory growth from image sequences
-    texture_cache: LruCache<u32, (egui::TextureHandle, u32, u32)>,
+    // Kitty graphics texture cache with count and byte-budget eviction.
+    texture_cache: LruCache<u32, (egui::TextureHandle, u32, u32, u64)>,
+    texture_cache_bytes: usize,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
     pub opacity: f32,
@@ -413,8 +395,16 @@ pub struct TerminalRenderer {
     pub gpu_rendering: bool,
     /// wgpu render state for GPU-accelerated grid rendering
     pub wgpu_render_state: Option<egui_wgpu::RenderState>,
+    /// Stable key for this renderer's per-surface GPU buffers. egui-wgpu
+    /// prepares all callbacks before painting any of them, so pane renderers
+    /// must not share instance or uniform storage.
+    gpu_surface_id: gpu::callback::GridSurfaceId,
     /// Pending cursor movement input (arrow keys) from mouse clicks
     pub cursor_move_input: Vec<u8>,
+    /// Stable identity of the terminal that produced `cursor_move_input`.
+    /// Renderers are reused when tabs/panes switch, so bytes without this tag
+    /// could otherwise be delivered to the replacement PTY next frame.
+    pub cursor_move_terminal_ptr: Option<usize>,
     /// Sub-line pixel offset for smooth scrolling animation
     pub scroll_pixel_offset: f32,
 
@@ -424,6 +414,7 @@ pub struct TerminalRenderer {
     pub cached_links: std::sync::Arc<Vec<crate::link::Link>>,
     pub cached_links_grid_version: u64,
     pub cached_links_scroll_offset: usize,
+    pub cached_links_terminal_ptr: usize,
 
     // Dirty-region rendering cache
     cached_instances: std::sync::Arc<Vec<gpu::instance::CellInstance>>,
@@ -443,6 +434,7 @@ pub struct TerminalRenderer {
     row_instances_scratch: Vec<gpu::instance::CellInstance>,
     cached_atlas_w: f32,
     cached_atlas_h: f32,
+    last_rendered_font_generation: (u64, u64),
 }
 
 impl TerminalRenderer {
@@ -450,6 +442,11 @@ impl TerminalRenderer {
     const SCROLLBAR_GAP: f32 = 2.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
     const SCROLLBAR_HIT_EXPAND: f32 = 8.0;
+    /// This is per renderer (split panes have independent caches), so keep it
+    /// tight enough that several panes cannot multiply into a multi-GiB VRAM
+    /// allocation under adversarial terminal output.
+    const MAX_KITTY_TEXTURE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_KITTY_TEXTURE_CACHE_ENTRIES: usize = 100;
 
     pub fn new(
         font_size: f32,
@@ -470,6 +467,7 @@ impl TerminalRenderer {
             padding,
             line_spacing,
             dragging_scrollbar: false,
+            local_selection_terminal: None,
             scrollbar_visibility,
             theme,
             requested_initial_focus: false,
@@ -480,13 +478,17 @@ impl TerminalRenderer {
             font_ligatures: true,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
+            texture_cache_bytes: 0,
             wgpu_render_state: None,
+            gpu_surface_id: gpu::callback::GridSurfaceId::allocate(),
             cursor_move_input: Vec::new(),
+            cursor_move_terminal_ptr: None,
             scroll_pixel_offset: 0.0,
             cached_links: std::sync::Arc::new(Vec::new()),
             // u64::MAX 作哨兵,保证首帧必定重建链接缓存。
             cached_links_grid_version: u64::MAX,
             cached_links_scroll_offset: usize::MAX,
+            cached_links_terminal_ptr: usize::MAX,
             // Dirty-region rendering cache (initialized empty)
             cached_instances: std::sync::Arc::new(Vec::new()),
             row_instance_offsets: std::sync::Arc::new(Vec::new()),
@@ -505,6 +507,7 @@ impl TerminalRenderer {
             row_instances_scratch: Vec::new(),
             cached_atlas_w: 1.0,
             cached_atlas_h: 1.0,
+            last_rendered_font_generation: (0, 0),
         }
     }
 
@@ -512,6 +515,10 @@ impl TerminalRenderer {
     pub fn reset_ime_state(&mut self) {
         self.ime_enabled = false;
         self.last_ime_rect = None;
+    }
+
+    pub fn cancel_local_selection_capture(&mut self) {
+        self.local_selection_terminal = None;
     }
 
     pub fn invalidate_font_cache(&mut self) {
@@ -578,8 +585,15 @@ impl TerminalRenderer {
         image: &crate::kitty_graphics::KittyImage,
     ) -> Option<egui::TextureHandle> {
         // Check cache first (get_mut to update LRU order)
-        if let Some((handle, _w, _h)) = self.texture_cache.get(&image_id) {
-            return Some(handle.clone());
+        if let Some((handle, _w, _h, revision)) = self.texture_cache.get(&image_id) {
+            if *revision == image.revision {
+                return Some(handle.clone());
+            }
+        }
+        if let Some((_handle, width, height, _revision)) = self.texture_cache.pop(&image_id) {
+            self.texture_cache_bytes = self
+                .texture_cache_bytes
+                .saturating_sub(Self::texture_bytes(width, height));
         }
 
         // Create new texture from image data.
@@ -602,21 +616,161 @@ impl TerminalRenderer {
                 return None;
             }
         }
+        let texture_bytes = expected.expect("texture dimensions were validated above");
+        if texture_bytes > Self::MAX_KITTY_TEXTURE_CACHE_BYTES {
+            log::warn!(
+                "[KITTY_GRAPHICS] Skip texture for image {}: {} bytes exceeds GPU cache limit",
+                image_id,
+                texture_bytes
+            );
+            return None;
+        }
+        while self.texture_cache_bytes.saturating_add(texture_bytes)
+            > Self::MAX_KITTY_TEXTURE_CACHE_BYTES
+            || self.texture_cache.len() >= Self::MAX_KITTY_TEXTURE_CACHE_ENTRIES
+        {
+            let Some((_id, (_handle, width, height, _revision))) = self.texture_cache.pop_lru()
+            else {
+                break;
+            };
+            self.texture_cache_bytes = self
+                .texture_cache_bytes
+                .saturating_sub(Self::texture_bytes(width, height));
+        }
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
             [image.width as usize, image.height as usize],
             &image.data,
         );
         let handle = ctx.load_texture(
-            format!("kitty_{}", image_id),
+            format!("kitty_{}_{}", image_id, image.revision),
             color_image,
             Default::default(),
         );
 
         // Cache it (LRU will auto-evict oldest if at capacity)
         let result = handle.clone();
-        self.texture_cache
-            .put(image_id, (handle, image.width, image.height));
+        self.texture_cache.put(
+            image_id,
+            (handle, image.width, image.height, image.revision),
+        );
+        self.texture_cache_bytes = self.texture_cache_bytes.saturating_add(texture_bytes);
         Some(result)
+    }
+
+    fn texture_bytes(width: u32, height: u32) -> usize {
+        (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_kitty_image_layer(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        terminal: &TerminalState,
+        content_rect: egui::Rect,
+        char_width: f32,
+        line_height: f32,
+        layer: KittyImageLayer,
+    ) {
+        let viewport_rows = i64::try_from(terminal.grid.rows()).unwrap_or(i64::MAX);
+        let scroll_offset = terminal.scroll_offset;
+        let mut placements: Vec<_> = terminal
+            .kitty_graphics
+            .get_placements()
+            .iter()
+            .filter(|placement| {
+                let viewport_row = placement.viewport_row(scroll_offset);
+                layer.contains(placement.z_index)
+                    && viewport_row < viewport_rows
+                    && viewport_row.saturating_add(i64::from(placement.height)) > 0
+            })
+            .collect();
+        placements.sort_by_key(|placement| (placement.z_index, placement.image_id));
+
+        let painter = painter.with_clip_rect(content_rect);
+        let pixels_per_point = ctx.pixels_per_point().max(0.1);
+        for placement in placements {
+            let Some(image) = terminal.kitty_graphics.get_image(placement.image_id) else {
+                continue;
+            };
+            let natural_width = placement.source_width as f32 / pixels_per_point;
+            let natural_height = placement.source_height as f32 / pixels_per_point;
+            let (display_width, full_display_height) =
+                match (placement.requested_columns, placement.requested_rows) {
+                    (None, None) => (natural_width, natural_height),
+                    (Some(columns), None) => {
+                        let width = columns as f32 * char_width;
+                        (width, width * natural_height / natural_width.max(0.1))
+                    }
+                    (None, Some(rows)) => {
+                        let height = rows as f32 * line_height;
+                        (height * natural_width / natural_height.max(0.1), height)
+                    }
+                    (Some(columns), Some(rows)) => {
+                        (columns as f32 * char_width, rows as f32 * line_height)
+                    }
+                };
+            let top_clip =
+                (placement.clip_top_rows as f32 * line_height).min(full_display_height.max(0.0));
+            let bottom_clip = (placement.clip_bottom_rows as f32 * line_height)
+                .min((full_display_height - top_clip).max(0.0));
+            let display_height = full_display_height - top_clip - bottom_clip;
+            if display_width <= 0.0 || display_height <= 0.0 {
+                continue;
+            }
+            let viewport_row = placement.viewport_row(scroll_offset);
+            let image_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    content_rect.left()
+                        + placement.x as f32 * char_width
+                        + placement.cell_x_offset as f32 / pixels_per_point,
+                    content_rect.top()
+                        + viewport_row as f32 * line_height
+                        + placement.cell_y_offset as f32 / pixels_per_point,
+                ),
+                Vec2::new(display_width, display_height),
+            );
+            let Some(texture) = self.get_image_texture(ctx, image.id, image) else {
+                continue;
+            };
+            let u0 = placement.source_x as f32 / image.width as f32;
+            let u1 = (placement.source_x + placement.source_width) as f32 / image.width as f32;
+            let source_v0 = placement.source_y as f32 / image.height as f32;
+            let source_v1 =
+                (placement.source_y + placement.source_height) as f32 / image.height as f32;
+            let source_v_span = source_v1 - source_v0;
+            let v0 = source_v0 + source_v_span * top_clip / full_display_height.max(0.1);
+            let v1 = source_v1 - source_v_span * bottom_clip / full_display_height.max(0.1);
+            let mesh = egui::Mesh {
+                indices: vec![0, 1, 2, 0, 2, 3],
+                vertices: vec![
+                    egui::epaint::Vertex {
+                        pos: image_rect.left_top(),
+                        uv: egui::pos2(u0, v0),
+                        color: Color32::WHITE,
+                    },
+                    egui::epaint::Vertex {
+                        pos: image_rect.right_top(),
+                        uv: egui::pos2(u1, v0),
+                        color: Color32::WHITE,
+                    },
+                    egui::epaint::Vertex {
+                        pos: image_rect.right_bottom(),
+                        uv: egui::pos2(u1, v1),
+                        color: Color32::WHITE,
+                    },
+                    egui::epaint::Vertex {
+                        pos: image_rect.left_bottom(),
+                        uv: egui::pos2(u0, v1),
+                        color: Color32::WHITE,
+                    },
+                ],
+                texture_id: texture.id(),
+            };
+            painter.add(egui::Shape::mesh(mesh));
+        }
     }
 
     fn content_size(&self, available: Vec2) -> Vec2 {
@@ -672,10 +826,14 @@ impl TerminalRenderer {
     }
 
     /// 在指定矩形内渲染（用于多窗格模式）
+    // Rendering a pane needs the terminal model plus its transient overlays and geometry.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_in_rect(
         &mut self,
         ui: &mut Ui,
         terminal: &mut TerminalState,
+        interaction_enabled: bool,
+        focus_enabled: bool,
         cursor_visible: bool,
         search_state: &crate::search::SearchState,
         links: &[crate::link::Link],
@@ -690,16 +848,18 @@ impl TerminalRenderer {
 
         // Allocate in the target rectangle area
         let rect = target_rect;
-        let response = ui
-            .allocate_exact_size(
-                egui::vec2(rect.width(), rect.height()),
-                egui::Sense::click_and_drag().union(egui::Sense::focusable_noninteractive()),
-            )
-            .1;
+        let sense = if interaction_enabled {
+            egui::Sense::click_and_drag().union(egui::Sense::focusable_noninteractive())
+        } else {
+            egui::Sense::hover()
+        };
+        let response = ui.allocate_rect(rect, sense);
 
         self.render_terminal_at_rect(
             ui,
             terminal,
+            interaction_enabled,
+            focus_enabled,
             cursor_visible,
             search_state,
             links,
@@ -713,10 +873,12 @@ impl TerminalRenderer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         ui: &mut Ui,
         terminal: &mut TerminalState,
+        interaction_enabled: bool,
         cursor_visible: bool,
         search_state: &crate::search::SearchState,
         links: &[crate::link::Link],
@@ -736,14 +898,19 @@ impl TerminalRenderer {
         // eprintln!("[UI] Char size: {:.1} x {:.1}", char_width, line_height);
 
         // Allocate the full available space
-        let (rect, response) = ui.allocate_exact_size(
-            Vec2::new(available_width, available_height),
-            egui::Sense::click_and_drag().union(egui::Sense::focusable_noninteractive()),
-        );
+        let sense = if interaction_enabled {
+            egui::Sense::click_and_drag().union(egui::Sense::focusable_noninteractive())
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(available_width, available_height), sense);
 
         self.render_terminal_at_rect(
             ui,
             terminal,
+            interaction_enabled,
+            interaction_enabled,
             cursor_visible,
             search_state,
             links,
@@ -757,10 +924,14 @@ impl TerminalRenderer {
         )
     }
 
+    // Keep the hot render path explicit: bundling these borrowed frame inputs would add churn.
+    #[allow(clippy::too_many_arguments)]
     fn render_terminal_at_rect(
         &mut self,
         ui: &mut Ui,
         terminal: &mut TerminalState,
+        interaction_enabled: bool,
+        focus_enabled: bool,
         cursor_visible: bool,
         search_state: &crate::search::SearchState,
         links: &[crate::link::Link],
@@ -772,6 +943,11 @@ impl TerminalRenderer {
         line_height: f32,
         char_width: f32,
     ) -> Response {
+        let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
+        terminal.kitty_graphics.set_cell_size_pixels(
+            (char_width * pixels_per_point).round().max(1.0) as u32,
+            (line_height * pixels_per_point).round().max(1.0) as u32,
+        );
         let grid = terminal.get_visible_cells();
         let rows = grid.len();
         let cols = if rows > 0 { grid[0].len() } else { 80 };
@@ -800,15 +976,16 @@ impl TerminalRenderer {
         );
 
         let ctx = ui.ctx();
-        if response.clicked()
-            || (!self.requested_initial_focus && !ctx.memory(|mem| mem.has_focus(response.id)))
+        if focus_enabled
+            && (response.clicked()
+                || (!self.requested_initial_focus && !ctx.memory(|mem| mem.has_focus(response.id))))
         {
             response.request_focus();
             self.requested_initial_focus = true;
         }
 
         let has_focus = ctx.memory(|mem| mem.has_focus(response.id));
-        if has_focus {
+        if focus_enabled && has_focus {
             // Tell egui that the terminal widget needs arrow keys, tab, and escape,
             // so they are NOT consumed by egui's focus navigation system.
             ctx.memory_mut(|mem| {
@@ -823,7 +1000,7 @@ impl TerminalRenderer {
                 );
             });
         }
-        if !self.ime_enabled {
+        if focus_enabled && !self.ime_enabled {
             ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
                 egui::IMEPurpose::Terminal,
@@ -831,7 +1008,7 @@ impl TerminalRenderer {
             self.ime_enabled = true;
         }
 
-        {
+        if focus_enabled {
             let ime_rect_changed = self
                 .last_ime_rect
                 .map(|prev| prev != ime_rect)
@@ -840,6 +1017,12 @@ impl TerminalRenderer {
                 ctx.send_viewport_cmd(egui::ViewportCommand::IMERect(ime_rect));
                 self.last_ime_rect = Some(ime_rect);
             }
+        } else {
+            self.dragging_scrollbar = false;
+            self.cursor_move_input.clear();
+            self.cursor_move_terminal_ptr = None;
+            self.ime_enabled = false;
+            self.last_ime_rect = None;
         }
 
         // Pre-compute scrollbar geometry for hit-testing
@@ -857,6 +1040,18 @@ impl TerminalRenderer {
                     scrollbar_hovered || self.dragging_scrollbar
                 }
             };
+        let mouse_enabled = terminal.is_mouse_enabled();
+        let rendered_terminal = terminal as *const TerminalState as usize;
+        self.local_selection_terminal = local_selection_capture_after_press(
+            self.local_selection_terminal,
+            rendered_terminal,
+            mouse_enabled,
+            interaction_enabled,
+            response.hovered(),
+            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary)),
+            ui.input(|input| input.modifiers.shift),
+        );
+        let local_selection_enabled = self.local_selection_terminal == Some(rendered_terminal);
 
         // Compute thumb rect and related values for interaction
         let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> =
@@ -893,7 +1088,7 @@ impl TerminalRenderer {
         // Handle mouse events for text selection
         // Track selection start on initial mouse down
         // Scrollbar interaction: detect if drag started on thumb
-        if response.drag_started() {
+        if interaction_enabled && response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x >= scrollbar_x {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
@@ -906,7 +1101,7 @@ impl TerminalRenderer {
         }
 
         // Scrollbar drag: update scroll_offset while dragging thumb
-        if self.dragging_scrollbar && response.dragged() {
+        if interaction_enabled && self.dragging_scrollbar && response.dragged() {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some((_, scrollbar_height, thumb_height, scrollback_len_f)) =
                     scrollbar_thumb_rect
@@ -926,12 +1121,12 @@ impl TerminalRenderer {
         }
 
         // Reset dragging state when mouse released
-        if response.drag_stopped() {
+        if interaction_enabled && response.drag_stopped() {
             self.dragging_scrollbar = false;
         }
 
         // Click in scrollbar track (not on thumb): page up/down
-        if response.drag_started() && !self.dragging_scrollbar {
+        if interaction_enabled && response.drag_started() && !self.dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x >= scrollbar_x && !terminal.scrollback.is_empty() {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
@@ -948,7 +1143,13 @@ impl TerminalRenderer {
         }
 
         // Single click: move cursor to click position (when mouse reporting is disabled)
-        if response.clicked() && !response.double_clicked() && !self.dragging_scrollbar {
+        if interaction_enabled
+            && local_selection_enabled
+            && !ui.input(|input| input.modifiers.ctrl)
+            && response.clicked()
+            && !response.double_clicked()
+            && !self.dragging_scrollbar
+        {
             terminal.selection = None;
 
             if let Some(pos) = response.interact_pointer_pos() {
@@ -966,9 +1167,13 @@ impl TerminalRenderer {
 
                     if click_row == cursor_row {
                         let col_diff = click_col as isize - cursor_col as isize;
+                        // A newer click supersedes any prior not-yet-routed
+                        // synthetic movement, including a no-op click.
+                        self.cursor_move_input.clear();
+                        self.cursor_move_terminal_ptr = None;
 
                         if col_diff != 0 {
-                            self.cursor_move_input.clear();
+                            self.cursor_move_terminal_ptr = Some(rendered_terminal);
                             let app_cursor_keys = terminal.is_application_cursor_keys();
                             let (right, left): (&[u8], &[u8]) = if app_cursor_keys {
                                 (b"\x1bOC", b"\x1bOD")
@@ -987,7 +1192,11 @@ impl TerminalRenderer {
         }
 
         // Triple-click: select the whole visual line, like VTE terminals.
-        if response.triple_clicked() && !self.dragging_scrollbar {
+        if interaction_enabled
+            && local_selection_enabled
+            && response.triple_clicked()
+            && !self.dragging_scrollbar
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x {
                     let clamped_y =
@@ -1001,7 +1210,11 @@ impl TerminalRenderer {
                 }
             }
         // Double-click: select word at cursor position
-        } else if response.double_clicked() && !self.dragging_scrollbar {
+        } else if interaction_enabled
+            && local_selection_enabled
+            && response.double_clicked()
+            && !self.dragging_scrollbar
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x {
                     let clamped_x =
@@ -1025,7 +1238,11 @@ impl TerminalRenderer {
         }
 
         // Text selection: only when not interacting with scrollbar
-        if response.drag_started() && !self.dragging_scrollbar {
+        if interaction_enabled
+            && local_selection_enabled
+            && response.drag_started()
+            && !self.dragging_scrollbar
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 // Only select text if NOT in scrollbar area
                 if pos.x < scrollbar_x {
@@ -1057,7 +1274,11 @@ impl TerminalRenderer {
         }
 
         // Update selection end during drag
-        if response.dragged() && !self.dragging_scrollbar {
+        if interaction_enabled
+            && local_selection_enabled
+            && response.dragged()
+            && !self.dragging_scrollbar
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x {
                     // Clamp position to rect bounds to prevent underflow
@@ -1082,115 +1303,24 @@ impl TerminalRenderer {
             }
         }
 
-        // Render Kitty graphics images
-        let placements = terminal.kitty_graphics.get_placements();
-        for placement in placements {
-            if let Some(image) = terminal.kitty_graphics.get_image(placement.image_id) {
-                // Calculate pixel position from grid coordinates
-                let img_x = content_rect.left() + placement.x as f32 * char_width;
-                let img_y = content_rect.top() + placement.y as f32 * line_height;
-                let img_width = placement.width as f32 * char_width;
-                let img_height = placement.height as f32 * line_height;
-
-                let rect = egui::Rect::from_min_size(
-                    egui::pos2(img_x, img_y),
-                    Vec2::new(img_width, img_height),
-                );
-
-                // Render the image using GPU texture
-                if let Some(texture) = self.get_image_texture(ui.ctx(), image.id, image) {
-                    // Render the texture
-                    let mesh = egui::Mesh {
-                        indices: vec![0, 1, 2, 0, 2, 3],
-                        vertices: vec![
-                            egui::epaint::Vertex {
-                                pos: rect.left_top(),
-                                uv: egui::pos2(0.0, 0.0),
-                                color: Color32::WHITE,
-                            },
-                            egui::epaint::Vertex {
-                                pos: rect.right_top(),
-                                uv: egui::pos2(1.0, 0.0),
-                                color: Color32::WHITE,
-                            },
-                            egui::epaint::Vertex {
-                                pos: rect.right_bottom(),
-                                uv: egui::pos2(1.0, 1.0),
-                                color: Color32::WHITE,
-                            },
-                            egui::epaint::Vertex {
-                                pos: rect.left_bottom(),
-                                uv: egui::pos2(0.0, 1.0),
-                                color: Color32::WHITE,
-                            },
-                        ],
-                        texture_id: texture.id(),
-                    };
-                    painter.add(egui::Shape::mesh(mesh));
-
-                    // Draw border and info
-                    painter.rect_stroke(
-                        rect,
-                        egui::CornerRadius::ZERO,
-                        egui::Stroke::new(1.0, Color32::from_rgb(100, 150, 200)),
-                        egui::StrokeKind::Middle,
-                    );
-
-                    let info = format!("#{} ({}×{})", image.id, image.width, image.height);
-                    let font_id = FontId::monospace(self.font_size * 0.6);
-                    let galley = ui.painter().layout_no_wrap(
-                        info,
-                        font_id,
-                        Color32::from_rgb(100, 150, 200),
-                    );
-
-                    painter.galley(
-                        egui::pos2(img_x + 2.0, img_y + 2.0),
-                        galley,
-                        Color32::from_rgb(100, 150, 200),
-                    );
-
-                    crate::debug_log!(
-                        "[KITTY_RENDER] Rendered image #{} at ({},{}) size {}x{} placement {}x{}",
-                        image.id,
-                        placement.x,
-                        placement.y,
-                        image.width,
-                        image.height,
-                        placement.width,
-                        placement.height
-                    );
-                } else {
-                    // Render placeholder if image preparation failed
-                    painter.rect_filled(
-                        rect,
-                        egui::CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(50, 50, 50, 100),
-                    );
-
-                    painter.rect_stroke(
-                        rect,
-                        egui::CornerRadius::ZERO,
-                        egui::Stroke::new(1.0, Color32::from_rgb(100, 100, 100)),
-                        egui::StrokeKind::Middle,
-                    );
-
-                    let text = "Invalid Image";
-                    let font_id = FontId::monospace(self.font_size * 0.6);
-                    let galley = ui.painter().layout_no_wrap(
-                        text.to_string(),
-                        font_id,
-                        Color32::from_rgb(100, 100, 100),
-                    );
-
-                    painter.galley(
-                        egui::pos2(img_x + 2.0, img_y + 2.0),
-                        galley,
-                        Color32::from_rgb(100, 100, 100),
-                    );
-                }
-            }
+        // Keep the capture through this release frame so click/drag-stopped
+        // handlers above still observe the press-time routing decision.
+        if !ui.input(|input| input.pointer.any_down()) {
+            self.local_selection_terminal = None;
         }
+
+        // Extremely negative z-index images sit below non-default cell
+        // backgrounds. The remaining negative layer is inserted between the
+        // grid's background and foreground phases below.
+        self.paint_kitty_image_layer(
+            ui.ctx(),
+            &painter,
+            terminal,
+            content_rect,
+            char_width,
+            line_height,
+            KittyImageLayer::BelowCellBackgrounds,
+        );
 
         // GPU-accelerated grid rendering via wgpu instanced draw
         let gpu_rendered = if self.gpu_rendering {
@@ -1239,6 +1369,18 @@ impl TerminalRenderer {
                 line_height,
             );
         }
+
+        // Zero/positive z-index images are above terminal text. Keep the
+        // cursor as the final UI affordance so it remains locatable.
+        self.paint_kitty_image_layer(
+            ui.ctx(),
+            &painter,
+            terminal,
+            content_rect,
+            char_width,
+            line_height,
+            KittyImageLayer::AboveText,
+        );
 
         // Render cursor - direct O(1) positioning instead of full grid scan
         if cursor_visible && cursor_pos.0 < rows && cursor_pos.1 < cols {
@@ -1369,6 +1511,8 @@ impl TerminalRenderer {
 
     /// GPU path: build instance buffer from grid, rasterize new glyphs, emit PaintCallback.
     /// Returns true if GPU rendering was used, false if fallback is needed.
+    // The GPU boundary mirrors the complete frame state consumed by the paint callback.
+    #[allow(clippy::too_many_arguments)]
     fn render_grid_gpu(
         &mut self,
         ui: &mut Ui,
@@ -1393,6 +1537,21 @@ impl TerminalRenderer {
         let has_search = !search_state.matches.is_empty() && !search_state.query.is_empty();
         let target_cell_width = char_width * ppp;
         let target_cell_height = line_height * ppp;
+        let font_generation_before = {
+            // Resolve a grow/compaction requested by the previous CPU build
+            // before reading the generation and constructing instances. Doing
+            // this only in the paint callback would let one frame use old UVs
+            // with a newly reset atlas.
+            let mut renderer = render_state.renderer.write();
+            let Some(gpu_res) = renderer
+                .callback_resources
+                .get_mut::<gpu::callback::GpuResources>()
+            else {
+                return false;
+            };
+            gpu_res.prepare_atlas(&render_state.device, &render_state.queue);
+            gpu_res.font_content_generation()
+        };
 
         // --- Dirty detection: determine which rows need rebuild ---
         let terminal_ptr = terminal as *const _ as usize;
@@ -1413,6 +1572,7 @@ impl TerminalRenderer {
             current_grid_version > self.last_rendered_grid_version + rows as u64;
 
         let need_full_rebuild = self.cached_instances.is_empty()
+            || self.last_rendered_font_generation != font_generation_before
             || self.last_rendered_terminal_ptr != terminal_ptr
             || self.last_rendered_rows != rows
             || self.last_rendered_cols != cols
@@ -1495,6 +1655,7 @@ impl TerminalRenderer {
         // 一旦发生,后续行的偏移已整体平移,必须全量上传 GPU buffer;否则只传脏行会让
         // buffer 残留旧布局,渲染错乱。见末尾 use_partial_upload 的计算。
         let mut did_full_relayout = false;
+        let mut font_generation_after = font_generation_before;
         if !any_dirty && !self.cached_instances.is_empty() {
             // Nothing changed — reuse cached instances as-is
         } else {
@@ -1568,7 +1729,6 @@ impl TerminalRenderer {
                             hovered_link,
                             &self.theme,
                             default_bg,
-                            self.opacity,
                             has_search,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
@@ -1585,8 +1745,8 @@ impl TerminalRenderer {
                     let mut needs_relayout = false;
                     let mut row_scratch = std::mem::take(&mut self.row_instances_scratch);
 
-                    for row_idx in 0..rows {
-                        if !dirty_rows[row_idx] {
+                    for (row_idx, is_dirty) in dirty_rows.iter().copied().enumerate().take(rows) {
+                        if !is_dirty {
                             continue;
                         }
 
@@ -1603,7 +1763,6 @@ impl TerminalRenderer {
                             hovered_link,
                             &self.theme,
                             default_bg,
-                            self.opacity,
                             has_search,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
@@ -1652,7 +1811,6 @@ impl TerminalRenderer {
                                 hovered_link,
                                 &self.theme,
                                 default_bg,
-                                self.opacity,
                                 has_search,
                                 glyph_offset_x_adjust,
                                 glyph_offset_y_adjust,
@@ -1666,7 +1824,18 @@ impl TerminalRenderer {
                         }
                     }
                 }
+                font_generation_after = gpu_res.font_content_generation();
             } // drop renderer write lock
+        }
+
+        // Rasterizing a missing glyph can grow or compact the atlas. Earlier
+        // rows in this same batch then contain UVs for the previous layout.
+        // Paint the CPU fallback for this frame and rebuild every GPU instance
+        // next frame against one stable generation.
+        if font_generation_after != font_generation_before {
+            self.invalidate_font_cache();
+            ui.ctx().request_repaint();
+            return false;
         }
 
         // Update tracking state
@@ -1686,10 +1855,12 @@ impl TerminalRenderer {
         }
         self.last_rendered_cols = cols;
         self.last_rendered_rows = rows;
+        self.last_rendered_font_generation = font_generation_after;
 
         let (atlas_w, atlas_h) = (self.cached_atlas_w, self.cached_atlas_h);
 
         let instance_count = self.cached_instances.len() as u32;
+        let frame_nr = ui.ctx().cumulative_frame_nr();
         let background_uniforms = gpu::instance::GridUniforms {
             viewport_width: content_rect.width() * ppp,
             viewport_height: content_rect.height() * ppp,
@@ -1707,6 +1878,8 @@ impl TerminalRenderer {
         };
 
         let background_callback = gpu::callback::GridBackgroundCallback {
+            surface_id: self.gpu_surface_id,
+            frame_nr,
             instances: self.cached_instances.clone(),
             uniforms: background_uniforms,
             instance_count,
@@ -1714,17 +1887,31 @@ impl TerminalRenderer {
             row_counts: self.row_instance_counts.clone(),
             dirty_rows: self.dirty_rows.clone(),
             use_partial_upload: !need_full_rebuild && !did_full_relayout && any_dirty,
+            expected_font_generation: font_generation_after,
         };
 
         let foreground_callback = gpu::callback::GridForegroundCallback {
+            surface_id: self.gpu_surface_id,
+            frame_nr,
             uniforms: foreground_uniforms,
             instance_count,
+            expected_font_generation: font_generation_after,
         };
 
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             content_rect,
             background_callback,
         ));
+        let painter = ui.painter().clone();
+        self.paint_kitty_image_layer(
+            ui.ctx(),
+            &painter,
+            terminal,
+            content_rect,
+            char_width,
+            line_height,
+            KittyImageLayer::BelowText,
+        );
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             content_rect,
             foreground_callback,
@@ -1747,8 +1934,12 @@ impl TerminalRenderer {
                 .saturating_sub(terminal.scroll_offset);
             let start = min_abs.max(scrollback_offset) - scrollback_offset;
             let end = max_abs.saturating_sub(scrollback_offset);
-            for r in start..=end.min(rows.saturating_sub(1)) {
-                dirty_rows[r] = true;
+            for dirty in dirty_rows
+                .iter_mut()
+                .take(end.min(rows.saturating_sub(1)).saturating_add(1))
+                .skip(start)
+            {
+                *dirty = true;
             }
         }
     }
@@ -1765,7 +1956,6 @@ impl TerminalRenderer {
         hovered_link: &Option<crate::link::Link>,
         theme: &crate::theme::Theme,
         default_bg: Color32,
-        opacity: f32,
         has_search: bool,
         glyph_offset_x_adjust: f32,
         glyph_offset_y_adjust: f32,
@@ -1809,8 +1999,8 @@ impl TerminalRenderer {
                     let shaped = gpu_res.atlas.shape_run(&run, bold, 0);
                     // A merge happened only if fewer glyphs than input columns.
                     if shaped.len() < run_len {
-                        for col2 in run_start..c {
-                            map[col2] = Some(LigOverride::Covered);
+                        for slot in map.iter_mut().take(c).skip(run_start) {
+                            *slot = Some(LigOverride::Covered);
                         }
                         for g in shaped.iter() {
                             // Run is pure ASCII, so cluster byte offset == column offset.
@@ -1837,8 +2027,7 @@ impl TerminalRenderer {
             None
         };
 
-        for col_idx in 0..cols {
-            let cell = &grid[row_idx][col_idx];
+        for (col_idx, cell) in grid[row_idx].iter().enumerate().take(cols) {
             if cell.flags.wide_continuation() {
                 continue;
             }
@@ -1859,11 +2048,13 @@ impl TerminalRenderer {
                 color::resolve_bg(cell.background, theme)
             };
 
+            let mut is_search_match = false;
             if has_search {
                 let row_matches = search_map.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
                 if !row_matches.is_empty() {
                     for m in row_matches.iter() {
                         if col_idx >= m.col_start && col_idx < m.col_end {
+                            is_search_match = true;
                             bg_color = color::resolve_fg(cell.foreground, theme, bold, dim);
                             if active_match_pos == Some((m.line, m.col_start)) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
@@ -1880,11 +2071,11 @@ impl TerminalRenderer {
                 }
             }
 
-            if !is_selected
+            let is_default_background = !is_selected
                 && !is_inverse
                 && cell.background == crate::terminal::Color::Default
-                && !has_search
-            {
+                && !is_search_match;
+            if is_default_background {
                 bg_color = default_bg;
             }
 
@@ -1993,11 +2184,12 @@ impl TerminalRenderer {
 
             let [fg_r, fg_g, fg_b, fg_a] = fg_color.to_srgba_unmultiplied();
             let [bg_r, bg_g, bg_b, _bg_a] = bg_color.to_srgba_unmultiplied();
-            let bg_a = if bg_color == default_bg {
-                (opacity * 255.0) as u8
-            } else {
-                255u8
-            };
+            // The terminal base color was already painted once behind the
+            // grid (with configured opacity). Default cells stay transparent
+            // so negative-z Kitty images remain visible and opacity is not
+            // composited twice. Explicit/inverse/selection/search backgrounds
+            // intentionally cover the image layer.
+            let bg_a = if is_default_background { 0 } else { 255 };
 
             instances.push(gpu::instance::CellInstance {
                 col: col_idx as u32,
@@ -2017,8 +2209,10 @@ impl TerminalRenderer {
     }
 
     /// CPU fallback: render grid using egui painter API (the original path).
+    // The CPU fallback intentionally mirrors the GPU renderer's frame inputs.
+    #[allow(clippy::too_many_arguments)]
     fn render_grid_cpu(
-        &self,
+        &mut self,
         ui: &mut Ui,
         painter: &egui::Painter,
         terminal: &TerminalState,
@@ -2032,14 +2226,12 @@ impl TerminalRenderer {
         char_width: f32,
         line_height: f32,
     ) {
-        let default_bg = self.theme.terminal_background();
         let has_search = !search_state.matches.is_empty() && !search_state.query.is_empty();
 
-        for row_idx in 0..rows {
+        for (row_idx, row) in grid.iter().enumerate().take(rows) {
             let sel_cols = terminal.row_selection_cols(row_idx);
 
-            for col_idx in 0..cols {
-                let cell = &grid[row_idx][col_idx];
+            for (col_idx, cell) in row.iter().enumerate().take(cols) {
                 if cell.flags.wide_continuation() {
                     continue;
                 }
@@ -2067,9 +2259,11 @@ impl TerminalRenderer {
                     color::resolve_bg(cell.background, &self.theme)
                 };
 
+                let mut is_search_match = false;
                 if has_search {
                     for (match_idx, m) in search_state.matches.iter().enumerate() {
                         if m.line == row_idx && col_idx >= m.col_start && col_idx < m.col_end {
+                            is_search_match = true;
                             bg_color = color::resolve_fg(cell.foreground, &self.theme, bold, dim);
                             if match_idx
                                 == search_state.current_match_index % search_state.matches.len()
@@ -2085,7 +2279,13 @@ impl TerminalRenderer {
                             break;
                         }
                     }
-                } else if bg_color == default_bg {
+                }
+
+                if !is_selected
+                    && !is_inverse
+                    && cell.background == crate::terminal::Color::Default
+                    && !is_search_match
+                {
                     continue;
                 }
 
@@ -2104,15 +2304,25 @@ impl TerminalRenderer {
             }
         }
 
+        self.paint_kitty_image_layer(
+            ui.ctx(),
+            painter,
+            terminal,
+            content_rect,
+            char_width,
+            line_height,
+            KittyImageLayer::BelowText,
+        );
+
         // Phase 2: Render characters
-        for row_idx in 0..rows {
+        for (row_idx, row) in grid.iter().enumerate().take(rows) {
             let sel_cols = terminal.row_selection_cols(row_idx);
             let (_, snapped_height) = snapped_span(content_rect.top(), row_idx, line_height);
             let y = snapped_span(content_rect.top(), row_idx, line_height).0;
 
             let mut col_idx = 0;
             while col_idx < cols {
-                let cell = &grid[row_idx][col_idx];
+                let cell = &row[col_idx];
                 if cell.flags.wide_continuation() || cell.character == ' ' {
                     col_idx += 1;
                     continue;
@@ -2217,6 +2427,8 @@ impl TerminalRenderer {
         }
     }
 
+    // Protocol modes are passed explicitly so keyboard encoding remains stateless and testable.
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_keyboard_input(
         &self,
         _ctx: &egui::Context,
@@ -2228,7 +2440,7 @@ impl TerminalRenderer {
         xterm_modify_other_keys: u16,
         xterm_format_other_keys: u16,
         application_cursor_keys: bool,
-        alt_screen: bool,
+        _alt_screen: bool,
         events: &[egui::Event],
     ) {
         let report_all_keys = report_all_keys_mode || (keyboard_enhancement_flags & 0b1000) != 0;
@@ -2333,7 +2545,6 @@ impl TerminalRenderer {
                         *key,
                         effective_modifiers,
                         application_cursor_keys,
-                        alt_screen,
                     );
 
                     if let Some(s) = seq {
@@ -2376,5 +2587,134 @@ impl TerminalRenderer {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_position_uses_content_origin() {
+        let content_rect =
+            egui::Rect::from_min_size(egui::pos2(12.0, 36.0), egui::vec2(800.0, 400.0));
+
+        let (row, col) = grid_position_from_content(
+            egui::pos2(12.0 + 4.0 * 8.0, 36.0 + 2.0 * 20.0),
+            content_rect,
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+
+        assert_eq!((row, col), (2, 4));
+    }
+
+    #[test]
+    fn cursor_keys_follow_decckm_not_alt_screen() {
+        let modifiers = egui::Modifiers::default();
+
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false),
+            Some("\x1b[A")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true),
+            Some("\x1bOB")
+        );
+    }
+
+    #[test]
+    fn kitty_z_layers_follow_the_protocol_cutoff() {
+        let cutoff = KittyImageLayer::BACKGROUND_CUTOFF;
+        assert!(KittyImageLayer::BelowCellBackgrounds.contains(cutoff - 1));
+        assert!(KittyImageLayer::BelowText.contains(cutoff));
+        assert!(KittyImageLayer::BelowText.contains(-1));
+        assert!(KittyImageLayer::AboveText.contains(0));
+        assert!(KittyImageLayer::AboveText.contains(i32::MAX));
+    }
+
+    #[test]
+    fn grid_position_clamps_to_grid_bounds() {
+        let content_rect =
+            egui::Rect::from_min_size(egui::pos2(12.0, 36.0), egui::vec2(800.0, 400.0));
+
+        let (row, col) = grid_position_from_content(
+            egui::pos2(2000.0, 2000.0),
+            content_rect,
+            8.0,
+            20.0,
+            100,
+            20,
+        );
+
+        assert_eq!((row, col), (19, 99));
+    }
+
+    #[test]
+    fn shift_local_selection_is_locked_at_primary_press() {
+        let terminal_a = 11;
+        let captured =
+            local_selection_capture_after_press(None, terminal_a, true, true, true, true, true);
+        assert_eq!(captured, Some(terminal_a));
+        assert_eq!(
+            local_selection_capture_after_press(
+                captured, terminal_a, true, true, true, false, false,
+            ),
+            Some(terminal_a)
+        );
+        assert_eq!(
+            local_selection_capture_after_press(None, terminal_a, true, true, true, true, false,),
+            None
+        );
+    }
+
+    #[test]
+    fn local_selection_capture_cannot_cross_terminal_routes() {
+        let terminal_a = 11;
+        let terminal_b = 22;
+        assert_eq!(
+            local_selection_capture_after_press(
+                Some(terminal_a),
+                terminal_b,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            local_selection_capture_after_press(None, terminal_b, false, true, true, true, false,),
+            Some(terminal_b)
+        );
+    }
+
+    #[test]
+    fn terminal_renderers_have_distinct_stable_gpu_surfaces() {
+        let renderer_a = TerminalRenderer::new(
+            14.0,
+            4.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut renderer_b = TerminalRenderer::new(
+            14.0,
+            4.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+
+        let original_b = renderer_b.gpu_surface_id;
+        assert_ne!(renderer_a.gpu_surface_id, original_b);
+
+        // Cache invalidation and runtime font changes must preserve the key so
+        // the surface's clean rows remain associated with the same GPU buffer.
+        renderer_b.invalidate_font_cache();
+        assert_eq!(renderer_b.gpu_surface_id, original_b);
     }
 }

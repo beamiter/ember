@@ -38,6 +38,10 @@ impl TerminalApp {
     }
 
     pub fn render_terminal_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let interaction_enabled = !self.terminal_input_blocked(ctx);
+        if !interaction_enabled {
+            self.dragging_divider = false;
+        }
         // 终端显示区域
         self.renderer.sync_font_metrics(ctx);
         let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
@@ -71,6 +75,7 @@ impl TerminalApp {
             // 获取所有窗格信息
             let panes = self.layout_manager.panes().to_vec();
             let divider_rect = self.layout_manager.get_divider_rect();
+            let inactive_search = crate::search::SearchState::default();
 
             // 为每个窗格渲染
             for (pane_idx, pane) in panes.iter().enumerate() {
@@ -84,6 +89,7 @@ impl TerminalApp {
                 let (pane_cols, pane_rows) =
                     self.pane_renderers[pane_idx].grid_dimensions(pane.rect.size());
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                    let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                     let mut terminal_guard = session.terminal.lock();
                     if pane_cols != terminal_guard.grid.row_len()
                         || pane_rows != terminal_guard.grid.rows()
@@ -98,6 +104,7 @@ impl TerminalApp {
                     let renderer = &mut self.pane_renderers[pane_idx];
                     if grid_version != renderer.cached_links_grid_version
                         || scroll_offset != renderer.cached_links_scroll_offset
+                        || terminal_ptr != renderer.cached_links_terminal_ptr
                     {
                         let visible_cells = terminal_guard.get_visible_cells();
                         let row_wrapped = terminal_guard.get_visible_row_wrapped();
@@ -110,18 +117,33 @@ impl TerminalApp {
                         );
                         renderer.cached_links_grid_version = grid_version;
                         renderer.cached_links_scroll_offset = scroll_offset;
+                        renderer.cached_links_terminal_ptr = terminal_ptr;
                     }
                     // O(1) clone Arc,规避 &mut renderer 与 &renderer.cached_links 借用冲突。
                     let links = renderer.cached_links.clone();
+                    let pane_cursor_visible = terminal_guard.is_cursor_visible()
+                        && (!pane.focused || self.cursor_visible);
+                    let pane_search = if pane.focused {
+                        &self.search_state
+                    } else {
+                        &inactive_search
+                    };
+                    let pane_hovered_link = if pane.focused {
+                        &self.hovered_link
+                    } else {
+                        &None
+                    };
 
                     // 在指定矩形内渲染（多窗格模式专用方法）
                     renderer.render_in_rect(
                         ui,
                         &mut terminal_guard,
-                        self.cursor_visible,
-                        &self.search_state,
+                        interaction_enabled,
+                        interaction_enabled && pane.focused,
+                        pane_cursor_visible,
+                        pane_search,
                         &links,
-                        &self.hovered_link,
+                        pane_hovered_link,
                         pane.rect,
                     );
                 }
@@ -139,7 +161,9 @@ impl TerminalApp {
                 painter.rect_filled(divider, 0.0, divider_color);
 
                 // 处理分隔线拖拽
-                if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                if interaction_enabled
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+                {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                         if divider.contains(pos) {
                             self.dragging_divider = true;
@@ -147,7 +171,7 @@ impl TerminalApp {
                     }
                 }
 
-                if self.dragging_divider {
+                if interaction_enabled && self.dragging_divider {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                         // 计算新的分割比例
                         match self.layout_manager.mode {
@@ -175,7 +199,8 @@ impl TerminalApp {
 
             // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
             // 那是用于拖拽调整比例的)。
-            if !self.dragging_divider
+            if interaction_enabled
+                && !self.dragging_divider
                 && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
             {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -206,40 +231,10 @@ impl TerminalApp {
                     self.cached_links_grid_version = grid_version;
                     self.cached_links_scroll_offset = scroll_offset;
                 }
-                // 在渲染终端之前读取滚轮值和 Ctrl 键状态
-                let ctrl_pressed_render = ui.input(|i| i.modifiers.ctrl);
-
-                // 从原始 MouseWheel 事件中提取 delta（因为 smooth_scroll_delta 被 egui 消费了）
-                let mut scroll_delta_from_event = 0.0;
-                if ctrl_pressed_render {
-                    scroll_delta_from_event = ui.input(|i| {
-                        i.events
-                            .iter()
-                            .filter_map(|evt| match evt {
-                                egui::Event::MouseWheel {
-                                    delta, modifiers, ..
-                                } if modifiers.ctrl => Some(delta.y),
-                                _ => None,
-                            })
-                            .sum()
-                    });
-                }
-
-                // Ctrl+滚轮字体缩放（积累事件而不是立即应用）
-                if scroll_delta_from_event != 0.0 && ctrl_pressed_render {
-                    let font_size_delta = if scroll_delta_from_event > 0.0 {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    // 积累字体大小变化
-                    self.font_size_accumulator += font_size_delta;
-                    self.had_ctrl_scroll_last_frame = true;
-                }
-
                 self.renderer.render(
                     ui,
                     &mut terminal_guard,
+                    interaction_enabled,
                     self.cursor_visible,
                     &self.search_state,
                     &self.cached_links,
@@ -363,6 +358,8 @@ impl TerminalApp {
         }
 
         // 命令调色板 UI（中央弹窗）
+        let mut clicked_palette_command = None;
+        let mut hovered_palette_index = None;
         if self.command_palette.is_open {
             let screen_rect = ctx.viewport_rect();
             let palette_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
@@ -412,7 +409,9 @@ impl TerminalApp {
                     ui.separator();
 
                     // 命令列表
-                    let results = self.command_palette.get_results();
+                    // Own a snapshot so pointer actions can be applied after the
+                    // window closure without borrowing command_palette twice.
+                    let results = self.command_palette.get_results().to_vec();
                     let selected_index = self.command_palette.selected_index;
 
                     egui::ScrollArea::vertical()
@@ -501,6 +500,20 @@ impl TerminalApp {
                                         .scroll_to_me(Some(egui::Align::Center));
                                 }
 
+                                let click_response = ui
+                                    .interact(
+                                        item_response.response.rect,
+                                        item_response.response.id.with("palette_click"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if click_response.hovered() {
+                                    hovered_palette_index = Some(idx);
+                                }
+                                if click_response.clicked() {
+                                    clicked_palette_command = Some(cmd_info.command.clone());
+                                }
+
                                 ui.separator();
                             }
 
@@ -523,6 +536,13 @@ impl TerminalApp {
                         );
                     });
                 });
+        }
+
+        if let Some(index) = hovered_palette_index {
+            self.command_palette.selected_index = index;
+        }
+        if let Some(command) = clicked_palette_command {
+            self.dispatch_palette_command(ctx, command);
         }
 
         // 帮助面板 UI（浮动窗口）
@@ -596,8 +616,14 @@ impl TerminalApp {
                                 }
                             }
                             search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
-                                let session = self.session_manager.get_active_session_mut();
-                                let _ = session.shell.write(result.as_bytes());
+                                let write_result = {
+                                    let session = self.session_manager.get_active_session_mut();
+                                    session.shell.write(result.as_bytes())
+                                };
+                                if let Err(error) = write_result {
+                                    self.search_replace_panel.status =
+                                        format!("Terminal write failed: {error}");
+                                }
                             }
                         }
                     }
@@ -730,10 +756,7 @@ impl TerminalApp {
         // 通过引用让 checkbox 在 self 上持久(对话框可能跨多帧)。
         let mut dont_ask_again = self.paste_dont_ask_again;
         // Some(true) = paste, Some(false) = cancel.
-        egui::Window::new("⚠ 确认粘贴")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        let modal_response = egui::Modal::new(egui::Id::new("paste_confirmation_modal"))
             .frame(egui::Frame {
                 fill: panel_bg,
                 stroke: egui::Stroke::new(1.0, border),
@@ -743,6 +766,7 @@ impl TerminalApp {
             })
             .show(ctx, |ui| {
                 ui.set_max_width(640.0);
+                ui.heading("⚠ 确认粘贴");
                 ui.label(
                     egui::RichText::new(format!(
                         "粘贴包含 {} 行 / {} 字节,执行前请确认内容:",
@@ -790,6 +814,9 @@ impl TerminalApp {
                     decision = Some(true);
                 }
             });
+        if modal_response.should_close() {
+            decision = Some(false);
+        }
 
         self.paste_dont_ask_again = dont_ask_again;
 
@@ -810,16 +837,36 @@ impl TerminalApp {
             return;
         }
         // 只在仍是同一个 tab 时投递,避免误粘到刚切换过去的会话。
-        if self.session_manager.active_index() != pending.session_idx {
+        if self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            != pending.session_id
+        {
             return;
         }
-        let bytes = pending.text.into_bytes();
+        let bytes = pending.text.as_bytes().to_vec();
         let paste_bytes = if pending.bracketed {
             crate::wrap_bracketed_paste(bytes)
         } else {
             bytes
         };
-        let session = self.session_manager.get_active_session_mut();
-        let _ = session.shell.write(&paste_bytes);
+        let write_result = {
+            let session = self.session_manager.get_active_session_mut();
+            session.shell.write(&paste_bytes)
+        };
+        if let Err(error) = write_result {
+            let retryable = error.is_backpressure();
+            self.set_status_for(
+                format!("Paste failed: {error}"),
+                std::time::Duration::from_secs(4),
+            );
+            if retryable {
+                // The bounded writer guarantees Full enqueued zero
+                // bytes, so reopening the confirmation is a safe exact retry.
+                self.pending_paste_confirm = Some(pending);
+            }
+        }
     }
 }

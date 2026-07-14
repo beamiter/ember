@@ -232,6 +232,6 @@ mod tests {
     #[test]
     fn test_platform_detection() {
         let caps = PlatformCapabilities::detect();
-        assert!(caps.get_shell_command().len() > 0);
+        assert!(!caps.get_shell_command().is_empty());
     }
 }

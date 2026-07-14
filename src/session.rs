@@ -4,6 +4,23 @@ use parking_lot::Mutex as ParkingMutex;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// UI-side retry storage is separate from the bounded PTY writer, but must be
+/// bounded as well: a stopped child plus key repeat must not grow memory
+/// forever. Clipboard payloads that cannot fit remain in the paste-confirm
+/// flow instead of entering this queue.
+pub const PENDING_INPUT_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+fn append_bounded_input(buffer: &mut Vec<u8>, input: &[u8], cap: usize) -> bool {
+    let Some(total) = buffer.len().checked_add(input.len()) else {
+        return false;
+    };
+    if total > cap {
+        return false;
+    }
+    buffer.extend_from_slice(input);
+    true
+}
+
 /// Generate a unique session ID for rsh session persistence.
 pub fn generate_session_id() -> String {
     let ts = SystemTime::now()
@@ -55,6 +72,11 @@ pub struct Session {
     pub metadata: SessionMetadata,
     pub terminal: Arc<ParkingMutex<TerminalState>>,
     pub shell: ShellSession,
+    /// User input accepted by the UI but not yet admitted to this session's
+    /// bounded PTY write queue. Keeping the retry buffer on the session is a
+    /// correctness boundary: switching tabs while the writer is backpressured
+    /// must never deliver bytes to a different shell.
+    pub pending_input: Vec<u8>,
     /// PTY output that exceeded the per-frame parsing budget.
     ///
     /// This must live on the session rather than on `TerminalApp`: a tab switch
@@ -65,6 +87,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Append bytes to this session's strict input FIFO without crossing its
+    /// memory cap. `false` guarantees that no byte was appended.
+    pub fn queue_input(&mut self, input: &[u8]) -> bool {
+        append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP)
+    }
+
     pub fn new(
         name: String,
         tags: Vec<String>,
@@ -75,6 +103,7 @@ impl Session {
             metadata: SessionMetadata::new(name, tags),
             terminal,
             shell,
+            pending_input: Vec::new(),
             pending_output: Vec::new(),
         }
     }
@@ -110,5 +139,14 @@ mod tests {
     fn test_default_name() {
         assert_eq!(SessionMetadata::default_name(0), "Session 1");
         assert_eq!(SessionMetadata::default_name(5), "Session 6");
+    }
+
+    #[test]
+    fn pending_input_cap_is_atomic() {
+        let mut pending = b"old".to_vec();
+        assert!(append_bounded_input(&mut pending, b"12", 5));
+        assert_eq!(pending, b"old12");
+        assert!(!append_bounded_input(&mut pending, b"x", 5));
+        assert_eq!(pending, b"old12");
     }
 }

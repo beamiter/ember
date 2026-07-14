@@ -18,6 +18,10 @@ impl TerminalApp {
             self.config_save_pending = false;
             if let Err(e) = self.config.save() {
                 eprintln!("[Config] Failed to save: {}", e);
+            } else {
+                // Record our own write immediately so the hot-reload watcher
+                // does not treat it as an external edit in the same frame.
+                self.config_last_mtime = config::Config::config_mtime();
             }
         }
     }
@@ -45,7 +49,13 @@ impl TerminalApp {
     pub fn flush_session_save(&mut self) {
         if self.session_save_pending && std::time::Instant::now() >= self.session_save_deadline {
             self.session_save_pending = false;
-            if let Ok(path) = config::Config::session_history_path() {
+            // Only the process holding the instance lock owns the shared
+            // snapshot. A secondary window must not overwrite the primary
+            // instance's complete session list when it exits or changes tabs.
+            if self._lock_file.is_none() {
+                return;
+            }
+            if let Ok(path) = self.config.resolved_session_history_path() {
                 let _ = session_persistence::ensure_session_history_dir(&path);
                 let snapshots = self.session_manager.get_session_snapshots();
                 let active_index = Some(self.session_manager.active_index());
@@ -58,7 +68,7 @@ impl TerminalApp {
         }
     }
 
-    pub fn check_config_hot_reload(&mut self) {
+    pub fn check_config_hot_reload(&mut self, ctx: &eframe::egui::Context) {
         let now = std::time::Instant::now();
         if now.duration_since(self.config_last_check) < std::time::Duration::from_secs(2) {
             return;
@@ -79,9 +89,21 @@ impl TerminalApp {
         if let Ok(config_path) = config::Config::config_path() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 match toml::from_str::<config::Config>(&content) {
-                    Ok(new_config) => {
-                        self.apply_hot_reload(&new_config);
+                    Ok(mut new_config) => {
+                        let mut notes = new_config.normalize();
+                        notes.extend(self.apply_hot_reload(new_config, ctx));
                         eprintln!("[Config] Hot-reloaded from {}", config_path.display());
+                        if notes.is_empty() {
+                            self.set_status("配置已热重载");
+                        } else {
+                            for note in &notes {
+                                eprintln!("[Config] WARNING: {}", note);
+                            }
+                            self.set_status_for(
+                                format!("配置已重载（{} 项已调整）", notes.len()),
+                                std::time::Duration::from_secs(5),
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("[Config] Hot-reload parse error: {}", e);
@@ -95,58 +117,45 @@ impl TerminalApp {
         }
     }
 
-    fn apply_hot_reload(&mut self, new: &config::Config) {
-        // 热重载来自磁盘上用户手改的文件,先 clamp 到合法范围,避免非法值
-        // (负 padding、>1 不透明度、0 字号等)破坏渲染。
-        let mut new = new.clone();
-        new.font_size = config::Config::clamp_font_size(new.font_size);
-        new.opacity = new.opacity.clamp(0.0, 1.0);
-        new.padding = new.padding.clamp(0.0, 100.0);
-        new.line_spacing = new.line_spacing.clamp(0.5, 3.0);
-        // scroll_speed 为 0 会让滚轮完全失效,过大则一格滚太多;钳到合理范围。
-        new.scroll_speed = new.scroll_speed.clamp(1, 50);
-        let new = &new;
-        let old = &self.config;
+    fn apply_hot_reload(
+        &mut self,
+        mut new: config::Config,
+        ctx: &eframe::egui::Context,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        let font_changed = new.font_family != self.config.font_family
+            || new.font_backend != self.config.font_backend
+            || (new.font_size - self.config.font_size).abs() > 0.01
+            || (new.font_weight - self.config.font_weight).abs() > 0.01
+            || (new.font_sharpness - self.config.font_sharpness).abs() > 0.01
+            || (new.line_spacing - self.config.line_spacing).abs() > 0.01
+            || new.subpixel_rendering != self.config.subpixel_rendering
+            || new.font_ligatures != self.config.font_ligatures;
 
-        let font_size_changed = (new.font_size - old.font_size).abs() > 0.01;
-        let theme_changed = new.theme != old.theme;
-        let opacity_changed = (new.opacity - old.opacity).abs() > 0.001;
-        let padding_changed = (new.padding - old.padding).abs() > 0.01;
-        let line_spacing_changed = (new.line_spacing - old.line_spacing).abs() > 0.01;
-        let scrollback_changed = new.scrollback_lines != old.scrollback_lines;
-        let scroll_speed_changed = new.scroll_speed != old.scroll_speed;
-
-        if font_size_changed {
-            self.config.font_size = new.font_size;
-            self.renderer.invalidate_font_cache();
-            for pr in &mut self.pane_renderers {
-                pr.invalidate_font_cache();
-            }
-        }
-        if theme_changed {
-            self.config.theme = new.theme.clone();
+        if new.theme != self.config.theme {
             if let Some(theme) = crate::theme::Theme::get_theme(&new.theme) {
                 self.current_theme = theme;
+            } else {
+                notes.push(format!(
+                    "theme '{}' was not found; keeping '{}'",
+                    new.theme, self.config.theme
+                ));
+                new.theme = self.config.theme.clone();
             }
         }
-        if opacity_changed {
-            self.config.opacity = new.opacity;
-        }
-        if padding_changed {
-            self.config.padding = new.padding;
-        }
-        if line_spacing_changed {
-            self.config.line_spacing = new.line_spacing;
+
+        if font_changed {
             self.renderer.invalidate_font_cache();
             for pr in &mut self.pane_renderers {
                 pr.invalidate_font_cache();
             }
         }
-        if scrollback_changed {
-            self.config.scrollback_lines = new.scrollback_lines;
-        }
-        if scroll_speed_changed {
-            self.config.scroll_speed = new.scroll_speed;
-        }
+
+        let configured_shell = std::env::var("JTERM2_SHELL").ok().or(new.shell.clone());
+        self.session_manager.set_configured_shell(configured_shell);
+        self.config = new;
+        self.config_panel.sync_from_config(&self.config);
+        self.apply_runtime_config(ctx);
+        notes
     }
 }

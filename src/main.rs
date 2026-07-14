@@ -37,11 +37,13 @@ use clipboard::{ClipboardContent, ClipboardManager};
 use eframe::egui;
 use parking_lot::Mutex as ParkingMutex;
 use session::Session;
-use session_manager::SessionManager;
+use session_manager::{ProtocolResponseQueueError, ProtocolResponseSender, SessionManager};
 use shell::{ShellEvent, ShellSession};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +52,10 @@ use ui::{grid_position_from_content, TerminalRenderer};
 
 // 全局标志，用于信号处理
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static NEXT_KITTY_PASTE_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
+#[cfg(test)]
+const KITTY_BASE64_CHUNK_BYTES: usize = 4096;
 
 /// 设置信号处理器，确保收到SIGINT/SIGTERM时能正常退出
 /// 这允许Drop逻辑执行，从而清理所有rsh子进程
@@ -79,63 +85,6 @@ fn setup_signal_handlers() {
 #[cfg(not(unix))]
 fn setup_signal_handlers() {
     // Windows平台暂不支持
-}
-
-fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
-    if data.len() < 4 {
-        crate::debug_log!("[MIME] data too short: {} bytes", data.len());
-        return None;
-    }
-
-    // PNG: 89 50 4E 47
-    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-        crate::debug_log!("[MIME] detected PNG");
-        return Some("image/png");
-    }
-
-    // JPEG: FF D8
-    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
-        crate::debug_log!("[MIME] detected JPEG");
-        return Some("image/jpeg");
-    }
-
-    // GIF: 47 49 46 (GIF)
-    if data.len() >= 3 && &data[0..3] == b"GIF" {
-        crate::debug_log!("[MIME] detected GIF");
-        return Some("image/gif");
-    }
-
-    // WebP: RIFF...WEBP
-    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        crate::debug_log!("[MIME] detected WebP");
-        return Some("image/webp");
-    }
-
-    // BMP: 42 4D (BM)
-    if data.len() >= 2 && data[0] == 0x42 && data[1] == 0x4D {
-        crate::debug_log!("[MIME] detected BMP");
-        return Some("image/bmp");
-    }
-
-    // 未识别的格式，显示前几个字节
-    let _hex_preview = if data.len() >= 8 {
-        format!(
-            "{:02X} {:02X} {:02X} {:02X} ...",
-            data[0], data[1], data[2], data[3]
-        )
-    } else {
-        data.iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_string()
-    };
-    crate::debug_log!(
-        "[MIME] unknown format ({}bytes): {}",
-        data.len(),
-        _hex_preview
-    );
-    None
 }
 
 fn register_font_family(
@@ -354,8 +303,13 @@ fn load_matching_fallback_fonts(
 }
 
 /// 从 PNG 数据中提取宽度和高度
+#[cfg(test)]
 fn extract_png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    if data.len() < 24 {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < 24
+        || !data.starts_with(PNG_SIGNATURE)
+        || data.get(12..16) != Some(b"IHDR".as_slice())
+    {
         return None;
     }
 
@@ -363,55 +317,65 @@ fn extract_png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
     let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
 
+    if width == 0 || height == 0 {
+        return None;
+    }
+
     crate::debug_log!("[KITTY] PNG dimensions: {}x{}", width, height);
     Some((width, height))
 }
 
-/// 生成 Kitty 图像协议数据包
-fn kitty_graphics_payload(mime_type: &str, data: &[u8]) -> Vec<u8> {
+#[cfg(test)]
+fn next_kitty_paste_image_id() -> u32 {
+    loop {
+        let id = NEXT_KITTY_PASTE_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+/// Encode a PNG as standard Kitty direct-transfer APC chunks, followed by a
+/// separate put command. Each base64 payload is at most 4096 bytes; the final
+/// transfer chunk uses m=0 and retains normal RFC 4648 padding.
+#[cfg(test)]
+fn kitty_graphics_payload(mime_type: &str, data: &[u8]) -> Option<Vec<u8>> {
     crate::debug_log!(
         "[KITTY] generating payload: mime_type={}, data_size={}",
         mime_type,
         data.len()
     );
 
-    let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(data);
+    if mime_type != "image/png" || extract_png_dimensions(data).is_none() {
+        return None;
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     crate::debug_log!(
         "[KITTY] encoded data size (base64): {} bytes",
         encoded.len()
     );
 
-    let mut output = Vec::new();
-
-    // 获取尺寸（如果是 PNG）
-    let (width, height) = if mime_type == "image/png" {
-        extract_png_dimensions(data).unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
-
-    // Kitty 图像协议：ESC _ G id=1,s=WIDTH,v=HEIGHT,mime=image/png;BASE64_DATA ESC \
-    output.extend_from_slice(b"\x1b_G");
-
-    if width > 0 && height > 0 {
-        output.extend_from_slice(format!("s={},v={},", width, height).as_bytes());
+    let image_id = next_kitty_paste_image_id();
+    let chunks: Vec<&[u8]> = encoded
+        .as_bytes()
+        .chunks(KITTY_BASE64_CHUNK_BYTES)
+        .collect();
+    let mut output = Vec::with_capacity(encoded.len() + chunks.len() * 32 + 48);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let more = u8::from(index + 1 < chunks.len());
+        if index == 0 {
+            output.extend_from_slice(format!("\x1b_Ga=t,f=100,i={image_id},m={more};").as_bytes());
+        } else {
+            output.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+        }
+        output.extend_from_slice(chunk);
+        output.extend_from_slice(b"\x1b\\");
     }
-
-    output.extend_from_slice(b"m=1,"); // m=1: more data coming (or action)
-
-    // 添加 mime 类型（可选，但有助于解析）
-    let mime_encoded =
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(mime_type.as_bytes());
-    output.extend_from_slice(format!("m={};", mime_encoded).as_bytes());
-
-    // 添加 base64 编码的数据
-    output.extend_from_slice(encoded.as_bytes());
-
-    // 结束符
-    output.extend_from_slice(b"\x1b\\");
+    output.extend_from_slice(format!("\x1b_Ga=p,i={image_id}\x1b\\").as_bytes());
 
     crate::debug_log!("[KITTY] final packet size: {} bytes", output.len());
-    output
+    Some(output)
 }
 
 fn configure_fonts_and_gpu(
@@ -565,50 +529,15 @@ fn configure_fonts_and_gpu(
             &fallback_font_data,
             font_size_px,
         );
-        let color_atlas_placeholder =
-            render_state
-                .device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("color_atlas_init"),
-                    size: wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-        let color_atlas_view =
-            color_atlas_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
-        let color_atlas_sampler = render_state
-            .device
-            .create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("color_atlas_sampler_init"),
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            });
-
-        let pipeline = gpu::pipeline::GridPipeline::new(
-            &render_state.device,
-            render_state.target_format,
-            atlas.gpu_resources().0,
-            atlas.gpu_resources().1,
-            &color_atlas_view,
-            &color_atlas_sampler,
-        );
+        let pipeline =
+            gpu::pipeline::GridPipeline::new(&render_state.device, render_state.target_format);
 
         let mut renderer = render_state.renderer.write();
         if let Some(gpu_res) = renderer
             .callback_resources
             .get_mut::<gpu::callback::GpuResources>()
         {
-            gpu_res.atlas = atlas;
-            gpu_res.pipeline = pipeline;
+            gpu_res.replace_font_resources(atlas, pipeline);
         } else {
             let gpu_resources =
                 gpu::callback::GpuResources::new(atlas, pipeline, &render_state.device);
@@ -717,6 +646,7 @@ fn shell_single_quote(s: &str) -> String {
 ///   foot-gun is a multi-line block that runs commands without review;
 /// - large payloads (> [`PASTE_CONFIRM_THRESHOLD_BYTES`]) that the user
 ///   probably wants to look at before unleashing.
+///
 /// Bracketed-paste mode is *not* enough on its own: the receiving program
 /// (e.g. plain `bash`) may still execute on the first newline.
 fn should_confirm_paste(text: &str) -> bool {
@@ -726,13 +656,12 @@ fn should_confirm_paste(text: &str) -> bool {
 fn paste_text_into_session(
     session: &mut Session,
     text: String,
-    active_session_idx: usize,
     paste_confirm: bool,
     pending_paste_confirm: &mut Option<crate::app::state::PendingPasteConfirm>,
-) -> bool {
+) -> Result<bool, crate::shell::ShellWriteError> {
     let normalized = text.replace("\r\n", "\n");
     if normalized.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let bracketed_paste = {
@@ -743,20 +672,32 @@ fn paste_text_into_session(
     if paste_confirm && should_confirm_paste(&normalized) {
         *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
             text: normalized,
-            session_idx: active_session_idx,
+            session_id: session.metadata.session_id.clone(),
             bracketed: bracketed_paste,
         });
     } else {
-        let bytes = normalized.into_bytes();
+        // Retain the normalized source until the all-or-nothing shell enqueue
+        // succeeds. On transient backpressure the confirmation flow becomes a
+        // durable retry surface even when confirmations were otherwise off.
+        let bytes = normalized.as_bytes().to_vec();
         let paste_bytes = if bracketed_paste {
             wrap_bracketed_paste(bytes)
         } else {
             bytes
         };
-        let _ = session.shell.write(&paste_bytes);
+        if let Err(error) = session.shell.write(&paste_bytes) {
+            if error.is_backpressure() {
+                *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
+                    text: normalized,
+                    session_id: session.metadata.session_id.clone(),
+                    bracketed: bracketed_paste,
+                });
+            }
+            return Err(error);
+        }
     }
 
-    true
+    Ok(true)
 }
 
 fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
@@ -792,22 +733,571 @@ fn osc_5522_packet(metadata: &str, payload: Option<&str>) -> Vec<u8> {
     packet
 }
 
+const OSC_5522_DATA_CHUNK_BYTES: usize = 4096;
+const MAX_OSC_5522_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+struct ClipboardRequestGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ClipboardRequestGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn enqueue_terminal_protocol_response(
+    response_tx: &ProtocolResponseSender,
+    terminal: &Arc<ParkingMutex<TerminalState>>,
+    response: Vec<u8>,
+    context: &str,
+) {
+    if let Err((error, mut response)) = response_tx.try_enqueue_critical(response) {
+        if error == ProtocolResponseQueueError::Full {
+            // The parser pump stops while the per-session queue is non-empty,
+            // so this bounded batch is retried before any newer PTY requests
+            // are accepted. Prepend to preserve response order.
+            let mut terminal = terminal.lock();
+            response.append(&mut terminal.output_buffer);
+            terminal.output_buffer = response;
+        } else {
+            log::debug!("{context} cancelled: {error}");
+        }
+    }
+}
+
+/// Worker responses wait for space in the bounded per-session protocol FIFO,
+/// so transient shell-writer pressure cannot lose an accepted query. The
+/// clipboard reader is globally single-flight and closing a session wakes the
+/// waiter. Only a permanently oversized response is replaced with the small
+/// protocol-specific failure response.
+fn enqueue_worker_protocol_response(
+    response_tx: &ProtocolResponseSender,
+    response: Vec<u8>,
+    fallback: Vec<u8>,
+    context: &str,
+) {
+    match response_tx.enqueue_blocking(response) {
+        Ok(()) => {}
+        Err(ProtocolResponseQueueError::Closed) => {
+            log::debug!("{context} target session closed before its response was queued");
+        }
+        Err(error) => {
+            log::warn!("{context} response replaced by bounded fallback: {error}");
+            if let Err(fallback_error) = response_tx.enqueue_blocking(fallback) {
+                log::debug!("{context} fallback was cancelled: {fallback_error}");
+            }
+        }
+    }
+}
+
+fn send_osc5522_worker_response(response_tx: &ProtocolResponseSender, response: Vec<u8>) {
+    enqueue_worker_protocol_response(
+        response_tx,
+        response,
+        osc_5522_packet("type=read:status=EBUSY", None),
+        "OSC 5522",
+    );
+}
+
+fn service_osc5522_clipboard_requests(
+    clipboard_available: bool,
+    in_flight: &Arc<AtomicBool>,
+    terminal: Arc<ParkingMutex<TerminalState>>,
+    response_tx: ProtocolResponseSender,
+    mut requests: Vec<terminal::ClipboardReadRequest>,
+) {
+    if requests.is_empty() {
+        return;
+    }
+    if !clipboard_available {
+        for _ in &requests {
+            enqueue_terminal_protocol_response(
+                &response_tx,
+                &terminal,
+                osc_5522_packet("type=read:status=ENOSYS", None),
+                "OSC 5522 ENOSYS response",
+            );
+        }
+        return;
+    }
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        for _ in &requests {
+            enqueue_terminal_protocol_response(
+                &response_tx,
+                &terminal,
+                osc_5522_packet("type=read:status=EBUSY", None),
+                "OSC 5522 busy response",
+            );
+        }
+        return;
+    }
+
+    let in_flight_for_thread = Arc::clone(in_flight);
+    let error_tx = response_tx.clone();
+    let error_terminal = Arc::clone(&terminal);
+    let request_count = requests.len();
+    let spawn_result = std::thread::Builder::new()
+        .name("clipboard-request-handler".to_string())
+        .spawn(move || {
+            let _guard = ClipboardRequestGuard(in_flight_for_thread);
+            let Ok(clipboard) = ClipboardManager::new() else {
+                crate::debug_log!("[OSC5522] Failed to create clipboard manager");
+                for _ in 0..request_count {
+                    send_osc5522_worker_response(
+                        &response_tx,
+                        osc_5522_packet("type=read:status=ENOSYS", None),
+                    );
+                }
+                return;
+            };
+
+            for request in requests.drain(..) {
+                let terminal::ClipboardReadKind::MimeData(mime_type) = request.kind;
+                let data = clipboard.read_mime(&mime_type).unwrap_or_default();
+                let response = if data.is_empty() {
+                    osc_5522_packet("type=read:status=ENOSYS", None)
+                } else {
+                    clipboard_5522_response_for_mime(&mime_type, &data)
+                };
+                crate::debug_log!(
+                    "[OSC5522] responding to mime request mime={} bytes={}",
+                    mime_type,
+                    data.len()
+                );
+                send_osc5522_worker_response(&response_tx, response);
+            }
+        });
+    if let Err(error) = spawn_result {
+        in_flight.store(false, Ordering::Release);
+        log::warn!("failed to spawn OSC 5522 clipboard handler: {error}");
+        for _ in 0..request_count {
+            enqueue_terminal_protocol_response(
+                &error_tx,
+                &error_terminal,
+                osc_5522_packet("type=read:status=ENOSYS", None),
+                "OSC 5522 spawn-error response",
+            );
+        }
+    }
+}
+
 fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
+    clipboard_5522_response_for_mime_with_limit(mime_type, data, MAX_OSC_5522_RESPONSE_BYTES)
+}
+
+fn clipboard_5522_response_for_mime_with_limit(
+    mime_type: &str,
+    data: &[u8],
+    max_bytes: usize,
+) -> Vec<u8> {
+    if data.len() > max_bytes {
+        // OSC 5522 has no dedicated "too large" read error. EPERM is the
+        // closest truthful response: terminal policy denied this read.
+        return osc_5522_packet("type=read:status=EPERM", None);
+    }
+
     let encoded_mime = base64::engine::general_purpose::STANDARD.encode(mime_type.as_bytes());
-    let encoded_data = base64::engine::general_purpose::STANDARD.encode(data);
     let mut output = Vec::new();
     output.extend_from_slice(&osc_5522_packet("type=read:status=OK", None));
-    output.extend_from_slice(&osc_5522_packet(
-        &format!("type=read:status=DATA:mime={}", encoded_mime),
-        Some(&encoded_data),
-    ));
+    for chunk in data.chunks(OSC_5522_DATA_CHUNK_BYTES) {
+        let encoded_data = base64::engine::general_purpose::STANDARD.encode(chunk);
+        output.extend_from_slice(&osc_5522_packet(
+            &format!("type=read:status=DATA:mime={}", encoded_mime),
+            Some(&encoded_data),
+        ));
+    }
     output.extend_from_slice(&osc_5522_packet("type=read:status=DONE", None));
     output
+}
+
+fn link_at_pointer(
+    links: &[link::Link],
+    pointer: egui::Pos2,
+    content_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    cols: usize,
+    rows: usize,
+) -> Option<link::Link> {
+    if !content_rect.contains(pointer) || cols == 0 || rows == 0 {
+        return None;
+    }
+    let (row, col) =
+        grid_position_from_content(pointer, content_rect, char_width, line_height, cols, rows);
+    links
+        .iter()
+        .find(|link| link.line == row && col >= link.col_start && col < link.col_end)
+        .cloned()
+}
+
+fn show_desktop_notification(
+    window_started: &mut std::time::Instant,
+    notifications_in_window: &mut usize,
+    title: String,
+    body: String,
+) {
+    const WINDOW: Duration = Duration::from_secs(5);
+    const MAX_PER_WINDOW: usize = 4;
+
+    let now = std::time::Instant::now();
+    if now.duration_since(*window_started) >= WINDOW {
+        *window_started = now;
+        *notifications_in_window = 0;
+    }
+    if *notifications_in_window >= MAX_PER_WINDOW {
+        return;
+    }
+    *notifications_in_window += 1;
+    if let Err(error) = std::process::Command::new("notify-send")
+        .arg("--")
+        .arg(title)
+        .arg(body)
+        .spawn()
+    {
+        log::debug!("desktop notification unavailable: {error}");
+    }
+}
+
+fn reported_capture_button(capture: Option<(bool, u8)>) -> Option<u8> {
+    capture.and_then(|(reported_to_app, button)| reported_to_app.then_some(button))
+}
+
+const MAX_MOUSE_WHEEL_REPORTS_PER_FRAME: isize = 64;
+
+fn bounded_wheel_step_accumulate(current: isize, delta: f32, multiplier: usize) -> isize {
+    let multiplier = isize::try_from(multiplier).unwrap_or(isize::MAX);
+    current
+        .saturating_add((delta.round() as isize).saturating_mul(multiplier))
+        .clamp(
+            -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+            MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+        )
+}
+
+fn captured_release_button(
+    capture: Option<(bool, u8)>,
+    released: &[u8],
+    pointer_any_down: bool,
+) -> Option<u8> {
+    reported_capture_button(capture).filter(|button| released.contains(button) || !pointer_any_down)
+}
+
+fn queue_mouse_control(
+    queue: &mut std::collections::VecDeque<crate::app::state::PendingMouseControl>,
+    kind: crate::app::state::PendingMouseControlKind,
+    bytes: Vec<u8>,
+) {
+    if !queue.iter().any(|pending| pending.kind == kind) {
+        queue.push_back(crate::app::state::PendingMouseControl { kind, bytes });
+    }
+}
+
+fn flush_pending_mouse_controls<E>(
+    queue: &mut std::collections::VecDeque<crate::app::state::PendingMouseControl>,
+    press_accepted: &mut bool,
+    mut send: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    while let Some(pending) = queue.front() {
+        send(&pending.bytes)?;
+        let accepted = queue.pop_front().expect("front existed above");
+        if accepted.kind == crate::app::state::PendingMouseControlKind::Press {
+            *press_accepted = true;
+        }
+    }
+    Ok(())
+}
+
+fn flush_mouse_controls(
+    capture: &mut crate::app::state::TerminalMouseCapture,
+) -> Result<(), crate::shell::ShellWriteError> {
+    let write_tx = capture.write_tx.clone();
+    flush_pending_mouse_controls(
+        &mut capture.pending_controls,
+        &mut capture.press_accepted,
+        |bytes| write_tx.try_send(bytes.to_vec()),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryCopyRoute {
+    None,
+    CapturedLocal,
+    Generic,
+    SuppressCaptured,
+}
+
+fn primary_copy_route(
+    capture: Option<(bool, bool, u8)>,
+    capture_finished: bool,
+    primary_released: bool,
+) -> PrimaryCopyRoute {
+    match capture {
+        Some((reported_to_app, local_selection_cancelled, 0)) if capture_finished => {
+            if !reported_to_app && !local_selection_cancelled {
+                PrimaryCopyRoute::CapturedLocal
+            } else {
+                PrimaryCopyRoute::SuppressCaptured
+            }
+        }
+        _ if primary_released => PrimaryCopyRoute::Generic,
+        _ => PrimaryCopyRoute::None,
+    }
+}
+
+fn take_tagged_cursor_move(
+    target: &mut Option<usize>,
+    bytes: &mut Vec<u8>,
+) -> Option<(usize, Vec<u8>)> {
+    let target = target.take();
+    let bytes = std::mem::take(bytes);
+    if bytes.is_empty() {
+        None
+    } else {
+        target.map(|target| (target, bytes))
+    }
+}
+
+fn mouse_capture_allows_lossy(capture: Option<&crate::app::state::TerminalMouseCapture>) -> bool {
+    capture.is_none_or(|capture| {
+        mouse_sequence_allows_lossy(
+            capture.reported_to_app,
+            capture.press_accepted,
+            capture.release_observed,
+            capture.pending_controls.is_empty(),
+        )
+    })
+}
+
+fn mouse_capture_is_complete(capture: &crate::app::state::TerminalMouseCapture) -> bool {
+    mouse_sequence_is_complete(
+        capture.reported_to_app,
+        capture.press_accepted,
+        capture.release_observed,
+        capture.pending_controls.is_empty(),
+    )
+}
+
+fn mouse_sequence_allows_lossy(
+    reported_to_app: bool,
+    press_accepted: bool,
+    release_observed: bool,
+    controls_empty: bool,
+) -> bool {
+    !reported_to_app || (press_accepted && !release_observed && controls_empty)
+}
+
+fn mouse_sequence_is_complete(
+    reported_to_app: bool,
+    press_accepted: bool,
+    release_observed: bool,
+    controls_empty: bool,
+) -> bool {
+    release_observed && (!reported_to_app || (press_accepted && controls_empty))
+}
+
+fn spawn_osc52_clipboard_writer(
+    clipboard_available: bool,
+) -> Option<crossbeam::channel::Sender<String>> {
+    if !clipboard_available {
+        return None;
+    }
+    let (tx, rx) = crossbeam::channel::bounded::<String>(1);
+    std::thread::Builder::new()
+        .name("osc52-clipboard-writer".to_string())
+        .spawn(move || {
+            let Ok(clipboard) = ClipboardManager::new() else {
+                return;
+            };
+            while let Ok(text) = rx.recv() {
+                if let Err(error) = clipboard.copy(&text) {
+                    log::warn!("OSC 52 clipboard write failed: {error}");
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
+fn enqueue_osc52_clipboard_write(
+    tx: Option<&crossbeam::channel::Sender<String>>,
+    window_started: &mut std::time::Instant,
+    writes_in_window: &mut usize,
+    text: String,
+) {
+    const WINDOW: Duration = Duration::from_secs(1);
+    const MAX_WRITES_PER_WINDOW: usize = 2;
+
+    let now = std::time::Instant::now();
+    if now.duration_since(*window_started) >= WINDOW {
+        *window_started = now;
+        *writes_in_window = 0;
+    }
+    let Some(tx) = tx else {
+        return;
+    };
+    if *writes_in_window >= MAX_WRITES_PER_WINDOW {
+        return;
+    }
+    if tx.try_send(text).is_ok() {
+        *writes_in_window += 1;
+    }
+}
+
+const MAX_OSC52_CLIPBOARD_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const OSC52_READ_RATE_WINDOW: Duration = Duration::from_secs(1);
+const MAX_OSC52_READS_PER_WINDOW: usize = 2;
+
+fn osc52_clipboard_response_with_limit(content: &str, max_response_bytes: usize) -> Vec<u8> {
+    const PREFIX: &[u8] = b"\x1b]52;c;";
+    const TERMINATOR: &[u8] = b"\x1b\\";
+    let overhead = PREFIX.len() + TERMINATOR.len();
+    if max_response_bytes < overhead {
+        return Vec::new();
+    }
+
+    let encoded_len = content
+        .len()
+        .checked_add(2)
+        .map(|length| length / 3)
+        .and_then(|length| length.checked_mul(4));
+    let content = if encoded_len.is_some_and(|length| length <= max_response_bytes - overhead) {
+        content
+    } else {
+        // OSC 52 has no standardized error response. Replying with an empty
+        // selection is bounded and lets a querying application stop waiting.
+        ""
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    let mut response = Vec::with_capacity(overhead + encoded.len());
+    response.extend_from_slice(PREFIX);
+    response.extend_from_slice(encoded.as_bytes());
+    response.extend_from_slice(TERMINATOR);
+    response
+}
+
+fn osc52_read_rate_limit_allows(
+    now: std::time::Instant,
+    window_started: &mut std::time::Instant,
+    reads_in_window: &mut usize,
+) -> bool {
+    if now.duration_since(*window_started) >= OSC52_READ_RATE_WINDOW {
+        *window_started = now;
+        *reads_in_window = 0;
+    }
+    if *reads_in_window >= MAX_OSC52_READS_PER_WINDOW {
+        return false;
+    }
+    *reads_in_window += 1;
+    true
+}
+
+fn service_osc52_clipboard_query(
+    clipboard_available: bool,
+    in_flight: &Arc<AtomicBool>,
+    terminal: Arc<ParkingMutex<TerminalState>>,
+    response_tx: ProtocolResponseSender,
+    window_started: &mut std::time::Instant,
+    reads_in_window: &mut usize,
+) {
+    let empty_response =
+        || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES);
+    if !osc52_read_rate_limit_allows(std::time::Instant::now(), window_started, reads_in_window)
+        || !clipboard_available
+    {
+        enqueue_terminal_protocol_response(
+            &response_tx,
+            &terminal,
+            empty_response(),
+            "OSC 52 empty response",
+        );
+        return;
+    }
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        enqueue_terminal_protocol_response(
+            &response_tx,
+            &terminal,
+            empty_response(),
+            "OSC 52 busy response",
+        );
+        return;
+    }
+
+    let in_flight_for_thread = Arc::clone(in_flight);
+    let error_tx = response_tx.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("osc52-clipboard-reader".to_string())
+        .spawn(move || {
+            let _guard = ClipboardRequestGuard(in_flight_for_thread);
+            let content = ClipboardManager::new()
+                .and_then(|clipboard| clipboard.paste())
+                .unwrap_or_default();
+            let response =
+                osc52_clipboard_response_with_limit(&content, MAX_OSC52_CLIPBOARD_RESPONSE_BYTES);
+            let fallback =
+                osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES);
+            enqueue_worker_protocol_response(&response_tx, response, fallback, "OSC 52");
+        });
+    if let Err(error) = spawn_result {
+        in_flight.store(false, Ordering::Release);
+        log::warn!("failed to spawn OSC 52 clipboard reader: {error}");
+        enqueue_terminal_protocol_response(
+            &error_tx,
+            &terminal,
+            empty_response(),
+            "OSC 52 spawn-error response",
+        );
+    }
 }
 
 // key_to_string and build_keybinding_string moved to app::events module
 
 impl TerminalApp {
+    /// Route click-to-cursor arrows produced by the previous render before
+    /// collecting any input from this frame. The terminal pointer is a stable
+    /// identity tag while the session owns its `Arc`; stale/unroutable bytes
+    /// are discarded instead of being delivered to a replacement PTY.
+    fn stage_prior_cursor_moves(&mut self, terminal_input_blocked: bool) -> (bool, bool) {
+        let mut tagged_moves = Vec::with_capacity(self.pane_renderers.len() + 1);
+        if let Some(tagged) = take_tagged_cursor_move(
+            &mut self.renderer.cursor_move_terminal_ptr,
+            &mut self.renderer.cursor_move_input,
+        ) {
+            tagged_moves.push(tagged);
+        }
+        for renderer in &mut self.pane_renderers {
+            if let Some(tagged) = take_tagged_cursor_move(
+                &mut renderer.cursor_move_terminal_ptr,
+                &mut renderer.cursor_move_input,
+            ) {
+                tagged_moves.push(tagged);
+            }
+        }
+
+        if terminal_input_blocked {
+            return (false, false);
+        }
+
+        let mut had_input = false;
+        let mut overflow = false;
+        for (target, bytes) in tagged_moves {
+            let routed = self
+                .session_manager
+                .sessions_mut()
+                .iter_mut()
+                .find(|session| Arc::as_ptr(&session.terminal) as usize == target);
+            if let Some(session) = routed {
+                had_input = true;
+                overflow |= !session.queue_input(&bytes);
+            }
+        }
+        (had_input, overflow)
+    }
+
     fn new(
         cfg: &config::Config,
         repaint_ctx: egui::Context,
@@ -828,7 +1318,7 @@ impl TerminalApp {
 
         // 仅在首个实例且配置允许时恢复会话
         let saved_snapshot = if cfg.restore_session && is_first_instance {
-            config::Config::session_history_path()
+            cfg.resolved_session_history_path()
                 .ok()
                 .and_then(|path| session_persistence::SessionsSnapshot::load(&path).ok())
                 .filter(|s| !s.sessions.is_empty())
@@ -903,6 +1393,7 @@ impl TerminalApp {
         }
 
         let clipboard = ClipboardManager::new().ok();
+        let osc52_clipboard_write_tx = spawn_osc52_clipboard_writer(clipboard.is_some());
 
         let keybindings = keybindings::KeyBindings::load().unwrap_or_default();
 
@@ -956,9 +1447,14 @@ impl TerminalApp {
 
         Ok(TerminalApp {
             session_manager,
-            input_queue: Arc::new(ParkingMutex::new(Vec::new())),
             renderer,
             clipboard,
+            clipboard_request_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            osc52_clipboard_write_tx,
+            osc52_write_window_started: std::time::Instant::now(),
+            osc52_writes_in_window: 0,
+            osc52_read_window_started: std::time::Instant::now(),
+            osc52_reads_in_window: 0,
             cols,
             rows,
             next_cursor_blink_time: std::time::Instant::now() + Duration::from_millis(1000),
@@ -1004,6 +1500,8 @@ impl TerminalApp {
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             _lock_file: lock_file,
             mouse_scroll_accumulator: 0.0,
+            terminal_mouse_capture: None,
+            last_terminal_mouse_motion: None,
             font_size_accumulator: 0.0,
             had_ctrl_scroll_last_frame: false,
             frame_events: Vec::new(),
@@ -1015,6 +1513,8 @@ impl TerminalApp {
             smooth_scroll_pixel_offset: 0.0,
             pending_paste_confirm: None,
             paste_dont_ask_again: false,
+            notification_window_started: std::time::Instant::now(),
+            notifications_in_window: 0,
         })
     }
 
@@ -1026,7 +1526,22 @@ impl TerminalApp {
             .unwrap_or_else(|| ctx.native_pixels_per_point().unwrap_or(1.0));
         ctx.set_pixels_per_point(scale);
 
-        configure_fonts_and_gpu(ctx, self.renderer.wgpu_render_state.as_ref(), &self.config);
+        // eframe chooses Glow vs WGPU when the native window is created; that
+        // backend cannot be swapped by hot reload. Keep the newly configured
+        // value for the next launch, but apply all other settings against the
+        // renderer that is actually alive in this process.
+        let runtime_uses_wgpu = self.renderer.wgpu_render_state.is_some();
+        let mut runtime_config = self.config.clone();
+        runtime_config.app_renderer = if runtime_uses_wgpu {
+            config::AppRendererType::Wgpu
+        } else {
+            config::AppRendererType::Glow
+        };
+        configure_fonts_and_gpu(
+            ctx,
+            self.renderer.wgpu_render_state.as_ref(),
+            &runtime_config,
+        );
         apply_theme_visuals(ctx, &self.current_theme);
 
         self.renderer.font_size = self.config.font_size;
@@ -1036,10 +1551,9 @@ impl TerminalApp {
         self.renderer.theme = self.current_theme.clone();
         self.renderer.opacity = self.config.opacity;
         self.renderer.font_ligatures = self.config.font_ligatures;
-        self.renderer.gpu_rendering =
-            matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
-                && self.config.gpu_rendering;
+        self.renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
         self.renderer.sync_font_metrics(ctx);
+        self.renderer.invalidate_font_cache();
 
         for renderer in &mut self.pane_renderers {
             renderer.font_size = self.config.font_size;
@@ -1049,10 +1563,9 @@ impl TerminalApp {
             renderer.theme = self.current_theme.clone();
             renderer.opacity = self.config.opacity;
             renderer.font_ligatures = self.config.font_ligatures;
-            renderer.gpu_rendering =
-                matches!(self.config.app_renderer, config::AppRendererType::Wgpu)
-                    && self.config.gpu_rendering;
+            renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
             renderer.sync_font_metrics(ctx);
+            renderer.invalidate_font_cache();
         }
 
         for session in self.session_manager.sessions_mut() {
@@ -1208,7 +1721,10 @@ impl TerminalApp {
             let quoted = shell_single_quote(&p.to_string_lossy());
             let cmd = format!("cd {}\n", quoted);
             let session = self.session_manager.get_active_session_mut();
-            let _ = session.shell.write(cmd.as_bytes());
+            if let Err(error) = session.shell.write(cmd.as_bytes()) {
+                self.status_message = format!("目录切换命令发送失败：{error}");
+                self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(4));
+            }
             self.sidebar.set_current_dir(p);
         }
         if do_refresh {
@@ -1363,21 +1879,177 @@ impl eframe::App for TerminalApp {
         // 自适应调整帧预算：根据帧时间动态调整每帧处理字节数
         self.adjust_frame_budget();
 
+        // A stateful mouse edge admitted in an earlier frame is older than
+        // every keyboard/IME event arriving now. Retry it before any session
+        // gets a chance to flush user input. If capacity is still unavailable,
+        // keep accepting bytes only into that session's bounded retry buffer
+        // and hold a one-frame admission barrier for the captured writer.
+        let mut retire_mouse_capture = false;
+        let mut prior_mouse_write_error = None;
+        let prior_mouse_control_result = self
+            .terminal_mouse_capture
+            .as_mut()
+            .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
+            .map(flush_mouse_controls);
+        if let Some(Err(error)) = prior_mouse_control_result {
+            retire_mouse_capture = !error.is_backpressure();
+            prior_mouse_write_error = Some(error);
+        }
+        if self
+            .terminal_mouse_capture
+            .as_ref()
+            .is_some_and(mouse_capture_is_complete)
+        {
+            retire_mouse_capture = true;
+        }
+        if retire_mouse_capture {
+            self.terminal_mouse_capture = None;
+            self.last_terminal_mouse_motion = None;
+        }
+        let user_input_barrier_session_id = self
+            .terminal_mouse_capture
+            .as_ref()
+            .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
+            .map(|capture| capture.session_id.clone());
+        if let Some(error) = prior_mouse_write_error {
+            self.set_status_for(format!("鼠标报告发送失败：{error}"), Duration::from_secs(3));
+            if error.is_backpressure() {
+                ctx.request_repaint_after(Duration::from_millis(10));
+            }
+        }
+
+        // Render-time click navigation is tagged with its originating
+        // terminal and staged now, before this frame's IME, Ctrl commands, or
+        // keyboard bytes. A modal that already owned input when the frame
+        // began discards the stale navigation instead.
+        let initially_blocked = self.terminal_input_blocked(ctx);
+        let (has_cursor_move_input, cursor_move_retry_overflow) =
+            self.stage_prior_cursor_moves(initially_blocked);
+
+        // Keep every PTY moving, not just the focused tab. A visible second
+        // pane receives priority, while hidden tabs rotate fairly. Background
+        // parsing consumes at most half of the global adaptive byte budget;
+        // whatever it does not use remains available to the active session.
+        let visible_sessions: Vec<usize> = self
+            .layout_manager
+            .panes()
+            .iter()
+            .map(|pane| pane.session_idx)
+            .collect();
+        let background_budget = if self.session_manager.len() > 1 {
+            self.adaptive_frame_budget / 2
+        } else {
+            0
+        };
+        let mut background_pump = self.session_manager.pump_inactive_sessions(
+            background_budget,
+            &visible_sessions,
+            user_input_barrier_session_id.as_deref(),
+        );
+        for (session_idx, error) in background_pump.errors.drain(..) {
+            log::warn!("background session {}: {}", session_idx + 1, error);
+        }
+        for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
+            let response_tx = self.session_manager.protocol_response_sender(session_idx);
+            if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                if let Some(response_tx) = response_tx {
+                    service_osc5522_clipboard_requests(
+                        self.clipboard.is_some(),
+                        &self.clipboard_request_in_flight,
+                        Arc::clone(&session.terminal),
+                        response_tx,
+                        requests,
+                    );
+                }
+            }
+        }
+        if self.config.osc52_clipboard_write {
+            for (_session_idx, text) in background_pump.osc52_writes.drain(..) {
+                enqueue_osc52_clipboard_write(
+                    self.osc52_clipboard_write_tx.as_ref(),
+                    &mut self.osc52_write_window_started,
+                    &mut self.osc52_writes_in_window,
+                    text,
+                );
+            }
+        }
+        if self.config.osc52_clipboard_read {
+            for session_idx in background_pump.osc52_queries.drain(..) {
+                let response_route = self
+                    .session_manager
+                    .protocol_response_sender(session_idx)
+                    .zip(
+                        self.session_manager
+                            .sessions()
+                            .get(session_idx)
+                            .map(|session| Arc::clone(&session.terminal)),
+                    );
+                if let Some((response_tx, terminal)) = response_route {
+                    service_osc52_clipboard_query(
+                        self.clipboard.is_some(),
+                        &self.clipboard_request_in_flight,
+                        terminal,
+                        response_tx,
+                        &mut self.osc52_read_window_started,
+                        &mut self.osc52_reads_in_window,
+                    );
+                }
+            }
+        }
+        for (_session_idx, title, body) in background_pump.notifications.drain(..) {
+            show_desktop_notification(
+                &mut self.notification_window_started,
+                &mut self.notifications_in_window,
+                title,
+                body,
+            );
+        }
+        background_pump.exited_indices.sort_unstable();
+        background_pump.exited_indices.dedup();
+        for session_idx in background_pump.exited_indices.iter().rev().copied() {
+            if self.session_manager.len() > 1
+                && session_idx < self.session_manager.len()
+                && session_idx != self.session_manager.active_index()
+            {
+                self.close_session_synced(session_idx);
+                self.schedule_session_save();
+            }
+        }
+        let active_output_budget = self
+            .adaptive_frame_budget
+            .saturating_sub(background_pump.bytes_processed)
+            .max(1);
+        let background_had_output = background_pump.had_output;
+        let background_has_more = background_pump.has_more;
+
         // Collect events once per frame to avoid multiple clones
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
 
-        // Keybindings may switch tabs. This index is only valid while handling
-        // the keybinding itself; take a fresh snapshot immediately afterwards.
-        let active_session_idx = self.session_manager.active_index();
-        let has_preedit = self.handle_ime_events(ctx);
+        let mut terminal_input_blocked = self.terminal_input_blocked(ctx);
+        let has_preedit = if terminal_input_blocked {
+            // UI text fields and modal dialogs own IME/keyboard input while open.
+            // In particular, an IME commit must never be mirrored into the PTY.
+            self.session_manager
+                .get_active_session_mut()
+                .terminal
+                .lock()
+                .clear_preedit();
+            false
+        } else {
+            self.handle_ime_events(ctx)
+        };
 
-        self.handle_font_zoom(ctx);
+        if !terminal_input_blocked {
+            self.handle_font_zoom(ctx);
+        }
 
         // Step 2: 处理快捷键 - 使用可配置的快捷键系统
 
         // 命令调色板快捷键 (Ctrl+Shift+P) - toggle
-        if ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.ctrl && i.modifiers.shift) {
+        let palette_toggle_pressed =
+            ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.ctrl && i.modifiers.shift);
+        if palette_toggle_pressed && (self.command_palette.is_open || !terminal_input_blocked) {
             if self.command_palette.is_open {
                 self.command_palette.close();
                 self.set_status("命令面板已关闭");
@@ -1385,10 +2057,23 @@ impl eframe::App for TerminalApp {
                 self.command_palette.open();
                 self.set_status("命令面板已打开，直接输入即可搜索命令");
             }
+            self.frame_events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::P,
+                        modifiers,
+                        pressed: true,
+                        ..
+                    } if modifiers.ctrl && modifiers.shift
+                )
+            });
         }
 
         // 帮助面板快捷键 (Ctrl+?)
-        if ctx.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.ctrl) {
+        if !terminal_input_blocked
+            && ctx.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.ctrl)
+        {
             self.help_panel.toggle();
             self.set_status(if self.help_panel.is_open {
                 "快捷键帮助已打开，按 Ctrl+? 可关闭"
@@ -1397,37 +2082,99 @@ impl eframe::App for TerminalApp {
             });
         }
 
-        // Debug overlay 快捷键 (F12)
-        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
-            self.debug_panel.toggle();
-            self.set_status("调试信息已切换");
-        }
-
-        if self.handle_command_palette_input(root_ui) {
+        let (palette_requested_close, palette_owned_input) = self.handle_command_palette_input(ctx);
+        if palette_requested_close {
             return;
         }
 
-        if self.handle_keybindings(ctx, active_session_idx) {
+        if self.handle_keybindings(ctx, terminal_input_blocked || palette_owned_input) {
             return;
+        }
+
+        // A command handled above may have opened Settings, Search, Find &
+        // Replace, or a paste confirmation. Re-evaluate before routing the
+        // remainder of this frame to clipboard/PTY handlers.
+        terminal_input_blocked = palette_owned_input || self.terminal_input_blocked(ctx);
+
+        // Route pointer input to the pane under the pointer before taking the
+        // active-session borrow below. The renderer used to switch focus only
+        // at the end of the frame, which sent a click (and mouse protocol
+        // coordinates) to the previously focused PTY.
+        let pointer_targets_terminal = !terminal_input_blocked
+            && ctx.input(|input| {
+                input.pointer.button_pressed(egui::PointerButton::Primary)
+                    || input.pointer.button_pressed(egui::PointerButton::Secondary)
+                    || input.pointer.button_pressed(egui::PointerButton::Middle)
+                    || input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+            });
+        if pointer_targets_terminal && self.layout_manager.panes().len() > 1 {
+            if let Some(pos) =
+                ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()))
+            {
+                let on_divider = self
+                    .layout_manager
+                    .get_divider_rect()
+                    .is_some_and(|divider| divider.contains(pos));
+                if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
+                    self.sync_active_session_to_focused_pane();
+                }
+            }
         }
 
         let active_session_idx = self.session_manager.active_index();
+        let active_pane_renderer_idx = (self.layout_manager.panes().len() > 1).then(|| {
+            self.layout_manager
+                .panes()
+                .iter()
+                .position(|pane| pane.id == self.layout_manager.focused_pane_id)
+        });
+        let active_pane_renderer_idx = active_pane_renderer_idx.flatten();
+        let active_terminal_content_rect = if let Some(index) = active_pane_renderer_idx {
+            self.pane_renderers
+                .get(index)
+                .and_then(|renderer| renderer.last_content_rect)
+        } else {
+            self.renderer.last_content_rect
+        };
+        let pointer_over_active_terminal = ctx
+            .input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()))
+            .zip(active_terminal_content_rect)
+            .is_some_and(|(pointer, rect)| rect.contains(pointer));
 
         // 获取当前活跃会话（在所有快捷键处理完后）
         let session_count_before = self.session_manager.len();
         let mut shell_exited = false;
 
         // Step 2.5: 搜索面板事件处理
-        self.handle_search_panel_input();
+        if self.pending_paste_confirm.is_none() && !self.search_replace_panel.is_open {
+            self.handle_search_panel_input();
+        }
+
+        if let Some(Err(error)) = self
+            .session_manager
+            .flush_protocol_responses(active_session_idx)
+        {
+            if !error.is_backpressure() {
+                log::warn!("active protocol response queue stopped: {error}");
+            }
+        }
+        let active_protocol_responses = self
+            .session_manager
+            .protocol_response_sender(active_session_idx)
+            .expect("active session has an aligned protocol response queue");
 
         // Snapshot active session index before mutably borrowing session_manager;
         // we use it to tag pending-paste confirmations so they only deliver to
         // the same tab if the user hasn't switched away.
-        let active_session_idx_for_paste = active_session_idx;
         let session = self.session_manager.get_active_session_mut();
+        let active_session_id = session.metadata.session_id.clone();
 
         // Step 3: 处理复制粘贴（从配置系统或硬编码的 Ctrl+Shift+C/V）
-        let events_copy = self.frame_events.clone();
+        let events_copy =
+            app::input::routed_terminal_events(&self.frame_events, terminal_input_blocked);
         let mut consumed_keys = std::collections::HashSet::new();
 
         let mut saw_ctrl_shift_c = false;
@@ -1536,44 +2283,39 @@ impl eframe::App for TerminalApp {
                     match content {
                         ClipboardContent::Text(text) => {
                             crate::debug_log!("[PASTE] content type: TEXT ({} chars)", text.len());
-                            if paste_text_into_session(
+                            match paste_text_into_session(
                                 session,
                                 text,
-                                active_session_idx_for_paste,
                                 self.config.paste_confirm,
                                 &mut self.pending_paste_confirm,
                             ) {
-                                consumed_keys.insert(paste_key.to_string());
-                            } else {
-                                crate::debug_log!("[PASTE] text content is empty");
+                                Ok(true) => {
+                                    consumed_keys.insert(paste_key.to_string());
+                                }
+                                Ok(false) => {
+                                    crate::debug_log!("[PASTE] text content is empty");
+                                }
+                                Err(error) => {
+                                    self.status_message = format!("粘贴失败：{error}");
+                                    self.status_expires_at =
+                                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                                }
                             }
                         }
-                        ClipboardContent::Binary(bytes) => {
+                        ClipboardContent::Binary(_bytes) => {
                             crate::debug_log!(
                                 "[PASTE] content type: BINARY ({} bytes)",
-                                bytes.len()
+                                _bytes.len()
                             );
-                            // 二进制内容（如图像）：使用 Kitty 图像协议
-                            if !bytes.is_empty() {
-                                crate::debug_log!(
-                                    "[PASTE] detecting MIME type for {} bytes...",
-                                    bytes.len()
-                                );
-                                if let Some(mime_type) = detect_image_mime_type(&bytes) {
-                                    crate::debug_log!("[PASTE] MIME type detected: {}", mime_type);
-                                    let paste_packet = kitty_graphics_payload(mime_type, &bytes);
-                                    crate::debug_log!("[KITTY] Ctrl+Shift+V pasting {} bytes with mime_type={}, packet_size={}",
-                                                    bytes.len(), mime_type, paste_packet.len());
-                                    session.shell.write_async(paste_packet);
-                                    consumed_keys.insert(paste_key.to_string());
-                                } else {
-                                    crate::debug_log!(
-                                        "[PASTE] MIME type NOT detected, ignoring binary data"
-                                    );
-                                }
-                            } else {
-                                crate::debug_log!("[PASTE] binary content is empty");
-                            }
+                            // Kitty graphics is terminal *output*, not a binary
+                            // paste transport. Sending its APC bytes to the PTY
+                            // input would type escape garbage into the shell.
+                            // Binary clipboard data is exposed only through the
+                            // negotiated OSC 5522 paste protocol.
+                            self.status_message = "图像粘贴需要应用支持 OSC 5522".to_string();
+                            self.status_expires_at =
+                                Some(std::time::Instant::now() + Duration::from_secs(4));
+                            consumed_keys.insert(paste_key.to_string());
                         }
                     }
                 } else {
@@ -1602,24 +2344,49 @@ impl eframe::App for TerminalApp {
             };
 
             if paste_events_enabled && self.clipboard.is_some() {
-                // 应用支持粘贴事件协议，发送 MIME 类型列表，让应用请求
-                crate::debug_log!("[PASTE] app supports paste events, building paste event");
-                let terminal = Arc::clone(&session.terminal);
-                let write_tx = session.shell.write_sender();
-                let _ = std::thread::Builder::new()
-                    .name("paste-event-sender".to_string())
-                    .spawn(move || {
-                        let mime_types = ClipboardManager::new()
-                            .and_then(|clipboard| clipboard.available_mime_types())
-                            .unwrap_or_default();
-                        crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
-                        let bytes = terminal.lock().build_paste_event(&mime_types);
-                        crate::debug_log!(
-                            "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
-                            bytes.len()
-                        );
-                        let _ = write_tx.send(bytes);
-                    });
+                // MIME discovery is host clipboard I/O and build_paste_event
+                // replaces the terminal's single-use grant. Serialize it with
+                // OSC reads so concurrent Paste events cannot race tokens or
+                // create an unbounded helper/thread population.
+                if self
+                    .clipboard_request_in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    crate::debug_log!("[PASTE] app supports paste events, building paste event");
+                    let terminal = Arc::clone(&session.terminal);
+                    let response_tx = active_protocol_responses.clone();
+                    let in_flight = Arc::clone(&self.clipboard_request_in_flight);
+                    let spawn_result = std::thread::Builder::new()
+                        .name("paste-event-sender".to_string())
+                        .spawn(move || {
+                            let _guard = ClipboardRequestGuard(in_flight);
+                            let mime_types = ClipboardManager::new()
+                                .and_then(|clipboard| clipboard.available_mime_types())
+                                .unwrap_or_default();
+                            crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
+                            let bytes = terminal.lock().build_paste_event(&mime_types);
+                            crate::debug_log!(
+                                "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
+                                bytes.len()
+                            );
+                            if let Err(error) = response_tx.enqueue_blocking(bytes) {
+                                log::debug!("OSC 5522 unsolicited paste event cancelled: {error}");
+                            }
+                        });
+                    if let Err(error) = spawn_result {
+                        self.clipboard_request_in_flight
+                            .store(false, Ordering::Release);
+                        log::warn!("failed to spawn OSC 5522 paste event worker: {error}");
+                        self.status_message = "剪贴板正忙，请重试粘贴".to_string();
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(3));
+                    }
+                } else {
+                    self.status_message = "剪贴板正忙，请稍后重试粘贴".to_string();
+                    self.status_expires_at =
+                        Some(std::time::Instant::now() + Duration::from_secs(3));
+                }
                 consumed_keys.insert("PasteEvent".to_string());
             } else {
                 if self.clipboard.is_none() {
@@ -1639,58 +2406,39 @@ impl eframe::App for TerminalApp {
                                     "[PASTE] fallback: TEXT content ({} chars)",
                                     text.len()
                                 );
-                                let normalized = text.replace("\r\n", "\n");
-                                if !normalized.is_empty() {
-                                    let bracketed_paste = {
-                                        let terminal = session.terminal.lock();
-                                        terminal.is_bracketed_paste_enabled()
-                                    };
-                                    if self.config.paste_confirm
-                                        && should_confirm_paste(&normalized)
-                                    {
-                                        self.pending_paste_confirm =
-                                            Some(crate::app::state::PendingPasteConfirm {
-                                                text: normalized,
-                                                session_idx: active_session_idx_for_paste,
-                                                bracketed: bracketed_paste,
-                                            });
-                                        consumed_keys.insert("PasteEvent".to_string());
-                                    } else {
-                                        let bytes = normalized.into_bytes();
-                                        let paste_bytes = if bracketed_paste {
-                                            wrap_bracketed_paste(bytes)
-                                        } else {
-                                            bytes
-                                        };
-                                        let _ = session.shell.write(&paste_bytes);
+                                match paste_text_into_session(
+                                    session,
+                                    text,
+                                    self.config.paste_confirm,
+                                    &mut self.pending_paste_confirm,
+                                ) {
+                                    Ok(true) => {
                                         consumed_keys.insert("PasteEvent".to_string());
                                     }
-                                } else {
-                                    crate::debug_log!("[PASTE] fallback: text is empty");
+                                    Ok(false) => {
+                                        crate::debug_log!("[PASTE] fallback: text is empty");
+                                    }
+                                    Err(error) => {
+                                        self.status_message = format!("粘贴失败：{error}");
+                                        self.status_expires_at = Some(
+                                            std::time::Instant::now() + Duration::from_secs(4),
+                                        );
+                                    }
                                 }
                             }
-                            ClipboardContent::Binary(bytes) => {
+                            ClipboardContent::Binary(_bytes) => {
                                 crate::debug_log!(
                                     "[PASTE] fallback: BINARY content ({} bytes)",
-                                    bytes.len()
+                                    _bytes.len()
                                 );
-                                // 二进制内容（如图像）：使用 Kitty 图像协议
-                                if !bytes.is_empty() {
-                                    crate::debug_log!("[PASTE] fallback: detecting MIME type...");
-                                    if let Some(mime_type) = detect_image_mime_type(&bytes) {
-                                        let paste_packet =
-                                            kitty_graphics_payload(mime_type, &bytes);
-                                        crate::debug_log!("[KITTY] fallback: pasting {} bytes with mime_type={}, packet_size={}",
-                                                        bytes.len(), mime_type, paste_packet.len());
-                                        session.shell.write_async(paste_packet);
-                                        consumed_keys.insert("PasteEvent".to_string());
-                                    } else {
-                                        // 未知的二进制格式，不发送（防止破坏终端）
-                                        crate::debug_log!("[PASTE] fallback: MIME type NOT detected, ignoring binary data");
-                                    }
-                                } else {
-                                    crate::debug_log!("[PASTE] fallback: binary is empty");
-                                }
+                                crate::debug_log!(
+                                    "[PASTE] refusing to send {} binary bytes as PTY input; app did not negotiate OSC 5522",
+                                    _bytes.len()
+                                );
+                                self.status_message = "图像粘贴需要应用支持 OSC 5522".to_string();
+                                self.status_expires_at =
+                                    Some(std::time::Instant::now() + Duration::from_secs(4));
+                                consumed_keys.insert("PasteEvent".to_string());
                             }
                         }
                     } else {
@@ -1707,7 +2455,7 @@ impl eframe::App for TerminalApp {
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
         // 复用缓冲区减少内存分配
         self.keyboard_input_buffer.clear();
-        if !self.search_state.is_open && !self.config_panel.is_open {
+        if !terminal_input_blocked {
             let (
                 keyboard_enhancement_flags,
                 report_all_keys_mode,
@@ -1729,7 +2477,10 @@ impl eframe::App for TerminalApp {
             // 转换 consumed_keys 为需要的格式（HashSet<&str>）
             let consumed_keys_refs: std::collections::HashSet<&str> =
                 consumed_keys.iter().map(|s| s.as_str()).collect();
-            self.renderer.handle_keyboard_input(
+            let input_renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            input_renderer.handle_keyboard_input(
                 ctx,
                 &mut self.keyboard_input_buffer,
                 &consumed_keys_refs,
@@ -1745,27 +2496,54 @@ impl eframe::App for TerminalApp {
         }
 
         let has_keyboard_input = !self.keyboard_input_buffer.is_empty();
-        let has_cursor_move_input = !self.renderer.cursor_move_input.is_empty();
 
         // 有输入活动时更新最后活动时间
         if has_keyboard_input || has_cursor_move_input {
             self.last_activity_time = std::time::Instant::now();
         }
 
+        // The retry buffer is per-session and sent as one FIFO message. Do not
+        // split arbitrary bytes into frame-sized chunks: terminal replies could
+        // otherwise interleave inside a UTF-8/key escape/paste sequence.
+        let mut terminal_write_error = None;
+        let mut input_retry_overflow = cursor_move_retry_overflow;
         {
-            let mut input_guard = self.input_queue.lock();
             if has_keyboard_input {
-                input_guard.extend(&self.keyboard_input_buffer);
+                input_retry_overflow |= !session.queue_input(&self.keyboard_input_buffer);
             }
-            if has_cursor_move_input {
-                input_guard.extend(&self.renderer.cursor_move_input);
-                self.renderer.cursor_move_input.clear();
-            }
-            if !input_guard.is_empty() {
+            let user_input_flush_blocked =
+                crate::session_manager::user_input_is_blocked_by_mouse_edge(
+                    &session.metadata.session_id,
+                    user_input_barrier_session_id.as_deref(),
+                );
+            if !user_input_flush_blocked && !session.pending_input.is_empty() {
                 session.terminal.lock().scroll_to_bottom();
-                let _ = session.shell.write(&input_guard);
-                input_guard.clear();
+                match session.shell.write(&session.pending_input) {
+                    Ok(()) => session.pending_input.clear(),
+                    Err(error) => {
+                        if !error.is_backpressure() {
+                            session.pending_input.clear();
+                        }
+                        terminal_write_error = Some(error);
+                    }
+                }
             }
+        }
+        if let Some(error) = terminal_write_error {
+            if error.is_backpressure() {
+                self.status_message = "终端输入繁忙，正在重试…".to_string();
+                ctx.request_repaint_after(Duration::from_millis(10));
+            } else {
+                self.status_message = format!("终端输入失败：{error}");
+            }
+            self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(3));
+        }
+        if input_retry_overflow {
+            self.status_message = "终端输入重试缓冲区已满，新输入未发送".to_string();
+            self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(4));
+        }
+        if !session.pending_input.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(10));
         }
 
         // Force repaint if we have any keyboard/cursor input - ensures input renders immediately
@@ -1780,7 +2558,7 @@ impl eframe::App for TerminalApp {
         // 会把旧 session 的 ANSI 字节流喂给新 session，造成串屏和终端模式污染。
         // 使用自适应帧预算，根据帧时间动态调整
         let mut has_new_output = false;
-        let max_bytes_per_frame = self.adaptive_frame_budget;
+        let max_bytes_per_frame = active_output_budget;
         let mut has_more_data = false;
 
         // 先取回上一帧未处理完的数据
@@ -1840,62 +2618,52 @@ impl eframe::App for TerminalApp {
 
         // 处理本帧的数据
         if !accumulated_data.is_empty() {
-            let mut terminal = session.terminal.lock();
-            terminal.process_batch(&accumulated_data);
-            terminal.check_sync_output_timeout();
-            // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
-            // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
-            // 有输出时更新最后活动时间
-            self.last_activity_time = std::time::Instant::now();
+            if active_protocol_responses.has_pending() {
+                // Preserve PTY byte order and stop accepting more protocol
+                // requests until their older replies have entered the bounded
+                // shell writer. The current chunk precedes the split-off tail.
+                accumulated_data.append(&mut session.pending_output);
+                session.pending_output = accumulated_data;
+                has_more_data = true;
+            } else {
+                let mut terminal = session.terminal.lock();
+                terminal.process_batch(&accumulated_data);
+                terminal.check_sync_output_timeout();
+                // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
+                // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
+                // 有输出时更新最后活动时间
+                self.last_activity_time = std::time::Instant::now();
+            }
         }
 
         // Step 7: 发送终端输出回 shell（DSR 响应等）
         {
             let mut terminal = session.terminal.lock();
+            terminal.check_sync_output_timeout();
             let output = terminal.get_output();
-            if !output.is_empty() {
-                let _ = session.shell.write(&output);
+            if let Err((error, mut output)) = active_protocol_responses.try_enqueue(output) {
+                if error == ProtocolResponseQueueError::Full {
+                    output.append(&mut terminal.output_buffer);
+                    terminal.output_buffer = output;
+                    has_more_data = true;
+                } else {
+                    log::warn!("terminal protocol response queue rejected output: {error}");
+                }
             }
             let clipboard_requests = terminal.take_clipboard_read_requests();
             drop(terminal);
-
-            if self.clipboard.is_some() && !clipboard_requests.is_empty() {
-                let terminal = Arc::clone(&session.terminal);
-                let write_tx = session.shell.write_sender();
-                let _ = std::thread::Builder::new()
-                    .name("clipboard-request-handler".to_string())
-                    .spawn(move || {
-                        let Ok(clipboard) = ClipboardManager::new() else {
-                            crate::debug_log!("[OSC5522] Failed to create clipboard manager");
-                            return;
-                        };
-
-                        for request in clipboard_requests {
-                            match request.kind {
-                                terminal::ClipboardReadKind::MimeList => {
-                                    let mime_types =
-                                        clipboard.available_mime_types().unwrap_or_default();
-                                    let response = terminal.lock().build_paste_event(&mime_types);
-                                    let _ = write_tx.send(response);
-                                }
-                                terminal::ClipboardReadKind::MimeData(mime_type) => {
-                                    let data = clipboard.read_mime(&mime_type).unwrap_or_default();
-                                    let response = if data.is_empty() {
-                                        osc_5522_packet("type=read:status=ENOSYS", None)
-                                    } else {
-                                        clipboard_5522_response_for_mime(&mime_type, &data)
-                                    };
-                                    crate::debug_log!(
-                                        "[OSC5522] responding to mime request mime={} bytes={}",
-                                        mime_type,
-                                        data.len()
-                                    );
-                                    let _ = write_tx.send(response);
-                                }
-                            }
-                        }
-                    });
+            if let Err(error) = active_protocol_responses.flush(&session.shell) {
+                if !error.is_backpressure() {
+                    log::warn!("terminal protocol response queue stopped: {error}");
+                }
             }
+            service_osc5522_clipboard_requests(
+                self.clipboard.is_some(),
+                &self.clipboard_request_in_flight,
+                Arc::clone(&session.terminal),
+                active_protocol_responses.clone(),
+                clipboard_requests,
+            );
         }
 
         // OSC 52 clipboard handling
@@ -1903,23 +2671,28 @@ impl eframe::App for TerminalApp {
             let mut terminal = session.terminal.lock();
             if let Some(text) = terminal.take_osc52_clipboard_set() {
                 if self.config.osc52_clipboard_write {
-                    if let Some(clipboard) = &self.clipboard {
-                        if let Err(e) = clipboard.copy(&text) {
-                            log::warn!("{}", e);
-                        }
-                    }
+                    enqueue_osc52_clipboard_write(
+                        self.osc52_clipboard_write_tx.as_ref(),
+                        &mut self.osc52_write_window_started,
+                        &mut self.osc52_writes_in_window,
+                        text,
+                    );
                 }
             }
-            if terminal.take_osc52_clipboard_query() {
-                // 读取剪贴板会把内容回传给终端内程序,默认禁止,需显式开启。
-                if self.config.osc52_clipboard_read {
-                    let content = self
-                        .clipboard
-                        .as_ref()
-                        .and_then(|c| c.paste().ok())
-                        .unwrap_or_default();
-                    terminal.respond_osc52_clipboard(&content);
-                }
+            let osc52_query = terminal.take_osc52_clipboard_query();
+            drop(terminal);
+            // Reading the clipboard exposes user data to a terminal program,
+            // so it remains opt-in. Even when enabled, the external helper
+            // and base64 encoding run only on the bounded background path.
+            if osc52_query && self.config.osc52_clipboard_read {
+                service_osc52_clipboard_query(
+                    self.clipboard.is_some(),
+                    &self.clipboard_request_in_flight,
+                    Arc::clone(&session.terminal),
+                    active_protocol_responses.clone(),
+                    &mut self.osc52_read_window_started,
+                    &mut self.osc52_reads_in_window,
+                );
             }
         }
 
@@ -1929,12 +2702,12 @@ impl eframe::App for TerminalApp {
             let notifications: Vec<_> = terminal.pending_notifications.drain(..).collect();
             drop(terminal);
             for (title, body) in notifications {
-                // `--` 终止选项解析,防止以 `-`/`--` 开头的标题或正文被当作 notify-send 选项注入。
-                let _ = std::process::Command::new("notify-send")
-                    .arg("--")
-                    .arg(&title)
-                    .arg(&body)
-                    .spawn();
+                show_desktop_notification(
+                    &mut self.notification_window_started,
+                    &mut self.notifications_in_window,
+                    title,
+                    body,
+                );
             }
         }
 
@@ -1982,24 +2755,24 @@ impl eframe::App for TerminalApp {
 
         // Step 9: 滚动处理
         // 优化：批量处理键盘滚动，只获取一次锁
-        let scroll_amount =
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown) && i.modifiers.ctrl) {
-                Some(-3)
-            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) && i.modifiers.ctrl) {
-                Some(3)
-            } else if ctx.input(|i| i.key_pressed(egui::Key::PageUp) && !i.modifiers.ctrl) {
-                let terminal = session.terminal.lock();
-                let (_, rows) = terminal.get_dimensions();
-                drop(terminal);
-                Some(rows as isize)
-            } else if ctx.input(|i| i.key_pressed(egui::Key::PageDown) && !i.modifiers.ctrl) {
-                let terminal = session.terminal.lock();
-                let (_, rows) = terminal.get_dimensions();
-                drop(terminal);
-                Some(-(rows as isize))
-            } else {
-                None
-            };
+        let page_scroll_key = (!terminal_input_blocked)
+            .then(|| {
+                ctx.input(|i| {
+                    if i.key_pressed(egui::Key::PageUp) {
+                        Some((egui::Key::PageUp, i.modifiers))
+                    } else if i.key_pressed(egui::Key::PageDown) {
+                        Some((egui::Key::PageDown, i.modifiers))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .flatten();
+        let scroll_amount = page_scroll_key.and_then(|(key, modifiers)| {
+            let terminal = session.terminal.lock();
+            let (_, rows) = terminal.get_dimensions();
+            app::input::viewport_scroll_delta(key, modifiers, rows)
+        });
 
         if let Some(amount) = scroll_amount {
             let mut terminal = session.terminal.lock();
@@ -2007,22 +2780,21 @@ impl eframe::App for TerminalApp {
         }
 
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        let ctrl_scroll_this_frame = self.frame_events.iter().any(
+            |event| matches!(event, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl),
+        );
 
         // 检查是否启用鼠标报告
         let mouse_enabled = {
             let terminal = session.terminal.lock();
             terminal.is_mouse_enabled()
         };
+        let shift_mouse_bypass = ctx.input(|input| input.modifiers.shift);
 
-        let middle_paste_requested = !mouse_enabled
-            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle))
-            && ctx
-                .input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()))
-                .is_some_and(|pos| {
-                    self.renderer
-                        .last_content_rect
-                        .is_some_and(|rect| rect.contains(pos))
-                });
+        let middle_paste_requested = !terminal_input_blocked
+            && (!mouse_enabled || shift_mouse_bypass)
+            && pointer_over_active_terminal
+            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
 
         if middle_paste_requested {
             if let Some(clipboard) = &self.clipboard {
@@ -2032,20 +2804,28 @@ impl eframe::App for TerminalApp {
                 } else {
                     primary_text
                 };
-                let _ = paste_text_into_session(
+                if let Err(error) = paste_text_into_session(
                     session,
                     text,
-                    active_session_idx_for_paste,
                     self.config.paste_confirm,
                     &mut self.pending_paste_confirm,
-                );
+                ) {
+                    self.status_message = format!("粘贴失败：{error}");
+                    self.status_expires_at =
+                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                }
             }
         }
 
         // 鼠标滚轮处理：
         // 1. 如果应用启用了鼠标报告（如 vim），滚轮会在下面的鼠标处理部分发送给应用
         // 2. 如果应用未启用鼠标，或在普通终端，滚轮用于查看历史
-        if scroll_delta != 0.0 && !mouse_enabled {
+        if !terminal_input_blocked
+            && pointer_over_active_terminal
+            && scroll_delta != 0.0
+            && !ctrl_scroll_this_frame
+            && (!mouse_enabled || shift_mouse_bypass)
+        {
             // 0.35 阻尼系数：原始的 scroll_speed 直接乘 delta 会让单次滚轮累积约 7 倍位移，滑得太快
             const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
             self.smooth_scroll_velocity +=
@@ -2056,7 +2836,11 @@ impl eframe::App for TerminalApp {
         if self.smooth_scroll_velocity.abs() > 0.1 {
             self.smooth_scroll_velocity *= 0.88;
 
-            let line_h = self.renderer.line_height.max(1.0);
+            let line_h = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer)
+                .line_height
+                .max(1.0);
 
             // 抵达边界检测：在累积偏移前先看当前是否已到顶/到底(或处于备用屏幕)。
             // 若惯性继续往边界外推，会出现"跨行 → scroll 被钳制 → 偏移回弹"的逐帧抖动。
@@ -2092,9 +2876,12 @@ impl eframe::App for TerminalApp {
             // 渲染偏移取负：shader 中 +offset 使内容上移，而 terminal.scroll(+lines)
             // 是向历史滚动(内容下移)。两者方向必须一致，否则每跨一行就会出现约
             // 2*行高的回跳——滚轮停下后的低速惯性阶段表现为上下抖动。
-            self.renderer.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
-            for pr in &mut self.pane_renderers {
-                pr.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
+            if let Some(index) = active_pane_renderer_idx {
+                if let Some(renderer) = self.pane_renderers.get_mut(index) {
+                    renderer.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
+                }
+            } else {
+                self.renderer.scroll_pixel_offset = -self.smooth_scroll_pixel_offset;
             }
             if !hit_boundary {
                 ctx.request_repaint();
@@ -2102,57 +2889,253 @@ impl eframe::App for TerminalApp {
         } else if self.smooth_scroll_velocity.abs() > 0.0 {
             self.smooth_scroll_velocity = 0.0;
             self.smooth_scroll_pixel_offset = 0.0;
-            self.renderer.scroll_pixel_offset = 0.0;
-            for pr in &mut self.pane_renderers {
-                pr.scroll_pixel_offset = 0.0;
+            if let Some(index) = active_pane_renderer_idx {
+                if let Some(renderer) = self.pane_renderers.get_mut(index) {
+                    renderer.scroll_pixel_offset = 0.0;
+                }
+            } else {
+                self.renderer.scroll_pixel_offset = 0.0;
             }
         }
 
         // Step 11: 鼠标处理（包括滚轮）
-        let mouse_reports: Vec<String> = {
-            let terminal = session.terminal.lock();
+        let terminal_button_pressed = ctx.input(|input| {
+            if input.pointer.button_pressed(egui::PointerButton::Primary) {
+                Some(0)
+            } else if input.pointer.button_pressed(egui::PointerButton::Secondary) {
+                Some(2)
+            } else if input.pointer.button_pressed(egui::PointerButton::Middle) {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        let terminal_buttons_released = ctx.input(|input| {
+            let mut buttons: SmallVec<[u8; 3]> = SmallVec::new();
+            if input.pointer.button_released(egui::PointerButton::Primary) {
+                buttons.push(0);
+            }
+            if input
+                .pointer
+                .button_released(egui::PointerButton::Secondary)
+            {
+                buttons.push(2);
+            }
+            if input.pointer.button_released(egui::PointerButton::Middle) {
+                buttons.push(1);
+            }
+            buttons
+        });
+        let pointer_pos =
+            ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
+        if let Some(button) = terminal_button_pressed.filter(|button| {
+            self.terminal_mouse_capture.is_none()
+                && (mouse_enabled || *button == 0)
+                && !terminal_input_blocked
+                && pointer_over_active_terminal
+        }) {
+            let pointer_renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            let content_rect = pointer_renderer
+                .last_content_rect
+                .unwrap_or_else(|| ctx.viewport_rect());
+            let (mouse_cols, mouse_rows) = session.terminal.lock().get_dimensions();
+            let (last_row, last_col) = grid_position_from_content(
+                pointer_pos.unwrap_or_else(|| content_rect.center()),
+                content_rect,
+                pointer_renderer.char_width,
+                pointer_renderer.line_height,
+                mouse_cols,
+                mouse_rows,
+            );
+            self.terminal_mouse_capture = Some(crate::app::state::TerminalMouseCapture {
+                session_id: active_session_id.clone(),
+                reported_to_app: mouse_enabled && !shift_mouse_bypass,
+                button,
+                terminal: Arc::clone(&session.terminal),
+                write_tx: session.shell.write_sender(),
+                content_rect,
+                char_width: pointer_renderer.char_width,
+                line_height: pointer_renderer.line_height,
+                last_col,
+                last_row,
+                pending_controls: std::collections::VecDeque::new(),
+                press_accepted: false,
+                release_observed: false,
+                local_selection_cancelled: false,
+            });
+        }
+
+        let pointer_any_down = ctx.input(|input| input.pointer.any_down());
+        let capture_button_explicitly_released = self
+            .terminal_mouse_capture
+            .as_ref()
+            .is_some_and(|capture| terminal_buttons_released.contains(&capture.button));
+        let capture_finished = self.terminal_mouse_capture.is_some()
+            && (capture_button_explicitly_released || !pointer_any_down);
+        if capture_finished {
+            if let Some(capture) = self.terminal_mouse_capture.as_mut() {
+                capture.release_observed = true;
+            }
+        }
+        let primary_copy_route = primary_copy_route(
+            self.terminal_mouse_capture.as_ref().map(|capture| {
+                (
+                    capture.reported_to_app,
+                    capture.local_selection_cancelled,
+                    capture.button,
+                )
+            }),
+            capture_finished,
+            terminal_buttons_released.contains(&0),
+        );
+        let local_primary_selection_terminal =
+            if primary_copy_route == PrimaryCopyRoute::CapturedLocal {
+                self.terminal_mouse_capture
+                    .as_ref()
+                    .map(|capture| Arc::clone(&capture.terminal))
+            } else {
+                None
+            };
+        let capture_for_route = self.terminal_mouse_capture.as_ref();
+        let capture_route_state =
+            capture_for_route.map(|capture| (capture.reported_to_app, capture.button));
+        let pointer_routes_to_terminal =
+            pointer_over_active_terminal || capture_for_route.is_some();
+        let sequence_reports_to_app = capture_route_state
+            .map(|(reported_to_app, _)| reported_to_app)
+            .unwrap_or(!shift_mouse_bypass);
+        let reported_capture_release = captured_release_button(
+            capture_route_state,
+            &terminal_buttons_released,
+            pointer_any_down,
+        );
+        let only_release = terminal_input_blocked;
+
+        let (
+            mouse_terminal,
+            mouse_write_tx,
+            mouse_session_id,
+            content_rect,
+            char_width,
+            line_height,
+            fallback_cell,
+        ) = if let Some(capture) = capture_for_route {
+            (
+                Arc::clone(&capture.terminal),
+                capture.write_tx.clone(),
+                capture.session_id.clone(),
+                capture.content_rect,
+                capture.char_width,
+                capture.line_height,
+                Some((capture.last_row, capture.last_col)),
+            )
+        } else {
+            let pointer_renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            (
+                Arc::clone(&session.terminal),
+                session.shell.write_sender(),
+                active_session_id.clone(),
+                pointer_renderer
+                    .last_content_rect
+                    .unwrap_or_else(|| ctx.viewport_rect()),
+                pointer_renderer.char_width,
+                pointer_renderer.line_height,
+                None,
+            )
+        };
+        let mut mouse_route_closed = false;
+        let lossy_mouse_reports: Vec<Vec<u8>> = if (!sequence_reports_to_app
+            || !pointer_routes_to_terminal
+            || (terminal_input_blocked && reported_capture_release.is_none()))
+            || (pointer_pos.is_none() && fallback_cell.is_none())
+        {
+            self.mouse_scroll_accumulator = 0.0;
+            Vec::new()
+        } else {
+            let terminal = mouse_terminal.lock();
             if !terminal.is_mouse_enabled() {
                 self.mouse_scroll_accumulator = 0.0;
+                // The application disabled mouse reporting while a sequence was
+                // active. An unaccepted press can be retired, but a release
+                // already encoded behind backpressure must still follow its
+                // accepted press on the original writer route.
+                let queued_release = self.terminal_mouse_capture.as_ref().is_some_and(|capture| {
+                    capture.pending_controls.iter().any(|pending| {
+                        pending.kind == crate::app::state::PendingMouseControlKind::Release
+                    })
+                });
+                mouse_route_closed = self.terminal_mouse_capture.is_some() && !queued_release;
                 drop(terminal);
                 Vec::new()
             } else {
                 let mut reports = Vec::new();
+                let (mouse_cols, mouse_rows) = terminal.get_dimensions();
+                let (row, col) = pointer_pos
+                    .map(|pos| {
+                        grid_position_from_content(
+                            pos,
+                            content_rect,
+                            char_width,
+                            line_height,
+                            mouse_cols,
+                            mouse_rows,
+                        )
+                    })
+                    .or(fallback_cell)
+                    .unwrap_or((0, 0));
+                if pointer_pos.is_some() {
+                    if let Some(capture) = self.terminal_mouse_capture.as_mut() {
+                        if capture.session_id == mouse_session_id {
+                            capture.last_col = col;
+                            capture.last_row = row;
+                        }
+                    }
+                }
 
-                // 获取鼠标位置信息
-                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                    let char_width = self.renderer.char_width;
-                    let line_height = self.renderer.line_height;
-                    let content_rect = self
-                        .renderer
-                        .last_content_rect
-                        .unwrap_or_else(|| ctx.viewport_rect());
-                    let (row, col) = grid_position_from_content(
-                        pos,
-                        content_rect,
-                        char_width,
-                        line_height,
-                        self.cols,
-                        self.rows,
-                    );
-
+                if !only_release {
                     // 处理鼠标滚轮（当启用鼠标报告时）
-                    let line_h = self.renderer.line_height.max(1.0);
+                    let line_h = line_height.max(1.0);
                     let mut discrete_scroll_steps: isize = 0;
                     let mut point_scroll_delta: f32 = 0.0;
 
                     ctx.input(|i| {
                         for event in &i.events {
-                            if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                            if let egui::Event::MouseWheel {
+                                unit,
+                                delta,
+                                modifiers,
+                                ..
+                            } = event
+                            {
+                                if modifiers.ctrl {
+                                    continue;
+                                }
                                 match unit {
                                     egui::MouseWheelUnit::Line => {
-                                        discrete_scroll_steps += delta.y.round() as isize;
+                                        discrete_scroll_steps = bounded_wheel_step_accumulate(
+                                            discrete_scroll_steps,
+                                            delta.y,
+                                            1,
+                                        );
                                     }
                                     egui::MouseWheelUnit::Page => {
-                                        discrete_scroll_steps +=
-                                            delta.y.round() as isize * self.rows.max(1) as isize;
+                                        discrete_scroll_steps = bounded_wheel_step_accumulate(
+                                            discrete_scroll_steps,
+                                            delta.y,
+                                            mouse_rows.max(1),
+                                        );
                                     }
                                     egui::MouseWheelUnit::Point => {
-                                        point_scroll_delta += delta.y;
+                                        if delta.y.is_finite() {
+                                            let limit =
+                                                line_h * MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as f32;
+                                            point_scroll_delta =
+                                                (point_scroll_delta + delta.y).clamp(-limit, limit);
+                                        }
                                     }
                                 }
                             }
@@ -2160,15 +3143,27 @@ impl eframe::App for TerminalApp {
                     });
 
                     if point_scroll_delta != 0.0 {
-                        self.mouse_scroll_accumulator += point_scroll_delta;
+                        let limit = line_h * MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as f32;
+                        self.mouse_scroll_accumulator = (self.mouse_scroll_accumulator
+                            + point_scroll_delta)
+                            .clamp(-limit, limit);
                     }
 
-                    let point_scroll_steps = (self.mouse_scroll_accumulator / line_h) as isize;
+                    let point_scroll_steps = ((self.mouse_scroll_accumulator / line_h) as isize)
+                        .clamp(
+                            -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                            MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                        );
                     if point_scroll_steps != 0 {
                         self.mouse_scroll_accumulator -= point_scroll_steps as f32 * line_h;
                     }
 
-                    let total_scroll_steps = discrete_scroll_steps + point_scroll_steps;
+                    let total_scroll_steps = discrete_scroll_steps
+                        .saturating_add(point_scroll_steps)
+                        .clamp(
+                            -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                            MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                        );
                     if total_scroll_steps != 0 {
                         let button = if total_scroll_steps > 0 { 64 } else { 65 };
 
@@ -2179,46 +3174,59 @@ impl eframe::App for TerminalApp {
                         }
                     }
 
-                    // 处理鼠标按钮（使用 SmallVec 避免堆分配）
-                    let button_pressed = ctx.input(|i| {
-                        let mut btns: SmallVec<[u8; 3]> = SmallVec::new();
-                        if i.pointer.button_pressed(egui::PointerButton::Primary) {
-                            btns.push(0);
-                        }
-                        if i.pointer.button_pressed(egui::PointerButton::Secondary) {
-                            btns.push(2);
-                        }
-                        if i.pointer.button_pressed(egui::PointerButton::Middle) {
-                            btns.push(1);
-                        }
-                        btns
-                    });
-
-                    for button_num in button_pressed {
-                        if let Some(report) = terminal.get_mouse_report(button_num, col, row) {
-                            reports.push(report);
+                    if let Some(capture) = self.terminal_mouse_capture.as_ref() {
+                        if capture.reported_to_app
+                            && terminal_button_pressed == Some(capture.button)
+                        {
+                            if let Some(report) =
+                                terminal.get_mouse_report(capture.button, col, row)
+                            {
+                                if let Some(capture) = self.terminal_mouse_capture.as_mut() {
+                                    queue_mouse_control(
+                                        &mut capture.pending_controls,
+                                        crate::app::state::PendingMouseControlKind::Press,
+                                        report,
+                                    );
+                                }
+                            }
                         }
                     }
 
-                    let button_released = ctx.input(|i| {
-                        let mut btns: SmallVec<[u8; 3]> = SmallVec::new();
-                        if i.pointer.button_released(egui::PointerButton::Primary) {
-                            btns.push(0);
-                        }
-                        if i.pointer.button_released(egui::PointerButton::Secondary) {
-                            btns.push(2);
-                        }
-                        if i.pointer.button_released(egui::PointerButton::Middle) {
-                            btns.push(1);
-                        }
-                        btns
-                    });
-
-                    for button_num in button_released {
+                    let pointer_moved =
+                        ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
+                    let motion_button = reported_capture_button(capture_route_state);
+                    if pointer_moved
+                        && terminal.should_report_mouse_motion(motion_button.is_some())
+                        && self.last_terminal_mouse_motion.as_ref().is_none_or(
+                            |(session_id, last_col, last_row)| {
+                                session_id != &mouse_session_id
+                                    || *last_col != col
+                                    || *last_row != row
+                            },
+                        )
+                    {
+                        let base_button = motion_button.unwrap_or(3);
                         if let Some(report) =
-                            terminal.get_mouse_release_report(button_num, col, row)
+                            terminal.get_mouse_report(base_button.saturating_add(32), col, row)
                         {
                             reports.push(report);
+                            self.last_terminal_mouse_motion =
+                                Some((mouse_session_id.clone(), col, row));
+                        }
+                    }
+                }
+
+                // A release is emitted exactly once and only for a press
+                // captured by this terminal. Mode 1002 therefore cannot
+                // see an orphan release after a drag began elsewhere.
+                if let Some(button) = reported_capture_release {
+                    if let Some(report) = terminal.get_mouse_release_report(button, col, row) {
+                        if let Some(capture) = self.terminal_mouse_capture.as_mut() {
+                            queue_mouse_control(
+                                &mut capture.pending_controls,
+                                crate::app::state::PendingMouseControlKind::Release,
+                                report,
+                            );
                         }
                     }
                 }
@@ -2228,67 +3236,135 @@ impl eframe::App for TerminalApp {
             }
         };
 
-        let has_mouse_input = !mouse_reports.is_empty();
-        if has_mouse_input {
-            for report in mouse_reports {
-                let _ = session.shell.write(report.as_bytes());
+        let has_mouse_input = !lossy_mouse_reports.is_empty()
+            || self
+                .terminal_mouse_capture
+                .as_ref()
+                .is_some_and(|capture| !capture.pending_controls.is_empty());
+        let mut mouse_write_error = None;
+        if !mouse_route_closed {
+            if let Some(capture) = self.terminal_mouse_capture.as_mut() {
+                if capture.reported_to_app {
+                    if let Err(error) = flush_mouse_controls(capture) {
+                        if !error.is_backpressure() {
+                            mouse_route_closed = true;
+                        }
+                        mouse_write_error = Some(error);
+                    }
+                }
             }
         }
 
-        // Step 12: 链接检测和交互
+        if !mouse_route_closed
+            && mouse_write_error.is_none()
+            && mouse_capture_allows_lossy(self.terminal_mouse_capture.as_ref())
         {
+            for report in lossy_mouse_reports {
+                if let Err(error) = mouse_write_tx.try_send(report) {
+                    if !error.is_backpressure() && self.terminal_mouse_capture.is_some() {
+                        mouse_route_closed = true;
+                    }
+                    mouse_write_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = mouse_write_error {
+            // Motion/wheel are deliberately lossy. Press/release remain queued
+            // on the capture and are retried in order on the next frame.
+            self.status_message = format!("鼠标报告发送失败：{error}");
+            self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(3));
+            if error.is_backpressure() && self.terminal_mouse_capture.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(10));
+            }
+        }
+        let capture_complete = self
+            .terminal_mouse_capture
+            .as_ref()
+            .is_some_and(mouse_capture_is_complete);
+        if mouse_route_closed || capture_complete {
+            self.terminal_mouse_capture = None;
+            self.last_terminal_mouse_motion = None;
+        }
+
+        // Step 12: 链接检测和交互
+        if terminal_input_blocked {
+            self.hovered_link = None;
+        } else {
+            let terminal_ptr = Arc::as_ptr(&session.terminal) as usize;
             let mut terminal = session.terminal.lock();
             let grid_version = terminal.get_grid_version();
             let scroll_offset = terminal.scroll_offset;
+            let (link_cols, link_rows) = terminal.get_dimensions();
+            let pointer = ctx.input(|input| input.pointer.hover_pos());
 
-            if grid_version != self.cached_links_grid_version
-                || scroll_offset != self.cached_links_scroll_offset
-                || active_session_idx != self.cached_links_session_idx
-            {
-                let visible_cells = terminal.get_visible_cells();
-                let row_wrapped = terminal.get_visible_row_wrapped();
-                self.cached_links = self
-                    .link_detector
-                    .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
-                self.cached_links_grid_version = grid_version;
-                self.cached_links_scroll_offset = scroll_offset;
-                self.cached_links_session_idx = active_session_idx;
-            }
-            drop(terminal);
-
-            // 检测悬停的链接
-            self.hovered_link = None;
-            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                if let Some(content_rect) = self.renderer.last_content_rect {
-                    let char_width = self.renderer.char_width;
-                    let line_height = self.renderer.line_height;
-
-                    let clamped_x =
-                        (pos.x - content_rect.left()).clamp(0.0, content_rect.width().max(0.0));
-                    let clamped_y =
-                        (pos.y - content_rect.top()).clamp(0.0, content_rect.height().max(0.0));
-
-                    let col = if char_width > 0.0 {
-                        ((clamped_x / char_width) as usize).min(self.cols - 1)
-                    } else {
-                        0
-                    };
-                    let row = if line_height > 0.0 {
-                        ((clamped_y / line_height) as usize).min(self.rows - 1)
-                    } else {
-                        0
-                    };
-
-                    if content_rect.contains(pos) {
-                        for link in &self.cached_links {
-                            if link.line == row && col >= link.col_start && col < link.col_end {
-                                self.hovered_link = Some(link.clone());
-                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                                break;
-                            }
-                        }
+            self.hovered_link = if let Some(renderer_idx) = active_pane_renderer_idx {
+                let needs_refresh = self
+                    .pane_renderers
+                    .get(renderer_idx)
+                    .is_some_and(|renderer| {
+                        grid_version != renderer.cached_links_grid_version
+                            || scroll_offset != renderer.cached_links_scroll_offset
+                            || terminal_ptr != renderer.cached_links_terminal_ptr
+                    });
+                if needs_refresh {
+                    let visible_cells = terminal.get_visible_cells();
+                    let row_wrapped = terminal.get_visible_row_wrapped();
+                    let links = self
+                        .link_detector
+                        .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
+                    if let Some(renderer) = self.pane_renderers.get_mut(renderer_idx) {
+                        renderer.cached_links = Arc::new(links);
+                        renderer.cached_links_grid_version = grid_version;
+                        renderer.cached_links_scroll_offset = scroll_offset;
+                        renderer.cached_links_terminal_ptr = terminal_ptr;
                     }
                 }
+                self.pane_renderers
+                    .get(renderer_idx)
+                    .and_then(|renderer| Some((renderer, pointer?, renderer.last_content_rect?)))
+                    .and_then(|(renderer, pointer, rect)| {
+                        link_at_pointer(
+                            &renderer.cached_links,
+                            pointer,
+                            rect,
+                            renderer.char_width,
+                            renderer.line_height,
+                            link_cols,
+                            link_rows,
+                        )
+                    })
+            } else {
+                if grid_version != self.cached_links_grid_version
+                    || scroll_offset != self.cached_links_scroll_offset
+                    || active_session_idx != self.cached_links_session_idx
+                {
+                    let visible_cells = terminal.get_visible_cells();
+                    let row_wrapped = terminal.get_visible_row_wrapped();
+                    self.cached_links = self
+                        .link_detector
+                        .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
+                    self.cached_links_grid_version = grid_version;
+                    self.cached_links_scroll_offset = scroll_offset;
+                    self.cached_links_session_idx = active_session_idx;
+                }
+                pointer
+                    .zip(self.renderer.last_content_rect)
+                    .and_then(|(pointer, rect)| {
+                        link_at_pointer(
+                            &self.cached_links,
+                            pointer,
+                            rect,
+                            self.renderer.char_width,
+                            self.renderer.line_height,
+                            link_cols,
+                            link_rows,
+                        )
+                    })
+            };
+            drop(terminal);
+            if self.hovered_link.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
 
             // 链接悬停提示:在指针右下方画一个浮层显示完整 URL 和 Ctrl+Click 操作提示。
@@ -2344,15 +3420,20 @@ impl eframe::App for TerminalApp {
         // 渲染 UI
         self.render_ui(root_ui);
 
-        if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
-            let selection_for_primary = {
-                let session = self.session_manager.get_active_session_mut();
-                let terminal = session.terminal.lock();
-                if terminal.is_mouse_enabled() {
-                    None
-                } else {
-                    terminal.copy_selection()
+        if !self.terminal_input_blocked(ctx) {
+            let selection_for_primary = match primary_copy_route {
+                PrimaryCopyRoute::CapturedLocal => local_primary_selection_terminal
+                    .and_then(|terminal| terminal.lock().copy_selection()),
+                PrimaryCopyRoute::Generic => {
+                    let session = self.session_manager.get_active_session_mut();
+                    let terminal = session.terminal.lock();
+                    if terminal.is_mouse_enabled() {
+                        None
+                    } else {
+                        terminal.copy_selection()
+                    }
                 }
+                PrimaryCopyRoute::None | PrimaryCopyRoute::SuppressCaptured => None,
             };
             if let (Some(clipboard), Some(text)) = (&self.clipboard, selection_for_primary) {
                 if !text.is_empty() {
@@ -2362,7 +3443,7 @@ impl eframe::App for TerminalApp {
         }
 
         // channel 中还有未处理的数据时，立即请求下一帧继续处理
-        if has_more_data {
+        if has_more_data || background_has_more {
             ctx.request_repaint();
         } else {
             // 二次检查：render_ui 期间 PTY 线程可能又发送了新数据
@@ -2372,7 +3453,7 @@ impl eframe::App for TerminalApp {
             } else {
                 false
             };
-            let has_new_output = has_new_output || has_pending_data;
+            let has_new_output = has_new_output || background_had_output || has_pending_data;
 
             let should_repaint = has_new_output
                 || cursor_state_changed
@@ -2400,7 +3481,7 @@ impl eframe::App for TerminalApp {
         // Debounce 保存配置和会话
         self.flush_config_save();
         self.flush_session_save();
-        self.check_config_hot_reload();
+        self.check_config_hot_reload(ctx);
 
         // Handle shell exit: close current session
         if shell_exited {
@@ -2434,16 +3515,19 @@ impl Drop for TerminalApp {
             }
         }
 
-        // 保存当前会话到持久化存储（包含每个 session 的 cwd 和 restorable commands）
-        if let Ok(session_history_path) = config::Config::session_history_path() {
-            let _ = session_persistence::ensure_session_history_dir(&session_history_path);
+        // 保存当前会话到持久化存储（包含每个 session 的 cwd）。只有持有实例锁
+        // 的主实例能更新共享快照，避免后开的临时窗口在退出时覆盖完整状态。
+        if self._lock_file.is_some() {
+            if let Ok(session_history_path) = self.config.resolved_session_history_path() {
+                let _ = session_persistence::ensure_session_history_dir(&session_history_path);
 
-            let snapshots = self.session_manager.get_session_snapshots();
-            let active_index = Some(self.session_manager.active_index());
-            let snapshot =
-                session_persistence::SessionsSnapshot::from_snapshots(snapshots, active_index);
-            if let Err(e) = snapshot.save(&session_history_path) {
-                eprintln!("[SessionPersistence] Failed to save sessions: {}", e);
+                let snapshots = self.session_manager.get_session_snapshots();
+                let active_index = Some(self.session_manager.active_index());
+                let snapshot =
+                    session_persistence::SessionsSnapshot::from_snapshots(snapshots, active_index);
+                if let Err(e) = snapshot.save(&session_history_path) {
+                    eprintln!("[SessionPersistence] Failed to save sessions: {}", e);
+                }
             }
         }
     }
@@ -2451,11 +3535,332 @@ impl Drop for TerminalApp {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
+        clipboard_5522_response_for_mime_with_limit, flush_pending_mouse_controls,
+        kitty_graphics_payload, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
+        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, primary_copy_route,
+        queue_mouse_control, reported_capture_button, should_confirm_paste,
+        take_tagged_cursor_move, wrap_bracketed_paste, ClipboardRequestGuard, PrimaryCopyRoute,
+        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
+        OSC_5522_DATA_CHUNK_BYTES,
+    };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
         shortcut_event_to_key_event,
     };
+    use base64::Engine as _;
     use eframe::egui;
+    use image::ImageEncoder as _;
+
+    #[test]
+    fn risky_paste_detection_covers_newlines_and_large_single_lines() {
+        assert!(!should_confirm_paste("printf safe"));
+        assert!(should_confirm_paste("first\nsecond"));
+        assert!(should_confirm_paste(
+            &"x".repeat(crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_cannot_embed_an_early_terminator() {
+        let wrapped = wrap_bracketed_paste(b"safe\x1b[201~injected".to_vec());
+        assert_eq!(wrapped, b"\x1b[200~safeinjected\x1b[201~");
+        assert_eq!(
+            wrapped
+                .windows(b"\x1b[201~".len())
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn synthetic_wheel_deltas_are_saturating_and_bounded() {
+        assert_eq!(
+            bounded_wheel_step_accumulate(0, f32::INFINITY, usize::MAX),
+            64
+        );
+        assert_eq!(
+            bounded_wheel_step_accumulate(0, f32::NEG_INFINITY, usize::MAX),
+            -64
+        );
+        assert_eq!(bounded_wheel_step_accumulate(63, 1000.0, 512), 64);
+        assert_eq!(bounded_wheel_step_accumulate(-63, -1000.0, 512), -64);
+        assert_eq!(bounded_wheel_step_accumulate(7, f32::NAN, 512), 7);
+    }
+    fn encoded_test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        let mut value = 0x1234_5678_u32;
+        for _ in 0..width as usize * height as usize {
+            value = value.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pixels.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        png
+    }
+
+    fn kitty_packet_bodies(packet: &[u8]) -> Vec<&str> {
+        std::str::from_utf8(packet)
+            .unwrap()
+            .split("\x1b\\")
+            .filter(|body| !body.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn clipboard_request_guard_releases_the_single_flight_slot() {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        drop(ClipboardRequestGuard(std::sync::Arc::clone(&in_flight)));
+        assert!(!in_flight.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn osc52_response_is_bounded_before_base64_allocation() {
+        let normal = osc52_clipboard_response_with_limit("hello", 64);
+        assert_eq!(normal, b"\x1b]52;c;aGVsbG8=\x1b\\");
+
+        let capped = osc52_clipboard_response_with_limit(&"x".repeat(128), 16);
+        assert_eq!(capped, b"\x1b]52;c;\x1b\\");
+        assert!(capped.len() <= 16);
+        assert!(osc52_clipboard_response_with_limit("x", 4).is_empty());
+    }
+
+    #[test]
+    fn osc52_read_rate_limit_resets_after_its_window() {
+        let base = std::time::Instant::now();
+        let mut window = base;
+        let mut count = 0;
+        for _ in 0..MAX_OSC52_READS_PER_WINDOW {
+            assert!(osc52_read_rate_limit_allows(base, &mut window, &mut count));
+        }
+        assert!(!osc52_read_rate_limit_allows(base, &mut window, &mut count));
+        assert!(osc52_read_rate_limit_allows(
+            base + OSC52_READ_RATE_WINDOW,
+            &mut window,
+            &mut count,
+        ));
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mouse_drag_reports_require_the_press_time_capture() {
+        assert_eq!(reported_capture_button(None), None);
+        assert_eq!(reported_capture_button(Some((false, 0))), None);
+        assert_eq!(reported_capture_button(Some((true, 2))), Some(2));
+
+        assert_eq!(captured_release_button(None, &[0], false), None);
+        assert_eq!(captured_release_button(Some((false, 0)), &[0], false), None);
+        assert_eq!(captured_release_button(Some((true, 0)), &[2], true), None);
+        assert_eq!(
+            captured_release_button(Some((true, 0)), &[0], false),
+            Some(0)
+        );
+        // Some backends only report the button-up state after the pointer
+        // leaves the window. The captured last cell still receives release.
+        assert_eq!(
+            captured_release_button(Some((true, 2)), &[], false),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn mouse_control_edges_remain_ordered_and_gate_lossy_reports() {
+        use crate::app::state::PendingMouseControlKind::{Press, Release};
+
+        let mut controls = std::collections::VecDeque::new();
+        queue_mouse_control(&mut controls, Press, b"press".to_vec());
+        queue_mouse_control(&mut controls, Release, b"release".to_vec());
+        queue_mouse_control(&mut controls, Press, b"duplicate".to_vec());
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls[0].kind, Press);
+        assert_eq!(controls[1].kind, Release);
+
+        assert!(!mouse_sequence_allows_lossy(true, false, false, false));
+        assert!(mouse_sequence_allows_lossy(true, true, false, true));
+        assert!(!mouse_sequence_allows_lossy(true, true, true, true));
+        assert!(!mouse_sequence_is_complete(true, true, true, false));
+        assert!(mouse_sequence_is_complete(true, true, true, true));
+        assert!(mouse_sequence_is_complete(false, false, true, true));
+    }
+
+    #[test]
+    fn backpressured_mouse_edges_stay_at_the_front_until_both_are_accepted() {
+        use crate::app::state::PendingMouseControlKind::{Press, Release};
+
+        let mut controls = std::collections::VecDeque::new();
+        queue_mouse_control(&mut controls, Press, b"press".to_vec());
+        queue_mouse_control(&mut controls, Release, b"release".to_vec());
+        let mut press_accepted = false;
+
+        let blocked: Result<(), ()> =
+            flush_pending_mouse_controls(&mut controls, &mut press_accepted, |_| Err(()));
+        assert_eq!(blocked, Err(()));
+        assert!(!press_accepted);
+        assert_eq!(controls.len(), 2);
+
+        let mut admitted = Vec::new();
+        flush_pending_mouse_controls(&mut controls, &mut press_accepted, |bytes| {
+            admitted.extend_from_slice(bytes);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(admitted, b"pressrelease");
+        assert!(press_accepted);
+        assert!(controls.is_empty());
+    }
+
+    #[test]
+    fn prior_render_cursor_bytes_keep_their_route_and_precede_current_input() {
+        let mut target = Some(17);
+        let mut cursor = b"\x1b[C".to_vec();
+        let (routed_to, mut ordered) =
+            take_tagged_cursor_move(&mut target, &mut cursor).expect("tagged cursor input");
+        assert_eq!(routed_to, 17);
+        ordered.extend_from_slice("中".as_bytes());
+        ordered.push(0x03);
+        assert_eq!(
+            ordered,
+            [b"\x1b[C".as_slice(), "中".as_bytes(), &[0x03]].concat()
+        );
+        assert!(target.is_none());
+        assert!(cursor.is_empty());
+
+        let mut stale_target = None;
+        let mut stale = b"\x1b[D".to_vec();
+        assert!(take_tagged_cursor_move(&mut stale_target, &mut stale).is_none());
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn captured_primary_release_never_falls_back_to_the_replacement_terminal() {
+        assert_eq!(
+            primary_copy_route(Some((false, false, 0)), true, true),
+            PrimaryCopyRoute::CapturedLocal
+        );
+        assert_eq!(
+            primary_copy_route(Some((true, false, 0)), true, true),
+            PrimaryCopyRoute::SuppressCaptured
+        );
+        assert_eq!(
+            primary_copy_route(Some((false, true, 0)), true, true),
+            PrimaryCopyRoute::SuppressCaptured
+        );
+        assert_eq!(
+            primary_copy_route(None, false, true),
+            PrimaryCopyRoute::Generic
+        );
+        assert_eq!(
+            primary_copy_route(Some((true, false, 2)), true, false),
+            PrimaryCopyRoute::None
+        );
+    }
+
+    #[test]
+    fn osc_5522_response_chunks_data_at_4096_bytes() {
+        let data = vec![0x5a; OSC_5522_DATA_CHUNK_BYTES + 1];
+        let response = clipboard_5522_response_for_mime("application/octet-stream", &data);
+        let response = String::from_utf8(response).unwrap();
+        let packets: Vec<&str> = response
+            .split("\x1b\\")
+            .filter(|packet| packet.contains("status=DATA"))
+            .collect();
+        assert_eq!(packets.len(), 2);
+
+        let decoded: Vec<Vec<u8>> = packets
+            .iter()
+            .map(|packet| {
+                let payload = packet.rsplit_once(';').unwrap().1;
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(decoded[0].len(), OSC_5522_DATA_CHUNK_BYTES);
+        assert_eq!(decoded[1].len(), 1);
+        assert_eq!(decoded.concat(), data);
+        assert_eq!(response.matches("status=OK").count(), 1);
+        assert_eq!(response.matches("status=DONE").count(), 1);
+    }
+
+    #[test]
+    fn osc_5522_response_rejects_data_over_policy_limit() {
+        let response = clipboard_5522_response_for_mime_with_limit("text/plain", b"12345", 4);
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "\x1b]5522;type=read:status=EPERM\x1b\\"
+        );
+    }
+
+    #[test]
+    fn kitty_png_payload_uses_standard_bounded_chunks_and_put() {
+        let png = encoded_test_png(64, 64);
+        let packet = kitty_graphics_payload("image/png", &png).unwrap();
+        let bodies = kitty_packet_bodies(&packet);
+        assert!(
+            bodies.len() >= 3,
+            "expected multiple transfer chunks plus put"
+        );
+
+        let transfer_bodies = &bodies[..bodies.len() - 1];
+        let mut encoded = String::new();
+        let mut image_id = None;
+        for (index, body) in transfer_bodies.iter().enumerate() {
+            let body = body.strip_prefix("\x1b_G").unwrap();
+            let (control, payload) = body.split_once(';').unwrap();
+            assert!(payload.len() <= KITTY_BASE64_CHUNK_BYTES);
+            let expected_more = u8::from(index + 1 < transfer_bodies.len());
+            let expected_more_control = format!("m={expected_more}");
+            assert!(control.split(',').any(|part| part == expected_more_control));
+
+            if index == 0 {
+                assert!(control.split(',').any(|part| part == "a=t"));
+                assert!(control.split(',').any(|part| part == "f=100"));
+                image_id = control
+                    .split(',')
+                    .find_map(|part| part.strip_prefix("i="))
+                    .map(str::to_owned);
+            } else {
+                assert_eq!(control, expected_more_control);
+            }
+            encoded.push_str(payload);
+        }
+
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&encoded)
+                .unwrap(),
+            png
+        );
+        let expected_put = format!("\x1b_Ga=p,i={}", image_id.unwrap());
+        assert_eq!(bodies.last().copied(), Some(expected_put.as_str()));
+    }
+
+    #[test]
+    fn kitty_png_payload_marks_a_single_transfer_final_and_keeps_padding() {
+        let mut png = encoded_test_png(1, 1);
+        while png.len().is_multiple_of(3) {
+            png.push(0);
+        }
+        let packet = kitty_graphics_payload("image/png", &png).unwrap();
+        let bodies = kitty_packet_bodies(&packet);
+        assert_eq!(bodies.len(), 2);
+        let (_, payload) = bodies[0].split_once(';').unwrap();
+        assert!(bodies[0].contains("a=t,f=100"));
+        assert!(bodies[0].contains("m=0"));
+        assert!(payload.ends_with('='));
+        assert!(bodies[1].contains("a=p"));
+    }
+
+    #[test]
+    fn kitty_image_paste_rejects_non_png_and_invalid_png() {
+        assert!(kitty_graphics_payload("image/jpeg", b"\xff\xd8\xff\xe0").is_none());
+        assert!(kitty_graphics_payload("image/png", b"not a png").is_none());
+    }
 
     #[test]
     fn copy_event_becomes_ctrl_c_key_event() {

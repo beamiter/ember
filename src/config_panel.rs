@@ -758,8 +758,9 @@ fn render_theme_editor(
                 .num_columns(8)
                 .spacing([4.0, 2.0])
                 .show(ui, |ui| {
-                    for i in 0..8 {
-                        changed |= color_btn_rgb(ui, names[i], &mut theme.terminal.ansi_colors[i]);
+                    for (name, color) in names[..8].iter().zip(&mut theme.terminal.ansi_colors[..8])
+                    {
+                        changed |= color_btn_rgb(ui, name, color);
                     }
                     ui.end_row();
                 });
@@ -773,8 +774,9 @@ fn render_theme_editor(
                 .num_columns(8)
                 .spacing([4.0, 2.0])
                 .show(ui, |ui| {
-                    for i in 8..16 {
-                        changed |= color_btn_rgb(ui, names[i], &mut theme.terminal.ansi_colors[i]);
+                    for (name, color) in names[8..].iter().zip(&mut theme.terminal.ansi_colors[8..])
+                    {
+                        changed |= color_btn_rgb(ui, name, color);
                     }
                     ui.end_row();
                 });

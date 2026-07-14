@@ -1,4 +1,241 @@
-use super::{ClipboardReadKind, Color, TerminalState, UnderlineStyle};
+use super::{
+    ClipboardReadKind, ClipboardReadRequest, Color, TerminalState, UnderlineStyle,
+    MAX_PENDING_ESCAPE,
+};
+
+// `a=t` is the protocol default. Omitting it also guards against regressing to
+// heuristic routing based on searching the body for an `a=` substring.
+const KITTY_ONE_PIXEL_RGBA_APC: &[u8] = b"\x1b_Gi=41,f=32,s=1,v=1;/wAA/w==\x1b\\";
+
+#[test]
+fn kitty_graphics_routes_only_standard_g_apc() {
+    let mut terminal = TerminalState::new(8, 2);
+
+    terminal.process_input(KITTY_ONE_PIXEL_RGBA_APC);
+
+    let image = terminal
+        .kitty_graphics
+        .get_image(41)
+        .expect("standard Kitty APC should reach the graphics state");
+    assert_eq!((image.width, image.height), (1, 1));
+    assert_eq!(image.data, [255, 0, 0, 255]);
+}
+
+#[test]
+fn kitty_graphics_apc_survives_every_input_batch_boundary() {
+    for split_at in 1..KITTY_ONE_PIXEL_RGBA_APC.len() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(&KITTY_ONE_PIXEL_RGBA_APC[..split_at]);
+        assert!(
+            terminal.kitty_graphics.get_image(41).is_none(),
+            "incomplete APC was applied at split {split_at}"
+        );
+        terminal.process_input(&KITTY_ONE_PIXEL_RGBA_APC[split_at..]);
+
+        assert!(
+            terminal.kitty_graphics.get_image(41).is_some(),
+            "APC was lost at input split {split_at}"
+        );
+    }
+}
+
+#[test]
+fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b_Gi=52,f=32,s=1,v=1;");
+    assert_eq!(
+        terminal.pending_apc_scan_from,
+        terminal.pending_apc.len().saturating_sub(1)
+    );
+
+    for fragment in [
+        b"AQ".as_slice(),
+        b"ID".as_slice(),
+        b"BA".as_slice(),
+        b"==".as_slice(),
+    ] {
+        let old_len = terminal.pending_apc.len();
+        terminal.process_input(fragment);
+        assert_eq!(terminal.pending_apc.len(), old_len + fragment.len());
+        assert_eq!(
+            terminal.pending_apc_scan_from,
+            terminal.pending_apc.len().saturating_sub(1),
+            "unterminated fragments must resume scanning at the previous tail"
+        );
+    }
+    terminal.process_input(b"\x1b\\");
+    assert!(terminal.pending_apc.is_empty());
+    assert!(terminal.kitty_graphics.get_image(52).is_some());
+    std::mem::take(&mut terminal.output_buffer);
+
+    let mut oversized = b"\x1b_Ga=p,i=53,q=0;".to_vec();
+    oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    terminal.process_input(&oversized);
+    assert!(terminal.pending_apc.is_empty());
+    assert!(terminal.discarding_oversized_apc);
+    let response = std::mem::take(&mut terminal.output_buffer);
+    assert!(response.starts_with(b"\x1b_Gi=53;EINVAL:"));
+    assert!(response.len() < 256);
+
+    // Discard through ST without allocating the oversized packet, then resume
+    // ordinary terminal parsing on the same input batch.
+    terminal.process_input(b"\x1b\\Z");
+    assert!(!terminal.discarding_oversized_apc);
+    assert_eq!(terminal.grid[0][0].character, 'Z');
+
+    // The bytes after ST belong to the normal stream, not the APC. Even when
+    // they make the whole read exceed the cap, a packet whose terminator is
+    // itself within the cap must be completed and the remainder preserved.
+    let mut near_limit = b"\x1b_Gi=55,f=32,s=1,v=1,q=2;".to_vec();
+    near_limit.resize(MAX_PENDING_ESCAPE - 2, b'A');
+    terminal.process_input(&near_limit);
+    terminal.process_input(b"\x1b\\Y");
+    assert!(!terminal.discarding_oversized_apc);
+    assert!(terminal.pending_apc.is_empty());
+    assert_eq!(terminal.grid[0][1].character, 'Y');
+}
+
+#[test]
+fn malformed_kitty_apc_reports_errors_unless_quiet_suppresses_them() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b_Ga=p,i=54,bad\x1b\\");
+    let response = std::mem::take(&mut terminal.output_buffer);
+    assert!(response.starts_with(b"\x1b_Gi=54;EINVAL:"));
+    assert!(response.len() < 256);
+
+    terminal.process_input(b"\x1b_Ga=p,i=54,bad,q=2\x1b\\");
+    assert!(std::mem::take(&mut terminal.output_buffer).is_empty());
+
+    terminal.process_input(b"\x1b_Ga=p,i=54,q=0;\xff\x1b\\");
+    let response = std::mem::take(&mut terminal.output_buffer);
+    assert!(response.starts_with(b"\x1b_Gi=54;EINVAL:"));
+    assert!(response.len() < 256);
+}
+
+#[test]
+fn ris_resets_graphics_and_parser_state_without_printing_the_final_byte() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.set_max_scrollback(17);
+    terminal.kitty_graphics.set_cell_size_pixels(9, 18);
+    terminal.process_input(KITTY_ONE_PIXEL_RGBA_APC);
+    terminal.process_input(b"\x1b_Ga=p,i=41,C=1\x1b\\");
+    terminal.process_input(b"before\x1b[31m\x1b[?25l");
+    assert!(terminal.kitty_graphics.get_image(41).is_some());
+
+    terminal.process_input(b"\x1bcZ");
+
+    assert!(terminal.kitty_graphics.get_image(41).is_none());
+    assert!(terminal.kitty_graphics.get_placements().is_empty());
+    assert_eq!(terminal.grid[0][0].character, 'Z');
+    assert_eq!((terminal.cursor_col, terminal.cursor_row), (1, 0));
+    assert!(terminal.is_cursor_visible());
+    assert_eq!(terminal.current_fg, Color::Default);
+    assert_eq!(terminal.max_scrollback(), 17);
+    assert_eq!(terminal.kitty_graphics.cell_size_pixels(), (9, 18));
+    assert!(terminal.pending_escape.is_empty());
+    assert!(terminal.pending_apc.is_empty());
+}
+
+#[test]
+fn kitty_placements_follow_text_into_and_out_of_scrollback_view() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.process_input(KITTY_ONE_PIXEL_RGBA_APC);
+    terminal.process_input(b"\x1b_Ga=p,i=41,c=2,r=2,C=1\x1b\\");
+    terminal.process_input(b"\x1b[3;1H\n");
+
+    let placement = &terminal.kitty_graphics.get_placements()[0];
+    assert_eq!(placement.y, -1);
+    assert_eq!(placement.viewport_row(0), -1);
+    assert_eq!(terminal.scrollback_len(), 1);
+
+    terminal.scroll(1);
+    let placement = &terminal.kitty_graphics.get_placements()[0];
+    assert_eq!(placement.viewport_row(terminal.scroll_offset), 0);
+}
+
+#[test]
+fn kitty_chunked_display_uses_cursor_at_final_chunk() {
+    let mut terminal = TerminalState::new(8, 3);
+
+    terminal.process_input(b"\x1b_Ga=T,i=42,f=32,s=1,v=1,c=2,r=1,m=1;/wAA\x1b\\");
+    assert!(terminal.kitty_graphics.get_placements().is_empty());
+
+    terminal.process_input(b"\x1b[2;4H");
+    terminal.process_input(b"\x1b_Gm=0;/w==\x1b\\");
+
+    let placement = terminal
+        .kitty_graphics
+        .get_placements()
+        .first()
+        .expect("a=T should place the completed image");
+    assert_eq!(placement.image_id, 42);
+    assert_eq!((placement.x, placement.y), (3, 1));
+    assert_eq!((placement.width, placement.height), (2, 1));
+}
+
+#[test]
+fn kitty_placement_applies_explicit_cursor_policy_and_cell_offsets() {
+    let mut terminal = TerminalState::new(10, 6);
+    terminal.process_input(b"\x1b_Gf=32,i=50,s=1,v=1;AQIDBA==\x1b\\");
+    terminal.process_input(b"\x1b_Ga=p,i=50,X=3,Y=4,c=2,r=3\x1b\\");
+
+    assert_eq!((terminal.cursor_col, terminal.cursor_row), (2, 3));
+    let placement = terminal.kitty_graphics.get_placements().last().unwrap();
+    assert_eq!((placement.cell_x_offset, placement.cell_y_offset), (3, 4));
+
+    terminal.process_input(b"\x1b[2;2H");
+    terminal.process_input(b"\x1b_Ga=p,i=50,c=4,r=2,C=1\x1b\\");
+    assert_eq!((terminal.cursor_col, terminal.cursor_row), (1, 1));
+}
+
+#[test]
+fn text_erase_keeps_graphics_except_for_full_ed2() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal.process_input(b"\x1b_Gf=32,i=51,s=1,v=1;AQIDBA==\x1b\\");
+    terminal.process_input(b"\x1b_Ga=p,i=51,C=1\x1b\\");
+
+    for erase in [
+        b"\x1b[K".as_slice(),
+        b"\x1b[1K".as_slice(),
+        b"\x1b[2K".as_slice(),
+        b"\x1b[J".as_slice(),
+        b"\x1b[1J".as_slice(),
+    ] {
+        terminal.process_input(erase);
+        assert_eq!(
+            terminal.kitty_graphics.get_placements().len(),
+            1,
+            "text erase {erase:?} must not clear graphics"
+        );
+    }
+
+    terminal.process_input(b"\x1b[2J");
+    assert!(terminal.kitty_graphics.get_placements().is_empty());
+    assert!(terminal.kitty_graphics.get_image(51).is_some());
+}
+
+#[test]
+fn kitty_graphics_does_not_route_dcs_sos_pm_or_non_g_apc() {
+    let body = b"Ga=t,i=41,f=32,s=1,v=1;/wAA/w==";
+
+    for introducer in [b'P', b'X', b'^'] {
+        let mut terminal = TerminalState::new(8, 2);
+        let mut sequence = vec![0x1b, introducer];
+        sequence.extend_from_slice(body);
+        sequence.extend_from_slice(b"\x1b\\");
+
+        terminal.process_input(&sequence);
+        assert!(
+            terminal.kitty_graphics.get_image(41).is_none(),
+            "non-APC introducer {introducer:#x} was routed as Kitty graphics"
+        );
+    }
+
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b_a=t,i=41,f=32,s=1,v=1;/wAA/w==\x1b\\");
+    assert!(terminal.kitty_graphics.get_image(41).is_none());
+}
 
 #[test]
 fn resize_preserves_full_screen_scroll_region() {
@@ -28,6 +265,86 @@ fn alt_screen_resize_does_not_leak_background_into_primary_screen() {
     assert_eq!(terminal.grid[0][0].character, 'm');
     assert_eq!(terminal.grid[0][4].background, Color::Default);
     assert_eq!(terminal.grid[2][0].background, Color::Default);
+}
+
+#[test]
+fn application_cursor_mode_is_tracked_independently_of_alt_screen() {
+    let mut terminal = TerminalState::new(4, 2);
+
+    assert!(!terminal.is_application_cursor_keys());
+    terminal.process_input(b"\x1b[?1049h");
+    assert!(terminal.is_alt_buffer_active());
+    assert!(!terminal.is_application_cursor_keys());
+
+    terminal.process_input(b"\x1b[?1h");
+    assert!(terminal.is_application_cursor_keys());
+    terminal.process_input(b"\x1b[?1l");
+    assert!(!terminal.is_application_cursor_keys());
+}
+
+#[test]
+fn osc7_rejects_remote_host_paths_for_local_session_restore() {
+    assert_eq!(
+        TerminalState::decode_osc7_cwd("file:///home/user/My%20Files"),
+        Some("/home/user/My Files".to_string())
+    );
+    assert_eq!(
+        TerminalState::decode_osc7_cwd("file://localhost/tmp"),
+        Some("/tmp".to_string())
+    );
+    assert_eq!(
+        TerminalState::decode_osc7_cwd("file://definitely-remote.invalid/etc"),
+        None
+    );
+}
+
+#[test]
+fn sgr_mouse_coordinates_are_not_limited_to_one_byte() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"\x1b[?1000h\x1b[?1006h");
+
+    assert_eq!(
+        terminal.get_mouse_report(0, 254, 255).as_deref(),
+        Some(b"\x1b[<0;255;256M".as_slice())
+    );
+    assert_eq!(
+        terminal.get_mouse_report(0, 255, 256).as_deref(),
+        Some(b"\x1b[<0;256;257M".as_slice())
+    );
+    assert_eq!(
+        terminal.get_mouse_release_report(0, 999, 1000).as_deref(),
+        Some(b"\x1b[<0;1000;1001m".as_slice())
+    );
+}
+
+#[test]
+fn legacy_mouse_coordinates_clamp_before_narrowing() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"\x1b[?1000h");
+
+    let origin = terminal.get_mouse_report(0, 0, 0).unwrap();
+    assert_eq!(origin, b"\x1b[M !!");
+
+    let large = terminal.get_mouse_report(0, 255, usize::MAX).unwrap();
+    assert_eq!(&large[..4], b"\x1b[M ");
+    assert_eq!(large[4], 255);
+    assert_eq!(large[5], 255);
+
+    let larger = terminal.get_mouse_report(0, 511, 256).unwrap();
+    assert_eq!(larger[4], large[4]);
+    assert_eq!(larger[5], large[5]);
+}
+
+#[test]
+fn mouse_motion_modes_distinguish_drag_and_all_motion() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"\x1b[?1002h");
+    assert!(!terminal.should_report_mouse_motion(false));
+    assert!(terminal.should_report_mouse_motion(true));
+
+    terminal.process_input(b"\x1b[?1002l\x1b[?1003h");
+    assert!(terminal.should_report_mouse_motion(false));
+    assert!(terminal.should_report_mouse_motion(true));
 }
 
 #[test]
@@ -552,15 +869,158 @@ fn vte_report_all_keys_mode_is_tracked() {
     assert!(!terminal.is_report_all_keys_enabled());
 }
 
+fn paste_token_from_event(event: &[u8]) -> String {
+    use base64::Engine as _;
+
+    let event = std::str::from_utf8(event).expect("paste event must be UTF-8");
+    let encoded = event
+        .split_once(":pw=")
+        .and_then(|(_, rest)| rest.split('\x1b').next())
+        .expect("paste event must include pw metadata");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("pw must be valid base64");
+    String::from_utf8(bytes).expect("pw must be UTF-8")
+}
+
+fn osc_5522_mime_read(mime: &str, token: &str, name: &str) -> Vec<u8> {
+    use base64::Engine as _;
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let encoded_mime = engine.encode(mime.as_bytes());
+    let encoded_token = engine.encode(token.as_bytes());
+    let encoded_name = engine.encode(name.as_bytes());
+    format!("\x1b]5522;type=read:pw={encoded_token}:name={encoded_name};{encoded_mime}\x1b\\")
+        .into_bytes()
+}
+
 #[test]
-fn osc_5522_read_request_is_queued() {
+fn osc_5522_mime_list_request_without_user_paste_is_denied() {
     let mut terminal = TerminalState::new(8, 2);
 
     terminal.process_input(b"\x1b]5522;type=read;Lg==\x1b\\");
 
-    let requests = terminal.take_clipboard_read_requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].kind, ClipboardReadKind::MimeList);
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert!(terminal.pending_paste_grant.is_none());
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b]5522;type=read:status=EPERM\x1b\\"
+    );
+}
+
+#[test]
+fn osc_5522_data_read_without_user_paste_is_denied() {
+    let mut terminal = TerminalState::new(8, 2);
+    let request = osc_5522_mime_read("text/plain", "guessed-token", "Paste event");
+
+    terminal.process_input(&request);
+
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b]5522;type=read:status=EPERM\x1b\\"
+    );
+}
+
+#[test]
+fn osc_5522_paste_grant_is_mode_bound_and_single_use() {
+    let mut terminal = TerminalState::new(8, 2);
+    assert!(terminal
+        .build_paste_event(&["text/plain".to_string()])
+        .is_empty());
+
+    terminal.process_input(b"\x1b[?5522h");
+    let event = terminal.build_paste_event(&["text/plain".to_string()]);
+    let event_text = String::from_utf8(event.clone()).unwrap();
+    assert!(event_text.contains(":pw="));
+    assert!(!event_text.contains(":password="));
+    let token = paste_token_from_event(&event);
+    let request = osc_5522_mime_read("text/plain", &token, "Paste event");
+
+    terminal.process_input(&request);
+    assert_eq!(
+        terminal.take_clipboard_read_requests(),
+        vec![ClipboardReadRequest {
+            kind: ClipboardReadKind::MimeData("text/plain".to_string()),
+        }]
+    );
+
+    terminal.process_input(&request);
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b]5522;type=read:status=EPERM\x1b\\"
+    );
+}
+
+#[test]
+fn osc_5522_paste_grant_rejects_wrong_name_and_unoffered_mime() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[?5522h");
+    let event = terminal.build_paste_event(&["text/plain".to_string()]);
+    let token = paste_token_from_event(&event);
+
+    terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Other app"));
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert!(String::from_utf8(terminal.get_output())
+        .unwrap()
+        .contains("status=EPERM"));
+
+    // A failed credential check does not reveal or consume the grant. Once
+    // authenticated, however, even an invalid MIME consumes the one-time token.
+    terminal.process_input(&osc_5522_mime_read(
+        "application/octet-stream",
+        &token,
+        "Paste event",
+    ));
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert!(terminal.pending_paste_grant.is_none());
+
+    terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+}
+
+#[test]
+fn osc_5522_paste_grant_expires_and_is_revoked_with_mode() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[?5522h");
+    let event = terminal.build_paste_event(&["text/plain".to_string()]);
+    let token = paste_token_from_event(&event);
+    terminal.pending_paste_grant.as_mut().unwrap().expires_at =
+        std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+    terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert!(terminal.pending_paste_grant.is_none());
+
+    let event = terminal.build_paste_event(&["text/plain".to_string()]);
+    let token = paste_token_from_event(&event);
+    terminal.process_input(b"\x1b[?5522l");
+    terminal.process_input(&osc_5522_mime_read("text/plain", &token, "Paste event"));
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+    assert!(terminal.pending_paste_grant.is_none());
+}
+
+#[test]
+fn osc_5522_new_user_paste_invalidates_the_previous_token() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[?5522h");
+    let old_event = terminal.build_paste_event(&["text/plain".to_string()]);
+    let old_token = paste_token_from_event(&old_event);
+    let new_event = terminal.build_paste_event(&["image/png".to_string()]);
+    let new_token = paste_token_from_event(&new_event);
+    assert_ne!(old_token, new_token);
+
+    terminal.process_input(&osc_5522_mime_read("text/plain", &old_token, "Paste event"));
+    assert!(terminal.take_clipboard_read_requests().is_empty());
+
+    terminal.process_input(&osc_5522_mime_read("image/png", &new_token, "Paste event"));
+    assert_eq!(
+        terminal.take_clipboard_read_requests(),
+        vec![ClipboardReadRequest {
+            kind: ClipboardReadKind::MimeData("image/png".to_string()),
+        }]
+    );
 }
 
 #[test]

@@ -1,144 +1,216 @@
 # jterm2
 
-A modern, GPU-accelerated terminal emulator written in Rust with egui.
+jterm2 is a Linux terminal emulator written in Rust. It combines an egui
+desktop shell with a WGPU text pipeline, a built-in VTE/ANSI parser, tabs,
+split panes, searchable scrollback and Kitty protocol extensions.
 
-## Features
+The project is under active development. It is useful as a daily terminal for
+testing, but compatibility with every TUI and escape sequence is not yet
+claimed.
 
-- **GPU-accelerated rendering** - Hardware-accelerated text rendering using wgpu
-- **Kitty graphics protocol** - Display images directly in the terminal
-- **Multi-session support** - Multiple terminal sessions with tab management
-- **Search & Replace** - Powerful text search with context display
-- **Session persistence** - Automatic save/restore of sessions
-- **Customizable themes** - Full theme support with multiple built-in themes
-- **Font configuration** - Flexible font selection with fallback support
-- **Command palette** - Quick access to all features
-- **Performance monitoring** - Built-in debug overlay with FPS, memory usage
-- **VTE compatibility** - Full ANSI/VTE escape sequence support
+## Highlights
 
-## Performance Optimizations
+- WGPU terminal grid rendering with a CPU/Glow fallback
+- Tabs, drag-to-reorder, rename, activity indicators and session restore
+- Two-pane horizontal or vertical splits with independent terminal grids
+- Unicode width handling, combining characters, ligatures and font fallback
+- Search, match navigation, selection-aware replace and command marks (OSC 133)
+- Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
+- Bracketed paste sanitization, multiline paste confirmation and guarded
+  clipboard-read protocols
+- Clickable URLs, IP addresses and local paths
+- Built-in/custom themes, live configuration reload and configurable bindings
+- Bounded PTY channels, adaptive parsing budgets and dirty-row GPU uploads
 
-- LRU texture cache for Kitty graphics (prevents unbounded memory growth)
-- Dirty-region rendering (only redraws changed cells)
-- Frame budget system (limits processing per frame to maintain 60 FPS)
-- Zero-copy rendering with Arc-based instance buffers
-- Keyboard input buffer reuse (reduces allocations)
-- Smart cursor blinking (only when idle)
+### Kitty graphics compatibility
 
-## Building
+jterm2 implements the core 7-bit Kitty graphics APC path for direct RGB,
+RGBA and PNG transfers (`t=d`, `f=24/32/100`), chunking, queries, placement,
+crop, z-order, deletion, cursor movement and ordinary main-screen scrollback.
+Malformed, oversized and unsupported requests receive bounded protocol errors
+instead of being accepted silently.
 
-### Prerequisites
+The following advanced parts of the
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+are not currently implemented: file/temporary-file/shared-memory media, zlib,
+animation, Unicode placeholders, relative placements and C1 APC. Horizontal
+text reflow does not re-anchor images, margin clipping is cell-row based rather
+than pixel-exact, and the project-specific alternate-screen text snapshot does
+not include images.
 
-- Rust 1.70 or later
-- Linux (tested on Ubuntu/Debian)
+## Platform and prerequisites
 
-### Compile
+jterm2 currently targets Linux (X11 and Wayland). Building requires Rust 1.92
+or newer and the native window/graphics development packages used by winit and
+WGPU.
+
+On Ubuntu/Debian:
 
 ```bash
-# Debug build (faster compilation)
-cargo build
-
-# Release build (optimized)
-cargo build --release
+sudo apt-get install --no-install-recommends \
+  pkg-config libfontconfig1-dev libwayland-dev libx11-dev libx11-xcb-dev \
+  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev \
+  libegl1-mesa-dev libgl1-mesa-dev
 ```
 
-### Run
+Clipboard integration uses the first available backend:
+
+- Wayland: `wl-copy` / `wl-paste` from `wl-clipboard`
+- X11: `xclip` or `xsel`
+
+The application still starts if none is installed, but host clipboard actions
+will be unavailable.
+
+## Build and run
 
 ```bash
-# Debug
+cargo build
 cargo run
 
-# Release
-cargo run --release
+# Optimized binary (thin LTO, one codegen unit, stripped symbols)
+cargo build --release
+./target/release/jterm2
+```
+
+Set `JTERM2_SHELL` to override shell detection for one launch:
+
+```bash
+JTERM2_SHELL=/bin/zsh cargo run --release
 ```
 
 ## Configuration
 
-Configuration file: `~/.config/jterm2/config.toml`
+The main configuration is `~/.config/jterm2/config.toml`. It is created after
+settings are saved. Hand-edited values are validated on startup and hot reload;
+unsafe dimensions and non-finite/out-of-range numeric values are normalized.
 
-Key settings:
-- `font_size` - Base font size
-- `font_family` - Primary font family
-- `font_fallback` - Fallback fonts for Unicode
-- `theme` - Color scheme name
-- `ui_scale` - UI scaling factor
-- `scroll_speed` - Mouse wheel scroll speed
+Example:
 
-## Keybindings
+```toml
+font_family = "JetBrains Mono Nerd Font"
+font_size = 14.0
+font_weight = 1.0
+line_spacing = 1.0
+padding = 2.0
+font_backend = "fontdue"       # fontdue | ab_glyph
+font_ligatures = true
+subpixel_rendering = false
 
-- `Ctrl+Shift+T` - New tab
-- `Ctrl+Shift+W` - Close tab
-- `Ctrl+Shift+F` - Search
-- `Ctrl+Shift+P` - Command palette
-- `Ctrl+Shift+,` - Settings panel
-- `F12` - Debug overlay
-- `Ctrl+Tab` / `Ctrl+Shift+Tab` - Switch tabs
-- `Ctrl+Shift+C` - Copy
-- `Ctrl+Shift+V` - Paste
+theme = "dark"
+opacity = 1.0
+ui_scale = 1.0                 # omit to follow native DPI
+app_renderer = "wgpu"         # wgpu | glow (restart required)
+gpu_rendering = true
+
+scrollback_lines = 10000
+scroll_speed = 3
+restore_session = true
+tab_bar_position = "top"      # top | sidebar
+shell = "/bin/bash"            # optional; JTERM2_SHELL has priority
+
+# Host clipboard policy. Reading is more sensitive than writing.
+osc52_clipboard_write = true
+osc52_clipboard_read = false
+paste_confirm = true
+```
+
+`session_history_file` may point at a custom session snapshot location. Other
+state is stored beside the config:
+
+- `session_history.json` — tabs, names and working directories
+- `ui_history.json` — recent commands and search history
+- `keybindings.toml` — user binding overrides
+- `themes/*.toml` — custom themes
+
+Only the first running jterm2 instance owns and updates the shared session
+snapshot, preventing a secondary window from overwriting the primary state.
+
+### Keybindings
+
+Defaults include:
+
+| Action | Binding |
+| --- | --- |
+| New session | `Ctrl+Shift+T` |
+| Next / previous session | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Last active session | `Ctrl+\`` |
+| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| Search | `Ctrl+Shift+F` |
+| Find and replace selection | `Ctrl+Shift+R` |
+| Command palette | `Ctrl+Shift+P` |
+| Settings | `Ctrl+Shift+,` |
+| Toggle sidebar | `Ctrl+Shift+B` |
+| Horizontal / vertical split | `Ctrl+Shift+O` / `Ctrl+Shift+E` |
+| Close focused pane | `Ctrl+Shift+W` |
+| Close window | `Ctrl+Shift+Q` |
+| Help | `Ctrl+?` |
+| Debug overlay | `F12` |
+
+Bindings in `~/.config/jterm2/keybindings.toml` override defaults. The file is
+a flat TOML table:
+
+```toml
+"ctrl+shift+t" = "session:new"
+"alt+right" = "pane:focus_next"
+"alt+left" = "pane:focus_prev"
+```
+
+The in-app help panel is generated from the active bindings, so it reflects
+customizations.
+
+## Security notes
+
+- OSC 52 clipboard writes are enabled by default; clipboard reads are disabled
+  unless `osc52_clipboard_read = true` is set explicitly.
+- MIME-aware OSC 5522 data reads are authorized only by a short-lived,
+  single-use token created by an actual user paste action. The token is scoped
+  to the MIME types announced for that paste.
+- Multiline or large text paste asks for confirmation by default.
+- Embedded bracketed-paste terminators are removed before forwarding data.
+- Link targets are shown before opening and require `Ctrl+Click`.
+
+Terminal output is untrusted input. Keep the read policy disabled unless a
+workflow genuinely requires programmatic clipboard reads.
 
 ## Architecture
 
-### Core Components
+```text
+PTY reader/writer threads
+        │ bounded events
+        ▼
+TerminalState + parser ── dirty rows / snapshots ──► TerminalRenderer
+        │                                               │
+        │ responses                                     ▼
+        └────────────────────────────────────── WGPU callbacks / Glow painter
 
-- **main.rs** - Application entry point, main event loop
-- **src/terminal/mod.rs** - VTE state machine, ANSI escape sequence parsing
-- **src/ui.rs** - GPU-accelerated renderer, UI layout
-- **src/shell.rs** - PTY management, subprocess handling
-- **src/session_manager.rs** - Multi-session coordination
-- **src/theme.rs** - Color scheme system
-- **gpu/** - WGPU rendering pipeline
-
-### Rendering Pipeline
-
-1. VTE parser updates grid state (`src/terminal/mod.rs`)
-2. Dirty-region detection compares grid versions (`src/ui.rs`)
-3. Changed cells compiled to GPU instances (`src/gpu/instance.rs`)
-4. Instances uploaded to vertex buffer
-5. WGPU draws using instanced rendering (`src/gpu/pipeline.rs` and `src/gpu/callback.rs`)
-
-### Performance Design
-
-- **Frame budget**: Max 32KB ANSI data per frame (5ms processing)
-- **Dirty tracking**: Only rebuild changed rows
-- **Cache coherence**: Quantized subpixel positioning for glyph cache
-- **Batch rendering**: Single draw call for entire grid
-
-## Development
-
-### Debug Build
-
-Development builds include:
-- Incremental compilation
-- Dependency optimization (opt-level=1)
-- Fast compile times
-
-### Release Build
-
-Release builds enable:
-- Thin LTO (Link Time Optimization)
-- Symbol stripping
-- Single codegen unit (maximum optimization)
-- opt-level=3
-
-### Testing
-
-```bash
-# Check compilation
-cargo check
-
-# Run lints
-cargo clippy
-
-# Format code
-cargo fmt
+TerminalApp coordinates tabs, panes, input, search, config and persistence.
 ```
 
-## License
+Important modules:
 
-See LICENSE file for details.
+- `src/terminal/` — grid, parser, modes, selection and scrollback
+- `src/pty.rs`, `src/shell.rs` — PTY lifecycle and bounded background I/O
+- `src/session_manager.rs`, `src/layout.rs` — tabs, restore and pane mapping
+- `src/ui.rs`, `src/gpu/` — terminal layout, glyph atlas and rendering pipeline
+- `src/app/` — input, UI coordination, config/session save and window behavior
+- `src/config.rs`, `src/keybindings.rs`, `src/theme.rs` — customization
 
-## Contributing
+## Development and verification
 
-Contributions welcome! Please ensure:
-- Code passes `cargo clippy`
-- Format with `cargo fmt`
-- Test changes with both debug and release builds
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+cargo build --workspace --release --all-features
+```
+
+Criterion benchmarks live in `benches/terminal_benchmark.rs`:
+
+```bash
+cargo bench
+```
+
+GitHub Actions runs formatting, Clippy, tests and a release build. Please add a
+focused regression test for parser, input or persistence changes whenever the
+behavior can be exercised without a desktop session.

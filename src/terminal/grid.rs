@@ -1,5 +1,5 @@
 /// 连续内存网格存储 - 优化内存局部性和缓存命中率
-/// 内存布局: cells[row * cols + col] 对应 grid[row][col]
+/// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
 #[derive(Clone)]
 pub struct TerminalGrid {
     pub(super) cells: Vec<TerminalCell>,
@@ -38,13 +38,13 @@ impl TerminalGrid {
         self.cols
     }
 
-    /// 返回行数（兼容 grid[i].len()）
+    /// 返回行数（兼容 `grid[i].len()`）。
     #[inline]
     pub fn row_len(&self) -> usize {
         self.cols
     }
 
-    /// 获取所有行为Vec<Vec> (用于兼容旧代码)
+    /// 获取所有行为 `Vec<Vec<_>>`（用于兼容旧代码）。
     pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
         self.cells
             .chunks_exact(self.cols)

@@ -103,7 +103,7 @@ impl CommandPalette {
 
     /// 构建所有可用命令列表
     fn build_commands() -> Vec<CommandInfo> {
-        vec![
+        let mut commands = vec![
             // === 会话管理 ===
             CommandInfo::new(
                 "New Session",
@@ -174,6 +174,18 @@ impl CommandPalette {
                 crate::keybindings::Command::SearchPrev,
             ),
             CommandInfo::new(
+                "Previous Search History",
+                CommandCategory::Search,
+                "Load the previous search query",
+                crate::keybindings::Command::SearchHistoryPrev,
+            ),
+            CommandInfo::new(
+                "Next Search History",
+                CommandCategory::Search,
+                "Load the next search query",
+                crate::keybindings::Command::SearchHistoryNext,
+            ),
+            CommandInfo::new(
                 "Find and Replace",
                 CommandCategory::Search,
                 "Open find-and-replace on the selection",
@@ -198,6 +210,60 @@ impl CommandPalette {
                 "Clear the terminal screen",
                 crate::keybindings::Command::TerminalClear,
             ),
+            CommandInfo::new(
+                "Send Interrupt",
+                CommandCategory::Terminal,
+                "Send Ctrl+C to the terminal",
+                crate::keybindings::Command::TerminalSendSigint,
+            ),
+            CommandInfo::new(
+                "Send End of File",
+                CommandCategory::Terminal,
+                "Send Ctrl+D to the terminal",
+                crate::keybindings::Command::TerminalSendEof,
+            ),
+            CommandInfo::new(
+                "Previous Command Mark",
+                CommandCategory::Terminal,
+                "Jump to the previous shell command mark",
+                crate::keybindings::Command::TerminalJumpPrevMark,
+            ),
+            CommandInfo::new(
+                "Next Command Mark",
+                CommandCategory::Terminal,
+                "Jump to the next shell command mark",
+                crate::keybindings::Command::TerminalJumpNextMark,
+            ),
+            CommandInfo::new(
+                "Split Vertically",
+                CommandCategory::Terminal,
+                "Create a terminal pane side by side",
+                crate::keybindings::Command::TerminalSplitVertical,
+            ),
+            CommandInfo::new(
+                "Split Horizontally",
+                CommandCategory::Terminal,
+                "Create a terminal pane above or below",
+                crate::keybindings::Command::TerminalSplitHorizontal,
+            ),
+            CommandInfo::new(
+                "Close Pane",
+                CommandCategory::Terminal,
+                "Close the focused pane",
+                crate::keybindings::Command::TerminalClosePane,
+            ),
+            CommandInfo::new(
+                "Focus Next Pane",
+                CommandCategory::Terminal,
+                "Move keyboard focus to the next pane",
+                crate::keybindings::Command::PaneFocusNext,
+            ),
+            CommandInfo::new(
+                "Focus Previous Pane",
+                CommandCategory::Terminal,
+                "Move keyboard focus to the previous pane",
+                crate::keybindings::Command::PaneFocusPrev,
+            ),
             // === 窗口操作 ===
             CommandInfo::new(
                 "Close Window",
@@ -218,7 +284,36 @@ impl CommandPalette {
                 "Open the settings panel",
                 crate::keybindings::Command::ConfigOpen,
             ),
-        ]
+            CommandInfo::new(
+                "Close Settings",
+                CommandCategory::Config,
+                "Close the settings panel",
+                crate::keybindings::Command::ConfigClose,
+            ),
+            CommandInfo::new(
+                "Toggle Settings",
+                CommandCategory::Config,
+                "Open or close the settings panel",
+                crate::keybindings::Command::ConfigToggle,
+            ),
+            CommandInfo::new(
+                "Toggle Debug Overlay",
+                CommandCategory::Config,
+                "Show or hide renderer diagnostics",
+                crate::keybindings::Command::DebugToggle,
+            ),
+        ];
+
+        for index in 0..9 {
+            commands.push(CommandInfo::new(
+                &format!("Go to Session {}", index + 1),
+                CommandCategory::Session,
+                "Switch directly to a numbered session",
+                crate::keybindings::Command::SessionJump(index),
+            ));
+        }
+
+        commands
     }
 
     /// 打开调色板
@@ -275,7 +370,8 @@ impl CommandPalette {
             }
 
             // 按分数从高到低排序
-            self.search_results.sort_by(|a, b| b.1.cmp(&a.1));
+            self.search_results
+                .sort_by_key(|result| std::cmp::Reverse(result.1));
         }
     }
 
@@ -385,5 +481,59 @@ mod tests {
         let initial_idx = palette.selected_index;
         palette.select_next();
         assert!(palette.selected_index >= initial_idx || palette.search_results.len() <= 1);
+    }
+
+    #[test]
+    fn every_command_variant_is_discoverable() {
+        use crate::keybindings::Command;
+
+        let palette = CommandPalette::new();
+        let represented = |command: &Command| {
+            palette
+                .all_commands()
+                .iter()
+                .any(|entry| &entry.command == command)
+        };
+        let fixed_commands = [
+            Command::SessionNew,
+            Command::SessionClose,
+            Command::SessionNext,
+            Command::SessionPrev,
+            Command::SessionPrevActive,
+            Command::EditCopy,
+            Command::EditPaste,
+            Command::SearchOpen,
+            Command::SearchClose,
+            Command::SearchNext,
+            Command::SearchPrev,
+            Command::SearchHistoryPrev,
+            Command::SearchHistoryNext,
+            Command::SearchReplaceToggle,
+            Command::TerminalSendSigint,
+            Command::TerminalSendEof,
+            Command::TerminalClear,
+            Command::TerminalScrollUp,
+            Command::TerminalScrollDown,
+            Command::TerminalJumpPrevMark,
+            Command::TerminalJumpNextMark,
+            Command::TerminalSplitVertical,
+            Command::TerminalSplitHorizontal,
+            Command::TerminalClosePane,
+            Command::PaneFocusNext,
+            Command::PaneFocusPrev,
+            Command::WindowClose,
+            Command::ConfigOpen,
+            Command::ConfigClose,
+            Command::ConfigToggle,
+            Command::DebugToggle,
+            Command::SidebarToggle,
+        ];
+
+        for command in fixed_commands {
+            assert!(represented(&command), "missing palette entry for {command}");
+        }
+        for index in 0..9 {
+            assert!(represented(&Command::SessionJump(index)));
+        }
     }
 }

@@ -44,6 +44,9 @@ struct GidGlyphKey {
     subpixel_offset: u8,
 }
 
+/// Owned shaping output kept after releasing the immutable font-face borrow.
+type ShapedGlyphData = (u16, u32, f32, f32, f32);
+
 /// 自包含的整形字体:`face` 借用同结构体内 `_data` Arc 持有的字节。
 /// 把"face 的 'static 生命周期是伪造的、实际借用 _data"这一不安全不变量
 /// 局部化到这里——字段顺序(face 在 _data 之前)是该不变量的一部分,使 face
@@ -122,6 +125,10 @@ pub struct FontdueAtlas {
 }
 
 impl FontdueAtlas {
+    // This constructor intentionally mirrors the independent GPU, font-family, and
+    // rendering settings needed to create an atlas; grouping them would only move
+    // the same one-time initialization fields into an otherwise unused wrapper.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -326,8 +333,13 @@ impl FontdueAtlas {
         if !self.allocate_shelf(padded_w, padded_h) {
             if !self.grow() {
                 // Atlas is at max size and full. Request a compaction (rebuild) on
-                // the next upload so churned/evicted glyphs reclaim their shelf space.
+                // the start of the next frame so churned/evicted glyphs reclaim
+                // their shelf space. Bump the generation immediately: the current
+                // CPU instance build must be discarded before a callback can paint
+                // it against the subsequently rebuilt atlas.
                 self.needs_compaction = true;
+                self.shape_cache.clear();
+                self.atlas_generation = self.atlas_generation.wrapping_add(1);
                 let region = empty_glyph_region();
                 self.cache_insert(key, region);
                 return region;
@@ -348,15 +360,7 @@ impl FontdueAtlas {
         let use_subpixel = self.subpixel_rendering && !is_cjk_or_wide(key.ch);
 
         if use_subpixel {
-            self.rasterize_subpixel(
-                metrics,
-                glyph_bitmap,
-                glyph_w,
-                glyph_h,
-                bx,
-                by,
-                weight_boost,
-            );
+            self.rasterize_subpixel(glyph_bitmap, glyph_w, glyph_h, bx, by, weight_boost);
         } else {
             for gy in 0..glyph_h {
                 for gx in 0..glyph_w {
@@ -405,7 +409,6 @@ impl FontdueAtlas {
 
     fn rasterize_subpixel(
         &mut self,
-        _metrics: &fontdue::Metrics,
         glyph_bitmap: &[u8],
         glyph_w: u32,
         glyph_h: u32,
@@ -496,7 +499,7 @@ impl FontdueAtlas {
             &self.font_regular
         };
 
-        let (metrics, glyph_bitmap) = font.rasterize_indexed(gid as u16, self.font_size_px);
+        let (metrics, glyph_bitmap) = font.rasterize_indexed(gid, self.font_size_px);
 
         if glyph_bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
             let region = empty_glyph_region();
@@ -512,6 +515,8 @@ impl FontdueAtlas {
         if !self.allocate_shelf(padded_w, padded_h) {
             if !self.grow() {
                 self.needs_compaction = true;
+                self.shape_cache.clear();
+                self.atlas_generation = self.atlas_generation.wrapping_add(1);
                 let region = empty_glyph_region();
                 self.gid_cache.put(key, region);
                 return region;
@@ -787,6 +792,10 @@ impl FontBackend for FontdueAtlas {
         (self.width, self.height)
     }
 
+    fn content_generation(&self) -> u64 {
+        self.atlas_generation
+    }
+
     fn take_needs_rebind(&mut self) -> bool {
         let v = self.needs_rebind;
         self.needs_rebind = false;
@@ -842,11 +851,8 @@ impl FontBackend for FontdueAtlas {
         // 收集本次整形得到的字形信息为自有数据，随后即可释放对 Face（&self）的借用，
         // 以便调用需要 &mut self 的 rasterize_gid。复用 UnicodeBuffer 避免每次
         // 缓存未命中都新分配一个。
-        let shaped: Option<Vec<(u16, u32, f32, f32, f32)>> = face.map(|face| {
-            let mut buffer = self
-                .shape_buffer
-                .take()
-                .unwrap_or_else(rustybuzz::UnicodeBuffer::new);
+        let shaped: Option<Vec<ShapedGlyphData>> = face.map(|face| {
+            let mut buffer = self.shape_buffer.take().unwrap_or_default();
             buffer.push_str(text);
 
             let glyph_buffer = rustybuzz::shape(face, &[], buffer);

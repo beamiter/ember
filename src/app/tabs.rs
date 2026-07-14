@@ -7,8 +7,31 @@ impl TerminalApp {
     /// 关闭指定会话,并同步修正分屏窗格保存的 session_idx,避免删除后索引错位。
     /// 返回是否真的关闭了会话。
     pub fn close_session_synced(&mut self, index: usize) -> bool {
+        let removed_session_id = self
+            .session_manager
+            .sessions()
+            .get(index)
+            .map(|session| session.metadata.session_id.clone());
         if !self.session_manager.close_session(index) {
             return false;
+        }
+        if self
+            .pending_paste_confirm
+            .as_ref()
+            .map(|pending| &pending.session_id)
+            == removed_session_id.as_ref()
+        {
+            self.pending_paste_confirm = None;
+            self.paste_dont_ask_again = false;
+        }
+        if self
+            .terminal_mouse_capture
+            .as_ref()
+            .map(|capture| &capture.session_id)
+            == removed_session_id.as_ref()
+        {
+            self.terminal_mouse_capture = None;
+            self.last_terminal_mouse_motion = None;
         }
         let fallback = self.session_manager.active_index();
         self.layout_manager.on_session_removed(index, fallback);
@@ -61,7 +84,13 @@ impl TerminalApp {
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
-        self.session_manager.refresh_unseen_flags();
+        let visible_sessions: Vec<usize> = self
+            .layout_manager
+            .panes()
+            .iter()
+            .map(|pane| pane.session_idx)
+            .collect();
+        self.session_manager.refresh_unseen_flags(&visible_sessions);
         let active = self.session_manager.active_index();
         let infos: Vec<(usize, String, bool)> = self
             .session_manager
@@ -474,7 +503,13 @@ impl TerminalApp {
     }
 
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
-        self.session_manager.refresh_unseen_flags();
+        let visible_sessions: Vec<usize> = self
+            .layout_manager
+            .panes()
+            .iter()
+            .map(|pane| pane.session_idx)
+            .collect();
+        self.session_manager.refresh_unseen_flags(&visible_sessions);
         let tab_height = 30.0;
         let close_btn_size = 14.0;
         let tab_rect = egui::Rect::from_min_size(

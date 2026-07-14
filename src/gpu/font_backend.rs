@@ -66,6 +66,10 @@ pub trait FontBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
     fn gpu_resources(&self) -> (&wgpu::TextureView, &wgpu::Sampler);
     fn atlas_dimensions(&self) -> (u32, u32);
+    /// Changes whenever cached glyph UVs may have moved or been invalidated.
+    fn content_generation(&self) -> u64 {
+        0
+    }
     fn take_needs_rebind(&mut self) -> bool;
 
     fn shape_run(
@@ -98,7 +102,7 @@ pub const INITIAL_ATLAS_SIZE: u32 = 1024;
 pub const MAX_ATLAS_SIZE: u32 = 4096;
 
 /// Convert coverage alpha to baked color using TwoCoverageMinusCoverageSq function.
-/// This matches egui's approach: alpha = 2c - c² where c is coverage in [0,1].
+/// This matches egui's approach: alpha = 2c - c² where c is coverage in `0..=1`.
 /// Produces perceptually correct blending for both light and dark backgrounds.
 pub fn alpha_from_coverage(coverage: f32) -> f32 {
     let c = coverage.clamp(0.0, 1.0);

@@ -327,7 +327,10 @@ impl Config {
             if config_path.exists() {
                 match std::fs::read_to_string(&config_path) {
                     Ok(content) => match toml::from_str::<Config>(&content) {
-                        Ok(config) => {
+                        Ok(mut config) => {
+                            for warning in config.normalize() {
+                                eprintln!("[Config] WARNING: {}", warning);
+                            }
                             eprintln!("[Config] Loaded from {}", config_path.display());
                             eprintln!("[Config] Font: {}", config.font_family);
                             return config;
@@ -373,7 +376,14 @@ impl Config {
 
         // 原子写:先写临时文件、fsync 落盘,再 rename,避免崩溃/掉电后得到损坏或空的配置。
         use std::io::Write;
-        let content = toml::to_string_pretty(self)?;
+        // Persist only values that the runtime can safely consume. This also
+        // protects callers outside the settings panel (or future migrations)
+        // from writing NaN/zero dimensions that make the next startup fail.
+        let mut normalized = self.clone();
+        for warning in normalized.normalize() {
+            eprintln!("[Config] WARNING while saving: {}", warning);
+        }
+        let content = toml::to_string_pretty(&normalized)?;
         let tmp_path = config_path.with_extension("toml.tmp");
         {
             let mut f = std::fs::File::create(&tmp_path)?;
@@ -391,6 +401,15 @@ impl Config {
     pub fn session_history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
         Ok(config_dir.join("jterm2").join("session_history.json"))
+    }
+
+    /// Resolve the session snapshot path, honoring the documented per-user
+    /// override instead of always writing to the default config directory.
+    pub fn resolved_session_history_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        match &self.session_history_file {
+            Some(path) if !path.as_os_str().is_empty() => Ok(path.clone()),
+            _ => Self::session_history_path(),
+        }
     }
 
     pub fn ui_history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -419,11 +438,158 @@ impl Config {
         size.clamp(8.0, 72.0)
     }
 
+    /// Normalize values loaded from hand-edited TOML before any renderer,
+    /// window or terminal allocation sees them. Returns human-readable notes
+    /// for diagnostics; valid configurations produce an empty list.
+    pub fn normalize(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        fn finite_or(value: f32, fallback: f32) -> f32 {
+            if value.is_finite() {
+                value
+            } else {
+                fallback
+            }
+        }
+
+        macro_rules! normalize_f32 {
+            ($field:ident, $min:expr, $max:expr, $fallback:expr) => {{
+                let old = self.$field;
+                self.$field = finite_or(old, $fallback).clamp($min, $max);
+                if self.$field != old {
+                    warnings.push(format!(
+                        "{}={} is outside the supported range; using {}",
+                        stringify!($field),
+                        old,
+                        self.$field
+                    ));
+                }
+            }};
+        }
+
+        normalize_f32!(font_size, 8.0, 72.0, default_font_size());
+        normalize_f32!(font_weight, 0.5, 2.0, default_font_weight());
+        normalize_f32!(font_sharpness, 0.5, 2.0, default_font_sharpness());
+        normalize_f32!(padding, 0.0, 20.0, default_padding());
+        normalize_f32!(line_spacing, 0.8, 3.0, default_line_spacing());
+        normalize_f32!(initial_width, 320.0, 16_384.0, default_initial_width());
+        normalize_f32!(initial_height, 200.0, 16_384.0, default_initial_height());
+        normalize_f32!(opacity, 0.05, 1.0, default_opacity());
+
+        let old_cols = self.cols;
+        let old_rows = self.rows;
+        (self.cols, self.rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
+        if (self.cols, self.rows) != (old_cols, old_rows) {
+            warnings.push(format!(
+                "terminal dimensions {}x{} are unsupported; using {}x{}",
+                old_cols, old_rows, self.cols, self.rows
+            ));
+        }
+
+        let old_scrollback = self.scrollback_lines;
+        self.scrollback_lines = self.scrollback_lines.clamp(100, 1_000_000);
+        if self.scrollback_lines != old_scrollback {
+            warnings.push(format!(
+                "scrollback_lines={} is outside 100..=1000000; using {}",
+                old_scrollback, self.scrollback_lines
+            ));
+        }
+
+        let old_scroll_speed = self.scroll_speed;
+        self.scroll_speed = self.scroll_speed.clamp(1, 50);
+        if self.scroll_speed != old_scroll_speed {
+            warnings.push(format!(
+                "scroll_speed={} is outside 1..=50; using {}",
+                old_scroll_speed, self.scroll_speed
+            ));
+        }
+
+        if self.font_family.trim().is_empty() {
+            self.font_family = default_font_family();
+            warnings.push("font_family is empty; using the default font".to_string());
+        }
+        if self.theme.trim().is_empty() {
+            self.theme = default_theme();
+            warnings.push("theme is empty; using the default theme".to_string());
+        }
+        if self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.trim().is_empty())
+        {
+            self.shell = None;
+            warnings.push("shell is empty; using automatic shell detection".to_string());
+        }
+        if let Some(scale) = self.ui_scale {
+            let normalized = finite_or(scale, 1.0).clamp(0.5, 3.0);
+            if normalized != scale {
+                warnings.push(format!(
+                    "ui_scale={} is outside 0.5..=3; using {}",
+                    scale, normalized
+                ));
+            }
+            self.ui_scale = Some(normalized);
+        }
+
+        warnings
+    }
+
     pub fn get_monospace_fonts() -> &'static Vec<String> {
         detect_monospace_fonts()
     }
 
     pub fn get_all_fonts() -> &'static Vec<String> {
         detect_available_fonts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_repairs_unsafe_hand_edited_values() {
+        let mut config = Config {
+            font_size: f32::NAN,
+            font_weight: 99.0,
+            padding: -5.0,
+            line_spacing: 0.0,
+            opacity: 2.0,
+            cols: 0,
+            rows: usize::MAX,
+            scrollback_lines: 0,
+            scroll_speed: 0,
+            ui_scale: Some(f32::INFINITY),
+            shell: Some("   ".to_string()),
+            ..Config::default()
+        };
+
+        let warnings = config.normalize();
+
+        assert!(!warnings.is_empty());
+        assert_eq!(config.font_size, default_font_size());
+        assert_eq!(config.font_weight, 2.0);
+        assert_eq!(config.padding, 0.0);
+        assert_eq!(config.line_spacing, 0.8);
+        assert_eq!(config.opacity, 1.0);
+        assert!(config.cols > 0);
+        assert!(config.rows < usize::MAX);
+        assert_eq!(config.scrollback_lines, 100);
+        assert_eq!(config.scroll_speed, 1);
+        assert_eq!(config.ui_scale, Some(1.0));
+        assert_eq!(config.shell, None);
+    }
+
+    #[test]
+    fn resolved_session_history_path_honors_override() {
+        let config = Config {
+            session_history_file: Some(PathBuf::from("/tmp/jterm2-sessions.json")),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.resolved_session_history_path().unwrap(),
+            PathBuf::from("/tmp/jterm2-sessions.json")
+        );
     }
 }

@@ -21,7 +21,187 @@ impl super::TerminalState {
         self.pending_escape.extend_from_slice(tail);
     }
 
+    fn handle_kitty_apc_payload(&mut self, payload: &[u8]) {
+        if payload.first() != Some(&b'G') {
+            return;
+        }
+        let Ok(payload) = std::str::from_utf8(payload) else {
+            self.kitty_graphics
+                .reject_graphics_payload(payload, "Kitty graphics command is not valid UTF-8");
+            self.drain_kitty_graphics_responses();
+            return;
+        };
+        let cursor_col = u32::try_from(self.cursor_col).unwrap_or(u32::MAX);
+        let cursor_row = u32::try_from(self.cursor_row).unwrap_or(u32::MAX);
+        let parsed = self
+            .kitty_graphics
+            .parse_graphics_payload_at(payload, cursor_col, cursor_row);
+        if let Err(_error) = parsed {
+            crate::debug_log!("[APC] Kitty graphics error: {}", _error);
+        } else if let Some((columns, rows)) = self.kitty_graphics.take_cursor_movement() {
+            self.pending_wrap = false;
+            let last_col = self.grid.row_len().saturating_sub(1);
+            self.cursor_col = self
+                .cursor_col
+                .saturating_add(columns as usize)
+                .min(last_col);
+            let last_row = if self.cursor_row >= self.scroll_region_top
+                && self.cursor_row <= self.scroll_region_bottom
+            {
+                self.scroll_region_bottom
+            } else {
+                self.grid.rows().saturating_sub(1)
+            };
+            self.cursor_row = self.cursor_row.saturating_add(rows as usize).min(last_row);
+        }
+        self.drain_kitty_graphics_responses();
+    }
+
+    fn drain_kitty_graphics_responses(&mut self) {
+        let responses = self.kitty_graphics.take_responses();
+        if !responses.is_empty() {
+            self.output_buffer.extend_from_slice(&responses);
+        }
+    }
+
+    fn reject_buffered_kitty_apc_with_suffix(&mut self, suffix: &[u8], error: &str) {
+        let Some(payload) = self.pending_apc.strip_prefix(b"\x1b_") else {
+            return;
+        };
+        if payload.first() != Some(&b'G') {
+            return;
+        }
+
+        // Usually i/I/q are already buffered. If fragmentation happened
+        // unusually early, copy only a bounded control prefix from the new
+        // fragment so an oversized rejection can still echo the identifier and
+        // honor q without retaining the oversized packet.
+        let limit = crate::kitty_graphics::MAX_KITTY_CONTROL_BYTES;
+        let mut recovery =
+            Vec::with_capacity(limit.min(payload.len().saturating_add(suffix.len())));
+        recovery.extend_from_slice(&payload[..payload.len().min(limit)]);
+        if recovery.len() < limit && !recovery.contains(&b';') {
+            recovery.extend_from_slice(&suffix[..suffix.len().min(limit - recovery.len())]);
+        }
+        self.kitty_graphics
+            .reject_graphics_payload(&recovery, error);
+        self.drain_kitty_graphics_responses();
+    }
+
+    fn begin_pending_apc(&mut self, tail: &[u8]) {
+        if tail.len() > MAX_PENDING_ESCAPE {
+            if let Some(payload) = tail.strip_prefix(b"\x1b_") {
+                if payload.first() == Some(&b'G') {
+                    self.kitty_graphics.reject_graphics_payload(
+                        payload,
+                        "Kitty graphics APC exceeded the parser size limit",
+                    );
+                    self.drain_kitty_graphics_responses();
+                }
+            }
+            self.pending_apc.clear();
+            self.discarding_oversized_apc = true;
+            self.discarding_apc_prev_escape = tail.last() == Some(&0x1b);
+            return;
+        }
+        self.pending_apc.clear();
+        self.pending_apc.extend_from_slice(tail);
+        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
+    }
+
+    /// Resume a fragmented Kitty APC. Returns true when this function consumed
+    /// the input (including any recursively processed bytes after the ST).
+    fn resume_pending_apc(&mut self, input: &[u8]) -> bool {
+        if self.discarding_oversized_apc {
+            let mut previous_escape = self.discarding_apc_prev_escape;
+            for (index, byte) in input.iter().copied().enumerate() {
+                if previous_escape && byte == b'\\' {
+                    self.discarding_oversized_apc = false;
+                    self.discarding_apc_prev_escape = false;
+                    if index + 1 < input.len() {
+                        self.process_input(&input[index + 1..]);
+                    }
+                    return true;
+                }
+                previous_escape = byte == 0x1b;
+            }
+            self.discarding_apc_prev_escape = previous_escape;
+            return true;
+        }
+
+        if self.pending_apc.is_empty() {
+            return false;
+        }
+
+        // Everything before pending_apc_scan_from was proved not to contain
+        // ST in the previous call. A new terminator can therefore only straddle
+        // the old/new boundary or live entirely in input. Search the new bytes
+        // once before doing the capacity check: bytes after ST are normal
+        // terminal input and must not be charged to the APC size limit.
+        let scan_from = self
+            .pending_apc_scan_from
+            .min(self.pending_apc.len().saturating_sub(1));
+        let terminator = if scan_from + 1 == self.pending_apc.len()
+            && self.pending_apc[scan_from] == 0x1b
+            && input.first() == Some(&b'\\')
+        {
+            Some((scan_from, 1))
+        } else {
+            input
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .map(|offset| (self.pending_apc.len() + offset, offset + 2))
+        };
+
+        if let Some((terminator, consumed)) = terminator {
+            let packet_len = self.pending_apc.len().saturating_add(consumed);
+            if packet_len > MAX_PENDING_ESCAPE {
+                self.reject_buffered_kitty_apc_with_suffix(
+                    &input[..consumed],
+                    "Kitty graphics APC exceeded the parser size limit",
+                );
+                self.pending_apc.clear();
+                self.pending_apc_scan_from = 0;
+            } else {
+                self.pending_apc.extend_from_slice(&input[..consumed]);
+                let packet = std::mem::take(&mut self.pending_apc);
+                self.pending_apc_scan_from = 0;
+                if packet.starts_with(b"\x1b_") {
+                    self.handle_kitty_apc_payload(&packet[2..terminator]);
+                }
+            }
+            if consumed < input.len() {
+                self.process_input(&input[consumed..]);
+            }
+            return true;
+        }
+
+        if self.pending_apc.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
+            let previous_escape = input
+                .last()
+                .copied()
+                .or_else(|| self.pending_apc.last().copied())
+                == Some(0x1b);
+            self.reject_buffered_kitty_apc_with_suffix(
+                input,
+                "Kitty graphics APC exceeded the parser size limit",
+            );
+            self.pending_apc.clear();
+            self.pending_apc_scan_from = 0;
+            self.discarding_oversized_apc = true;
+            self.discarding_apc_prev_escape = previous_escape;
+            return true;
+        }
+
+        self.pending_apc.extend_from_slice(input);
+        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
+        true
+    }
+
     pub fn process_input(&mut self, input: &[u8]) {
+        if self.resume_pending_apc(input) {
+            return;
+        }
         // Fast path: if no pending escape, process input directly without allocation
         let data;
         let data_slice: &[u8] = if self.pending_escape.is_empty() {
@@ -105,6 +285,13 @@ impl super::TerminalState {
                     }
 
                     match data_slice[i + 1] {
+                        b'c' => {
+                            // RIS — full terminal reset. Reinitialize graphics
+                            // state as well; the final byte is control syntax,
+                            // never printable text.
+                            self.hard_reset();
+                            i += 2;
+                        }
                         b'7' => {
                             // DECSC - 保存光标(含 SGR/字符集/模式)
                             self.save_cursor_state();
@@ -266,41 +453,26 @@ impl super::TerminalState {
                             }
                         }
                         b'P' | b'X' | b'^' | b'_' => {
+                            // ECMA-48 string introducers share the same ST
+                            // terminator, but Kitty graphics is specifically an
+                            // APC (`ESC _`) whose body starts with the literal
+                            // protocol discriminator `G`. DCS/SOS/PM contents
+                            // must remain opaque even when they happen to contain
+                            // strings such as `a=`.
+                            let is_apc = data_slice[i + 1] == b'_';
                             i += 2;
 
                             let mut terminated = false;
-                            let dcs_start = i;
+                            let string_start = i;
                             while i < data_slice.len() {
                                 if i + 1 < data_slice.len()
                                     && data_slice[i] == 0x1b
                                     && data_slice[i + 1] == 0x5c
                                 {
-                                    // Extract DCS payload
-                                    let payload = &data_slice[dcs_start..i];
+                                    let payload = &data_slice[string_start..i];
 
-                                    // Check if this is a Kitty graphics protocol DCS
-                                    if let Ok(payload_str) = std::str::from_utf8(payload) {
-                                        // Kitty graphics protocol starts with @ or other specific markers
-                                        if payload_str.starts_with('@')
-                                            || payload_str.contains("a=")
-                                            || payload_str.starts_with("kitty")
-                                        {
-                                            if let Err(_e) = self
-                                                .kitty_graphics
-                                                .parse_graphics_payload(payload_str)
-                                            {
-                                                crate::debug_log!(
-                                                    "[DCS] Kitty graphics error: {}",
-                                                    _e
-                                                );
-                                            }
-                                            let kitty_responses =
-                                                self.kitty_graphics.take_responses();
-                                            if !kitty_responses.is_empty() {
-                                                self.output_buffer
-                                                    .extend_from_slice(&kitty_responses);
-                                            }
-                                        }
+                                    if is_apc {
+                                        self.handle_kitty_apc_payload(payload);
                                     }
 
                                     i += 2;
@@ -311,7 +483,11 @@ impl super::TerminalState {
                             }
 
                             if !terminated {
-                                self.stash_pending_escape(&data_slice[esc_start..]);
+                                if is_apc {
+                                    self.begin_pending_apc(&data_slice[esc_start..]);
+                                } else {
+                                    self.stash_pending_escape(&data_slice[esc_start..]);
+                                }
                                 break;
                             }
                         }
@@ -466,7 +642,7 @@ impl super::TerminalState {
                         i += 1;
                         while i < data_slice.len() {
                             let b = data_slice[i];
-                            if b < 32 || b > 126 {
+                            if !(32..=126).contains(&b) {
                                 break;
                             }
                             i += 1;
@@ -678,6 +854,7 @@ impl super::TerminalState {
                     3 => {
                         // Clear scrollback buffer (xterm extension)
                         self.scrollback.clear();
+                        self.kitty_graphics.clear_scrollback_placements();
                         self.scroll_offset = 0;
                     }
                     _ => {}
@@ -735,6 +912,11 @@ impl super::TerminalState {
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         self.grid.cells[src_start..src_start + cols].fill(blank);
                     }
+                    self.kitty_graphics.scroll_region_down(
+                        self.cursor_row,
+                        self.scroll_region_bottom,
+                        n,
+                    );
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
@@ -756,6 +938,12 @@ impl super::TerminalState {
                         let blank_start = self.scroll_region_bottom * cols;
                         self.grid.cells[blank_start..blank_start + cols].fill(blank);
                     }
+                    self.kitty_graphics.scroll_region_up(
+                        self.cursor_row,
+                        self.scroll_region_bottom,
+                        n,
+                        false,
+                    );
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
             }
@@ -980,11 +1168,8 @@ impl super::TerminalState {
                 if self.cursor_col < cols {
                     let n = n.min(cols - self.cursor_col);
                     for _ in 0..n {
-                        self.grid.insert_cell_in_row(
-                            self.cursor_row,
-                            self.cursor_col,
-                            blank_cell.clone(),
-                        );
+                        self.grid
+                            .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell);
                     }
                     self.mark_row_dirty(self.cursor_row);
                 }
@@ -1000,7 +1185,7 @@ impl super::TerminalState {
                         self.grid
                             .remove_cell_from_row(self.cursor_row, self.cursor_col);
                         let last_col = cols - 1;
-                        *self.grid.get_mut(self.cursor_row, last_col) = blank_cell.clone();
+                        *self.grid.get_mut(self.cursor_row, last_col) = blank_cell;
                     }
                     self.mark_row_dirty(self.cursor_row);
                 }
@@ -1258,6 +1443,7 @@ impl super::TerminalState {
         // Mark all rows as dirty
         self.dirty_region.mark_all(self.grid.rows());
         self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.kitty_graphics.clear_placements();
     }
 
     /// 擦除屏幕并把光标归位到左上角。供切换备用缓冲区等场景使用。
@@ -1280,6 +1466,7 @@ impl super::TerminalState {
         // 备用屏不显示 scrollback
         self.scroll_offset = 0;
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.kitty_graphics.switch_screen();
         self.alt_cursor_row = self.cursor_row;
         self.alt_cursor_col = self.cursor_col;
         std::mem::swap(
@@ -1293,6 +1480,11 @@ impl super::TerminalState {
         self.use_alt_buffer = true;
         if clear {
             self.clear_screen();
+            // ED2 only removes placements intersecting the visible viewport so
+            // primary-screen scrollback survives. A freshly entered alternate
+            // buffer has no scrollback and must discard every placement left
+            // from its previous use, including any off-screen residue.
+            self.kitty_graphics.clear_current_screen_placements();
         }
     }
 
@@ -1305,6 +1497,7 @@ impl super::TerminalState {
         self.alt_cursor_row = self.cursor_row;
         self.alt_cursor_col = self.cursor_col;
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.kitty_graphics.switch_screen();
         if restore_cursor {
             self.cursor_row = self.saved_cursor_row;
             self.cursor_col = self.saved_cursor_col;
@@ -1425,6 +1618,12 @@ impl super::TerminalState {
             2004 => {
                 // Disable bracketed paste mode
                 self.modes.remove(&2004);
+            }
+            5522 => {
+                // A paste capability is valid only while the application keeps
+                // paste-event mode enabled. Revocation must be immediate.
+                self.modes.remove(&5522);
+                self.pending_paste_grant = None;
             }
             1000..=1003 => {
                 // Disable mouse reporting

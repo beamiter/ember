@@ -1,27 +1,42 @@
 use super::instance::{CellInstance, GridUniforms};
 use wgpu::util::DeviceExt;
 
-/// Holds the wgpu render pipeline, bind group layout, and per-frame buffers.
+/// Shared render-pipeline state. Per-surface buffers live in
+/// [`GridDrawSurface`].
 pub struct GridPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// Borrowed atlas resources used to create or refresh a terminal draw surface.
+#[derive(Clone, Copy)]
+pub struct GridAtlasBindings<'a> {
+    pub atlas_view: &'a wgpu::TextureView,
+    pub atlas_sampler: &'a wgpu::Sampler,
+    pub color_atlas_view: &'a wgpu::TextureView,
+    pub color_atlas_sampler: &'a wgpu::Sampler,
+    pub generation: u64,
+}
+
+/// GPU state owned by one terminal drawing surface.
+///
+/// egui-wgpu calls `prepare` for every paint callback before it calls any
+/// callback's `paint`.  Instance/uniform buffers therefore cannot be shared
+/// between panes: a later pane would overwrite the data that an earlier pane
+/// still needs for its eventual paint call.  The render pipeline and glyph
+/// atlas remain shared, while this state is keyed by a stable surface id.
+pub struct GridDrawSurface {
     background_uniform_buffer: wgpu::Buffer,
     foreground_uniform_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     pub background_bind_group: wgpu::BindGroup,
     pub foreground_bind_group: wgpu::BindGroup,
+    atlas_generation: u64,
 }
 
 impl GridPipeline {
-    pub fn new(
-        device: &wgpu::Device,
-        target_format: wgpu::TextureFormat,
-        atlas_view: &wgpu::TextureView,
-        atlas_sampler: &wgpu::Sampler,
-        color_atlas_view: &wgpu::TextureView,
-        color_atlas_sampler: &wgpu::Sampler,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader_src = include_str!("shader.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grid_shader"),
@@ -126,58 +141,9 @@ impl GridPipeline {
             cache: None,
         });
 
-        let background_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("grid_background_uniforms"),
-                contents: bytemuck::bytes_of(&GridUniforms::zeroed()),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let foreground_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("grid_foreground_uniforms"),
-                contents: bytemuck::bytes_of(&GridUniforms::zeroed()),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-
-        // Initial instance buffer capacity for ~200x50 grid
-        let initial_capacity = 16384;
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("grid_instances"),
-            size: (initial_capacity * std::mem::size_of::<CellInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let background_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &background_uniform_buffer,
-            atlas_view,
-            atlas_sampler,
-            color_atlas_view,
-            color_atlas_sampler,
-        );
-
-        let foreground_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &foreground_uniform_buffer,
-            atlas_view,
-            atlas_sampler,
-            color_atlas_view,
-            color_atlas_sampler,
-        );
-
         GridPipeline {
             pipeline,
             bind_group_layout,
-            background_uniform_buffer,
-            foreground_uniform_buffer,
-            instance_buffer,
-            instance_capacity: initial_capacity,
-            background_bind_group,
-            foreground_bind_group,
         }
     }
 
@@ -218,33 +184,118 @@ impl GridPipeline {
         })
     }
 
-    /// Rebuild the bind group when atlas texture is recreated (e.g. after resize).
-    pub fn rebuild_bind_group(
+    pub fn create_draw_surface(
+        &self,
+        device: &wgpu::Device,
+        atlas: GridAtlasBindings<'_>,
+    ) -> GridDrawSurface {
+        GridDrawSurface::new(device, &self.bind_group_layout, atlas)
+    }
+
+    pub fn rebind_draw_surface(
+        &self,
+        surface: &mut GridDrawSurface,
+        device: &wgpu::Device,
+        atlas: GridAtlasBindings<'_>,
+    ) {
+        surface.rebuild_bind_groups(device, &self.bind_group_layout, atlas);
+    }
+
+    pub fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.pipeline
+    }
+}
+
+impl GridDrawSurface {
+    const INITIAL_INSTANCE_CAPACITY: usize = 16384;
+
+    fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        atlas: GridAtlasBindings<'_>,
+    ) -> Self {
+        let background_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("grid_surface_background_uniforms"),
+                contents: bytemuck::bytes_of(&GridUniforms::zeroed()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let foreground_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("grid_surface_foreground_uniforms"),
+                contents: bytemuck::bytes_of(&GridUniforms::zeroed()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("grid_surface_instances"),
+            size: (Self::INITIAL_INSTANCE_CAPACITY * std::mem::size_of::<CellInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let background_bind_group = GridPipeline::create_bind_group(
+            device,
+            bind_group_layout,
+            &background_uniform_buffer,
+            atlas.atlas_view,
+            atlas.atlas_sampler,
+            atlas.color_atlas_view,
+            atlas.color_atlas_sampler,
+        );
+        let foreground_bind_group = GridPipeline::create_bind_group(
+            device,
+            bind_group_layout,
+            &foreground_uniform_buffer,
+            atlas.atlas_view,
+            atlas.atlas_sampler,
+            atlas.color_atlas_view,
+            atlas.color_atlas_sampler,
+        );
+
+        Self {
+            background_uniform_buffer,
+            foreground_uniform_buffer,
+            instance_buffer,
+            instance_capacity: Self::INITIAL_INSTANCE_CAPACITY,
+            background_bind_group,
+            foreground_bind_group,
+            atlas_generation: atlas.generation,
+        }
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
+    }
+
+    /// Rebuild this surface's bind groups when the shared atlas texture is
+    /// recreated. Its instance and uniform buffers remain intact.
+    pub fn rebuild_bind_groups(
         &mut self,
         device: &wgpu::Device,
-        atlas_view: &wgpu::TextureView,
-        atlas_sampler: &wgpu::Sampler,
-        color_atlas_view: &wgpu::TextureView,
-        color_atlas_sampler: &wgpu::Sampler,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        atlas: GridAtlasBindings<'_>,
     ) {
-        self.background_bind_group = Self::create_bind_group(
+        self.background_bind_group = GridPipeline::create_bind_group(
             device,
-            &self.bind_group_layout,
+            bind_group_layout,
             &self.background_uniform_buffer,
-            atlas_view,
-            atlas_sampler,
-            color_atlas_view,
-            color_atlas_sampler,
+            atlas.atlas_view,
+            atlas.atlas_sampler,
+            atlas.color_atlas_view,
+            atlas.color_atlas_sampler,
         );
-        self.foreground_bind_group = Self::create_bind_group(
+        self.foreground_bind_group = GridPipeline::create_bind_group(
             device,
-            &self.bind_group_layout,
+            bind_group_layout,
             &self.foreground_uniform_buffer,
-            atlas_view,
-            atlas_sampler,
-            color_atlas_view,
-            color_atlas_sampler,
+            atlas.atlas_view,
+            atlas.atlas_sampler,
+            atlas.color_atlas_view,
+            atlas.color_atlas_sampler,
         );
+        self.atlas_generation = atlas.generation;
     }
 
     /// Upload uniform data.
@@ -298,16 +349,11 @@ impl GridPipeline {
             return;
         }
 
-        // Reallocate buffer if needed (same logic as update_instances)
+        // A newly allocated buffer has no preserved clean rows. If capacity
+        // grows, upload the complete surface instead of only the dirty spans.
         if instances.len() > self.instance_capacity {
-            let new_capacity = instances.len().next_power_of_two();
-            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("grid_instances"),
-                size: (new_capacity * std::mem::size_of::<CellInstance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.instance_capacity = new_capacity;
+            self.update_instances(device, queue, instances);
+            return;
         }
 
         // Upload dirty rows in contiguous spans to minimize write_buffer calls
@@ -370,10 +416,6 @@ impl GridPipeline {
             byte_offset,
             bytemuck::cast_slice(slice),
         );
-    }
-
-    pub fn pipeline(&self) -> &wgpu::RenderPipeline {
-        &self.pipeline
     }
 
     pub fn instance_buffer(&self) -> &wgpu::Buffer {

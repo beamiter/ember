@@ -15,7 +15,7 @@ use crate::session_manager::SessionManager;
 use crate::sidebar;
 use crate::ui::TerminalRenderer;
 use parking_lot::Mutex as ParkingMutex;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 /// Text from the clipboard waiting for the user to confirm before being
 /// written to the active session. Created when a paste contains a newline or
@@ -23,10 +23,10 @@ use std::sync::Arc;
 /// a newline would otherwise execute immediately.
 pub struct PendingPasteConfirm {
     pub text: String,
-    /// Session that initiated the paste; we only deliver if it is still the
-    /// active session at confirm time (otherwise the user has switched tabs
-    /// and probably no longer intends the paste).
-    pub session_idx: usize,
+    /// Stable identity of the session that initiated the paste. Indices can
+    /// be reused after a tab exits, which could otherwise paste into a
+    /// completely different PTY after confirmation.
+    pub session_id: String,
     pub bracketed: bool,
 }
 
@@ -36,12 +36,67 @@ pub struct PendingPasteConfirm {
 /// to verify what's about to enter the shell.
 pub const PASTE_CONFIRM_THRESHOLD_BYTES: usize = 4 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingMouseControlKind {
+    Press,
+    Release,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingMouseControl {
+    pub kind: PendingMouseControlKind,
+    pub bytes: Vec<u8>,
+}
+
+pub struct TerminalMouseCapture {
+    pub session_id: String,
+    /// False for a local selection (normal mode or Shift bypass). Locking this
+    /// decision at press time prevents an orphan motion/release if modifiers
+    /// change mid-drag.
+    pub reported_to_app: bool,
+    pub button: u8,
+    /// Keep the original terminal and writer route alive across focus/tab
+    /// changes so release can never land in a different PTY.
+    pub terminal: Arc<ParkingMutex<crate::terminal::TerminalState>>,
+    pub write_tx: crate::shell::ShellWriteSender,
+    /// Press-time pane geometry plus the most recent cell. Some window
+    /// systems deliver an outside-window release without a pointer position.
+    pub content_rect: egui::Rect,
+    pub char_width: f32,
+    pub line_height: f32,
+    pub last_col: usize,
+    pub last_row: usize,
+    /// Press/release are state transitions and cannot be dropped like motion
+    /// or wheel reports. Keep them ordered across bounded-writer backpressure.
+    pub pending_controls: std::collections::VecDeque<PendingMouseControl>,
+    pub press_accepted: bool,
+    pub release_observed: bool,
+    /// A local text selection was cancelled because its pane/tab route was
+    /// replaced before button-up. Retain the capture only to absorb that
+    /// release without copying a different session's selection to PRIMARY.
+    pub local_selection_cancelled: bool,
+}
+
 /// Main application state
 pub struct TerminalApp {
     pub session_manager: SessionManager,
     pub renderer: TerminalRenderer,
-    pub input_queue: Arc<ParkingMutex<Vec<u8>>>,
     pub clipboard: Option<ClipboardManager>,
+    /// Serializes OSC 5522 clipboard reads. Clipboard owners are external
+    /// processes, so allowing the PTY to spawn overlapping reads would turn a
+    /// harmless MIME-list query into an unbounded thread/process DoS.
+    pub clipboard_request_in_flight: Arc<AtomicBool>,
+    /// Bounded background writer for OSC 52. PTY output is untrusted and must
+    /// never synchronously wait for external clipboard-owner processes on the
+    /// UI thread.
+    pub osc52_clipboard_write_tx: Option<crossbeam::channel::Sender<String>>,
+    pub osc52_write_window_started: std::time::Instant,
+    pub osc52_writes_in_window: usize,
+    /// OSC 52 clipboard reads are opt-in but still originate from untrusted
+    /// PTY output. These counters bound accepted queries independently of
+    /// frame rate; `clipboard_request_in_flight` serializes the actual helper.
+    pub osc52_read_window_started: std::time::Instant,
+    pub osc52_reads_in_window: usize,
     pub cols: usize,
     pub rows: usize,
     pub next_cursor_blink_time: std::time::Instant,
@@ -128,6 +183,9 @@ pub struct TerminalApp {
 
     // 鼠标报告模式下的滚轮累积器
     pub mouse_scroll_accumulator: f32,
+    /// Stable session identity and routing decision for the current drag.
+    pub terminal_mouse_capture: Option<TerminalMouseCapture>,
+    pub last_terminal_mouse_motion: Option<(String, usize, usize)>,
 
     // Ctrl+滚轮字体缩放累积器
     pub font_size_accumulator: f32,
@@ -159,6 +217,12 @@ pub struct TerminalApp {
 
     /// 粘贴确认对话框里"不再询问"复选框的临时状态(跨帧保留,直到对话框关闭)。
     pub paste_dont_ask_again: bool,
+
+    /// Global rate limit for OSC 9/777. The queue inside each terminal is
+    /// bounded, but draining it every frame without a time budget still lets
+    /// untrusted PTY output fork hundreds of `notify-send` processes.
+    pub notification_window_started: std::time::Instant,
+    pub notifications_in_window: usize,
 }
 
 impl TerminalApp {

@@ -44,6 +44,7 @@ pub struct AbGlyphAtlas {
     dirty_rects: Vec<DirtyRect>,
     needs_full_upload: bool,
     needs_rebind: bool,
+    atlas_generation: u64,
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
@@ -92,6 +93,7 @@ impl AbGlyphAtlas {
             dirty_rects: Vec::new(),
             needs_full_upload: false,
             needs_rebind: false,
+            atlas_generation: 0,
             texture,
             view,
             sampler,
@@ -175,6 +177,8 @@ impl AbGlyphAtlas {
             region.v1 *= scale_y;
         }
 
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
+
         self.width = new_size;
         self.height = new_size;
         self.needs_full_upload = true;
@@ -203,6 +207,7 @@ impl AbGlyphAtlas {
     /// 重新打包所有存活字形(ASCII 永久缓存 + Unicode LRU),回收被 LRU 淘汰
     /// 字形遗留、却永不归还的货架死空间。仅在 grow 到上限后调用。
     fn compact(&mut self) {
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
         let ascii_entries: Vec<(AtlasGlyphKey, GlyphRegion)> =
             self.ascii_cache.iter().map(|(k, v)| (*k, *v)).collect();
         // LruCache::iter 从最近到最旧;反转后按最旧→最新重插,保持 LRU 顺序。
@@ -435,6 +440,7 @@ impl FontBackend for AbGlyphAtlas {
     }
 
     fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
         self.ascii_cache.clear();
         self.unicode_cache.clear();
         self.shelf_x = 0;
@@ -545,6 +551,10 @@ impl FontBackend for AbGlyphAtlas {
 
     fn atlas_dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    fn content_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     fn take_needs_rebind(&mut self) -> bool {

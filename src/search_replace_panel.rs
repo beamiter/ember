@@ -61,11 +61,7 @@ impl SearchReplacePanel {
 
         let mut action = None;
 
-        egui::Window::new("Find & Replace")
-            .title_bar(false)
-            .resizable(false)
-            .default_pos(egui::pos2(ctx.viewport_rect().right() - 360.0, 120.0))
-            .default_size([350.0, 120.0])
+        let modal_response = egui::Modal::new(egui::Id::new("find_replace_modal"))
             .frame(egui::Frame {
                 fill: Theme::rgb_to_color32(theme.search.bg),
                 stroke: egui::Stroke::new(1.0, Theme::rgb_to_color32(theme.search.border)),
@@ -74,6 +70,10 @@ impl SearchReplacePanel {
                 ..Default::default()
             })
             .show(ctx, |ui| {
+                ui.set_width(350.0_f32.min((ctx.viewport_rect().width() - 32.0).max(240.0)));
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    self.is_open = false;
+                }
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Find & Replace").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -132,6 +132,9 @@ impl SearchReplacePanel {
                     );
                 }
             });
+        if modal_response.should_close() {
+            self.is_open = false;
+        }
 
         action
     }

@@ -161,12 +161,19 @@ fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
             let cov = coverage * in_bounds;
             let a = max(cov.r, max(cov.g, cov.b));
             if a > 0.001 {
-                let blended = vec3<f32>(
-                    mix(in.bg_color.r, in.fg_color.r, cov.r),
-                    mix(in.bg_color.g, in.fg_color.g, cov.g),
-                    mix(in.bg_color.b, in.fg_color.b, cov.b),
-                );
-                color = vec4<f32>(blended, 1.0);
+                if in.bg_color.a <= 0.001 {
+                    // Default cells are transparent over the Kitty image
+                    // layer, so alpha-blend the glyph instead of baking the
+                    // terminal base color into its antialiased edge.
+                    color = vec4<f32>(in.fg_color.rgb, a);
+                } else {
+                    let blended = vec3<f32>(
+                        mix(in.bg_color.r, in.fg_color.r, cov.r),
+                        mix(in.bg_color.g, in.fg_color.g, cov.g),
+                        mix(in.bg_color.b, in.fg_color.b, cov.b),
+                    );
+                    color = vec4<f32>(blended, 1.0);
+                }
             }
         }
     }
