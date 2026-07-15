@@ -86,7 +86,16 @@ pub fn normalize_terminal_shortcut_events(
             _ => {}
         }
 
-        if preserve_paste_event && matches!(event, egui::Event::Paste(_)) {
+        // OSC 5522 owns the application's ordinary Ctrl+V paste event, but
+        // Ctrl+Shift+V is jterm2's explicit host-text paste shortcut. Egui
+        // represents both as Event::Paste, so keeping the shifted event here
+        // would incorrectly send Codex an OSC 5522 MIME notification and make
+        // it try an image paste instead of inserting the clipboard text.
+        let explicit_text_paste = restore_shortcuts
+            && modifiers.ctrl
+            && modifiers.shift
+            && matches!(event, egui::Event::Paste(_));
+        if preserve_paste_event && matches!(event, egui::Event::Paste(_)) && !explicit_text_paste {
             crate::debug_log!("[NORMALIZE] preserving Paste (preserve_paste_event=true)");
             normalized_events.push(event);
             continue;

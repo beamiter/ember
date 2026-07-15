@@ -808,6 +808,43 @@ fn double_click_excludes_wrapping_punctuation() {
 }
 
 #[test]
+fn double_click_selects_extended_token_across_soft_wraps() {
+    let mut terminal = TerminalState::new(12, 6);
+
+    terminal.process_input(b"path=\"/home/yj/projects/jwm/submodules/dioxus_bar/target\"");
+    terminal.select_word_at(2, 4);
+
+    assert_eq!(
+        terminal.copy_selection().as_deref(),
+        Some("/home/yj/projects/jwm/submodules/dioxus_bar/target")
+    );
+}
+
+#[test]
+fn alternate_screen_drops_primary_screen_selection() {
+    let mut terminal = TerminalState::new(16, 2);
+    terminal.process_input(b"selected");
+    terminal.select_word_at(0, 2);
+    assert!(terminal.selection.is_some());
+
+    terminal.process_input(b"\x1b[?1049h");
+
+    assert!(terminal.selection.is_none());
+}
+
+#[test]
+fn scrolling_drops_viewport_selection() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"one\r\ntwo\r\nthree");
+    terminal.select_word_at(1, 1);
+    assert!(terminal.selection.is_some());
+
+    terminal.scroll(1);
+
+    assert!(terminal.selection.is_none());
+}
+
+#[test]
 fn triple_click_selects_visual_line_without_padding() {
     let mut terminal = TerminalState::new(16, 2);
 

@@ -3938,6 +3938,30 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_v_remains_explicit_text_paste_with_osc_5522_enabled() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut events = vec![egui::Event::Paste("clipboard text".to_owned())];
+
+        normalize_terminal_shortcut_events(&mut events, modifiers, true, true);
+
+        assert_eq!(
+            events,
+            vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]
+        );
+    }
+
+    #[test]
     fn image_only_clipboard_restores_ctrl_v_after_ctrl_is_released() {
         let expected_modifiers = egui::Modifiers {
             ctrl: true,

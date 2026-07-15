@@ -1114,7 +1114,11 @@ impl TerminalRenderer {
                         let new_offset = (((track_height - relative_y) / track_height)
                             * scrollback_len_f)
                             .round() as usize;
-                        terminal.scroll_offset = new_offset.min(terminal.scrollback.len());
+                        let new_offset = new_offset.min(terminal.scrollback.len());
+                        if terminal.scroll_offset != new_offset {
+                            terminal.scroll_offset = new_offset;
+                            terminal.selection = None;
+                        }
                     }
                 }
             }

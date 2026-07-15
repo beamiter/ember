@@ -1660,11 +1660,36 @@ impl super::TerminalState {
             start_col -= 1;
         }
 
-        if let Some((left, right)) = Self::select_extended_token_span(line, start_col) {
-            let abs_row = self.viewport_row_to_absolute(row);
+        // Paths and URLs commonly span several visual rows. Treat adjacent
+        // soft-wrapped rows as one logical line so a double-click selects the
+        // complete token rather than only the fragment under the pointer.
+        let wrapped = self.get_visible_row_wrapped();
+        let mut logical_start_row = row;
+        while logical_start_row > 0 && wrapped.get(logical_start_row - 1).copied().unwrap_or(false)
+        {
+            logical_start_row -= 1;
+        }
+        let mut logical_end_row = row;
+        while logical_end_row + 1 < visible.len()
+            && wrapped.get(logical_end_row).copied().unwrap_or(false)
+        {
+            logical_end_row += 1;
+        }
+        let mut logical_cells =
+            Vec::with_capacity((logical_end_row - logical_start_row + 1).saturating_mul(cols));
+        for logical_row in logical_start_row..=logical_end_row {
+            logical_cells.extend_from_slice(&visible[logical_row]);
+        }
+        let logical_col = (row - logical_start_row)
+            .saturating_mul(cols)
+            .saturating_add(start_col);
+
+        if let Some((left, right)) = Self::select_extended_token_span(&logical_cells, logical_col) {
+            let first_row = logical_start_row + left / cols;
+            let last_row = logical_start_row + right / cols;
             self.selection = Some(Selection {
-                anchor: (abs_row, left),
-                active: (abs_row, right),
+                anchor: (self.viewport_row_to_absolute(first_row), left % cols),
+                active: (self.viewport_row_to_absolute(last_row), right % cols),
                 mode: SelectionMode::Normal,
             });
             return;
@@ -1929,6 +1954,7 @@ impl super::TerminalState {
             return;
         }
 
+        let old_offset = self.scroll_offset;
         if lines > 0 {
             // Scroll up (show earlier lines)
             self.scroll_offset = self.scroll_offset.saturating_add(lines as usize);
@@ -1940,6 +1966,10 @@ impl super::TerminalState {
         // Clamp scroll_offset to valid range
         let max_scroll = self.scrollback.len();
         self.scroll_offset = self.scroll_offset.min(max_scroll);
+
+        if self.scroll_offset != old_offset {
+            self.selection = None;
+        }
 
         // When scrolling to bottom (offset 0), reset to live view
         if self.scroll_offset == 0 {

@@ -1459,6 +1459,10 @@ impl super::TerminalState {
         if self.use_alt_buffer {
             return;
         }
+        // A selection belongs to the screen on which it was made. Keeping its
+        // absolute cell coordinates while swapping buffers paints an unrelated
+        // rectangle at the same viewport position in Vim/less.
+        self.selection = None;
         if save_cursor {
             self.saved_cursor_row = self.cursor_row;
             self.saved_cursor_col = self.cursor_col;
@@ -1494,6 +1498,7 @@ impl super::TerminalState {
         if !self.use_alt_buffer {
             return;
         }
+        self.selection = None;
         self.alt_cursor_row = self.cursor_row;
         self.alt_cursor_col = self.cursor_col;
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
