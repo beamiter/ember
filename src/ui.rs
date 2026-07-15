@@ -106,6 +106,24 @@ fn local_selection_capture_after_press(
     }
 }
 
+fn should_clear_selection_on_click(
+    local_selection_enabled: bool,
+    ctrl_held: bool,
+    clicked: bool,
+    double_clicked: bool,
+    triple_clicked: bool,
+    dragging_scrollbar: bool,
+    pointer_in_content: bool,
+) -> bool {
+    local_selection_enabled
+        && !ctrl_held
+        && clicked
+        && !double_clicked
+        && !triple_clicked
+        && !dragging_scrollbar
+        && pointer_in_content
+}
+
 fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -1115,10 +1133,10 @@ impl TerminalRenderer {
                             * scrollback_len_f)
                             .round() as usize;
                         let new_offset = new_offset.min(terminal.scrollback.len());
-                        if terminal.scroll_offset != new_offset {
-                            terminal.scroll_offset = new_offset;
-                            terminal.selection = None;
-                        }
+                        // Like wheel scrolling, dragging the scrollbar only
+                        // moves the viewport. Selection endpoints are anchored
+                        // in absolute buffer coordinates and remain valid.
+                        terminal.scroll_offset = new_offset;
                     }
                 }
             }
@@ -1146,18 +1164,26 @@ impl TerminalRenderer {
             }
         }
 
-        // Single click: move cursor to click position (when mouse reporting is disabled)
+        // A plain local click in the content area dismisses the previous
+        // selection. Scrollbar navigation preserves it, and double/triple
+        // clicks replace it in their dedicated handlers below.
+        let click_pos = response.interact_pointer_pos();
+        let pointer_in_content = click_pos.is_some_and(|pos| pos.x < scrollbar_x);
         if interaction_enabled
-            && local_selection_enabled
-            && !ui.input(|input| input.modifiers.ctrl)
-            && response.clicked()
-            && !response.double_clicked()
-            && !self.dragging_scrollbar
+            && should_clear_selection_on_click(
+                local_selection_enabled,
+                ui.input(|input| input.modifiers.ctrl),
+                response.clicked(),
+                response.double_clicked(),
+                response.triple_clicked(),
+                self.dragging_scrollbar,
+                pointer_in_content,
+            )
         {
             terminal.selection = None;
 
-            if let Some(pos) = response.interact_pointer_pos() {
-                if pos.x < scrollbar_x && !terminal.is_mouse_enabled() {
+            if let Some(pos) = click_pos {
+                if !terminal.is_mouse_enabled() {
                     let (click_row, click_col) = grid_position_from_content(
                         pos,
                         content_rect,
@@ -2661,6 +2687,30 @@ mod tests {
             local_selection_capture_after_press(None, terminal_b, false, true, true, true, false,),
             Some(terminal_b)
         );
+    }
+
+    #[test]
+    fn only_plain_local_content_click_clears_selection() {
+        assert!(should_clear_selection_on_click(
+            true, false, true, false, false, false, true,
+        ));
+
+        for rejected in [
+            // Application-reported click: not a local selection action.
+            (false, false, true, false, false, false, true),
+            // Ctrl+click is reserved for link opening.
+            (true, true, true, false, false, false, true),
+            // Multi-click handlers replace the selection themselves.
+            (true, false, true, true, false, false, true),
+            (true, false, true, false, true, false, true),
+            // Scrollbar interaction only moves the viewport.
+            (true, false, true, false, false, true, false),
+            (true, false, true, false, false, false, false),
+        ] {
+            assert!(!should_clear_selection_on_click(
+                rejected.0, rejected.1, rejected.2, rejected.3, rejected.4, rejected.5, rejected.6,
+            ));
+        }
     }
 
     #[test]

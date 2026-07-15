@@ -1954,7 +1954,6 @@ impl super::TerminalState {
             return;
         }
 
-        let old_offset = self.scroll_offset;
         if lines > 0 {
             // Scroll up (show earlier lines)
             self.scroll_offset = self.scroll_offset.saturating_add(lines as usize);
@@ -1967,9 +1966,10 @@ impl super::TerminalState {
         let max_scroll = self.scrollback.len();
         self.scroll_offset = self.scroll_offset.min(max_scroll);
 
-        if self.scroll_offset != old_offset {
-            self.selection = None;
-        }
+        // Selection endpoints are absolute buffer coordinates, so moving the
+        // viewport must not discard them. `row_selection_cols` remaps the same
+        // selection onto whichever part is currently visible; a later plain
+        // primary click is responsible for clearing it.
 
         // When scrolling to bottom (offset 0), reset to live view
         if self.scroll_offset == 0 {

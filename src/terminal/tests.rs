@@ -849,15 +849,52 @@ fn alternate_screen_drops_primary_screen_selection() {
 }
 
 #[test]
-fn scrolling_drops_viewport_selection() {
+fn scrolling_preserves_buffer_anchored_selection() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"one\r\ntwo\r\nthree");
-    terminal.select_word_at(1, 1);
-    assert!(terminal.selection.is_some());
+    terminal.select_word_at(0, 1);
+    let selection = terminal.selection.expect("selection should exist");
+    assert_eq!(terminal.copy_selection().as_deref(), Some("two"));
 
     terminal.scroll(1);
 
-    assert!(terminal.selection.is_none());
+    assert_eq!(terminal.selection, Some(selection));
+    assert_eq!(terminal.copy_selection().as_deref(), Some("two"));
+    assert_eq!(terminal.row_selection_cols(1), Some((0, 2)));
+
+    terminal.scroll(-1);
+
+    assert_eq!(terminal.selection, Some(selection));
+    assert_eq!(terminal.row_selection_cols(0), Some((0, 2)));
+}
+
+#[test]
+fn selection_can_extend_after_viewport_scroll() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"one\r\ntwo\r\nthree");
+    terminal.start_selection((1, 4));
+    assert_eq!(terminal.selection.unwrap().anchor, (2, 4));
+
+    // Simulate holding the primary button while the wheel exposes older rows,
+    // then moving the active endpoint over the newly visible top row.
+    terminal.scroll(1);
+    terminal.update_selection((0, 0));
+
+    let selection = terminal
+        .selection
+        .expect("selection should survive scrolling");
+    assert_eq!(selection.anchor, (2, 4));
+    assert_eq!(selection.active, (0, 0));
+    assert_eq!(terminal.row_selection_cols(0), Some((0, usize::MAX)));
+    assert_eq!(terminal.row_selection_cols(1), Some((0, usize::MAX)));
+    let copied = terminal.copy_selection();
+
+    terminal.scroll(-1);
+
+    assert_eq!(terminal.selection, Some(selection));
+    assert_eq!(terminal.copy_selection(), copied);
+    assert_eq!(terminal.row_selection_cols(0), Some((0, usize::MAX)));
+    assert_eq!(terminal.row_selection_cols(1), Some((0, 4)));
 }
 
 #[test]
