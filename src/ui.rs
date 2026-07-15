@@ -1606,19 +1606,11 @@ impl TerminalRenderer {
 
             // Selection overlay changes
             if self.last_rendered_selection != current_selection {
-                // Mark rows affected by old and new selection
-                Self::mark_selection_rows(
-                    &self.last_rendered_selection,
-                    rows,
-                    dirty_rows.as_mut_slice(),
-                    terminal,
-                );
-                Self::mark_selection_rows(
-                    &current_selection,
-                    rows,
-                    dirty_rows.as_mut_slice(),
-                    terminal,
-                );
+                // Selection is a viewport overlay whose absolute rows may span
+                // live grid, scrollback and reflowed soft wraps. Rebuild every
+                // visible row when it changes so the GPU cache cannot retain
+                // stale unselected instances outside the hovered row.
+                dirty_rows.fill(true);
             }
 
             // Search overlay changes - only mark matching lines dirty
@@ -1921,31 +1913,6 @@ impl TerminalRenderer {
             foreground_callback,
         ));
         true
-    }
-
-    fn mark_selection_rows(
-        selection: &Option<crate::terminal::Selection>,
-        rows: usize,
-        dirty_rows: &mut [bool],
-        terminal: &TerminalState,
-    ) {
-        if let Some(sel) = selection {
-            let min_abs = sel.anchor.0.min(sel.active.0);
-            let max_abs = sel.anchor.0.max(sel.active.0);
-            let scrollback_offset = terminal
-                .scrollback
-                .len()
-                .saturating_sub(terminal.scroll_offset);
-            let start = min_abs.max(scrollback_offset) - scrollback_offset;
-            let end = max_abs.saturating_sub(scrollback_offset);
-            for dirty in dirty_rows
-                .iter_mut()
-                .take(end.min(rows.saturating_sub(1)).saturating_add(1))
-                .skip(start)
-            {
-                *dirty = true;
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -818,6 +818,22 @@ fn double_click_selects_extended_token_across_soft_wraps() {
         terminal.copy_selection().as_deref(),
         Some("/home/yj/projects/jwm/submodules/dioxus_bar/target")
     );
+
+    let selection = terminal.selection.expect("selection should exist");
+    let (start, end) = if selection.anchor <= selection.active {
+        (selection.anchor, selection.active)
+    } else {
+        (selection.active, selection.anchor)
+    };
+    assert!(end.0 > start.0, "test token must span visual rows");
+    let viewport_base = terminal.scrollback_len();
+    for abs_row in start.0..=end.0 {
+        let viewport_row = abs_row - viewport_base;
+        assert!(
+            terminal.row_selection_cols(viewport_row).is_some(),
+            "every selected visual row must expose highlight columns"
+        );
+    }
 }
 
 #[test]
