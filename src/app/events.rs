@@ -11,6 +11,52 @@ pub fn should_restore_terminal_shortcut_event(
     !ctx.text_edit_focused() && modifiers.command && !modifiers.alt
 }
 
+/// Recover the modifiers that accompanied a semantic paste shortcut.
+///
+/// `egui::Event::Paste` carries only clipboard text. If V and the modifiers
+/// are released before eframe drains the window-event batch,
+/// `RawInput::modifiers` already contains the final (usually empty) state.
+/// Winit still emits V's release with its event-time modifiers, which lets us
+/// distinguish Ctrl+Shift+V from an application's ordinary Ctrl+V.
+pub fn semantic_paste_modifiers(
+    events: &[egui::Event],
+    fallback: egui::Modifiers,
+) -> egui::Modifiers {
+    if !events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)))
+    {
+        return fallback;
+    }
+
+    let release = events.iter().rev().find_map(|event| match event {
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed: false,
+            modifiers,
+            ..
+        } => Some(*modifiers),
+        _ => None,
+    });
+
+    let Some(release) = release else {
+        return fallback;
+    };
+
+    let mut recovered = fallback;
+    recovered.alt |= release.alt;
+    recovered.shift |= release.shift;
+    recovered.ctrl |= release.ctrl;
+    recovered.mac_cmd |= release.mac_cmd;
+    recovered.command = true;
+    if !cfg!(target_os = "macos") {
+        // A semantic Paste event proves Ctrl/Cmd was held when V was pressed.
+        // On Linux and Windows `command` is the Ctrl shortcut modifier.
+        recovered.ctrl = true;
+    }
+    recovered
+}
+
 /// 将快捷键事件转换为按键事件
 pub fn shortcut_event_to_key_event(
     event: egui::Event,

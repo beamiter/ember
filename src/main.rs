@@ -30,7 +30,7 @@ mod windows_compat;
 
 use app::events::{
     normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
-    should_restore_terminal_shortcut_event,
+    semantic_paste_modifiers, should_restore_terminal_shortcut_event,
 };
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
@@ -1846,14 +1846,19 @@ impl eframe::App for TerminalApp {
         // Detect this case and inject Key::V pressed so the terminal receives 0x16.
         restore_missing_image_paste_key_event(&mut raw_input.events);
 
+        // Event::Paste has no per-event modifiers. Recover Shift from V's
+        // release when a whole Ctrl+Shift+V chord lands in one input batch;
+        // the batch-level modifier snapshot may already be empty by now.
+        let shortcut_modifiers = semantic_paste_modifiers(&raw_input.events, raw_input.modifiers);
+
         // egui-winit turns Ctrl/Cmd+C/X/V into semantic clipboard events and skips the
         // corresponding Key press. Restore those as Key events so the terminal can receive
         // control bytes, while still preventing egui's default text-edit shortcut behavior.
-        let restore_shortcuts = should_restore_terminal_shortcut_event(ctx, raw_input.modifiers);
+        let restore_shortcuts = should_restore_terminal_shortcut_event(ctx, shortcut_modifiers);
 
         normalize_terminal_shortcut_events(
             &mut raw_input.events,
-            raw_input.modifiers,
+            shortcut_modifiers,
             restore_shortcuts,
             preserve_paste_event,
         );
@@ -3547,7 +3552,7 @@ mod tests {
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
-        shortcut_event_to_key_event,
+        semantic_paste_modifiers, shortcut_event_to_key_event,
     };
     use base64::Engine as _;
     use eframe::egui;
@@ -3959,6 +3964,70 @@ mod tests {
                 modifiers,
             }]
         );
+    }
+
+    #[test]
+    fn released_ctrl_shift_v_recovers_shift_for_text_paste_routing() {
+        let event_modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            egui::Event::Paste("clipboard text".to_owned()),
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: false,
+                repeat: false,
+                modifiers: event_modifiers,
+            },
+        ];
+
+        let recovered = semantic_paste_modifiers(&events, egui::Modifiers::NONE);
+        normalize_terminal_shortcut_events(&mut events, recovered, true, true);
+
+        assert!(events.iter().any(|event| {
+            matches!(event,
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl && modifiers.shift
+            )
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Paste(_))));
+    }
+
+    #[test]
+    fn released_plain_ctrl_v_stays_an_osc_5522_paste_event() {
+        let event_modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            egui::Event::Paste("clipboard text".to_owned()),
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: false,
+                repeat: false,
+                modifiers: event_modifiers,
+            },
+        ];
+
+        let recovered = semantic_paste_modifiers(&events, egui::Modifiers::NONE);
+        normalize_terminal_shortcut_events(&mut events, recovered, true, true);
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Paste(_))));
+        assert!(!recovered.shift);
     }
 
     #[test]
