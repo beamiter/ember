@@ -3,6 +3,24 @@
 use super::state::TerminalApp;
 use eframe::egui;
 
+/// Tracks a V press until its matching release across raw-input batches.
+///
+/// `egui-winit` replaces a Ctrl/Cmd+V press with [`egui::Event::Paste`] when
+/// it can read text from the clipboard. The matching V release is still a
+/// regular key event and can arrive in a later batch. Remembering the press is
+/// essential: otherwise that later release is indistinguishable from the
+/// release left behind when an image-only Ctrl+V press was swallowed.
+#[derive(Debug, Default)]
+pub struct PasteKeyState {
+    v_press_pending_release: bool,
+}
+
+impl PasteKeyState {
+    pub fn reset(&mut self) {
+        self.v_press_pending_release = false;
+    }
+}
+
 /// 检查是否应该恢复终端快捷键事件
 pub fn should_restore_terminal_shortcut_event(
     ctx: &egui::Context,
@@ -183,32 +201,42 @@ pub fn normalize_terminal_shortcut_events(
 /// no data. This also happens when Ctrl has already been released by the time
 /// V's release reaches us, so the missing shortcut is identified from the
 /// absent press/Paste events rather than its release modifiers.
-pub fn restore_missing_image_paste_key_event(events: &mut Vec<egui::Event>) -> bool {
-    let v_release_modifiers = events.iter().find_map(|event| match event {
-        egui::Event::Key {
-            key: egui::Key::V,
-            pressed: false,
-            modifiers,
-            ..
-        } if !modifiers.shift => Some(*modifiers),
-        _ => None,
-    });
-    let has_ctrl_v_press = events.iter().any(|event| {
-        matches!(event,
-            egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
-            if modifiers.ctrl && !modifiers.shift
-        )
-    });
-    let has_paste_event = events
-        .iter()
-        .any(|event| matches!(event, egui::Event::Paste(_)));
+pub fn restore_missing_image_paste_key_event(
+    events: &mut Vec<egui::Event>,
+    state: &mut PasteKeyState,
+) -> bool {
+    let mut swallowed_press_release = None;
 
-    let Some(mut modifiers) = v_release_modifiers else {
+    for event in events.iter() {
+        match event {
+            // A semantic paste replaces the Ctrl/Cmd+V press, but not its
+            // release. Keep that press alive across frames so the release is
+            // consumed instead of being turned into a second Ctrl+V.
+            egui::Event::Paste(_) => state.v_press_pending_release = true,
+            egui::Event::Key {
+                key: egui::Key::V,
+                pressed: true,
+                ..
+            } => state.v_press_pending_release = true,
+            egui::Event::Key {
+                key: egui::Key::V,
+                pressed: false,
+                modifiers,
+                ..
+            } => {
+                if state.v_press_pending_release {
+                    state.v_press_pending_release = false;
+                } else if !modifiers.shift {
+                    swallowed_press_release = Some(*modifiers);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(mut modifiers) = swallowed_press_release else {
         return false;
     };
-    if has_ctrl_v_press || has_paste_event {
-        return false;
-    }
 
     // egui's global modifiers may be clear if Ctrl was released first. We are
     // restoring a swallowed Ctrl+V, so explicitly restore both fields used by

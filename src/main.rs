@@ -1505,6 +1505,7 @@ impl TerminalApp {
             font_size_accumulator: 0.0,
             had_ctrl_scroll_last_frame: false,
             frame_events: Vec::new(),
+            paste_key_state: Default::default(),
             keyboard_input_buffer: Vec::new(),
             adaptive_frame_budget: 65536, // 初始值 64KB
             config_last_mtime: config::Config::config_mtime(),
@@ -1840,11 +1841,14 @@ impl eframe::App for TerminalApp {
             terminal.is_paste_events_enabled()
         };
 
-        // Fix: egui-winit swallows Ctrl+V press when clipboard has no text (e.g. image only).
-        // It calls `return` after checking clipboard, so neither Paste nor Key::V pressed
-        // appears in raw_input — only Key::V released survives.
-        // Detect this case and inject Key::V pressed so the terminal receives 0x16.
-        restore_missing_image_paste_key_event(&mut raw_input.events);
+        // Egui-winit swallows Ctrl+V press when clipboard has no text (e.g. image only),
+        // leaving only V's release. Track real/semantic V presses across frames so only
+        // a genuinely orphaned release restores the application-facing Ctrl+V event.
+        if raw_input.focused {
+            restore_missing_image_paste_key_event(&mut raw_input.events, &mut self.paste_key_state);
+        } else {
+            self.paste_key_state.reset();
+        }
 
         // Event::Paste has no per-event modifiers. Recover Shift from V's
         // release when a whole Ctrl+Shift+V chord lands in one input batch;
@@ -3552,7 +3556,7 @@ mod tests {
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
-        semantic_paste_modifiers, shortcut_event_to_key_event,
+        semantic_paste_modifiers, shortcut_event_to_key_event, PasteKeyState,
     };
     use base64::Engine as _;
     use eframe::egui;
@@ -4032,6 +4036,7 @@ mod tests {
 
     #[test]
     fn image_only_clipboard_restores_ctrl_v_after_ctrl_is_released() {
+        let mut state = PasteKeyState::default();
         let expected_modifiers = egui::Modifiers {
             ctrl: true,
             command: true,
@@ -4046,7 +4051,10 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         }];
 
-        assert!(restore_missing_image_paste_key_event(&mut events));
+        assert!(restore_missing_image_paste_key_event(
+            &mut events,
+            &mut state
+        ));
         assert_eq!(
             events[0],
             egui::Event::Key {
@@ -4061,6 +4069,7 @@ mod tests {
 
     #[test]
     fn image_paste_restoration_does_not_duplicate_existing_paste_input() {
+        let mut state = PasteKeyState::default();
         let modifiers = egui::Modifiers {
             ctrl: true,
             command: true,
@@ -4083,7 +4092,70 @@ mod tests {
             },
         ];
 
-        assert!(!restore_missing_image_paste_key_event(&mut events));
+        assert!(!restore_missing_image_paste_key_event(
+            &mut events,
+            &mut state
+        ));
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn semantic_text_paste_suppresses_v_release_in_a_later_frame() {
+        let mut state = PasteKeyState::default();
+        let mut paste_frame = vec![egui::Event::Paste("clipboard text".to_owned())];
+        assert!(!restore_missing_image_paste_key_event(
+            &mut paste_frame,
+            &mut state
+        ));
+
+        let mut release_frame = vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        assert!(!restore_missing_image_paste_key_event(
+            &mut release_frame,
+            &mut state
+        ));
+        assert_eq!(release_frame.len(), 1);
+        assert!(matches!(
+            release_frame[0],
+            egui::Event::Key {
+                key: egui::Key::V,
+                pressed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ordinary_v_press_suppresses_release_restoration_across_frames() {
+        let mut state = PasteKeyState::default();
+        let mut press_frame = vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        assert!(!restore_missing_image_paste_key_event(
+            &mut press_frame,
+            &mut state
+        ));
+
+        let mut release_frame = vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: Some(egui::Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        assert!(!restore_missing_image_paste_key_event(
+            &mut release_frame,
+            &mut state
+        ));
+        assert_eq!(release_frame.len(), 1);
     }
 }
