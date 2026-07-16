@@ -130,6 +130,12 @@ impl CommandPalette {
                 crate::keybindings::Command::SessionPrev,
             ),
             CommandInfo::new(
+                "Last Session",
+                CommandCategory::Session,
+                "Switch to the last session",
+                crate::keybindings::Command::SessionLast,
+            ),
+            CommandInfo::new(
                 "Last Active Session",
                 CommandCategory::Session,
                 "Switch back to the most recently focused session",
@@ -264,6 +270,54 @@ impl CommandPalette {
                 "Move keyboard focus to the previous pane",
                 crate::keybindings::Command::PaneFocusPrev,
             ),
+            CommandInfo::new(
+                "Focus Pane Left",
+                CommandCategory::Terminal,
+                "Focus the pane physically to the left",
+                crate::keybindings::Command::PaneFocusLeft,
+            ),
+            CommandInfo::new(
+                "Focus Pane Right",
+                CommandCategory::Terminal,
+                "Focus the pane physically to the right",
+                crate::keybindings::Command::PaneFocusRight,
+            ),
+            CommandInfo::new(
+                "Focus Pane Up",
+                CommandCategory::Terminal,
+                "Focus the pane physically above",
+                crate::keybindings::Command::PaneFocusUp,
+            ),
+            CommandInfo::new(
+                "Focus Pane Down",
+                CommandCategory::Terminal,
+                "Focus the pane physically below",
+                crate::keybindings::Command::PaneFocusDown,
+            ),
+            CommandInfo::new(
+                "Resize Divider Left",
+                CommandCategory::Terminal,
+                "Move a vertical pane divider left",
+                crate::keybindings::Command::PaneResizeLeft,
+            ),
+            CommandInfo::new(
+                "Resize Divider Right",
+                CommandCategory::Terminal,
+                "Move a vertical pane divider right",
+                crate::keybindings::Command::PaneResizeRight,
+            ),
+            CommandInfo::new(
+                "Resize Divider Up",
+                CommandCategory::Terminal,
+                "Move a horizontal pane divider up",
+                crate::keybindings::Command::PaneResizeUp,
+            ),
+            CommandInfo::new(
+                "Resize Divider Down",
+                CommandCategory::Terminal,
+                "Move a horizontal pane divider down",
+                crate::keybindings::Command::PaneResizeDown,
+            ),
             // === 窗口操作 ===
             CommandInfo::new(
                 "Close Window",
@@ -276,6 +330,18 @@ impl CommandPalette {
                 CommandCategory::Window,
                 "Show/hide the file tree sidebar",
                 crate::keybindings::Command::SidebarToggle,
+            ),
+            CommandInfo::new(
+                "Toggle Command Palette",
+                CommandCategory::Window,
+                "Open or close the command palette",
+                crate::keybindings::Command::CommandPaletteToggle,
+            ),
+            CommandInfo::new(
+                "Keyboard Shortcuts",
+                CommandCategory::Window,
+                "Open or close the keyboard shortcut reference",
+                crate::keybindings::Command::HelpToggle,
             ),
             // === 配置 ===
             CommandInfo::new(
@@ -304,7 +370,7 @@ impl CommandPalette {
             ),
         ];
 
-        for index in 0..9 {
+        for index in 0..8 {
             commands.push(CommandInfo::new(
                 &format!("Go to Session {}", index + 1),
                 CommandCategory::Session,
@@ -499,6 +565,7 @@ mod tests {
             Command::SessionClose,
             Command::SessionNext,
             Command::SessionPrev,
+            Command::SessionLast,
             Command::SessionPrevActive,
             Command::EditCopy,
             Command::EditPaste,
@@ -521,7 +588,17 @@ mod tests {
             Command::TerminalClosePane,
             Command::PaneFocusNext,
             Command::PaneFocusPrev,
+            Command::PaneFocusLeft,
+            Command::PaneFocusRight,
+            Command::PaneFocusUp,
+            Command::PaneFocusDown,
+            Command::PaneResizeLeft,
+            Command::PaneResizeRight,
+            Command::PaneResizeUp,
+            Command::PaneResizeDown,
             Command::WindowClose,
+            Command::CommandPaletteToggle,
+            Command::HelpToggle,
             Command::ConfigOpen,
             Command::ConfigClose,
             Command::ConfigToggle,
@@ -532,7 +609,7 @@ mod tests {
         for command in fixed_commands {
             assert!(represented(&command), "missing palette entry for {command}");
         }
-        for index in 0..9 {
+        for index in 0..8 {
             assert!(represented(&Command::SessionJump(index)));
         }
     }

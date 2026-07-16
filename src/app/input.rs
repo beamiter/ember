@@ -181,6 +181,11 @@ impl TerminalApp {
                     self.set_status(format!("Session {} is not available", index + 1));
                 }
             }
+            keybindings::Command::SessionLast => {
+                if let Some(last_index) = self.session_manager.len().checked_sub(1) {
+                    self.activate_session(last_index);
+                }
+            }
             keybindings::Command::SessionPrevActive => {
                 if !self.activate_previous_session() {
                     self.set_status("No previous session to switch to");
@@ -303,9 +308,48 @@ impl TerminalApp {
                 }
                 self.sync_active_session_to_focused_pane();
             }
+            keybindings::Command::PaneFocusLeft => {
+                self.focus_physical_pane(layout::PaneDirection::Left, "left")
+            }
+            keybindings::Command::PaneFocusRight => {
+                self.focus_physical_pane(layout::PaneDirection::Right, "right")
+            }
+            keybindings::Command::PaneFocusUp => {
+                self.focus_physical_pane(layout::PaneDirection::Up, "above")
+            }
+            keybindings::Command::PaneFocusDown => {
+                self.focus_physical_pane(layout::PaneDirection::Down, "below")
+            }
+            keybindings::Command::PaneResizeLeft => {
+                self.resize_pane(layout::PaneDirection::Left, "left")
+            }
+            keybindings::Command::PaneResizeRight => {
+                self.resize_pane(layout::PaneDirection::Right, "right")
+            }
+            keybindings::Command::PaneResizeUp => self.resize_pane(layout::PaneDirection::Up, "up"),
+            keybindings::Command::PaneResizeDown => {
+                self.resize_pane(layout::PaneDirection::Down, "down")
+            }
             keybindings::Command::WindowClose => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return true;
+            }
+            keybindings::Command::CommandPaletteToggle => {
+                if self.command_palette.is_open {
+                    self.command_palette.close();
+                    self.set_status("命令面板已关闭");
+                } else {
+                    self.command_palette.open();
+                    self.set_status("命令面板已打开，直接输入即可搜索命令");
+                }
+            }
+            keybindings::Command::HelpToggle => {
+                self.help_panel.toggle();
+                self.set_status(if self.help_panel.is_open {
+                    "快捷键帮助已打开，按 Ctrl+Shift+/ 可关闭"
+                } else {
+                    "快捷键帮助已关闭"
+                });
             }
             keybindings::Command::ConfigOpen => {
                 self.config_panel.open(&self.config);
@@ -333,6 +377,11 @@ impl TerminalApp {
         command: keybindings::Command,
     ) -> bool {
         self.command_palette.execute_command(command.clone());
+        if command == keybindings::Command::CommandPaletteToggle {
+            let close_requested = self.dispatch_command(ctx, command);
+            self.save_ui_history();
+            return close_requested;
+        }
         self.command_palette.close();
         self.save_ui_history();
         self.dispatch_command(ctx, command)
@@ -427,6 +476,21 @@ impl TerminalApp {
         }
         let index = self.session_manager.active_index();
         self.activate_session(index)
+    }
+
+    fn focus_physical_pane(&mut self, direction: layout::PaneDirection, label: &str) {
+        if self.layout_manager.focus_pane(direction) {
+            self.sync_active_session_to_focused_pane();
+        } else {
+            self.set_status(format!("No pane {label}"));
+        }
+    }
+
+    fn resize_pane(&mut self, direction: layout::PaneDirection, label: &str) {
+        const RESIZE_STEP: f32 = 0.05;
+        if !self.layout_manager.resize_split(direction, RESIZE_STEP) {
+            self.set_status(format!("Cannot resize pane {label}"));
+        }
     }
 
     /// 创建并分出一个新终端。先检查布局容量，避免达到上限后仍启动一个
@@ -594,6 +658,9 @@ impl TerminalApp {
                             | keybindings::Command::SearchHistoryNext => self.search_state.is_open,
                             keybindings::Command::ConfigClose
                             | keybindings::Command::ConfigToggle => self.config_panel.is_open,
+                            keybindings::Command::CommandPaletteToggle => {
+                                self.command_palette.is_open
+                            }
                             keybindings::Command::SearchReplaceToggle => {
                                 self.search_replace_panel.is_open
                             }

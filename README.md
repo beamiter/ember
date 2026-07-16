@@ -133,18 +133,21 @@ Defaults include:
 | Action | Binding |
 | --- | --- |
 | New session | `Ctrl+Shift+T` |
-| Next / previous session | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Close focused pane or session | `Ctrl+Shift+W` |
+| Next / previous session | `Ctrl+Tab` / `Ctrl+Shift+Tab` (`Ctrl+PageDown` / `Ctrl+PageUp`) |
+| Sessions 1–8 / last session | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
 | Last active session | `Ctrl+\`` |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | Search | `Ctrl+Shift+F` |
-| Find and replace selection | `Ctrl+Shift+R` |
+| Find and replace selection | `Ctrl+Alt+R` |
 | Command palette | `Ctrl+Shift+P` |
-| Settings | `Ctrl+Shift+,` |
-| Toggle sidebar | `Ctrl+Shift+B` |
-| Horizontal / vertical split | `Ctrl+Shift+O` / `Ctrl+Shift+E` |
-| Close focused pane | `Ctrl+Shift+W` |
-| Close window | `Ctrl+Shift+Q` |
-| Help | `Ctrl+?` |
+| Settings | `Ctrl+Shift+O` |
+| Toggle sidebar | `Ctrl+\` |
+| Left/right / top/bottom split | `Ctrl+Shift+E` / `Ctrl+Shift+D` |
+| Focus pane by direction | `Ctrl+Alt+Arrow` |
+| Resize pane divider | `Ctrl+Alt+Shift+Arrow` |
+| Font size increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
 
 Bindings in `~/.config/jterm2/keybindings.toml` override defaults. The file is
@@ -152,8 +155,8 @@ a flat TOML table:
 
 ```toml
 "ctrl+shift+t" = "session:new"
-"alt+right" = "pane:focus_next"
-"alt+left" = "pane:focus_prev"
+"ctrl+alt+right" = "pane:focus_right"
+"ctrl+alt+left" = "pane:focus_left"
 ```
 
 The in-app help panel is generated from the active bindings, so it reflects

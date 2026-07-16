@@ -206,23 +206,18 @@ impl LayoutManager {
             return false;
         }
 
+        let current_idx = self
+            .panes
+            .iter()
+            .position(|p| p.id == self.focused_pane_id)
+            .unwrap_or(0);
         match direction {
             PaneDirection::Next => {
-                let current_idx = self
-                    .panes
-                    .iter()
-                    .position(|p| p.id == self.focused_pane_id)
-                    .unwrap_or(0);
                 let next_idx = (current_idx + 1) % self.panes.len();
                 self.focused_pane_id = self.panes[next_idx].id;
                 true
             }
             PaneDirection::Prev => {
-                let current_idx = self
-                    .panes
-                    .iter()
-                    .position(|p| p.id == self.focused_pane_id)
-                    .unwrap_or(0);
                 let next_idx = if current_idx == 0 {
                     self.panes.len() - 1
                 } else {
@@ -231,7 +226,34 @@ impl LayoutManager {
                 self.focused_pane_id = self.panes[next_idx].id;
                 true
             }
+            PaneDirection::Left => self.focus_physical_pane(current_idx, 1, 0, false),
+            PaneDirection::Right => self.focus_physical_pane(current_idx, 0, 1, false),
+            PaneDirection::Up => self.focus_physical_pane(current_idx, 1, 0, true),
+            PaneDirection::Down => self.focus_physical_pane(current_idx, 0, 1, true),
         }
+    }
+
+    /// 按布局中的物理方向聚焦相邻窗格。只有两窗格时顺序是稳定的：
+    /// `panes[0]` 位于左/上，`panes[1]` 位于右/下。边缘按键不回绕。
+    fn focus_physical_pane(
+        &mut self,
+        current_idx: usize,
+        from_idx: usize,
+        to_idx: usize,
+        horizontal_split: bool,
+    ) -> bool {
+        let matching_axis = matches!(
+            (self.mode, horizontal_split),
+            (SplitMode::VerticalSplit { .. }, false) | (SplitMode::HorizontalSplit { .. }, true)
+        );
+        if !matching_axis || current_idx != from_idx {
+            return false;
+        }
+        let Some(target) = self.panes.get(to_idx) else {
+            return false;
+        };
+        self.focused_pane_id = target.id;
+        true
     }
 
     /// 调整分割比例
@@ -244,6 +266,32 @@ impl LayoutManager {
                 *ratio = (*ratio + delta).clamp(0.1, 0.9);
             }
             _ => {}
+        }
+    }
+
+    /// 沿指定物理方向移动分隔线。左右仅作用于左右分屏，上下仅作用于
+    /// 上下分屏。返回 `true` 表示分割比例实际发生了变化。
+    pub fn resize_split(&mut self, direction: PaneDirection, step: f32) -> bool {
+        let delta = match (self.mode, direction) {
+            (SplitMode::VerticalSplit { .. }, PaneDirection::Left) => -step,
+            (SplitMode::VerticalSplit { .. }, PaneDirection::Right) => step,
+            (SplitMode::HorizontalSplit { .. }, PaneDirection::Up) => -step,
+            (SplitMode::HorizontalSplit { .. }, PaneDirection::Down) => step,
+            _ => return false,
+        };
+        let before = self.split_ratio();
+        self.adjust_split_ratio(delta);
+        self.split_ratio()
+            .zip(before)
+            .is_some_and(|(after, before)| (after - before).abs() > f32::EPSILON)
+    }
+
+    fn split_ratio(&self) -> Option<f32> {
+        match self.mode {
+            SplitMode::VerticalSplit { ratio } | SplitMode::HorizontalSplit { ratio } => {
+                Some(ratio)
+            }
+            SplitMode::Single => None,
         }
     }
 
@@ -361,10 +409,14 @@ impl LayoutManager {
 }
 
 /// 窗格方向
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneDirection {
     Next,
     Prev,
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[cfg(test)]
@@ -427,5 +479,46 @@ mod tests {
         layout.split(1, true).unwrap();
         assert!(!layout.can_split());
         assert!(layout.split(2, true).is_err());
+    }
+
+    #[test]
+    fn physical_focus_follows_layout_axis_without_wrapping() {
+        let mut vertical = LayoutManager::new(0);
+        vertical.split(1, false).unwrap();
+        assert_eq!(vertical.focused_session_idx(), Some(1));
+        assert!(vertical.focus_pane(PaneDirection::Left));
+        assert_eq!(vertical.focused_session_idx(), Some(0));
+        assert!(!vertical.focus_pane(PaneDirection::Left));
+        assert!(!vertical.focus_pane(PaneDirection::Up));
+        assert!(vertical.focus_pane(PaneDirection::Right));
+        assert_eq!(vertical.focused_session_idx(), Some(1));
+
+        let mut horizontal = LayoutManager::new(0);
+        horizontal.split(1, true).unwrap();
+        assert!(horizontal.focus_pane(PaneDirection::Up));
+        assert_eq!(horizontal.focused_session_idx(), Some(0));
+        assert!(!horizontal.focus_pane(PaneDirection::Left));
+        assert!(horizontal.focus_pane(PaneDirection::Down));
+        assert_eq!(horizontal.focused_session_idx(), Some(1));
+        assert!(!horizontal.focus_pane(PaneDirection::Down));
+    }
+
+    #[test]
+    fn directional_resize_only_moves_the_matching_axis() {
+        let mut vertical = LayoutManager::new(0);
+        vertical.split(1, false).unwrap();
+        assert!(vertical.resize_split(PaneDirection::Left, 0.05));
+        assert_eq!(vertical.mode, SplitMode::VerticalSplit { ratio: 0.45 });
+        assert!(!vertical.resize_split(PaneDirection::Up, 0.05));
+        assert!(vertical.resize_split(PaneDirection::Right, 0.05));
+        assert_eq!(vertical.mode, SplitMode::VerticalSplit { ratio: 0.5 });
+
+        let mut horizontal = LayoutManager::new(0);
+        horizontal.split(1, true).unwrap();
+        assert!(horizontal.resize_split(PaneDirection::Up, 0.05));
+        assert_eq!(horizontal.mode, SplitMode::HorizontalSplit { ratio: 0.45 });
+        assert!(!horizontal.resize_split(PaneDirection::Left, 0.05));
+        assert!(horizontal.resize_split(PaneDirection::Down, 0.05));
+        assert_eq!(horizontal.mode, SplitMode::HorizontalSplit { ratio: 0.5 });
     }
 }

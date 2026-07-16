@@ -363,3 +363,56 @@ pub fn build_keybinding_string(key: egui::Key, modifiers: egui::Modifiers) -> Op
 impl TerminalApp {
     // Event processing methods will be moved here
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directional_shortcuts_use_the_keybinding_modifier_order() {
+        let focus = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_keybinding_string(egui::Key::ArrowLeft, focus).as_deref(),
+            Some("ctrl+alt+left")
+        );
+
+        let resize = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_keybinding_string(egui::Key::ArrowDown, resize).as_deref(),
+            Some("ctrl+shift+alt+down")
+        );
+    }
+
+    #[test]
+    fn sidebar_and_help_punctuation_chords_are_distinct() {
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_keybinding_string(egui::Key::Backslash, ctrl).as_deref(),
+            Some("ctrl+\\")
+        );
+
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl
+        };
+        assert_eq!(
+            build_keybinding_string(egui::Key::Slash, ctrl_shift).as_deref(),
+            Some("ctrl+shift+/")
+        );
+    }
+}

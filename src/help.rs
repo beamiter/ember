@@ -3,7 +3,7 @@
 use egui::{Color32, RichText, Window};
 
 use crate::command_palette::{CommandCategory, CommandPalette};
-use crate::keybindings::KeyBindings;
+use crate::keybindings::{Command, KeyBindings};
 use crate::theme::Theme;
 
 /// 帮助面板状态
@@ -38,6 +38,12 @@ impl HelpPanel {
         let dim_color = Theme::rgb_to_color32(theme.ui.text_disabled);
         let panel_bg = Theme::rgb_to_color32(theme.ui.panel_bg);
         let border = Theme::rgb_to_color32(theme.ui.border);
+        let palette_binding = keybindings
+            .pretty_bindings_for(&Command::CommandPaletteToggle.to_string())
+            .join(" / ");
+        let help_binding = keybindings
+            .pretty_bindings_for(&Command::HelpToggle.to_string())
+            .join(" / ");
 
         let categories = [
             CommandCategory::Session,
@@ -50,7 +56,7 @@ impl HelpPanel {
 
         Window::new("⌨  Keybindings")
             .open(open)
-            .default_size([560.0, 520.0])
+            .default_size([680.0, 520.0])
             .resizable(true)
             .vscroll(true)
             .frame(egui::Frame {
@@ -71,17 +77,21 @@ impl HelpPanel {
 
                 ui.horizontal(|ui| {
                     ui.add_sized(
-                        [150.0, 18.0],
+                        [210.0, 18.0],
                         egui::Label::new(
-                            RichText::new("Ctrl+Shift+P").monospace().color(text_color),
+                            RichText::new(&palette_binding)
+                                .monospace()
+                                .color(text_color),
                         ),
                     );
                     ui.label(RichText::new("打开命令面板，搜索全部功能").color(text_color));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized(
-                        [150.0, 18.0],
-                        egui::Label::new(RichText::new("Ctrl+?").monospace().color(text_color)),
+                        [210.0, 18.0],
+                        egui::Label::new(
+                            RichText::new(&help_binding).monospace().color(text_color),
+                        ),
                     );
                     ui.label(RichText::new("打开或关闭本快捷键帮助").color(text_color));
                 });
@@ -126,7 +136,7 @@ impl HelpPanel {
                     for (name, keys) in bound {
                         ui.horizontal(|ui| {
                             ui.add_sized(
-                                [150.0, 18.0],
+                                [210.0, 18.0],
                                 egui::Label::new(RichText::new(keys).monospace().color(cat_color)),
                             );
                             ui.label(RichText::new(name).color(text_color));
@@ -135,7 +145,7 @@ impl HelpPanel {
                     for name in unbound {
                         ui.horizontal(|ui| {
                             ui.add_sized(
-                                [150.0, 18.0],
+                                [210.0, 18.0],
                                 egui::Label::new(
                                     RichText::new("(未绑定)").monospace().color(dim_color),
                                 ),
@@ -147,7 +157,7 @@ impl HelpPanel {
 
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("💡 更多命令见命令调色板 (Ctrl+Shift+P)")
+                    RichText::new(format!("💡 更多命令见命令调色板 ({palette_binding})"))
                         .size(11.0)
                         .color(dim_color),
                 );

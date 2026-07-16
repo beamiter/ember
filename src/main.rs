@@ -2053,43 +2053,9 @@ impl eframe::App for TerminalApp {
             self.handle_font_zoom(ctx);
         }
 
-        // Step 2: 处理快捷键 - 使用可配置的快捷键系统
-
-        // 命令调色板快捷键 (Ctrl+Shift+P) - toggle
-        let palette_toggle_pressed =
-            ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.ctrl && i.modifiers.shift);
-        if palette_toggle_pressed && (self.command_palette.is_open || !terminal_input_blocked) {
-            if self.command_palette.is_open {
-                self.command_palette.close();
-                self.set_status("命令面板已关闭");
-            } else {
-                self.command_palette.open();
-                self.set_status("命令面板已打开，直接输入即可搜索命令");
-            }
-            self.frame_events.retain(|event| {
-                !matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::P,
-                        modifiers,
-                        pressed: true,
-                        ..
-                    } if modifiers.ctrl && modifiers.shift
-                )
-            });
-        }
-
-        // 帮助面板快捷键 (Ctrl+?)
-        if !terminal_input_blocked
-            && ctx.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.ctrl)
-        {
-            self.help_panel.toggle();
-            self.set_status(if self.help_panel.is_open {
-                "快捷键帮助已打开，按 Ctrl+? 可关闭"
-            } else {
-                "快捷键帮助已关闭"
-            });
-        }
+        // Step 2: 处理快捷键 - 使用可配置的快捷键系统。
+        // 命令面板与帮助面板也通过 Command 派发，确保按键会被消费且
+        // 帮助文案始终反映当前绑定。
 
         let (palette_requested_close, palette_owned_input) = self.handle_command_palette_input(ctx);
         if palette_requested_close {
