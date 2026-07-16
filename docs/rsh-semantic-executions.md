@@ -73,12 +73,35 @@ leaving the live OSC timeline available. An absolute
 `RSH_EXECUTION_JOURNAL_PATH` overrides the JSONL location for both rsh and
 jterm; its sibling `executions.lock` remains the coordination lock.
 
+jterm allocates a valid stable session ID before every shell spawn and passes
+that same ID to rsh with `--session`. The tab router, rsh session snapshot, and
+each journal `start.session_id` therefore share one identity even for a brand
+new tab; an ID is never generated only after PTY output has begun. Restored IDs
+are validated against rsh's 1–128 byte ASCII grammar, and invalid or duplicate
+tab IDs are replaced before they can reach `--session`.
+
 ## UI behavior
 
 The Commands sidebar is a chronological index for the focused tab. A row can
 jump to the existing terminal position, copy command/output, place a command
 in the editor, or explicitly run it again. The terminal grid is never divided
 into command blocks.
+
+The index can be searched by command or working directory and filtered to all,
+failed, or currently running executions. Selecting a row opens an inline
+detail view with exact/display-derived provenance, direct actions, and a
+bounded rendered-output preview. Preview allocations are capped independently
+of the full 256 KiB copy/context snapshot, and the timeline follows new rows
+only while the user remains at its live end.
+
+When the sidebar first targets a tab, jterm reads that session's persisted
+records on a bounded background worker under the journal's shared advisory
+lock and merges them by execution ID. Live terminal records win duplicate IDs.
+Restored rows remain copyable and exact commands may use the same guarded Fill
+or Run actions, but Jump is disabled because an earlier process has no live
+scrollback position. Malformed, oversized, future-version, other-session, and
+orphan events are ignored using the same limits as rsh; at most the newest
+2,000 executions are retained in the sidebar cache.
 
 Fill and rerun require all of the following:
 

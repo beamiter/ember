@@ -296,6 +296,7 @@ pub struct ShellSession {
 
 impl ShellSession {
     /// 启动新的 shell session
+    #[allow(dead_code)]
     pub fn new(
         cols: usize,
         rows: usize,

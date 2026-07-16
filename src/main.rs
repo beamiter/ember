@@ -1336,7 +1336,9 @@ impl TerminalApp {
             .and_then(|s| s.sessions.first()?.cwd.as_deref().map(String::from));
         let first_session_id = saved_snapshot
             .as_ref()
-            .and_then(|s| s.sessions.first()?.session_id.as_deref().map(String::from));
+            .and_then(|s| s.sessions.first()?.session_id.as_deref().map(String::from))
+            .filter(|id| session::is_valid_rsh_session_id(id))
+            .unwrap_or_else(session::generate_session_id);
         let saved_active_index = saved_snapshot.as_ref().and_then(|s| s.active_index);
         let terminal = TerminalState::new(cols, rows);
 
@@ -1346,7 +1348,7 @@ impl TerminalApp {
             cols,
             rows,
             first_cwd.as_deref(),
-            first_session_id.as_deref(),
+            Some(&first_session_id),
             configured_shell.as_deref(),
             repaint_ctx.clone(),
         ) {
@@ -1359,9 +1361,11 @@ impl TerminalApp {
                     "✗ Failed to start shell with saved cwd, falling back: {}",
                     e
                 );
-                match ShellSession::new(
+                match ShellSession::new_with_cwd(
                     cols,
                     rows,
+                    None,
+                    Some(&first_session_id),
                     configured_shell.as_deref(),
                     repaint_ctx.clone(),
                 ) {
@@ -1376,7 +1380,12 @@ impl TerminalApp {
             }
         };
 
-        let session = Session::with_default_name(0, Arc::new(ParkingMutex::new(terminal)), shell);
+        let session = Session::with_default_name_and_session_id(
+            0,
+            Arc::new(ParkingMutex::new(terminal)),
+            shell,
+            first_session_id,
+        );
         let mut session_manager = SessionManager::new(session, repaint_ctx, configured_shell);
 
         // 恢复额外的会话（包括 restorable commands 回放）

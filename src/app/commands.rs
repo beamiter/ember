@@ -5,9 +5,15 @@
 //! closures are active, and performs terminal/clipboard/PTY work afterwards.
 
 use super::state::TerminalApp;
+use crate::execution_journal::{self, HistoryLoad, HistoryRequestError, PersistedExecution};
 use crate::terminal::{CommandState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
 use eframe::egui;
-use std::time::{Duration, SystemTime};
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const COMMAND_DETAIL_COMMAND_BYTES: usize = 8 * 1024;
+const COMMAND_DETAIL_OUTPUT_BYTES: usize = 16 * 1024;
+const DETAIL_TRUNCATION_MARKER: &str = "\n… preview truncated …\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandTarget {
@@ -15,11 +21,25 @@ pub struct CommandTarget {
     pub execution_id: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct CommandSidebarState {
     pub query: String,
     pub selected: Option<CommandTarget>,
+    filter: CommandFilter,
     pending_action: Option<CommandAction>,
+    history_session_id: Option<String>,
+    history: Vec<PersistedExecution>,
+    history_load: Option<HistoryLoad>,
+    history_loaded: bool,
+    history_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CommandFilter {
+    #[default]
+    All,
+    Failed,
+    Running,
 }
 
 #[derive(Clone, Debug)]
@@ -29,11 +49,43 @@ struct CommandRowSnapshot {
     command_summary: String,
     command_preview: String,
     command_exact: bool,
+    command_multiline: bool,
     cwd: Option<String>,
     state: CommandState,
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     started_at: Option<SystemTime>,
+    sort_started_at_ms: u64,
+    live_position: bool,
+    output_copy_available: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DetailTextSnapshot {
+    text: String,
+    truncated: bool,
+    total_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CommandDetailSnapshot {
+    target: CommandTarget,
+    command: Option<DetailTextSnapshot>,
+    command_exact: bool,
+    command_omitted: bool,
+    output: Option<DetailTextSnapshot>,
+    output_copy_available: bool,
+    state: CommandState,
+    command_from_history: bool,
+    output_from_history: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayGuardSnapshot {
+    prompt_ready: bool,
+    alternate_screen: bool,
+    bracketed_paste: bool,
+    pending_input: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,14 +121,22 @@ impl TerminalApp {
     /// Render commands for the currently focused tab in chronological order.
     pub(crate) fn render_sidebar_commands(&mut self, ui: &mut egui::Ui) {
         let active_index = self.session_manager.active_index();
-        let (session_id, session_title, mut rows) = {
+        let selected_before = self.command_sidebar.selected.clone();
+        let (session_id, session_title, mut rows, replay_guard, live_selected_detail) = {
             let Some(session) = self.session_manager.sessions().get(active_index) else {
                 ui.label("No active session");
                 return;
             };
             let session_id = session.metadata.session_id.clone();
             let session_title = Self::session_cwd_title(session);
+            let pending_input = !session.pending_input.is_empty();
             let terminal = session.terminal.lock();
+            let replay_guard = ReplayGuardSnapshot {
+                prompt_ready: terminal.shell_is_prompt_ready(),
+                alternate_screen: terminal.is_alt_buffer(),
+                bracketed_paste: terminal.is_bracketed_paste_enabled(),
+                pending_input,
+            };
             let rows = terminal
                 .command_records()
                 .iter()
@@ -91,6 +151,14 @@ impl TerminalApp {
                             .command_truncated
                             .then_some("(command omitted: exceeds integration limit)")
                     })?;
+                    let output_copy_available = record
+                        .captured_output
+                        .as_ref()
+                        .is_some_and(|output| !output.text.is_empty())
+                        || record
+                            .output_start
+                            .zip(record.output_end)
+                            .is_some_and(|(start, end)| end > start);
                     Some(CommandRowSnapshot {
                         target: CommandTarget {
                             session_id: session_id.clone(),
@@ -102,6 +170,10 @@ impl TerminalApp {
                         command_exact: record.command_exact
                             && !record.command_truncated
                             && command.is_some(),
+                        command_multiline: record
+                            .command
+                            .as_deref()
+                            .is_some_and(replay_command_is_multiline),
                         cwd: record
                             .cwd
                             .as_deref()
@@ -110,18 +182,141 @@ impl TerminalApp {
                         exit_code: record.exit_code,
                         duration_ms: record.duration_ms,
                         started_at: record.started_at,
+                        sort_started_at_ms: system_time_to_unix_ms(record.started_at)
+                            .unwrap_or(record.sequence),
+                        live_position: true,
+                        output_copy_available,
                     })
                 })
                 .collect::<Vec<_>>();
-            (session_id, session_title, rows)
+            let selected_detail = selected_before
+                .as_ref()
+                .filter(|target| target.session_id == session_id)
+                .and_then(|target| {
+                    let record = terminal.command_record(&target.execution_id)?;
+                    let command = record.command.as_deref().map(|command| {
+                        detail_text_snapshot(
+                            command,
+                            false,
+                            command.len(),
+                            COMMAND_DETAIL_COMMAND_BYTES,
+                        )
+                    });
+                    let output = record.captured_output.as_ref().map(|output| {
+                        detail_text_snapshot(
+                            &output.text,
+                            output.truncated,
+                            output.total_bytes,
+                            COMMAND_DETAIL_OUTPUT_BYTES,
+                        )
+                    });
+                    let output_copy_available = record
+                        .captured_output
+                        .as_ref()
+                        .is_some_and(|output| !output.text.is_empty())
+                        || record
+                            .output_start
+                            .zip(record.output_end)
+                            .is_some_and(|(start, end)| end > start);
+                    Some(CommandDetailSnapshot {
+                        target: target.clone(),
+                        command,
+                        command_exact: record.command_exact && !record.command_truncated,
+                        command_omitted: record.command_truncated && record.command.is_none(),
+                        output,
+                        output_copy_available,
+                        state: record.state,
+                        command_from_history: false,
+                        output_from_history: false,
+                    })
+                });
+            (
+                session_id,
+                session_title,
+                rows,
+                replay_guard,
+                selected_detail,
+            )
         };
-        rows.sort_by_key(|row| row.sequence);
 
-        ui.label(
-            egui::RichText::new(session_title)
-                .small()
-                .color(ui.visuals().weak_text_color()),
-        );
+        self.sync_command_sidebar_history(&session_id, ui.ctx());
+        let history_by_id = self
+            .command_sidebar
+            .history
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect::<HashMap<_, _>>();
+        let live_ids = rows
+            .iter()
+            .map(|row| row.target.execution_id.clone())
+            .collect::<HashSet<_>>();
+        for row in &mut rows {
+            if let Some(record) = history_by_id.get(row.target.execution_id.as_str()) {
+                enrich_live_row_from_history(row, record);
+            }
+        }
+        let mut restored_rows = 0usize;
+        for record in &self.command_sidebar.history {
+            if !live_ids.contains(&record.id) {
+                if let Some(row) = persisted_command_row(&session_id, record) {
+                    rows.push(row);
+                    restored_rows += 1;
+                }
+            }
+        }
+        let selected_history = selected_before
+            .as_ref()
+            .filter(|target| target.session_id == session_id)
+            .and_then(|target| {
+                history_by_id
+                    .get(target.execution_id.as_str())
+                    .copied()
+                    .map(|record| (target, record))
+            });
+        let selected_detail = match (live_selected_detail, selected_history) {
+            (Some(mut detail), Some((_, record))) => {
+                enrich_live_detail_from_history(&mut detail, record);
+                Some(detail)
+            }
+            (Some(detail), None) => Some(detail),
+            (None, Some((target, record))) => Some(persisted_command_detail(target, record)),
+            (None, None) => None,
+        };
+        rows.sort_by(|left, right| {
+            (
+                left.sort_started_at_ms,
+                left.sequence,
+                &left.target.execution_id,
+            )
+                .cmp(&(
+                    right.sort_started_at_ms,
+                    right.sequence,
+                    &right.target.execution_id,
+                ))
+        });
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(session_title)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                )
+                .truncate(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("↻").small()).small())
+                    .on_hover_text("Reload persisted rsh history")
+                    .clicked()
+                {
+                    self.command_sidebar.history_loaded = false;
+                    self.command_sidebar.history_load = None;
+                    self.command_sidebar.history_error = None;
+                    ui.ctx().request_repaint();
+                }
+            });
+        });
         ui.add_space(3.0);
 
         ui.horizontal(|ui| {
@@ -146,23 +341,64 @@ impl TerminalApp {
             }
         });
 
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Show")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            for (filter, label) in [
+                (CommandFilter::All, "All"),
+                (CommandFilter::Failed, "Failed"),
+                (CommandFilter::Running, "Running"),
+            ] {
+                if ui
+                    .selectable_label(
+                        self.command_sidebar.filter == filter,
+                        egui::RichText::new(label).small(),
+                    )
+                    .clicked()
+                {
+                    self.command_sidebar.filter = filter;
+                }
+            }
+        });
+
         let query = self.command_sidebar.query.trim().to_lowercase();
         let visible_rows = rows
             .iter()
-            .filter(|row| command_row_matches(row, &query))
+            .filter(|row| command_row_matches(row, &query, self.command_sidebar.filter))
             .collect::<Vec<_>>();
+        let mut count_label = if query.is_empty() {
+            format!("{} commands", visible_rows.len())
+        } else {
+            format!("{} of {} commands", visible_rows.len(), rows.len())
+        };
+        if restored_rows > 0 {
+            count_label.push_str(&format!(" · {restored_rows} restored"));
+        }
         ui.label(
-            egui::RichText::new(if query.is_empty() {
-                format!("{} commands", visible_rows.len())
-            } else {
-                format!("{} of {} commands", visible_rows.len(), rows.len())
-            })
-            .small()
-            .color(ui.visuals().weak_text_color()),
+            egui::RichText::new(count_label)
+                .small()
+                .color(ui.visuals().weak_text_color()),
         );
+        if self.command_sidebar.history_load.is_some() {
+            ui.label(
+                egui::RichText::new("Loading persisted history…")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        } else if let Some(error) = self.command_sidebar.history_error.as_deref() {
+            ui.label(
+                egui::RichText::new(format!("Persisted history unavailable: {error}"))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
         ui.add_space(2.0);
 
         let mut action = None;
+        let mut clear_selection = false;
         if visible_rows.is_empty() {
             ui.add_space(8.0);
             ui.label(
@@ -178,6 +414,7 @@ impl TerminalApp {
             egui::ScrollArea::vertical()
                 .id_salt(("command_timeline", &session_id))
                 .auto_shrink([false, true])
+                .stick_to_bottom(true)
                 .show(ui, |ui| {
                     for row in visible_rows {
                         let selected = self.command_sidebar.selected.as_ref() == Some(&row.target);
@@ -223,10 +460,15 @@ impl TerminalApp {
                             &row.target.session_id,
                             &row.target.execution_id,
                         ));
+                        let interaction_hint = if row.live_position {
+                            "Click to jump · Right-click for actions"
+                        } else {
+                            "Click for details · Restored from the rsh journal"
+                        };
                         let response = ui
                             .interact(frame.response.rect, row_id, egui::Sense::click())
                             .on_hover_text(format!(
-                                "{}\n\nClick to jump · Right-click for actions",
+                                "{}\n\n{interaction_hint}",
                                 row.command_preview
                             ));
                         if response.hovered() {
@@ -234,10 +476,12 @@ impl TerminalApp {
                         }
                         if response.clicked() {
                             self.command_sidebar.selected = Some(row.target.clone());
-                            action = Some(CommandAction {
-                                target: row.target.clone(),
-                                kind: CommandActionKind::Jump,
-                            });
+                            if row.live_position {
+                                action = Some(CommandAction {
+                                    target: row.target.clone(),
+                                    kind: CommandActionKind::Jump,
+                                });
+                            }
                         }
                         response.context_menu(|ui| {
                             command_menu_item(
@@ -246,7 +490,8 @@ impl TerminalApp {
                                 row,
                                 "Copy command",
                                 CommandActionKind::CopyCommand,
-                                row.command_exact,
+                                (!row.command_exact)
+                                    .then_some("The shell did not provide exact command metadata"),
                             );
                             command_menu_item(
                                 ui,
@@ -254,7 +499,8 @@ impl TerminalApp {
                                 row,
                                 "Copy output",
                                 CommandActionKind::CopyOutput,
-                                true,
+                                (!row.output_copy_available)
+                                    .then_some("Rendered command output is unavailable or empty"),
                             );
                             command_menu_item(
                                 ui,
@@ -262,7 +508,7 @@ impl TerminalApp {
                                 row,
                                 "Copy command + output",
                                 CommandActionKind::CopyCombined,
-                                row.command_exact,
+                                combined_copy_disabled_reason(row),
                             );
                             ui.separator();
                             command_menu_item(
@@ -271,7 +517,7 @@ impl TerminalApp {
                                 row,
                                 "Fill at prompt",
                                 CommandActionKind::Fill,
-                                row.command_exact,
+                                replay_disabled_reason(row, replay_guard, false),
                             );
                             command_menu_item(
                                 ui,
@@ -279,18 +525,97 @@ impl TerminalApp {
                                 row,
                                 "Run again",
                                 CommandActionKind::RunAgain,
-                                row.command_exact,
+                                replay_disabled_reason(row, replay_guard, true),
                             );
                         });
+                        if selected {
+                            if let Some(detail) = selected_detail
+                                .as_ref()
+                                .filter(|detail| detail.target == row.target)
+                            {
+                                render_command_detail(
+                                    ui,
+                                    row,
+                                    detail,
+                                    replay_guard,
+                                    &mut action,
+                                    &mut clear_selection,
+                                );
+                            }
+                        }
                         ui.add_space(2.0);
                     }
                 });
+        }
+
+        let selected_missing = selected_before
+            .as_ref()
+            .is_some_and(|target| target.session_id == session_id)
+            && selected_detail.is_none()
+            && self.command_sidebar.history_loaded;
+        if clear_selection || selected_missing {
+            self.command_sidebar.selected = None;
         }
 
         // The containing Panel::show closure is still alive here. Stage the
         // action so main.rs can execute it after that outer closure returns.
         if action.is_some() {
             self.command_sidebar.pending_action = action;
+        }
+    }
+
+    fn sync_command_sidebar_history(&mut self, session_id: &str, ctx: &egui::Context) {
+        if self.command_sidebar.history_session_id.as_deref() != Some(session_id) {
+            self.command_sidebar.history_session_id = Some(session_id.to_owned());
+            self.command_sidebar.history.clear();
+            self.command_sidebar.history_load = None;
+            self.command_sidebar.history_loaded = false;
+            self.command_sidebar.history_error = None;
+        }
+
+        let polled = self
+            .command_sidebar
+            .history_load
+            .as_ref()
+            .map(HistoryLoad::try_snapshot);
+        match polled {
+            Some(Ok(Some(snapshot))) => {
+                self.command_sidebar.history_load = None;
+                if snapshot.session_id == session_id {
+                    self.command_sidebar.history = snapshot.records;
+                    self.command_sidebar.history_error = snapshot.error;
+                    self.command_sidebar.history_loaded = true;
+                }
+            }
+            Some(Ok(None)) => {
+                ctx.request_repaint_after(Duration::from_millis(75));
+                return;
+            }
+            Some(Err(())) => {
+                self.command_sidebar.history_load = None;
+                self.command_sidebar.history_loaded = true;
+                self.command_sidebar.history_error =
+                    Some("background reader stopped unexpectedly".to_owned());
+            }
+            None => {}
+        }
+
+        if self.command_sidebar.history_loaded || self.command_sidebar.history_load.is_some() {
+            return;
+        }
+        match execution_journal::request_history(session_id.to_owned()) {
+            Ok(load) => {
+                self.command_sidebar.history_load = Some(load);
+                ctx.request_repaint_after(Duration::from_millis(75));
+            }
+            Err(HistoryRequestError::Full) => {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+            Err(HistoryRequestError::Closed) => {
+                self.command_sidebar.history_loaded = true;
+                self.command_sidebar.history_error =
+                    Some("background reader is unavailable".to_owned());
+            }
         }
     }
 
@@ -322,6 +647,16 @@ impl TerminalApp {
             .sessions()
             .iter()
             .position(|session| session.metadata.session_id == target.session_id)
+    }
+
+    fn persisted_sidebar_execution(&self, target: &CommandTarget) -> Option<&PersistedExecution> {
+        if self.command_sidebar.history_session_id.as_deref() != Some(target.session_id.as_str()) {
+            return None;
+        }
+        self.command_sidebar
+            .history
+            .iter()
+            .find(|record| record.id == target.execution_id)
     }
 
     fn jump_to_sidebar_command(&mut self, target: &CommandTarget) {
@@ -364,7 +699,7 @@ impl TerminalApp {
             self.set_status("Command session is no longer available");
             return;
         };
-        let captured = self
+        let live_captured = self
             .session_manager
             .sessions()
             .get(index)
@@ -384,6 +719,34 @@ impl TerminalApp {
                 };
                 Some((command, command_exact, output))
             });
+        let persisted_captured = self.persisted_sidebar_execution(target).map(|record| {
+            let output = match kind {
+                CopyKind::Command => None,
+                CopyKind::Output | CopyKind::Combined => record
+                    .output
+                    .as_ref()
+                    .map(|output| (output.text.clone(), output.truncated)),
+            };
+            (
+                record.command.clone(),
+                !record.command_truncated && !record.command.is_empty(),
+                output,
+            )
+        });
+        let captured = match (live_captured, persisted_captured) {
+            (Some((mut command, mut command_exact, mut output)), Some(persisted)) => {
+                if !command_exact && persisted.1 {
+                    command = persisted.0;
+                    command_exact = true;
+                }
+                if output.is_none() {
+                    output = persisted.2;
+                }
+                Some((command, command_exact, output))
+            }
+            (Some(captured), None) | (None, Some(captured)) => Some(captured),
+            (None, None) => None,
+        };
         let Some(captured) = captured else {
             self.set_status("Command record is no longer available");
             return;
@@ -442,65 +805,68 @@ impl TerminalApp {
             self.set_status("Command session is no longer available");
             return;
         };
-        if !self.activate_session(index) {
+        if self.session_manager.active_index() != index && !self.activate_session(index) {
             self.set_status("Command session is no longer available");
             return;
         }
 
+        let persisted_command = self
+            .persisted_sidebar_execution(target)
+            .filter(|record| !record.command_truncated && !record.command.is_empty())
+            .map(|record| record.command.clone());
         let outcome = {
             let Some(session) = self.session_manager.get_session_mut(index) else {
                 return self.set_status("Command session is no longer available");
             };
-            if !session.pending_input.is_empty() {
+            let pending_input = !session.pending_input.is_empty();
+            let replay = {
+                let terminal = session.terminal.lock();
+                let command = terminal
+                    .command_record(&target.execution_id)
+                    .and_then(|record| {
+                        (record.command_exact && !record.command_truncated)
+                            .then(|| record.command.clone())
+                            .flatten()
+                    })
+                    .or(persisted_command);
+                (
+                    command,
+                    terminal.shell_is_prompt_ready(),
+                    terminal.is_alt_buffer(),
+                    terminal.is_bracketed_paste_enabled(),
+                )
+            };
+            let Some(command) = replay.0 else {
+                return self.set_status("Exact command text is unavailable");
+            };
+            let command = trim_replay_command(&command);
+            if replay.2 {
+                ReplayOutcome::AlternateScreen
+            } else if !replay.1 {
+                ReplayOutcome::NotPromptReady
+            } else if !replay.3 {
+                ReplayOutcome::BracketedPasteDisabled
+            } else if pending_input {
                 ReplayOutcome::PendingInput
+            } else if command.is_empty() {
+                ReplayOutcome::EmptyCommand
+            } else if run && replay_command_is_multiline(&command) {
+                ReplayOutcome::MultilineRun
             } else {
-                let replay = {
-                    let terminal = session.terminal.lock();
-                    let command =
-                        terminal
-                            .command_record(&target.execution_id)
-                            .and_then(|record| {
-                                (record.command_exact && !record.command_truncated)
-                                    .then(|| record.command.clone())
-                                    .flatten()
-                            });
-                    (
-                        command,
-                        terminal.shell_is_prompt_ready(),
-                        terminal.is_alt_buffer(),
-                        terminal.is_bracketed_paste_enabled(),
-                    )
-                };
-                let Some(command) = replay.0 else {
-                    return self.set_status("Exact command text is unavailable");
-                };
-                let command = trim_replay_command(&command);
-                if !replay.1 {
-                    ReplayOutcome::NotPromptReady
-                } else if replay.2 {
-                    ReplayOutcome::AlternateScreen
-                } else if !replay.3 {
-                    ReplayOutcome::BracketedPasteDisabled
-                } else if command.is_empty() {
-                    ReplayOutcome::EmptyCommand
-                } else if run && command.chars().any(|ch| matches!(ch, '\r' | '\n')) {
-                    ReplayOutcome::MultilineRun
-                } else {
-                    let mut payload = crate::wrap_bracketed_paste(command.as_bytes().to_vec());
-                    if run {
-                        payload.push(b'\r');
-                    }
-                    match session.shell.write(&payload) {
-                        Ok(()) => {
-                            session.terminal.lock().scroll_to_bottom();
-                            if run {
-                                ReplayOutcome::Ran
-                            } else {
-                                ReplayOutcome::Filled
-                            }
+                let mut payload = crate::wrap_bracketed_paste(command.as_bytes().to_vec());
+                if run {
+                    payload.push(b'\r');
+                }
+                match session.shell.write(&payload) {
+                    Ok(()) => {
+                        session.terminal.lock().scroll_to_bottom();
+                        if run {
+                            ReplayOutcome::Ran
+                        } else {
+                            ReplayOutcome::Filled
                         }
-                        Err(error) => ReplayOutcome::WriteFailed(error),
                     }
+                    Err(error) => ReplayOutcome::WriteFailed(error),
                 }
             }
         };
@@ -539,17 +905,164 @@ enum CopyKind {
     Combined,
 }
 
+fn persisted_command_row(
+    session_id: &str,
+    record: &PersistedExecution,
+) -> Option<CommandRowSnapshot> {
+    let command = record.command.trim();
+    let display = if command.is_empty() {
+        record
+            .command_truncated
+            .then_some("(command omitted: exceeds journal limit)")?
+    } else {
+        command
+    };
+    let state = if record.exit_code.is_some() {
+        CommandState::Complete
+    } else {
+        CommandState::Running
+    };
+    Some(CommandRowSnapshot {
+        target: CommandTarget {
+            session_id: session_id.to_owned(),
+            execution_id: record.id.clone(),
+        },
+        sequence: record.seq,
+        command_summary: single_line_command_preview(display, 160),
+        command_preview: single_line_command_preview(display, 512),
+        command_exact: !record.command_truncated && !command.is_empty(),
+        command_multiline: replay_command_is_multiline(&record.command),
+        cwd: (!record.cwd.is_empty()).then(|| single_line_command_preview(&record.cwd, 256)),
+        state,
+        exit_code: record.exit_code,
+        duration_ms: record.duration_ms,
+        started_at: unix_ms_to_system_time(record.started_at_ms),
+        sort_started_at_ms: record.started_at_ms,
+        live_position: false,
+        output_copy_available: record
+            .output
+            .as_ref()
+            .is_some_and(|output| !output.text.is_empty()),
+    })
+}
+
+fn enrich_live_row_from_history(row: &mut CommandRowSnapshot, record: &PersistedExecution) {
+    let exact_command = (!record.command_truncated)
+        .then_some(record.command.trim())
+        .filter(|command| !command.is_empty());
+    if !row.command_exact {
+        if let Some(command) = exact_command {
+            row.command_summary = single_line_command_preview(command, 160);
+            row.command_preview = single_line_command_preview(command, 512);
+            row.command_exact = true;
+            row.command_multiline = replay_command_is_multiline(&record.command);
+        }
+    }
+    row.output_copy_available |= record
+        .output
+        .as_ref()
+        .is_some_and(|output| !output.text.is_empty());
+}
+
+fn persisted_command_detail(
+    target: &CommandTarget,
+    record: &PersistedExecution,
+) -> CommandDetailSnapshot {
+    let command = (!record.command.is_empty()).then(|| {
+        detail_text_snapshot(
+            &record.command,
+            record.command_truncated,
+            record.command.len(),
+            COMMAND_DETAIL_COMMAND_BYTES,
+        )
+    });
+    let output = record.output.as_ref().map(|output| {
+        detail_text_snapshot(
+            &output.text,
+            output.truncated,
+            usize::try_from(output.total_bytes).unwrap_or(usize::MAX),
+            COMMAND_DETAIL_OUTPUT_BYTES,
+        )
+    });
+    CommandDetailSnapshot {
+        target: target.clone(),
+        command,
+        command_exact: !record.command_truncated && !record.command.is_empty(),
+        command_omitted: record.command_truncated && record.command.is_empty(),
+        output_copy_available: record
+            .output
+            .as_ref()
+            .is_some_and(|output| !output.text.is_empty()),
+        output,
+        state: if record.exit_code.is_some() {
+            CommandState::Complete
+        } else {
+            CommandState::Running
+        },
+        command_from_history: true,
+        output_from_history: true,
+    }
+}
+
+fn enrich_live_detail_from_history(
+    detail: &mut CommandDetailSnapshot,
+    record: &PersistedExecution,
+) {
+    if !detail.command_exact && !record.command_truncated && !record.command.is_empty() {
+        detail.command = Some(detail_text_snapshot(
+            &record.command,
+            false,
+            record.command.len(),
+            COMMAND_DETAIL_COMMAND_BYTES,
+        ));
+        detail.command_exact = true;
+        detail.command_omitted = false;
+        detail.command_from_history = true;
+    }
+    if detail.output.is_none() {
+        if let Some(output) = record.output.as_ref() {
+            detail.output = Some(detail_text_snapshot(
+                &output.text,
+                output.truncated,
+                usize::try_from(output.total_bytes).unwrap_or(usize::MAX),
+                COMMAND_DETAIL_OUTPUT_BYTES,
+            ));
+            detail.output_from_history = true;
+        }
+    }
+    detail.output_copy_available |= record
+        .output
+        .as_ref()
+        .is_some_and(|output| !output.text.is_empty());
+}
+
+fn system_time_to_unix_ms(time: Option<SystemTime>) -> Option<u64> {
+    let millis = time?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .min(u128::from(u64::MAX));
+    Some(millis as u64)
+}
+
+fn unix_ms_to_system_time(millis: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_millis(millis))
+}
+
 fn command_menu_item(
     ui: &mut egui::Ui,
     action: &mut Option<CommandAction>,
     row: &CommandRowSnapshot,
     label: &str,
     kind: CommandActionKind,
-    enabled: bool,
+    disabled_reason: Option<&str>,
 ) {
-    let response = ui
-        .add_enabled(enabled, egui::Button::new(label))
-        .on_disabled_hover_text("The shell did not provide exact command metadata");
+    let response = ui.add_enabled(disabled_reason.is_none(), egui::Button::new(label));
+    let response = if let Some(reason) = disabled_reason {
+        response.on_disabled_hover_text(reason)
+    } else {
+        response
+    };
     if response.clicked() {
         *action = Some(CommandAction {
             target: row.target.clone(),
@@ -559,19 +1072,300 @@ fn command_menu_item(
     }
 }
 
-fn command_row_matches(row: &CommandRowSnapshot, query: &str) -> bool {
-    query.is_empty()
-        || row.command_preview.to_lowercase().contains(query)
-        || row
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.to_lowercase().contains(query))
+fn combined_copy_disabled_reason(row: &CommandRowSnapshot) -> Option<&'static str> {
+    if !row.command_exact {
+        Some("The shell did not provide exact command metadata")
+    } else if !row.output_copy_available {
+        Some("Rendered command output is unavailable or empty")
+    } else {
+        None
+    }
+}
+
+fn command_detail_action_button(
+    ui: &mut egui::Ui,
+    action: &mut Option<CommandAction>,
+    row: &CommandRowSnapshot,
+    label: &str,
+    kind: CommandActionKind,
+    disabled_reason: Option<&str>,
+) {
+    let response = ui.add_enabled(
+        disabled_reason.is_none(),
+        egui::Button::new(egui::RichText::new(label).small()).small(),
+    );
+    let response = if let Some(reason) = disabled_reason {
+        response.on_disabled_hover_text(reason)
+    } else {
+        response
+    };
+    if response.clicked() {
+        *action = Some(CommandAction {
+            target: row.target.clone(),
+            kind,
+        });
+    }
+}
+
+fn render_command_detail(
+    ui: &mut egui::Ui,
+    row: &CommandRowSnapshot,
+    detail: &CommandDetailSnapshot,
+    replay_guard: ReplayGuardSnapshot,
+    action: &mut Option<CommandAction>,
+    clear_selection: &mut bool,
+) {
+    egui::Frame::group(ui.style())
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::same(6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Command details").small().strong());
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("×").small()).small())
+                            .on_hover_text("Close details")
+                            .clicked()
+                        {
+                            *clear_selection = true;
+                        }
+                    },
+                );
+            });
+
+            match detail.command.as_ref() {
+                Some(command) => {
+                    egui::ScrollArea::vertical()
+                        .id_salt((
+                            "semantic_command_detail_command",
+                            &detail.target.session_id,
+                            &detail.target.execution_id,
+                        ))
+                        .max_height(96.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&command.text).monospace().small(),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                        });
+                    let mut provenance = if detail.command_exact && detail.command_from_history {
+                        "exact rsh journal metadata".to_owned()
+                    } else if detail.command_exact {
+                        "exact shell metadata".to_owned()
+                    } else if detail.command_from_history {
+                        "truncated rsh journal metadata; replay disabled".to_owned()
+                    } else {
+                        "display-derived; replay disabled".to_owned()
+                    };
+                    if command.truncated {
+                        provenance.push_str(&format!(
+                            " · preview of {}",
+                            format_byte_count(command.total_bytes)
+                        ));
+                    }
+                    ui.label(
+                        egui::RichText::new(provenance)
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(if detail.command_omitted {
+                            "Exact command omitted by the producer because it exceeded the limit."
+                        } else {
+                            "Command text is unavailable."
+                        })
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
+            }
+
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                command_detail_action_button(
+                    ui,
+                    action,
+                    row,
+                    "Jump",
+                    CommandActionKind::Jump,
+                    (!row.live_position).then_some(
+                        "This restored command no longer has a live scrollback position",
+                    ),
+                );
+                command_detail_action_button(
+                    ui,
+                    action,
+                    row,
+                    "Copy cmd",
+                    CommandActionKind::CopyCommand,
+                    (!detail.command_exact)
+                        .then_some("The shell did not provide exact command metadata"),
+                );
+                command_detail_action_button(
+                    ui,
+                    action,
+                    row,
+                    "Copy output",
+                    CommandActionKind::CopyOutput,
+                    (!detail.output_copy_available)
+                        .then_some("Rendered command output is unavailable or empty"),
+                );
+                command_detail_action_button(
+                    ui,
+                    action,
+                    row,
+                    "Fill",
+                    CommandActionKind::Fill,
+                    replay_disabled_reason(row, replay_guard, false),
+                );
+                command_detail_action_button(
+                    ui,
+                    action,
+                    row,
+                    "Run",
+                    CommandActionKind::RunAgain,
+                    replay_disabled_reason(row, replay_guard, true),
+                );
+            });
+
+            ui.separator();
+            match (detail.state, detail.output.as_ref()) {
+                (CommandState::Complete, Some(output)) if output.text.is_empty() => {
+                    ui.label(
+                        egui::RichText::new("Command produced no rendered output.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                (CommandState::Complete, Some(output)) => {
+                    let output_source = if detail.output_from_history {
+                        "Persisted output"
+                    } else {
+                        "Output"
+                    };
+                    let output_metadata = if output.truncated {
+                        format!(
+                            "{output_source} · truncated from {}",
+                            format_byte_count(output.total_bytes)
+                        )
+                    } else {
+                        format!("{output_source} · {}", format_byte_count(output.total_bytes))
+                    };
+                    ui.label(
+                        egui::RichText::new(output_metadata)
+                            .small()
+                            .strong(),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt((
+                            "semantic_command_detail_output",
+                            &detail.target.session_id,
+                            &detail.target.execution_id,
+                        ))
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&output.text).monospace().small(),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                        });
+                }
+                (CommandState::Complete, None) => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Rendered output preview is unavailable (its terminal range may have been evicted).",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                (CommandState::Running, _) if detail.output_from_history => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Persisted execution has no finish event; it is not treated as currently running.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                (CommandState::Running, _) => {
+                    ui.label(
+                        egui::RichText::new("Command is running; output is captured on completion.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                (CommandState::Prompt | CommandState::Editing, _) => {
+                    ui.label(
+                        egui::RichText::new("Waiting for the command to run.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+            }
+        });
+}
+
+fn replay_disabled_reason(
+    row: &CommandRowSnapshot,
+    guard: ReplayGuardSnapshot,
+    run: bool,
+) -> Option<&'static str> {
+    if !row.command_exact {
+        Some("The shell did not provide exact command metadata")
+    } else if guard.alternate_screen {
+        Some("Unavailable while an alternate-screen app is open")
+    } else if !guard.prompt_ready {
+        Some("Wait for the shell prompt")
+    } else if !guard.bracketed_paste {
+        Some("Safe replay requires bracketed-paste mode")
+    } else if guard.pending_input {
+        Some("Wait for pending terminal input to be delivered")
+    } else if run && row.command_multiline {
+        Some("Use Fill for multiline commands")
+    } else {
+        None
+    }
+}
+
+fn command_row_matches(row: &CommandRowSnapshot, query: &str, filter: CommandFilter) -> bool {
+    let matches_filter = match filter {
+        CommandFilter::All => true,
+        CommandFilter::Failed => {
+            row.state == CommandState::Complete && row.exit_code.is_some_and(|code| code != 0)
+        }
+        CommandFilter::Running => row.live_position && row.state == CommandState::Running,
+    };
+    matches_filter
+        && (query.is_empty()
+            || row.command_preview.to_lowercase().contains(query)
+            || row
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.to_lowercase().contains(query)))
 }
 
 fn command_status(row: &CommandRowSnapshot) -> (&'static str, egui::Color32, &'static str) {
     match row.state {
         CommandState::Prompt => ("○", egui::Color32::from_rgb(90, 160, 240), "Prompt"),
         CommandState::Editing => ("●", egui::Color32::from_rgb(90, 160, 240), "Editing"),
+        CommandState::Running if !row.live_position => (
+            "◌",
+            egui::Color32::from_rgb(190, 145, 70),
+            "Unfinished persisted execution",
+        ),
         CommandState::Running => ("●", egui::Color32::from_rgb(230, 175, 60), "Running"),
         CommandState::Complete if row.exit_code == Some(0) => {
             ("✓", egui::Color32::from_rgb(70, 190, 115), "Succeeded")
@@ -584,7 +1378,10 @@ fn command_status(row: &CommandRowSnapshot) -> (&'static str, egui::Color32, &'s
 }
 
 fn command_metadata(row: &CommandRowSnapshot) -> String {
-    let mut parts = Vec::with_capacity(3);
+    let mut parts = Vec::with_capacity(5);
+    if !row.live_position {
+        parts.push("history".to_owned());
+    }
     if let Some(cwd) = row.cwd.as_deref() {
         parts.push(abbreviate_home(cwd));
     }
@@ -641,8 +1438,67 @@ fn format_age(started_at: Option<SystemTime>) -> Option<String> {
     })
 }
 
+fn detail_text_snapshot(
+    value: &str,
+    source_truncated: bool,
+    total_bytes: usize,
+    max_bytes: usize,
+) -> DetailTextSnapshot {
+    if value.len() <= max_bytes {
+        return DetailTextSnapshot {
+            text: value.to_owned(),
+            truncated: source_truncated,
+            total_bytes: total_bytes.max(value.len()),
+        };
+    }
+
+    let marker = if max_bytes >= DETAIL_TRUNCATION_MARKER.len() + 2 {
+        DETAIL_TRUNCATION_MARKER
+    } else {
+        ""
+    };
+    let payload_budget = max_bytes.saturating_sub(marker.len());
+    let head_budget = payload_budget / 2;
+    let tail_budget = payload_budget - head_budget;
+    let mut head_end = head_budget.min(value.len());
+    while !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = value.len().saturating_sub(tail_budget);
+    while !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let mut text = String::with_capacity(max_bytes);
+    text.push_str(&value[..head_end]);
+    text.push_str(marker);
+    text.push_str(&value[tail_start..]);
+    debug_assert!(text.len() <= max_bytes);
+    DetailTextSnapshot {
+        text,
+        truncated: true,
+        total_bytes: total_bytes.max(value.len()),
+    }
+}
+
+fn format_byte_count(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 fn trim_replay_command(command: &str) -> String {
     command.trim_end_matches(&['\r', '\n'][..]).to_string()
+}
+
+fn replay_command_is_multiline(command: &str) -> bool {
+    command
+        .trim_end_matches(&['\r', '\n'][..])
+        .chars()
+        .any(|ch| matches!(ch, '\r' | '\n'))
 }
 
 fn single_line_command_preview(command: &str, max_chars: usize) -> String {
@@ -688,6 +1544,58 @@ fn combine_command_and_output(command: &str, output: &str) -> String {
 mod tests {
     use super::*;
 
+    fn persisted_test_record() -> PersistedExecution {
+        PersistedExecution {
+            id: "persisted-execution".to_owned(),
+            seq: 9,
+            command: "printf hi".to_owned(),
+            command_truncated: false,
+            cwd: "/tmp".to_owned(),
+            started_at_ms: 1_000,
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            cwd_after: Some("/tmp".to_owned()),
+            ended_at_ms: Some(1_012),
+            output: Some(crate::execution_journal::PersistedExecutionOutput {
+                text: "hi".to_owned(),
+                truncated: false,
+                total_bytes: 2,
+                captured_at_ms: 1_012,
+            }),
+        }
+    }
+
+    fn replay_test_row(exact: bool, multiline: bool) -> CommandRowSnapshot {
+        CommandRowSnapshot {
+            target: CommandTarget {
+                session_id: "session".to_owned(),
+                execution_id: "execution".to_owned(),
+            },
+            sequence: 1,
+            command_summary: "echo test".to_owned(),
+            command_preview: "echo test".to_owned(),
+            command_exact: exact,
+            command_multiline: multiline,
+            cwd: None,
+            state: CommandState::Complete,
+            exit_code: Some(0),
+            duration_ms: None,
+            started_at: None,
+            sort_started_at_ms: 0,
+            live_position: true,
+            output_copy_available: false,
+        }
+    }
+
+    fn ready_replay_guard() -> ReplayGuardSnapshot {
+        ReplayGuardSnapshot {
+            prompt_ready: true,
+            alternate_screen: false,
+            bracketed_paste: true,
+            pending_input: false,
+        }
+    }
+
     #[test]
     fn replay_trims_only_trailing_line_endings() {
         assert_eq!(
@@ -695,6 +1603,140 @@ mod tests {
             "printf 'a\\nb'"
         );
         assert_eq!(trim_replay_command(" echo hi  "), " echo hi  ");
+    }
+
+    #[test]
+    fn multiline_replay_detection_ignores_only_trailing_line_endings() {
+        assert!(!replay_command_is_multiline("echo hi\r\n"));
+        assert!(replay_command_is_multiline("printf one\nprintf two\n"));
+        assert!(replay_command_is_multiline("printf one\rprintf two"));
+    }
+
+    #[test]
+    fn command_detail_preview_is_utf8_safe_bounded_and_keeps_both_ends() {
+        let value = format!("start-{}-end", "雪".repeat(40));
+        let preview = detail_text_snapshot(&value, false, value.len(), 48);
+
+        assert!(preview.truncated);
+        assert_eq!(preview.total_bytes, value.len());
+        assert!(preview.text.len() <= 48);
+        assert!(preview.text.starts_with("start"));
+        assert!(preview.text.ends_with("end"));
+        assert!(preview.text.contains("preview truncated"));
+        assert!(std::str::from_utf8(preview.text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn command_detail_preview_preserves_source_truncation_and_total_size() {
+        let preview = detail_text_snapshot("short", true, 4096, 128);
+        assert_eq!(preview.text, "short");
+        assert!(preview.truncated);
+        assert_eq!(preview.total_bytes, 4096);
+        assert_eq!(format_byte_count(12), "12 B");
+        assert_eq!(format_byte_count(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn semantic_filters_compose_with_command_and_cwd_search() {
+        let mut row = replay_test_row(true, false);
+        row.command_preview = "cargo test".to_owned();
+        row.cwd = Some("/work/jterm2".to_owned());
+
+        assert!(command_row_matches(&row, "cargo", CommandFilter::All));
+        assert!(command_row_matches(&row, "jterm2", CommandFilter::All));
+        assert!(!command_row_matches(&row, "missing", CommandFilter::All));
+        assert!(!command_row_matches(&row, "", CommandFilter::Failed));
+
+        row.exit_code = Some(101);
+        assert!(command_row_matches(&row, "cargo", CommandFilter::Failed));
+
+        row.state = CommandState::Running;
+        row.exit_code = None;
+        assert!(command_row_matches(&row, "", CommandFilter::Running));
+        assert!(!command_row_matches(&row, "", CommandFilter::Failed));
+    }
+
+    #[test]
+    fn replay_menu_guard_tracks_rsh_editor_safety_requirements() {
+        let exact = replay_test_row(true, false);
+        assert_eq!(
+            replay_disabled_reason(&exact, ready_replay_guard(), false),
+            None
+        );
+        assert_eq!(
+            replay_disabled_reason(&exact, ready_replay_guard(), true),
+            None
+        );
+
+        let mut guard = ready_replay_guard();
+        guard.alternate_screen = true;
+        assert!(replay_disabled_reason(&exact, guard, false).is_some());
+
+        let mut guard = ready_replay_guard();
+        guard.prompt_ready = false;
+        assert!(replay_disabled_reason(&exact, guard, false).is_some());
+
+        let mut guard = ready_replay_guard();
+        guard.bracketed_paste = false;
+        assert!(replay_disabled_reason(&exact, guard, false).is_some());
+
+        let mut guard = ready_replay_guard();
+        guard.pending_input = true;
+        assert!(replay_disabled_reason(&exact, guard, false).is_some());
+
+        let multiline = replay_test_row(true, true);
+        assert_eq!(
+            replay_disabled_reason(&multiline, ready_replay_guard(), false),
+            None
+        );
+        assert!(replay_disabled_reason(&multiline, ready_replay_guard(), true).is_some());
+
+        let inexact = replay_test_row(false, false);
+        assert!(replay_disabled_reason(&inexact, ready_replay_guard(), false).is_some());
+    }
+
+    #[test]
+    fn persisted_rows_keep_exact_actions_but_not_live_jump_positions() {
+        let record = persisted_test_record();
+        let row = persisted_command_row("session", &record).unwrap();
+        let detail = persisted_command_detail(&row.target, &record);
+
+        assert!(row.command_exact);
+        assert!(!row.live_position);
+        assert!(row.output_copy_available);
+        assert_eq!(row.state, CommandState::Complete);
+        assert!(detail.command_from_history);
+        assert!(detail.output_from_history);
+        assert!(detail.command_exact);
+        assert_eq!(detail.output.unwrap().text, "hi");
+    }
+
+    #[test]
+    fn journal_metadata_enriches_an_inexact_live_row() {
+        let record = persisted_test_record();
+        let mut row = replay_test_row(false, false);
+        row.command_summary = "(command omitted)".to_owned();
+        row.command_preview = row.command_summary.clone();
+
+        enrich_live_row_from_history(&mut row, &record);
+
+        assert!(row.live_position);
+        assert!(row.command_exact);
+        assert_eq!(row.command_summary, "printf hi");
+        assert!(row.output_copy_available);
+    }
+
+    #[test]
+    fn unfinished_history_is_not_reported_as_currently_running() {
+        let mut record = persisted_test_record();
+        record.exit_code = None;
+        record.duration_ms = None;
+        record.ended_at_ms = None;
+        let row = persisted_command_row("session", &record).unwrap();
+
+        assert_eq!(row.state, CommandState::Running);
+        assert!(!command_row_matches(&row, "", CommandFilter::Running));
+        assert!(command_row_matches(&row, "", CommandFilter::All));
     }
 
     #[test]

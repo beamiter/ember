@@ -1,7 +1,7 @@
 use super::{
     ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, TerminalState,
     UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-    MAX_PENDING_ESCAPE,
+    MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE,
 };
 
 // `a=t` is the protocol default. Omitting it also guards against regressing to
@@ -1265,7 +1265,9 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
 fn osc_133_truncated_command_is_never_reconstructed_as_exact() {
     let mut terminal = TerminalState::new(24, 4);
     terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07displayed editor text\r\n");
-    terminal.process_input(b"\x1b]133;C;id=large;cmd_truncated=1;cwd_url=%2Ftmp\x07");
+    terminal.process_input(
+        b"\x1b]133;C;id=large;cmdline_url=unsafe-prefix;cmd_truncated=1;cwd_url=%2Ftmp\x07",
+    );
     terminal.process_input(b"output\x1b]133;D;0;id=large\x07");
 
     let record = terminal.command_record("large").expect("semantic record");
@@ -1273,6 +1275,57 @@ fn osc_133_truncated_command_is_never_reconstructed_as_exact() {
     assert!(!record.command_exact);
     assert!(record.command_truncated);
     assert_eq!(record.cwd.as_deref(), Some("/tmp"));
+}
+
+#[test]
+fn osc_133_invalid_utf8_command_is_rejected_instead_of_accepting_a_prefix() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07shown command\r\n");
+    terminal.process_input(b"\x1b]133;C;id=invalid-utf8;cmdline_url=echo%20safe%FFignored\x07");
+
+    let record = terminal
+        .command_record("invalid-utf8")
+        .expect("semantic record");
+    assert!(record.command.is_none());
+    assert!(!record.command_exact);
+    assert!(!record.command_truncated);
+}
+
+#[test]
+fn osc_133_oversized_command_is_retained_only_as_truncated_metadata() {
+    let mut terminal = TerminalState::new(24, 4);
+    let oversized = "x".repeat(MAX_OSC_133_COMMAND_BYTES + 1);
+    let lifecycle = format!(
+        "\x1b]133;A\x07> \x1b]133;B\x07shown command\r\n\x1b]133;C;id=oversized;cmdline_url={oversized}\x07"
+    );
+    terminal.process_input(lifecycle.as_bytes());
+
+    let record = terminal
+        .command_record("oversized")
+        .expect("semantic record");
+    assert!(record.command.is_none());
+    assert!(!record.command_exact);
+    assert!(record.command_truncated);
+}
+
+#[test]
+fn osc_133_invalid_or_oversized_ids_keep_the_terminal_local_identity() {
+    let mut invalid = TerminalState::new(24, 4);
+    invalid.process_input(b"\x1b]133;A\x07\x1b]133;C;id=prefix%FFsuffix\x07");
+    let invalid_record = invalid.command_records().back().expect("semantic record");
+    assert!(invalid_record.id.starts_with("local:"));
+    assert!(invalid.command_record("prefix").is_none());
+
+    let mut oversized = TerminalState::new(24, 4);
+    let id = "i".repeat(MAX_OSC_133_ID_BYTES + 1);
+    let lifecycle = format!("\x1b]133;A\x07\x1b]133;C;id={id}\x07");
+    oversized.process_input(lifecycle.as_bytes());
+    assert!(oversized
+        .command_records()
+        .back()
+        .expect("semantic record")
+        .id
+        .starts_with("local:"));
 }
 
 #[test]

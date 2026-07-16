@@ -83,7 +83,7 @@ mod unix_pty {
         quoted
     }
 
-    fn build_rsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
+    pub(crate) fn build_rsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
         let mut exec_cmd = format!("exec {}", shell_single_quote(shell_path));
         if let Some(sid) = session_id {
             exec_cmd.push_str(" --session ");
@@ -749,6 +749,19 @@ mod tests {
         assert_eq!(
             super::unix_pty::shell_single_quote("/tmp/it's"),
             "'/tmp/it'\"'\"'s'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_rsh_receives_the_preassigned_session_id() {
+        assert_eq!(
+            super::unix_pty::build_rsh_exec_command("/tmp/rsh", Some("123-456")),
+            "exec '/tmp/rsh' --session '123-456'"
+        );
+        assert_eq!(
+            super::unix_pty::build_rsh_exec_command("/tmp/rsh", None),
+            "exec '/tmp/rsh'"
         );
     }
 }

@@ -6,7 +6,7 @@ use crate::terminal::{
 };
 use eframe::egui;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -354,6 +354,23 @@ pub(crate) fn user_input_is_blocked_by_mouse_edge(
     barrier_session_id == Some(session_id)
 }
 
+fn restored_or_fresh_session_id(
+    candidate: Option<String>,
+    used_session_ids: &HashSet<String>,
+) -> String {
+    if let Some(id) = candidate
+        .filter(|id| crate::session::is_valid_rsh_session_id(id) && !used_session_ids.contains(id))
+    {
+        return id;
+    }
+    loop {
+        let id = crate::session::generate_session_id();
+        if !used_session_ids.contains(&id) {
+            return id;
+        }
+    }
+}
+
 impl SessionManager {
     /// 创建新的会话管理器，初始化一个默认会话
     pub fn new(
@@ -577,13 +594,15 @@ impl SessionManager {
             None
         };
 
-        // 创建新会话，继承工作目录（新会话不传 session_id，自动生成）
+        // 在启动 shell 前分配稳定 ID；rsh 的 --session、tab 路由和执行
+        // journal 必须从第一条输出起使用同一个值。
+        let session_id = crate::session::generate_session_id();
         let cwd_ref = cwd.as_deref();
         match ShellSession::new_with_cwd(
             cols,
             rows,
             cwd_ref,
-            None,
+            Some(&session_id),
             self.configured_shell.as_deref(),
             self.repaint_ctx.clone(),
         ) {
@@ -591,7 +610,7 @@ impl SessionManager {
                 let mut terminal = TerminalState::new(cols, rows);
                 terminal.set_max_scrollback(scrollback_lines);
                 let terminal = Arc::new(ParkingMutex::new(terminal));
-                let session = Session::new(name, tags, terminal, shell);
+                let session = Session::new_with_session_id(name, tags, terminal, shell, session_id);
                 self.sessions.insert(insert_index, session);
                 self.protocol_responses.insert(
                     insert_index,
@@ -804,38 +823,47 @@ impl SessionManager {
         active_index: Option<usize>,
     ) {
         let mut restored_indices = vec![None; snapshots.len()];
-        // 用第一个快照的 name/tags/session_id 更新已有的第一个 session
+        // 第一个 shell 的 ID 已在 spawn 前从同一快照规范化并固定；这里
+        // 只恢复展示元数据，绝不能再用损坏的磁盘值改写跨进程路由键。
         if let Some(first) = snapshots.first() {
             if let Some(session) = self.sessions.get_mut(0) {
                 session.metadata.name = first.name.clone();
                 session.metadata.tags = first.tags.clone();
                 session.metadata.custom_name = first.custom_name.clone();
-                if let Some(ref sid) = first.session_id {
-                    session.metadata.session_id = sid.clone();
-                }
                 restored_indices[0] = Some(0);
             }
         }
 
+        let mut used_session_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.metadata.session_id.clone())
+            .collect::<HashSet<_>>();
         // 为剩余快照创建新会话
         for (snapshot_idx, snap) in snapshots.into_iter().enumerate().skip(1) {
-            let cwd_ref = snap.cwd.as_deref();
-            let sid_ref = snap.session_id.as_deref();
+            let session_persistence::SessionSnapshot {
+                name,
+                tags,
+                cwd,
+                session_id,
+                custom_name,
+            } = snap;
+            let session_id = restored_or_fresh_session_id(session_id, &used_session_ids);
+            used_session_ids.insert(session_id.clone());
+            let cwd_ref = cwd.as_deref();
             match ShellSession::new_with_cwd(
                 80,
                 24,
                 cwd_ref,
-                sid_ref,
+                Some(&session_id),
                 self.configured_shell.as_deref(),
                 self.repaint_ctx.clone(),
             ) {
                 Ok(shell) => {
                     let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
-                    let mut session = Session::new(snap.name, snap.tags, terminal, shell);
-                    if let Some(sid) = snap.session_id {
-                        session.metadata.session_id = sid;
-                    }
-                    session.metadata.custom_name = snap.custom_name;
+                    let mut session =
+                        Session::new_with_session_id(name, tags, terminal, shell, session_id);
+                    session.metadata.custom_name = custom_name;
                     self.sessions.push(session);
                     self.protocol_responses
                         .push(ProtocolResponseSender::new(self.repaint_ctx.clone()));
@@ -909,11 +937,12 @@ fn refreshed_unseen_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        background_pump_order, refreshed_unseen_output, retry_pending_input,
-        user_input_is_blocked_by_mouse_edge, ProtocolResponseLimits, ProtocolResponseQueueError,
-        ProtocolResponseSender,
+        background_pump_order, refreshed_unseen_output, restored_or_fresh_session_id,
+        retry_pending_input, user_input_is_blocked_by_mouse_edge, ProtocolResponseLimits,
+        ProtocolResponseQueueError, ProtocolResponseSender,
     };
     use crate::shell::ShellWriteError;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     fn tiny_protocol_limits() -> ProtocolResponseLimits {
@@ -995,6 +1024,24 @@ mod tests {
             "captured-session",
             None
         ));
+    }
+
+    #[test]
+    fn restored_session_ids_are_valid_and_unique() {
+        let used = HashSet::from(["already-used".to_owned()]);
+        assert_eq!(
+            restored_or_fresh_session_id(Some("saved-session".to_owned()), &used),
+            "saved-session"
+        );
+        for candidate in [
+            Some("already-used".to_owned()),
+            Some("../bad".to_owned()),
+            None,
+        ] {
+            let generated = restored_or_fresh_session_id(candidate, &used);
+            assert!(crate::session::is_valid_rsh_session_id(&generated));
+            assert!(!used.contains(&generated));
+        }
     }
 
     #[test]

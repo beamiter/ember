@@ -2,6 +2,13 @@ use super::*;
 
 const OUTPUT_TRUNCATION_MARKER: &str = "\n… output truncated …\n";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Osc133DecodeError {
+    MalformedPercentEncoding,
+    TooLong,
+    InvalidUtf8,
+}
+
 /// Streaming UTF-8 head+tail collector. It retains the full value while it
 /// fits; only after the first overflow does it repartition into bounded head
 /// and rolling tail storage.
@@ -1294,17 +1301,27 @@ impl super::TerminalState {
         }
     }
 
-    fn percent_decode_osc_133(value: &str, max_bytes: usize) -> Option<String> {
+    /// Decode one OSC 133 metadata field without ever accepting a prefix as
+    /// the complete value. Exact command actions depend on this distinction:
+    /// an over-limit or invalid UTF-8 field must be rejected, not shortened
+    /// and subsequently labelled exact.
+    fn percent_decode_osc_133(value: &str, max_bytes: usize) -> Result<String, Osc133DecodeError> {
         let bytes = value.as_bytes();
         let mut decoded = Vec::with_capacity(bytes.len().min(max_bytes));
         let mut i = 0;
         while i < bytes.len() {
             let byte = if bytes[i] == b'%' {
                 if i + 2 >= bytes.len() {
-                    return None;
+                    return Err(Osc133DecodeError::MalformedPercentEncoding);
                 }
-                let high = (bytes[i + 1] as char).to_digit(16)? as u8;
-                let low = (bytes[i + 2] as char).to_digit(16)? as u8;
+                let high = (bytes[i + 1] as char)
+                    .to_digit(16)
+                    .ok_or(Osc133DecodeError::MalformedPercentEncoding)?
+                    as u8;
+                let low = (bytes[i + 2] as char)
+                    .to_digit(16)
+                    .ok_or(Osc133DecodeError::MalformedPercentEncoding)?
+                    as u8;
                 i += 3;
                 (high << 4) | low
             } else {
@@ -1312,19 +1329,17 @@ impl super::TerminalState {
                 i += 1;
                 byte
             };
-            if decoded.len() < max_bytes {
-                decoded.push(byte);
+            if decoded.len() == max_bytes {
+                return Err(Osc133DecodeError::TooLong);
             }
+            decoded.push(byte);
         }
 
-        while std::str::from_utf8(&decoded).is_err() {
-            decoded.pop()?;
-        }
-        String::from_utf8(decoded).ok()
+        String::from_utf8(decoded).map_err(|_| Osc133DecodeError::InvalidUtf8)
     }
 
     fn valid_osc_133_id(value: &str) -> Option<String> {
-        let id = Self::percent_decode_osc_133(value, MAX_OSC_133_ID_BYTES)?;
+        let id = Self::percent_decode_osc_133(value, MAX_OSC_133_ID_BYTES).ok()?;
         if id.is_empty() || id.chars().any(char::is_control) {
             return None;
         }
@@ -1378,15 +1393,28 @@ impl super::TerminalState {
         cwd: Option<&str>,
     ) {
         self.adopt_record_id(index, id);
+        let decoded_command =
+            command.map(|value| Self::percent_decode_osc_133(value, MAX_OSC_133_COMMAND_BYTES));
+        let decoded_cwd = cwd.map(|value| Self::percent_decode_osc_133(value, 16 * 1024));
         if let Some(record) = self.command_records.get_mut(index) {
-            if let Some(command) = command
-                .and_then(|value| Self::percent_decode_osc_133(value, MAX_OSC_133_COMMAND_BYTES))
-            {
-                record.command = Some(command);
-                record.command_exact = true;
+            match decoded_command {
+                Some(Ok(command)) => {
+                    record.command = Some(command);
+                    record.command_exact = true;
+                }
+                Some(Err(Osc133DecodeError::TooLong)) => {
+                    // Preserve the execution row, but never expose a decoded
+                    // prefix through exact copy/fill/rerun actions.
+                    record.command = None;
+                    record.command_exact = false;
+                    record.command_truncated = true;
+                }
+                Some(Err(
+                    Osc133DecodeError::MalformedPercentEncoding | Osc133DecodeError::InvalidUtf8,
+                ))
+                | None => {}
             }
-            if let Some(cwd) = cwd.and_then(|value| Self::percent_decode_osc_133(value, 16 * 1024))
-            {
+            if let Some(Ok(cwd)) = decoded_cwd {
                 record.cwd = Some(cwd);
             }
         }
@@ -1539,6 +1567,7 @@ impl super::TerminalState {
         self.apply_record_metadata(index, id, command, cwd);
         if let Some(record) = self.command_records.get_mut(index) {
             if command_truncated {
+                record.command = None;
                 record.command_truncated = true;
                 record.command_exact = false;
             }
