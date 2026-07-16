@@ -329,7 +329,11 @@ impl TerminalApp {
             self.set_status("Command session is no longer available");
             return;
         };
-        if !self.activate_session(index) {
+        // The Commands view is built from the active tab. Re-activating that
+        // same session sets `force_resize_session`, and the resize later in
+        // this frame resets the scrollback position we are about to choose.
+        // Only switch when a stable target genuinely belongs to another tab.
+        if self.session_manager.active_index() != index && !self.activate_session(index) {
             self.set_status("Command session is no longer available");
             return;
         }

@@ -2782,6 +2782,14 @@ impl super::TerminalState {
 
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
 
+        // A forced render pass may repeat the current PTY dimensions (for
+        // example after focusing the already-active tab). Treat that as the
+        // no-op it is: clearing scroll_offset here would undo a semantic
+        // command jump performed earlier in the same frame.
+        if cols == self.grid.row_len() && rows == self.grid.rows() {
+            return;
+        }
+
         let old_rows = self.grid.rows();
         let had_full_screen_region = old_rows == 0
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);

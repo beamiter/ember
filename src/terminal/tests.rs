@@ -1467,6 +1467,35 @@ fn jump_to_prev_command_scrolls_into_history() {
 }
 
 #[test]
+fn semantic_command_jump_survives_a_noop_resize() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.process_input(b"\x1b]133;A\x07$ first\r\n\x1b]133;C;id=first;cmdline_url=first\x07");
+    terminal.process_input(b"one\r\ntwo\r\nthree\r\n\x1b]133;D;0;id=first\x07");
+    terminal.process_input(b"later-1\r\nlater-2\r\nlater-3\r\n");
+
+    let prompt = terminal
+        .command_record("first")
+        .expect("semantic command")
+        .prompt_start;
+    let target_row = terminal
+        .buffer_anchor_to_absolute(prompt)
+        .expect("prompt remains in scrollback")
+        .0;
+
+    assert!(terminal.scroll_to_command("first"));
+    assert!(terminal.scroll_offset > 0);
+    assert_eq!(terminal.viewport_row_to_absolute(0), target_row);
+    let jumped_offset = terminal.scroll_offset;
+
+    // This is the exact second half of the sidebar regression: the render
+    // pass repeats unchanged dimensions after the jump.
+    terminal.on_resize(8, 3);
+
+    assert_eq!(terminal.scroll_offset, jumped_offset);
+    assert_eq!(terminal.viewport_row_to_absolute(0), target_row);
+}
+
+#[test]
 fn jump_to_next_command_returns_to_live_view() {
     let mut terminal = TerminalState::new(8, 3);
     terminal.process_input(b"\x1b]133;A\x07a\n");
