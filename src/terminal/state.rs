@@ -1,5 +1,98 @@
 use super::*;
 
+const OUTPUT_TRUNCATION_MARKER: &str = "\n… output truncated …\n";
+
+/// Streaming UTF-8 head+tail collector. It retains the full value while it
+/// fits; only after the first overflow does it repartition into bounded head
+/// and rolling tail storage.
+struct BoundedTextBuilder {
+    max_bytes: usize,
+    total_bytes: usize,
+    head: String,
+    tail: std::collections::VecDeque<char>,
+    tail_bytes: usize,
+    tail_budget: usize,
+    marker: &'static str,
+    truncated: bool,
+}
+
+impl BoundedTextBuilder {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            total_bytes: 0,
+            head: String::with_capacity(max_bytes.min(4096)),
+            tail: std::collections::VecDeque::new(),
+            tail_bytes: 0,
+            tail_budget: 0,
+            marker: "",
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, ch: char) {
+        let ch_bytes = ch.len_utf8();
+        self.total_bytes = self.total_bytes.saturating_add(ch_bytes);
+        if !self.truncated && self.head.len().saturating_add(ch_bytes) <= self.max_bytes {
+            self.head.push(ch);
+            return;
+        }
+
+        if !self.truncated {
+            self.truncated = true;
+            self.marker = if self.max_bytes >= OUTPUT_TRUNCATION_MARKER.len() + 2 {
+                OUTPUT_TRUNCATION_MARKER
+            } else {
+                ""
+            };
+            let payload_budget = self.max_bytes.saturating_sub(self.marker.len());
+            let requested_head_bytes = payload_budget / 2;
+            let mut split = requested_head_bytes.min(self.head.len());
+            while !self.head.is_char_boundary(split) {
+                split -= 1;
+            }
+
+            let previous = std::mem::take(&mut self.head);
+            self.head.push_str(&previous[..split]);
+            self.tail_budget = self
+                .max_bytes
+                .saturating_sub(self.marker.len())
+                .saturating_sub(self.head.len());
+            for previous_ch in previous[split..].chars() {
+                self.push_tail(previous_ch);
+            }
+        }
+        self.push_tail(ch);
+    }
+
+    fn push_tail(&mut self, ch: char) {
+        let ch_bytes = ch.len_utf8();
+        while self.tail_bytes.saturating_add(ch_bytes) > self.tail_budget {
+            let Some(removed) = self.tail.pop_front() else {
+                break;
+            };
+            self.tail_bytes = self.tail_bytes.saturating_sub(removed.len_utf8());
+        }
+        if ch_bytes <= self.tail_budget {
+            self.tail.push_back(ch);
+            self.tail_bytes = self.tail_bytes.saturating_add(ch_bytes);
+        }
+    }
+
+    fn finish(mut self) -> ExtractedText {
+        if self.truncated {
+            self.head.push_str(self.marker);
+            self.head.extend(self.tail);
+        }
+        debug_assert!(self.head.len() <= self.max_bytes);
+        ExtractedText {
+            text: self.head,
+            truncated: self.truncated,
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
 impl super::TerminalState {
     /// 解析 CSI 参数字节。
     ///
@@ -207,6 +300,10 @@ impl super::TerminalState {
             pending_notifications: Vec::new(),
             total_lines_scrolled: 0,
             command_marks: VecDeque::new(),
+            command_records: VecDeque::new(),
+            next_command_sequence: 1,
+            pending_completed_command_outputs: VecDeque::new(),
+            captured_command_output_bytes: 0,
         }
     }
 
@@ -1143,13 +1240,22 @@ impl super::TerminalState {
         self.scroll_offset = 0;
     }
 
-    /// Current line id of the row the cursor is on. `line_id` is monotonic
-    /// across the session and survives scrollback eviction; it can be
-    /// translated back to a viewport/scrollback index via
-    /// [`Self::line_id_to_scrollback_index`].
-    fn current_cursor_line_id(&self) -> u64 {
-        self.total_lines_scrolled
-            .saturating_add(self.cursor_row as u64)
+    /// Current stable buffer boundary. When DEC's delayed-wrap flag is set,
+    /// the cursor is visually parked on the last cell even though the logical
+    /// boundary is after it; represent that as `column == cols` so output
+    /// extraction does not drop the final character.
+    fn current_buffer_anchor(&self) -> BufferAnchor {
+        let column = if self.pending_wrap {
+            self.grid.row_len()
+        } else {
+            self.cursor_col
+        };
+        BufferAnchor {
+            line_id: self
+                .total_lines_scrolled
+                .saturating_add(self.cursor_row as u64),
+            column,
+        }
     }
 
     /// Translate a recorded `line_id` to its current `scrollback` index, or
@@ -1188,40 +1294,673 @@ impl super::TerminalState {
         }
     }
 
-    /// Record an OSC 133;A boundary at the current cursor row. Called from
-    /// the parser when a FinalTerm-aware shell emits the prompt-start mark.
-    pub(super) fn record_prompt_start(&mut self) {
+    fn percent_decode_osc_133(value: &str, max_bytes: usize) -> Option<String> {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len().min(max_bytes));
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = if bytes[i] == b'%' {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let high = (bytes[i + 1] as char).to_digit(16)? as u8;
+                let low = (bytes[i + 2] as char).to_digit(16)? as u8;
+                i += 3;
+                (high << 4) | low
+            } else {
+                let byte = bytes[i];
+                i += 1;
+                byte
+            };
+            if decoded.len() < max_bytes {
+                decoded.push(byte);
+            }
+        }
+
+        while std::str::from_utf8(&decoded).is_err() {
+            decoded.pop()?;
+        }
+        String::from_utf8(decoded).ok()
+    }
+
+    fn valid_osc_133_id(value: &str) -> Option<String> {
+        let id = Self::percent_decode_osc_133(value, MAX_OSC_133_ID_BYTES)?;
+        if id.is_empty() || id.chars().any(char::is_control) {
+            return None;
+        }
+        Some(id)
+    }
+
+    fn local_command_id(sequence: u64) -> String {
+        format!("local:{sequence}")
+    }
+
+    fn next_command_identity(&mut self) -> (u64, String) {
+        let sequence = self.next_command_sequence;
+        self.next_command_sequence = self.next_command_sequence.saturating_add(1);
+        (sequence, Self::local_command_id(sequence))
+    }
+
+    fn record_index_for_id(&self, id: &str) -> Option<usize> {
+        self.command_records
+            .iter()
+            .rposition(|record| record.id == id)
+    }
+
+    fn active_record_index(&self) -> Option<usize> {
+        self.command_records
+            .iter()
+            .rposition(|record| !record.complete)
+    }
+
+    fn adopt_record_id(&mut self, index: usize, requested_id: Option<&str>) {
+        let Some(requested_id) = requested_id.and_then(Self::valid_osc_133_id) else {
+            return;
+        };
+        if self
+            .command_records
+            .iter()
+            .enumerate()
+            .any(|(other, record)| other != index && record.id == requested_id)
+        {
+            return;
+        }
+        if let Some(record) = self.command_records.get_mut(index) {
+            record.id = requested_id;
+        }
+    }
+
+    fn apply_record_metadata(
+        &mut self,
+        index: usize,
+        id: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) {
+        self.adopt_record_id(index, id);
+        if let Some(record) = self.command_records.get_mut(index) {
+            if let Some(command) = command
+                .and_then(|value| Self::percent_decode_osc_133(value, MAX_OSC_133_COMMAND_BYTES))
+            {
+                record.command = Some(command);
+                record.command_exact = true;
+            }
+            if let Some(cwd) = cwd.and_then(|value| Self::percent_decode_osc_133(value, 16 * 1024))
+            {
+                record.cwd = Some(cwd);
+            }
+        }
+    }
+
+    fn push_command_record(
+        &mut self,
+        anchor: BufferAnchor,
+        id: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) -> usize {
+        let (sequence, local_id) = self.next_command_identity();
+        if self.command_records.len() >= MAX_COMMAND_MARKS {
+            if let Some(evicted) = self.command_records.pop_front() {
+                self.captured_command_output_bytes =
+                    self.captured_command_output_bytes.saturating_sub(
+                        evicted
+                            .captured_output
+                            .as_ref()
+                            .map(|output| output.text.len())
+                            .unwrap_or(0),
+                    );
+            }
+        }
+        self.command_records.push_back(CommandRecord {
+            id: local_id,
+            sequence,
+            command: None,
+            command_exact: false,
+            command_truncated: false,
+            cwd: self.current_working_dir.clone(),
+            prompt_start: anchor,
+            command_start: None,
+            output_start: None,
+            output_end: None,
+            end: None,
+            exit_code: None,
+            duration_ms: None,
+            state: CommandState::Prompt,
+            complete: false,
+            started_at: None,
+            finished_at: None,
+            captured_output: None,
+            started_instant: None,
+        });
+        let index = self.command_records.len() - 1;
+        self.apply_record_metadata(index, id, command, cwd);
+        index
+    }
+
+    fn ensure_active_record(&mut self) -> usize {
+        if let Some(index) = self.active_record_index() {
+            return index;
+        }
+        let anchor = self.current_buffer_anchor();
+        if self.command_marks.len() >= MAX_COMMAND_MARKS {
+            self.command_marks.pop_front();
+        }
+        self.command_marks.push_back(CommandMark {
+            line_id: anchor.line_id,
+            exit_code: None,
+        });
+        self.push_command_record(anchor, None, None, None)
+    }
+
+    fn record_prompt_start_with_metadata(
+        &mut self,
+        id: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) {
         // Bypass the alt buffer entirely (less / vim emit no marks; if they
-        // did, they'd contaminate the main-screen history).
+        // did, they'd contaminate the primary-screen command history).
         if self.use_alt_buffer {
             return;
         }
-        let line_id = self.current_cursor_line_id();
+        let anchor = self.current_buffer_anchor();
 
-        // Coalesce: if the most recent mark is on the same row (e.g., shell
-        // sent A twice for the same prompt) just keep the latest.
-        if let Some(last) = self.command_marks.back_mut() {
-            if last.line_id == line_id {
-                last.exit_code = None;
+        // Only coalesce truly duplicated A markers. A new A on the same row
+        // after a completed zero-output command is still a distinct command.
+        if let Some(index) = self.command_records.len().checked_sub(1) {
+            let duplicate = self
+                .command_records
+                .get(index)
+                .map(|record| {
+                    !record.complete
+                        && record.state == CommandState::Prompt
+                        && record.prompt_start == anchor
+                })
+                .unwrap_or(false);
+            if duplicate {
+                self.apply_record_metadata(index, id, command, cwd);
                 return;
             }
+        }
+
+        // If a shell omitted D, preserve a closed semantic range rather than
+        // leaving an earlier record permanently "running".
+        if let Some(index) = self.active_record_index() {
+            self.finish_command_record(index, anchor, None, None);
         }
 
         if self.command_marks.len() >= MAX_COMMAND_MARKS {
             self.command_marks.pop_front();
         }
         self.command_marks.push_back(CommandMark {
-            line_id,
+            line_id: anchor.line_id,
             exit_code: None,
         });
+        self.push_command_record(anchor, id, command, cwd);
     }
 
-    /// Attach an exit code to the most recently recorded prompt mark.
-    /// Called for OSC 133;D[;<code>].
-    pub(super) fn record_command_exit(&mut self, exit_code: Option<i32>) {
-        if let Some(last) = self.command_marks.back_mut() {
-            last.exit_code = exit_code;
+    fn record_command_start(&mut self, id: Option<&str>, command: Option<&str>, cwd: Option<&str>) {
+        if self.use_alt_buffer {
+            return;
         }
+        let index = self.ensure_active_record();
+        self.apply_record_metadata(index, id, command, cwd);
+        let anchor = self.current_buffer_anchor();
+        if let Some(record) = self.command_records.get_mut(index) {
+            if matches!(record.state, CommandState::Prompt | CommandState::Editing) {
+                record.command_start.get_or_insert(anchor);
+                record.state = CommandState::Editing;
+            }
+        }
+    }
+
+    fn record_output_start(
+        &mut self,
+        id: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        command_truncated: bool,
+    ) {
+        if self.use_alt_buffer {
+            return;
+        }
+        let index = self.ensure_active_record();
+        let anchor = self.current_buffer_anchor();
+        let reconstructed = self
+            .command_records
+            .get(index)
+            .filter(|record| record.command.is_none() && command.is_none())
+            .and_then(|record| record.command_start)
+            .and_then(|start| self.extract_text_range(start, anchor, MAX_OSC_133_COMMAND_BYTES))
+            .map(|extracted| extracted.text.trim_end_matches(['\r', '\n']).to_string())
+            .filter(|command| !command.is_empty());
+
+        self.apply_record_metadata(index, id, command, cwd);
+        if let Some(record) = self.command_records.get_mut(index) {
+            if command_truncated {
+                record.command_truncated = true;
+                record.command_exact = false;
+            }
+            if record.command.is_none() && !record.command_truncated {
+                record.command = reconstructed;
+            }
+            record.output_start.get_or_insert(anchor);
+            record.state = CommandState::Running;
+            record
+                .started_at
+                .get_or_insert_with(std::time::SystemTime::now);
+            record
+                .started_instant
+                .get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    pub(super) fn store_captured_command_output(&mut self, index: usize, output: ExtractedText) {
+        let previous_bytes = self
+            .command_records
+            .get_mut(index)
+            .and_then(|record| record.captured_output.take())
+            .map(|previous| previous.text.len())
+            .unwrap_or(0);
+        self.captured_command_output_bytes = self
+            .captured_command_output_bytes
+            .saturating_sub(previous_bytes);
+
+        let output_bytes = output.text.len();
+        while self
+            .captured_command_output_bytes
+            .saturating_add(output_bytes)
+            > MAX_CAPTURED_COMMAND_OUTPUT_BYTES
+        {
+            let Some(evict_index) =
+                self.command_records
+                    .iter()
+                    .enumerate()
+                    .find_map(|(candidate, record)| {
+                        (candidate != index && record.captured_output.is_some())
+                            .then_some(candidate)
+                    })
+            else {
+                break;
+            };
+            if let Some(evicted) = self.command_records[evict_index].captured_output.take() {
+                self.captured_command_output_bytes = self
+                    .captured_command_output_bytes
+                    .saturating_sub(evicted.text.len());
+            }
+        }
+
+        if output_bytes <= MAX_CAPTURED_COMMAND_OUTPUT_BYTES {
+            self.captured_command_output_bytes = self
+                .captured_command_output_bytes
+                .saturating_add(output_bytes);
+            if let Some(record) = self.command_records.get_mut(index) {
+                record.captured_output = Some(output);
+            }
+        }
+    }
+
+    fn capture_and_queue_completed_command_output(&mut self, index: usize) {
+        let Some(record_before_capture) = self.command_records.get(index).cloned() else {
+            return;
+        };
+        let extracted = record_before_capture
+            .output_start
+            .zip(record_before_capture.output_end)
+            .and_then(|(start, end)| {
+                self.extract_text_range(start, end, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
+            });
+        let output_available = extracted.is_some();
+        if let Some(output) = extracted.as_ref() {
+            self.store_captured_command_output(index, output.clone());
+        }
+        let Some(record) = self.command_records.get(index).cloned() else {
+            return;
+        };
+        let extracted = extracted.unwrap_or_default();
+        if self.pending_completed_command_outputs.len() >= MAX_PENDING_COMPLETED_COMMANDS {
+            self.pending_completed_command_outputs.pop_front();
+        }
+        self.pending_completed_command_outputs
+            .push_back(CompletedCommandOutput {
+                id: record.id,
+                command: record.command,
+                cwd: record.cwd,
+                exit_code: record.exit_code,
+                duration_ms: record.duration_ms,
+                output: extracted.text,
+                output_available,
+                truncated: extracted.truncated,
+                total_bytes: extracted.total_bytes,
+            });
+    }
+
+    fn finish_command_record(
+        &mut self,
+        index: usize,
+        anchor: BufferAnchor,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+    ) {
+        if let Some(record) = self.command_records.get_mut(index) {
+            record.output_end = Some(anchor);
+            record.end = Some(anchor);
+            record.exit_code = exit_code;
+            record.duration_ms = duration_ms.or_else(|| {
+                record
+                    .started_instant
+                    .map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            });
+            record.state = CommandState::Complete;
+            record.complete = true;
+            record.finished_at = Some(std::time::SystemTime::now());
+            record.started_instant = None;
+        }
+        self.capture_and_queue_completed_command_output(index);
+    }
+
+    fn record_command_exit_with_metadata(
+        &mut self,
+        id: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+    ) {
+        if self.use_alt_buffer {
+            return;
+        }
+        let decoded_id = id.and_then(Self::valid_osc_133_id);
+        let by_id = decoded_id
+            .as_deref()
+            .and_then(|id| self.record_index_for_id(id))
+            .filter(|&index| {
+                self.command_records
+                    .get(index)
+                    .map(|record| !record.complete)
+                    .unwrap_or(false)
+            });
+        let index = by_id.or_else(|| self.active_record_index());
+        let Some(index) = index else {
+            return;
+        };
+        if self
+            .command_records
+            .get(index)
+            .map(|record| record.complete)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        self.apply_record_metadata(index, id, command, cwd);
+        let anchor = self.current_buffer_anchor();
+        self.finish_command_record(index, anchor, exit_code, duration_ms);
+        if let Some(mark) = self.command_marks.back_mut() {
+            mark.exit_code = exit_code;
+        }
+    }
+
+    /// Parse and apply one OSC 133 payload (the part after `133;`). Supports
+    /// FinalTerm A/B/C/D, Kitty `cmdline_url`, and rsh correlation metadata.
+    pub(super) fn handle_osc_133(&mut self, value: &str) {
+        let mut parts = value.split(';');
+        let kind = parts.next().unwrap_or("");
+        let mut id = None;
+        let mut command = None;
+        let mut cwd = None;
+        let mut exit_code = None;
+        let mut duration_ms = None;
+        let mut command_truncated = false;
+
+        for part in parts {
+            if let Some((key, value)) = part.split_once('=') {
+                match key {
+                    "id" | "rsh_id" | "execution_id" | "command_id" => id = Some(value),
+                    "cmdline_url" | "command_url" | "command" | "cmdline" => command = Some(value),
+                    "cwd" | "cwd_url" => cwd = Some(value),
+                    "exit" | "exit_code" | "exit_status" => {
+                        exit_code = value.trim().parse::<i32>().ok()
+                    }
+                    "duration" | "duration_ms" => duration_ms = value.trim().parse::<u64>().ok(),
+                    "cmd_truncated" | "command_truncated" => {
+                        command_truncated = matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    }
+                    _ => {}
+                }
+            } else if kind == "D" && exit_code.is_none() {
+                exit_code = part.trim().parse::<i32>().ok();
+            }
+        }
+
+        match kind {
+            "A" => self.record_prompt_start_with_metadata(id, command, cwd),
+            "B" => self.record_command_start(id, command, cwd),
+            "C" => self.record_output_start(id, command, cwd, command_truncated),
+            "D" => self.record_command_exit_with_metadata(id, command, cwd, exit_code, duration_ms),
+            _ => {}
+        }
+    }
+
+    /// Canonical semantic command history in execution order. Records remain
+    /// listed after their terminal rows are evicted; range extraction/jumping
+    /// then returns `None`/`false` for the unavailable anchors.
+    pub fn command_records(&self) -> &VecDeque<CommandRecord> {
+        &self.command_records
+    }
+
+    pub fn command_record(&self, id: &str) -> Option<&CommandRecord> {
+        self.record_index_for_id(id)
+            .and_then(|index| self.command_records.get(index))
+    }
+
+    /// True after B and before C. This is the safe state for placing a
+    /// command into the shell editor without racing a running foreground job.
+    pub fn shell_is_prompt_ready(&self) -> bool {
+        self.command_records
+            .back()
+            .map(|record| !record.complete && record.state == CommandState::Editing)
+            .unwrap_or(false)
+    }
+
+    pub fn take_completed_command_outputs(&mut self) -> Vec<CompletedCommandOutput> {
+        self.pending_completed_command_outputs.drain(..).collect()
+    }
+
+    /// Resolve a stable line-id anchor into the current raw terminal buffer
+    /// (`scrollback` followed by the live grid).
+    pub fn buffer_anchor_to_absolute(&self, anchor: BufferAnchor) -> Option<(usize, usize)> {
+        let first_scrollback_line_id = self
+            .total_lines_scrolled
+            .saturating_sub(self.scrollback.len() as u64);
+        let absolute_row = if anchor.line_id < self.total_lines_scrolled {
+            if anchor.line_id < first_scrollback_line_id {
+                return None;
+            }
+            (anchor.line_id - first_scrollback_line_id) as usize
+        } else {
+            let grid_row = (anchor.line_id - self.total_lines_scrolled) as usize;
+            if grid_row >= self.grid.rows() {
+                return None;
+            }
+            self.scrollback.len().saturating_add(grid_row)
+        };
+        Some((absolute_row, anchor.column))
+    }
+
+    /// Convert a current raw-buffer coordinate to a stable line-id anchor.
+    #[allow(dead_code)] // Public library surface for other jterm frontends.
+    pub fn absolute_to_buffer_anchor(&self, absolute: (usize, usize)) -> Option<BufferAnchor> {
+        let (row, column) = absolute;
+        let line_id = if row < self.scrollback.len() {
+            self.total_lines_scrolled
+                .saturating_sub(self.scrollback.len() as u64)
+                .saturating_add(row as u64)
+        } else {
+            let grid_row = row - self.scrollback.len();
+            if grid_row >= self.grid.rows() {
+                return None;
+            }
+            self.total_lines_scrolled.saturating_add(grid_row as u64)
+        };
+        Some(BufferAnchor { line_id, column })
+    }
+
+    fn absolute_row_cells(&self, absolute_row: usize) -> Option<Vec<TerminalCell>> {
+        if absolute_row < self.scrollback.len() {
+            return self
+                .scrollback
+                .get(absolute_row)
+                .map(ScrollbackLine::decompress);
+        }
+        let grid_row = absolute_row - self.scrollback.len();
+        (grid_row < self.grid.rows()).then(|| self.grid[grid_row].to_vec())
+    }
+
+    fn absolute_row_is_wrapped(&self, absolute_row: usize) -> Option<bool> {
+        if absolute_row < self.scrollback.len() {
+            return self
+                .scrollback
+                .get(absolute_row)
+                .map(|line| line.is_wrapped);
+        }
+        let grid_row = absolute_row - self.scrollback.len();
+        self.grid.row_wrapped.get(grid_row).copied()
+    }
+
+    /// Extract normalized display text from `[start, end)`. Soft-wrapped rows
+    /// are joined without a newline, hard row boundaries retain one newline,
+    /// right-padding and wide-character continuation cells are omitted, and
+    /// the returned allocation never exceeds `max_bytes`.
+    pub fn extract_text_range(
+        &self,
+        start: BufferAnchor,
+        end: BufferAnchor,
+        max_bytes: usize,
+    ) -> Option<ExtractedText> {
+        if end < start {
+            return None;
+        }
+        let (start_row, start_col) = self.buffer_anchor_to_absolute(start)?;
+        let (end_row, end_col) = self.buffer_anchor_to_absolute(end)?;
+        if end_row < start_row || (end_row == start_row && end_col < start_col) {
+            return None;
+        }
+
+        let mut extracted = BoundedTextBuilder::new(max_bytes);
+        for absolute_row in start_row..=end_row {
+            let cells = self.absolute_row_cells(absolute_row)?;
+            let row_start = if absolute_row == start_row {
+                start_col.min(cells.len())
+            } else {
+                0
+            };
+            let mut row_end = if absolute_row == end_row {
+                end_col.min(cells.len())
+            } else {
+                cells.len()
+            };
+            while row_end > row_start
+                && matches!(cells[row_end - 1].character, ' ' | '\0')
+                && !cells[row_end - 1].flags.wide_continuation()
+            {
+                row_end -= 1;
+            }
+            for cell in &cells[row_start..row_end] {
+                if !cell.flags.wide_continuation() {
+                    extracted.push(cell.character);
+                }
+            }
+
+            if absolute_row < end_row
+                && !self.absolute_row_is_wrapped(absolute_row).unwrap_or(false)
+            {
+                extracted.push('\n');
+            }
+        }
+        Some(extracted.finish())
+    }
+
+    /// Same extraction API for callers that already hold raw absolute buffer
+    /// coordinates (for example selection/search results).
+    #[allow(dead_code)] // Public library surface for other jterm frontends.
+    pub fn extract_absolute_text_range(
+        &self,
+        start: (usize, usize),
+        end: (usize, usize),
+        max_bytes: usize,
+    ) -> Option<ExtractedText> {
+        let start = self.absolute_to_buffer_anchor(start)?;
+        let end = self.absolute_to_buffer_anchor(end)?;
+        self.extract_text_range(start, end, max_bytes)
+    }
+
+    /// Extract full rows for an inclusive stable line-id range.
+    #[allow(dead_code)] // Public library surface for other jterm frontends.
+    pub fn extract_text_by_line_ids(
+        &self,
+        start_line_id: u64,
+        end_line_id: u64,
+        max_bytes: usize,
+    ) -> Option<ExtractedText> {
+        if end_line_id < start_line_id {
+            return None;
+        }
+        let end_absolute = self.buffer_anchor_to_absolute(BufferAnchor {
+            line_id: end_line_id,
+            column: 0,
+        })?;
+        let end_cells = self.absolute_row_cells(end_absolute.0)?;
+        self.extract_text_range(
+            BufferAnchor {
+                line_id: start_line_id,
+                column: 0,
+            },
+            BufferAnchor {
+                line_id: end_line_id,
+                column: end_cells.len(),
+            },
+            max_bytes,
+        )
+    }
+
+    pub fn command_output_text(&self, id: &str, max_bytes: usize) -> Option<ExtractedText> {
+        let record = self.command_record(id)?;
+        if let Some(captured) = record.captured_output.as_ref() {
+            if captured.text.len() <= max_bytes {
+                return Some(captured.clone());
+            }
+            let mut builder = BoundedTextBuilder::new(max_bytes);
+            for ch in captured.text.chars() {
+                builder.push(ch);
+            }
+            let mut recapped = builder.finish();
+            recapped.total_bytes = captured.total_bytes;
+            recapped.truncated = true;
+            return Some(recapped);
+        }
+        let start = record.output_start?;
+        let end = record
+            .output_end
+            .unwrap_or_else(|| self.current_buffer_anchor());
+        self.extract_text_range(start, end, max_bytes)
+    }
+
+    /// Scroll directly to a semantic command by id.
+    pub fn scroll_to_command(&mut self, id: &str) -> bool {
+        if self.use_alt_buffer {
+            return false;
+        }
+        let Some(anchor) = self.command_record(id).map(|record| record.prompt_start) else {
+            return false;
+        };
+        if self.buffer_anchor_to_absolute(anchor).is_none() {
+            return false;
+        }
+        self.scroll_to_line_id(anchor.line_id)
     }
 
     /// Scroll the viewport so the row at `line_id` lands at the top of

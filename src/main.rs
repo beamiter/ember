@@ -7,6 +7,7 @@ mod config;
 mod config_panel;
 mod debug;
 mod debug_panel;
+mod execution_journal;
 mod gpu;
 mod help;
 mod history_persistence;
@@ -700,7 +701,7 @@ fn paste_text_into_session(
     Ok(true)
 }
 
-fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
+pub(crate) fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
     // 安全:剔除 payload 内嵌的粘贴结束序列 ESC[201~,否则恶意剪贴板可
     // 提前结束粘贴模式并注入随后被 shell 执行的命令(bracketed-paste 注入)。
     let end = b"\x1b[201~";
@@ -1473,9 +1474,18 @@ impl TerminalApp {
             sidebar: {
                 let mut sb = sidebar::Sidebar::new();
                 sb.visible = false; // 默认隐藏，opt-in 切换
-                sb.view = cfg.sidebar_view; // 恢复上次记住的视图(默认会话)
+
+                // Top 模式没有 Sessions 视图；Commands 与 Files 在两种布局下都可用。
+                sb.view = if matches!(cfg.tab_bar_position, config::TabBarPosition::Top)
+                    && cfg.sidebar_view == sidebar::SidebarView::Sessions
+                {
+                    sidebar::SidebarView::Files
+                } else {
+                    cfg.sidebar_view
+                };
                 sb
             },
+            command_sidebar: Default::default(),
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
@@ -1607,8 +1617,10 @@ impl TerminalApp {
             config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
         };
         if matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
-            // 切回顶部模式时把侧边栏视图复位到文件视图，避免停留在 Sessions
-            self.sidebar.view = sidebar::SidebarView::Files;
+            // Top 模式不提供 Sessions；Commands/Files 保持用户当前选择。
+            if self.sidebar.view == sidebar::SidebarView::Sessions {
+                self.sidebar.view = sidebar::SidebarView::Files;
+            }
         } else {
             // 标签移入侧边栏：恢复上次记住的视图并确保侧边栏可见，否则标签不可达
             self.sidebar.view = self.config.sidebar_view;
@@ -1629,12 +1641,12 @@ impl TerminalApp {
             return;
         }
 
-        // 侧边栏 tab 模式：允许在「会话」与「文件」视图间切换；其余模式锁定为文件视图
+        // Sessions 只属于侧边栏 tab 模式；Files/Commands 在两种布局下都可用。
         let sidebar_tab_mode = matches!(
             self.config.tab_bar_position,
             config::TabBarPosition::Sidebar
         );
-        if !sidebar_tab_mode {
+        if !sidebar_tab_mode && self.sidebar.view == sidebar::SidebarView::Sessions {
             self.sidebar.view = sidebar::SidebarView::Files;
         }
 
@@ -1653,7 +1665,6 @@ impl TerminalApp {
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     if sidebar_tab_mode {
-                        // 分区切换：会话 / 文件
                         if ui
                             .selectable_label(
                                 self.sidebar.view == sidebar::SidebarView::Sessions,
@@ -1664,18 +1675,28 @@ impl TerminalApp {
                             self.sidebar.view = sidebar::SidebarView::Sessions;
                             view_changed = true;
                         }
-                        if ui
-                            .selectable_label(
-                                self.sidebar.view == sidebar::SidebarView::Files,
-                                egui::RichText::new("Files").strong(),
-                            )
-                            .clicked()
-                        {
-                            self.sidebar.view = sidebar::SidebarView::Files;
-                            view_changed = true;
-                        }
-                    } else {
-                        ui.label(egui::RichText::new("Files").strong());
+                    }
+                    if ui
+                        .selectable_label(
+                            self.sidebar.view == sidebar::SidebarView::Files,
+                            egui::RichText::new("Files").strong(),
+                        )
+                        .clicked()
+                    {
+                        self.sidebar.view = sidebar::SidebarView::Files;
+                        view_changed = true;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.sidebar.view == sidebar::SidebarView::Commands,
+                            egui::RichText::new("Commands").strong(),
+                        )
+                        .clicked()
+                    {
+                        self.sidebar.view = sidebar::SidebarView::Commands;
+                        view_changed = true;
+                    }
+                    if self.sidebar.view == sidebar::SidebarView::Files {
                         if ui.button("⟳").on_hover_text("Refresh").clicked() {
                             do_refresh = true;
                         }
@@ -1683,35 +1704,38 @@ impl TerminalApp {
                 });
                 ui.separator();
 
-                if self.sidebar.view == sidebar::SidebarView::Sessions {
-                    self.render_sidebar_sessions(ui);
-                } else {
-                    if let Some(dir) = self
-                        .sidebar
-                        .current_dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                    {
-                        ui.label(egui::RichText::new(dir).weak().small());
-                    }
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if let Some(root) = &self.sidebar.root {
-                            for child in &root.children {
-                                Self::draw_tree_node(
-                                    ui,
-                                    child,
-                                    &self.sidebar.selected_path,
-                                    &mut toggle_path,
-                                    &mut select_path,
-                                    &mut cd_path,
-                                );
-                            }
+                match self.sidebar.view {
+                    sidebar::SidebarView::Sessions => self.render_sidebar_sessions(ui),
+                    sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
+                    sidebar::SidebarView::Files => {
+                        if let Some(dir) = self
+                            .sidebar
+                            .current_dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                        {
+                            ui.label(egui::RichText::new(dir).weak().small());
                         }
-                    });
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if let Some(root) = &self.sidebar.root {
+                                for child in &root.children {
+                                    Self::draw_tree_node(
+                                        ui,
+                                        child,
+                                        &self.sidebar.selected_path,
+                                        &mut toggle_path,
+                                        &mut select_path,
+                                        &mut cd_path,
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             });
 
         // 闭包结束，安全 mutate
+        self.execute_pending_command_sidebar_action();
         if let Some(p) = toggle_path {
             self.sidebar.toggle_node(&p);
         }
@@ -1732,7 +1756,7 @@ impl TerminalApp {
             self.sidebar.refresh();
         }
         if view_changed {
-            // 记住用户在侧边栏 tab 模式下选择的视图，下次默认沿用
+            // 记住用户选择的视图，下次默认沿用。
             self.config.sidebar_view = self.sidebar.view;
             self.schedule_config_save();
         }
@@ -1955,6 +1979,11 @@ impl eframe::App for TerminalApp {
             &visible_sessions,
             user_input_barrier_session_id.as_deref(),
         );
+        for (_session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
+            if let Err(error) = execution_journal::submit(completed) {
+                log::warn!("rsh execution output journal queue rejected an event: {error:?}");
+            }
+        }
         for (session_idx, error) in background_pump.errors.drain(..) {
             log::warn!("background session {}: {}", session_idx + 1, error);
         }
@@ -2604,10 +2633,19 @@ impl eframe::App for TerminalApp {
                 let mut terminal = session.terminal.lock();
                 terminal.process_batch(&accumulated_data);
                 terminal.check_sync_output_timeout();
+                let completed_outputs = terminal.take_completed_command_outputs();
                 // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
                 // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
                 // 有输出时更新最后活动时间
                 self.last_activity_time = std::time::Instant::now();
+                drop(terminal);
+                for completed in completed_outputs {
+                    if let Err(error) = execution_journal::submit(completed) {
+                        log::warn!(
+                            "rsh execution output journal queue rejected an event: {error:?}"
+                        );
+                    }
+                }
             }
         }
 
@@ -3504,6 +3542,13 @@ impl Drop for TerminalApp {
                     eprintln!("[SessionPersistence] Failed to save sessions: {}", e);
                 }
             }
+        }
+
+        // A completed command's rendered output is written off the UI thread.
+        // Give already accepted snapshots a bounded chance to reach the shared
+        // rsh journal before process teardown terminates that worker.
+        if !execution_journal::flush(Duration::from_secs(2)) {
+            log::warn!("timed out flushing rsh execution output journal");
         }
     }
 }

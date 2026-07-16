@@ -1,5 +1,6 @@
 // Application core module - main app state and coordination
 
+pub mod commands;
 pub mod events;
 pub mod input;
 pub mod rendering;

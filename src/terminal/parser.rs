@@ -421,22 +421,10 @@ impl super::TerminalState {
                                             //   B           prompt end / command line begins
                                             //   C           command output begins
                                             //   D[;<exit>]  command finished, optional exit code
-                                            // We only act on A (record a mark) and D (attach
-                                            // the exit code). B/C are accepted but ignored.
-                                            let mut parts = value.split(';');
-                                            let kind = parts.next().unwrap_or("");
-                                            match kind {
-                                                "A" => {
-                                                    self.record_prompt_start();
-                                                }
-                                                "D" => {
-                                                    let exit = parts
-                                                        .next()
-                                                        .and_then(|s| s.trim().parse::<i32>().ok());
-                                                    self.record_command_exit(exit);
-                                                }
-                                                _ => {}
-                                            }
+                                            // Parameters are parsed centrally so C can carry
+                                            // Kitty's `cmdline_url` and rsh can correlate all
+                                            // phases with `rsh_id`/`id`.
+                                            self.handle_osc_133(value);
                                         } else if command == "5522" {
                                             let (metadata, osc_payload) =
                                                 if let Some((metadata, osc_payload)) =

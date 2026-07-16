@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// 侧边栏内容视图:文件树 或 会话列表(仅在 tab 栏位于侧边栏模式时可切换)
+/// 侧边栏内容视图。命令时间线在两种 tab 栏布局下都可用；会话列表仅在
+/// tab 栏位于侧边栏模式时可选。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarView {
     #[default]
     Files,
     Sessions,
+    Commands,
 }
 
 /// 文件树节点
@@ -28,7 +30,7 @@ pub struct Sidebar {
     pub current_dir: PathBuf,
     pub root: Option<FileTreeNode>,
     pub selected_path: Option<PathBuf>,
-    /// 当前侧边栏视图(侧边栏 tab 模式下用于在会话/文件间切换)
+    /// 当前侧边栏视图。
     pub view: SidebarView,
 }
 

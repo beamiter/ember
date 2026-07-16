@@ -1,5 +1,6 @@
 // Application state management
 
+use super::commands::CommandSidebarState;
 use super::events::PasteKeyState;
 use crate::clipboard::ClipboardManager;
 use crate::command_palette;
@@ -126,6 +127,9 @@ pub struct TerminalApp {
 
     // File-tree sidebar
     pub sidebar: sidebar::Sidebar,
+
+    // Semantic command timeline sidebar
+    pub command_sidebar: CommandSidebarState,
 
     // Find & Replace (operates on selection)
     pub search_replace_panel: search_replace_panel::SearchReplacePanel,

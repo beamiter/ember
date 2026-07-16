@@ -72,10 +72,15 @@ const MAX_OSC_5522_MIME_LEN: usize = 256;
 
 type VisibleCellsCache = (u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>);
 
-/// Hard cap on tracked OSC 133 command marks. Each mark is a few u64s, so
-/// 1024 ≈ 32 KiB; well beyond any reasonable session's prompt count, but
-/// bounded so a malicious shell can't grow this without limit.
+/// Hard cap on tracked OSC 133 command records. Protocol strings are bounded
+/// separately, so even an untrusted process attached to the PTY cannot grow
+/// terminal state without limit.
 pub const MAX_COMMAND_MARKS: usize = 1024;
+const MAX_OSC_133_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_OSC_133_ID_BYTES: usize = 256;
+const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
+pub const MAX_COMPLETED_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_CAPTURED_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// One entry recorded by an OSC 133-aware shell. `line_id` is the monotonic
 /// id of the row where the prompt began; we resolve it to a current
@@ -88,6 +93,84 @@ pub struct CommandMark {
     pub line_id: u64,
     /// Exit code reported by `OSC 133;D;<n>`. None until the command exits.
     pub exit_code: Option<i32>,
+}
+
+/// Stable terminal-buffer coordinate used by semantic command records.
+///
+/// `line_id` is monotonic for the lifetime of the primary screen. Unlike a
+/// scrollback index it does not change when old scrollback rows are evicted.
+/// An anchor can nevertheless become unavailable once its row is evicted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BufferAnchor {
+    pub line_id: u64,
+    pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandState {
+    Prompt,
+    Editing,
+    Running,
+    Complete,
+}
+
+/// A complete OSC 133 A/B/C/D lifecycle. The legacy [`CommandMark`] list is
+/// retained for source compatibility, while this is the canonical semantic
+/// representation used by command-history UI and AI context capture.
+#[derive(Clone, Debug)]
+pub struct CommandRecord {
+    /// Shell supplied `rsh_id`/`id`, or a terminal-local stable fallback.
+    pub id: String,
+    pub sequence: u64,
+    /// Exact command supplied as `cmdline_url`, when available. For generic
+    /// shells this may be reconstructed from the final displayed input.
+    pub command: Option<String>,
+    /// True only when the shell supplied exact command metadata. Screen
+    /// reconstruction is useful for display, but must not authorize rerun.
+    pub command_exact: bool,
+    /// The producer explicitly omitted or shortened an oversized command.
+    pub command_truncated: bool,
+    pub cwd: Option<String>,
+    pub prompt_start: BufferAnchor,
+    pub command_start: Option<BufferAnchor>,
+    pub output_start: Option<BufferAnchor>,
+    pub output_end: Option<BufferAnchor>,
+    pub end: Option<BufferAnchor>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub state: CommandState,
+    pub complete: bool,
+    pub started_at: Option<std::time::SystemTime>,
+    pub finished_at: Option<std::time::SystemTime>,
+    /// Bounded normalized output captured at D. This survives scrollback
+    /// eviction; `truncated`/`total_bytes` describe the original range.
+    pub captured_output: Option<ExtractedText>,
+    started_instant: Option<std::time::Instant>,
+}
+
+/// Plain-text terminal extraction with explicit capacity/truncation metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtractedText {
+    pub text: String,
+    pub truncated: bool,
+    /// UTF-8 byte length the normalized text would have without the cap.
+    pub total_bytes: usize,
+}
+
+/// Completed-command event drained by the app/session pump. Capturing happens
+/// at OSC 133;D while the output anchors are still likely to be retained; file
+/// IO and journal persistence intentionally stay outside `TerminalState`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedCommandOutput {
+    pub id: String,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub output: String,
+    pub output_available: bool,
+    pub truncated: bool,
+    pub total_bytes: usize,
 }
 
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
@@ -344,4 +427,9 @@ pub struct TerminalState {
     /// capped at `MAX_COMMAND_MARKS`. Marks pointing to lines that have been
     /// evicted from scrollback are pruned lazily during navigation.
     pub command_marks: VecDeque<CommandMark>,
+
+    command_records: VecDeque<CommandRecord>,
+    next_command_sequence: u64,
+    pending_completed_command_outputs: VecDeque<CompletedCommandOutput>,
+    captured_command_output_bytes: usize,
 }

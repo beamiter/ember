@@ -14,7 +14,8 @@ claimed.
 - Tabs, drag-to-reorder, rename, activity indicators and session restore
 - Two-pane horizontal or vertical splits with independent terminal grids
 - Unicode width handling, combining characters, ligatures and font fallback
-- Search, match navigation, selection-aware replace and command marks (OSC 133)
+- Search, match navigation, selection-aware replace, and a continuous-grid
+  [semantic command timeline](docs/rsh-semantic-executions.md) (OSC 133)
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols

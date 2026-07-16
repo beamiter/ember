@@ -1,7 +1,9 @@
 use crate::session::Session;
 use crate::session_persistence;
 use crate::shell::{ShellEvent, ShellSession, ShellWriteError};
-use crate::terminal::{clamp_terminal_dimensions, ClipboardReadRequest, TerminalState};
+use crate::terminal::{
+    clamp_terminal_dimensions, ClipboardReadRequest, CompletedCommandOutput, TerminalState,
+};
 use eframe::egui;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use std::collections::VecDeque;
@@ -316,6 +318,9 @@ pub struct BackgroundPumpResult {
     pub osc52_writes: Vec<(usize, String)>,
     pub osc52_queries: Vec<usize>,
     pub notifications: Vec<(usize, String, String)>,
+    /// Completed OSC 133 output snapshots. The caller forwards these to the
+    /// asynchronous journal writer after all terminal locks have been dropped.
+    pub completed_command_outputs: Vec<(usize, CompletedCommandOutput)>,
 }
 
 /// Retry one session's UI-accepted input as a single shell-writer message.
@@ -521,6 +526,12 @@ impl SessionManager {
             for (title, body) in terminal.pending_notifications.drain(..) {
                 result.notifications.push((session_idx, title, body));
             }
+            result.completed_command_outputs.extend(
+                terminal
+                    .take_completed_command_outputs()
+                    .into_iter()
+                    .map(|completed| (session_idx, completed)),
+            );
             drop(terminal);
             if let Err(error) = protocol_responses.flush(&session.shell) {
                 if !error.is_backpressure() {

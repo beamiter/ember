@@ -1,5 +1,6 @@
 use super::{
-    ClipboardReadKind, ClipboardReadRequest, Color, TerminalState, UnderlineStyle,
+    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, TerminalState,
+    UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
     MAX_PENDING_ESCAPE,
 };
 
@@ -1214,6 +1215,232 @@ fn osc_133_d_without_exit_code_leaves_none() {
 
     assert_eq!(terminal.command_marks.len(), 1);
     assert_eq!(terminal.command_marks[0].exit_code, None);
+}
+
+#[test]
+fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
+    let mut terminal = TerminalState::new(16, 5);
+
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;rsh_id=exec-7\x07");
+    assert!(terminal.shell_is_prompt_ready());
+    terminal.process_input(b"echo hi\r\n");
+    terminal.process_input(b"\x1b]133;C;rsh_id=exec-7;cmdline_url=echo%20hi;cwd=%2Ftmp\x07");
+    assert!(!terminal.shell_is_prompt_ready());
+    terminal.process_input(b"hello\r\n");
+    terminal.process_input(b"\x1b]133;D;0;rsh_id=exec-7;duration_ms=12\x07");
+
+    let records = terminal.command_records();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.id, "exec-7");
+    assert_eq!(record.command.as_deref(), Some("echo hi"));
+    assert!(record.command_exact);
+    assert!(!record.command_truncated);
+    assert_eq!(record.cwd.as_deref(), Some("/tmp"));
+    assert_eq!(record.exit_code, Some(0));
+    assert_eq!(record.duration_ms, Some(12));
+    assert_eq!(record.state, CommandState::Complete);
+    assert!(record.complete);
+    assert_eq!(record.prompt_start.column, 0);
+    assert_eq!(record.command_start.expect("B anchor").column, 2);
+    assert!(record.output_start.is_some());
+    assert_eq!(record.output_end, record.end);
+
+    let output = terminal
+        .command_output_text("exec-7", 1024)
+        .expect("retained command output");
+    assert_eq!(output.text, "hello\n");
+    assert!(!output.truncated);
+    assert_eq!(output.total_bytes, output.text.len());
+
+    let completed = terminal.take_completed_command_outputs();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, "exec-7");
+    assert_eq!(completed[0].output, "hello\n");
+    assert!(completed[0].output_available);
+    assert!(terminal.take_completed_command_outputs().is_empty());
+}
+
+#[test]
+fn osc_133_truncated_command_is_never_reconstructed_as_exact() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07displayed editor text\r\n");
+    terminal.process_input(b"\x1b]133;C;id=large;cmd_truncated=1;cwd_url=%2Ftmp\x07");
+    terminal.process_input(b"output\x1b]133;D;0;id=large\x07");
+
+    let record = terminal.command_record("large").expect("semantic record");
+    assert!(record.command.is_none());
+    assert!(!record.command_exact);
+    assert!(record.command_truncated);
+    assert_eq!(record.cwd.as_deref(), Some("/tmp"));
+}
+
+#[test]
+fn osc_133_decodes_kitty_command_and_percent_encoded_rsh_id() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07");
+    terminal.process_input(b"shown command\r\n");
+    terminal.process_input(b"\x1b]133;C;rsh_id=rsh%3A42;cmdline_url=printf%20%27a%3Bb%2Bc%27\x07");
+    terminal.process_input(b"a;b+c\x1b]133;D;exit_status=3;rsh_id=rsh%3A42\x07");
+
+    let record = terminal.command_record("rsh:42").expect("decoded id");
+    assert_eq!(record.command.as_deref(), Some("printf 'a;b+c'"));
+    assert_eq!(record.exit_code, Some(3));
+    assert_eq!(
+        terminal
+            .command_output_text("rsh:42", 1024)
+            .expect("output")
+            .text,
+        "a;b+c"
+    );
+}
+
+#[test]
+fn command_output_joins_soft_wraps_and_skips_wide_continuations() {
+    let mut terminal = TerminalState::new(4, 4);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=wide\x07");
+    terminal.process_input("ab界c".as_bytes());
+    terminal.process_input(b"\x1b]133;D;0;rsh_id=wide\x07");
+
+    let output = terminal
+        .command_output_text("wide", 1024)
+        .expect("wide output");
+    assert_eq!(output.text, "ab界c");
+    assert_eq!(output.total_bytes, "ab界c".len());
+}
+
+#[test]
+fn bounded_command_output_keeps_utf8_safe_head_and_tail() {
+    let mut terminal = TerminalState::new(32, 3);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=bounded\x07");
+    terminal.process_input("甲乙丙丁戊己".as_bytes());
+    terminal.process_input(b"\x1b]133;D;1;rsh_id=bounded\x07");
+
+    let output = terminal
+        .command_output_text("bounded", 12)
+        .expect("bounded output");
+    assert_eq!(output.text, "甲乙戊己");
+    assert!(output.truncated);
+    assert_eq!(output.total_bytes, "甲乙丙丁戊己".len());
+    assert!(output.text.len() <= 12);
+}
+
+#[test]
+fn anchor_and_absolute_range_apis_preserve_soft_wrap_semantics() {
+    let mut terminal = TerminalState::new(4, 3);
+    terminal.process_input(b"abcde");
+
+    let absolute = terminal
+        .extract_absolute_text_range((0, 0), (1, 1), 1024)
+        .expect("absolute range");
+    assert_eq!(absolute.text, "abcde");
+
+    let start = terminal.absolute_to_buffer_anchor((0, 0)).unwrap();
+    let end = terminal.absolute_to_buffer_anchor((1, 1)).unwrap();
+    assert_eq!(terminal.buffer_anchor_to_absolute(start), Some((0, 0)));
+    assert_eq!(terminal.buffer_anchor_to_absolute(end), Some((1, 1)));
+    assert_eq!(
+        terminal
+            .extract_text_range(start, end, 1024)
+            .expect("line-id anchors")
+            .text,
+        "abcde"
+    );
+    assert_eq!(
+        terminal
+            .extract_text_by_line_ids(start.line_id, end.line_id, 1024)
+            .expect("inclusive line-id range")
+            .text,
+        "abcde"
+    );
+}
+
+#[test]
+fn command_record_survives_output_eviction_but_anchors_report_unavailable() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.set_max_scrollback(1);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=evicted\x07");
+    terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+    terminal.process_input(b"\x1b]133;D;0;rsh_id=evicted\x07");
+
+    assert!(terminal.command_record("evicted").is_some());
+    assert!(terminal.command_output_text("evicted", 1024).is_none());
+    assert!(!terminal.scroll_to_command("evicted"));
+    let completed = terminal.take_completed_command_outputs();
+    assert_eq!(completed.len(), 1);
+    assert!(!completed[0].output_available);
+}
+
+#[test]
+fn completed_snapshot_keeps_output_after_later_scrollback_eviction() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.set_max_scrollback(1);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=kept\x07");
+    terminal.process_input(b"kept\r\n");
+    terminal.process_input(b"\x1b]133;D;0;rsh_id=kept\x07");
+    assert_eq!(
+        terminal
+            .command_output_text("kept", 1024)
+            .expect("captured at D")
+            .text,
+        "kept\n"
+    );
+
+    terminal.process_input(b"later1\r\nlater2\r\nlater3\r\n");
+    let prompt = terminal.command_record("kept").unwrap().prompt_start;
+    assert!(terminal.buffer_anchor_to_absolute(prompt).is_none());
+    assert_eq!(
+        terminal
+            .command_output_text("kept", 1024)
+            .expect("snapshot survives eviction")
+            .text,
+        "kept\n"
+    );
+}
+
+#[test]
+fn captured_output_cache_evicts_oldest_payloads_at_session_cap() {
+    let mut terminal = TerminalState::new(8, 2);
+    for sequence in 0..65 {
+        let lifecycle = format!(
+            "\x1b]133;A\x07\x1b]133;C;rsh_id=cache-{sequence}\x07\x1b]133;D;0;rsh_id=cache-{sequence}\x07"
+        );
+        terminal.process_input(lifecycle.as_bytes());
+        let index = terminal.command_records().len() - 1;
+        terminal.store_captured_command_output(
+            index,
+            ExtractedText {
+                text: "x".repeat(MAX_COMPLETED_COMMAND_OUTPUT_BYTES),
+                truncated: false,
+                total_bytes: MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
+            },
+        );
+    }
+
+    assert!(terminal.captured_command_output_bytes <= MAX_CAPTURED_COMMAND_OUTPUT_BYTES);
+    assert!(terminal
+        .command_record("cache-0")
+        .expect("metadata retained")
+        .captured_output
+        .is_none());
+    assert!(terminal
+        .command_record("cache-64")
+        .expect("newest record")
+        .captured_output
+        .is_some());
+}
+
+#[test]
+fn prompt_ready_requires_b_and_ends_at_c() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.process_input(b"\x1b]133;A\x07");
+    assert!(!terminal.shell_is_prompt_ready());
+    terminal.process_input(b"$ \x1b]133;B\x07");
+    assert!(terminal.shell_is_prompt_ready());
+    terminal.process_input(b"cmd\r\n\x1b]133;C\x07");
+    assert!(!terminal.shell_is_prompt_ready());
+    terminal.process_input(b"\x1b]133;D;0\x07");
+    assert!(!terminal.shell_is_prompt_ready());
 }
 
 #[test]
