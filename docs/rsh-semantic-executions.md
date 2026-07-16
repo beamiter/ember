@@ -94,14 +94,13 @@ bounded rendered-output preview. Preview allocations are capped independently
 of the full 256 KiB copy/context snapshot, and the timeline follows new rows
 only while the user remains at its live end.
 
-When the sidebar first targets a tab, jterm reads that session's persisted
-records on a bounded background worker under the journal's shared advisory
-lock and merges them by execution ID. Live terminal records win duplicate IDs.
-Restored rows remain copyable and exact commands may use the same guarded Fill
-or Run actions, but Jump is disabled because an earlier process has no live
-scrollback position. Malformed, oversized, future-version, other-session, and
-orphan events are ignored using the same limits as rsh; at most the newest
-2,000 executions are retained in the sidebar cache.
+The sidebar contains only in-memory semantic records owned by the focused tab;
+switching tabs replaces the list with that tab's command history. It never
+creates rows solely from persisted records left by an earlier process. jterm
+may read that session's journal on a bounded background worker and merge exact
+metadata or captured output into a matching in-memory execution ID, but the
+merge cannot change the row count. Malformed, oversized, future-version,
+other-session, and orphan events are ignored using the same limits as rsh.
 
 Fill and rerun require all of the following:
 

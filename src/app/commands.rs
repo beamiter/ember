@@ -8,8 +8,8 @@ use super::state::TerminalApp;
 use crate::execution_journal::{self, HistoryLoad, HistoryRequestError, PersistedExecution};
 use crate::terminal::{CommandState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 const COMMAND_DETAIL_COMMAND_BYTES: usize = 8 * 1024;
 const COMMAND_DETAIL_OUTPUT_BYTES: usize = 16 * 1024;
@@ -55,8 +55,6 @@ struct CommandRowSnapshot {
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     started_at: Option<SystemTime>,
-    sort_started_at_ms: u64,
-    live_position: bool,
     output_copy_available: bool,
 }
 
@@ -182,9 +180,6 @@ impl TerminalApp {
                         exit_code: record.exit_code,
                         duration_ms: record.duration_ms,
                         started_at: record.started_at,
-                        sort_started_at_ms: system_time_to_unix_ms(record.started_at)
-                            .unwrap_or(record.sequence),
-                        live_position: true,
                         output_copy_available,
                     })
                 })
@@ -240,83 +235,28 @@ impl TerminalApp {
         };
 
         self.sync_command_sidebar_history(&session_id, ui.ctx());
-        let history_by_id = self
-            .command_sidebar
-            .history
-            .iter()
-            .map(|record| (record.id.as_str(), record))
-            .collect::<HashMap<_, _>>();
-        let live_ids = rows
-            .iter()
-            .map(|row| row.target.execution_id.clone())
-            .collect::<HashSet<_>>();
-        for row in &mut rows {
-            if let Some(record) = history_by_id.get(row.target.execution_id.as_str()) {
-                enrich_live_row_from_history(row, record);
-            }
-        }
-        let mut restored_rows = 0usize;
-        for record in &self.command_sidebar.history {
-            if !live_ids.contains(&record.id) {
-                if let Some(row) = persisted_command_row(&session_id, record) {
-                    rows.push(row);
-                    restored_rows += 1;
-                }
-            }
-        }
-        let selected_history = selected_before
-            .as_ref()
-            .filter(|target| target.session_id == session_id)
-            .and_then(|target| {
-                history_by_id
-                    .get(target.execution_id.as_str())
-                    .copied()
-                    .map(|record| (target, record))
-            });
-        let selected_detail = match (live_selected_detail, selected_history) {
-            (Some(mut detail), Some((_, record))) => {
+        enrich_current_tab_rows_from_history(&mut rows, &self.command_sidebar.history);
+        let selected_detail = live_selected_detail.map(|mut detail| {
+            if let Some(record) = self
+                .command_sidebar
+                .history
+                .iter()
+                .find(|record| record.id == detail.target.execution_id)
+            {
                 enrich_live_detail_from_history(&mut detail, record);
-                Some(detail)
             }
-            (Some(detail), None) => Some(detail),
-            (None, Some((target, record))) => Some(persisted_command_detail(target, record)),
-            (None, None) => None,
-        };
-        rows.sort_by(|left, right| {
-            (
-                left.sort_started_at_ms,
-                left.sequence,
-                &left.target.execution_id,
-            )
-                .cmp(&(
-                    right.sort_started_at_ms,
-                    right.sequence,
-                    &right.target.execution_id,
-                ))
+            detail
         });
+        rows.sort_by_key(|row| row.sequence);
 
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(session_title)
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                )
-                .truncate(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(egui::RichText::new("↻").small()).small())
-                    .on_hover_text("Reload persisted rsh history")
-                    .clicked()
-                {
-                    self.command_sidebar.history_loaded = false;
-                    self.command_sidebar.history_load = None;
-                    self.command_sidebar.history_error = None;
-                    ui.ctx().request_repaint();
-                }
-            });
-        });
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(session_title)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .truncate(),
+        );
         ui.add_space(3.0);
 
         ui.horizontal(|ui| {
@@ -369,32 +309,16 @@ impl TerminalApp {
             .iter()
             .filter(|row| command_row_matches(row, &query, self.command_sidebar.filter))
             .collect::<Vec<_>>();
-        let mut count_label = if query.is_empty() {
+        let count_label = if query.is_empty() {
             format!("{} commands", visible_rows.len())
         } else {
             format!("{} of {} commands", visible_rows.len(), rows.len())
         };
-        if restored_rows > 0 {
-            count_label.push_str(&format!(" · {restored_rows} restored"));
-        }
         ui.label(
             egui::RichText::new(count_label)
                 .small()
                 .color(ui.visuals().weak_text_color()),
         );
-        if self.command_sidebar.history_load.is_some() {
-            ui.label(
-                egui::RichText::new("Loading persisted history…")
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
-        } else if let Some(error) = self.command_sidebar.history_error.as_deref() {
-            ui.label(
-                egui::RichText::new(format!("Persisted history unavailable: {error}"))
-                    .small()
-                    .color(ui.visuals().warn_fg_color),
-            );
-        }
         ui.add_space(2.0);
 
         let mut action = None;
@@ -460,15 +384,10 @@ impl TerminalApp {
                             &row.target.session_id,
                             &row.target.execution_id,
                         ));
-                        let interaction_hint = if row.live_position {
-                            "Click to jump · Right-click for actions"
-                        } else {
-                            "Click for details · Restored from the rsh journal"
-                        };
                         let response = ui
                             .interact(frame.response.rect, row_id, egui::Sense::click())
                             .on_hover_text(format!(
-                                "{}\n\n{interaction_hint}",
+                                "{}\n\nClick to jump · Right-click for actions",
                                 row.command_preview
                             ));
                         if response.hovered() {
@@ -476,12 +395,10 @@ impl TerminalApp {
                         }
                         if response.clicked() {
                             self.command_sidebar.selected = Some(row.target.clone());
-                            if row.live_position {
-                                action = Some(CommandAction {
-                                    target: row.target.clone(),
-                                    kind: CommandActionKind::Jump,
-                                });
-                            }
+                            action = Some(CommandAction {
+                                target: row.target.clone(),
+                                kind: CommandActionKind::Jump,
+                            });
                         }
                         response.context_menu(|ui| {
                             command_menu_item(
@@ -551,8 +468,7 @@ impl TerminalApp {
         let selected_missing = selected_before
             .as_ref()
             .is_some_and(|target| target.session_id == session_id)
-            && selected_detail.is_none()
-            && self.command_sidebar.history_loaded;
+            && selected_detail.is_none();
         if clear_selection || selected_missing {
             self.command_sidebar.selected = None;
         }
@@ -905,45 +821,22 @@ enum CopyKind {
     Combined,
 }
 
-fn persisted_command_row(
-    session_id: &str,
-    record: &PersistedExecution,
-) -> Option<CommandRowSnapshot> {
-    let command = record.command.trim();
-    let display = if command.is_empty() {
-        record
-            .command_truncated
-            .then_some("(command omitted: exceeds journal limit)")?
-    } else {
-        command
-    };
-    let state = if record.exit_code.is_some() {
-        CommandState::Complete
-    } else {
-        CommandState::Running
-    };
-    Some(CommandRowSnapshot {
-        target: CommandTarget {
-            session_id: session_id.to_owned(),
-            execution_id: record.id.clone(),
-        },
-        sequence: record.seq,
-        command_summary: single_line_command_preview(display, 160),
-        command_preview: single_line_command_preview(display, 512),
-        command_exact: !record.command_truncated && !command.is_empty(),
-        command_multiline: replay_command_is_multiline(&record.command),
-        cwd: (!record.cwd.is_empty()).then(|| single_line_command_preview(&record.cwd, 256)),
-        state,
-        exit_code: record.exit_code,
-        duration_ms: record.duration_ms,
-        started_at: unix_ms_to_system_time(record.started_at_ms),
-        sort_started_at_ms: record.started_at_ms,
-        live_position: false,
-        output_copy_available: record
-            .output
-            .as_ref()
-            .is_some_and(|output| !output.text.is_empty()),
-    })
+/// Persisted metadata may fill gaps in a command that already belongs to the
+/// active tab, but it must never create a sidebar row on its own. A slice
+/// makes that row-count invariant explicit.
+fn enrich_current_tab_rows_from_history(
+    rows: &mut [CommandRowSnapshot],
+    history: &[PersistedExecution],
+) {
+    let history_by_id = history
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect::<HashMap<_, _>>();
+    for row in rows {
+        if let Some(record) = history_by_id.get(row.target.execution_id.as_str()) {
+            enrich_live_row_from_history(row, record);
+        }
+    }
 }
 
 fn enrich_live_row_from_history(row: &mut CommandRowSnapshot, record: &PersistedExecution) {
@@ -962,46 +855,6 @@ fn enrich_live_row_from_history(row: &mut CommandRowSnapshot, record: &Persisted
         .output
         .as_ref()
         .is_some_and(|output| !output.text.is_empty());
-}
-
-fn persisted_command_detail(
-    target: &CommandTarget,
-    record: &PersistedExecution,
-) -> CommandDetailSnapshot {
-    let command = (!record.command.is_empty()).then(|| {
-        detail_text_snapshot(
-            &record.command,
-            record.command_truncated,
-            record.command.len(),
-            COMMAND_DETAIL_COMMAND_BYTES,
-        )
-    });
-    let output = record.output.as_ref().map(|output| {
-        detail_text_snapshot(
-            &output.text,
-            output.truncated,
-            usize::try_from(output.total_bytes).unwrap_or(usize::MAX),
-            COMMAND_DETAIL_OUTPUT_BYTES,
-        )
-    });
-    CommandDetailSnapshot {
-        target: target.clone(),
-        command,
-        command_exact: !record.command_truncated && !record.command.is_empty(),
-        command_omitted: record.command_truncated && record.command.is_empty(),
-        output_copy_available: record
-            .output
-            .as_ref()
-            .is_some_and(|output| !output.text.is_empty()),
-        output,
-        state: if record.exit_code.is_some() {
-            CommandState::Complete
-        } else {
-            CommandState::Running
-        },
-        command_from_history: true,
-        output_from_history: true,
-    }
 }
 
 fn enrich_live_detail_from_history(
@@ -1034,19 +887,6 @@ fn enrich_live_detail_from_history(
         .output
         .as_ref()
         .is_some_and(|output| !output.text.is_empty());
-}
-
-fn system_time_to_unix_ms(time: Option<SystemTime>) -> Option<u64> {
-    let millis = time?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis()
-        .min(u128::from(u64::MAX));
-    Some(millis as u64)
-}
-
-fn unix_ms_to_system_time(millis: u64) -> Option<SystemTime> {
-    UNIX_EPOCH.checked_add(Duration::from_millis(millis))
 }
 
 fn command_menu_item(
@@ -1196,9 +1036,7 @@ fn render_command_detail(
                     row,
                     "Jump",
                     CommandActionKind::Jump,
-                    (!row.live_position).then_some(
-                        "This restored command no longer has a live scrollback position",
-                    ),
+                    None,
                 );
                 command_detail_action_button(
                     ui,
@@ -1291,15 +1129,6 @@ fn render_command_detail(
                         .color(ui.visuals().weak_text_color()),
                     );
                 }
-                (CommandState::Running, _) if detail.output_from_history => {
-                    ui.label(
-                        egui::RichText::new(
-                            "Persisted execution has no finish event; it is not treated as currently running.",
-                        )
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                    );
-                }
                 (CommandState::Running, _) => {
                     ui.label(
                         egui::RichText::new("Command is running; output is captured on completion.")
@@ -1346,7 +1175,7 @@ fn command_row_matches(row: &CommandRowSnapshot, query: &str, filter: CommandFil
         CommandFilter::Failed => {
             row.state == CommandState::Complete && row.exit_code.is_some_and(|code| code != 0)
         }
-        CommandFilter::Running => row.live_position && row.state == CommandState::Running,
+        CommandFilter::Running => row.state == CommandState::Running,
     };
     matches_filter
         && (query.is_empty()
@@ -1361,11 +1190,6 @@ fn command_status(row: &CommandRowSnapshot) -> (&'static str, egui::Color32, &'s
     match row.state {
         CommandState::Prompt => ("○", egui::Color32::from_rgb(90, 160, 240), "Prompt"),
         CommandState::Editing => ("●", egui::Color32::from_rgb(90, 160, 240), "Editing"),
-        CommandState::Running if !row.live_position => (
-            "◌",
-            egui::Color32::from_rgb(190, 145, 70),
-            "Unfinished persisted execution",
-        ),
         CommandState::Running => ("●", egui::Color32::from_rgb(230, 175, 60), "Running"),
         CommandState::Complete if row.exit_code == Some(0) => {
             ("✓", egui::Color32::from_rgb(70, 190, 115), "Succeeded")
@@ -1378,10 +1202,7 @@ fn command_status(row: &CommandRowSnapshot) -> (&'static str, egui::Color32, &'s
 }
 
 fn command_metadata(row: &CommandRowSnapshot) -> String {
-    let mut parts = Vec::with_capacity(5);
-    if !row.live_position {
-        parts.push("history".to_owned());
-    }
+    let mut parts = Vec::with_capacity(4);
     if let Some(cwd) = row.cwd.as_deref() {
         parts.push(abbreviate_home(cwd));
     }
@@ -1581,8 +1402,6 @@ mod tests {
             exit_code: Some(0),
             duration_ms: None,
             started_at: None,
-            sort_started_at_ms: 0,
-            live_position: true,
             output_copy_available: false,
         }
     }
@@ -1696,47 +1515,20 @@ mod tests {
     }
 
     #[test]
-    fn persisted_rows_keep_exact_actions_but_not_live_jump_positions() {
-        let record = persisted_test_record();
-        let row = persisted_command_row("session", &record).unwrap();
-        let detail = persisted_command_detail(&row.target, &record);
+    fn journal_only_records_never_create_current_tab_rows() {
+        let mut matching_record = persisted_test_record();
+        matching_record.id = "execution".to_owned();
+        let unmatched_record = persisted_test_record();
+        let mut rows = vec![replay_test_row(false, false)];
+        rows[0].command_summary = "(command omitted)".to_owned();
+        rows[0].command_preview = rows[0].command_summary.clone();
 
-        assert!(row.command_exact);
-        assert!(!row.live_position);
-        assert!(row.output_copy_available);
-        assert_eq!(row.state, CommandState::Complete);
-        assert!(detail.command_from_history);
-        assert!(detail.output_from_history);
-        assert!(detail.command_exact);
-        assert_eq!(detail.output.unwrap().text, "hi");
-    }
+        enrich_current_tab_rows_from_history(&mut rows, &[unmatched_record, matching_record]);
 
-    #[test]
-    fn journal_metadata_enriches_an_inexact_live_row() {
-        let record = persisted_test_record();
-        let mut row = replay_test_row(false, false);
-        row.command_summary = "(command omitted)".to_owned();
-        row.command_preview = row.command_summary.clone();
-
-        enrich_live_row_from_history(&mut row, &record);
-
-        assert!(row.live_position);
-        assert!(row.command_exact);
-        assert_eq!(row.command_summary, "printf hi");
-        assert!(row.output_copy_available);
-    }
-
-    #[test]
-    fn unfinished_history_is_not_reported_as_currently_running() {
-        let mut record = persisted_test_record();
-        record.exit_code = None;
-        record.duration_ms = None;
-        record.ended_at_ms = None;
-        let row = persisted_command_row("session", &record).unwrap();
-
-        assert_eq!(row.state, CommandState::Running);
-        assert!(!command_row_matches(&row, "", CommandFilter::Running));
-        assert!(command_row_matches(&row, "", CommandFilter::All));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].command_exact);
+        assert_eq!(rows[0].command_summary, "printf hi");
+        assert!(rows[0].output_copy_available);
     }
 
     #[test]
