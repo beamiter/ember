@@ -134,7 +134,7 @@ Defaults include:
 | Action | Binding |
 | --- | --- |
 | New session | `Ctrl+Shift+T` |
-| Close focused pane or session | `Ctrl+Shift+W` |
+| Close focused pane and its session | `Ctrl+Shift+W` |
 | Next / previous session | `Ctrl+Tab` / `Ctrl+Shift+Tab` (`Ctrl+PageDown` / `Ctrl+PageUp`) |
 | Sessions 1–8 / last session | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
 | Last active session | `Ctrl+\`` |

@@ -255,7 +255,7 @@ impl CommandPalette {
             CommandInfo::new(
                 "Close Pane",
                 CommandCategory::Terminal,
-                "Close the focused pane",
+                "Close the focused pane and its shell session",
                 crate::keybindings::Command::TerminalClosePane,
             ),
             CommandInfo::new(

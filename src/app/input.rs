@@ -283,19 +283,7 @@ impl TerminalApp {
             }
             keybindings::Command::TerminalSplitVertical => self.split_terminal(false),
             keybindings::Command::TerminalSplitHorizontal => self.split_terminal(true),
-            keybindings::Command::TerminalClosePane => {
-                if let Err(error) = self.layout_manager.close_focused_pane() {
-                    if self.session_manager.len() > 1 {
-                        let active_idx = self.session_manager.active_index();
-                        self.close_session_synced(active_idx);
-                        self.schedule_session_save();
-                    } else {
-                        self.set_status(error);
-                    }
-                } else {
-                    self.sync_active_session_to_focused_pane();
-                }
-            }
+            keybindings::Command::TerminalClosePane => self.close_focused_pane_or_session(),
             keybindings::Command::PaneFocusNext => {
                 if !self.layout_manager.focus_pane(layout::PaneDirection::Next) {
                     self.set_status("Only one pane is open");
@@ -490,6 +478,41 @@ impl TerminalApp {
         const RESIZE_STEP: f32 = 0.05;
         if !self.layout_manager.resize_split(direction, RESIZE_STEP) {
             self.set_status(format!("Cannot resize pane {label}"));
+        }
+    }
+
+    /// 关闭 pane 时同时关闭它拥有的 shell session。旧行为只从布局中摘掉
+    /// pane，却把 PTY 留成隐藏 tab，既泄漏后台进程，也让 split 看起来像
+    /// 在拼接已有 session。
+    fn close_focused_pane_or_session(&mut self) {
+        if self.layout_manager.panes().len() > 1 {
+            let Some(closing_session_idx) = self.layout_manager.focused_session_idx() else {
+                self.set_status("No focused pane to close");
+                return;
+            };
+            if let Err(error) = self.layout_manager.close_focused_pane() {
+                self.set_status(error);
+                return;
+            }
+
+            // 先激活折叠后留下的 pane，再删除原 session。这样 SessionManager
+            // 删除索引时会继续跟踪同一个 PTY，close_session_synced 也只需做
+            // 常规的索引平移，不会用隐藏 tab 替换当前可见 pane。
+            self.sync_active_session_to_focused_pane();
+            if self.close_session_synced(closing_session_idx) {
+                self.set_status("Closed pane and session");
+                self.schedule_session_save();
+            }
+            return;
+        }
+
+        if self.session_manager.len() > 1 {
+            let active_idx = self.session_manager.active_index();
+            if self.close_session_synced(active_idx) {
+                self.schedule_session_save();
+            }
+        } else {
+            self.set_status("Cannot close the last pane");
         }
     }
 

@@ -171,27 +171,107 @@ impl TerminalApp {
                 }
             }
 
-            // 绘制全部递归分割线。
+            // 用主题强调色标出当前输入 pane。边框画在终端内容之后，确保
+            // GPU/Glow 两条渲染路径下都不会被背景覆盖。
             let painter = ui.painter();
+            if let Some(focused_pane) = panes.iter().find(|pane| pane.focused) {
+                painter.rect_stroke(
+                    focused_pane.rect.shrink(1.0),
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(
+                        1.5,
+                        crate::theme::Theme::rgb_to_color32(
+                            self.current_theme.tabbar.active_border,
+                        ),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            // 给分隔线注册真正的交互控件。它们晚于 terminal response 注册，
+            // 因此双击/拖动不会穿透到相邻终端触发选词或鼠标协议。
+            let divider_interactions: Vec<(layout::SplitDivider, egui::Response)> = divider_rects
+                .iter()
+                .map(|divider| {
+                    let cursor = match divider.axis {
+                        layout::SplitAxis::Vertical => egui::CursorIcon::ResizeHorizontal,
+                        layout::SplitAxis::Horizontal => egui::CursorIcon::ResizeVertical,
+                    };
+                    let response = ui
+                        .interact(
+                            divider.rect,
+                            ui.id().with(("terminal-split-divider", divider.id.0)),
+                            egui::Sense::click_and_drag(),
+                        )
+                        .on_hover_cursor(cursor)
+                        .on_hover_text("Drag to resize · double-click to reset");
+                    (*divider, response)
+                })
+                .collect();
+            let hovered_divider = divider_interactions
+                .iter()
+                .find(|(_, response)| response.hovered())
+                .map(|(divider, _)| *divider);
+            let active_divider = self.dragging_divider.and_then(|split_id| {
+                divider_rects
+                    .iter()
+                    .find(|divider| divider.id == split_id)
+                    .copied()
+            });
+            if let Some(divider) = active_divider.or(hovered_divider) {
+                ctx.set_cursor_icon(match divider.axis {
+                    layout::SplitAxis::Vertical => egui::CursorIcon::ResizeHorizontal,
+                    layout::SplitAxis::Horizontal => egui::CursorIcon::ResizeVertical,
+                });
+            }
+
+            // 命中区域为 10px，但只画细线；hover/drag 时加粗并使用强调色。
             for divider in &divider_rects {
-                let divider_color = if self.dragging_divider == Some(divider.id) {
+                let highlighted = self.dragging_divider == Some(divider.id)
+                    || hovered_divider.is_some_and(|hovered| hovered.id == divider.id);
+                let divider_color = if highlighted {
                     crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border)
                 } else {
                     crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border)
                 };
-                painter.rect_filled(divider.rect, 0.0, divider_color);
+                let stroke = egui::Stroke::new(if highlighted { 2.0 } else { 1.0 }, divider_color);
+                let center = divider.rect.center();
+                match divider.axis {
+                    layout::SplitAxis::Vertical => {
+                        painter.vline(
+                            center.x,
+                            divider.container_rect.top()..=divider.container_rect.bottom(),
+                            stroke,
+                        );
+                    }
+                    layout::SplitAxis::Horizontal => {
+                        painter.hline(
+                            divider.container_rect.left()..=divider.container_rect.right(),
+                            center.y,
+                            stroke,
+                        );
+                    }
+                }
             }
 
-            // 按下时锁定最深层分隔线，拖动时直接按该分割区域计算比例。
-            if interaction_enabled
-                && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
-            {
-                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    self.dragging_divider = self
-                        .layout_manager
-                        .divider_at(pos)
-                        .map(|divider| divider.id);
-                }
+            // 双击恢复 50/50；普通按下则锁定最深层分隔线，拖出命中区域后
+            // 仍继续调整同一个 split。
+            let double_clicked_divider = interaction_enabled.then(|| {
+                divider_interactions
+                    .iter()
+                    .find(|(_, response)| response.double_clicked_by(egui::PointerButton::Primary))
+                    .map(|(divider, _)| *divider)
+            });
+            if let Some(divider) = double_clicked_divider.flatten() {
+                self.layout_manager.set_split_ratio(divider.id, 0.5);
+                self.dragging_divider = None;
+                self.set_status("Reset split to 50/50");
+                ctx.request_repaint();
+            } else if interaction_enabled && self.dragging_divider.is_none() {
+                self.dragging_divider = divider_interactions
+                    .iter()
+                    .find(|(_, response)| response.is_pointer_button_down_on())
+                    .map(|(divider, _)| divider.id);
             }
 
             if interaction_enabled {

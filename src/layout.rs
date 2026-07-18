@@ -71,6 +71,8 @@ pub struct LayoutManager {
 impl LayoutManager {
     const MIN_SPLIT_RATIO: f32 = 0.1;
     const MAX_SPLIT_RATIO: f32 = 0.9;
+    /// 分隔线视觉上保持轻量，但命中区域需要足够宽，避免高 DPI 下难以抓取。
+    const DIVIDER_HIT_HALF_WIDTH: f32 = 5.0;
 
     /// 创建单窗格布局
     pub fn new(session_idx: usize) -> Self {
@@ -638,12 +640,24 @@ impl LayoutManager {
         let (first_rect, second_rect) = Self::split_rect(container, *axis, *ratio);
         let rect = match axis {
             SplitAxis::Vertical => Rect::from_min_max(
-                egui::pos2(first_rect.right() - 2.0, container.top()),
-                egui::pos2(first_rect.right() + 2.0, container.bottom()),
+                egui::pos2(
+                    first_rect.right() - Self::DIVIDER_HIT_HALF_WIDTH,
+                    container.top(),
+                ),
+                egui::pos2(
+                    first_rect.right() + Self::DIVIDER_HIT_HALF_WIDTH,
+                    container.bottom(),
+                ),
             ),
             SplitAxis::Horizontal => Rect::from_min_max(
-                egui::pos2(container.left(), first_rect.bottom() - 2.0),
-                egui::pos2(container.right(), first_rect.bottom() + 2.0),
+                egui::pos2(
+                    container.left(),
+                    first_rect.bottom() - Self::DIVIDER_HIT_HALF_WIDTH,
+                ),
+                egui::pos2(
+                    container.right(),
+                    first_rect.bottom() + Self::DIVIDER_HIT_HALF_WIDTH,
+                ),
             ),
         };
         out.push(SplitDivider {
@@ -759,6 +773,21 @@ mod tests {
             .panes
             .iter()
             .all(|pane| pane.rect.height() == test_rect().height()));
+    }
+
+    #[test]
+    fn closing_pane_then_session_removal_keeps_remaining_focus_and_indices() {
+        let mut layout = LayoutManager::new(1);
+        layout.split(3, false).unwrap();
+        assert!(layout.focus_pane(PaneDirection::Left));
+
+        layout.close_focused_pane().unwrap();
+        assert_eq!(layout.focused_session_idx(), Some(3));
+
+        // Session 1 is removed; the remaining session shifts from 3 to 2.
+        layout.on_session_removed(1, 2);
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.focused_session_idx(), Some(2));
     }
 
     #[test]
