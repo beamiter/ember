@@ -1,5 +1,42 @@
 use serde::{Deserialize, Serialize};
 
+fn default_split_ratio() -> f32 {
+    0.5
+}
+
+/// 持久化布局只引用稳定 session ID，不保存运行期的 session 数组索引。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutSnapshot {
+    pub root: LayoutNodeSnapshot,
+    #[serde(default)]
+    pub focused_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayoutNodeSnapshot {
+    Pane {
+        session_id: String,
+    },
+    Split {
+        horizontal: bool,
+        #[serde(default = "default_split_ratio")]
+        ratio: f32,
+        first: Box<LayoutNodeSnapshot>,
+        second: Box<LayoutNodeSnapshot>,
+    },
+}
+
+/// 布局损坏不应连带丢失整个 session 列表。先读为 Value，再单独尝试解析；
+/// 失败时退化成 `None`，启动端会恢复为单 pane。
+fn deserialize_optional_layout<'de, D>(deserializer: D) -> Result<Option<LayoutSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 /// 会话持久化数据结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -21,15 +58,22 @@ pub struct SessionsSnapshot {
     pub sessions: Vec<SessionSnapshot>,
     #[serde(default)]
     pub active_index: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_layout")]
+    pub layout: Option<LayoutSnapshot>,
 }
 
 impl SessionsSnapshot {
     /// 从会话快照列表创建
-    pub fn from_snapshots(sessions: Vec<SessionSnapshot>, active_index: Option<usize>) -> Self {
+    pub fn from_snapshots(
+        sessions: Vec<SessionSnapshot>,
+        active_index: Option<usize>,
+        layout: Option<LayoutSnapshot>,
+    ) -> Self {
         SessionsSnapshot {
-            version: 2,
+            version: 3,
             sessions,
             active_index,
+            layout,
         }
     }
 
@@ -68,9 +112,10 @@ impl SessionsSnapshot {
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         if !path.exists() {
             return Ok(SessionsSnapshot {
-                version: 2,
+                version: 3,
                 sessions: vec![],
                 active_index: None,
+                layout: None,
             });
         }
 
@@ -151,11 +196,30 @@ mod tests {
             },
         ];
 
-        let snapshot = SessionsSnapshot::from_snapshots(snapshots, Some(1));
+        let layout = LayoutSnapshot {
+            root: LayoutNodeSnapshot::Split {
+                horizontal: false,
+                ratio: 0.6,
+                first: Box::new(LayoutNodeSnapshot::Pane {
+                    session_id: "123-456".to_string(),
+                }),
+                second: Box::new(LayoutNodeSnapshot::Pane {
+                    session_id: "second-session".to_string(),
+                }),
+            },
+            focused_session_id: Some("second-session".to_string()),
+        };
+        let snapshot = SessionsSnapshot::from_snapshots(snapshots, Some(1), Some(layout.clone()));
         assert_eq!(snapshot.sessions.len(), 2);
         assert_eq!(snapshot.sessions[0].cwd, Some("/home/user".to_string()));
         assert_eq!(snapshot.sessions[1].cwd, Some("/tmp".to_string()));
         assert_eq!(snapshot.active_index, Some(1));
+        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.layout, Some(layout.clone()));
+
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: SessionsSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.layout, Some(layout));
     }
 
     #[test]
@@ -165,5 +229,20 @@ mod tests {
         let snapshot: SessionsSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snapshot.sessions[0].session_id, None);
         assert_eq!(snapshot.active_index, None);
+        assert_eq!(snapshot.layout, None);
+    }
+
+    #[test]
+    fn malformed_layout_does_not_prevent_session_restore() {
+        let json = r#"{
+            "version": 3,
+            "sessions": [{"name": "Session 1", "tags": []}],
+            "active_index": 0,
+            "layout": {"root": {"kind": "unknown"}}
+        }"#;
+        let snapshot: SessionsSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.active_index, Some(0));
+        assert_eq!(snapshot.layout, None);
     }
 }

@@ -1340,6 +1340,9 @@ impl TerminalApp {
             .filter(|id| session::is_valid_rsh_session_id(id))
             .unwrap_or_else(session::generate_session_id);
         let saved_active_index = saved_snapshot.as_ref().and_then(|s| s.active_index);
+        let saved_layout = saved_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.layout.clone());
         let terminal = TerminalState::new(cols, rows);
 
         let configured_shell = std::env::var("JTERM2_SHELL").ok().or(cfg.shell.clone());
@@ -1422,9 +1425,28 @@ impl TerminalApp {
         renderer.gpu_rendering = cfg.gpu_rendering;
         renderer.wgpu_render_state = wgpu_render_state.clone();
 
-        // 恢复会话后从真正的活跃 tab 初始化布局，避免首次分屏时把旧的
-        // Session 1 错当成当前窗格内容。
-        let layout_manager = layout::LayoutManager::new(session_manager.active_index());
+        // 布局引用稳定 session ID，因此某个 shell 恢复失败时可以只折叠
+        // 对应分支；旧版/损坏快照则从真正的活跃 session 回退到单 pane。
+        let restored_session_ids: Vec<String> = session_manager
+            .sessions()
+            .iter()
+            .map(|session| session.metadata.session_id.clone())
+            .collect();
+        let mut layout_manager = saved_layout
+            .as_ref()
+            .map(|snapshot| {
+                layout::LayoutManager::from_snapshot(
+                    snapshot,
+                    &restored_session_ids,
+                    session_manager.active_index(),
+                )
+            })
+            .unwrap_or_else(|| layout::LayoutManager::new(session_manager.active_index()));
+        if let Some(focused_idx) = layout_manager.focused_session_idx() {
+            session_manager.switch_session(focused_idx);
+        } else {
+            layout_manager.show_session(session_manager.active_index());
+        }
 
         // Create additional renderers for multi-pane support (start with empty)
         let mut pane_renderers = Vec::new();
@@ -3540,10 +3562,7 @@ impl Drop for TerminalApp {
             if let Ok(session_history_path) = self.config.resolved_session_history_path() {
                 let _ = session_persistence::ensure_session_history_dir(&session_history_path);
 
-                let snapshots = self.session_manager.get_session_snapshots();
-                let active_index = Some(self.session_manager.active_index());
-                let snapshot =
-                    session_persistence::SessionsSnapshot::from_snapshots(snapshots, active_index);
+                let snapshot = self.current_sessions_snapshot();
                 if let Err(e) = snapshot.save(&session_history_path) {
                     eprintln!("[SessionPersistence] Failed to save sessions: {}", e);
                 }

@@ -1,4 +1,5 @@
 use egui::Rect;
+use std::collections::{HashMap, HashSet};
 
 /// 窗格 ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,6 +72,7 @@ pub struct LayoutManager {
 impl LayoutManager {
     const MIN_SPLIT_RATIO: f32 = 0.1;
     const MAX_SPLIT_RATIO: f32 = 0.9;
+    const MAX_RESTORED_LAYOUT_DEPTH: usize = 64;
     /// 分隔线视觉上保持轻量，但命中区域需要足够宽，避免高 DPI 下难以抓取。
     const DIVIDER_HIT_HALF_WIDTH: f32 = 5.0;
 
@@ -84,6 +86,185 @@ impl LayoutManager {
             split_counter: 0,
             root: Some(LayoutNode::Pane(PaneId(0))),
             last_container_rect: Rect::ZERO,
+        }
+    }
+
+    /// 将运行期 PaneId/session_idx 布局转换成稳定 session ID 快照。
+    pub fn to_snapshot(
+        &self,
+        session_ids: &[String],
+    ) -> Option<crate::session_persistence::LayoutSnapshot> {
+        let root = Self::snapshot_node(self.root.as_ref()?, &self.panes, session_ids)?;
+        let focused_session_id = self
+            .focused_session_idx()
+            .and_then(|idx| session_ids.get(idx))
+            .cloned();
+        Some(crate::session_persistence::LayoutSnapshot {
+            root,
+            focused_session_id,
+        })
+    }
+
+    fn snapshot_node(
+        node: &LayoutNode,
+        panes: &[Pane],
+        session_ids: &[String],
+    ) -> Option<crate::session_persistence::LayoutNodeSnapshot> {
+        match node {
+            LayoutNode::Pane(pane_id) => {
+                let session_idx = panes.iter().find(|pane| pane.id == *pane_id)?.session_idx;
+                Some(crate::session_persistence::LayoutNodeSnapshot::Pane {
+                    session_id: session_ids.get(session_idx)?.clone(),
+                })
+            }
+            LayoutNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+                ..
+            } => Some(crate::session_persistence::LayoutNodeSnapshot::Split {
+                horizontal: *axis == SplitAxis::Horizontal,
+                ratio: *ratio,
+                first: Box::new(Self::snapshot_node(first, panes, session_ids)?),
+                second: Box::new(Self::snapshot_node(second, panes, session_ids)?),
+            }),
+        }
+    }
+
+    /// 从稳定 session ID 快照恢复布局。缺失/重复 session 的叶子会被移除，
+    /// 父 split 自动折叠；整个布局无效时安全退回 `fallback_session_idx`。
+    pub fn from_snapshot(
+        snapshot: &crate::session_persistence::LayoutSnapshot,
+        session_ids: &[String],
+        fallback_session_idx: usize,
+    ) -> Self {
+        let session_indices: HashMap<&str, usize> = session_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, id)| (id.as_str(), idx))
+            .collect();
+        let mut used_sessions = HashSet::new();
+        let mut panes = Vec::new();
+        let mut next_pane_id = 0;
+        let mut next_split_id = 0;
+        let root = Self::restore_node(
+            &snapshot.root,
+            &session_indices,
+            &mut used_sessions,
+            &mut panes,
+            &mut next_pane_id,
+            &mut next_split_id,
+            0,
+        );
+
+        let Some(root) = root else {
+            return Self::new(fallback_session_idx);
+        };
+        let focused_pane_id = snapshot
+            .focused_session_id
+            .as_deref()
+            .and_then(|focused_id| session_indices.get(focused_id))
+            .and_then(|focused_idx| {
+                panes
+                    .iter()
+                    .find(|pane| pane.session_idx == *focused_idx)
+                    .map(|pane| pane.id)
+            })
+            .or_else(|| {
+                panes
+                    .iter()
+                    .find(|pane| pane.session_idx == fallback_session_idx)
+                    .map(|pane| pane.id)
+            })
+            .or_else(|| panes.first().map(|pane| pane.id))
+            .expect("restored layout root has no pane");
+
+        let mut layout = LayoutManager {
+            panes,
+            focused_pane_id,
+            pane_counter: next_pane_id,
+            split_counter: next_split_id,
+            root: Some(root),
+            last_container_rect: Rect::ZERO,
+        };
+        layout.update_focus_flags();
+        layout
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_node(
+        snapshot: &crate::session_persistence::LayoutNodeSnapshot,
+        session_indices: &HashMap<&str, usize>,
+        used_sessions: &mut HashSet<usize>,
+        panes: &mut Vec<Pane>,
+        next_pane_id: &mut usize,
+        next_split_id: &mut usize,
+        depth: usize,
+    ) -> Option<LayoutNode> {
+        if depth > Self::MAX_RESTORED_LAYOUT_DEPTH {
+            return None;
+        }
+        match snapshot {
+            crate::session_persistence::LayoutNodeSnapshot::Pane { session_id } => {
+                let session_idx = *session_indices.get(session_id.as_str())?;
+                if !used_sessions.insert(session_idx) {
+                    return None;
+                }
+                let pane_id = PaneId(*next_pane_id);
+                *next_pane_id += 1;
+                panes.push(Pane::new(pane_id, session_idx));
+                Some(LayoutNode::Pane(pane_id))
+            }
+            crate::session_persistence::LayoutNodeSnapshot::Split {
+                horizontal,
+                ratio,
+                first,
+                second,
+            } => {
+                let first = Self::restore_node(
+                    first,
+                    session_indices,
+                    used_sessions,
+                    panes,
+                    next_pane_id,
+                    next_split_id,
+                    depth + 1,
+                );
+                let second = Self::restore_node(
+                    second,
+                    session_indices,
+                    used_sessions,
+                    panes,
+                    next_pane_id,
+                    next_split_id,
+                    depth + 1,
+                );
+                match (first, second) {
+                    (Some(first), Some(second)) => {
+                        let split_id = SplitId(*next_split_id);
+                        *next_split_id += 1;
+                        let ratio = if ratio.is_finite() {
+                            ratio.clamp(Self::MIN_SPLIT_RATIO, Self::MAX_SPLIT_RATIO)
+                        } else {
+                            0.5
+                        };
+                        Some(LayoutNode::Split {
+                            id: split_id,
+                            axis: if *horizontal {
+                                SplitAxis::Horizontal
+                            } else {
+                                SplitAxis::Vertical
+                            },
+                            ratio,
+                            first: Box::new(first),
+                            second: Box::new(second),
+                        })
+                    }
+                    (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+                    (None, None) => None,
+                }
+            }
         }
     }
 
@@ -717,6 +898,85 @@ mod tests {
         assert_eq!(layout.focused_session_idx(), Some(2));
         assert_eq!(layout.panes[0].session_idx, 2);
         assert_eq!(layout.panes[1].session_idx, 1);
+    }
+
+    #[test]
+    fn nested_layout_round_trip_preserves_geometry_and_focus_by_session_id() {
+        let session_ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, true).unwrap();
+        layout.set_split_ratio(SplitId(0), 0.65);
+        layout.set_split_ratio(SplitId(1), 0.3);
+        layout.compute_pane_rects(test_rect());
+        let before: Vec<(usize, Rect)> = layout
+            .panes()
+            .iter()
+            .map(|pane| (pane.session_idx, pane.rect))
+            .collect();
+
+        let snapshot = layout.to_snapshot(&session_ids).unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded = serde_json::from_str(&encoded).unwrap();
+        let mut restored = LayoutManager::from_snapshot(&decoded, &session_ids, 0);
+        restored.compute_pane_rects(test_rect());
+        let after: Vec<(usize, Rect)> = restored
+            .panes()
+            .iter()
+            .map(|pane| (pane.session_idx, pane.rect))
+            .collect();
+
+        assert_eq!(after, before);
+        assert_eq!(restored.focused_session_idx(), Some(2));
+    }
+
+    #[test]
+    fn restore_prunes_missing_and_duplicate_sessions_and_collapses_splits() {
+        use crate::session_persistence::{LayoutNodeSnapshot, LayoutSnapshot};
+
+        let snapshot = LayoutSnapshot {
+            root: LayoutNodeSnapshot::Split {
+                horizontal: false,
+                ratio: f32::NAN,
+                first: Box::new(LayoutNodeSnapshot::Pane {
+                    session_id: "alpha".to_string(),
+                }),
+                second: Box::new(LayoutNodeSnapshot::Split {
+                    horizontal: true,
+                    ratio: 0.75,
+                    first: Box::new(LayoutNodeSnapshot::Pane {
+                        session_id: "missing".to_string(),
+                    }),
+                    second: Box::new(LayoutNodeSnapshot::Pane {
+                        session_id: "alpha".to_string(),
+                    }),
+                }),
+            },
+            focused_session_id: Some("missing".to_string()),
+        };
+        let session_ids = vec!["alpha".to_string(), "beta".to_string()];
+        let restored = LayoutManager::from_snapshot(&snapshot, &session_ids, 1);
+
+        assert_eq!(restored.panes().len(), 1);
+        assert_eq!(restored.focused_session_idx(), Some(0));
+        assert!(restored.get_divider_rects().is_empty());
+    }
+
+    #[test]
+    fn entirely_unrestorable_layout_falls_back_to_active_session() {
+        use crate::session_persistence::{LayoutNodeSnapshot, LayoutSnapshot};
+
+        let snapshot = LayoutSnapshot {
+            root: LayoutNodeSnapshot::Pane {
+                session_id: "gone".to_string(),
+            },
+            focused_session_id: Some("gone".to_string()),
+        };
+        let session_ids = vec!["alpha".to_string(), "beta".to_string()];
+        let restored = LayoutManager::from_snapshot(&snapshot, &session_ids, 1);
+
+        assert_eq!(restored.panes().len(), 1);
+        assert_eq!(restored.focused_session_idx(), Some(1));
     }
 
     #[test]

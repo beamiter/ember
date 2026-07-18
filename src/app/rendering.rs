@@ -263,7 +263,9 @@ impl TerminalApp {
                     .map(|(divider, _)| *divider)
             });
             if let Some(divider) = double_clicked_divider.flatten() {
-                self.layout_manager.set_split_ratio(divider.id, 0.5);
+                if self.layout_manager.set_split_ratio(divider.id, 0.5) {
+                    self.schedule_session_save();
+                }
                 self.dragging_divider = None;
                 self.set_status("Reset split to 50/50");
                 ctx.request_repaint();
@@ -290,7 +292,9 @@ impl TerminalApp {
                                         / divider.container_rect.height().max(1.0)
                                 }
                             };
-                            self.layout_manager.set_split_ratio(split_id, ratio);
+                            if self.layout_manager.set_split_ratio(split_id, ratio) {
+                                self.schedule_session_save();
+                            }
                         }
                     }
                 }

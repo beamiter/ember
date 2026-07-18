@@ -31,6 +31,22 @@ impl TerminalApp {
         self.session_save_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     }
 
+    pub(crate) fn current_sessions_snapshot(&self) -> session_persistence::SessionsSnapshot {
+        let snapshots = self.session_manager.get_session_snapshots();
+        let session_ids: Vec<String> = self
+            .session_manager
+            .sessions()
+            .iter()
+            .map(|session| session.metadata.session_id.clone())
+            .collect();
+        let layout = self.layout_manager.to_snapshot(&session_ids);
+        session_persistence::SessionsSnapshot::from_snapshots(
+            snapshots,
+            Some(self.session_manager.active_index()),
+            layout,
+        )
+    }
+
     /// 即时持久化命令面板最近命令 + 搜索历史。两者都很小,无需 debounce。
     /// 写盘失败只记日志,不影响交互(下次启动顶多丢一次新增项)。
     pub fn save_ui_history(&self) {
@@ -57,10 +73,7 @@ impl TerminalApp {
             }
             if let Ok(path) = self.config.resolved_session_history_path() {
                 let _ = session_persistence::ensure_session_history_dir(&path);
-                let snapshots = self.session_manager.get_session_snapshots();
-                let active_index = Some(self.session_manager.active_index());
-                let snapshot =
-                    session_persistence::SessionsSnapshot::from_snapshots(snapshots, active_index);
+                let snapshot = self.current_sessions_snapshot();
                 if let Err(e) = snapshot.save(&path) {
                     eprintln!("[SessionPersistence] Failed to save: {}", e);
                 }

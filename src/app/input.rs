@@ -476,7 +476,9 @@ impl TerminalApp {
 
     fn resize_pane(&mut self, direction: layout::PaneDirection, label: &str) {
         const RESIZE_STEP: f32 = 0.05;
-        if !self.layout_manager.resize_split(direction, RESIZE_STEP) {
+        if self.layout_manager.resize_split(direction, RESIZE_STEP) {
+            self.schedule_session_save();
+        } else {
             self.set_status(format!("Cannot resize pane {label}"));
         }
     }
@@ -556,7 +558,9 @@ impl TerminalApp {
     pub fn sync_active_session_to_focused_pane(&mut self) {
         if let Some(idx) = self.layout_manager.focused_session_idx() {
             if idx != self.session_manager.active_index() {
-                self.activate_session(idx);
+                if self.activate_session(idx) {
+                    self.schedule_session_save();
+                }
             }
         }
     }
