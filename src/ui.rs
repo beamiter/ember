@@ -459,6 +459,8 @@ impl TerminalRenderer {
     const SCROLLBAR_WIDTH: f32 = 8.0;
     const SCROLLBAR_GAP: f32 = 2.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
+    const MIN_SPLIT_COLS: f32 = 8.0;
+    const MIN_SPLIT_ROWS: f32 = 3.0;
     const SCROLLBAR_HIT_EXPAND: f32 = 8.0;
     /// This is per renderer (split panes have independent caches), so keep it
     /// tight enough that several panes cannot multiply into a multi-GiB VRAM
@@ -803,13 +805,33 @@ impl TerminalRenderer {
         )
     }
 
+    /// Minimum size of each child produced by a split. This is deliberately
+    /// based on cells rather than a pane-count cap, so a larger window can
+    /// still host more panes while every new terminal remains usable.
+    pub fn minimum_split_pane_size(&self) -> Vec2 {
+        Vec2::new(
+            self.char_width * Self::MIN_SPLIT_COLS
+                + self.padding * 2.0
+                + Self::SCROLLBAR_WIDTH
+                + Self::SCROLLBAR_GAP,
+            self.line_height * Self::MIN_SPLIT_ROWS + self.padding * 2.0,
+        )
+    }
+
     fn layout_rects(&self, rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+        // Deeply nested layouts can restore panes smaller than one cell. Keep
+        // all child geometry inside the pane instead of extending a forced
+        // one-cell rectangle into its neighbours.
+        let safe_padding = if self.padding.is_finite() {
+            self.padding.max(0.0)
+        } else {
+            0.0
+        };
+        let inset_x = safe_padding.min(rect.width().max(0.0) * 0.5);
+        let inset_y = safe_padding.min(rect.height().max(0.0) * 0.5);
         let outer_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + self.padding, rect.top() + self.padding),
-            egui::pos2(
-                (rect.right() - self.padding).max(rect.left() + self.char_width),
-                (rect.bottom() - self.padding).max(rect.top() + self.line_height),
-            ),
+            egui::pos2(rect.left() + inset_x, rect.top() + inset_y),
+            egui::pos2(rect.right() - inset_x, rect.bottom() - inset_y),
         );
 
         let reserved_scrollbar_width = (Self::SCROLLBAR_WIDTH + Self::SCROLLBAR_GAP)
@@ -830,6 +852,15 @@ impl TerminalRenderer {
         );
 
         (content_rect, scrollbar_rect)
+    }
+
+    fn scrollbar_thumb_height(visible_lines: usize, total_lines: usize, track_height: f32) -> f32 {
+        if total_lines == 0 || !track_height.is_finite() || track_height <= 0.0 {
+            return 0.0;
+        }
+
+        let natural_height = (visible_lines as f32 / total_lines as f32) * track_height;
+        natural_height.clamp(Self::MIN_THUMB_HEIGHT.min(track_height), track_height)
     }
 
     pub fn grid_dimensions(&self, available: Vec2) -> (usize, usize) {
@@ -1078,9 +1109,8 @@ impl TerminalRenderer {
                 let visible_lines = rows;
                 if total_lines > visible_lines {
                     let scrollbar_height = scrollbar_rect.height();
-                    let thumb_height = ((visible_lines as f32 / total_lines as f32)
-                        * scrollbar_height)
-                        .clamp(Self::MIN_THUMB_HEIGHT, scrollbar_height);
+                    let thumb_height =
+                        Self::scrollbar_thumb_height(visible_lines, total_lines, scrollbar_height);
                     // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                     let thumb_y = scrollbar_height
                         - thumb_height
@@ -1509,8 +1539,8 @@ impl TerminalRenderer {
             if let Some((_, scrollbar_height, _, scrollback_len_f)) = scrollbar_thumb_rect {
                 let total_lines = terminal.scrollback.len() + rows;
                 let visible_lines = rows;
-                let thumb_height = ((visible_lines as f32 / total_lines as f32) * scrollbar_height)
-                    .clamp(Self::MIN_THUMB_HEIGHT, scrollbar_height);
+                let thumb_height =
+                    Self::scrollbar_thumb_height(visible_lines, total_lines, scrollbar_height);
                 // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                 let thumb_y = scrollbar_height
                     - thumb_height
@@ -2647,6 +2677,77 @@ mod tests {
         );
 
         assert_eq!((row, col), (19, 99));
+    }
+
+    #[test]
+    fn scrollbar_thumb_fits_tracks_shorter_than_its_normal_minimum() {
+        let short_track = 23.15625;
+        assert_eq!(
+            TerminalRenderer::scrollbar_thumb_height(1, 100, short_track),
+            short_track
+        );
+        assert_eq!(
+            TerminalRenderer::scrollbar_thumb_height(1, 100, 100.0),
+            TerminalRenderer::MIN_THUMB_HEIGHT
+        );
+        assert_eq!(TerminalRenderer::scrollbar_thumb_height(1, 100, 0.0), 0.0);
+        assert_eq!(
+            TerminalRenderer::scrollbar_thumb_height(1, 100, f32::NAN),
+            0.0
+        );
+    }
+
+    #[test]
+    fn tiny_pane_layout_rects_do_not_escape_the_pane() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let pane = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(12.0, 10.0));
+        let (content, scrollbar) = renderer.layout_rects(pane);
+
+        for rect in [content, scrollbar] {
+            assert!(rect.left() >= pane.left());
+            assert!(rect.top() >= pane.top());
+            assert!(rect.right() <= pane.right());
+            assert!(rect.bottom() <= pane.bottom());
+        }
+    }
+
+    #[test]
+    fn deeply_nested_twenty_four_pane_layout_keeps_scrollbars_bounded() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut layout = crate::layout::LayoutManager::new(0);
+        for session_idx in 1..24 {
+            layout.split(session_idx, session_idx % 2 == 0).unwrap();
+        }
+        layout.compute_pane_rects(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 800.0),
+        ));
+
+        assert_eq!(layout.panes().len(), 24);
+        assert!(layout
+            .panes()
+            .iter()
+            .any(|pane| pane.rect.height() < TerminalRenderer::MIN_THUMB_HEIGHT));
+        for pane in layout.panes() {
+            let (_, scrollbar) = renderer.layout_rects(pane.rect);
+            let track_height = scrollbar.height();
+            let thumb_height = TerminalRenderer::scrollbar_thumb_height(1, 100, track_height);
+            assert!(thumb_height.is_finite());
+            assert!(thumb_height >= 0.0);
+            assert!(thumb_height <= track_height);
+        }
     }
 
     #[test]

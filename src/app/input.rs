@@ -528,6 +528,15 @@ impl TerminalApp {
 
         let active_idx = self.session_manager.active_index();
         self.layout_manager.show_session(active_idx);
+        let minimum_pane_size = self.renderer.minimum_split_pane_size();
+        if !self
+            .layout_manager
+            .can_split_focused_pane(horizontal, minimum_pane_size)
+        {
+            self.set_status("Pane is too small to split; resize it or choose a larger pane");
+            return;
+        }
+
         let old_len = self.session_manager.len();
         let new_session_idx = self.create_session_with_current_config(None, None);
         if self.session_manager.len() == old_len {

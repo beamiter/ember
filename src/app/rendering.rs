@@ -65,6 +65,11 @@ impl TerminalApp {
         }
         // 终端显示区域
         self.renderer.sync_font_metrics(ctx);
+        let available_rect = ui.available_rect_before_wrap();
+        // Keep the focused pane's geometry current even in single-pane mode,
+        // so split commands can validate the resulting child sizes before
+        // creating another shell session.
+        self.layout_manager.compute_pane_rects(available_rect);
         let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
@@ -89,10 +94,6 @@ impl TerminalApp {
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
         if self.layout_manager.panes().len() > 1 {
             self.ensure_pane_renderer_capacity(ctx);
-            let available_rect = ui.available_rect_before_wrap();
-
-            // 计算窗格矩形
-            self.layout_manager.compute_pane_rects(available_rect);
 
             // 获取所有窗格信息
             let panes = self.layout_manager.panes().to_vec();

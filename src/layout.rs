@@ -336,6 +336,31 @@ impl LayoutManager {
             .any(|pane| pane.id == self.focused_pane_id)
     }
 
+    /// Check whether splitting the focused pane would leave both children at
+    /// least `minimum_pane_size` along the requested axis. Before the first
+    /// frame has supplied viewport geometry, retain the legacy permissive
+    /// behaviour; the renderer itself still handles tiny restored panes.
+    pub fn can_split_focused_pane(&self, horizontal: bool, minimum_pane_size: egui::Vec2) -> bool {
+        let Some(pane) = self
+            .panes
+            .iter()
+            .find(|pane| pane.id == self.focused_pane_id)
+        else {
+            return false;
+        };
+
+        if self.last_container_rect.width() <= 0.0 || self.last_container_rect.height() <= 0.0 {
+            return true;
+        }
+
+        let (available, minimum) = if horizontal {
+            (pane.rect.height(), minimum_pane_size.y)
+        } else {
+            (pane.rect.width(), minimum_pane_size.x)
+        };
+        available.is_finite() && minimum.is_finite() && minimum > 0.0 && available >= minimum * 2.0
+    }
+
     /// 让某个会话出现在当前布局中：若它已经在某个窗格中则只移动焦点，
     /// 否则用它替换当前焦点窗格。用于 tab 切换时保持“活跃会话 = 可见焦点窗格”。
     pub fn show_session(&mut self, session_idx: usize) {
@@ -1016,6 +1041,30 @@ mod tests {
         assert_eq!(pane1.rect.height(), 400.0);
         assert_eq!(pane2.rect.width(), 250.0);
         assert_eq!(pane3.rect.width(), 250.0);
+    }
+
+    #[test]
+    fn split_capacity_depends_on_focused_pane_size_and_axis() {
+        let mut layout = LayoutManager::new(0);
+        let minimum = egui::vec2(100.0, 70.0);
+
+        // Geometry is not known until the first render, so startup commands
+        // remain possible and rendering provides the hard safety net.
+        assert!(layout.can_split_focused_pane(false, minimum));
+
+        layout.compute_pane_rects(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(300.0, 120.0),
+        ));
+        assert!(layout.can_split_focused_pane(false, minimum));
+        assert!(!layout.can_split_focused_pane(true, minimum));
+
+        layout.split(1, false).unwrap();
+        layout.compute_pane_rects(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(300.0, 120.0),
+        ));
+        assert!(!layout.can_split_focused_pane(false, minimum));
     }
 
     #[test]
