@@ -12,7 +12,7 @@ claimed.
 
 - WGPU terminal grid rendering with a CPU/Glow fallback
 - Tabs, drag-to-reorder, rename, activity indicators and session restore
-- Two-pane horizontal or vertical splits with independent terminal grids
+- Nested horizontal and vertical splits; every split starts an independent shell session
 - Unicode width handling, combining characters, ligatures and font fallback
 - Search, match navigation, selection-aware replace, and a continuous-grid
   [semantic command timeline](docs/rsh-semantic-executions.md) (OSC 133)

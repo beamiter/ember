@@ -1508,7 +1508,7 @@ impl TerminalApp {
             current_theme,
             layout_manager,
             pane_renderers,
-            dragging_divider: false,
+            dragging_divider: None,
             help_panel: help::HelpPanel::new(),
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
@@ -1968,8 +1968,8 @@ impl eframe::App for TerminalApp {
         let (has_cursor_move_input, cursor_move_retry_overflow) =
             self.stage_prior_cursor_moves(initially_blocked);
 
-        // Keep every PTY moving, not just the focused tab. A visible second
-        // pane receives priority, while hidden tabs rotate fairly. Background
+        // Keep every PTY moving, not just the focused tab. All visible panes
+        // receive priority, while hidden tabs rotate fairly. Background
         // parsing consumes at most half of the global adaptive byte budget;
         // whatever it does not use remains available to the active session.
         let visible_sessions: Vec<usize> = self
@@ -2127,10 +2127,7 @@ impl eframe::App for TerminalApp {
             if let Some(pos) =
                 ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()))
             {
-                let on_divider = self
-                    .layout_manager
-                    .get_divider_rect()
-                    .is_some_and(|divider| divider.contains(pos));
+                let on_divider = self.layout_manager.divider_at(pos).is_some();
                 if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
                     self.sync_active_session_to_focused_pane();
                 }

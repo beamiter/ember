@@ -5,6 +5,27 @@ use crate::{command_palette, config, config_panel, layout, search_replace_panel,
 use eframe::egui;
 
 impl TerminalApp {
+    /// Pane 数量按需增长时，为每个可见 pane 保留独立 renderer/GPU surface。
+    /// 过去启动时只预建 4 个 renderer，超过后布局存在但内容不会被绘制。
+    fn ensure_pane_renderer_capacity(&mut self, ctx: &egui::Context) {
+        let required = self.layout_manager.panes().len();
+        while self.pane_renderers.len() < required {
+            let mut renderer = crate::ui::TerminalRenderer::new(
+                self.renderer.font_size,
+                self.renderer.padding,
+                self.renderer.line_spacing,
+                self.renderer.scrollbar_visibility.clone(),
+                self.renderer.theme.clone(),
+            );
+            renderer.opacity = self.renderer.opacity;
+            renderer.font_ligatures = self.renderer.font_ligatures;
+            renderer.gpu_rendering = self.renderer.gpu_rendering;
+            renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
+            renderer.sync_font_metrics(ctx);
+            self.pane_renderers.push(renderer);
+        }
+    }
+
     /// 自适应帧预算：根据帧时间动态调整处理量
     pub fn adjust_frame_budget(&mut self) {
         const TARGET_FRAME_MS: f64 = 16.0; // 目标 60 FPS
@@ -40,7 +61,7 @@ impl TerminalApp {
     pub fn render_terminal_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let interaction_enabled = !self.terminal_input_blocked(ctx);
         if !interaction_enabled {
-            self.dragging_divider = false;
+            self.dragging_divider = None;
         }
         // 终端显示区域
         self.renderer.sync_font_metrics(ctx);
@@ -67,6 +88,7 @@ impl TerminalApp {
 
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
         if self.layout_manager.panes().len() > 1 {
+            self.ensure_pane_renderer_capacity(ctx);
             let available_rect = ui.available_rect_before_wrap();
 
             // 计算窗格矩形
@@ -74,7 +96,7 @@ impl TerminalApp {
 
             // 获取所有窗格信息
             let panes = self.layout_manager.panes().to_vec();
-            let divider_rect = self.layout_manager.get_divider_rect();
+            let divider_rects = self.layout_manager.get_divider_rects();
             let inactive_search = crate::search::SearchState::default();
 
             // 为每个窗格渲染
@@ -149,62 +171,64 @@ impl TerminalApp {
                 }
             }
 
-            // 绘制分隔线
-            if let Some(divider) = divider_rect {
-                let painter = ui.painter();
-                let divider_color = if self.dragging_divider {
+            // 绘制全部递归分割线。
+            let painter = ui.painter();
+            for divider in &divider_rects {
+                let divider_color = if self.dragging_divider == Some(divider.id) {
                     crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border)
                 } else {
                     crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border)
                 };
+                painter.rect_filled(divider.rect, 0.0, divider_color);
+            }
 
-                painter.rect_filled(divider, 0.0, divider_color);
+            // 按下时锁定最深层分隔线，拖动时直接按该分割区域计算比例。
+            if interaction_enabled
+                && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+            {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    self.dragging_divider = self
+                        .layout_manager
+                        .divider_at(pos)
+                        .map(|divider| divider.id);
+                }
+            }
 
-                // 处理分隔线拖拽
-                if interaction_enabled
-                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
-                {
+            if interaction_enabled {
+                if let Some(split_id) = self.dragging_divider {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        if divider.contains(pos) {
-                            self.dragging_divider = true;
+                        if let Some(divider) =
+                            divider_rects.iter().find(|divider| divider.id == split_id)
+                        {
+                            let ratio = match divider.axis {
+                                layout::SplitAxis::Vertical => {
+                                    (pos.x - divider.container_rect.left())
+                                        / divider.container_rect.width().max(1.0)
+                                }
+                                layout::SplitAxis::Horizontal => {
+                                    (pos.y - divider.container_rect.top())
+                                        / divider.container_rect.height().max(1.0)
+                                }
+                            };
+                            self.layout_manager.set_split_ratio(split_id, ratio);
                         }
                     }
                 }
-
-                if interaction_enabled && self.dragging_divider {
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        // 计算新的分割比例
-                        match self.layout_manager.mode {
-                            layout::SplitMode::VerticalSplit { .. } => {
-                                let delta = pos.x - divider.center().x;
-                                let total_width = available_rect.width();
-                                let ratio_delta = delta / total_width * 0.1; // 降低灵敏度
-                                self.layout_manager.adjust_split_ratio(ratio_delta);
-                            }
-                            layout::SplitMode::HorizontalSplit { .. } => {
-                                let delta = pos.y - divider.center().y;
-                                let total_height = available_rect.height();
-                                let ratio_delta = delta / total_height * 0.1;
-                                self.layout_manager.adjust_split_ratio(ratio_delta);
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
-                        self.dragging_divider = false;
-                    }
+                if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+                    self.dragging_divider = None;
                 }
             }
 
             // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
             // 那是用于拖拽调整比例的)。
             if interaction_enabled
-                && !self.dragging_divider
+                && self.dragging_divider.is_none()
                 && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
             {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    let on_divider = divider_rect.map(|d| d.contains(pos)).unwrap_or(false);
+                    let on_divider = divider_rects
+                        .iter()
+                        .any(|divider| divider.rect.contains(pos));
                     if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
                         self.sync_active_session_to_focused_pane();
                     }

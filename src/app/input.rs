@@ -493,11 +493,11 @@ impl TerminalApp {
         }
     }
 
-    /// 创建并分出一个新终端。先检查布局容量，避免达到上限后仍启动一个
-    /// 孤立 shell；创建失败也不会把当前会话重复显示在两个窗格中。
+    /// 创建一个全新的 shell session，并从当前焦点 pane 原地分出新 pane。
+    /// session 创建失败时不改变布局，布局更新失败时回滚刚创建的 session。
     fn split_terminal(&mut self, horizontal: bool) {
         if !self.layout_manager.can_split() {
-            self.set_status("Maximum 2 panes reached");
+            self.set_status("No focused pane to split");
             return;
         }
 
@@ -514,14 +514,14 @@ impl TerminalApp {
             Ok(()) => {
                 self.sync_active_session_to_focused_pane();
                 self.set_status(if horizontal {
-                    "Split horizontally"
+                    "Created new session in horizontal split"
                 } else {
-                    "Split vertically"
+                    "Created new session in vertical split"
                 });
                 self.schedule_session_save();
             }
             Err(error) => {
-                // 容量已预检；若布局状态意外变化，回滚刚创建的会话。
+                // 若布局状态意外变化，回滚刚创建的 session。
                 self.close_session_synced(new_session_idx);
                 self.set_status(error);
             }

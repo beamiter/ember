@@ -392,8 +392,8 @@ impl SessionManager {
 
     /// Fairly parse PTY output for every non-active session within one shared
     /// byte budget. Visible split panes are considered first, then hidden tabs
-    /// are rotated between frames. This keeps a second pane live and prevents
-    /// bounded PTY channels from permanently back-pressuring background jobs.
+    /// are rotated between frames. This keeps every visible pane live and
+    /// prevents bounded PTY channels from permanently back-pressuring jobs.
     pub fn pump_inactive_sessions(
         &mut self,
         total_budget: usize,

@@ -163,7 +163,7 @@ pub struct TerminalApp {
     pub pane_renderers: Vec<TerminalRenderer>,
 
     // Divider drag state
-    pub dragging_divider: bool,
+    pub dragging_divider: Option<layout::SplitId>,
 
     // Help panel
     pub help_panel: help::HelpPanel,
