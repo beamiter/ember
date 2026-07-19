@@ -294,6 +294,7 @@ impl super::TerminalState {
             // This ensures dirty tracking works correctly even with scrollback
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
+            viewport_mapping_exact_cache: std::cell::Cell::new(None),
             current_hyperlink: None,
             sync_output_active: false,
             sync_output_start: None,
@@ -1820,6 +1821,89 @@ impl super::TerminalState {
         Some((absolute_row, anchor.column))
     }
 
+    /// Whether raw scrollback rows and the currently rendered visual rows have
+    /// a one-to-one coordinate mapping. Historical lines are reflowed lazily
+    /// after a width change; until the terminal model exposes per-cell origins,
+    /// drawing a raw-column search span there would confidently highlight the
+    /// wrong cell. Callers should omit that overlay instead.
+    pub fn viewport_buffer_mapping_is_exact(&self) -> bool {
+        if self.scroll_offset == 0 {
+            return true;
+        }
+        let cols = self.grid.row_len();
+        let rows = self.grid.rows();
+        let cache_key = ViewportMappingExactCache {
+            cols,
+            rows,
+            scroll_offset: self.scroll_offset,
+            scrollback_len: self.scrollback.len(),
+            total_lines_scrolled: self.total_lines_scrolled,
+            exact: false,
+        };
+        let cached_exact = self.viewport_mapping_exact_cache.get().and_then(|cached| {
+            (cached.cols == cache_key.cols
+                && cached.rows == cache_key.rows
+                && cached.scroll_offset == cache_key.scroll_offset
+                && cached.scrollback_len == cache_key.scrollback_len
+                && cached.total_lines_scrolled == cache_key.total_lines_scrolled)
+                .then_some(cached.exact)
+        });
+        if let Some(exact) = cached_exact {
+            return exact;
+        }
+        let mut start = self
+            .scrollback
+            .len()
+            .saturating_sub(self.scroll_offset.saturating_add(rows));
+        while start > 0 && self.scrollback[start - 1].is_wrapped {
+            start -= 1;
+        }
+        let exact = self
+            .scrollback
+            .iter()
+            .skip(start)
+            .all(|line| line.columns() == cols && !line.is_wrapped);
+        self.viewport_mapping_exact_cache
+            .set(Some(ViewportMappingExactCache { exact, ..cache_key }));
+        exact
+    }
+
+    /// Resolve a stable buffer anchor into the current viewport using the
+    /// same absolute-row semantics as text selection. This intentionally
+    /// keeps search and selection aligned across resize/reflow until both can
+    /// share a richer logical-line mapping.
+    pub fn buffer_anchor_to_viewport(&self, anchor: BufferAnchor) -> Option<(usize, usize)> {
+        if !self.viewport_buffer_mapping_is_exact() {
+            return None;
+        }
+        let (absolute_row, column) = self.buffer_anchor_to_absolute(anchor)?;
+        self.absolute_row_to_viewport(absolute_row)
+            .map(|viewport_row| (viewport_row, column))
+    }
+
+    /// Scroll enough to reveal a stable buffer anchor. Historical matches are
+    /// placed at the top of the viewport; live-grid matches return to the live
+    /// tail. If the row is already visible, the current viewport is preserved.
+    pub fn scroll_to_buffer_anchor(&mut self, anchor: BufferAnchor) -> bool {
+        let Some((absolute_row, _)) = self.buffer_anchor_to_absolute(anchor) else {
+            return false;
+        };
+        if self.absolute_row_to_viewport(absolute_row).is_some() {
+            return true;
+        }
+
+        if absolute_row < self.scrollback.len() {
+            self.scroll_offset = self
+                .scrollback
+                .len()
+                .saturating_sub(absolute_row)
+                .min(self.scrollback.len());
+        } else {
+            self.scroll_offset = 0;
+        }
+        true
+    }
+
     /// Convert a current raw-buffer coordinate to a stable line-id anchor.
     #[allow(dead_code)] // Public library surface for other jterm frontends.
     pub fn absolute_to_buffer_anchor(&self, absolute: (usize, usize)) -> Option<BufferAnchor> {
@@ -2374,6 +2458,13 @@ impl super::TerminalState {
         self.scrollback.len().saturating_sub(self.scroll_offset) + viewport_row
     }
 
+    #[inline]
+    pub fn absolute_row_to_viewport(&self, absolute_row: usize) -> Option<usize> {
+        let top = self.viewport_row_to_absolute(0);
+        let viewport_row = absolute_row.checked_sub(top)?;
+        (viewport_row < self.grid.rows()).then_some(viewport_row)
+    }
+
     /// Start a new selection at a viewport-relative position.
     /// Converts to absolute buffer coordinates internally.
     pub fn start_selection(&mut self, viewport_pos: (usize, usize)) {
@@ -2819,6 +2910,13 @@ impl super::TerminalState {
             return;
         }
 
+        // Dimensions and row contents are part of every renderer/search cache
+        // key. A resize can happen while the PTY is otherwise idle, so it must
+        // invalidate them independently of new parser input.
+        self.grid_version = self.grid_version.saturating_add(1);
+        self.visible_cells_cache = None;
+        self.viewport_mapping_exact_cache.set(None);
+
         let old_rows = self.grid.rows();
         let had_full_screen_region = old_rows == 0
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
@@ -2863,6 +2961,8 @@ impl super::TerminalState {
         if rows != self.row_versions.len() {
             self.row_versions.resize(rows, self.grid_version);
         }
+        self.row_versions.fill(self.grid_version);
+        self.dirty_region.mark_all(rows);
 
         self.scroll_offset = 0;
         self.pending_wrap = false;

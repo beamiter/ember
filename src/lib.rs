@@ -1,5 +1,6 @@
 // Library export for benchmarks and testing
 
+pub(crate) mod atomic_file;
 pub mod char_width; // P5：字符宽度缓存
 pub mod clipboard;
 pub mod color;

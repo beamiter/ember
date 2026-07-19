@@ -5,6 +5,65 @@ use crate::config;
 use crate::history_persistence;
 use crate::session_persistence;
 
+const MAX_WINDOW_TITLE_CHARS: usize = 200;
+
+/// Window titles originate in untrusted OSC output. Keep them single-line,
+/// bounded, and free of bidi override/isolate controls that could make a
+/// desktop task switcher display a deceptive title. An empty OSC title must
+/// also restore the application fallback instead of leaving a stale title from
+/// the previously focused session.
+pub(crate) fn safe_window_title(reported: &str, fallback: &str) -> String {
+    let source = if reported.trim().is_empty() {
+        fallback
+    } else {
+        reported
+    };
+    let mut title = String::with_capacity(source.len().min(MAX_WINDOW_TITLE_CHARS));
+    let mut pending_space = false;
+    let mut truncated = false;
+    let mut chars = 0;
+
+    for ch in source.chars() {
+        let bidi_control = matches!(
+            ch,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        );
+        if bidi_control || (ch.is_control() && !ch.is_whitespace()) {
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = !title.is_empty();
+            continue;
+        }
+        if pending_space {
+            if chars >= MAX_WINDOW_TITLE_CHARS {
+                truncated = true;
+                break;
+            }
+            title.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        if chars >= MAX_WINDOW_TITLE_CHARS {
+            truncated = true;
+            break;
+        }
+        title.push(ch);
+        chars += 1;
+    }
+
+    if title.is_empty() {
+        title.push_str("JTerm2");
+    } else if truncated {
+        title.push('…');
+    }
+    title
+}
+
 impl TerminalApp {
     // 配置保存相关方法
     pub fn schedule_config_save(&mut self) {
@@ -170,5 +229,28 @@ impl TerminalApp {
         self.config_panel.sync_from_config(&self.config);
         self.apply_runtime_config(ctx);
         notes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_window_title;
+
+    #[test]
+    fn empty_or_control_only_osc_title_uses_a_safe_fallback() {
+        assert_eq!(safe_window_title("", "~/work — JTerm2"), "~/work — JTerm2");
+        assert_eq!(safe_window_title("\u{1b}\u{202e}", ""), "JTerm2");
+    }
+
+    #[test]
+    fn terminal_title_is_single_line_bidi_safe_and_bounded() {
+        assert_eq!(
+            safe_window_title(" build\n\u{202e}done\t now ", "fallback"),
+            "build done now"
+        );
+        let long = "界".repeat(300);
+        let title = safe_window_title(&long, "fallback");
+        assert_eq!(title.chars().count(), 201);
+        assert!(title.ends_with('…'));
     }
 }

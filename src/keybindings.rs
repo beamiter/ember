@@ -51,9 +51,12 @@ pub enum Command {
     PaneResizeRight,
     PaneResizeUp,
     PaneResizeDown,
+    PaneZoomToggle,
+    PaneEqualize,
 
     // === 窗口操作 ===
     WindowClose,
+    #[allow(clippy::enum_variant_names)]
     CommandPaletteToggle,
     HelpToggle,
 
@@ -106,6 +109,8 @@ impl std::fmt::Display for Command {
             Command::PaneResizeRight => write!(f, "pane:resize_right"),
             Command::PaneResizeUp => write!(f, "pane:resize_up"),
             Command::PaneResizeDown => write!(f, "pane:resize_down"),
+            Command::PaneZoomToggle => write!(f, "pane:zoom_toggle"),
+            Command::PaneEqualize => write!(f, "pane:equalize"),
             Command::WindowClose => write!(f, "window:close"),
             Command::CommandPaletteToggle => write!(f, "command_palette:toggle"),
             Command::HelpToggle => write!(f, "help:toggle"),
@@ -158,6 +163,8 @@ impl std::str::FromStr for Command {
             "pane:resize_right" => Ok(Command::PaneResizeRight),
             "pane:resize_up" => Ok(Command::PaneResizeUp),
             "pane:resize_down" => Ok(Command::PaneResizeDown),
+            "pane:zoom_toggle" => Ok(Command::PaneZoomToggle),
+            "pane:equalize" => Ok(Command::PaneEqualize),
             "window:close" => Ok(Command::WindowClose),
             "command_palette:toggle" => Ok(Command::CommandPaletteToggle),
             "help:toggle" => Ok(Command::HelpToggle),
@@ -317,6 +324,10 @@ impl KeyBindings {
                 .bindings
                 .insert(format!("ctrl+shift+alt+{key}"), command.to_string());
         }
+        bindings.bindings.insert(
+            "ctrl+shift+return".to_string(),
+            "pane:zoom_toggle".to_string(),
+        );
 
         // OSC 133 命令跳转：上一/下一个 shell 提示符
         bindings.bindings.insert(
@@ -333,7 +344,7 @@ impl KeyBindings {
 
     /// 获取快捷键对应的命令
     pub fn get_command(&self, key_str: &str) -> Option<Command> {
-        let normalized = key_str.to_lowercase();
+        let normalized = Self::normalize_binding(key_str).ok()?;
         self.bindings
             .get(&normalized)
             .and_then(|cmd_str| cmd_str.parse::<Command>().ok())
@@ -355,6 +366,15 @@ impl KeyBindings {
     fn prettify_binding(key: &str) -> String {
         key.split('+')
             .map(|tok| {
+                if tok == "return" {
+                    return "Enter".to_string();
+                }
+                if tok == "pageup" {
+                    return "PageUp".to_string();
+                }
+                if tok == "pagedown" {
+                    return "PageDown".to_string();
+                }
                 let mut chars = tok.chars();
                 match chars.next() {
                     Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
@@ -373,13 +393,190 @@ impl KeyBindings {
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let user_bindings: KeyBindings = toml::from_str(&content)?;
-            // 合并用户配置到默认配置，用户配置会覆盖默认值
-            for (key, value) in user_bindings.bindings {
-                bindings.bindings.insert(key, value);
+            for warning in bindings.merge_user_bindings(user_bindings) {
+                eprintln!("[Keybindings] WARNING: {warning}");
             }
         }
 
         Ok(bindings)
+    }
+
+    /// Merge hand-edited overrides without letting one bad entry discard every
+    /// valid customization. Keys are normalized to the exact modifier order
+    /// emitted by the input router; `none` removes a default binding.
+    fn merge_user_bindings(&mut self, user: KeyBindings) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut entries: Vec<_> = user.bindings.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (raw_key, raw_command) in entries {
+            let key = match Self::normalize_binding(&raw_key) {
+                Ok(key) => key,
+                Err(error) => {
+                    warnings.push(format!("ignoring binding '{raw_key}': {error}"));
+                    continue;
+                }
+            };
+            let command = raw_command.trim().to_ascii_lowercase();
+            if matches!(command.as_str(), "none" | "unbind") {
+                self.bindings.remove(&key);
+                continue;
+            }
+            if let Err(error) = command.parse::<Command>() {
+                warnings.push(format!(
+                    "ignoring binding '{raw_key}' = '{raw_command}': {error}"
+                ));
+                continue;
+            }
+            self.bindings.insert(key, command);
+        }
+        warnings
+    }
+
+    fn normalize_binding(binding: &str) -> Result<String, String> {
+        let binding = binding.trim().to_ascii_lowercase();
+        if binding.is_empty() {
+            return Err("key chord is empty".to_string());
+        }
+
+        // A literal plus key is represented as the final `+` in chords such as
+        // `ctrl++`; split the modifier prefix separately to retain it.
+        let (prefix, mut key) = if binding == "+" {
+            ("", "+")
+        } else if let Some(prefix) = binding.strip_suffix('+') {
+            (prefix.trim_end_matches('+'), "+")
+        } else {
+            match binding.rsplit_once('+') {
+                Some((prefix, key)) => (prefix, key),
+                None => ("", binding.as_str()),
+            }
+        };
+        key = match key.trim() {
+            "enter" => "return",
+            "arrowup" => "up",
+            "arrowdown" => "down",
+            "arrowleft" => "left",
+            "arrowright" => "right",
+            other => other,
+        };
+        if !Self::is_supported_key(key) {
+            return Err(format!("unsupported key '{key}'"));
+        }
+
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut super_key = false;
+        if !prefix.is_empty() {
+            for modifier in prefix.split('+').map(str::trim) {
+                let slot = match modifier {
+                    "ctrl" | "control" => &mut ctrl,
+                    "shift" => &mut shift,
+                    "alt" => &mut alt,
+                    "super" | "cmd" | "command" => &mut super_key,
+                    "" => return Err("empty modifier".to_string()),
+                    other => return Err(format!("unsupported modifier '{other}'")),
+                };
+                if *slot {
+                    return Err(format!("duplicate modifier '{modifier}'"));
+                }
+                *slot = true;
+            }
+        }
+
+        let mut normalized = String::with_capacity(binding.len());
+        for (enabled, name) in [
+            (ctrl, "ctrl+"),
+            (shift, "shift+"),
+            (alt, "alt+"),
+            (super_key, "super+"),
+        ] {
+            if enabled {
+                normalized.push_str(name);
+            }
+        }
+        normalized.push_str(key);
+        Ok(normalized)
+    }
+
+    fn is_supported_key(key: &str) -> bool {
+        matches!(
+            key,
+            "return"
+                | "escape"
+                | "backspace"
+                | "tab"
+                | "up"
+                | "down"
+                | "left"
+                | "right"
+                | "home"
+                | "end"
+                | "insert"
+                | "delete"
+                | "pageup"
+                | "pagedown"
+                | "f1"
+                | "f2"
+                | "f3"
+                | "f4"
+                | "f5"
+                | "f6"
+                | "f7"
+                | "f8"
+                | "f9"
+                | "f10"
+                | "f11"
+                | "f12"
+                | "a"
+                | "b"
+                | "c"
+                | "d"
+                | "e"
+                | "f"
+                | "g"
+                | "h"
+                | "i"
+                | "j"
+                | "k"
+                | "l"
+                | "m"
+                | "n"
+                | "o"
+                | "p"
+                | "q"
+                | "r"
+                | "s"
+                | "t"
+                | "u"
+                | "v"
+                | "w"
+                | "x"
+                | "y"
+                | "z"
+                | "0"
+                | "1"
+                | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | ","
+                | "."
+                | "+"
+                | "-"
+                | "/"
+                | "\\"
+                | ";"
+                | "'"
+                | "["
+                | "]"
+                | "="
+                | "`"
+        )
     }
 
     /// 获取配置文件路径
@@ -417,6 +614,8 @@ mod tests {
             Command::PaneResizeRight,
             Command::PaneResizeUp,
             Command::PaneResizeDown,
+            Command::PaneZoomToggle,
+            Command::PaneEqualize,
             Command::CommandPaletteToggle,
             Command::HelpToggle,
         ] {
@@ -443,6 +642,7 @@ mod tests {
             ("ctrl+\\", Command::SidebarToggle),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
+            ("ctrl+shift+return", Command::PaneZoomToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+/", Command::HelpToggle),
             ("shift+insert", Command::EditPaste),
@@ -513,5 +713,44 @@ mod tests {
                 Some(resize)
             );
         }
+    }
+
+    #[test]
+    fn user_bindings_are_canonicalized_validated_and_can_unbind_defaults() {
+        let mut bindings = KeyBindings::default_bindings();
+        let user = KeyBindings {
+            bindings: HashMap::from([
+                (
+                    " Alt + Control + X ".to_string(),
+                    " SESSION:NEW ".to_string(),
+                ),
+                ("ctrl+shift+t".to_string(), "none".to_string()),
+                ("ctrl+shift+y".to_string(), "not:a:command".to_string()),
+            ]),
+        };
+
+        let warnings = bindings.merge_user_bindings(user);
+
+        assert_eq!(
+            bindings.get_command("ctrl+alt+x"),
+            Some(Command::SessionNew)
+        );
+        assert_eq!(bindings.get_command("ctrl+shift+t"), None);
+        assert_eq!(bindings.get_command("ctrl+shift+y"), None);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn binding_normalization_handles_aliases_and_literal_plus() {
+        assert_eq!(
+            KeyBindings::normalize_binding("Shift+Ctrl+Enter").as_deref(),
+            Ok("ctrl+shift+return")
+        );
+        assert_eq!(
+            KeyBindings::normalize_binding("ctrl++").as_deref(),
+            Ok("ctrl++")
+        );
+        assert!(KeyBindings::normalize_binding("ctrl+ctrl+x").is_err());
+        assert!(KeyBindings::normalize_binding("ctrl+space").is_err());
     }
 }

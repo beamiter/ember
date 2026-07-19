@@ -318,6 +318,18 @@ impl CommandPalette {
                 "Move a horizontal pane divider down",
                 crate::keybindings::Command::PaneResizeDown,
             ),
+            CommandInfo::new(
+                "Toggle Pane Zoom",
+                CommandCategory::Terminal,
+                "Temporarily maximize or restore the focused pane",
+                crate::keybindings::Command::PaneZoomToggle,
+            ),
+            CommandInfo::new(
+                "Equalize Panes",
+                CommandCategory::Terminal,
+                "Reset every pane divider to an even split",
+                crate::keybindings::Command::PaneEqualize,
+            ),
             // === 窗口操作 ===
             CommandInfo::new(
                 "Close Window",
@@ -596,6 +608,8 @@ mod tests {
             Command::PaneResizeRight,
             Command::PaneResizeUp,
             Command::PaneResizeDown,
+            Command::PaneZoomToggle,
+            Command::PaneEqualize,
             Command::WindowClose,
             Command::CommandPaletteToggle,
             Command::HelpToggle,

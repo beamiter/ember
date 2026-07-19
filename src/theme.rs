@@ -1,6 +1,9 @@
 use egui::Color32;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+
+const MAX_CUSTOM_THEME_NAME_BYTES: usize = 128;
 
 /// 终端颜色配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -823,29 +826,110 @@ impl Theme {
     /// 保存主题到文件
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        crate::atomic_file::write_atomic(path, content.as_bytes())?;
         Ok(())
     }
 
     /// Custom themes directory
-    pub fn custom_themes_dir() -> Option<std::path::PathBuf> {
+    pub fn custom_themes_dir() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("jterm2").join("themes"))
     }
 
-    /// Load all custom themes from the themes directory
-    pub fn load_custom_themes() -> Vec<Self> {
-        let Some(dir) = Self::custom_themes_dir() else {
+    fn invalid_theme_name(message: impl Into<String>) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message.into())
+    }
+
+    /// Validate the user-controlled portion of a custom-theme filename.
+    ///
+    /// The returned path is always one direct child of `dir`; callers must not
+    /// reconstruct this path independently.
+    fn custom_theme_path_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
+        if name.trim().is_empty() {
+            return Err(Self::invalid_theme_name("theme name must not be empty"));
+        }
+        if name.len() > MAX_CUSTOM_THEME_NAME_BYTES {
+            return Err(Self::invalid_theme_name(format!(
+                "theme name is too long (maximum {MAX_CUSTOM_THEME_NAME_BYTES} UTF-8 bytes)"
+            )));
+        }
+        if name.chars().any(char::is_control) {
+            return Err(Self::invalid_theme_name(
+                "theme name must not contain control characters",
+            ));
+        }
+
+        let name_path = Path::new(name);
+        if name_path.is_absolute() {
+            return Err(Self::invalid_theme_name(
+                "theme name must not be an absolute path",
+            ));
+        }
+        // Backslash is not a separator on Linux, but rejecting both forms keeps
+        // persisted names safe if the file is moved between platforms.
+        if name.contains('/') || name.contains('\\') {
+            return Err(Self::invalid_theme_name(
+                "theme name must be a single file name without path separators",
+            ));
+        }
+        let mut components = name_path.components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(Self::invalid_theme_name(
+                "theme name must be a single ordinary file name",
+            ));
+        }
+
+        Ok(dir.join(format!("{name}.toml")))
+    }
+
+    fn validate_custom_themes_dir(dir: &Path) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(dir)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom themes directory must not be a symbolic link",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom themes path is not a directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_custom_themes_dir(dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        Self::validate_custom_themes_dir(dir)
+    }
+
+    fn load_custom_themes_from(dir: &Path) -> Vec<Self> {
+        if Self::validate_custom_themes_dir(dir).is_err() {
             return Vec::new();
-        };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
         let mut themes = Vec::new();
         for entry in entries.flatten() {
+            // Do not read through a symlink planted in the themes directory.
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+                continue;
+            }
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "toml") {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            {
                 if let Ok(theme) = Self::from_file(&path) {
-                    themes.push(theme);
+                    // A theme's embedded name must resolve back to the file it
+                    // was loaded from. This keeps edit/delete mapped to the same
+                    // validated single-file path.
+                    if Self::custom_theme_path_in(dir, &theme.name)
+                        .is_ok_and(|expected| expected == path)
+                    {
+                        themes.push(theme);
+                    }
                 }
             }
         }
@@ -853,24 +937,46 @@ impl Theme {
         themes
     }
 
+    /// Load all custom themes from the themes directory
+    pub fn load_custom_themes() -> Vec<Self> {
+        let Some(dir) = Self::custom_themes_dir() else {
+            return Vec::new();
+        };
+        Self::load_custom_themes_from(&dir)
+    }
+
+    fn save_custom_theme_in(&self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::custom_theme_path_in(dir, &self.name)?;
+        Self::ensure_custom_themes_dir(dir)?;
+        // Atomic replacement changes the directory entry itself, so an
+        // existing `<name>.toml` symlink is replaced rather than followed.
+        self.save(&path)
+    }
+
     /// Save this theme as a custom theme file
     pub fn save_custom_theme(&self) -> Result<(), Box<dyn std::error::Error>> {
         let dir = Self::custom_themes_dir().ok_or("Cannot determine config directory")?;
-        std::fs::create_dir_all(&dir)?;
-        let filename = format!("{}.toml", self.name);
-        let path = dir.join(filename);
-        self.save(&path)
+        self.save_custom_theme_in(&dir)
+    }
+
+    fn delete_custom_theme_in(dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::custom_theme_path_in(dir, name)?;
+        match Self::validate_custom_themes_dir(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Delete a custom theme file
     pub fn delete_custom_theme(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = Self::custom_themes_dir().ok_or("Cannot determine config directory")?;
-        let filename = format!("{}.toml", name);
-        let path = dir.join(filename);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        Ok(())
+        Self::delete_custom_theme_in(&dir, name)
     }
 
     /// Get a theme by name — checks builtins first, then custom themes
@@ -972,5 +1078,171 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::builtin_dark()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("jterm2-theme-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn named_theme(name: &str) -> Theme {
+        Theme {
+            name: name.to_owned(),
+            ..Theme::default()
+        }
+    }
+
+    #[test]
+    fn custom_theme_path_accepts_only_one_safe_filename_component() {
+        let dir = Path::new("/tmp/themes");
+        for valid in ["night-owl", "my theme", "theme..backup", "夜间"] {
+            assert_eq!(
+                Theme::custom_theme_path_in(dir, valid).unwrap(),
+                dir.join(format!("{valid}.toml"))
+            );
+        }
+        assert!(Theme::custom_theme_path_in(dir, &"a".repeat(128)).is_ok());
+
+        for invalid in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../outside",
+            "nested/theme",
+            r"nested\theme",
+            "/tmp/outside",
+            "line\nbreak",
+        ] {
+            assert!(
+                Theme::custom_theme_path_in(dir, invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+        assert!(Theme::custom_theme_path_in(dir, &"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn invalid_names_cannot_save_or_delete_outside_themes_directory() {
+        let root = TestDirectory::new("invalid-name-operations");
+        let themes_dir = root.0.join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        let outside = root.0.join("outside.toml");
+        std::fs::write(&outside, "outside stays intact").unwrap();
+
+        assert!(named_theme("../outside")
+            .save_custom_theme_in(&themes_dir)
+            .is_err());
+        assert!(Theme::delete_custom_theme_in(&themes_dir, "../outside").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside stays intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_replaces_a_destination_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("save-symlink");
+        let themes_dir = root.0.join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        let outside = root.0.join("outside.toml");
+        std::fs::write(&outside, "outside stays intact").unwrap();
+        let destination = themes_dir.join("safe.toml");
+        symlink(&outside, &destination).unwrap();
+
+        named_theme("safe")
+            .save_custom_theme_in(&themes_dir)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside stays intact"
+        );
+        assert!(!std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(Theme::from_file(&destination).unwrap().name, "safe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_destination_symlink_never_deletes_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("delete-symlink");
+        let themes_dir = root.0.join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        let outside = root.0.join("outside.toml");
+        std::fs::write(&outside, "outside stays intact").unwrap();
+        let destination = themes_dir.join("safe.toml");
+        symlink(&outside, &destination).unwrap();
+
+        Theme::delete_custom_theme_in(&themes_dir, "safe").unwrap();
+
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside stays intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_themes_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("directory-symlink");
+        let outside_dir = root.0.join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let themes_dir = root.0.join("themes");
+        symlink(&outside_dir, &themes_dir).unwrap();
+
+        assert!(named_theme("safe")
+            .save_custom_theme_in(&themes_dir)
+            .is_err());
+        assert!(Theme::delete_custom_theme_in(&themes_dir, "safe").is_err());
+        assert!(!outside_dir.join("safe.toml").exists());
+    }
+
+    #[test]
+    fn loading_ignores_files_whose_embedded_name_is_unsafe_or_mismatched() {
+        let root = TestDirectory::new("load-validation");
+        let themes_dir = root.0.join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+
+        named_theme("safe")
+            .save(&themes_dir.join("safe.toml"))
+            .unwrap();
+        named_theme("../outside")
+            .save(&themes_dir.join("unsafe.toml"))
+            .unwrap();
+        named_theme("different")
+            .save(&themes_dir.join("mismatch.toml"))
+            .unwrap();
+
+        let loaded = Theme::load_custom_themes_from(&themes_dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "safe");
     }
 }

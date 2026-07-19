@@ -133,6 +133,7 @@ impl TerminalApp {
                     session,
                     text,
                     self.config.paste_confirm,
+                    false,
                     &mut self.pending_paste_confirm,
                 ) {
                     Ok(true) => {}
@@ -201,8 +202,8 @@ impl TerminalApp {
                 self.search_state.close();
                 self.save_ui_history();
             }
-            keybindings::Command::SearchNext => self.search_state.next_match(),
-            keybindings::Command::SearchPrev => self.search_state.prev_match(),
+            keybindings::Command::SearchNext => self.select_next_search_match(),
+            keybindings::Command::SearchPrev => self.select_prev_search_match(),
             keybindings::Command::SearchHistoryPrev => {
                 self.search_state.history_prev();
                 self.refresh_search_matches();
@@ -318,6 +319,28 @@ impl TerminalApp {
             keybindings::Command::PaneResizeDown => {
                 self.resize_pane(layout::PaneDirection::Down, "down")
             }
+            keybindings::Command::PaneZoomToggle => {
+                if self.layout_manager.toggle_focused_pane_zoom() {
+                    self.force_resize_session = true;
+                    ctx.request_repaint();
+                    self.set_status(if self.layout_manager.is_zoomed() {
+                        "Focused pane zoomed"
+                    } else {
+                        "Pane zoom restored"
+                    });
+                } else {
+                    self.set_status("Only one pane is open");
+                }
+            }
+            keybindings::Command::PaneEqualize => {
+                if self.layout_manager.equalize_splits() {
+                    self.schedule_session_save();
+                    ctx.request_repaint();
+                    self.set_status("Pane dividers reset to 50/50");
+                } else {
+                    self.set_status("Pane dividers are already equal");
+                }
+            }
             keybindings::Command::WindowClose => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return true;
@@ -430,22 +453,62 @@ impl TerminalApp {
     /// 针对当前活跃会话重算搜索结果，并记录结果所属的 grid/session 版本。
     pub(super) fn refresh_search_matches(&mut self) {
         let session_idx = self.session_manager.active_index();
-        let (matches, error, grid_version) = {
+        let selected_match = self
+            .search_state
+            .matches
+            .get(self.search_state.current_match_index)
+            .copied();
+        let (matches, error, truncated, grid_version) = {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
-            let (matches, error) = search::SearchEngine::search(
-                &terminal.grid,
+            let (matches, error, truncated) = search::SearchEngine::search(
+                &terminal,
                 &self.search_state.query,
                 self.search_state.use_regex,
                 self.search_state.case_sensitive,
             );
-            (matches, error, terminal.get_grid_version())
+            (matches, error, truncated, terminal.get_grid_version())
         };
         self.search_state.matches = matches;
         self.search_state.error_message = error;
-        self.search_state.current_match_index = 0;
+        self.search_state.results_truncated = truncated;
+        self.search_state.current_match_index = selected_match
+            .and_then(|selected| {
+                self.search_state
+                    .matches
+                    .iter()
+                    .position(|candidate| *candidate == selected)
+            })
+            .unwrap_or(0);
         self.search_state.results_grid_version = Some(grid_version);
         self.search_state.results_session_idx = Some(session_idx);
+        self.search_state.results_refreshed_at = Some(std::time::Instant::now());
+    }
+
+    fn reveal_current_search_match(&mut self) {
+        let Some(search_match) = self
+            .search_state
+            .matches
+            .get(self.search_state.current_match_index)
+            .copied()
+        else {
+            return;
+        };
+        let session = self.session_manager.get_active_session_mut();
+        session
+            .terminal
+            .lock()
+            .scroll_to_buffer_anchor(search_match.anchor());
+    }
+
+    pub(super) fn select_next_search_match(&mut self) {
+        self.search_state.next_match();
+        self.reveal_current_search_match();
+    }
+
+    pub(super) fn select_prev_search_match(&mut self) {
+        self.search_state.prev_match();
+        self.reveal_current_search_match();
     }
 
     fn activate_next_session(&mut self) {
@@ -565,12 +628,11 @@ impl TerminalApp {
     /// 把全局活跃会话切换到当前焦点窗格对应的会话,使键盘输入/复制等
     /// 路由到正确的分屏窗格。focus 变化(分屏、Next/Prev、关闭、点击)后调用。
     pub fn sync_active_session_to_focused_pane(&mut self) {
-        if let Some(idx) = self.layout_manager.focused_session_idx() {
-            if idx != self.session_manager.active_index() {
-                if self.activate_session(idx) {
-                    self.schedule_session_save();
-                }
-            }
+        let Some(idx) = self.layout_manager.focused_session_idx() else {
+            return;
+        };
+        if idx != self.session_manager.active_index() && self.activate_session(idx) {
+            self.schedule_session_save();
         }
     }
 
@@ -592,16 +654,18 @@ impl TerminalApp {
                         }
                         egui::Key::Enter => {
                             if !modifiers.shift {
-                                self.search_state.next_match();
+                                self.select_next_search_match();
                             } else {
-                                self.search_state.prev_match();
+                                self.select_prev_search_match();
                             }
                         }
                         egui::Key::ArrowUp => {
                             self.search_state.history_prev();
+                            self.refresh_search_matches();
                         }
                         egui::Key::ArrowDown => {
                             self.search_state.history_next();
+                            self.refresh_search_matches();
                         }
                         _ => {}
                     },
@@ -783,11 +847,14 @@ impl TerminalApp {
             !terminal.preedit_text.is_empty()
         };
 
-        let window_title = {
+        let reported_window_title = {
             let terminal = session.terminal.lock();
             terminal.window_title.clone()
         };
-        if !window_title.is_empty() && window_title != self.last_window_title {
+        let fallback_title = format!("{} — JTerm2", Self::session_cwd_title(session));
+        let window_title =
+            super::window::safe_window_title(&reported_window_title, &fallback_title);
+        if window_title != self.last_window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));
             self.last_window_title = window_title;
         }
@@ -991,5 +1058,27 @@ mod tests {
 
         assert!(routed_terminal_events(&events, true).is_empty());
         assert_eq!(routed_terminal_events(&events, false).len(), 2);
+    }
+
+    #[test]
+    fn paste_confirmation_keeps_focus_off_the_pty_when_replace_panel_stays_open() {
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let blocked = should_block_terminal_input(
+            false, // search
+            false, // settings
+            true,  // Find & Replace remains open behind the confirmation
+            true,  // paste confirmation owns keyboard focus
+            false, // command palette
+            false, // no unrelated text editor focus
+        );
+
+        assert!(blocked);
+        assert!(routed_terminal_events(&[enter], blocked).is_empty());
     }
 }

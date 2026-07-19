@@ -59,6 +59,7 @@ pub struct ConfigPanel {
     custom_themes: Vec<Theme>,
     editing_theme: Option<Theme>,
     custom_theme_name: String,
+    custom_theme_error: Option<String>,
     base_theme_for_new: String,
     // 保存编辑状态
     has_changes: bool,
@@ -93,6 +94,7 @@ impl ConfigPanel {
             custom_themes: Vec::new(),
             editing_theme: None,
             custom_theme_name: String::new(),
+            custom_theme_error: None,
             base_theme_for_new: "dark".to_string(),
             has_changes: false,
         }
@@ -449,7 +451,7 @@ impl ConfigPanel {
         &mut self,
         ui: &mut egui::Ui,
         actions: &mut Vec<ConfigAction>,
-        _theme: &Theme,
+        theme: &Theme,
     ) {
         ui.label(RichText::new("Appearance Settings").strong().size(14.0));
         ui.separator();
@@ -481,6 +483,7 @@ impl ConfigPanel {
                 .unwrap_or(false)
             {
                 self.editing_theme = None;
+                self.custom_theme_error = None;
                 self.has_changes = true;
             }
         });
@@ -497,18 +500,33 @@ impl ConfigPanel {
                     {
                         self.editing_theme = Some(ct.clone());
                         self.custom_theme_name = ct.name.clone();
+                        self.custom_theme_error = None;
                     }
                 }
                 if ui.button("Delete").clicked() {
                     let name = self.edit_theme.clone();
-                    let _ = Theme::delete_custom_theme(&name);
-                    self.edit_theme = "dark".to_string();
-                    self.editing_theme = None;
-                    self.refresh_theme_list();
-                    self.has_changes = true;
+                    match Theme::delete_custom_theme(&name) {
+                        Ok(()) => {
+                            self.edit_theme = "dark".to_string();
+                            self.editing_theme = None;
+                            self.custom_theme_error = None;
+                            self.refresh_theme_list();
+                            self.has_changes = true;
+                        }
+                        Err(error) => {
+                            self.custom_theme_error =
+                                Some(format!("Failed to delete theme: {error}"));
+                        }
+                    }
                 }
             }
         });
+
+        if self.editing_theme.is_none() {
+            if let Some(error) = &self.custom_theme_error {
+                ui.colored_label(warning_color(theme), error);
+            }
+        }
 
         ui.add_space(4.0);
 
@@ -536,6 +554,7 @@ impl ConfigPanel {
                         new_theme.name = custom_name.clone();
                         self.custom_theme_name = custom_name;
                         self.editing_theme = Some(new_theme);
+                        self.custom_theme_error = None;
                     }
                 }
             });
@@ -631,6 +650,7 @@ impl ConfigPanel {
                 &mut self.available_themes,
                 &mut self.custom_themes,
                 &mut self.has_changes,
+                &mut self.custom_theme_error,
             );
         }
     }
@@ -657,6 +677,7 @@ fn render_theme_editor(
     available_themes: &mut Vec<String>,
     custom_themes: &mut Vec<Theme>,
     has_changes: &mut bool,
+    custom_theme_error: &mut Option<String>,
 ) {
     let mut changed = false;
     let mut should_cancel = false;
@@ -677,6 +698,7 @@ fn render_theme_editor(
 
     if should_cancel {
         *editing_theme = None;
+        *custom_theme_error = None;
         return;
     }
 
@@ -685,6 +707,7 @@ fn render_theme_editor(
             theme.name.clone_from(custom_theme_name);
             if let Err(e) = theme.save_custom_theme() {
                 eprintln!("[Theme] Failed to save: {}", e);
+                *custom_theme_error = Some(format!("Failed to save theme: {e}"));
             } else {
                 edit_theme.clone_from(&theme.name);
                 // Refresh theme list
@@ -700,16 +723,22 @@ fn render_theme_editor(
                 }
                 *available_themes = themes;
                 *has_changes = true;
+                *custom_theme_error = None;
+                *editing_theme = None;
+                return;
             }
         }
-        *editing_theme = None;
-        return;
     }
 
     ui.horizontal(|ui| {
         ui.label("Name:");
-        ui.text_edit_singleline(custom_theme_name);
+        if ui.text_edit_singleline(custom_theme_name).changed() {
+            *custom_theme_error = None;
+        }
     });
+    if let Some(error) = custom_theme_error.as_deref() {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
 
     ui.add_space(4.0);
 

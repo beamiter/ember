@@ -5,10 +5,13 @@ use crate::{command_palette, config, config_panel, layout, search_replace_panel,
 use eframe::egui;
 
 impl TerminalApp {
-    /// Pane 数量按需增长时，为每个可见 pane 保留独立 renderer/GPU surface。
-    /// 过去启动时只预建 4 个 renderer，超过后布局存在但内容不会被绘制。
+    /// Keep exactly one renderer per pane while split mode is active. This
+    /// removes the old four-pane ceiling and also releases texture caches when
+    /// panes are closed. Zoom keeps the underlying split renderers warm.
     fn ensure_pane_renderer_capacity(&mut self, ctx: &egui::Context) {
-        let required = self.layout_manager.panes().len();
+        let pane_count = self.layout_manager.panes.len();
+        let required = if pane_count > 1 { pane_count } else { 0 };
+        self.pane_renderers.truncate(required);
         while self.pane_renderers.len() < required {
             let mut renderer = crate::ui::TerminalRenderer::new(
                 self.renderer.font_size,
@@ -70,6 +73,7 @@ impl TerminalApp {
         // so split commands can validate the resulting child sizes before
         // creating another shell session.
         self.layout_manager.compute_pane_rects(available_rect);
+        self.ensure_pane_renderer_capacity(ctx);
         let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
@@ -93,8 +97,6 @@ impl TerminalApp {
 
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
         if self.layout_manager.panes().len() > 1 {
-            self.ensure_pane_renderer_capacity(ctx);
-
             // 获取所有窗格信息
             let panes = self.layout_manager.panes().to_vec();
             let divider_rects = self.layout_manager.get_divider_rects();
@@ -323,6 +325,7 @@ impl TerminalApp {
             // 单窗格渲染（原有逻辑）
             {
                 let session = self.session_manager.get_active_session_mut();
+                let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                 let mut terminal_guard = session.terminal.lock();
 
                 // 获取链接列表用于渲染（使用缓存）
@@ -331,6 +334,7 @@ impl TerminalApp {
 
                 if grid_version != self.cached_links_grid_version
                     || scroll_offset != self.cached_links_scroll_offset
+                    || terminal_ptr != self.cached_links_terminal_ptr
                 {
                     let visible_cells = terminal_guard.get_visible_cells();
                     let row_wrapped = terminal_guard.get_visible_row_wrapped();
@@ -339,6 +343,7 @@ impl TerminalApp {
                         .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
                     self.cached_links_grid_version = grid_version;
                     self.cached_links_scroll_offset = scroll_offset;
+                    self.cached_links_terminal_ptr = terminal_ptr;
                 }
                 self.renderer.render(
                     ui,
@@ -355,26 +360,43 @@ impl TerminalApp {
 
     #[allow(deprecated)]
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
-        let search_needs_refresh = if self.search_state.is_open {
+        const LIVE_SEARCH_REFRESH_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(300);
+        let (search_needs_refresh, delayed_refresh) = if self.search_state.is_open {
             let session_idx = self.session_manager.active_index();
             let grid_version = {
                 let session = self.session_manager.get_active_session_mut();
                 session.terminal.lock().get_grid_version()
             };
-            self.search_state.results_session_idx != Some(session_idx)
-                || self.search_state.results_grid_version != Some(grid_version)
+            let session_changed = self.search_state.results_session_idx != Some(session_idx);
+            let grid_changed = self.search_state.results_grid_version != Some(grid_version);
+            let elapsed = self
+                .search_state
+                .results_refreshed_at
+                .map(|refreshed| refreshed.elapsed())
+                .unwrap_or(LIVE_SEARCH_REFRESH_INTERVAL);
+            (
+                session_changed || (grid_changed && elapsed >= LIVE_SEARCH_REFRESH_INTERVAL),
+                grid_changed
+                    .then_some(LIVE_SEARCH_REFRESH_INTERVAL.saturating_sub(elapsed))
+                    .filter(|remaining| !remaining.is_zero()),
+            )
         } else {
-            false
+            (false, None)
         };
         if search_needs_refresh {
             self.refresh_search_matches();
+        } else if let Some(delay) = delayed_refresh {
+            ctx.request_repaint_after(delay);
         }
 
         // 搜索面板 UI（浮动窗口，右上角）
         if self.search_state.is_open {
             let screen_rect = ctx.viewport_rect();
             let search_width = (screen_rect.width() - 24.0).clamp(300.0, 520.0);
-            let search_height = if self.search_state.error_message.is_some() {
+            let search_height = if self.search_state.error_message.is_some()
+                || self.search_state.results_truncated
+            {
                 82.0
             } else {
                 52.0
@@ -432,9 +454,14 @@ impl TerminalApp {
                         // 显示匹配计数
                         if !self.search_state.matches.is_empty() {
                             ui.label(format!(
-                                "{}/{}",
+                                "{}/{}{}",
                                 self.search_state.current_match_index + 1,
-                                self.search_state.matches.len()
+                                self.search_state.matches.len(),
+                                if self.search_state.results_truncated {
+                                    "+"
+                                } else {
+                                    ""
+                                }
                             ));
                         } else if !self.search_state.query.is_empty() {
                             ui.label("No matches");
@@ -446,10 +473,12 @@ impl TerminalApp {
                             .on_hover_text("Previous match (Shift+Enter)")
                             .clicked()
                         {
-                            self.search_state.prev_match();
+                            self.select_prev_search_match();
+                            self.search_state.search_focused = true;
                         }
                         if ui.button("↓").on_hover_text("Next match (Enter)").clicked() {
-                            self.search_state.next_match();
+                            self.select_next_search_match();
+                            self.search_state.search_focused = true;
                         }
 
                         // 关闭按钮
@@ -462,6 +491,14 @@ impl TerminalApp {
                     // 显示错误信息（如正则表达式错误）
                     if let Some(error) = &self.search_state.error_message {
                         ui.label(egui::RichText::new(error).color(egui::Color32::RED));
+                    } else if self.search_state.results_truncated {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Showing the first {} matches",
+                                crate::search::MAX_SEARCH_MATCHES
+                            ))
+                            .color(egui::Color32::YELLOW),
+                        );
                     }
                 });
         }
@@ -665,9 +702,6 @@ impl TerminalApp {
         );
         self.help_panel.is_open = help_open;
 
-        // 危险粘贴确认弹窗:含换行或超过阈值时,先让用户预览并按"粘贴 / 取消"。
-        self.show_paste_confirm_dialog(ctx);
-
         // 配置面板 UI（浮动窗口）
         let config_actions = self.config_panel.show(ctx, &self.current_theme);
         for action in config_actions {
@@ -725,13 +759,33 @@ impl TerminalApp {
                                 }
                             }
                             search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
-                                let write_result = {
+                                let paste_result = {
                                     let session = self.session_manager.get_active_session_mut();
-                                    session.shell.write(result.as_bytes())
+                                    crate::paste_text_into_session(
+                                        session,
+                                        result,
+                                        self.config.paste_confirm,
+                                        false,
+                                        &mut self.pending_paste_confirm,
+                                    )
                                 };
-                                if let Err(error) = write_result {
-                                    self.search_replace_panel.status =
-                                        format!("Terminal write failed: {error}");
+                                match paste_result {
+                                    Ok(true) if self.pending_paste_confirm.is_some() => {
+                                        self.search_replace_panel.status =
+                                            "Awaiting paste confirmation".to_string();
+                                    }
+                                    Ok(true) => {
+                                        self.search_replace_panel.status =
+                                            "Typed into terminal".to_string();
+                                    }
+                                    Ok(false) => {
+                                        self.search_replace_panel.status =
+                                            "Nothing to type".to_string();
+                                    }
+                                    Err(error) => {
+                                        self.search_replace_panel.status =
+                                            format!("Terminal paste failed: {error}");
+                                    }
                                 }
                             }
                         }
@@ -742,6 +796,12 @@ impl TerminalApp {
                 }
             }
         }
+
+        // Render after every surface that can create a pending paste. This
+        // gives the modal top focus in the same frame as Find & Replace's
+        // "Type into terminal" action, so Enter/Escape cannot return to the
+        // panel or leak into the PTY underneath.
+        self.show_paste_confirm_dialog(ctx);
 
         // 状态 toast(右下角)——把分散在 input/main/window 里写入 status_message
         // 的反馈集中显示;过期由 current_status_for_display 内部判定后清理。
@@ -955,12 +1015,11 @@ impl TerminalApp {
         {
             return;
         }
-        let bytes = pending.text.as_bytes().to_vec();
-        let paste_bytes = if pending.bracketed {
-            crate::wrap_bracketed_paste(bytes)
-        } else {
-            bytes
-        };
+        let paste_bytes = crate::encode_terminal_paste(
+            &pending.text,
+            pending.bracketed,
+            pending.submit_after_paste,
+        );
         let write_result = {
             let session = self.session_manager.get_active_session_mut();
             session.shell.write(&paste_bytes)

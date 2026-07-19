@@ -370,6 +370,11 @@ enum CompressedLineData {
 }
 
 impl ScrollbackLine {
+    #[inline]
+    pub fn columns(&self) -> usize {
+        self.cols as usize
+    }
+
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
         let cols = cells.len() as u16;
         let trailing_blanks = cells

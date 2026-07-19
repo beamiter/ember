@@ -12,16 +12,19 @@ claimed.
 
 - WGPU terminal grid rendering with a CPU/Glow fallback
 - Tabs, drag-to-reorder, rename, activity indicators and split-layout restore
-- Nested horizontal and vertical splits; every split starts an independent shell session
+- Nested horizontal and vertical splits, focused-pane zoom and one-command
+  divider equalization; every split starts an independent shell session
 - Unicode width handling, combining characters, ligatures and font fallback
-- Search, match navigation, selection-aware replace, and a continuous-grid
+- Full-scrollback search with auto-reveal navigation, bounded live refresh,
+  selection-aware replace, and a continuous-grid
   [semantic command timeline](docs/rsh-semantic-executions.md) (OSC 133)
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
 - Clickable URLs, IP addresses and local paths
-- Built-in/custom themes, live configuration reload and configurable bindings
+- Built-in/custom themes, live configuration reload and resilient configurable bindings
 - Bounded PTY channels, adaptive parsing budgets and dirty-row GPU uploads
+- Crash-safe atomic config/history/session writes and private state-file permissions
 
 ### Kitty graphics compatibility
 
@@ -78,6 +81,14 @@ Set `JTERM2_SHELL` to override shell detection for one launch:
 
 ```bash
 JTERM2_SHELL=/bin/zsh cargo run --release
+```
+
+Bare shell names are resolved through `PATH`; relative paths such as
+`./my-shell` remain explicit. Operational warnings are enabled by default.
+Enable deeper diagnostics when needed:
+
+```bash
+RUST_LOG=jterm2=debug cargo run
 ```
 
 ## Configuration
@@ -147,6 +158,8 @@ Defaults include:
 | Left/right / top/bottom split | `Ctrl+Shift+E` / `Ctrl+Shift+D` |
 | Focus pane by direction | `Ctrl+Alt+Arrow` |
 | Resize pane divider | `Ctrl+Alt+Shift+Arrow` |
+| Zoom / restore focused pane | `Ctrl+Shift+Enter` |
+| Equalize all pane dividers | Command palette: “Equalize Panes” |
 | Font size increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
@@ -158,10 +171,20 @@ a flat TOML table:
 "ctrl+shift+t" = "session:new"
 "ctrl+alt+right" = "pane:focus_right"
 "ctrl+alt+left" = "pane:focus_left"
+"ctrl+shift+w" = "none" # remove a default binding
 ```
+
+Modifier order and common aliases (`Control`, `Cmd`, `Enter`, `ArrowLeft`,
+and similar) are normalized. Invalid entries are reported and skipped without
+discarding the other valid overrides.
 
 The in-app help panel is generated from the active bindings, so it reflects
 customizations.
+
+Search results are capped at 20,000 matches to keep broad queries bounded.
+When old scrollback must be reflowed after a width change, jterm2 keeps the
+results and navigation but suppresses any historical highlight whose raw
+coordinate cannot yet be mapped exactly, rather than painting the wrong cell.
 
 ## Security notes
 
@@ -171,7 +194,11 @@ customizations.
   single-use token created by an actual user paste action. The token is scoped
   to the MIME types announced for that paste.
 - Multiline or large text paste asks for confirmation by default.
+- Carriage returns are normalized before that policy is evaluated, and UI
+  commands place their submit key outside bracketed-paste markers.
 - Embedded bracketed-paste terminators are removed before forwarding data.
+- Custom-theme names are restricted to one safe filename component; theme
+  saves replace symlinks rather than following them outside the theme directory.
 - Link targets are shown before opening and require `Ctrl+Click`.
 
 Terminal output is untrusted input. Keep the read policy disabled unless a

@@ -367,15 +367,6 @@ impl Config {
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::config_path()?;
-        let config_dir = config_path
-            .parent()
-            .ok_or("Config path has no parent directory")?;
-
-        // Create config directory if it doesn't exist
-        std::fs::create_dir_all(config_dir)?;
-
-        // 原子写:先写临时文件、fsync 落盘,再 rename,避免崩溃/掉电后得到损坏或空的配置。
-        use std::io::Write;
         // Persist only values that the runtime can safely consume. This also
         // protects callers outside the settings panel (or future migrations)
         // from writing NaN/zero dimensions that make the next startup fail.
@@ -384,16 +375,7 @@ impl Config {
             eprintln!("[Config] WARNING while saving: {}", warning);
         }
         let content = toml::to_string_pretty(&normalized)?;
-        let tmp_path = config_path.with_extension("toml.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(content.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, &config_path)?;
-        if let Ok(dir) = std::fs::File::open(config_dir) {
-            let _ = dir.sync_all();
-        }
+        crate::atomic_file::write_atomic(&config_path, content.as_bytes())?;
         eprintln!("[Config] Saved to {}", config_path.display());
         Ok(())
     }

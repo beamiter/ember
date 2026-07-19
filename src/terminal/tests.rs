@@ -1,7 +1,8 @@
 use super::{
-    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, TerminalState,
-    UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-    MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE,
+    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, ScrollbackLine,
+    TerminalCell, TerminalState, UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES,
+    MAX_COMPLETED_COMMAND_OUTPUT_BYTES, MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES,
+    MAX_PENDING_ESCAPE,
 };
 
 // `a=t` is the protocol default. Omitting it also guards against regressing to
@@ -534,6 +535,42 @@ fn visible_cells_keep_rectangular_shape_after_resize_with_scrollback() {
     assert!(visible.iter().all(|row| row.len() == 5));
     assert_eq!(visible[0][0].character, 'A');
     assert_eq!(visible[0][4].character, ' ');
+}
+
+#[test]
+fn resize_invalidates_an_already_populated_visible_cells_cache() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"abcd");
+    let cached = terminal.get_visible_cells();
+    assert_eq!(cached.len(), 2);
+    assert!(cached.iter().all(|row| row.len() == 4));
+    let version_before = terminal.get_grid_version();
+
+    terminal.on_resize(6, 3);
+    let resized = terminal.get_visible_cells();
+
+    assert!(terminal.get_grid_version() > version_before);
+    assert_eq!(resized.len(), 3);
+    assert!(resized.iter().all(|row| row.len() == 6));
+    assert_eq!(resized[0][0].character, 'a');
+}
+
+#[test]
+fn viewport_mapping_exactness_is_recomputed_when_height_changes() {
+    let mut terminal = TerminalState::new(4, 2);
+    let line = vec![TerminalCell::default(); 4];
+    for index in 0..5 {
+        terminal
+            .scrollback
+            .push_back(ScrollbackLine::compress(&line, index == 0));
+    }
+    terminal.total_lines_scrolled = 5;
+    terminal.scroll_offset = 1;
+    assert!(terminal.viewport_buffer_mapping_is_exact());
+
+    terminal.on_resize(4, 4);
+    terminal.scroll_offset = 1;
+    assert!(!terminal.viewport_buffer_mapping_is_exact());
 }
 
 #[test]

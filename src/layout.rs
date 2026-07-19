@@ -67,6 +67,9 @@ pub struct LayoutManager {
     split_counter: usize,
     root: Option<LayoutNode>,
     last_container_rect: Rect,
+    /// Transient focus mode. The recursive split tree stays intact while the
+    /// renderer sees only the focused pane; this state is not persisted.
+    zoomed: bool,
 }
 
 impl LayoutManager {
@@ -86,6 +89,7 @@ impl LayoutManager {
             split_counter: 0,
             root: Some(LayoutNode::Pane(PaneId(0))),
             last_container_rect: Rect::ZERO,
+            zoomed: false,
         }
     }
 
@@ -187,6 +191,7 @@ impl LayoutManager {
             split_counter: next_split_id,
             root: Some(root),
             last_container_rect: Rect::ZERO,
+            zoomed: false,
         };
         layout.update_focus_flags();
         layout
@@ -299,6 +304,7 @@ impl LayoutManager {
         self.pane_counter += 1;
         self.split_counter += 1;
         self.focused_pane_id = new_id;
+        self.zoomed = false;
         self.update_focus_flags();
         Ok(())
     }
@@ -353,10 +359,24 @@ impl LayoutManager {
             return true;
         }
 
-        let (available, minimum) = if horizontal {
-            (pane.rect.height(), minimum_pane_size.y)
+        let unzoomed_rect = if self.zoomed {
+            let mut rects = Vec::with_capacity(self.panes.len());
+            if let Some(root) = &self.root {
+                Self::collect_pane_rects(root, self.last_container_rect, &mut rects);
+            }
+            rects
+                .into_iter()
+                .find(|(pane_id, _)| *pane_id == pane.id)
+                .map(|(_, rect)| rect)
+                .unwrap_or(pane.rect)
         } else {
-            (pane.rect.width(), minimum_pane_size.x)
+            pane.rect
+        };
+
+        let (available, minimum) = if horizontal {
+            (unzoomed_rect.height(), minimum_pane_size.y)
+        } else {
+            (unzoomed_rect.width(), minimum_pane_size.x)
         };
         available.is_finite() && minimum.is_finite() && minimum > 0.0 && available >= minimum * 2.0
     }
@@ -405,6 +425,7 @@ impl LayoutManager {
 
         self.remove_pane(target);
         self.focused_pane_id = next_focus;
+        self.zoomed = false;
         self.update_focus_flags();
         Ok(())
     }
@@ -446,6 +467,7 @@ impl LayoutManager {
 
     /// 某个会话被关闭后,修正所有窗格保存的 session_idx。
     pub fn on_session_removed(&mut self, removed_idx: usize, fallback_idx: usize) {
+        self.zoomed = false;
         let removed_panes: Vec<PaneId> = self
             .panes
             .iter()
@@ -543,6 +565,9 @@ impl LayoutManager {
         if next_id == self.focused_pane_id {
             return false;
         }
+        // A successful navigation reveals the full layout. A failed
+        // directional command must not unexpectedly cancel zoom.
+        self.zoomed = false;
         self.focused_pane_id = next_id;
         self.update_focus_flags();
         true
@@ -634,6 +659,9 @@ impl LayoutManager {
 
     /// 沿指定物理方向移动离当前 pane 最近、轴向匹配的分隔线。
     pub fn resize_split(&mut self, direction: PaneDirection, step: f32) -> bool {
+        if self.zoomed {
+            return false;
+        }
         let axis = match direction {
             PaneDirection::Left | PaneDirection::Right => SplitAxis::Vertical,
             PaneDirection::Up | PaneDirection::Down => SplitAxis::Horizontal,
@@ -742,9 +770,53 @@ impl LayoutManager {
         }
     }
 
-    /// 获取所有窗格
+    /// Toggle a temporary focused-pane view without modifying the split tree,
+    /// shell sessions, or persisted layout. Returns false for a single pane.
+    pub fn toggle_focused_pane_zoom(&mut self) -> bool {
+        if self.panes.len() <= 1 {
+            self.zoomed = false;
+            return false;
+        }
+        self.zoomed = !self.zoomed;
+        true
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// Reset every nested divider to an even 50/50 split.
+    pub fn equalize_splits(&mut self) -> bool {
+        self.root.as_mut().is_some_and(Self::equalize_node)
+    }
+
+    fn equalize_node(node: &mut LayoutNode) -> bool {
+        match node {
+            LayoutNode::Pane(_) => false,
+            LayoutNode::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let changed = (*ratio - 0.5).abs() > f32::EPSILON;
+                *ratio = 0.5;
+                changed | Self::equalize_node(first) | Self::equalize_node(second)
+            }
+        }
+    }
+
+    /// 获取当前可见窗格。聚焦缩放时只暴露焦点 pane，底层树保持不变。
     pub fn panes(&self) -> &[Pane] {
-        &self.panes
+        if self.zoomed {
+            self.panes
+                .iter()
+                .position(|pane| pane.id == self.focused_pane_id)
+                .map(|index| &self.panes[index..index + 1])
+                .unwrap_or(&[])
+        } else {
+            &self.panes
+        }
     }
 
     /// 返回当前焦点窗格对应的 session 索引
@@ -758,7 +830,7 @@ impl LayoutManager {
     /// 根据坐标设置焦点窗格,命中则返回该窗格的 session 索引。
     pub fn focus_pane_at(&mut self, pos: egui::Pos2) -> Option<usize> {
         let hit = self
-            .panes
+            .panes()
             .iter()
             .find(|pane| pane.rect.contains(pos))
             .map(|pane| (pane.id, pane.session_idx));
@@ -782,6 +854,15 @@ impl LayoutManager {
         for (pane_id, rect) in rects {
             if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
                 pane.rect = rect;
+            }
+        }
+        if self.zoomed {
+            if let Some(focused) = self
+                .panes
+                .iter_mut()
+                .find(|pane| pane.id == self.focused_pane_id)
+            {
+                focused.rect = container;
             }
         }
         self.update_focus_flags();
@@ -825,6 +906,9 @@ impl LayoutManager {
 
     /// 获取所有可交互分隔线。顺序为父节点到子节点。
     pub fn get_divider_rects(&self) -> Vec<SplitDivider> {
+        if self.zoomed {
+            return Vec::new();
+        }
         let mut dividers = Vec::with_capacity(self.panes.len().saturating_sub(1));
         if let Some(root) = &self.root {
             Self::collect_dividers(root, self.last_container_rect, &mut dividers);
@@ -1177,5 +1261,81 @@ mod tests {
         assert!(layout.set_split_ratio(divider.id, 0.7));
         layout.compute_pane_rects(test_rect());
         assert_eq!(layout.get_divider_rects()[0].rect.center().x, 700.0);
+    }
+
+    #[test]
+    fn zoom_exposes_only_the_focused_pane_without_losing_the_layout() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, true).unwrap();
+        layout.compute_pane_rects(test_rect());
+
+        assert!(layout.toggle_focused_pane_zoom());
+        layout.compute_pane_rects(test_rect());
+        assert!(layout.is_zoomed());
+        assert_eq!(layout.panes().len(), 1);
+        assert_eq!(layout.panes()[0].session_idx, 2);
+        assert_eq!(layout.panes()[0].rect, test_rect());
+        assert!(layout.get_divider_rects().is_empty());
+
+        assert!(layout.toggle_focused_pane_zoom());
+        layout.compute_pane_rects(test_rect());
+        assert!(!layout.is_zoomed());
+        assert_eq!(layout.panes().len(), 3);
+        assert_eq!(layout.get_divider_rects().len(), 2);
+    }
+
+    #[test]
+    fn equalize_resets_every_nested_divider() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, true).unwrap();
+        layout.compute_pane_rects(test_rect());
+        let dividers = layout.get_divider_rects();
+        assert!(layout.set_split_ratio(dividers[0].id, 0.7));
+        assert!(layout.set_split_ratio(dividers[1].id, 0.3));
+
+        assert!(layout.equalize_splits());
+        layout.compute_pane_rects(test_rect());
+        let dividers = layout.get_divider_rects();
+        assert_eq!(dividers[0].rect.center().x, test_rect().center().x);
+        assert_eq!(
+            dividers[1].rect.center().y,
+            dividers[1].container_rect.center().y
+        );
+        assert!(!layout.equalize_splits());
+    }
+
+    #[test]
+    fn zoom_cannot_bypass_the_underlying_pane_minimum_size() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.compute_pane_rects(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(100.0, 100.0),
+        ));
+        let divider = layout.get_divider_rects()[0];
+        assert!(layout.set_split_ratio(divider.id, 0.9));
+        layout.compute_pane_rects(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(100.0, 100.0),
+        ));
+        assert!(layout.toggle_focused_pane_zoom());
+        layout.compute_pane_rects(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(100.0, 100.0),
+        ));
+
+        assert!(!layout.can_split_focused_pane(false, egui::vec2(30.0, 30.0)));
+    }
+
+    #[test]
+    fn failed_directional_focus_keeps_zoom_active() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        assert!(layout.toggle_focused_pane_zoom());
+
+        assert!(!layout.focus_pane(PaneDirection::Right));
+        assert!(layout.is_zoomed());
     }
 }

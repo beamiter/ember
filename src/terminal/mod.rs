@@ -72,6 +72,16 @@ const MAX_OSC_5522_MIME_LEN: usize = 256;
 
 type VisibleCellsCache = (u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>);
 
+#[derive(Clone, Copy)]
+struct ViewportMappingExactCache {
+    cols: usize,
+    rows: usize,
+    scroll_offset: usize,
+    scrollback_len: usize,
+    total_lines_scrolled: u64,
+    exact: bool,
+}
+
 /// Hard cap on tracked OSC 133 command records. Protocol strings are bounded
 /// separately, so even an untrusted process attached to the PTY cannot grow
 /// terminal state without limit.
@@ -100,7 +110,7 @@ pub struct CommandMark {
 /// `line_id` is monotonic for the lifetime of the primary screen. Unlike a
 /// scrollback index it does not change when old scrollback rows are evicted.
 /// An anchor can nevertheless become unavailable once its row is evicted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BufferAnchor {
     pub line_id: u64,
     pub column: usize,
@@ -394,6 +404,10 @@ pub struct TerminalState {
 
     // Cached visible cells to avoid per-frame cloning
     visible_cells_cache: Option<VisibleCellsCache>,
+    /// Cached answer for whether raw buffer coordinates exactly match the
+    /// lazily reflowed viewport. Interior mutability keeps per-match lookup
+    /// O(1) while the first lookup for a new viewport performs one scan.
+    viewport_mapping_exact_cache: std::cell::Cell<Option<ViewportMappingExactCache>>,
 
     // OSC 8 hyperlink tracking
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)

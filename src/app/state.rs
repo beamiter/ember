@@ -30,6 +30,10 @@ pub struct PendingPasteConfirm {
     /// completely different PTY after confirmation.
     pub session_id: String,
     pub bracketed: bool,
+    /// Trusted UI commands (currently the Files sidebar's quoted `cd`) keep
+    /// the final Enter outside bracketed-paste mode so Readline executes them
+    /// after confirmation instead of merely inserting them.
+    pub submit_after_paste: bool,
 }
 
 /// Show the confirmation dialog when the paste contains a newline (the most
@@ -140,9 +144,10 @@ pub struct TerminalApp {
     pub cached_links: Vec<link::Link>,
     pub cached_links_grid_version: u64,
     pub cached_links_scroll_offset: usize,
-    /// 缓存所属的活跃会话索引;切换 pane/会话时需失效,
-    /// 否则不同终端碰巧相同的 grid_version 会复用上一个会话的过期链接。
-    pub cached_links_session_idx: usize,
+    /// Cache identity must follow the terminal object, not a reusable session
+    /// vector index. A closed tab can be replaced at the same index with the
+    /// same grid version and scroll offset.
+    pub cached_links_terminal_ptr: usize,
 
     // Keybindings
     pub keybindings: keybindings::KeyBindings,

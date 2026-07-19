@@ -79,31 +79,8 @@ impl SessionsSnapshot {
 
     /// 保存到文件（原子写入 + fsync 持久化）
     pub fn save(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
         let json = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_file_name(
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .map(|name| format!("{}.tmp", name))
-                .unwrap_or_else(|| "session_history.json.tmp".to_string()),
-        );
-        // 写入临时文件并 fsync:rename 只保证元数据原子性,若数据块未落盘,
-        // 崩溃/掉电后可能得到一个空或被截断的文件。必须先 sync_all 再 rename。
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(json.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, path).or_else(|_| {
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp_path, path)
-        })?;
-        // fsync 父目录,确保 rename 这条目录项本身也持久化。
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        crate::atomic_file::write_atomic(path, json.as_bytes())?;
         eprintln!("[SessionPersistence] Sessions saved to {}", path.display());
         Ok(())
     }
@@ -129,20 +106,23 @@ impl SessionsSnapshot {
     }
 }
 
-/// 尝试获取实例锁文件。成功返回 Some(File)（持有锁），失败表示已有实例在运行。
-pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
-    let lock_path = dirs::config_dir()?.join("jterm2").join("instance.lock");
+fn try_acquire_instance_lock_at(
+    lock_path: &std::path::Path,
+) -> std::io::Result<Option<std::fs::File>> {
     if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
 
-    // 尝试以排他锁方式打开文件
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&lock_path)
-        .ok()?;
+    // Do not truncate before flock: a losing second instance must leave the
+    // lock owner's diagnostic PID intact.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(lock_path)?;
 
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
@@ -150,14 +130,36 @@ pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
     // SAFETY: flock 对有效的文件描述符是安全的。fd 来自有效的 File 对象，
     // 标志是合法的 flock 常量。File 对象的生命周期确保 fd 在调用期间有效。
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 {
-        // 写入 PID 方便调试
-        use std::io::Write;
-        let mut f = &file;
-        let _ = write!(f, "{}", std::process::id());
-        Some(file)
-    } else {
-        None // 已有实例持有锁
+    if ret != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+
+    // Only the lock owner may replace the diagnostic PID.
+    use std::io::{Seek, Write};
+    file.set_len(0)?;
+    file.rewind()?;
+    write!(file, "{}", std::process::id())?;
+    file.sync_all()?;
+    Ok(Some(file))
+}
+
+/// 尝试获取实例锁文件。成功返回 Some(File)（持有锁），失败表示已有实例在运行。
+pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
+    let lock_path = dirs::config_dir()?.join("jterm2").join("instance.lock");
+    match try_acquire_instance_lock_at(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "[SessionPersistence] Failed to acquire instance lock {}: {}",
+                lock_path.display(),
+                error
+            );
+            None
+        }
     }
 }
 
@@ -176,6 +178,17 @@ pub fn ensure_session_history_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_LOCK_TEST: AtomicU64 = AtomicU64::new(0);
+
+    fn lock_test_path() -> std::path::PathBuf {
+        let id = NEXT_LOCK_TEST.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "jterm2-instance-lock-test-{}-{id}.lock",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn test_snapshot_conversion() {
@@ -244,5 +257,35 @@ mod tests {
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.active_index, Some(0));
         assert_eq!(snapshot.layout, None);
+    }
+
+    #[test]
+    fn contending_instance_does_not_truncate_owner_pid() {
+        let path = lock_test_path();
+        std::fs::write(&path, "stale-and-long-owner-value").unwrap();
+
+        let owner = try_acquire_instance_lock_at(&path)
+            .unwrap()
+            .expect("first caller should acquire the lock");
+        let expected_pid = std::process::id().to_string();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected_pid);
+
+        let contender = try_acquire_instance_lock_at(&path).unwrap();
+        assert!(contender.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+
+        drop(owner);
+        let replacement = try_acquire_instance_lock_at(&path)
+            .unwrap()
+            .expect("lock should be available after its owner drops");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+        drop(replacement);
+        std::fs::remove_file(path).unwrap();
     }
 }

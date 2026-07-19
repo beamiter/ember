@@ -64,28 +64,8 @@ impl HistorySnapshot {
 
     /// 原子写入(临时文件 + fsync + rename),失败返回 Err 由调用方决定如何提示。
     pub fn save(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
         let json = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_file_name(
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .map(|name| format!("{}.tmp", name))
-                .unwrap_or_else(|| "ui_history.json.tmp".to_string()),
-        );
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(json.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, path).or_else(|_| {
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp_path, path)
-        })?;
+        crate::atomic_file::write_atomic(path, json.as_bytes())?;
         Ok(())
     }
 }

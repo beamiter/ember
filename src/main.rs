@@ -1,4 +1,5 @@
 mod app;
+mod atomic_file;
 mod char_width;
 mod clipboard;
 mod color;
@@ -577,6 +578,13 @@ fn apply_theme_visuals(ctx: &egui::Context, theme: &theme::Theme) {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Keep operational failures observable by default while allowing
+    // `RUST_LOG=jterm2=debug` (or any normal env_logger filter) to opt into
+    // deeper diagnostics.
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format_timestamp_millis()
+        .try_init();
+
     // 设置panic hook，记录panic信息
     // 注意：panic时Drop可能不会被调用，但我们依赖PR_SET_PDEATHSIG确保子进程退出
     std::panic::set_hook(Box::new(|panic_info| {
@@ -654,13 +662,21 @@ fn should_confirm_paste(text: &str) -> bool {
     text.contains('\n') || text.len() > crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES
 }
 
+/// Normalize every terminal line-ending form before applying the paste safety
+/// policy. A lone carriage return is an executable Enter in canonical shells,
+/// so leaving it untouched would bypass newline confirmation.
+fn normalize_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn paste_text_into_session(
     session: &mut Session,
     text: String,
     paste_confirm: bool,
+    submit_after_paste: bool,
     pending_paste_confirm: &mut Option<crate::app::state::PendingPasteConfirm>,
 ) -> Result<bool, crate::shell::ShellWriteError> {
-    let normalized = text.replace("\r\n", "\n");
+    let normalized = normalize_paste_text(&text);
     if normalized.is_empty() {
         return Ok(false);
     }
@@ -675,23 +691,20 @@ fn paste_text_into_session(
             text: normalized,
             session_id: session.metadata.session_id.clone(),
             bracketed: bracketed_paste,
+            submit_after_paste,
         });
     } else {
         // Retain the normalized source until the all-or-nothing shell enqueue
         // succeeds. On transient backpressure the confirmation flow becomes a
         // durable retry surface even when confirmations were otherwise off.
-        let bytes = normalized.as_bytes().to_vec();
-        let paste_bytes = if bracketed_paste {
-            wrap_bracketed_paste(bytes)
-        } else {
-            bytes
-        };
+        let paste_bytes = encode_terminal_paste(&normalized, bracketed_paste, submit_after_paste);
         if let Err(error) = session.shell.write(&paste_bytes) {
             if error.is_backpressure() {
                 *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
                     text: normalized,
                     session_id: session.metadata.session_id.clone(),
                     bracketed: bracketed_paste,
+                    submit_after_paste,
                 });
             }
             return Err(error);
@@ -699,6 +712,25 @@ fn paste_text_into_session(
     }
 
     Ok(true)
+}
+
+fn encode_terminal_paste(text: &str, bracketed: bool, submit_after_paste: bool) -> Vec<u8> {
+    let payload = if submit_after_paste {
+        text.strip_suffix('\n').unwrap_or(text)
+    } else {
+        text
+    };
+    let mut bytes = if bracketed {
+        wrap_bracketed_paste(payload.as_bytes().to_vec())
+    } else {
+        payload.as_bytes().to_vec()
+    };
+    if submit_after_paste {
+        // Enter must be outside ESC[200~/ESC[201~. Bash/Readline deliberately
+        // does not execute newlines contained inside a bracketed paste.
+        bytes.push(b'\r');
+    }
+    bytes
 }
 
 pub(crate) fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
@@ -1408,7 +1440,13 @@ impl TerminalApp {
         let clipboard = ClipboardManager::new().ok();
         let osc52_clipboard_write_tx = spawn_osc52_clipboard_writer(clipboard.is_some());
 
-        let keybindings = keybindings::KeyBindings::load().unwrap_or_default();
+        let keybindings = match keybindings::KeyBindings::load() {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                eprintln!("[Keybindings] Failed to load keybindings.toml; using defaults: {error}");
+                keybindings::KeyBindings::default()
+            }
+        };
 
         // Load theme
         let current_theme = theme::Theme::get_theme(&cfg.theme).unwrap_or_default();
@@ -1448,22 +1486,9 @@ impl TerminalApp {
             layout_manager.show_session(session_manager.active_index());
         }
 
-        // Create additional renderers for multi-pane support (start with empty)
-        let mut pane_renderers = Vec::new();
-        for _ in 0..4 {
-            let mut pr = TerminalRenderer::new(
-                cfg.font_size,
-                cfg.padding,
-                cfg.line_spacing,
-                cfg.scrollbar_visibility.clone(),
-                current_theme.clone(),
-            );
-            pr.opacity = cfg.opacity;
-            pr.font_ligatures = cfg.font_ligatures;
-            pr.gpu_rendering = cfg.gpu_rendering;
-            pr.wgpu_render_state = wgpu_render_state.clone();
-            pane_renderers.push(pr);
-        }
+        // Multi-pane renderers are allocated on demand and trimmed when panes
+        // close, avoiding four full GPU/text caches in the common one-pane case.
+        let pane_renderers = Vec::new();
 
         // 命令面板/搜索历史:启动时一次性读盘,失败回 Default(load 已吞日志)。
         let history = config::Config::ui_history_path()
@@ -1523,7 +1548,7 @@ impl TerminalApp {
             cached_links: Vec::new(),
             cached_links_grid_version: 0,
             cached_links_scroll_offset: 0,
-            cached_links_session_idx: usize::MAX,
+            cached_links_terminal_ptr: usize::MAX,
             keybindings,
             command_palette,
             force_resize_session: false,
@@ -1672,6 +1697,23 @@ impl TerminalApp {
             return;
         }
 
+        // Follow the shell's authoritative OSC 7 cwd (or the local process
+        // cwd fallback) instead of guessing that a queued `cd` succeeded.
+        // This also keeps the file tree correct after users type `cd` by hand.
+        if self.sidebar.view == sidebar::SidebarView::Files {
+            let reported_cwd = {
+                let session = self.session_manager.get_active_session_mut();
+                let osc7 = session.terminal.lock().current_working_dir.clone();
+                osc7.or_else(|| session_manager::get_process_cwd(session.get_shell_pid()))
+            };
+            let changed_directory = reported_cwd
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_dir() && self.sidebar.current_dir != *path);
+            if let Some(path) = changed_directory {
+                self.sidebar.set_current_dir(path);
+            }
+        }
+
         // Sessions 只属于侧边栏 tab 模式；Files/Commands 在两种布局下都可用。
         let sidebar_tab_mode = matches!(
             self.config.tab_bar_position,
@@ -1695,17 +1737,16 @@ impl TerminalApp {
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
-                    if sidebar_tab_mode {
-                        if ui
+                    if sidebar_tab_mode
+                        && ui
                             .selectable_label(
                                 self.sidebar.view == sidebar::SidebarView::Sessions,
                                 egui::RichText::new("Sessions").strong(),
                             )
                             .clicked()
-                        {
-                            self.sidebar.view = sidebar::SidebarView::Sessions;
-                            view_changed = true;
-                        }
+                    {
+                        self.sidebar.view = sidebar::SidebarView::Sessions;
+                        view_changed = true;
                     }
                     if ui
                         .selectable_label(
@@ -1727,10 +1768,10 @@ impl TerminalApp {
                         self.sidebar.view = sidebar::SidebarView::Commands;
                         view_changed = true;
                     }
-                    if self.sidebar.view == sidebar::SidebarView::Files {
-                        if ui.button("⟳").on_hover_text("Refresh").clicked() {
-                            do_refresh = true;
-                        }
+                    if self.sidebar.view == sidebar::SidebarView::Files
+                        && ui.button("⟳").on_hover_text("Refresh").clicked()
+                    {
+                        do_refresh = true;
                     }
                 });
                 ui.separator();
@@ -1776,12 +1817,40 @@ impl TerminalApp {
         if let Some(p) = cd_path {
             let quoted = shell_single_quote(&p.to_string_lossy());
             let cmd = format!("cd {}\n", quoted);
-            let session = self.session_manager.get_active_session_mut();
-            if let Err(error) = session.shell.write(cmd.as_bytes()) {
-                self.status_message = format!("目录切换命令发送失败：{error}");
-                self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(4));
+            let paste_result = {
+                let session = self.session_manager.get_active_session_mut();
+                paste_text_into_session(
+                    session,
+                    cmd,
+                    self.config.paste_confirm,
+                    true,
+                    &mut self.pending_paste_confirm,
+                )
+            };
+            match paste_result {
+                Ok(true) if self.pending_paste_confirm.is_some() => {
+                    self.status_message =
+                        "请确认目录切换命令；文件树将在 shell 切换后同步".to_string();
+                    self.status_expires_at =
+                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                }
+                Ok(true) => {
+                    self.status_message =
+                        "目录切换命令已发送；文件树将跟随 shell 工作目录".to_string();
+                    self.status_expires_at =
+                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                }
+                Ok(false) => {
+                    self.status_message = "目录切换命令为空，未发送".to_string();
+                    self.status_expires_at =
+                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                }
+                Err(error) => {
+                    self.status_message = format!("目录切换命令发送失败：{error}");
+                    self.status_expires_at =
+                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                }
             }
-            self.sidebar.set_current_dir(p);
         }
         if do_refresh {
             self.sidebar.refresh();
@@ -2319,6 +2388,7 @@ impl eframe::App for TerminalApp {
                                 session,
                                 text,
                                 self.config.paste_confirm,
+                                false,
                                 &mut self.pending_paste_confirm,
                             ) {
                                 Ok(true) => {
@@ -2442,6 +2512,7 @@ impl eframe::App for TerminalApp {
                                     session,
                                     text,
                                     self.config.paste_confirm,
+                                    false,
                                     &mut self.pending_paste_confirm,
                                 ) {
                                     Ok(true) => {
@@ -2849,6 +2920,7 @@ impl eframe::App for TerminalApp {
                     session,
                     text,
                     self.config.paste_confirm,
+                    false,
                     &mut self.pending_paste_confirm,
                 ) {
                     self.status_message = format!("粘贴失败：{error}");
@@ -3378,7 +3450,7 @@ impl eframe::App for TerminalApp {
             } else {
                 if grid_version != self.cached_links_grid_version
                     || scroll_offset != self.cached_links_scroll_offset
-                    || active_session_idx != self.cached_links_session_idx
+                    || terminal_ptr != self.cached_links_terminal_ptr
                 {
                     let visible_cells = terminal.get_visible_cells();
                     let row_wrapped = terminal.get_visible_row_wrapped();
@@ -3387,7 +3459,7 @@ impl eframe::App for TerminalApp {
                         .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
                     self.cached_links_grid_version = grid_version;
                     self.cached_links_scroll_offset = scroll_offset;
-                    self.cached_links_session_idx = active_session_idx;
+                    self.cached_links_terminal_ptr = terminal_ptr;
                 }
                 pointer
                     .zip(self.renderer.last_content_rect)
@@ -3582,13 +3654,13 @@ impl Drop for TerminalApp {
 mod tests {
     use super::{
         bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
-        clipboard_5522_response_for_mime_with_limit, flush_pending_mouse_controls,
-        kitty_graphics_payload, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
-        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, primary_copy_route,
-        queue_mouse_control, reported_capture_button, should_confirm_paste,
-        take_tagged_cursor_move, wrap_bracketed_paste, ClipboardRequestGuard, PrimaryCopyRoute,
-        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
-        OSC_5522_DATA_CHUNK_BYTES,
+        clipboard_5522_response_for_mime_with_limit, encode_terminal_paste,
+        flush_pending_mouse_controls, kitty_graphics_payload, mouse_sequence_allows_lossy,
+        mouse_sequence_is_complete, normalize_paste_text, osc52_clipboard_response_with_limit,
+        osc52_read_rate_limit_allows, primary_copy_route, queue_mouse_control,
+        reported_capture_button, should_confirm_paste, take_tagged_cursor_move,
+        wrap_bracketed_paste, ClipboardRequestGuard, PrimaryCopyRoute, KITTY_BASE64_CHUNK_BYTES,
+        MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -3608,6 +3680,17 @@ mod tests {
     }
 
     #[test]
+    fn paste_normalization_cannot_hide_enter_as_a_carriage_return() {
+        assert_eq!(
+            normalize_paste_text("first\rsecond\r\nthird"),
+            "first\nsecond\nthird"
+        );
+        assert!(should_confirm_paste(&normalize_paste_text(
+            "printf risky\r"
+        )));
+    }
+
+    #[test]
     fn bracketed_paste_cannot_embed_an_early_terminator() {
         let wrapped = wrap_bracketed_paste(b"safe\x1b[201~injected".to_vec());
         assert_eq!(wrapped, b"\x1b[200~safeinjected\x1b[201~");
@@ -3617,6 +3700,18 @@ mod tests {
                 .filter(|window| *window == b"\x1b[201~")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn submitted_ui_command_places_enter_after_bracketed_paste() {
+        assert_eq!(
+            encode_terminal_paste("cd '/tmp'\n", true, true),
+            b"\x1b[200~cd '/tmp'\x1b[201~\r"
+        );
+        assert_eq!(
+            encode_terminal_paste("cd '/tmp'\n", false, true),
+            b"cd '/tmp'\r"
         );
     }
 

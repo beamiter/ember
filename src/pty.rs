@@ -27,6 +27,7 @@ pub enum WriteOutcome {
 #[cfg(unix)]
 mod unix_pty {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
@@ -61,12 +62,28 @@ mod unix_pty {
             .unwrap_or(false)
     }
 
+    fn executable_path(path: &Path) -> Option<String> {
+        if !is_executable(path) {
+            return None;
+        }
+
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        Some(absolute.to_string_lossy().into_owned())
+    }
+
+    fn find_executable_in_path_with(exe_name: &str, path_var: Option<&OsStr>) -> Option<String> {
+        std::env::split_paths(path_var?)
+            .map(|dir| dir.join(exe_name))
+            .find_map(|candidate| executable_path(&candidate))
+    }
+
     fn find_executable_in_path(exe_name: &str) -> Option<String> {
         let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var)
-            .map(|dir| dir.join(exe_name))
-            .find(|candidate| is_executable(candidate))
-            .map(|p| p.to_string_lossy().to_string())
+        find_executable_in_path_with(exe_name, Some(&path_var))
     }
 
     pub(crate) fn shell_single_quote(s: &str) -> String {
@@ -92,11 +109,27 @@ mod unix_pty {
         exec_cmd
     }
 
-    fn choose_shell(configured_shell: Option<&str>) -> String {
+    pub(super) fn choose_shell_with_path(
+        configured_shell: Option<&str>,
+        path_var: Option<&OsStr>,
+        sh_fallback: &Path,
+    ) -> Result<String> {
         // Priority 1: explicit config / env var (needed when PATH is stripped by launchers like wofi)
         if let Some(path) = configured_shell {
-            if is_executable(Path::new(path)) {
-                return path.to_string();
+            let configured_path = Path::new(path);
+            // A bare name is a PATH lookup, never an implicit `./name`.
+            // Otherwise opening a project directory containing a malicious
+            // executable named "bash" could hijack `shell = "bash"`.
+            let is_bare_name = configured_path
+                .file_name()
+                .is_some_and(|name| name == OsStr::new(path));
+            let resolved = if is_bare_name {
+                find_executable_in_path_with(path, path_var)
+            } else {
+                executable_path(configured_path)
+            };
+            if let Some(resolved) = resolved {
+                return Ok(resolved);
             }
             eprintln!(
                 "[PTY] Configured shell '{}' is not executable, falling back",
@@ -105,17 +138,33 @@ mod unix_pty {
         }
 
         // Priority 2: rsh (preferred shell with advanced features)
-        if let Some(rsh_path) = find_executable_in_path("rsh") {
-            return rsh_path;
+        if let Some(rsh_path) = find_executable_in_path_with("rsh", path_var) {
+            return Ok(rsh_path);
         }
 
         // Priority 3: bash (fallback)
-        if let Some(bash_path) = find_executable_in_path("bash") {
-            return bash_path;
+        if let Some(bash_path) = find_executable_in_path_with("bash", path_var) {
+            return Ok(bash_path);
         }
 
-        // Priority 4: sh (last resort)
-        "sh".to_string()
+        // Priority 4: sh (last resort). execve does not search PATH, so never
+        // return a bare "sh" token here.
+        if let Some(sh_path) = find_executable_in_path_with("sh", path_var) {
+            return Ok(sh_path);
+        }
+        if let Some(sh_path) = executable_path(sh_fallback) {
+            return Ok(sh_path);
+        }
+
+        Err(anyhow!(
+            "No executable shell found (tried configured shell, rsh, bash, PATH sh, and {})",
+            sh_fallback.display()
+        ))
+    }
+
+    fn choose_shell(configured_shell: Option<&str>) -> Result<String> {
+        let path_var = std::env::var_os("PATH");
+        choose_shell_with_path(configured_shell, path_var.as_deref(), Path::new("/bin/sh"))
     }
 
     pub struct Pty {
@@ -137,10 +186,6 @@ mod unix_pty {
             // 文件描述符的生命周期被正确管理（成功时存储在 PtySession 中，失败时关闭）。
             // fork 后的子进程分支永不返回（通过 execve 或 exit），避免了未定义行为。
             unsafe {
-                // 1. 创建 PTY
-                let mut master = 0;
-                let mut slave = 0;
-
                 let win_size = libc::winsize {
                     ws_row: rows as u16,
                     ws_col: cols as u16,
@@ -148,37 +193,17 @@ mod unix_pty {
                     ws_ypixel: 0,
                 };
 
-                if libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &win_size,
-                ) != 0
-                {
-                    return Err(anyhow!("Failed to open PTY"));
-                }
-
-                // 2. 设置 master 非阻塞模式
-                let flags = libc::fcntl(master, libc::F_GETFL, 0);
-                if flags >= 0 {
-                    let _ = libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-
-                // 设置 FD_CLOEXEC，防止子进程继承
-                let fd_flags = libc::fcntl(master, libc::F_GETFD, 0);
-                if fd_flags >= 0 {
-                    let _ = libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
-                }
-
-                // 3. fork 之前完成所有分配、加锁、PATH 解析与环境构建。
+                // Before opening file descriptors, complete every fallible
+                // allocation, PATH lookup and CString conversion. This both
+                // keeps the post-fork child async-signal-safe and avoids
+                // leaking a PTY pair if preparation returns an error.
                 // 原因:在多线程进程中 fork 后,子进程直到 execve 之间只能调用
                 // 异步信号安全的函数。malloc/CString/format!/Vec/setenv/std::env/std::fs
                 // 都不安全 —— 若 fork 时另一线程恰好持有 malloc 锁,子进程会永久死锁。
                 // 因此这里预先构建 argv、envp、cwd 的 C 字符串,子进程分支只做 syscall。
 
                 // 选择 shell(读取 env/fs,必须在 fork 前)
-                let shell_path = choose_shell(configured_shell);
+                let shell_path = choose_shell(configured_shell)?;
                 let shell_cstr = CString::new(shell_path.clone())
                     .map_err(|_| anyhow!("Invalid shell path: {}", shell_path))?;
                 let shell_name = Path::new(&shell_path)
@@ -301,7 +326,33 @@ mod unix_pty {
                     env_cstrings.iter().map(|c| c.as_ptr()).collect();
                 envp.push(std::ptr::null());
 
-                // 4. Fork 子进程
+                // Create the PTY only after all `?` exits above are behind us.
+                let mut master = 0;
+                let mut slave = 0;
+                if libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &win_size,
+                ) != 0
+                {
+                    return Err(anyhow!("Failed to open PTY"));
+                }
+
+                // 设置 master 非阻塞模式
+                let flags = libc::fcntl(master, libc::F_GETFL, 0);
+                if flags >= 0 {
+                    let _ = libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+
+                // 设置 FD_CLOEXEC，防止子进程继承
+                let fd_flags = libc::fcntl(master, libc::F_GETFD, 0);
+                if fd_flags >= 0 {
+                    let _ = libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+                }
+
+                // Fork 子进程
                 let fork_result = libc::fork();
 
                 if fork_result < 0 {
@@ -719,6 +770,48 @@ pub use windows_pty::Pty;
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(unix)]
+    static NEXT_SHELL_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    struct ShellTestDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl ShellTestDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_SHELL_TEST.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "jterm2-shell-test-{label}-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn executable(&self, name: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = self.0.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+
+        fn search_path(&self) -> std::ffi::OsString {
+            std::env::join_paths([&self.0]).unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ShellTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn retry_on_eintr_retries_only_interrupted_errors() {
         let mut attempts = 0;
@@ -763,5 +856,51 @@ mod tests {
             super::unix_pty::build_rsh_exec_command("/tmp/rsh", None),
             "exec '/tmp/rsh'"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_bare_shell_name_is_resolved_through_path() {
+        let root = ShellTestDir::new("configured");
+        let executable = root.executable("custom-shell");
+        let search_path = root.search_path();
+
+        let selected = super::unix_pty::choose_shell_with_path(
+            Some("custom-shell"),
+            Some(&search_path),
+            &root.0.join("missing-sh"),
+        )
+        .unwrap();
+
+        assert_eq!(std::path::Path::new(&selected), executable);
+        assert!(std::path::Path::new(&selected).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_fallback_is_resolved_to_an_executable_path() {
+        let root = ShellTestDir::new("path-sh");
+        let executable = root.executable("sh");
+        let search_path = root.search_path();
+
+        let selected = super::unix_pty::choose_shell_with_path(
+            None,
+            Some(&search_path),
+            &root.0.join("missing-sh"),
+        )
+        .unwrap();
+
+        assert_eq!(std::path::Path::new(&selected), executable);
+        assert_ne!(selected, "sh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_shells_return_an_explicit_error() {
+        let root = ShellTestDir::new("missing");
+        let error = super::unix_pty::choose_shell_with_path(None, None, &root.0.join("missing-sh"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("No executable shell found"));
     }
 }

@@ -49,6 +49,26 @@ fn hovered_link_color() -> Color32 {
     Color32::from_rgb(100, 200, 255)
 }
 
+fn viewport_search_map<'a>(
+    terminal: &TerminalState,
+    matches: &'a [crate::search::SearchMatch],
+    rows: usize,
+) -> Vec<Vec<&'a crate::search::SearchMatch>> {
+    let mut map = vec![Vec::new(); rows];
+    if !terminal.viewport_buffer_mapping_is_exact() {
+        return map;
+    }
+    for search_match in matches {
+        if let Some(viewport_row) = search_match
+            .viewport_row(terminal)
+            .filter(|viewport_row| *viewport_row < rows)
+        {
+            map[viewport_row].push(search_match);
+        }
+    }
+    map
+}
+
 fn cursor_rect(
     rect: egui::Rect,
     row: usize,
@@ -1622,7 +1642,7 @@ impl TerminalRenderer {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             search_state.query.hash(&mut h);
-            search_state.matches.len().hash(&mut h);
+            search_state.matches.hash(&mut h);
             search_state.current_match_index.hash(&mut h);
             h.finish()
         };
@@ -1680,8 +1700,11 @@ impl TerminalRenderer {
 
                 // Mark all currently matched lines as dirty
                 for m in &search_state.matches {
-                    if m.line < dirty_rows.len() {
-                        dirty_rows[m.line] = true;
+                    if let Some(viewport_row) = m
+                        .viewport_row(terminal)
+                        .filter(|viewport_row| *viewport_row < dirty_rows.len())
+                    {
+                        dirty_rows[viewport_row] = true;
                     }
                 }
             }
@@ -1746,16 +1769,10 @@ impl TerminalRenderer {
                     map
                 };
 
-                let search_map: Vec<Vec<&crate::search::SearchMatch>> = if !has_search {
+                let search_map = if !has_search {
                     Vec::new()
                 } else {
-                    let mut map = vec![Vec::new(); rows];
-                    for m in &search_state.matches {
-                        if m.line < rows {
-                            map[m.line].push(m);
-                        }
-                    }
-                    map
+                    viewport_search_map(terminal, &search_state.matches, rows)
                 };
 
                 if need_full_rebuild {
@@ -1899,7 +1916,9 @@ impl TerminalRenderer {
         // Update last_search_match_lines for next frame's dirty tracking
         self.last_search_match_lines.clear();
         for m in &search_state.matches {
-            self.last_search_match_lines.push(m.line);
+            if let Some(viewport_row) = m.viewport_row(terminal) {
+                self.last_search_match_lines.push(viewport_row);
+            }
         }
         // 绝大多数帧 hovered_link 不变,先比较再 clone 以省去 String 堆分配。
         if self.last_rendered_hovered_link != *hovered_link {
@@ -2049,7 +2068,10 @@ impl TerminalRenderer {
         // scan per highlighted cell. A match is uniquely identified by (line, col_start).
         let active_match_pos = if has_search && !search_state.matches.is_empty() {
             let idx = search_state.current_match_index % search_state.matches.len();
-            search_state.matches.get(idx).map(|m| (m.line, m.col_start))
+            search_state
+                .matches
+                .get(idx)
+                .map(|m| (m.line_id, m.col_start))
         } else {
             None
         };
@@ -2083,7 +2105,7 @@ impl TerminalRenderer {
                         if col_idx >= m.col_start && col_idx < m.col_end {
                             is_search_match = true;
                             bg_color = color::resolve_fg(cell.foreground, theme, bold, dim);
-                            if active_match_pos == Some((m.line, m.col_start)) {
+                            if active_match_pos == Some((m.line_id, m.col_start)) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
                                     (r as u16 * 180 / 255) as u8,
@@ -2254,6 +2276,17 @@ impl TerminalRenderer {
         line_height: f32,
     ) {
         let has_search = !search_state.matches.is_empty() && !search_state.query.is_empty();
+        let search_map = if has_search {
+            viewport_search_map(terminal, &search_state.matches, rows)
+        } else {
+            Vec::new()
+        };
+        let active_match = if has_search {
+            let index = search_state.current_match_index % search_state.matches.len();
+            search_state.matches.get(index)
+        } else {
+            None
+        };
 
         for (row_idx, row) in grid.iter().enumerate().take(rows) {
             let sel_cols = terminal.row_selection_cols(row_idx);
@@ -2288,13 +2321,12 @@ impl TerminalRenderer {
 
                 let mut is_search_match = false;
                 if has_search {
-                    for (match_idx, m) in search_state.matches.iter().enumerate() {
-                        if m.line == row_idx && col_idx >= m.col_start && col_idx < m.col_end {
+                    let row_matches = search_map.get(row_idx).map(Vec::as_slice).unwrap_or(&[]);
+                    for m in row_matches {
+                        if col_idx >= m.col_start && col_idx < m.col_end {
                             is_search_match = true;
                             bg_color = color::resolve_fg(cell.foreground, &self.theme, bold, dim);
-                            if match_idx
-                                == search_state.current_match_index % search_state.matches.len()
-                            {
+                            if active_match == Some(*m) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
                                     (r as u16 * 180 / 255) as u8,
