@@ -965,7 +965,74 @@ fn link_at_pointer(
         .cloned()
 }
 
+#[derive(Debug)]
+pub(crate) struct DesktopNotification {
+    title: String,
+    body: String,
+}
+
+const DESKTOP_NOTIFICATION_QUEUE_CAPACITY: usize = 8;
+
+fn desktop_notification_channel() -> (
+    crossbeam_channel::Sender<DesktopNotification>,
+    crossbeam_channel::Receiver<DesktopNotification>,
+) {
+    crossbeam_channel::bounded(DESKTOP_NOTIFICATION_QUEUE_CAPACITY)
+}
+
+fn wait_for_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // `kill` can race a natural exit. Either way `wait` is mandatory:
+            // dropping Child does not reap it on Unix.
+            let _ = child.kill();
+            return child.wait();
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+fn spawn_desktop_notification_worker() -> Option<crossbeam_channel::Sender<DesktopNotification>> {
+    let (tx, rx) = desktop_notification_channel();
+    std::thread::Builder::new()
+        .name("desktop-notification-worker".to_string())
+        .spawn(move || {
+            while let Ok(notification) = rx.recv() {
+                match std::process::Command::new("notify-send")
+                    .arg("--")
+                    .arg(notification.title)
+                    .arg(notification.body)
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        if let Err(error) =
+                            wait_for_child_with_timeout(&mut child, Duration::from_secs(2))
+                        {
+                            log::debug!("desktop notification wait failed: {error}");
+                        }
+                    }
+                    Err(error) => log::debug!("desktop notification unavailable: {error}"),
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
 fn show_desktop_notification(
+    notification_tx: Option<&crossbeam_channel::Sender<DesktopNotification>>,
     window_started: &mut std::time::Instant,
     notifications_in_window: &mut usize,
     title: String,
@@ -982,14 +1049,14 @@ fn show_desktop_notification(
     if *notifications_in_window >= MAX_PER_WINDOW {
         return;
     }
-    *notifications_in_window += 1;
-    if let Err(error) = std::process::Command::new("notify-send")
-        .arg("--")
-        .arg(title)
-        .arg(body)
-        .spawn()
+    let Some(notification_tx) = notification_tx else {
+        return;
+    };
+    if notification_tx
+        .try_send(DesktopNotification { title, body })
+        .is_ok()
     {
-        log::debug!("desktop notification unavailable: {error}");
+        *notifications_in_window += 1;
     }
 }
 
@@ -1132,11 +1199,11 @@ fn mouse_sequence_is_complete(
 
 fn spawn_osc52_clipboard_writer(
     clipboard_available: bool,
-) -> Option<crossbeam::channel::Sender<String>> {
+) -> Option<crossbeam_channel::Sender<String>> {
     if !clipboard_available {
         return None;
     }
-    let (tx, rx) = crossbeam::channel::bounded::<String>(1);
+    let (tx, rx) = crossbeam_channel::bounded::<String>(1);
     std::thread::Builder::new()
         .name("osc52-clipboard-writer".to_string())
         .spawn(move || {
@@ -1154,7 +1221,7 @@ fn spawn_osc52_clipboard_writer(
 }
 
 fn enqueue_osc52_clipboard_write(
-    tx: Option<&crossbeam::channel::Sender<String>>,
+    tx: Option<&crossbeam_channel::Sender<String>>,
     window_started: &mut std::time::Instant,
     writes_in_window: &mut usize,
     text: String,
@@ -1349,12 +1416,57 @@ impl TerminalApp {
         let lock_file = session_persistence::try_acquire_instance_lock();
         let is_first_instance = lock_file.is_some();
 
-        // 仅在首个实例且配置允许时恢复会话
+        let mut session_restore_notice = None;
+        let mut session_persistence_blocked = false;
+
+        // 仅在首个实例且配置允许时恢复会话。损坏文件先移到旁路备份；
+        // 若备份失败则禁止本进程保存，绝不让新建的单会话覆盖原始证据。
         let saved_snapshot = if cfg.restore_session && is_first_instance {
-            cfg.resolved_session_history_path()
-                .ok()
-                .and_then(|path| session_persistence::SessionsSnapshot::load(&path).ok())
-                .filter(|s| !s.sessions.is_empty())
+            match cfg.resolved_session_history_path() {
+                Ok(path) => {
+                    match session_persistence::SessionsSnapshot::load_with_warnings(&path) {
+                        Ok((snapshot, warnings)) => {
+                            if !warnings.is_empty() {
+                                for warning in &warnings {
+                                    eprintln!("[SessionPersistence] WARNING: {warning}");
+                                }
+                                session_restore_notice = Some(format!(
+                                    "Session restore adjusted {} unsafe value(s)",
+                                    warnings.len()
+                                ));
+                            }
+                            (!snapshot.sessions.is_empty()).then_some(snapshot)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[SessionPersistence] Failed to load {}: {error}",
+                                path.display()
+                            );
+                            match session_persistence::quarantine_corrupt_snapshot(&path) {
+                                Ok(backup) => {
+                                    session_restore_notice = Some(format!(
+                                        "Session restore failed; original moved to {}",
+                                        backup.display()
+                                    ));
+                                }
+                                Err(backup_error) => {
+                                    session_persistence_blocked = true;
+                                    session_restore_notice = Some(format!(
+                                    "Session restore failed and was not overwritten: {backup_error}"
+                                ));
+                                }
+                            }
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    session_persistence_blocked = true;
+                    session_restore_notice =
+                        Some(format!("Session persistence is unavailable: {error}"));
+                    None
+                }
+            }
         } else {
             if !is_first_instance {
                 eprintln!("[SessionPersistence] Another instance is running, starting fresh");
@@ -1501,6 +1613,10 @@ impl TerminalApp {
         for entry in history.search_history.into_iter().take(50) {
             search_state.history.push_back(entry);
         }
+        let initial_status_expires_at = session_restore_notice
+            .as_ref()
+            .map(|_| std::time::Instant::now() + Duration::from_secs(10));
+        let initial_status_message = session_restore_notice.unwrap_or_default();
 
         Ok(TerminalApp {
             session_manager,
@@ -1517,8 +1633,8 @@ impl TerminalApp {
             next_cursor_blink_time: std::time::Instant::now() + Duration::from_millis(1000),
             cursor_visible: true,
             last_activity_time: std::time::Instant::now(),
-            status_message: String::new(),
-            status_expires_at: None,
+            status_message: initial_status_message,
+            status_expires_at: initial_status_expires_at,
             last_window_title: String::new(),
             hovered_tab_index: None,
             dragging_tab: None,
@@ -1562,8 +1678,9 @@ impl TerminalApp {
             config: cfg.clone(),
             config_save_pending: false,
             config_save_deadline: std::time::Instant::now(),
-            session_save_pending: true, // 启动后立即保存一次（确保首次运行就有记录）
+            session_save_pending: !session_persistence_blocked,
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            session_persistence_blocked,
             _lock_file: lock_file,
             mouse_scroll_accumulator: 0.0,
             terminal_mouse_capture: None,
@@ -1580,6 +1697,7 @@ impl TerminalApp {
             smooth_scroll_pixel_offset: 0.0,
             pending_paste_confirm: None,
             paste_dont_ask_again: false,
+            notification_tx: spawn_desktop_notification_worker(),
             notification_window_started: std::time::Instant::now(),
             notifications_in_window: 0,
         })
@@ -2009,9 +2127,6 @@ impl eframe::App for TerminalApp {
 
         self.debug_panel.record_frame();
 
-        // 自适应调整帧预算：根据帧时间动态调整每帧处理字节数
-        self.adjust_frame_budget();
-
         // A stateful mouse edge admitted in an earlier frame is older than
         // every keyboard/IME event arriving now. Retry it before any session
         // gets a chance to flush user input. If capacity is still unavailable,
@@ -2074,11 +2189,13 @@ impl eframe::App for TerminalApp {
         } else {
             0
         };
+        let background_parse_started = std::time::Instant::now();
         let mut background_pump = self.session_manager.pump_inactive_sessions(
             background_budget,
             &visible_sessions,
             user_input_barrier_session_id.as_deref(),
         );
+        let mut terminal_parse_time = background_parse_started.elapsed();
         for (_session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
             if let Err(error) = execution_journal::submit(completed) {
                 log::warn!("rsh execution output journal queue rejected an event: {error:?}");
@@ -2136,6 +2253,7 @@ impl eframe::App for TerminalApp {
         }
         for (_session_idx, title, body) in background_pump.notifications.drain(..) {
             show_desktop_notification(
+                self.notification_tx.as_ref(),
                 &mut self.notification_window_started,
                 &mut self.notifications_in_window,
                 title,
@@ -2153,9 +2271,10 @@ impl eframe::App for TerminalApp {
                 self.schedule_session_save();
             }
         }
+        let background_processed_bytes = background_pump.bytes_processed;
         let active_output_budget = self
             .adaptive_frame_budget
-            .saturating_sub(background_pump.bytes_processed)
+            .saturating_sub(background_processed_bytes)
             .max(1);
         let background_had_output = background_pump.had_output;
         let background_has_more = background_pump.has_more;
@@ -2195,10 +2314,15 @@ impl eframe::App for TerminalApp {
             return;
         }
 
-        // A command handled above may have opened Settings, Search, Find &
-        // Replace, or a paste confirmation. Re-evaluate before routing the
-        // remainder of this frame to clipboard/PTY handlers.
-        terminal_input_blocked = palette_owned_input || self.terminal_input_blocked(ctx);
+        // A command handled above may have opened or closed a modal. Re-evaluate
+        // newly opened surfaces, but never release a frame that a UI surface
+        // owned at its start: later events in the same OS batch must not escape
+        // into the PTY after the modal-closing shortcut.
+        terminal_input_blocked = app::input::terminal_input_blocked_after_commands(
+            terminal_input_blocked,
+            palette_owned_input,
+            self.terminal_input_blocked(ctx),
+        );
 
         // Route pointer input to the pane under the pointer before taking the
         // active-session borrow below. The renderer used to switch focus only
@@ -2273,165 +2397,27 @@ impl eframe::App for TerminalApp {
         let session = self.session_manager.get_active_session_mut();
         let active_session_id = session.metadata.session_id.clone();
 
-        // Step 3: 处理复制粘贴（从配置系统或硬编码的 Ctrl+Shift+C/V）
+        // Step 3: semantic application paste events. Host copy/paste keyboard
+        // shortcuts are dispatched above through configurable commands.
         let events_copy =
             app::input::routed_terminal_events(&self.frame_events, terminal_input_blocked);
         let mut consumed_keys = std::collections::HashSet::new();
 
-        let mut saw_ctrl_shift_c = false;
-        let mut saw_ctrl_shift_v = false;
-        let mut saw_shift_insert = false;
-        let mut saw_font_zoom_key: Option<&'static str> = None;
-        let mut saw_semantic_paste = false;
-
-        for evt in &events_copy {
-            match evt {
-                egui::Event::Key {
-                    key,
-                    modifiers,
-                    pressed,
-                    ..
-                } => {
-                    // 检查 Ctrl+Shift+C/V（按下事件）
-                    if *pressed {
-                        if *key == egui::Key::C && modifiers.ctrl && modifiers.shift {
-                            crate::debug_log!("[EVENT] detected Ctrl+Shift+C (pressed=true)");
-                            saw_ctrl_shift_c = true;
-                        }
-                        if *key == egui::Key::V && modifiers.ctrl && modifiers.shift {
-                            crate::debug_log!("[EVENT] detected Ctrl+Shift+V (pressed=true)");
-                            saw_ctrl_shift_v = true;
-                        }
-                        if *key == egui::Key::Insert && modifiers.shift && !modifiers.ctrl {
-                            crate::debug_log!("[EVENT] detected Shift+Insert (pressed=true)");
-                            saw_shift_insert = true;
-                        }
-                        if modifiers.ctrl && !modifiers.alt {
-                            match key {
-                                egui::Key::Plus if modifiers.shift => {
-                                    saw_font_zoom_key = Some("Ctrl+Shift+Plus")
-                                }
-                                egui::Key::Plus => saw_font_zoom_key = Some("Ctrl+Plus"),
-                                egui::Key::Equals if !modifiers.shift => {
-                                    saw_font_zoom_key = Some("Ctrl+Equals")
-                                }
-                                egui::Key::Minus if !modifiers.shift => {
-                                    saw_font_zoom_key = Some("Ctrl+Minus")
-                                }
-                                egui::Key::Num0 if !modifiers.shift => {
-                                    saw_font_zoom_key = Some("Ctrl+0")
-                                }
-                                _ => {}
-                            }
-                        }
+        let saw_semantic_paste = events_copy.iter().any(|event| {
+            if let egui::Event::Paste(_content) = event {
+                crate::debug_log!(
+                    "[EVENT] detected Paste event: {:?}",
+                    if _content.is_empty() {
+                        "empty"
+                    } else {
+                        "has content"
                     }
-
-                    // 注意：不再检测 Ctrl+V 释放事件。
-                    // 当 restore_shortcuts=true 时，egui 的 Paste 事件已被转换为
-                    // Key::V pressed，由 ui.rs 发送 0x16 给 PTY，让应用自己处理剪贴板。
-                    // 之前这里检测 Key::V release 会导致终端也读剪贴板并发送文本内容，
-                    // 造成双重粘贴（应用收到 0x16 + bracketed paste 文本）。
-                    // Ctrl+V 粘贴只应通过 Ctrl+Shift+V（显式）或 semantic Paste 事件处理。
-                }
-                egui::Event::Paste(_content) => {
-                    crate::debug_log!(
-                        "[EVENT] detected Paste event: {:?}",
-                        if _content.is_empty() {
-                            "empty"
-                        } else {
-                            "has content"
-                        }
-                    );
-                    saw_semantic_paste = true;
-                }
-                _ => {}
-            }
-        }
-
-        if saw_ctrl_shift_c {
-            if let Some(clipboard) = &self.clipboard {
-                let copied = {
-                    let terminal = session.terminal.lock();
-                    terminal.copy_selection()
-                };
-                if let Some(text) = copied {
-                    let n = text.chars().count();
-                    let (msg, dur) = match clipboard.copy(&text) {
-                        Ok(_) => (format!("已复制 {} 个字符", n), Duration::from_millis(1800)),
-                        Err(e) => {
-                            log::warn!("{}", e);
-                            ("复制失败".to_string(), Duration::from_secs(3))
-                        }
-                    };
-                    // 直接写字段以避开 &mut self(session 仍持有可变借用)。
-                    self.status_message = msg;
-                    self.status_expires_at = Some(std::time::Instant::now() + dur);
-                    consumed_keys.insert("Ctrl+Shift+C".to_string());
-                }
-            }
-        }
-
-        if saw_ctrl_shift_v || saw_shift_insert {
-            let paste_key = if saw_shift_insert {
-                "Shift+Insert"
+                );
+                true
             } else {
-                "Ctrl+Shift+V"
-            };
-            crate::debug_log!("[PASTE] ===== {} triggered =====", paste_key);
-            if let Some(clipboard) = &self.clipboard {
-                crate::debug_log!("[PASTE] clipboard available");
-                if let Ok(content) = clipboard.paste_contents() {
-                    match content {
-                        ClipboardContent::Text(text) => {
-                            crate::debug_log!("[PASTE] content type: TEXT ({} chars)", text.len());
-                            match paste_text_into_session(
-                                session,
-                                text,
-                                self.config.paste_confirm,
-                                false,
-                                &mut self.pending_paste_confirm,
-                            ) {
-                                Ok(true) => {
-                                    consumed_keys.insert(paste_key.to_string());
-                                }
-                                Ok(false) => {
-                                    crate::debug_log!("[PASTE] text content is empty");
-                                }
-                                Err(error) => {
-                                    self.status_message = format!("粘贴失败：{error}");
-                                    self.status_expires_at =
-                                        Some(std::time::Instant::now() + Duration::from_secs(4));
-                                }
-                            }
-                        }
-                        ClipboardContent::Binary(_bytes) => {
-                            crate::debug_log!(
-                                "[PASTE] content type: BINARY ({} bytes)",
-                                _bytes.len()
-                            );
-                            // Kitty graphics is terminal *output*, not a binary
-                            // paste transport. Sending its APC bytes to the PTY
-                            // input would type escape garbage into the shell.
-                            // Binary clipboard data is exposed only through the
-                            // negotiated OSC 5522 paste protocol.
-                            self.status_message = "图像粘贴需要应用支持 OSC 5522".to_string();
-                            self.status_expires_at =
-                                Some(std::time::Instant::now() + Duration::from_secs(4));
-                            consumed_keys.insert(paste_key.to_string());
-                        }
-                    }
-                } else {
-                    crate::debug_log!("[PASTE] failed to get clipboard content");
-                }
-            } else {
-                crate::debug_log!("[PASTE] clipboard not available");
+                false
             }
-            crate::debug_log!("[PASTE] ===== {} finished =====", paste_key);
-        }
-
-        if let Some(key_name) = saw_font_zoom_key {
-            consumed_keys.insert(key_name.to_string());
-        }
+        });
 
         if saw_semantic_paste {
             crate::debug_log!("[PASTE] ===== Semantic Paste triggered =====");
@@ -2663,6 +2649,7 @@ impl eframe::App for TerminalApp {
         let mut has_new_output = false;
         let max_bytes_per_frame = active_output_budget;
         let mut has_more_data = false;
+        let mut active_processed_bytes = 0;
 
         // 先取回上一帧未处理完的数据
         let mut accumulated_data = std::mem::take(&mut session.pending_output);
@@ -2698,8 +2685,8 @@ impl eframe::App for TerminalApp {
                         has_new_output = true;
                         break;
                     }
-                    Err(crossbeam::channel::TryRecvError::Empty) => break,
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         shell_exited = true;
                         break;
                     }
@@ -2730,8 +2717,11 @@ impl eframe::App for TerminalApp {
                 has_more_data = true;
             } else {
                 let mut terminal = session.terminal.lock();
+                let active_parse_started = std::time::Instant::now();
                 terminal.process_batch(&accumulated_data);
                 terminal.check_sync_output_timeout();
+                terminal_parse_time += active_parse_started.elapsed();
+                active_processed_bytes = accumulated_data.len();
                 let completed_outputs = terminal.take_completed_command_outputs();
                 // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
                 // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
@@ -2747,6 +2737,17 @@ impl eframe::App for TerminalApp {
                 }
             }
         }
+
+        let processed_bytes = background_processed_bytes.saturating_add(active_processed_bytes);
+        let output_backlogged = background_has_more
+            || has_more_data
+            || processed_bytes >= self.adaptive_frame_budget.saturating_mul(3) / 4;
+        self.adaptive_frame_budget = app::rendering::adapt_frame_budget(
+            self.adaptive_frame_budget,
+            processed_bytes,
+            terminal_parse_time,
+            output_backlogged,
+        );
 
         // Step 7: 发送终端输出回 shell（DSR 响应等）
         {
@@ -2815,6 +2816,7 @@ impl eframe::App for TerminalApp {
             drop(terminal);
             for (title, body) in notifications {
                 show_desktop_notification(
+                    self.notification_tx.as_ref(),
                     &mut self.notification_window_started,
                     &mut self.notifications_in_window,
                     title,
@@ -3630,7 +3632,7 @@ impl Drop for TerminalApp {
 
         // 保存当前会话到持久化存储（包含每个 session 的 cwd）。只有持有实例锁
         // 的主实例能更新共享快照，避免后开的临时窗口在退出时覆盖完整状态。
-        if self._lock_file.is_some() {
+        if self._lock_file.is_some() && !self.session_persistence_blocked {
             if let Ok(session_history_path) = self.config.resolved_session_history_path() {
                 let _ = session_persistence::ensure_session_history_dir(&session_history_path);
 
@@ -3654,13 +3656,15 @@ impl Drop for TerminalApp {
 mod tests {
     use super::{
         bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
-        clipboard_5522_response_for_mime_with_limit, encode_terminal_paste,
-        flush_pending_mouse_controls, kitty_graphics_payload, mouse_sequence_allows_lossy,
-        mouse_sequence_is_complete, normalize_paste_text, osc52_clipboard_response_with_limit,
-        osc52_read_rate_limit_allows, primary_copy_route, queue_mouse_control,
-        reported_capture_button, should_confirm_paste, take_tagged_cursor_move,
-        wrap_bracketed_paste, ClipboardRequestGuard, PrimaryCopyRoute, KITTY_BASE64_CHUNK_BYTES,
-        MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
+        clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
+        encode_terminal_paste, flush_pending_mouse_controls, kitty_graphics_payload,
+        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalize_paste_text,
+        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, primary_copy_route,
+        queue_mouse_control, reported_capture_button, should_confirm_paste,
+        show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
+        wrap_bracketed_paste, ClipboardRequestGuard, DesktopNotification, PrimaryCopyRoute,
+        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
+        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -3669,6 +3673,91 @@ mod tests {
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+
+    #[cfg(unix)]
+    #[test]
+    fn background_helper_is_reaped_after_exit_and_timeout() {
+        let mut quick = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        assert!(
+            wait_for_child_with_timeout(&mut quick, std::time::Duration::from_secs(1))
+                .unwrap()
+                .success()
+        );
+        assert!(quick.try_wait().unwrap().is_some());
+
+        let mut slow = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 5"])
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let _ =
+            wait_for_child_with_timeout(&mut slow, std::time::Duration::from_millis(20)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(slow.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn desktop_notification_queue_is_bounded_without_spending_failed_rate_slots() {
+        let (production_tx, _production_rx) = desktop_notification_channel();
+        for index in 0..DESKTOP_NOTIFICATION_QUEUE_CAPACITY {
+            production_tx
+                .try_send(DesktopNotification {
+                    title: index.to_string(),
+                    body: String::new(),
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            production_tx.try_send(DesktopNotification {
+                title: "overflow".to_string(),
+                body: String::new(),
+            }),
+            Err(crossbeam_channel::TrySendError::Full(_))
+        ));
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut window_started = std::time::Instant::now();
+        let mut sent = 0;
+
+        show_desktop_notification(
+            Some(&tx),
+            &mut window_started,
+            &mut sent,
+            "title".to_string(),
+            "body".to_string(),
+        );
+        assert_eq!(sent, 1);
+        let notification = rx.recv().unwrap();
+        assert_eq!(notification.title, "title");
+        assert_eq!(notification.body, "body");
+
+        tx.try_send(DesktopNotification {
+            title: "queue filler".to_string(),
+            body: String::new(),
+        })
+        .unwrap();
+        show_desktop_notification(
+            Some(&tx),
+            &mut window_started,
+            &mut sent,
+            "dropped".to_string(),
+            "full queue".to_string(),
+        );
+        assert_eq!(sent, 1);
+
+        drop(rx);
+        show_desktop_notification(
+            Some(&tx),
+            &mut window_started,
+            &mut sent,
+            "dropped".to_string(),
+            "closed queue".to_string(),
+        );
+        assert_eq!(sent, 1);
+    }
 
     #[test]
     fn risky_paste_detection_covers_newlines_and_large_single_lines() {

@@ -342,7 +342,9 @@ impl TerminalApp {
     /// 应用 tab 重命名:trim 后写入 custom_name(空串等同清除自定义名,回退到 CWD 标题)。
     /// 触发持久化,确保下次启动保留用户标签。
     pub fn apply_rename(&mut self, i: usize, raw: String) {
-        let trimmed = raw.trim().to_string();
+        let raw_trimmed_len = raw.trim().len();
+        let trimmed = crate::session_persistence::bounded_session_name(&raw);
+        let was_truncated = trimmed.len() < raw_trimmed_len;
         if let Some(s) = self.session_manager.get_session_mut(i) {
             s.metadata.custom_name = if trimmed.is_empty() {
                 None
@@ -356,6 +358,9 @@ impl TerminalApp {
         }
         self.renaming_tab = None;
         self.schedule_session_save();
+        if was_truncated {
+            self.set_status("Tab name was shortened to the 256-byte persistence limit");
+        }
     }
 
     /// 渲染会话标签栏。返回 true 表示请求关闭窗口，render_ui 应据此提前返回。

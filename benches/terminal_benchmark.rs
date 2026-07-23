@@ -85,6 +85,27 @@ fn bench_grid_operations(c: &mut Criterion) {
         });
     });
 
+    // Cache-miss workload far back in history after a width change. Long
+    // logical records create soft-wrapped scrollback rows at the source width;
+    // alternating offsets prevents the one-entry visible-cells cache from
+    // hiding the reflow cost.
+    group.bench_function("get_visible_cells_deep_reflow_cache_miss", |b| {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.set_max_scrollback(10_000);
+        let mut record = vec![b'X'; 136];
+        record.extend_from_slice(b"\r\n");
+        terminal.process_batch(&record.repeat(4_000));
+        terminal.on_resize(120, 40);
+
+        let deep_offset = terminal.scrollback_len().saturating_sub(100).max(2);
+        let mut alternate = false;
+        b.iter(|| {
+            alternate = !alternate;
+            terminal.scroll_offset = deep_offset - usize::from(alternate);
+            black_box(terminal.get_visible_cells());
+        });
+    });
+
     group.finish();
 }
 

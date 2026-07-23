@@ -330,6 +330,24 @@ impl CommandPalette {
                 "Reset every pane divider to an even split",
                 crate::keybindings::Command::PaneEqualize,
             ),
+            CommandInfo::new(
+                "Increase Font Size",
+                CommandCategory::Terminal,
+                "Make terminal text larger",
+                crate::keybindings::Command::FontIncrease,
+            ),
+            CommandInfo::new(
+                "Decrease Font Size",
+                CommandCategory::Terminal,
+                "Make terminal text smaller",
+                crate::keybindings::Command::FontDecrease,
+            ),
+            CommandInfo::new(
+                "Reset Font Size",
+                CommandCategory::Terminal,
+                "Restore the default terminal text size",
+                crate::keybindings::Command::FontReset,
+            ),
             // === 窗口操作 ===
             CommandInfo::new(
                 "Close Window",
@@ -595,6 +613,9 @@ mod tests {
             Command::TerminalScrollDown,
             Command::TerminalJumpPrevMark,
             Command::TerminalJumpNextMark,
+            Command::FontIncrease,
+            Command::FontDecrease,
+            Command::FontReset,
             Command::TerminalSplitVertical,
             Command::TerminalSplitHorizontal,
             Command::TerminalClosePane,

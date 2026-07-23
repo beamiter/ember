@@ -478,8 +478,8 @@ impl SessionManager {
                             result.errors.push((session_idx, error));
                             break;
                         }
-                        Err(crossbeam::channel::TryRecvError::Empty) => break,
-                        Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
                             exited = true;
                             break;
                         }
@@ -851,14 +851,30 @@ impl SessionManager {
             let session_id = restored_or_fresh_session_id(session_id, &used_session_ids);
             used_session_ids.insert(session_id.clone());
             let cwd_ref = cwd.as_deref();
-            match ShellSession::new_with_cwd(
+            let mut shell_result = ShellSession::new_with_cwd(
                 80,
                 24,
                 cwd_ref,
                 Some(&session_id),
                 self.configured_shell.as_deref(),
                 self.repaint_ctx.clone(),
-            ) {
+            );
+            if let Err(error) = &shell_result {
+                if cwd_ref.is_some() {
+                    eprintln!(
+                        "Failed to restore session in saved cwd ({error}); retrying in default cwd"
+                    );
+                    shell_result = ShellSession::new_with_cwd(
+                        80,
+                        24,
+                        None,
+                        Some(&session_id),
+                        self.configured_shell.as_deref(),
+                        self.repaint_ctx.clone(),
+                    );
+                }
+            }
+            match shell_result {
                 Ok(shell) => {
                     let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
                     let mut session =

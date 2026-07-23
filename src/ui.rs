@@ -2548,16 +2548,6 @@ impl TerminalRenderer {
                         continue;
                     }
 
-                    // Skip Ctrl+Shift+C/V/X - these will be handled in main.rs for copy/paste
-                    if modifiers.ctrl && modifiers.shift && !modifiers.alt {
-                        match key {
-                            egui::Key::C | egui::Key::V | egui::Key::X => {
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-
                     // Skip Kitty encoding for alphanumeric when there's a corresponding Text event
                     // (Text event already sent the correct character with proper shift/caps handling)
                     if text_from_events
@@ -2616,7 +2606,7 @@ impl TerminalRenderer {
                             egui::Key::A => input.push(0x01), // Ctrl+A
                             egui::Key::B => input.push(0x02), // Ctrl+B (backward page in vim)
                             egui::Key::C => input.push(0x03), // Ctrl+C (SIGINT)
-                            egui::Key::D => {} // Ctrl+D (handled by keybindings system - close session/EOF)
+                            egui::Key::D => input.push(0x04),
                             egui::Key::E => input.push(0x05), // Ctrl+E
                             egui::Key::F => input.push(0x06), // Ctrl+F (forward page in vim)
                             egui::Key::G => input.push(0x07), // Ctrl+G
@@ -2682,6 +2672,85 @@ mod tests {
             key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true),
             Some("\x1bOB")
         );
+    }
+
+    #[test]
+    fn consumed_shortcuts_are_withheld_from_terminal_keyboard_encoding() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let ctrl_shift_c = egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: Some(egui::Key::C),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        };
+
+        let mut encoded = Vec::new();
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0b1,
+            false,
+            0,
+            0,
+            false,
+            false,
+            std::slice::from_ref(&ctrl_shift_c),
+        );
+        assert_eq!(encoded, b"\x1b[99;6u");
+
+        encoded.clear();
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::from(["Ctrl+Shift+C"]),
+            false,
+            0b1,
+            false,
+            0,
+            0,
+            false,
+            false,
+            &[ctrl_shift_c],
+        );
+        assert!(encoded.is_empty());
+
+        let ctrl_d = egui::Event::Key {
+            key: egui::Key::D,
+            physical_key: Some(egui::Key::D),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0,
+            false,
+            0,
+            0,
+            false,
+            false,
+            &[ctrl_d],
+        );
+        assert_eq!(encoded, [0x04]);
     }
 
     #[test]

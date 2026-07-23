@@ -518,6 +518,187 @@ fn linefeed_at_bottom_pushes_to_scrollback_for_full_screen_region() {
     assert_eq!(terminal.grid[1][0].character, ' ');
 }
 
+fn legacy_reflowed_visible_cells(terminal: &TerminalState) -> Vec<Vec<TerminalCell>> {
+    let rows = terminal.grid.rows();
+    let cols = terminal.grid.row_len();
+    let blank_cell = terminal.create_blank_cell();
+    let mut start_idx = terminal
+        .scrollback
+        .len()
+        .saturating_sub(terminal.scroll_offset + rows);
+    while start_idx > 0 && terminal.scrollback[start_idx - 1].is_wrapped {
+        start_idx -= 1;
+    }
+
+    let copied_tail: Vec<ScrollbackLine> = terminal
+        .scrollback
+        .iter()
+        .skip(start_idx)
+        .cloned()
+        .collect();
+    let reflowed = TerminalState::reflow_lines(&copied_tail, cols, &blank_cell);
+    let skip = reflowed.len().saturating_sub(terminal.scroll_offset + rows);
+    let visible_start = skip + (reflowed.len() - skip).saturating_sub(terminal.scroll_offset);
+    let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..]
+        .iter()
+        .map(ScrollbackLine::decompress)
+        .collect();
+    result.truncate(rows);
+
+    for row in terminal.grid.iter() {
+        if result.len() >= rows {
+            break;
+        }
+        result.push(terminal.normalize_line_width(row.to_vec(), cols));
+    }
+    while result.len() < rows {
+        result.push(terminal.blank_line(cols));
+    }
+    result
+}
+
+fn assert_cell_grids_equal(
+    actual: &[Vec<TerminalCell>],
+    expected: &[Vec<TerminalCell>],
+    context: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "{context}: row count");
+    for (row_index, (actual_row, expected_row)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            actual_row.len(),
+            expected_row.len(),
+            "{context}: column count at row {row_index}"
+        );
+        for (column_index, (actual_cell, expected_cell)) in
+            actual_row.iter().zip(expected_row).enumerate()
+        {
+            assert_eq!(
+                actual_cell.character, expected_cell.character,
+                "{context}: character at ({row_index}, {column_index})"
+            );
+            assert_eq!(
+                actual_cell.foreground, expected_cell.foreground,
+                "{context}: foreground at ({row_index}, {column_index})"
+            );
+            assert_eq!(
+                actual_cell.background, expected_cell.background,
+                "{context}: background at ({row_index}, {column_index})"
+            );
+            assert_eq!(
+                actual_cell.flags, expected_cell.flags,
+                "{context}: flags at ({row_index}, {column_index})"
+            );
+        }
+    }
+}
+
+#[test]
+fn streamed_scrollback_reflow_matches_legacy_results_across_offsets_and_resize() {
+    fn line(text: &str, cols: usize, wrapped: bool) -> ScrollbackLine {
+        let mut cells = vec![TerminalCell::default(); cols];
+        for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+            cell.character = ch;
+        }
+        ScrollbackLine::compress(&cells, wrapped)
+    }
+
+    let mut terminal = TerminalState::new(5, 3);
+    terminal.push_scrollback_compressed(line("abcd", 4, true));
+
+    // Foreground/style-only trailing spaces are intentionally discarded by
+    // the established logical-line join rule. Exercise the cached length
+    // against that less-obvious behavior.
+    let mut styled_tail = line("ef", 4, false).decompress();
+    styled_tail[3].foreground = Color::Red;
+    styled_tail[3].flags.set_bold(true);
+    terminal.push_scrollback_compressed(ScrollbackLine::compress(&styled_tail, false));
+
+    terminal.push_scrollback_compressed(line("ghijklm", 7, false));
+    terminal.push_scrollback_compressed(line("", 6, false));
+    terminal.push_scrollback_compressed(line("nopqr", 5, true));
+    terminal.push_scrollback_compressed(line("stu", 3, false));
+
+    for offset in 1..=terminal.scrollback.len() {
+        terminal.scroll_offset = offset;
+        let expected = legacy_reflowed_visible_cells(&terminal);
+        let actual = terminal.get_visible_cells();
+        assert_cell_grids_equal(
+            actual.as_ref(),
+            &expected,
+            &format!("streamed reflow at offset {offset}"),
+        );
+    }
+
+    // A width change must use the new chunking while preserving the same raw
+    // scrollback/search coordinate model.
+    terminal.on_resize(6, 4);
+    for offset in 1..=terminal.scrollback.len() {
+        terminal.scroll_offset = offset;
+        let expected = legacy_reflowed_visible_cells(&terminal);
+        let actual = terminal.get_visible_cells();
+        assert_cell_grids_equal(
+            actual.as_ref(),
+            &expected,
+            &format!("streamed reflow after resize at offset {offset}"),
+        );
+    }
+}
+
+#[test]
+fn appending_scrollback_invalidates_a_cached_historical_viewport() {
+    fn tagged_line(tag: char) -> ScrollbackLine {
+        let mut cells = vec![TerminalCell::default(); 4];
+        cells[0].character = tag;
+        ScrollbackLine::compress(&cells, false)
+    }
+
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.push_scrollback_compressed(tagged_line('A'));
+    terminal.push_scrollback_compressed(tagged_line('B'));
+    terminal.scroll_offset = 1;
+
+    let before = terminal.get_visible_cells();
+    assert_eq!(before[0][0].character, 'B');
+
+    // Keep grid_version and scroll_offset unchanged: only explicit scrollback
+    // cache invalidation can make the newly appended tail visible here.
+    let version = terminal.grid_version;
+    terminal.push_scrollback_compressed(tagged_line('C'));
+    assert_eq!(terminal.grid_version, version);
+    let after = terminal.get_visible_cells();
+
+    assert!(!std::sync::Arc::ptr_eq(&before, &after));
+    assert_eq!(after[0][0].character, 'C');
+}
+
+#[test]
+fn shrinking_scrollback_invalidates_both_historical_view_caches() {
+    fn tagged_line(tag: char) -> ScrollbackLine {
+        let mut cells = vec![TerminalCell::default(); 4];
+        cells[0].character = tag;
+        ScrollbackLine::compress(&cells, false)
+    }
+
+    let mut terminal = TerminalState::new(4, 2);
+    for tag in ['A', 'B', 'C'] {
+        terminal.push_scrollback_compressed(tagged_line(tag));
+    }
+    terminal.scroll_offset = 1;
+    let before = terminal.get_visible_cells();
+    let _ = terminal.viewport_buffer_mapping_is_exact();
+    assert!(terminal.visible_cells_cache.is_some());
+    assert!(terminal.viewport_mapping_exact_cache.get().is_some());
+
+    terminal.set_max_scrollback(2);
+
+    assert!(terminal.visible_cells_cache.is_none());
+    assert!(terminal.viewport_mapping_exact_cache.get().is_none());
+    let after = terminal.get_visible_cells();
+    assert!(!std::sync::Arc::ptr_eq(&before, &after));
+    assert_eq!(terminal.scrollback_len(), 2);
+    assert_eq!(after[0][0].character, 'C');
+}
+
 #[test]
 fn visible_cells_keep_rectangular_shape_after_resize_with_scrollback() {
     let mut terminal = TerminalState::new(4, 2);

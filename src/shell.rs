@@ -1,6 +1,6 @@
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
-use crossbeam::channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Receiver};
 use eframe::egui;
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
@@ -406,7 +406,7 @@ impl ShellSession {
     }
 
     fn send_event(
-        event_tx: &crossbeam::channel::Sender<ShellEvent>,
+        event_tx: &crossbeam_channel::Sender<ShellEvent>,
         repaint_ctx: &egui::Context,
         event: ShellEvent,
     ) -> bool {
@@ -421,7 +421,7 @@ impl ShellSession {
     /// P3 优化：批量读取 PTY 数据，累积后一次性发送事件
     fn io_loop(
         pty: Arc<Mutex<Pty>>,
-        event_tx: crossbeam::channel::Sender<ShellEvent>,
+        event_tx: crossbeam_channel::Sender<ShellEvent>,
         repaint_ctx: egui::Context,
         shutdown: Arc<AtomicBool>,
     ) {
@@ -951,7 +951,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn transient_pty_hangup_waits_for_real_exit_and_recovers_output() {
-        use crossbeam::channel::RecvTimeoutError;
+        use crossbeam_channel::RecvTimeoutError;
         use std::os::unix::fs::PermissionsExt;
 
         let unique = format!(

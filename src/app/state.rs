@@ -95,7 +95,7 @@ pub struct TerminalApp {
     /// Bounded background writer for OSC 52. PTY output is untrusted and must
     /// never synchronously wait for external clipboard-owner processes on the
     /// UI thread.
-    pub osc52_clipboard_write_tx: Option<crossbeam::channel::Sender<String>>,
+    pub osc52_clipboard_write_tx: Option<crossbeam_channel::Sender<String>>,
     pub osc52_write_window_started: std::time::Instant,
     pub osc52_writes_in_window: usize,
     /// OSC 52 clipboard reads are opt-in but still originate from untrusted
@@ -187,9 +187,12 @@ pub struct TerminalApp {
     // Session persistence
     pub session_save_pending: bool,
     pub session_save_deadline: std::time::Instant,
+    /// A corrupt snapshot that could not be moved aside must never be
+    /// overwritten by the fresh fallback session on debounce or Drop.
+    pub session_persistence_blocked: bool,
 
     // Lock file to detect running instances
-    pub _lock_file: Option<std::fs::File>,
+    pub _lock_file: Option<crate::session_persistence::InstanceLock>,
 
     // 鼠标报告模式下的滚轮累积器
     pub mouse_scroll_accumulator: f32,
@@ -235,6 +238,7 @@ pub struct TerminalApp {
     /// Global rate limit for OSC 9/777. The queue inside each terminal is
     /// bounded, but draining it every frame without a time budget still lets
     /// untrusted PTY output fork hundreds of `notify-send` processes.
+    pub notification_tx: Option<crossbeam_channel::Sender<crate::DesktopNotification>>,
     pub notification_window_started: std::time::Instant,
     pub notifications_in_window: usize,
 }

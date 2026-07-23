@@ -4,6 +4,46 @@ use super::state::TerminalApp;
 use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
 
+const MIN_FRAME_BUDGET: usize = 16 * 1024;
+const MAX_FRAME_BUDGET: usize = 256 * 1024;
+const TARGET_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
+const MIN_ADAPTIVE_SAMPLE_BYTES: usize = 4 * 1024;
+
+/// Adjust the next PTY parsing budget from measured parser work, not from the
+/// interval between UI frames. The latter includes time spent completely idle
+/// and used to collapse the budget after a cursor-blink repaint.
+///
+/// Samples are accepted only while output is backlogged. A short final chunk
+/// is dominated by fixed per-frame work and does not describe parser
+/// throughput. Each update is smoothed and rate-limited so one unusually
+/// expensive escape sequence cannot make the controller oscillate.
+pub(crate) fn adapt_frame_budget(
+    current: usize,
+    processed_bytes: usize,
+    parse_time: std::time::Duration,
+    output_backlogged: bool,
+) -> usize {
+    let current = current.clamp(MIN_FRAME_BUDGET, MAX_FRAME_BUDGET);
+    if !output_backlogged || processed_bytes < MIN_ADAPTIVE_SAMPLE_BYTES || parse_time.is_zero() {
+        return current;
+    }
+
+    let estimated = (processed_bytes as u128)
+        .saturating_mul(TARGET_PARSE_TIME.as_nanos())
+        .checked_div(parse_time.as_nanos())
+        .unwrap_or(MAX_FRAME_BUDGET as u128)
+        .min(usize::MAX as u128) as usize;
+    let desired = estimated.clamp(MIN_FRAME_BUDGET, MAX_FRAME_BUDGET);
+
+    // Limit one observation to ±25%, then move one quarter of the way toward
+    // it. This behaves as a small EWMA without storing a second floating-point
+    // state value in TerminalApp.
+    let lower = current.saturating_mul(3) / 4;
+    let upper = current.saturating_mul(5) / 4;
+    let limited = desired.clamp(lower, upper);
+    ((current.saturating_mul(3) + limited) / 4).clamp(MIN_FRAME_BUDGET, MAX_FRAME_BUDGET)
+}
+
 impl TerminalApp {
     /// Keep exactly one renderer per pane while split mode is active. This
     /// removes the old four-pane ceiling and also releases texture caches when
@@ -26,38 +66,6 @@ impl TerminalApp {
             renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
             renderer.sync_font_metrics(ctx);
             self.pane_renderers.push(renderer);
-        }
-    }
-
-    /// 自适应帧预算：根据帧时间动态调整处理量
-    pub fn adjust_frame_budget(&mut self) {
-        const TARGET_FRAME_MS: f64 = 16.0; // 目标 60 FPS
-
-        // TUI applications such as Codex commonly redraw a whole screen at
-        // once. A 64 KiB starting point keeps those updates responsive, while
-        // the adaptive controller can still back off when parsing/rendering
-        // pushes the frame over budget.
-        const MIN_BUDGET: usize = 16384; // 最小 16KB
-        const MAX_BUDGET: usize = 262144; // 最大 256KB
-        const ADJUST_RATE: f64 = 0.1; // 调整速率 10%
-
-        let avg_frame_ms = self.debug_panel.get_avg_frame_time_ms();
-
-        // 只有在有足够帧时间历史时才调整
-        if avg_frame_ms > 0.0 {
-            let current = self.adaptive_frame_budget as f64;
-            let new_budget = if avg_frame_ms < TARGET_FRAME_MS * 0.8 {
-                // 帧时间充裕，可以增加预算
-                current * (1.0 + ADJUST_RATE)
-            } else if avg_frame_ms > TARGET_FRAME_MS * 1.2 {
-                // 帧时间紧张，减少预算
-                current * (1.0 - ADJUST_RATE)
-            } else {
-                // 帧时间在目标范围内，保持不变
-                current
-            };
-
-            self.adaptive_frame_budget = (new_budget as usize).clamp(MIN_BUDGET, MAX_BUDGET);
         }
     }
 
@@ -720,8 +728,18 @@ impl TerminalApp {
                     // Apply runtime changes (fonts, GPU, renderer)
                     self.apply_runtime_config(ctx);
                     // Save to file
-                    if let Err(e) = self.config.save() {
-                        eprintln!("[Config] Failed to save: {}", e);
+                    match self.config.save() {
+                        Ok(()) => {
+                            self.config_last_mtime = config::Config::config_mtime();
+                            self.set_status("Settings saved");
+                        }
+                        Err(error) => {
+                            eprintln!("[Config] Failed to save: {}", error);
+                            self.set_status_for(
+                                format!("Settings are active but could not be saved: {error}"),
+                                std::time::Duration::from_secs(6),
+                            );
+                        }
                     }
                 }
                 config_panel::ConfigAction::ResetToDefaults => {
@@ -996,8 +1014,20 @@ impl TerminalApp {
         // 取消粘贴时也尊重选择,符合"我不想再被打扰"的语义。
         if dont_ask_again && self.config.paste_confirm {
             self.config.paste_confirm = false;
-            if let Err(e) = self.config.save() {
-                eprintln!("[Config] failed to save paste_confirm preference: {}", e);
+            match self.config.save() {
+                Ok(()) => {
+                    self.config_last_mtime = config::Config::config_mtime();
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Config] failed to save paste_confirm preference: {}",
+                        error
+                    );
+                    self.set_status_for(
+                        format!("Paste preference changed for this run but was not saved: {error}"),
+                        std::time::Duration::from_secs(6),
+                    );
+                }
             }
         }
         self.paste_dont_ask_again = false;
@@ -1036,5 +1066,68 @@ impl TerminalApp {
                 self.pending_paste_confirm = Some(pending);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_and_short_tail_samples_do_not_change_the_budget() {
+        let budget = 64 * 1024;
+        assert_eq!(
+            adapt_frame_budget(budget, 0, std::time::Duration::from_secs(1), false),
+            budget
+        );
+        assert_eq!(
+            adapt_frame_budget(
+                budget,
+                MIN_ADAPTIVE_SAMPLE_BYTES - 1,
+                std::time::Duration::from_millis(20),
+                true,
+            ),
+            budget
+        );
+        assert_eq!(
+            adapt_frame_budget(budget, budget, std::time::Duration::from_millis(20), false,),
+            budget
+        );
+    }
+
+    #[test]
+    fn saturated_fast_and_slow_samples_move_in_the_expected_direction() {
+        let budget = 64 * 1024;
+        let faster = adapt_frame_budget(budget, budget, std::time::Duration::from_millis(1), true);
+        let slower = adapt_frame_budget(budget, budget, std::time::Duration::from_millis(16), true);
+        assert!(faster > budget);
+        assert!(slower < budget);
+        assert!(faster <= budget * 5 / 4);
+        assert!(slower >= budget * 3 / 4);
+    }
+
+    #[test]
+    fn adaptive_budget_always_respects_hard_bounds() {
+        assert_eq!(
+            adapt_frame_budget(1, usize::MAX, std::time::Duration::from_nanos(1), true,),
+            MIN_FRAME_BUDGET * 17 / 16
+        );
+
+        let mut high = MAX_FRAME_BUDGET;
+        for _ in 0..8 {
+            high = adapt_frame_budget(high, usize::MAX, std::time::Duration::from_nanos(1), true);
+        }
+        assert_eq!(high, MAX_FRAME_BUDGET);
+
+        let mut low = MIN_FRAME_BUDGET;
+        for _ in 0..8 {
+            low = adapt_frame_budget(
+                low,
+                MIN_ADAPTIVE_SAMPLE_BYTES,
+                std::time::Duration::from_secs(1),
+                true,
+            );
+        }
+        assert_eq!(low, MIN_FRAME_BUDGET);
     }
 }

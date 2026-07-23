@@ -127,7 +127,7 @@ impl TerminalApp {
             // Only the process holding the instance lock owns the shared
             // snapshot. A secondary window must not overwrite the primary
             // instance's complete session list when it exits or changes tabs.
-            if self._lock_file.is_none() {
+            if self._lock_file.is_none() || self.session_persistence_blocked {
                 return;
             }
             if let Ok(path) = self.config.resolved_session_history_path() {

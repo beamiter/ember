@@ -842,6 +842,7 @@ impl super::TerminalState {
                     3 => {
                         // Clear scrollback buffer (xterm extension)
                         self.scrollback.clear();
+                        self.invalidate_scrollback_view_cache();
                         self.kitty_graphics.clear_scrollback_placements();
                         self.scroll_offset = 0;
                     }

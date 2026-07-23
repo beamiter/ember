@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
+pub const DEFAULT_FONT_SIZE: f32 = 14.0;
+
 // Nerd Font priority list
 const NERD_FONT_CANDIDATES: &[&str] = &[
     "SauceCodePro Nerd Font",
@@ -169,7 +171,7 @@ fn default_sidebar_view() -> crate::sidebar::SidebarView {
 }
 
 fn default_font_size() -> f32 {
-    14.0
+    DEFAULT_FONT_SIZE
 }
 
 fn default_font_weight() -> f32 {

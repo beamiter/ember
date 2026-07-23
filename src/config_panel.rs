@@ -47,6 +47,9 @@ pub struct ConfigPanel {
     edit_app_renderer: AppRendererType,
     edit_ui_scale: f32,
     edit_tab_bar_position: TabBarPosition,
+    edit_paste_confirm: bool,
+    edit_osc52_clipboard_write: bool,
+    edit_osc52_clipboard_read: bool,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
     all_fonts: Vec<String>,
@@ -85,6 +88,9 @@ impl ConfigPanel {
             edit_app_renderer: AppRendererType::Glow,
             edit_ui_scale: 0.0,
             edit_tab_bar_position: TabBarPosition::default(),
+            edit_paste_confirm: true,
+            edit_osc52_clipboard_write: true,
+            edit_osc52_clipboard_read: false,
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
             available_themes: Vec::new(),
@@ -152,6 +158,9 @@ impl ConfigPanel {
         self.edit_app_renderer = config.app_renderer;
         self.edit_ui_scale = config.ui_scale.unwrap_or(0.0);
         self.edit_tab_bar_position = config.tab_bar_position;
+        self.edit_paste_confirm = config.paste_confirm;
+        self.edit_osc52_clipboard_write = config.osc52_clipboard_write;
+        self.edit_osc52_clipboard_read = config.osc52_clipboard_read;
     }
 
     /// Apply all buffered edit values to the given Config.
@@ -174,6 +183,9 @@ impl ConfigPanel {
             None
         };
         config.tab_bar_position = self.edit_tab_bar_position;
+        config.paste_confirm = self.edit_paste_confirm;
+        config.osc52_clipboard_write = self.edit_osc52_clipboard_write;
+        config.osc52_clipboard_read = self.edit_osc52_clipboard_read;
     }
 
     pub fn close(&mut self) {
@@ -916,6 +928,54 @@ impl ConfigPanel {
 
         ui.separator();
 
+        ui.label(RichText::new("Security").strong());
+        if ui
+            .checkbox(
+                &mut self.edit_paste_confirm,
+                "Confirm multiline or large pastes",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.label(
+            RichText::new(
+                "Recommended. Shows a preview before potentially dangerous text is sent.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+
+        if ui
+            .checkbox(
+                &mut self.edit_osc52_clipboard_write,
+                "Allow terminal apps to write the system clipboard (OSC 52)",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+
+        if ui
+            .checkbox(
+                &mut self.edit_osc52_clipboard_read,
+                "Allow terminal apps to read the system clipboard (OSC 52)",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.label(
+            RichText::new(
+                "Warning: clipboard reads send its contents to programs running in the terminal. \
+                 Enable this only for trusted workflows.",
+            )
+            .size(11.0)
+            .color(ui.visuals().warn_fg_color),
+        );
+
+        ui.separator();
+
         // Debug overlay toggles immediately (no save needed)
         if ui
             .checkbox(&mut self.edit_debug_overlay, "Show debug overlay (F12)")
@@ -1028,4 +1088,38 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
     ui.color_edit_button_srgb(color)
         .on_hover_text(tooltip)
         .changed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigPanel;
+    use crate::config::Config;
+
+    #[test]
+    fn clipboard_security_settings_round_trip_through_panel_buffer() {
+        let source = Config {
+            paste_confirm: false,
+            osc52_clipboard_write: false,
+            osc52_clipboard_read: true,
+            ..Config::default()
+        };
+
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+
+        assert!(!panel.edit_paste_confirm);
+        assert!(!panel.edit_osc52_clipboard_write);
+        assert!(panel.edit_osc52_clipboard_read);
+
+        panel.edit_paste_confirm = true;
+        panel.edit_osc52_clipboard_write = true;
+        panel.edit_osc52_clipboard_read = false;
+
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+
+        assert!(applied.paste_confirm);
+        assert!(applied.osc52_clipboard_write);
+        assert!(!applied.osc52_clipboard_read);
+    }
 }

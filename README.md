@@ -23,8 +23,10 @@ claimed.
   clipboard-read protocols
 - Clickable URLs, IP addresses and local paths
 - Built-in/custom themes, live configuration reload and resilient configurable bindings
-- Bounded PTY channels, adaptive parsing budgets and dirty-row GPU uploads
-- Crash-safe atomic config/history/session writes and private state-file permissions
+- Bounded PTY channels, parser-work adaptive budgets, viewport-only historical
+  reflow and dirty-row GPU uploads
+- Crash-safe atomic state writes, bounded session restore, corrupt-snapshot
+  quarantine and hardened private lock/journal files
 
 ### Kitty graphics compatibility
 
@@ -127,6 +129,10 @@ osc52_clipboard_read = false
 paste_confirm = true
 ```
 
+The Settings panel exposes the same clipboard and paste-confirmation policies
+under **Advanced → Security**, including a way to re-enable confirmation after
+choosing “Don't ask again” in the paste preview.
+
 `session_history_file` may point at a custom session snapshot location. Other
 state is stored beside the config:
 
@@ -137,6 +143,12 @@ state is stored beside the config:
 
 Only the first running jterm2 instance owns and updates the shared session
 snapshot, preventing a secondary window from overwriting the primary state.
+Restore is capped at 64 sessions and 4 MiB of snapshot data. Malformed or
+oversized snapshots are moved to a timestamped `.corrupt-*` backup before a
+fresh session is saved; if that backup cannot be created, persistence remains
+disabled for the run instead of overwriting the original. The writer applies
+the same bounds, tab names are shortened on a UTF-8 boundary, and a saved
+working directory that no longer exists falls back to the default directory.
 
 ### Keybindings
 
@@ -171,6 +183,7 @@ a flat TOML table:
 "ctrl+shift+t" = "session:new"
 "ctrl+alt+right" = "pane:focus_right"
 "ctrl+alt+left" = "pane:focus_left"
+"ctrl+0" = "font:reset"
 "ctrl+shift+w" = "none" # remove a default binding
 ```
 
@@ -179,7 +192,8 @@ and similar) are normalized. Invalid entries are reported and skipped without
 discarding the other valid overrides.
 
 The in-app help panel is generated from the active bindings, so it reflects
-customizations.
+customizations. Copy, paste and keyboard font zoom use this same command path;
+there are no separate hard-coded shortcuts that bypass user overrides.
 
 Search results are capped at 20,000 matches to keep broad queries bounded.
 When old scrollback must be reflowed after a width change, jterm2 keeps the
@@ -197,6 +211,12 @@ coordinate cannot yet be mapped exactly, rather than painting the wrong cell.
 - Carriage returns are normalized before that policy is evaluated, and UI
   commands place their submit key outside bracketed-paste markers.
 - Embedded bracketed-paste terminators are removed before forwarding data.
+- Session snapshots are size/count bounded before shells are restored. Invalid
+  snapshots are preserved as side-by-side backups instead of silently replaced.
+- Instance locks and execution journals reject symbolic links, hard links and
+  non-regular files before mutation.
+- Desktop notifications use a bounded worker and always reap or time out the
+  external `notify-send` helper.
 - Custom-theme names are restricted to one safe filename component; theme
   saves replace symlinks rather than following them outside the theme directory.
 - Link targets are shown before opening and require `Ctrl+Click`.
@@ -236,7 +256,8 @@ cargo test --workspace --all-targets --all-features
 cargo build --workspace --release --all-features
 ```
 
-Criterion benchmarks live in `benches/terminal_benchmark.rs`:
+Criterion benchmarks, including deep-scrollback resize/reflow with a forced
+viewport cache miss, live in `benches/terminal_benchmark.rs`:
 
 ```bash
 cargo bench

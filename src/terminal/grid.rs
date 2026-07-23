@@ -361,6 +361,11 @@ pub struct ScrollbackLine {
     data: CompressedLineData,
     pub is_wrapped: bool,
     cols: u16,
+    /// Number of cells retained when historical soft-wrapped rows are joined
+    /// before being split at the current terminal width.  Computing this when
+    /// the line is compressed lets viewport reflow count rows without first
+    /// allocating and decoding every line in the scrollback tail.
+    reflow_content_len: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +382,10 @@ impl ScrollbackLine {
 
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
         let cols = cells.len() as u16;
+        let reflow_content_len = cells
+            .iter()
+            .rposition(|cell| !cell.is_reflow_trimmable_blank())
+            .map_or(0, |index| index + 1) as u16;
         let trailing_blanks = cells
             .iter()
             .rev()
@@ -405,6 +414,7 @@ impl ScrollbackLine {
                 data: CompressedLineData::Plain(text, trailing_blanks as u16),
                 is_wrapped,
                 cols,
+                reflow_content_len,
             }
         } else {
             let encoded = Self::encode_cells(&cells[..active_len]);
@@ -412,8 +422,14 @@ impl ScrollbackLine {
                 data: CompressedLineData::Encoded(encoded),
                 is_wrapped,
                 cols,
+                reflow_content_len,
             }
         }
+    }
+
+    #[inline]
+    pub(super) fn reflow_content_len(&self) -> usize {
+        self.reflow_content_len as usize
     }
 
     pub fn decompress(&self) -> Vec<TerminalCell> {
@@ -653,6 +669,19 @@ impl Default for TerminalCell {
             background: Color::Default,
             flags: StyleFlags::new(),
         }
+    }
+}
+
+impl TerminalCell {
+    /// Match the historical reflow rule exactly.  Foreground-only styling on
+    /// a space has never kept that space in a joined logical line; changing
+    /// that here would move existing search/selection coordinates.
+    #[inline]
+    pub(super) fn is_reflow_trimmable_blank(&self) -> bool {
+        self.character == ' '
+            && self.background == Color::Default
+            && !self.flags.wide()
+            && !self.flags.wide_continuation()
     }
 }
 

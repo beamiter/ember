@@ -950,6 +950,12 @@ impl super::TerminalState {
         self.push_scrollback_compressed_with_options(line, false);
     }
 
+    #[inline]
+    pub(super) fn invalidate_scrollback_view_cache(&mut self) {
+        self.visible_cells_cache = None;
+        self.viewport_mapping_exact_cache.set(None);
+    }
+
     pub(super) fn push_scrollback_compressed_with_options(
         &mut self,
         line: ScrollbackLine,
@@ -963,6 +969,7 @@ impl super::TerminalState {
         }
         self.scrollback.push_back(line);
         self.total_lines_scrolled = self.total_lines_scrolled.saturating_add(1);
+        self.invalidate_scrollback_view_cache();
     }
 
     pub(super) fn scroll_region_down(&mut self, top: usize, bottom: usize) {
@@ -1229,8 +1236,12 @@ impl super::TerminalState {
         self.kitty_graphics
             .set_max_scrollback_rows(self.max_scrollback);
 
+        let old_len = self.scrollback.len();
         while self.scrollback.len() > self.max_scrollback {
             self.scrollback.pop_front();
+        }
+        if self.scrollback.len() != old_len {
+            self.invalidate_scrollback_view_cache();
         }
 
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
@@ -2304,6 +2315,119 @@ impl super::TerminalState {
         std::mem::take(&mut self.pending_clipboard_requests)
     }
 
+    /// Return the next joined logical-line boundary and the number of visual
+    /// rows that logical line occupies at `new_cols`.
+    ///
+    /// `ScrollbackLine` caches the number of cells retained by the historical
+    /// trailing-blank rule, so this counting pass performs no decompression.
+    fn reflow_span(
+        lines: &VecDeque<ScrollbackLine>,
+        start: usize,
+        end: usize,
+        new_cols: usize,
+    ) -> (usize, usize) {
+        debug_assert!(start < end);
+        debug_assert!(new_cols > 0);
+
+        let mut next = start;
+        let mut logical_cells = 0usize;
+        loop {
+            let line = &lines[next];
+            logical_cells = logical_cells.saturating_add(line.reflow_content_len());
+            next += 1;
+            if !line.is_wrapped || next >= end {
+                break;
+            }
+        }
+
+        let visual_rows = if logical_cells == 0 {
+            1
+        } else {
+            logical_cells.div_ceil(new_cols)
+        };
+        (next, visual_rows)
+    }
+
+    /// Lazily materialize only the historical rows that can enter the current
+    /// viewport.  The old path cloned every compressed line in the scrollback
+    /// tail, decoded all of them, recompressed all reflowed rows, and finally
+    /// decoded the visible handful again.
+    ///
+    /// This implementation first counts visual rows from cached per-line
+    /// lengths, then decodes only logical lines intersecting the requested
+    /// range.  Recompressing the selected rows keeps byte-for-byte historical
+    /// cell semantics (including the existing style normalization) while
+    /// bounding that work to `viewport_rows`.
+    fn reflowed_viewport_rows(
+        lines: &VecDeque<ScrollbackLine>,
+        start: usize,
+        end: usize,
+        new_cols: usize,
+        scroll_offset: usize,
+        viewport_rows: usize,
+        blank_cell: &TerminalCell,
+    ) -> Vec<Vec<TerminalCell>> {
+        if start >= end || viewport_rows == 0 {
+            return Vec::new();
+        }
+
+        let mut total_visual_rows = 0usize;
+        let mut source = start;
+        while source < end {
+            let (next, visual_rows) = Self::reflow_span(lines, source, end, new_cols);
+            total_visual_rows = total_visual_rows.saturating_add(visual_rows);
+            source = next;
+        }
+
+        // This is the same range selected by the former `skip` /
+        // `visible_start` calculation: begin `scroll_offset` visual rows from
+        // the tail, then retain at most one terminal viewport.
+        let target_start = total_visual_rows.saturating_sub(scroll_offset);
+        let target_end = target_start
+            .saturating_add(viewport_rows)
+            .min(total_visual_rows);
+        let mut result = Vec::with_capacity(target_end.saturating_sub(target_start));
+
+        source = start;
+        let mut visual_start = 0usize;
+        while source < end && visual_start < target_end {
+            let (next, visual_rows) = Self::reflow_span(lines, source, end, new_cols);
+            let visual_end = visual_start.saturating_add(visual_rows);
+
+            if visual_end > target_start {
+                let mut logical_line = Vec::new();
+                for line in lines.range(source..next) {
+                    let decompressed = line.decompress();
+                    logical_line.extend_from_slice(Self::strip_trailing_blanks(&decompressed));
+                }
+
+                let first_chunk = target_start.saturating_sub(visual_start);
+                let last_chunk = target_end.saturating_sub(visual_start).min(visual_rows);
+                for chunk_index in first_chunk..last_chunk {
+                    let mut row = if logical_line.is_empty() {
+                        vec![*blank_cell; new_cols]
+                    } else {
+                        let cell_start = chunk_index.saturating_mul(new_cols);
+                        let cell_end = cell_start.saturating_add(new_cols).min(logical_line.len());
+                        logical_line[cell_start..cell_end].to_vec()
+                    };
+                    row.resize(new_cols, *blank_cell);
+
+                    // Preserve the exact cell normalization of reflow_lines()
+                    // without recompressing the entire historical tail.
+                    let normalized =
+                        ScrollbackLine::compress(&row, chunk_index + 1 < visual_rows).decompress();
+                    result.push(normalized);
+                }
+            }
+
+            visual_start = visual_end;
+            source = next;
+        }
+
+        result
+    }
+
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
         if let Some((cached_version, cached_offset, ref cells)) = self.visible_cells_cache {
             if cached_version == self.grid_version && cached_offset == self.scroll_offset {
@@ -2365,7 +2489,8 @@ impl super::TerminalState {
             // Fast path (shared allocation): fresh copy of current grid.
             self.grid.to_vec()
         } else {
-            // Slow path: reflow scrollback
+            // Historical path: count from cached compressed-line metadata and
+            // materialize only rows that can enter this viewport.
             let blank_cell = self.create_blank_cell();
 
             let mut start_idx = self
@@ -2376,25 +2501,15 @@ impl super::TerminalState {
                 start_idx -= 1;
             }
             let end_idx = self.scrollback.len();
-            let to_reflow: Vec<ScrollbackLine> = self
-                .scrollback
-                .iter()
-                .skip(start_idx)
-                .take(end_idx - start_idx)
-                .cloned()
-                .collect();
-
-            let reflowed = Self::reflow_lines(&to_reflow, cols, &blank_cell);
-            let skip = reflowed.len().saturating_sub(self.scroll_offset + rows);
-            let visible_start = skip + (reflowed.len() - skip).saturating_sub(self.scroll_offset);
-            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..]
-                .iter()
-                .map(|l| l.decompress())
-                .collect();
-
-            if result.len() > rows {
-                result.truncate(rows);
-            }
+            let mut result = Self::reflowed_viewport_rows(
+                &self.scrollback,
+                start_idx,
+                end_idx,
+                cols,
+                self.scroll_offset,
+                rows,
+                &blank_cell,
+            );
 
             for row in self.grid.iter() {
                 if result.len() < rows {
@@ -2838,17 +2953,13 @@ impl super::TerminalState {
 
     pub(super) fn strip_trailing_blanks(cells: &[TerminalCell]) -> &[TerminalCell] {
         let mut end = cells.len();
-        while end > 0
-            && cells[end - 1].character == ' '
-            && cells[end - 1].background == Color::Default
-            && !cells[end - 1].flags.wide()
-            && !cells[end - 1].flags.wide_continuation()
-        {
+        while end > 0 && cells[end - 1].is_reflow_trimmable_blank() {
             end -= 1;
         }
         &cells[..end]
     }
 
+    #[cfg(test)]
     pub(super) fn reflow_lines(
         lines: &[ScrollbackLine],
         new_cols: usize,

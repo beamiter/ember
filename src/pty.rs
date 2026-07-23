@@ -55,6 +55,56 @@ mod unix_pty {
         );
     }
 
+    /// Create a close-on-exec pipe used to report setup failures from the
+    /// post-fork child. EOF means `execve` succeeded and closed the write end.
+    fn startup_status_pipe() -> std::io::Result<[RawFd; 2]> {
+        let mut pipe_fds = [-1; 2];
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let result = unsafe {
+            let result = libc::pipe(pipe_fds.as_mut_ptr());
+            if result == 0 {
+                for fd in pipe_fds {
+                    let flags = libc::fcntl(fd, libc::F_GETFD, 0);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                        libc::close(pipe_fds[0]);
+                        libc::close(pipe_fds[1]);
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
+            result
+        };
+
+        if result == 0 {
+            Ok(pipe_fds)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Only async-signal-safe syscalls are allowed between fork and exec.
+    unsafe fn report_startup_failure(fd: RawFd, code: u8) {
+        // A one-byte write is atomic and the fresh pipe has capacity. Retry
+        // EINTR until the parent receives a status byte; otherwise EOF means
+        // successful exec and must not be produced by an interrupted write.
+        loop {
+            let result = libc::write(fd, &code as *const u8 as *const libc::c_void, 1);
+            if result == 1 {
+                return;
+            }
+            if result < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return;
+        }
+    }
+
     fn is_executable(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path)
@@ -352,25 +402,83 @@ mod unix_pty {
                     let _ = libc::fcntl(master, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
                 }
 
+                // The child reports chdir/exec failures through this pipe.
+                // Successful exec closes its CLOEXEC write end, so the parent
+                // does not return Ok until shell startup has actually crossed
+                // the exec boundary.
+                let startup_pipe = match startup_status_pipe() {
+                    Ok(pipe) => pipe,
+                    Err(error) => {
+                        libc::close(master);
+                        libc::close(slave);
+                        return Err(anyhow!("Failed to create shell startup pipe: {error}"));
+                    }
+                };
+                // Capture process-global state before fork. The child branch
+                // then needs only async-signal-safe syscalls.
+                let inherited_instance_lock_fd =
+                    crate::session_persistence::inherited_instance_lock_fd();
+                let mut default_signal_action: libc::sigaction = std::mem::zeroed();
+                default_signal_action.sa_sigaction = libc::SIG_DFL;
+                if libc::sigemptyset(&mut default_signal_action.sa_mask) != 0 {
+                    libc::close(master);
+                    libc::close(slave);
+                    libc::close(startup_pipe[0]);
+                    libc::close(startup_pipe[1]);
+                    return Err(anyhow!("Failed to prepare child signal state"));
+                }
+                #[cfg(target_os = "linux")]
+                let expected_parent_pid = libc::getpid();
+
                 // Fork 子进程
                 let fork_result = libc::fork();
 
                 if fork_result < 0 {
                     libc::close(master);
                     libc::close(slave);
+                    libc::close(startup_pipe[0]);
+                    libc::close(startup_pipe[1]);
                     return Err(anyhow!("Failed to fork"));
                 }
 
                 if fork_result == 0 {
                     // 子进程分支:从这里到 execve 只调用异步信号安全的 libc 函数。
+                    // A flock is tied to the inherited open-file description,
+                    // not merely this process. Close it before any operation
+                    // that could stall, so a PTY child can never outlive the
+                    // primary process while retaining the instance lock.
+                    if inherited_instance_lock_fd >= 0 {
+                        libc::close(inherited_instance_lock_fd);
+                    }
                     libc::close(master);
+                    libc::close(startup_pipe[0]);
+
+                    // Do not inherit the GUI's graceful-shutdown handler. A
+                    // pre-exec child never polls SHUTDOWN_REQUESTED, so that
+                    // handler would neutralize the parent-death SIGTERM.
+                    if libc::sigaction(libc::SIGTERM, &default_signal_action, std::ptr::null_mut())
+                        != 0
+                    {
+                        report_startup_failure(startup_pipe[1], b'S');
+                        libc::_exit(127);
+                    }
+                    libc::sigaction(libc::SIGINT, &default_signal_action, std::ptr::null_mut());
 
                     // 【关键】设置父进程死亡信号：当父进程(jterm2)死亡时，此进程会收到SIGTERM
                     // 这是最后一道防线，确保即使jterm2被SIGKILL强制杀死或panic崩溃，
                     // rsh进程也会收到退出信号，不会变成孤儿进程继续运行。
                     #[cfg(target_os = "linux")]
                     {
-                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                            report_startup_failure(startup_pipe[1], b'S');
+                            libc::_exit(127);
+                        }
+                        // The parent can die between fork and prctl. Detect
+                        // that race explicitly instead of waiting forever for
+                        // a signal the kernel could not retroactively deliver.
+                        if libc::getppid() != expected_parent_pid {
+                            libc::_exit(128 + libc::SIGTERM);
+                        }
                     }
 
                     // 创建新的会话和进程组（将此进程设为会话leader）
@@ -379,7 +487,7 @@ mod unix_pty {
                     // 切换工作目录(使用 fork 前构建好的指针)
                     if let Some(ref dir_cstr) = cwd_cstr {
                         if libc::chdir(dir_cstr.as_ptr()) != 0 {
-                            write_stderr(b"jterm2: chdir failed\n");
+                            report_startup_failure(startup_pipe[1], b'C');
                             libc::_exit(127);
                         }
                     }
@@ -401,18 +509,71 @@ mod unix_pty {
                     libc::execve(exec_cstr.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
 
                     // 如果 execve 返回，说明出错
-                    write_stderr(b"jterm2: execve failed\n");
+                    report_startup_failure(startup_pipe[1], b'E');
                     libc::_exit(127);
                 } else {
                     // 父进程分支
                     // 关闭 slave
                     libc::close(slave);
+                    libc::close(startup_pipe[1]);
 
-                    Ok(Pty {
-                        master,
-                        child_pid: fork_result as i32,
-                        exit_code_cached: None,
-                    })
+                    let startup_result = loop {
+                        let mut startup_code = 0u8;
+                        let result = libc::read(
+                            startup_pipe[0],
+                            &mut startup_code as *mut u8 as *mut libc::c_void,
+                            1,
+                        );
+                        if result == 0 {
+                            break Ok(None);
+                        }
+                        if result == 1 {
+                            break Ok(Some(startup_code));
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break Err(error);
+                    };
+                    libc::close(startup_pipe[0]);
+
+                    let startup_code = match startup_result {
+                        Ok(None) => {
+                            return Ok(Pty {
+                                master,
+                                child_pid: fork_result as i32,
+                                exit_code_cached: None,
+                            });
+                        }
+                        Ok(Some(code)) => code,
+                        Err(error) => {
+                            // An unknown pipe failure leaves shell state
+                            // ambiguous, so terminate and reap before returning.
+                            libc::close(master);
+                            let _ = libc::kill(fork_result, libc::SIGKILL);
+                            let mut status = 0;
+                            while libc::waitpid(fork_result, &mut status, 0) < 0
+                                && std::io::Error::last_os_error().kind()
+                                    == std::io::ErrorKind::Interrupted
+                            {}
+                            return Err(anyhow!("Failed to read shell startup status: {error}"));
+                        }
+                    };
+
+                    // A failed child never becomes an owned Pty, so close the
+                    // master and reap it here instead of leaving a zombie.
+                    libc::close(master);
+                    let mut status = 0;
+                    while libc::waitpid(fork_result, &mut status, 0) < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                    }
+                    match startup_code {
+                        b'C' => Err(anyhow!("Failed to enter saved working directory")),
+                        b'E' => Err(anyhow!("Failed to execute shell")),
+                        _ => Err(anyhow!("Shell failed during startup")),
+                    }
                 }
             }
         }
@@ -902,5 +1063,42 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("No executable shell found"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_working_directory_is_reported_before_returning_a_pty() {
+        let root = ShellTestDir::new("missing-cwd");
+        let missing_cwd = root.0.join("deleted");
+        let error = super::Pty::new_with_cwd(80, 24, missing_cwd.to_str(), None, Some("/bin/sh"))
+            .err()
+            .expect("a missing cwd must fail before returning a PTY");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to enter saved working directory"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_failure_is_reported_before_returning_a_pty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = ShellTestDir::new("exec-failure");
+        let invalid_shell = root.0.join("invalid-shell");
+        std::fs::write(&invalid_shell, b"not an executable format").unwrap();
+        std::fs::set_permissions(&invalid_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, invalid_shell.to_str())
+            .err()
+            .expect("execve failure must be reported synchronously");
+
+        assert!(
+            error.to_string().contains("Failed to execute shell"),
+            "{error}"
+        );
     }
 }

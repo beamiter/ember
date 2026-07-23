@@ -52,11 +52,6 @@ impl DebugPanel {
         sum / self.frame_times.len() as f64
     }
 
-    /// 获取平均帧时间（供外部使用）
-    pub fn get_avg_frame_time_ms(&self) -> f64 {
-        self.avg_frame_time_ms()
-    }
-
     fn fps(&self) -> f64 {
         let avg = self.avg_frame_time_ms();
         if avg > 0.0 {

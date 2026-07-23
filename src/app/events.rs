@@ -415,4 +415,49 @@ mod tests {
             Some("ctrl+shift+/")
         );
     }
+
+    #[test]
+    fn font_shortcuts_round_trip_from_egui_events_to_default_commands() {
+        let bindings = crate::keybindings::KeyBindings::default_bindings();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl
+        };
+
+        for (key, modifiers, expected) in [
+            (
+                egui::Key::Equals,
+                ctrl,
+                crate::keybindings::Command::FontIncrease,
+            ),
+            (
+                egui::Key::Plus,
+                ctrl,
+                crate::keybindings::Command::FontIncrease,
+            ),
+            (
+                egui::Key::Plus,
+                ctrl_shift,
+                crate::keybindings::Command::FontIncrease,
+            ),
+            (
+                egui::Key::Minus,
+                ctrl,
+                crate::keybindings::Command::FontDecrease,
+            ),
+            (
+                egui::Key::Num0,
+                ctrl,
+                crate::keybindings::Command::FontReset,
+            ),
+        ] {
+            let chord = build_keybinding_string(key, modifiers).unwrap();
+            assert_eq!(bindings.get_command(&chord), Some(expected), "{chord}");
+        }
+    }
 }

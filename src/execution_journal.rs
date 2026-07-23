@@ -8,7 +8,7 @@
 //! terminal as an `output` event with the same execution id.
 
 use crate::terminal::CompletedCommandOutput;
-use crossbeam::channel::{self, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -195,7 +195,7 @@ static READER: OnceCell<Option<Sender<HistoryRequest>>> = OnceCell::new();
 fn writer() -> Option<&'static Sender<JournalMessage>> {
     WRITER
         .get_or_init(|| {
-            let (tx, rx) = channel::bounded::<JournalMessage>(WRITER_QUEUE_CAPACITY);
+            let (tx, rx) = bounded::<JournalMessage>(WRITER_QUEUE_CAPACITY);
             match std::thread::Builder::new()
                 .name("rsh-execution-journal".to_owned())
                 .spawn(move || {
@@ -225,7 +225,7 @@ fn writer() -> Option<&'static Sender<JournalMessage>> {
 fn reader() -> Option<&'static Sender<HistoryRequest>> {
     READER
         .get_or_init(|| {
-            let (tx, rx) = channel::bounded::<HistoryRequest>(READER_QUEUE_CAPACITY);
+            let (tx, rx) = bounded::<HistoryRequest>(READER_QUEUE_CAPACITY);
             match std::thread::Builder::new()
                 .name("rsh-execution-history".to_owned())
                 .spawn(move || {
@@ -257,7 +257,7 @@ fn reader() -> Option<&'static Sender<HistoryRequest>> {
 /// resolves immediately to an empty snapshot so callers can share one state
 /// machine for both configurations.
 pub(crate) fn request_history(session_id: String) -> Result<HistoryLoad, HistoryRequestError> {
-    let (reply, receiver) = channel::bounded(1);
+    let (reply, receiver) = bounded(1);
     if !enabled() {
         let _ = reply.try_send(HistorySnapshot {
             session_id,
@@ -307,7 +307,7 @@ pub(crate) fn flush(timeout: std::time::Duration) -> bool {
     let Some(Some(writer)) = WRITER.get() else {
         return true;
     };
-    let (ack_tx, ack_rx) = channel::bounded(1);
+    let (ack_tx, ack_rx) = bounded(1);
     let started = std::time::Instant::now();
     if writer
         .send_timeout(JournalMessage::Flush(ack_tx), timeout)
@@ -359,6 +359,67 @@ fn journal_path() -> io::Result<(PathBuf, bool)> {
     Ok((state_dir.join("rsh/executions.jsonl"), false))
 }
 
+fn harden_open_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+}
+
+fn validate_journal_file(file: &File, description: &str) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} is not a regular file"),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{description} must have exactly one hard link"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn open_journal_lock(path: &std::path::Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    harden_open_options(&mut options);
+    let file = options.open(path)?;
+    validate_journal_file(&file, "execution journal lock")?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn open_journal_for_read(path: &std::path::Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    harden_open_options(&mut options);
+    let file = options.open(path)?;
+    validate_journal_file(&file, "execution journal")?;
+    Ok(file)
+}
+
+fn open_journal_for_append(path: &std::path::Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    harden_open_options(&mut options);
+    let file = options.open(path)?;
+    validate_journal_file(&file, "execution journal")?;
+    Ok(file)
+}
+
 fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>> {
     if !valid_rsh_session_id(session_id) {
         return Err(io::Error::new(
@@ -374,13 +435,7 @@ fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>>
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
     let lock_path = dir.join("executions.lock");
-    let mut lock_options = OpenOptions::new();
-    lock_options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    lock_options.mode(0o600);
-    let lock = lock_options.open(lock_path)?;
-    #[cfg(unix)]
-    lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let lock = open_journal_lock(&lock_path)?;
     lock_shared(&lock)?;
 
     let read_result = match read_session_history_file(&path, session_id) {
@@ -398,7 +453,7 @@ fn read_session_history_file(
     path: &std::path::Path,
     session_id: &str,
 ) -> io::Result<Vec<PersistedExecution>> {
-    let file = File::open(path)?;
+    let file = open_journal_for_read(path)?;
     if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -557,40 +612,30 @@ fn prepare_journal_path() -> io::Result<PathBuf> {
 fn append_event(event: OutputEvent) -> io::Result<()> {
     let encoded = encode_event(event)?;
     let journal_path = prepare_journal_path()?;
+    append_encoded_event_to_path(&journal_path, &encoded)
+}
+
+fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) -> io::Result<()> {
     let dir = journal_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
     let lock_path = dir.join("executions.lock");
 
-    let mut lock_options = OpenOptions::new();
-    lock_options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    lock_options.mode(0o600);
-    let lock = lock_options.open(lock_path)?;
-    #[cfg(unix)]
-    lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let lock = open_journal_lock(&lock_path)?;
     lock_exclusive(&lock)?;
 
     let write_result = (|| {
-        let current_len = match fs::metadata(&journal_path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
+        let mut journal = open_journal_for_append(journal_path)?;
+        let current_len = journal.metadata()?.len();
         if !journal_append_within_bound(current_len, encoded.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
                 "rsh execution journal is awaiting lifecycle compaction",
             ));
         }
-        let mut journal_options = OpenOptions::new();
-        journal_options.create(true).append(true);
-        #[cfg(unix)]
-        journal_options.mode(0o600);
-        let mut journal = journal_options.open(journal_path)?;
         #[cfg(unix)]
         journal.set_permissions(fs::Permissions::from_mode(0o600))?;
-        journal.write_all(&encoded)?;
+        journal.write_all(encoded)?;
         journal.flush()
     })();
 
@@ -718,6 +763,29 @@ fn unlock(_file: &std::fs::File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "jterm2-execution-journal-{}-{label}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn temporary_journal(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -911,5 +979,87 @@ mod tests {
             11
         ));
         assert!(!journal_append_within_bound(u64::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn ordinary_journal_append_still_creates_private_regular_files() {
+        let root = TestDir::new("ordinary-append");
+        let journal_path = root.0.join("executions.jsonl");
+        let lock_path = root.0.join("executions.lock");
+
+        append_encoded_event_to_path(&journal_path, b"event\n").unwrap();
+
+        assert_eq!(fs::read(&journal_path).unwrap(), b"event\n");
+        assert!(fs::metadata(&journal_path).unwrap().is_file());
+        assert!(fs::metadata(&lock_path).unwrap().is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&journal_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_symlink_never_changes_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("lock-symlink");
+        let target = root.0.join("do-not-touch");
+        let lock_path = root.0.join("executions.lock");
+        let journal_path = root.0.join("executions.jsonl");
+        fs::write(&target, "sentinel contents").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &lock_path).unwrap();
+
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "sentinel contents");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_symlink_is_rejected_for_reads_and_appends() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("journal-symlink");
+        let target = root.0.join("do-not-touch");
+        let journal_path = root.0.join("executions.jsonl");
+        fs::write(&target, "sentinel contents").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &journal_path).unwrap();
+
+        assert!(read_session_history_file(&journal_path, "wanted").is_err());
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "sentinel contents");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_hard_link_never_changes_its_target() {
+        let root = TestDir::new("journal-hard-link");
+        let target = root.0.join("do-not-touch");
+        let journal_path = root.0.join("executions.jsonl");
+        fs::write(&target, "sentinel contents").unwrap();
+        fs::hard_link(&target, &journal_path).unwrap();
+
+        assert!(read_session_history_file(&journal_path, "wanted").is_err());
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "sentinel contents");
     }
 }

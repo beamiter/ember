@@ -36,6 +36,9 @@ pub enum Command {
     TerminalScrollDown,
     TerminalJumpPrevMark,
     TerminalJumpNextMark,
+    FontIncrease,
+    FontDecrease,
+    FontReset,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E
@@ -96,6 +99,9 @@ impl std::fmt::Display for Command {
             Command::TerminalScrollDown => write!(f, "terminal:scroll_down"),
             Command::TerminalJumpPrevMark => write!(f, "terminal:jump_prev_command"),
             Command::TerminalJumpNextMark => write!(f, "terminal:jump_next_command"),
+            Command::FontIncrease => write!(f, "font:increase"),
+            Command::FontDecrease => write!(f, "font:decrease"),
+            Command::FontReset => write!(f, "font:reset"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -150,6 +156,9 @@ impl std::str::FromStr for Command {
             "terminal:scroll_down" => Ok(Command::TerminalScrollDown),
             "terminal:jump_prev_command" => Ok(Command::TerminalJumpPrevMark),
             "terminal:jump_next_command" => Ok(Command::TerminalJumpNextMark),
+            "font:increase" => Ok(Command::FontIncrease),
+            "font:decrease" => Ok(Command::FontDecrease),
+            "font:reset" => Ok(Command::FontReset),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -338,6 +347,20 @@ impl KeyBindings {
             "ctrl+shift+down".to_string(),
             "terminal:jump_next_command".to_string(),
         );
+        // Keep font zoom in the same configurable command path as every other
+        // keyboard shortcut. Different keyboard layouts can report `+` either
+        // with or without Shift, while `Ctrl+=` is the conventional spelling.
+        for chord in ["ctrl+=", "ctrl++", "ctrl+shift++"] {
+            bindings
+                .bindings
+                .insert(chord.to_string(), "font:increase".to_string());
+        }
+        bindings
+            .bindings
+            .insert("ctrl+-".to_string(), "font:decrease".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+0".to_string(), "font:reset".to_string());
 
         bindings
     }
@@ -616,6 +639,9 @@ mod tests {
             Command::PaneResizeDown,
             Command::PaneZoomToggle,
             Command::PaneEqualize,
+            Command::FontIncrease,
+            Command::FontDecrease,
+            Command::FontReset,
             Command::CommandPaletteToggle,
             Command::HelpToggle,
         ] {
@@ -646,6 +672,9 @@ mod tests {
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+/", Command::HelpToggle),
             ("shift+insert", Command::EditPaste),
+            ("ctrl+=", Command::FontIncrease),
+            ("ctrl+-", Command::FontDecrease),
+            ("ctrl+0", Command::FontReset),
             ("f12", Command::DebugToggle),
         ];
         for (key, command) in expected {
@@ -679,11 +708,11 @@ mod tests {
                 "stale binding {removed}"
             );
         }
-        assert_eq!(bindings.get_command("ctrl+0"), None);
+        assert_eq!(bindings.get_command("ctrl+0"), Some(Command::FontReset));
     }
 
     #[test]
-    fn numeric_tabs_use_browser_semantics_and_leave_ctrl_zero_for_zoom() {
+    fn numeric_tabs_use_browser_semantics_and_ctrl_zero_resets_zoom() {
         let bindings = KeyBindings::default_bindings();
         for index in 0..8 {
             assert_eq!(
@@ -692,7 +721,7 @@ mod tests {
             );
         }
         assert_eq!(bindings.get_command("ctrl+9"), Some(Command::SessionLast));
-        assert_eq!(bindings.get_command("ctrl+0"), None);
+        assert_eq!(bindings.get_command("ctrl+0"), Some(Command::FontReset));
     }
 
     #[test]
