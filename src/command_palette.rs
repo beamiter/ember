@@ -362,6 +362,12 @@ impl CommandPalette {
                 crate::keybindings::Command::SidebarToggle,
             ),
             CommandInfo::new(
+                "Toggle AI Agent",
+                CommandCategory::Window,
+                "Open/close the AI agent panel (per-command approval)",
+                crate::keybindings::Command::AgentToggle,
+            ),
+            CommandInfo::new(
                 "Toggle Command Palette",
                 CommandCategory::Window,
                 "Open or close the command palette",
@@ -639,6 +645,7 @@ mod tests {
             Command::ConfigToggle,
             Command::DebugToggle,
             Command::SidebarToggle,
+            Command::AgentToggle,
         ];
 
         for command in fixed_commands {

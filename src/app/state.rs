@@ -179,6 +179,9 @@ pub struct TerminalApp {
     // Debug overlay panel
     pub debug_panel: debug_panel::DebugPanel,
 
+    // AI agent panel (per-command approval agent over jterm_core)
+    pub agent_panel: crate::agent_panel::AgentPanel,
+
     // Config system
     pub config: config::Config,
     pub config_save_pending: bool,

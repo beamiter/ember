@@ -71,6 +71,7 @@ pub enum Command {
 
     // === 侧边栏 ===
     SidebarToggle,
+    AgentToggle,
 }
 
 impl std::fmt::Display for Command {
@@ -125,6 +126,7 @@ impl std::fmt::Display for Command {
             Command::ConfigToggle => write!(f, "config:toggle"),
             Command::DebugToggle => write!(f, "debug:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
+            Command::AgentToggle => write!(f, "agent:toggle"),
         }
     }
 }
@@ -182,6 +184,7 @@ impl std::str::FromStr for Command {
             "config:toggle" => Ok(Command::ConfigToggle),
             "debug:toggle" => Ok(Command::DebugToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
+            "agent:toggle" => Ok(Command::AgentToggle),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str
@@ -291,6 +294,11 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+\\".to_string(), "sidebar:toggle".to_string());
+
+        // AI agent 面板
+        bindings
+            .bindings
+            .insert("ctrl+shift+a".to_string(), "agent:toggle".to_string());
 
         // 终端操作
         bindings
@@ -666,6 +674,7 @@ mod tests {
             ("ctrl+pageup", Command::SessionPrev),
             ("ctrl+shift+o", Command::ConfigToggle),
             ("ctrl+\\", Command::SidebarToggle),
+            ("ctrl+shift+a", Command::AgentToggle),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
             ("ctrl+shift+return", Command::PaneZoomToggle),

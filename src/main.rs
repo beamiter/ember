@@ -1,3 +1,4 @@
+mod agent_panel;
 mod app;
 mod atomic_file;
 mod char_width;
@@ -594,6 +595,13 @@ fn main() -> Result<(), eframe::Error> {
 
     // 设置信号处理，确保收到SIGINT/SIGTERM时能正常清理
     setup_signal_handlers();
+
+    // Shared jterm_core modules brand themselves per app (env prefixes,
+    // prompt strings) from this identity.
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "jterm2",
+        app_id: "io.github.beamiter.jterm2",
+    });
 
     // Load configuration
     let cfg = config::Config::load();
@@ -1675,6 +1683,7 @@ impl TerminalApp {
             help_panel: help::HelpPanel::new(),
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
+            agent_panel: agent_panel::AgentPanel::new(),
             config: cfg.clone(),
             config_save_pending: false,
             config_save_deadline: std::time::Instant::now(),
@@ -2196,7 +2205,8 @@ impl eframe::App for TerminalApp {
             user_input_barrier_session_id.as_deref(),
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
-        for (_session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
+        for (session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
+            self.agent_panel.handle_completed(session_idx, &completed);
             if let Err(error) = execution_journal::submit(completed) {
                 log::warn!("rsh execution output journal queue rejected an event: {error:?}");
             }
@@ -2729,6 +2739,8 @@ impl eframe::App for TerminalApp {
                 self.last_activity_time = std::time::Instant::now();
                 drop(terminal);
                 for completed in completed_outputs {
+                    self.agent_panel
+                        .handle_completed(active_session_idx, &completed);
                     if let Err(error) = execution_journal::submit(completed) {
                         log::warn!(
                             "rsh execution output journal queue rejected an event: {error:?}"
@@ -3623,6 +3635,9 @@ impl eframe::App for TerminalApp {
 
 impl Drop for TerminalApp {
     fn drop(&mut self) {
+        // 保存 agent 会话（取消/清空会话时会删除快照文件）
+        self.agent_panel.persist();
+
         // 保存配置
         if self.config_save_pending {
             if let Err(e) = self.config.save() {

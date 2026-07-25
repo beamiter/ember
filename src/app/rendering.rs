@@ -854,6 +854,44 @@ impl TerminalApp {
                 frame_budget_kb,
             );
         }
+
+        // AI agent panel: advance the session (harvest model replies, start
+        // the next request), render, then apply approved-command effects.
+        if self.agent_panel.is_open {
+            let cwd = {
+                let session = self.session_manager.get_active_session_mut();
+                let terminal = session.terminal.lock();
+                terminal.current_working_dir.clone()
+            };
+            let shell = self
+                .config
+                .shell
+                .clone()
+                .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()));
+            self.agent_panel.drive(&self.config, cwd.as_deref(), &shell);
+            let effects = self.agent_panel.show(ctx);
+            for effect in effects {
+                match effect {
+                    crate::agent_panel::AgentEffect::RunCommand {
+                        session_index,
+                        command,
+                    } => {
+                        let mut bytes = command.into_bytes();
+                        bytes.push(b'\r');
+                        match self.session_manager.get_session_mut(session_index) {
+                            Some(session) => {
+                                if !session.queue_input(&bytes) {
+                                    self.set_status(
+                                        "Agent command rejected: input queue is full",
+                                    );
+                                }
+                            }
+                            None => self.set_status("Agent session's terminal no longer exists"),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 状态消息 toast。固定锚在屏幕右下角,过期后下一帧自动消失。

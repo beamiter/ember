@@ -19,6 +19,7 @@ pub enum ConfigTab {
     Font,
     Appearance,
     Advanced,
+    Ai,
 }
 
 pub enum ConfigAction {
@@ -50,6 +51,14 @@ pub struct ConfigPanel {
     edit_paste_confirm: bool,
     edit_osc52_clipboard_write: bool,
     edit_osc52_clipboard_read: bool,
+    edit_ai_enabled: bool,
+    edit_ai_provider: String,
+    edit_ai_model: String,
+    edit_ai_base_url: String,
+    edit_ai_max_tokens: u32,
+    edit_ai_redact_secrets: bool,
+    edit_ai_api_key_file: String,
+    edit_agent_max_turns: u32,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
     all_fonts: Vec<String>,
@@ -91,6 +100,14 @@ impl ConfigPanel {
             edit_paste_confirm: true,
             edit_osc52_clipboard_write: true,
             edit_osc52_clipboard_read: false,
+            edit_ai_enabled: false,
+            edit_ai_provider: "anthropic".to_string(),
+            edit_ai_model: String::new(),
+            edit_ai_base_url: String::new(),
+            edit_ai_max_tokens: 1_024,
+            edit_ai_redact_secrets: true,
+            edit_ai_api_key_file: String::new(),
+            edit_agent_max_turns: 20,
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
             available_themes: Vec::new(),
@@ -161,6 +178,14 @@ impl ConfigPanel {
         self.edit_paste_confirm = config.paste_confirm;
         self.edit_osc52_clipboard_write = config.osc52_clipboard_write;
         self.edit_osc52_clipboard_read = config.osc52_clipboard_read;
+        self.edit_ai_enabled = config.ai_enabled;
+        self.edit_ai_provider = config.ai_provider.clone();
+        self.edit_ai_model = config.ai_model.clone();
+        self.edit_ai_base_url = config.ai_base_url.clone();
+        self.edit_ai_max_tokens = config.ai_max_tokens;
+        self.edit_ai_redact_secrets = config.ai_redact_secrets;
+        self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
+        self.edit_agent_max_turns = config.agent_max_turns;
     }
 
     /// Apply all buffered edit values to the given Config.
@@ -186,6 +211,15 @@ impl ConfigPanel {
         config.paste_confirm = self.edit_paste_confirm;
         config.osc52_clipboard_write = self.edit_osc52_clipboard_write;
         config.osc52_clipboard_read = self.edit_osc52_clipboard_read;
+        config.ai_enabled = self.edit_ai_enabled;
+        config.ai_provider = self.edit_ai_provider.clone();
+        config.ai_model = self.edit_ai_model.trim().to_string();
+        config.ai_base_url = self.edit_ai_base_url.trim().to_string();
+        config.ai_max_tokens = self.edit_ai_max_tokens.clamp(64, 32_768);
+        config.ai_redact_secrets = self.edit_ai_redact_secrets;
+        config.ai_api_key_file = Some(self.edit_ai_api_key_file.trim().to_string())
+            .filter(|path| !path.is_empty());
+        config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
     }
 
     pub fn close(&mut self) {
@@ -247,6 +281,7 @@ impl ConfigPanel {
                     ui.selectable_value(&mut self.active_tab, ConfigTab::Font, "Font");
                     ui.selectable_value(&mut self.active_tab, ConfigTab::Appearance, "Appearance");
                     ui.selectable_value(&mut self.active_tab, ConfigTab::Advanced, "Advanced");
+                    ui.selectable_value(&mut self.active_tab, ConfigTab::Ai, "AI");
                 });
                 ui.separator();
 
@@ -263,6 +298,9 @@ impl ConfigPanel {
                         }
                         ConfigTab::Advanced => {
                             self.render_advanced_tab(ui, &mut actions);
+                        }
+                        ConfigTab::Ai => {
+                            self.render_ai_tab(ui);
                         }
                     });
 
@@ -886,6 +924,124 @@ fn render_theme_editor(
 }
 
 impl ConfigPanel {
+
+    fn render_ai_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("AI & Agent").strong().size(14.0));
+        ui.separator();
+
+        if ui
+            .checkbox(&mut self.edit_ai_enabled, "Enable AI features")
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.label(
+            RichText::new(
+                "Off by default. Nothing leaves this machine until you enable AI \
+                 and explicitly submit a request; agent commands always require \
+                 per-command approval.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Provider:");
+            for (value, label) in [
+                ("anthropic", "Anthropic"),
+                ("openai-compatible", "OpenAI-compatible"),
+                ("ollama", "Ollama"),
+            ] {
+                if ui
+                    .selectable_label(self.edit_ai_provider == value, label)
+                    .clicked()
+                {
+                    self.edit_ai_provider = value.to_string();
+                    self.has_changes = true;
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Model:");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.edit_ai_model).desired_width(260.0))
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Base URL:");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.edit_ai_base_url).desired_width(260.0))
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Max output tokens:");
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.edit_ai_max_tokens, 64..=32_768)
+                        .logarithmic(true)
+                        .show_value(true),
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("API key file:");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.edit_ai_api_key_file)
+                        .hint_text("~/.config/jterm2/ai.key (chmod 600)")
+                        .desired_width(260.0),
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Optional single-line key file owned by you with 0600 permissions. \
+                 Environment variables (JTERM2_AI_API_KEY, ANTHROPIC_API_KEY, …) \
+                 take precedence; the key itself is never written to config.toml.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+        ui.separator();
+
+        if ui
+            .checkbox(
+                &mut self.edit_ai_redact_secrets,
+                "Redact secrets in AI-bound text",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Agent turn budget:");
+            if ui
+                .add(egui::Slider::new(&mut self.edit_agent_max_turns, 1..=100).show_value(true))
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
+    }
+
     fn render_advanced_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ConfigAction>) {
         ui.label(RichText::new("Advanced Settings").strong().size(14.0));
         ui.separator();

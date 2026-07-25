@@ -550,6 +550,15 @@ impl TerminalApp {
                     self.sidebar.refresh();
                 }
             }
+            keybindings::Command::AgentToggle => {
+                let active = self.session_manager.active_index();
+                self.agent_panel.toggle(&self.config, active);
+                self.set_status(if self.agent_panel.is_open {
+                    "AI agent 已打开：每条命令都需要你批准后才会执行"
+                } else {
+                    "AI agent 已关闭"
+                });
+            }
         }
         false
     }
