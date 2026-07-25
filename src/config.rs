@@ -85,6 +85,10 @@ pub struct Config {
     #[serde(default = "default_ai_max_tokens")]
     pub ai_max_tokens: u32,
 
+    /// 采样温度（None 使用 provider 默认；有效范围 0.0..=2.0）
+    #[serde(default)]
+    pub ai_temperature: Option<f32>,
+
     /// Scrub high-confidence secrets from AI-bound text (default on).
     #[serde(default = "default_true")]
     pub ai_redact_secrets: bool,
@@ -346,6 +350,7 @@ impl Default for Config {
             ai_base_url: default_ai_base_url(),
             ai_model: default_ai_model(),
             ai_max_tokens: default_ai_max_tokens(),
+            ai_temperature: None,
             ai_redact_secrets: true,
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),

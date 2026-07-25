@@ -45,6 +45,7 @@ fn client_from_config(config: &Config) -> Result<AiClient, String> {
         model: config.ai_model.clone(),
         base_url: config.ai_base_url.clone(),
         max_tokens: config.ai_max_tokens,
+        temperature: config.ai_temperature,
         redact_secrets: config.ai_redact_secrets,
     })
     .map_err(|error| error.to_string())
