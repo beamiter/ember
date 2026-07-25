@@ -1,5 +1,6 @@
 // Tab management module
 
+use crate::theme::ThemeExt as _;
 use super::state::TerminalApp;
 use eframe::egui;
 

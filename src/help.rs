@@ -1,5 +1,6 @@
 //! 快捷键帮助面板模块
 
+use crate::theme::ThemeExt as _;
 use egui::{Color32, RichText, Window};
 
 use crate::command_palette::{CommandCategory, CommandPalette};

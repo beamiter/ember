@@ -1,3 +1,4 @@
+use crate::theme::ThemeExt as _;
 use crate::color;
 use crate::gpu;
 use crate::terminal::{clamp_terminal_dimensions, TerminalState};
@@ -1024,7 +1025,11 @@ impl TerminalRenderer {
         // eprintln!("[UI] Rect: {:?}", rect);
 
         let painter = ui.painter_at(rect);
-        let bg = self.theme.terminal_background();
+        // OSC 11 dynamic background wins over the theme for the whole widget.
+        let bg = terminal
+            .dynamic_bg
+            .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+            .unwrap_or_else(|| self.theme.terminal_background());
         let bg_with_opacity = egui::Color32::from_rgba_unmultiplied(
             bg.r(),
             bg.g(),
@@ -1483,9 +1488,12 @@ impl TerminalRenderer {
                 let block_cursor_rect =
                     cell_rect.shrink2(egui::vec2((cell_width * 0.24).clamp(1.5, 3.0), 0.5));
 
+                let dynamic_cursor = terminal
+                    .dynamic_cursor_color
+                    .map(|(r, g, b)| Color32::from_rgb(r, g, b));
                 match &terminal.cursor_shape {
                     crate::terminal::CursorShape::Block => {
-                        let cursor_c = self.theme.cursor_color();
+                        let cursor_c = dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color());
                         let [r, g, b, _] = cursor_c.to_srgba_unmultiplied();
                         painter.rect_filled(
                             block_cursor_rect,
@@ -1506,7 +1514,7 @@ impl TerminalRenderer {
                                 egui::pos2(x, underline_y),
                                 egui::pos2(x + cell_width, underline_y),
                             ],
-                            egui::Stroke::new(0.8, self.theme.cursor_color()),
+                            egui::Stroke::new(0.8, dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color())),
                         );
                     }
                     crate::terminal::CursorShape::Beam => {
@@ -1515,7 +1523,7 @@ impl TerminalRenderer {
                                 egui::pos2(x + 0.25, y),
                                 egui::pos2(x + 0.25, y + line_height),
                             ],
-                            egui::Stroke::new(0.8, self.theme.cursor_color()),
+                            egui::Stroke::new(0.8, dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color())),
                         );
                     }
                 }
@@ -1613,7 +1621,11 @@ impl TerminalRenderer {
         };
 
         let ppp = ui.ctx().pixels_per_point();
-        let default_bg = self.theme.terminal_background();
+        // OSC 11 dynamic background wins over the theme for the whole grid.
+        let default_bg = terminal
+            .dynamic_bg
+            .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+            .unwrap_or_else(|| self.theme.terminal_background());
         let has_search = !search_state.matches.is_empty() && !search_state.query.is_empty();
         let target_cell_width = char_width * ppp;
         let target_cell_height = line_height * ppp;
@@ -2096,11 +2108,17 @@ impl TerminalRenderer {
                     cell.foreground,
                     theme,
                     Some(&terminal.dynamic_palette),
+                    terminal.dynamic_fg,
                     bold,
                     dim,
                 )
             } else {
-                color::resolve_bg_with_palette(cell.background, theme, Some(&terminal.dynamic_palette))
+                color::resolve_bg_with_palette(
+                    cell.background,
+                    theme,
+                    Some(&terminal.dynamic_palette),
+                    terminal.dynamic_bg,
+                )
             };
 
             let mut is_search_match = false;
@@ -2114,6 +2132,7 @@ impl TerminalRenderer {
                     cell.foreground,
                     theme,
                     Some(&terminal.dynamic_palette),
+                    terminal.dynamic_fg,
                     bold,
                     dim,
                 );
@@ -2143,12 +2162,18 @@ impl TerminalRenderer {
             let mut fg_color = if is_selected {
                 theme.selection_fg_color()
             } else if is_inverse {
-                color::resolve_bg_with_palette(cell.background, theme, Some(&terminal.dynamic_palette))
+                color::resolve_bg_with_palette(
+                    cell.background,
+                    theme,
+                    Some(&terminal.dynamic_palette),
+                    terminal.dynamic_bg,
+                )
             } else {
                 color::resolve_fg_with_palette(
                     cell.foreground,
                     theme,
                     Some(&terminal.dynamic_palette),
+                    terminal.dynamic_fg,
                     bold,
                     dim,
                 )
@@ -2336,11 +2361,17 @@ impl TerminalRenderer {
                         cell.foreground,
                         &self.theme,
                         Some(&terminal.dynamic_palette),
+                        terminal.dynamic_fg,
                         bold,
                         dim,
                     )
                 } else {
-                    color::resolve_bg_with_palette(cell.background, &self.theme, Some(&terminal.dynamic_palette))
+                    color::resolve_bg_with_palette(
+                    cell.background,
+                    &self.theme,
+                    Some(&terminal.dynamic_palette),
+                    terminal.dynamic_bg,
+                )
                 };
 
                 let mut is_search_match = false;
@@ -2353,6 +2384,7 @@ impl TerminalRenderer {
                         cell.foreground,
                         &self.theme,
                         Some(&terminal.dynamic_palette),
+                        terminal.dynamic_fg,
                         bold,
                         dim,
                     );
@@ -2425,12 +2457,18 @@ impl TerminalRenderer {
                 let mut fg_color = if is_selected {
                     self.theme.selection_fg_color()
                 } else if cell.flags.inverse() {
-                    color::resolve_bg_with_palette(cell.background, &self.theme, Some(&terminal.dynamic_palette))
+                    color::resolve_bg_with_palette(
+                    cell.background,
+                    &self.theme,
+                    Some(&terminal.dynamic_palette),
+                    terminal.dynamic_bg,
+                )
                 } else {
                     color::resolve_fg_with_palette(
                         cell.foreground,
                         &self.theme,
                         Some(&terminal.dynamic_palette),
+                        terminal.dynamic_fg,
                         bold,
                         dim,
                     )

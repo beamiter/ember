@@ -29,6 +29,7 @@ mod theme;
 mod ui;
 mod windows_compat;
 
+use crate::theme::ThemeExt as _;
 use app::events::{
     normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
     semantic_paste_modifiers, should_restore_terminal_shortcut_event,

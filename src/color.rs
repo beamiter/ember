@@ -1,3 +1,4 @@
+use crate::theme::ThemeExt as _;
 use crate::terminal::{Color, DynamicColorPalette};
 use crate::theme::Theme;
 use egui::Color32;
@@ -29,7 +30,7 @@ fn ansi_index(color: Color) -> Option<usize> {
 /// bold-brightening and dim attenuation.
 #[allow(dead_code)]
 pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> Color32 {
-    resolve_fg_with_palette(color, theme, None, bold, dim)
+    resolve_fg_with_palette(color, theme, None, None, bold, dim)
 }
 
 /// Like [`resolve_fg`], but OSC 4 palette overrides win over the theme for
@@ -38,11 +39,15 @@ pub fn resolve_fg_with_palette(
     color: Color,
     theme: &Theme,
     palette: Option<&DynamicColorPalette>,
+    dynamic_fg: Option<(u8, u8, u8)>,
     bold: bool,
     dim: bool,
 ) -> Color32 {
     let base = match color {
-        Color::Default => theme.terminal_foreground(),
+        // OSC 10 dynamic foreground overrides the theme default.
+        Color::Default => dynamic_fg
+            .map(|(r, g, b)| Color32::from_rgb(r, g, b))
+            .unwrap_or_else(|| theme.terminal_foreground()),
         Color::Indexed(idx) => color_256_with_palette(idx, theme, palette),
         Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         _ => {
@@ -72,7 +77,7 @@ pub fn resolve_fg_with_palette(
 /// Resolve a background color using the theme palette.
 #[allow(dead_code)]
 pub fn resolve_bg(color: Color, theme: &Theme) -> Color32 {
-    resolve_bg_with_palette(color, theme, None)
+    resolve_bg_with_palette(color, theme, None, None)
 }
 
 /// Like [`resolve_bg`], but OSC 4 palette overrides win over the theme.
@@ -80,9 +85,13 @@ pub fn resolve_bg_with_palette(
     color: Color,
     theme: &Theme,
     palette: Option<&DynamicColorPalette>,
+    dynamic_bg: Option<(u8, u8, u8)>,
 ) -> Color32 {
     match color {
-        Color::Default => theme.terminal_background(),
+        // OSC 11 dynamic background overrides the theme default.
+        Color::Default => dynamic_bg
+            .map(|(r, g, b)| Color32::from_rgb(r, g, b))
+            .unwrap_or_else(|| theme.terminal_background()),
         Color::Indexed(idx) => color_256_with_palette(idx, theme, palette),
         Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         _ => {

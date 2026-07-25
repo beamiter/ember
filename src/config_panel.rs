@@ -1,3 +1,4 @@
+use crate::theme::ThemeExt as _;
 use crate::config::{AppRendererType, Config, TabBarPosition};
 use crate::theme::Theme;
 use egui::{Color32, RichText};

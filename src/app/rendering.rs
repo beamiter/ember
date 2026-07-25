@@ -1,5 +1,6 @@
 // Rendering coordination module
 
+use crate::theme::ThemeExt as _;
 use super::state::TerminalApp;
 use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
