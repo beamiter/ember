@@ -1,7 +1,5 @@
 mod agent_panel;
 mod app;
-mod atomic_file;
-mod char_width;
 mod clipboard;
 mod color;
 mod command_palette;
@@ -38,6 +36,8 @@ use app::events::{
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
 use eframe::egui;
+pub(crate) use jterm_core::atomic_file;
+pub(crate) use jterm_core::char_width;
 use parking_lot::Mutex as ParkingMutex;
 use session::Session;
 use session_manager::{ProtocolResponseQueueError, ProtocolResponseSender, SessionManager};

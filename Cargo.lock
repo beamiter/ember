@@ -1683,14 +1683,16 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?branch=master#b7c6ec6d6d64e1006490f6e4d7e00d7692c098a6"
+source = "git+https://github.com/beamiter/jterm_core.git?branch=master#cc695689a748eadd8cd50bbf8a867e55446471b5"
 dependencies = [
  "libc",
  "log",
+ "lru",
  "memchr",
  "regex",
  "serde",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 // Library export for benchmarks and testing
 
-pub(crate) mod atomic_file;
-pub mod char_width; // P5：字符宽度缓存
+pub(crate) use jterm_core::atomic_file;
+pub use jterm_core::char_width; // P5：字符宽度缓存（已抽取到 jterm_core）
 pub mod clipboard;
 pub mod color;
 pub mod command_palette;
