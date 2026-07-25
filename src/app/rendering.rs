@@ -211,25 +211,25 @@ impl TerminalApp {
                     let response = ui
                         .interact(
                             divider.rect,
-                            ui.id().with(("terminal-split-divider", divider.id.0)),
+                            ui.id().with(("terminal-split-divider", &divider.id)),
                             egui::Sense::click_and_drag(),
                         )
                         .on_hover_cursor(cursor)
                         .on_hover_text("Drag to resize · double-click to reset");
-                    (*divider, response)
+                    (divider.clone(), response)
                 })
                 .collect();
             let hovered_divider = divider_interactions
                 .iter()
                 .find(|(_, response)| response.hovered())
-                .map(|(divider, _)| *divider);
-            let active_divider = self.dragging_divider.and_then(|split_id| {
+                .map(|(divider, _)| divider.clone());
+            let active_divider = self.dragging_divider.as_ref().and_then(|split_id| {
                 divider_rects
                     .iter()
-                    .find(|divider| divider.id == split_id)
-                    .copied()
+                    .find(|divider| &divider.id == split_id)
+                    .cloned()
             });
-            if let Some(divider) = active_divider.or(hovered_divider) {
+            if let Some(divider) = active_divider.or_else(|| hovered_divider.clone()) {
                 ctx.set_cursor_icon(match divider.axis {
                     layout::SplitAxis::Vertical => egui::CursorIcon::ResizeHorizontal,
                     layout::SplitAxis::Horizontal => egui::CursorIcon::ResizeVertical,
@@ -238,8 +238,10 @@ impl TerminalApp {
 
             // 命中区域为 10px，但只画细线；hover/drag 时加粗并使用强调色。
             for divider in &divider_rects {
-                let highlighted = self.dragging_divider == Some(divider.id)
-                    || hovered_divider.is_some_and(|hovered| hovered.id == divider.id);
+                let highlighted = self.dragging_divider.as_ref() == Some(&divider.id)
+                    || hovered_divider
+                        .as_ref()
+                        .is_some_and(|hovered| hovered.id == divider.id);
                 let divider_color = if highlighted {
                     crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border)
                 } else {
@@ -271,10 +273,10 @@ impl TerminalApp {
                 divider_interactions
                     .iter()
                     .find(|(_, response)| response.double_clicked_by(egui::PointerButton::Primary))
-                    .map(|(divider, _)| *divider)
+                    .map(|(divider, _)| divider.clone())
             });
             if let Some(divider) = double_clicked_divider.flatten() {
-                if self.layout_manager.set_split_ratio(divider.id, 0.5) {
+                if self.layout_manager.set_split_ratio(&divider.id, 0.5) {
                     self.schedule_session_save();
                 }
                 self.dragging_divider = None;
@@ -284,28 +286,16 @@ impl TerminalApp {
                 self.dragging_divider = divider_interactions
                     .iter()
                     .find(|(_, response)| response.is_pointer_button_down_on())
-                    .map(|(divider, _)| divider.id);
+                    .map(|(divider, _)| divider.id.clone());
             }
 
             if interaction_enabled {
-                if let Some(split_id) = self.dragging_divider {
+                if let Some(split_id) = self.dragging_divider.clone() {
+                    // The layout resolves the divider's own node rectangle and
+                    // snaps near even pair splits.
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        if let Some(divider) =
-                            divider_rects.iter().find(|divider| divider.id == split_id)
-                        {
-                            let ratio = match divider.axis {
-                                layout::SplitAxis::Vertical => {
-                                    (pos.x - divider.container_rect.left())
-                                        / divider.container_rect.width().max(1.0)
-                                }
-                                layout::SplitAxis::Horizontal => {
-                                    (pos.y - divider.container_rect.top())
-                                        / divider.container_rect.height().max(1.0)
-                                }
-                            };
-                            if self.layout_manager.set_split_ratio(split_id, ratio) {
-                                self.schedule_session_save();
-                            }
+                        if self.layout_manager.drag_divider_to(&split_id, pos) {
+                            self.schedule_session_save();
                         }
                     }
                 }

@@ -2092,9 +2092,15 @@ impl TerminalRenderer {
             let mut bg_color = if is_selected {
                 theme.selection_color()
             } else if is_inverse {
-                color::resolve_fg(cell.foreground, theme, bold, dim)
+                color::resolve_fg_with_palette(
+                    cell.foreground,
+                    theme,
+                    Some(&terminal.dynamic_palette),
+                    bold,
+                    dim,
+                )
             } else {
-                color::resolve_bg(cell.background, theme)
+                color::resolve_bg_with_palette(cell.background, theme, Some(&terminal.dynamic_palette))
             };
 
             let mut is_search_match = false;
@@ -2104,7 +2110,13 @@ impl TerminalRenderer {
                     for m in row_matches.iter() {
                         if col_idx >= m.col_start && col_idx < m.col_end {
                             is_search_match = true;
-                            bg_color = color::resolve_fg(cell.foreground, theme, bold, dim);
+                            bg_color = color::resolve_fg_with_palette(
+                    cell.foreground,
+                    theme,
+                    Some(&terminal.dynamic_palette),
+                    bold,
+                    dim,
+                );
                             if active_match_pos == Some((m.line_id, m.col_start)) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
@@ -2131,9 +2143,15 @@ impl TerminalRenderer {
             let mut fg_color = if is_selected {
                 theme.selection_fg_color()
             } else if is_inverse {
-                color::resolve_bg(cell.background, theme)
+                color::resolve_bg_with_palette(cell.background, theme, Some(&terminal.dynamic_palette))
             } else {
-                color::resolve_fg(cell.foreground, theme, bold, dim)
+                color::resolve_fg_with_palette(
+                    cell.foreground,
+                    theme,
+                    Some(&terminal.dynamic_palette),
+                    bold,
+                    dim,
+                )
             };
 
             let is_link = {
@@ -2314,9 +2332,15 @@ impl TerminalRenderer {
                 let mut bg_color = if is_selected {
                     self.theme.selection_color()
                 } else if is_inverse {
-                    color::resolve_fg(cell.foreground, &self.theme, bold, dim)
+                    color::resolve_fg_with_palette(
+                        cell.foreground,
+                        &self.theme,
+                        Some(&terminal.dynamic_palette),
+                        bold,
+                        dim,
+                    )
                 } else {
-                    color::resolve_bg(cell.background, &self.theme)
+                    color::resolve_bg_with_palette(cell.background, &self.theme, Some(&terminal.dynamic_palette))
                 };
 
                 let mut is_search_match = false;
@@ -2325,7 +2349,13 @@ impl TerminalRenderer {
                     for m in row_matches {
                         if col_idx >= m.col_start && col_idx < m.col_end {
                             is_search_match = true;
-                            bg_color = color::resolve_fg(cell.foreground, &self.theme, bold, dim);
+                            bg_color = color::resolve_fg_with_palette(
+                        cell.foreground,
+                        &self.theme,
+                        Some(&terminal.dynamic_palette),
+                        bold,
+                        dim,
+                    );
                             if active_match == Some(*m) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
@@ -2395,9 +2425,15 @@ impl TerminalRenderer {
                 let mut fg_color = if is_selected {
                     self.theme.selection_fg_color()
                 } else if cell.flags.inverse() {
-                    color::resolve_bg(cell.background, &self.theme)
+                    color::resolve_bg_with_palette(cell.background, &self.theme, Some(&terminal.dynamic_palette))
                 } else {
-                    color::resolve_fg(cell.foreground, &self.theme, bold, dim)
+                    color::resolve_fg_with_palette(
+                        cell.foreground,
+                        &self.theme,
+                        Some(&terminal.dynamic_palette),
+                        bold,
+                        dim,
+                    )
                 };
 
                 let is_link = {

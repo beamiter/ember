@@ -1,32 +1,37 @@
+//! Split-pane layout for jterm2, backed by `jterm_core::pane_layout`.
+//!
+//! The tmux-style n-ary [`PaneTree`] (leaves are session indices) replaces the
+//! old app-local binary tree: splitting along a node's existing axis joins the
+//! new pane as a sibling instead of nesting, and divider drags snap near even.
+//! This module keeps jterm2's public `LayoutManager` API and the persisted
+//! binary `LayoutSnapshot` format: snapshots are converted to and from the
+//! n-ary tree on save/restore, so existing session files keep working.
+
 use egui::Rect;
 use std::collections::{HashMap, HashSet};
 
-/// 窗格 ID
+use jterm_core::pane_layout::{
+    collect_pane_rects, directional_focus_target, set_divider_share, split_node_rect,
+    PaneRect as CorePaneRect, PaneTree, Rect as CoreRect,
+};
+pub use jterm_core::pane_layout::{Axis as SplitAxis, DividerId, PaneDirection as CoreDirection};
+
+/// 窗格 ID。现在等同于该窗格显示的 session 索引（布局树保证每个会话
+/// 至多出现在一个窗格里），保留类型只为兼容既有调用方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub usize);
 
-/// 分割节点 ID。拖动分隔线时用稳定 ID 锁定具体分割，避免指针移出
-/// 分隔线后误操作另一个节点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SplitId(pub usize);
-
-/// 分割轴：垂直分割产生左右窗格，水平分割产生上下窗格。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitAxis {
-    Vertical,
-    Horizontal,
-}
-
-/// 可交互分隔线及它所属的布局区域。
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// 可交互分隔线及它所属的分割节点区域。`container_rect` 是分割节点自己
+/// 的矩形，拖动时把指针位置换算成该节点内的比例。
+#[derive(Debug, Clone, PartialEq)]
 pub struct SplitDivider {
-    pub id: SplitId,
+    pub id: DividerId,
     pub axis: SplitAxis,
     pub rect: Rect,
     pub container_rect: Rect,
 }
 
-/// 单个窗格的状态
+/// 单个窗格的状态（按需从布局树重建的缓存视图）。
 #[derive(Debug, Clone)]
 pub struct Pane {
     pub id: PaneId,
@@ -35,41 +40,33 @@ pub struct Pane {
     pub focused: bool,
 }
 
-impl Pane {
-    pub fn new(id: PaneId, session_idx: usize) -> Self {
-        Pane {
-            id,
-            session_idx,
-            rect: Rect::ZERO,
-            focused: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum LayoutNode {
-    Pane(PaneId),
-    Split {
-        id: SplitId,
-        axis: SplitAxis,
-        ratio: f32,
-        first: Box<LayoutNode>,
-        second: Box<LayoutNode>,
-    },
-}
-
 /// 递归窗格布局。每次分屏只拆分当前焦点窗格，因此可以自由组合左右和
 /// 上下布局，而不是把整个窗口限制成固定的两个区域。
 pub struct LayoutManager {
+    /// DFS 顺序的窗格缓存，随树结构/焦点/几何变化重建。
     pub panes: Vec<Pane>,
     pub focused_pane_id: PaneId,
-    pane_counter: usize,
-    split_counter: usize,
-    root: Option<LayoutNode>,
+    tree: PaneTree,
     last_container_rect: Rect,
     /// Transient focus mode. The recursive split tree stays intact while the
     /// renderer sees only the focused pane; this state is not persisted.
     zoomed: bool,
+}
+
+fn core_rect(rect: Rect) -> CoreRect {
+    CoreRect {
+        x: rect.left(),
+        y: rect.top(),
+        width: rect.width(),
+        height: rect.height(),
+    }
+}
+
+fn egui_rect(rect: CoreRect) -> Rect {
+    Rect::from_min_size(
+        egui::pos2(rect.x, rect.y),
+        egui::vec2(rect.width, rect.height),
+    )
 }
 
 impl LayoutManager {
@@ -81,24 +78,24 @@ impl LayoutManager {
 
     /// 创建单窗格布局
     pub fn new(session_idx: usize) -> Self {
-        let pane = Pane::new(PaneId(0), session_idx);
-        LayoutManager {
-            panes: vec![pane],
-            focused_pane_id: PaneId(0),
-            pane_counter: 1,
-            split_counter: 0,
-            root: Some(LayoutNode::Pane(PaneId(0))),
+        let mut layout = LayoutManager {
+            panes: Vec::new(),
+            focused_pane_id: PaneId(session_idx),
+            tree: PaneTree::Leaf(session_idx),
             last_container_rect: Rect::ZERO,
             zoomed: false,
-        }
+        };
+        layout.rebuild_panes();
+        layout
     }
 
-    /// 将运行期 PaneId/session_idx 布局转换成稳定 session ID 快照。
+    /// 将运行期布局转换成稳定 session ID 快照（沿用二叉持久化格式，
+    /// n 叉节点在保存时折叠成嵌套二叉分割，比例保持一致）。
     pub fn to_snapshot(
         &self,
         session_ids: &[String],
     ) -> Option<crate::session_persistence::LayoutSnapshot> {
-        let root = Self::snapshot_node(self.root.as_ref()?, &self.panes, session_ids)?;
+        let root = Self::snapshot_node(&self.tree, session_ids)?;
         let focused_session_id = self
             .focused_session_idx()
             .and_then(|idx| session_ids.get(idx))
@@ -110,29 +107,54 @@ impl LayoutManager {
     }
 
     fn snapshot_node(
-        node: &LayoutNode,
-        panes: &[Pane],
+        node: &PaneTree,
         session_ids: &[String],
     ) -> Option<crate::session_persistence::LayoutNodeSnapshot> {
         match node {
-            LayoutNode::Pane(pane_id) => {
-                let session_idx = panes.iter().find(|pane| pane.id == *pane_id)?.session_idx;
+            PaneTree::Leaf(session_idx) => {
                 Some(crate::session_persistence::LayoutNodeSnapshot::Pane {
-                    session_id: session_ids.get(session_idx)?.clone(),
+                    session_id: session_ids.get(*session_idx)?.clone(),
                 })
             }
-            LayoutNode::Split {
+            PaneTree::Split {
                 axis,
-                ratio,
-                first,
-                second,
-                ..
-            } => Some(crate::session_persistence::LayoutNodeSnapshot::Split {
-                horizontal: *axis == SplitAxis::Horizontal,
-                ratio: *ratio,
-                first: Box::new(Self::snapshot_node(first, panes, session_ids)?),
-                second: Box::new(Self::snapshot_node(second, panes, session_ids)?),
-            }),
+                children,
+                ratios,
+            } => Self::snapshot_split(*axis, children, ratios, session_ids),
+        }
+    }
+
+    /// 把一个 n 叉分割右折叠成嵌套二叉快照：`[a, b, c]` 变成
+    /// `Split(a, A, Split(b/(b+c), B, C))`，恢复时可无损展平回来。
+    fn snapshot_split(
+        axis: SplitAxis,
+        children: &[PaneTree],
+        ratios: &[f32],
+        session_ids: &[String],
+    ) -> Option<crate::session_persistence::LayoutNodeSnapshot> {
+        match children {
+            [] => None,
+            [only] => Self::snapshot_node(only, session_ids),
+            [first, rest @ ..] => {
+                let total: f32 = ratios.iter().sum();
+                let share = ratios.first().copied().unwrap_or(0.5);
+                let ratio = if total > f32::EPSILON {
+                    share / total
+                } else {
+                    0.5
+                };
+                Some(crate::session_persistence::LayoutNodeSnapshot::Split {
+                    horizontal: axis == SplitAxis::Horizontal,
+                    ratio,
+                    first: Box::new(Self::snapshot_node(first, session_ids)?),
+                    second: Box::new(Self::snapshot_split(
+                        axis,
+                        rest,
+                        ratios.get(1..).unwrap_or(&[]),
+                        session_ids,
+                    )?),
+                })
+            }
         }
     }
 
@@ -149,77 +171,49 @@ impl LayoutManager {
             .map(|(idx, id)| (id.as_str(), idx))
             .collect();
         let mut used_sessions = HashSet::new();
-        let mut panes = Vec::new();
-        let mut next_pane_id = 0;
-        let mut next_split_id = 0;
-        let root = Self::restore_node(
-            &snapshot.root,
-            &session_indices,
-            &mut used_sessions,
-            &mut panes,
-            &mut next_pane_id,
-            &mut next_split_id,
-            0,
-        );
+        let root = Self::restore_node(&snapshot.root, &session_indices, &mut used_sessions, 0);
 
-        let Some(root) = root else {
+        let Some(tree) = root else {
             return Self::new(fallback_session_idx);
         };
-        let focused_pane_id = snapshot
+        let focused = snapshot
             .focused_session_id
             .as_deref()
-            .and_then(|focused_id| session_indices.get(focused_id))
-            .and_then(|focused_idx| {
-                panes
-                    .iter()
-                    .find(|pane| pane.session_idx == *focused_idx)
-                    .map(|pane| pane.id)
-            })
+            .and_then(|focused_id| session_indices.get(focused_id).copied())
+            .filter(|idx| tree.contains_session(*idx))
             .or_else(|| {
-                panes
-                    .iter()
-                    .find(|pane| pane.session_idx == fallback_session_idx)
-                    .map(|pane| pane.id)
+                tree.contains_session(fallback_session_idx)
+                    .then_some(fallback_session_idx)
             })
-            .or_else(|| panes.first().map(|pane| pane.id))
+            .or_else(|| tree.leaves().first().copied())
             .expect("restored layout root has no pane");
 
         let mut layout = LayoutManager {
-            panes,
-            focused_pane_id,
-            pane_counter: next_pane_id,
-            split_counter: next_split_id,
-            root: Some(root),
+            panes: Vec::new(),
+            focused_pane_id: PaneId(focused),
+            tree,
             last_container_rect: Rect::ZERO,
             zoomed: false,
         };
-        layout.update_focus_flags();
+        layout.rebuild_panes();
         layout
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn restore_node(
         snapshot: &crate::session_persistence::LayoutNodeSnapshot,
         session_indices: &HashMap<&str, usize>,
         used_sessions: &mut HashSet<usize>,
-        panes: &mut Vec<Pane>,
-        next_pane_id: &mut usize,
-        next_split_id: &mut usize,
         depth: usize,
-    ) -> Option<LayoutNode> {
+    ) -> Option<PaneTree> {
         if depth > Self::MAX_RESTORED_LAYOUT_DEPTH {
             return None;
         }
         match snapshot {
             crate::session_persistence::LayoutNodeSnapshot::Pane { session_id } => {
                 let session_idx = *session_indices.get(session_id.as_str())?;
-                if !used_sessions.insert(session_idx) {
-                    return None;
-                }
-                let pane_id = PaneId(*next_pane_id);
-                *next_pane_id += 1;
-                panes.push(Pane::new(pane_id, session_idx));
-                Some(LayoutNode::Pane(pane_id))
+                used_sessions
+                    .insert(session_idx)
+                    .then_some(PaneTree::Leaf(session_idx))
             }
             crate::session_persistence::LayoutNodeSnapshot::Split {
                 horizontal,
@@ -227,44 +221,21 @@ impl LayoutManager {
                 first,
                 second,
             } => {
-                let first = Self::restore_node(
-                    first,
-                    session_indices,
-                    used_sessions,
-                    panes,
-                    next_pane_id,
-                    next_split_id,
-                    depth + 1,
-                );
-                let second = Self::restore_node(
-                    second,
-                    session_indices,
-                    used_sessions,
-                    panes,
-                    next_pane_id,
-                    next_split_id,
-                    depth + 1,
-                );
+                let first = Self::restore_node(first, session_indices, used_sessions, depth + 1);
+                let second = Self::restore_node(second, session_indices, used_sessions, depth + 1);
                 match (first, second) {
                     (Some(first), Some(second)) => {
-                        let split_id = SplitId(*next_split_id);
-                        *next_split_id += 1;
+                        let axis = if *horizontal {
+                            SplitAxis::Horizontal
+                        } else {
+                            SplitAxis::Vertical
+                        };
                         let ratio = if ratio.is_finite() {
                             ratio.clamp(Self::MIN_SPLIT_RATIO, Self::MAX_SPLIT_RATIO)
                         } else {
                             0.5
                         };
-                        Some(LayoutNode::Split {
-                            id: split_id,
-                            axis: if *horizontal {
-                                SplitAxis::Horizontal
-                            } else {
-                                SplitAxis::Vertical
-                            },
-                            ratio,
-                            first: Box::new(first),
-                            second: Box::new(second),
-                        })
+                        Some(Self::join(axis, first, ratio, second, 1.0 - ratio))
                     }
                     (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
                     (None, None) => None,
@@ -273,73 +244,64 @@ impl LayoutManager {
         }
     }
 
+    /// 组合两棵子树为一个 `axis` 分割；同轴子分割直接展平成兄弟节点
+    /// （子比例按父级份额缩放），把保存时的嵌套二叉还原为 n 叉。
+    fn join(axis: SplitAxis, first: PaneTree, first_share: f32, second: PaneTree, second_share: f32) -> PaneTree {
+        let mut children = Vec::new();
+        let mut ratios = Vec::new();
+        for (node, share) in [(first, first_share), (second, second_share)] {
+            match node {
+                PaneTree::Split {
+                    axis: child_axis,
+                    children: grand,
+                    ratios: grand_ratios,
+                } if child_axis == axis => {
+                    for (g, r) in grand.into_iter().zip(grand_ratios) {
+                        children.push(g);
+                        ratios.push(r * share);
+                    }
+                }
+                other => {
+                    children.push(other);
+                    ratios.push(share);
+                }
+            }
+        }
+        PaneTree::Split {
+            axis,
+            children,
+            ratios,
+        }
+    }
+
     /// 拆分当前焦点窗格并在新窗格中显示 `session_idx`。新窗格获得焦点。
+    /// tmux 语义：焦点窗格的父分割已经是同一轴向时，新窗格作为兄弟平级
+    /// 加入，而不是再嵌套一层。
     pub fn split(&mut self, session_idx: usize, horizontal: bool) -> Result<(), String> {
         if !self.can_split() {
             return Err("No focused pane to split".to_string());
         }
+        if self.tree.contains_session(session_idx) {
+            return Err("Session is already visible in a pane".to_string());
+        }
 
-        let new_id = PaneId(self.pane_counter);
-        let split_id = SplitId(self.split_counter);
         let axis = if horizontal {
             SplitAxis::Horizontal
         } else {
             SplitAxis::Vertical
         };
-        let Some(root) = &mut self.root else {
-            return Err("No focused pane to split".to_string());
-        };
-        if !Self::split_node(root, self.focused_pane_id, new_id, split_id, axis) {
+        if !self.tree.split_leaf(self.focused_pane_id.0, axis, session_idx) {
             return Err("Focused pane is missing from the layout".to_string());
         }
-
-        let focused_index = self
-            .panes
-            .iter()
-            .position(|pane| pane.id == self.focused_pane_id)
-            .map(|index| index + 1)
-            .unwrap_or(self.panes.len());
-        self.panes
-            .insert(focused_index, Pane::new(new_id, session_idx));
-        self.pane_counter += 1;
-        self.split_counter += 1;
-        self.focused_pane_id = new_id;
+        self.focused_pane_id = PaneId(session_idx);
         self.zoomed = false;
-        self.update_focus_flags();
+        self.rebuild_panes();
         Ok(())
-    }
-
-    fn split_node(
-        node: &mut LayoutNode,
-        target: PaneId,
-        new_pane: PaneId,
-        split_id: SplitId,
-        axis: SplitAxis,
-    ) -> bool {
-        match node {
-            LayoutNode::Pane(id) if *id == target => {
-                *node = LayoutNode::Split {
-                    id: split_id,
-                    axis,
-                    ratio: 0.5,
-                    first: Box::new(LayoutNode::Pane(target)),
-                    second: Box::new(LayoutNode::Pane(new_pane)),
-                };
-                true
-            }
-            LayoutNode::Pane(_) => false,
-            LayoutNode::Split { first, second, .. } => {
-                Self::split_node(first, target, new_pane, split_id, axis)
-                    || Self::split_node(second, target, new_pane, split_id, axis)
-            }
-        }
     }
 
     /// 不再设置固定 pane 数量上限；只要当前焦点仍属于布局即可继续分屏。
     pub fn can_split(&self) -> bool {
-        self.panes
-            .iter()
-            .any(|pane| pane.id == self.focused_pane_id)
+        self.tree.contains_session(self.focused_pane_id.0)
     }
 
     /// Check whether splitting the focused pane would leave both children at
@@ -347,31 +309,21 @@ impl LayoutManager {
     /// frame has supplied viewport geometry, retain the legacy permissive
     /// behaviour; the renderer itself still handles tiny restored panes.
     pub fn can_split_focused_pane(&self, horizontal: bool, minimum_pane_size: egui::Vec2) -> bool {
-        let Some(pane) = self
-            .panes
-            .iter()
-            .find(|pane| pane.id == self.focused_pane_id)
-        else {
+        if !self.can_split() {
             return false;
-        };
-
+        }
         if self.last_container_rect.width() <= 0.0 || self.last_container_rect.height() <= 0.0 {
             return true;
         }
 
-        let unzoomed_rect = if self.zoomed {
-            let mut rects = Vec::with_capacity(self.panes.len());
-            if let Some(root) = &self.root {
-                Self::collect_pane_rects(root, self.last_container_rect, &mut rects);
-            }
-            rects
-                .into_iter()
-                .find(|(pane_id, _)| *pane_id == pane.id)
-                .map(|(_, rect)| rect)
-                .unwrap_or(pane.rect)
-        } else {
-            pane.rect
-        };
+        // Zoom only changes what is rendered; capacity is judged against the
+        // pane's real (unzoomed) share of the layout.
+        let unzoomed_rect = self
+            .tree_pane_rects()
+            .into_iter()
+            .find(|pane| pane.session == self.focused_pane_id.0)
+            .map(|pane| egui_rect(pane.rect))
+            .unwrap_or(self.last_container_rect);
 
         let (available, minimum) = if horizontal {
             (unzoomed_rect.height(), minimum_pane_size.y)
@@ -384,123 +336,69 @@ impl LayoutManager {
     /// 让某个会话出现在当前布局中：若它已经在某个窗格中则只移动焦点，
     /// 否则用它替换当前焦点窗格。用于 tab 切换时保持“活跃会话 = 可见焦点窗格”。
     pub fn show_session(&mut self, session_idx: usize) {
-        if let Some(pane) = self
-            .panes
-            .iter()
-            .find(|pane| pane.session_idx == session_idx)
+        if self.tree.contains_session(session_idx)
+            || self
+                .tree
+                .focus_or_replace_session(self.focused_pane_id.0, session_idx)
         {
-            self.focused_pane_id = pane.id;
-            self.update_focus_flags();
-            return;
+            self.focused_pane_id = PaneId(session_idx);
         }
-
-        if let Some(pane) = self
-            .panes
-            .iter_mut()
-            .find(|pane| pane.id == self.focused_pane_id)
-        {
-            pane.session_idx = session_idx;
-        }
-        self.update_focus_flags();
+        self.rebuild_panes();
     }
 
-    /// 关闭当前焦点窗格。其父分割会自动折叠为仍存在的兄弟节点。
+    /// 关闭当前焦点窗格。其父分割会自动折叠，被关窗格的份额并入兄弟。
     pub fn close_focused_pane(&mut self) -> Result<(), String> {
-        if self.panes.len() == 1 {
+        let leaves = self.tree.leaves();
+        if leaves.len() == 1 {
             return Err("Cannot close the last pane".to_string());
         }
-
-        let target = self.focused_pane_id;
-        let focused_index = self
-            .panes
+        let target = self.focused_pane_id.0;
+        let focused_index = leaves
             .iter()
-            .position(|pane| pane.id == target)
+            .position(|&session| session == target)
             .ok_or_else(|| "Focused pane is missing from the layout".to_string())?;
-        let next_focus = self
-            .panes
+        let next_focus = leaves
             .get(focused_index + 1)
-            .or_else(|| focused_index.checked_sub(1).and_then(|i| self.panes.get(i)))
-            .map(|pane| pane.id)
+            .or_else(|| focused_index.checked_sub(1).and_then(|i| leaves.get(i)))
+            .copied()
             .ok_or_else(|| "Cannot close the last pane".to_string())?;
 
-        self.remove_pane(target);
-        self.focused_pane_id = next_focus;
+        self.tree.remove_leaf(target);
+        self.focused_pane_id = PaneId(next_focus);
         self.zoomed = false;
-        self.update_focus_flags();
+        self.rebuild_panes();
         Ok(())
     }
 
-    fn remove_pane(&mut self, target: PaneId) {
-        self.panes.retain(|pane| pane.id != target);
-        self.root = self
-            .root
-            .take()
-            .and_then(|node| Self::remove_node(node, target));
-    }
-
-    fn remove_node(node: LayoutNode, target: PaneId) -> Option<LayoutNode> {
-        match node {
-            LayoutNode::Pane(id) => (id != target).then_some(LayoutNode::Pane(id)),
-            LayoutNode::Split {
-                id,
-                axis,
-                ratio,
-                first,
-                second,
-            } => {
-                let first = Self::remove_node(*first, target);
-                let second = Self::remove_node(*second, target);
-                match (first, second) {
-                    (Some(first), Some(second)) => Some(LayoutNode::Split {
-                        id,
-                        axis,
-                        ratio,
-                        first: Box::new(first),
-                        second: Box::new(second),
-                    }),
-                    (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
-                    (None, None) => None,
+    /// 某个会话被关闭后，移除显示它的窗格并修正剩余窗格的 session 索引。
+    pub fn on_session_removed(&mut self, removed_idx: usize, fallback_idx: usize) {
+        self.zoomed = false;
+        if self.tree.contains_session(removed_idx) && self.tree.leaf_count() > 1 {
+            self.tree.remove_leaf(removed_idx);
+            if self.focused_pane_id.0 == removed_idx {
+                if let Some(&first) = self.tree.leaves().first() {
+                    self.focused_pane_id = PaneId(first);
                 }
             }
         }
-    }
 
-    /// 某个会话被关闭后,修正所有窗格保存的 session_idx。
-    pub fn on_session_removed(&mut self, removed_idx: usize, fallback_idx: usize) {
-        self.zoomed = false;
-        let removed_panes: Vec<PaneId> = self
-            .panes
-            .iter()
-            .filter(|pane| pane.session_idx == removed_idx)
-            .map(|pane| pane.id)
-            .collect();
-
-        // 分屏时关闭一个正在显示的 session，同时移除它的 pane。保留最后
-        // 一个 pane，由下方 fallback 接管，确保布局永远非空。
-        for pane_id in removed_panes {
-            if self.panes.len() > 1 {
-                self.remove_pane(pane_id);
+        let remap = |session: usize| {
+            if session == removed_idx {
+                fallback_idx
+            } else if session > removed_idx {
+                session - 1
+            } else {
+                session
+            }
+        };
+        self.tree.remap_sessions(&remap);
+        self.focused_pane_id = PaneId(remap(self.focused_pane_id.0));
+        if !self.tree.contains_session(self.focused_pane_id.0) {
+            if let Some(&first) = self.tree.leaves().first() {
+                self.focused_pane_id = PaneId(first);
             }
         }
-
-        for pane in &mut self.panes {
-            if pane.session_idx == removed_idx {
-                pane.session_idx = fallback_idx;
-            } else if pane.session_idx > removed_idx {
-                pane.session_idx -= 1;
-            }
-        }
-
-        if !self
-            .panes
-            .iter()
-            .any(|pane| pane.id == self.focused_pane_id)
-        {
-            if let Some(pane) = self.panes.first() {
-                self.focused_pane_id = pane.id;
-            }
-        }
-        self.update_focus_flags();
+        self.rebuild_panes();
     }
 
     /// 会话 tab 重排后同步窗格中保存的索引，使窗格继续显示同一个会话。
@@ -508,276 +406,200 @@ impl LayoutManager {
         if from_idx == to_idx {
             return;
         }
-        for pane in &mut self.panes {
-            pane.session_idx = if pane.session_idx == from_idx {
+        let remap = move |session: usize| {
+            if session == from_idx {
                 to_idx
-            } else if from_idx < to_idx && pane.session_idx > from_idx && pane.session_idx <= to_idx
-            {
-                pane.session_idx - 1
-            } else if to_idx < from_idx && pane.session_idx >= to_idx && pane.session_idx < from_idx
-            {
-                pane.session_idx + 1
+            } else if from_idx < to_idx && session > from_idx && session <= to_idx {
+                session - 1
+            } else if to_idx < from_idx && session >= to_idx && session < from_idx {
+                session + 1
             } else {
-                pane.session_idx
-            };
-        }
+                session
+            }
+        };
+        self.tree.remap_sessions(&remap);
+        self.focused_pane_id = PaneId(remap(self.focused_pane_id.0));
+        self.rebuild_panes();
     }
 
     /// 新会话插入 tab 向量后，原会话在插入点及其后的索引整体右移。
     pub fn on_session_inserted(&mut self, inserted_idx: usize) {
-        for pane in &mut self.panes {
-            if pane.session_idx >= inserted_idx {
-                pane.session_idx += 1;
+        let remap = move |session: usize| {
+            if session >= inserted_idx {
+                session + 1
+            } else {
+                session
             }
-        }
+        };
+        self.tree.remap_sessions(&remap);
+        self.focused_pane_id = PaneId(remap(self.focused_pane_id.0));
+        self.rebuild_panes();
     }
 
     /// 切换焦点窗格（通过顺序或物理方向）。
     pub fn focus_pane(&mut self, direction: PaneDirection) -> bool {
-        if self.panes.len() == 1 {
+        let leaves = self.tree.leaves();
+        if leaves.len() == 1 {
             return false;
         }
 
-        let current_idx = self
-            .panes
+        let current_idx = leaves
             .iter()
-            .position(|pane| pane.id == self.focused_pane_id)
+            .position(|&session| session == self.focused_pane_id.0)
             .unwrap_or(0);
-        let next_id = match direction {
-            PaneDirection::Next => Some(self.panes[(current_idx + 1) % self.panes.len()].id),
+        let next = match direction {
+            PaneDirection::Next => Some(leaves[(current_idx + 1) % leaves.len()]),
             PaneDirection::Prev => {
                 let next_idx = if current_idx == 0 {
-                    self.panes.len() - 1
+                    leaves.len() - 1
                 } else {
                     current_idx - 1
                 };
-                Some(self.panes[next_idx].id)
+                Some(leaves[next_idx])
             }
             PaneDirection::Left
             | PaneDirection::Right
             | PaneDirection::Up
-            | PaneDirection::Down => self.physical_neighbor(direction),
+            | PaneDirection::Down => {
+                // Normalized geometry keeps directional navigation working
+                // before the first frame supplies real pixel rectangles. The
+                // reference container is much larger than the core's 1px edge
+                // tolerance so proportions decide adjacency, not the epsilon.
+                let unit = CoreRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                };
+                let mut rects = Vec::new();
+                collect_pane_rects(&self.tree, unit, 0.0, &mut rects);
+                directional_focus_target(
+                    &rects,
+                    self.focused_pane_id.0,
+                    direction.core().expect("Next/Prev handled above"),
+                )
+            }
         };
 
-        let Some(next_id) = next_id else {
+        let Some(next) = next else {
             return false;
         };
-        if next_id == self.focused_pane_id {
+        if next == self.focused_pane_id.0 {
             return false;
         }
         // A successful navigation reveals the full layout. A failed
         // directional command must not unexpectedly cancel zoom.
         self.zoomed = false;
-        self.focused_pane_id = next_id;
-        self.update_focus_flags();
+        self.focused_pane_id = PaneId(next);
+        self.rebuild_panes();
         true
     }
 
-    fn physical_neighbor(&self, direction: PaneDirection) -> Option<PaneId> {
-        let root = self.root.as_ref()?;
-        let unit = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        let mut rects = Vec::with_capacity(self.panes.len());
-        Self::collect_pane_rects(root, unit, &mut rects);
-        let current = rects.iter().find(|(id, _)| *id == self.focused_pane_id)?.1;
-
-        rects
-            .into_iter()
-            .filter(|(id, _)| *id != self.focused_pane_id)
-            .filter_map(|(id, candidate)| {
-                Self::directional_score(current, candidate, direction).map(|score| (id, score))
-            })
-            .min_by(|(_, left), (_, right)| {
-                left.0
-                    .total_cmp(&right.0)
-                    .then_with(|| left.1.total_cmp(&right.1))
-                    .then_with(|| left.2.total_cmp(&right.2))
-            })
-            .map(|(id, _)| id)
-    }
-
-    fn directional_score(
-        current: Rect,
-        candidate: Rect,
-        direction: PaneDirection,
-    ) -> Option<(f32, f32, f32)> {
-        const EPSILON: f32 = 0.0001;
-        let (axis_gap, orthogonal_gap, center_gap) = match direction {
-            PaneDirection::Left if candidate.right() <= current.left() + EPSILON => (
-                (current.left() - candidate.right()).max(0.0),
-                Self::interval_gap(
-                    current.top(),
-                    current.bottom(),
-                    candidate.top(),
-                    candidate.bottom(),
-                ),
-                (current.center().y - candidate.center().y).abs(),
-            ),
-            PaneDirection::Right if candidate.left() >= current.right() - EPSILON => (
-                (candidate.left() - current.right()).max(0.0),
-                Self::interval_gap(
-                    current.top(),
-                    current.bottom(),
-                    candidate.top(),
-                    candidate.bottom(),
-                ),
-                (current.center().y - candidate.center().y).abs(),
-            ),
-            PaneDirection::Up if candidate.bottom() <= current.top() + EPSILON => (
-                (current.top() - candidate.bottom()).max(0.0),
-                Self::interval_gap(
-                    current.left(),
-                    current.right(),
-                    candidate.left(),
-                    candidate.right(),
-                ),
-                (current.center().x - candidate.center().x).abs(),
-            ),
-            PaneDirection::Down if candidate.top() >= current.bottom() - EPSILON => (
-                (candidate.top() - current.bottom()).max(0.0),
-                Self::interval_gap(
-                    current.left(),
-                    current.right(),
-                    candidate.left(),
-                    candidate.right(),
-                ),
-                (current.center().x - candidate.center().x).abs(),
-            ),
-            _ => return None,
-        };
-        Some((orthogonal_gap, axis_gap, center_gap))
-    }
-
-    fn interval_gap(a_min: f32, a_max: f32, b_min: f32, b_max: f32) -> f32 {
-        if a_max < b_min {
-            b_min - a_max
-        } else if b_max < a_min {
-            a_min - b_max
-        } else {
-            0.0
-        }
-    }
-
-    /// 沿指定物理方向移动离当前 pane 最近、轴向匹配的分隔线。
+    /// 沿指定物理方向移动焦点窗格对应一侧的分隔线（tmux 语义：从最近的
+    /// 轴向匹配祖先分割向外找有该侧分隔线的节点）。
     pub fn resize_split(&mut self, direction: PaneDirection, step: f32) -> bool {
         if self.zoomed {
             return false;
         }
-        let axis = match direction {
-            PaneDirection::Left | PaneDirection::Right => SplitAxis::Vertical,
-            PaneDirection::Up | PaneDirection::Down => SplitAxis::Horizontal,
-            PaneDirection::Next | PaneDirection::Prev => return false,
-        };
-        let delta = match direction {
-            PaneDirection::Left | PaneDirection::Up => -step,
-            PaneDirection::Right | PaneDirection::Down => step,
-            PaneDirection::Next | PaneDirection::Prev => return false,
-        };
-        let Some(root) = &self.root else {
+        let Some(wanted) = direction.core() else {
             return false;
         };
-        let (_, split_id) = Self::nearest_matching_split(root, self.focused_pane_id, axis);
-        let Some(split_id) = split_id else {
+        let forward = wanted.forward();
+        let axis = wanted.axis();
+        let Some(path) = self.tree.path_to_session(self.focused_pane_id.0) else {
             return false;
         };
-        Self::adjust_node_ratio(
-            self.root.as_mut().expect("layout root disappeared"),
-            split_id,
-            delta,
-        )
-    }
-
-    fn nearest_matching_split(
-        node: &LayoutNode,
-        target: PaneId,
-        wanted_axis: SplitAxis,
-    ) -> (bool, Option<SplitId>) {
-        match node {
-            LayoutNode::Pane(id) => (*id == target, None),
-            LayoutNode::Split {
-                id,
-                axis,
-                first,
-                second,
-                ..
-            } => {
-                let (contains, nearest) = Self::nearest_matching_split(first, target, wanted_axis);
-                let (contains, nearest) = if contains {
-                    (contains, nearest)
-                } else {
-                    Self::nearest_matching_split(second, target, wanted_axis)
-                };
-                if !contains {
-                    return (false, None);
-                }
-                (true, nearest.or((*axis == wanted_axis).then_some(*id)))
+        for k in (0..path.len()).rev() {
+            let node_path = &path[..k];
+            let child = path[k];
+            let Some(PaneTree::Split {
+                axis: node_axis,
+                children,
+                ratios,
+            }) = self.tree.node_at_path_mut(node_path)
+            else {
+                continue;
+            };
+            if *node_axis != axis {
+                continue;
             }
-        }
-    }
-
-    fn adjust_node_ratio(node: &mut LayoutNode, split_id: SplitId, delta: f32) -> bool {
-        match node {
-            LayoutNode::Pane(_) => false,
-            LayoutNode::Split {
-                id,
-                ratio,
-                first,
-                second,
-                ..
-            } => {
-                if *id == split_id {
-                    let before = *ratio;
-                    *ratio = (*ratio + delta).clamp(Self::MIN_SPLIT_RATIO, Self::MAX_SPLIT_RATIO);
-                    (*ratio - before).abs() > f32::EPSILON
-                } else {
-                    Self::adjust_node_ratio(first, split_id, delta)
-                        || Self::adjust_node_ratio(second, split_id, delta)
-                }
+            let gap = if forward {
+                (child + 1 < children.len()).then_some(child)
+            } else {
+                child.checked_sub(1)
+            };
+            let Some(gap) = gap else {
+                continue;
+            };
+            let delta = if forward { step } else { -step };
+            let first = ratios[gap] + delta;
+            let changed = set_divider_share(ratios, gap, first, false);
+            if changed {
+                self.rebuild_panes();
             }
+            return changed;
         }
+        false
     }
 
-    /// 直接设置某条分隔线的比例（拖动操作使用）。
-    pub fn set_split_ratio(&mut self, split_id: SplitId, ratio: f32) -> bool {
-        let Some(root) = &mut self.root else {
+    /// 设置某条分隔线两侧窗格对的比例（`ratio` 是前一个窗格在两者合计
+    /// 中的占比；二叉分割下与旧语义一致）。
+    pub fn set_split_ratio(&mut self, divider: &DividerId, ratio: f32) -> bool {
+        let Some(PaneTree::Split { ratios, .. }) = self.tree.node_at_path_mut(&divider.path) else {
             return false;
         };
-        Self::set_node_ratio(
-            root,
-            split_id,
-            ratio.clamp(Self::MIN_SPLIT_RATIO, Self::MAX_SPLIT_RATIO),
-        )
+        if divider.gap + 1 >= ratios.len() {
+            return false;
+        }
+        let pair = ratios[divider.gap] + ratios[divider.gap + 1];
+        let first = ratio.clamp(Self::MIN_SPLIT_RATIO, Self::MAX_SPLIT_RATIO) * pair;
+        let changed = set_divider_share(ratios, divider.gap, first, false);
+        if changed {
+            self.rebuild_panes();
+        }
+        changed
     }
 
-    fn set_node_ratio(node: &mut LayoutNode, split_id: SplitId, new_ratio: f32) -> bool {
-        match node {
-            LayoutNode::Pane(_) => false,
-            LayoutNode::Split {
-                id,
-                ratio,
-                first,
-                second,
-                ..
-            } => {
-                if *id == split_id {
-                    let changed = (*ratio - new_ratio).abs() > f32::EPSILON;
-                    *ratio = new_ratio;
-                    changed
-                } else {
-                    Self::set_node_ratio(first, split_id, new_ratio)
-                        || Self::set_node_ratio(second, split_id, new_ratio)
-                }
-            }
+    /// 把正在拖动的分隔线移到指针位置（带接近等分时的吸附）。
+    pub fn drag_divider_to(&mut self, divider: &DividerId, pos: egui::Pos2) -> bool {
+        let Some((axis, node_rect)) = split_node_rect(
+            &self.tree,
+            &divider.path,
+            core_rect(self.last_container_rect),
+            0.0,
+        ) else {
+            return false;
+        };
+        let local = match axis {
+            SplitAxis::Vertical => (pos.x - node_rect.x) / node_rect.width.max(1.0),
+            SplitAxis::Horizontal => (pos.y - node_rect.y) / node_rect.height.max(1.0),
+        };
+        let Some(PaneTree::Split { ratios, .. }) = self.tree.node_at_path_mut(&divider.path) else {
+            return false;
+        };
+        if divider.gap + 1 >= ratios.len() {
+            return false;
         }
+        // Pointer fraction minus the children before this gap gives the
+        // dragged child's new share of its pair.
+        let before: f32 = ratios[..divider.gap].iter().sum();
+        let first = local - before;
+        let changed = set_divider_share(ratios, divider.gap, first, true);
+        if changed {
+            self.rebuild_panes();
+        }
+        changed
     }
 
     /// Toggle a temporary focused-pane view without modifying the split tree,
     /// shell sessions, or persisted layout. Returns false for a single pane.
     pub fn toggle_focused_pane_zoom(&mut self) -> bool {
-        if self.panes.len() <= 1 {
+        if self.tree.leaf_count() <= 1 {
             self.zoomed = false;
             return false;
         }
         self.zoomed = !self.zoomed;
+        self.rebuild_panes();
         true
     }
 
@@ -785,25 +607,31 @@ impl LayoutManager {
         self.zoomed
     }
 
-    /// Reset every nested divider to an even 50/50 split.
+    /// Reset every nested divider so each split's children share evenly.
     pub fn equalize_splits(&mut self) -> bool {
-        self.root.as_mut().is_some_and(Self::equalize_node)
-    }
-
-    fn equalize_node(node: &mut LayoutNode) -> bool {
-        match node {
-            LayoutNode::Pane(_) => false,
-            LayoutNode::Split {
-                ratio,
-                first,
-                second,
-                ..
-            } => {
-                let changed = (*ratio - 0.5).abs() > f32::EPSILON;
-                *ratio = 0.5;
-                changed | Self::equalize_node(first) | Self::equalize_node(second)
+        fn equalize_node(node: &mut PaneTree) -> bool {
+            match node {
+                PaneTree::Leaf(_) => false,
+                PaneTree::Split {
+                    children, ratios, ..
+                } => {
+                    let even = 1.0 / children.len().max(1) as f32;
+                    let mut changed = ratios.iter().any(|r| (*r - even).abs() > f32::EPSILON);
+                    for r in ratios.iter_mut() {
+                        *r = even;
+                    }
+                    for child in children.iter_mut() {
+                        changed |= equalize_node(child);
+                    }
+                    changed
+                }
             }
         }
+        let changed = equalize_node(&mut self.tree);
+        if changed {
+            self.rebuild_panes();
+        }
+        changed
     }
 
     /// 获取当前可见窗格。聚焦缩放时只暴露焦点 pane，底层树保持不变。
@@ -821,22 +649,21 @@ impl LayoutManager {
 
     /// 返回当前焦点窗格对应的 session 索引
     pub fn focused_session_idx(&self) -> Option<usize> {
-        self.panes
-            .iter()
-            .find(|pane| pane.id == self.focused_pane_id)
-            .map(|pane| pane.session_idx)
+        self.tree
+            .contains_session(self.focused_pane_id.0)
+            .then_some(self.focused_pane_id.0)
     }
 
-    /// 根据坐标设置焦点窗格,命中则返回该窗格的 session 索引。
+    /// 根据坐标设置焦点窗格，命中则返回该窗格的 session 索引。
     pub fn focus_pane_at(&mut self, pos: egui::Pos2) -> Option<usize> {
         let hit = self
             .panes()
             .iter()
             .find(|pane| pane.rect.contains(pos))
-            .map(|pane| (pane.id, pane.session_idx));
-        if let Some((id, idx)) = hit {
-            self.focused_pane_id = id;
-            self.update_focus_flags();
+            .map(|pane| pane.session_idx);
+        if let Some(idx) = hit {
+            self.focused_pane_id = PaneId(idx);
+            self.rebuild_panes();
             Some(idx)
         } else {
             None
@@ -846,60 +673,38 @@ impl LayoutManager {
     /// 计算所有叶子 pane 的矩形。
     pub fn compute_pane_rects(&mut self, container: Rect) {
         self.last_container_rect = container;
-        let Some(root) = &self.root else {
-            return;
-        };
-        let mut rects = Vec::with_capacity(self.panes.len());
-        Self::collect_pane_rects(root, container, &mut rects);
-        for (pane_id, rect) in rects {
-            if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
-                pane.rect = rect;
-            }
-        }
+        self.rebuild_panes();
+    }
+
+    fn tree_pane_rects(&self) -> Vec<CorePaneRect> {
+        let mut rects = Vec::new();
+        collect_pane_rects(
+            &self.tree,
+            core_rect(self.last_container_rect),
+            0.0,
+            &mut rects,
+        );
+        rects
+    }
+
+    fn rebuild_panes(&mut self) {
+        self.panes = self
+            .tree_pane_rects()
+            .into_iter()
+            .map(|pane| Pane {
+                id: PaneId(pane.session),
+                session_idx: pane.session,
+                rect: egui_rect(pane.rect),
+                focused: pane.session == self.focused_pane_id.0,
+            })
+            .collect();
         if self.zoomed {
             if let Some(focused) = self
                 .panes
                 .iter_mut()
                 .find(|pane| pane.id == self.focused_pane_id)
             {
-                focused.rect = container;
-            }
-        }
-        self.update_focus_flags();
-    }
-
-    fn collect_pane_rects(node: &LayoutNode, container: Rect, out: &mut Vec<(PaneId, Rect)>) {
-        match node {
-            LayoutNode::Pane(id) => out.push((*id, container)),
-            LayoutNode::Split {
-                axis,
-                ratio,
-                first,
-                second,
-                ..
-            } => {
-                let (first_rect, second_rect) = Self::split_rect(container, *axis, *ratio);
-                Self::collect_pane_rects(first, first_rect, out);
-                Self::collect_pane_rects(second, second_rect, out);
-            }
-        }
-    }
-
-    fn split_rect(container: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
-        match axis {
-            SplitAxis::Vertical => {
-                let split_x = container.left() + container.width() * ratio;
-                (
-                    Rect::from_min_max(container.min, egui::pos2(split_x, container.bottom())),
-                    Rect::from_min_max(egui::pos2(split_x, container.top()), container.max),
-                )
-            }
-            SplitAxis::Horizontal => {
-                let split_y = container.top() + container.height() * ratio;
-                (
-                    Rect::from_min_max(container.min, egui::pos2(container.right(), split_y)),
-                    Rect::from_min_max(egui::pos2(container.left(), split_y), container.max),
-                )
+                focused.rect = self.last_container_rect;
             }
         }
     }
@@ -909,55 +714,93 @@ impl LayoutManager {
         if self.zoomed {
             return Vec::new();
         }
-        let mut dividers = Vec::with_capacity(self.panes.len().saturating_sub(1));
-        if let Some(root) = &self.root {
-            Self::collect_dividers(root, self.last_container_rect, &mut dividers);
-        }
+        let mut dividers = Vec::new();
+        Self::collect_dividers(
+            &self.tree,
+            core_rect(self.last_container_rect),
+            &mut Vec::new(),
+            &mut dividers,
+        );
         dividers
     }
 
-    fn collect_dividers(node: &LayoutNode, container: Rect, out: &mut Vec<SplitDivider>) {
-        let LayoutNode::Split {
-            id,
+    fn collect_dividers(
+        node: &PaneTree,
+        container: CoreRect,
+        path: &mut Vec<usize>,
+        out: &mut Vec<SplitDivider>,
+    ) {
+        let PaneTree::Split {
             axis,
-            ratio,
-            first,
-            second,
+            children,
+            ratios,
         } = node
         else {
             return;
         };
-        let (first_rect, second_rect) = Self::split_rect(container, *axis, *ratio);
-        let rect = match axis {
-            SplitAxis::Vertical => Rect::from_min_max(
-                egui::pos2(
-                    first_rect.right() - Self::DIVIDER_HIT_HALF_WIDTH,
-                    container.top(),
-                ),
-                egui::pos2(
-                    first_rect.right() + Self::DIVIDER_HIT_HALF_WIDTH,
-                    container.bottom(),
-                ),
-            ),
-            SplitAxis::Horizontal => Rect::from_min_max(
-                egui::pos2(
-                    container.left(),
-                    first_rect.bottom() - Self::DIVIDER_HIT_HALF_WIDTH,
-                ),
-                egui::pos2(
-                    container.right(),
-                    first_rect.bottom() + Self::DIVIDER_HIT_HALF_WIDTH,
-                ),
-            ),
-        };
-        out.push(SplitDivider {
-            id: *id,
-            axis: *axis,
-            rect,
-            container_rect: container,
-        });
-        Self::collect_dividers(first, first_rect, out);
-        Self::collect_dividers(second, second_rect, out);
+        let n = children.len().max(1);
+        let even = 1.0 / n as f32;
+        let container_rect = egui_rect(container);
+        let mut offset = 0.0;
+        for (index, child) in children.iter().enumerate() {
+            let share = ratios.get(index).copied().unwrap_or(even);
+            let (child_rect, boundary) = match axis {
+                SplitAxis::Vertical => {
+                    let width = container.width * share;
+                    let rect = CoreRect {
+                        x: container.x + offset,
+                        y: container.y,
+                        width,
+                        height: container.height,
+                    };
+                    offset += width;
+                    (rect, container.x + offset)
+                }
+                SplitAxis::Horizontal => {
+                    let height = container.height * share;
+                    let rect = CoreRect {
+                        x: container.x,
+                        y: container.y + offset,
+                        width: container.width,
+                        height,
+                    };
+                    offset += height;
+                    (rect, container.y + offset)
+                }
+            };
+
+            if index + 1 < n {
+                let rect = match axis {
+                    SplitAxis::Vertical => Rect::from_min_max(
+                        egui::pos2(boundary - Self::DIVIDER_HIT_HALF_WIDTH, container_rect.top()),
+                        egui::pos2(
+                            boundary + Self::DIVIDER_HIT_HALF_WIDTH,
+                            container_rect.bottom(),
+                        ),
+                    ),
+                    SplitAxis::Horizontal => Rect::from_min_max(
+                        egui::pos2(container_rect.left(), boundary - Self::DIVIDER_HIT_HALF_WIDTH),
+                        egui::pos2(
+                            container_rect.right(),
+                            boundary + Self::DIVIDER_HIT_HALF_WIDTH,
+                        ),
+                    ),
+                };
+                out.push(SplitDivider {
+                    id: DividerId {
+                        path: path.clone(),
+                        gap: index,
+                    },
+                    axis: *axis,
+                    rect,
+                    container_rect,
+                });
+            }
+
+            path.push(index);
+            Self::collect_dividers(child, child_rect, path, out);
+            path.pop();
+        }
     }
 
     /// 返回命中位置的最深层分隔线；交叉点优先操作更局部的分割。
@@ -966,12 +809,6 @@ impl LayoutManager {
             .into_iter()
             .rev()
             .find(|divider| divider.rect.contains(pos))
-    }
-
-    fn update_focus_flags(&mut self) {
-        for pane in &mut self.panes {
-            pane.focused = pane.id == self.focused_pane_id;
-        }
     }
 }
 
@@ -984,6 +821,19 @@ pub enum PaneDirection {
     Right,
     Up,
     Down,
+}
+
+impl PaneDirection {
+    /// 物理方向对应的 core 方向；Next/Prev 没有物理方位。
+    fn core(self) -> Option<CoreDirection> {
+        match self {
+            PaneDirection::Left => Some(CoreDirection::Left),
+            PaneDirection::Right => Some(CoreDirection::Right),
+            PaneDirection::Up => Some(CoreDirection::Up),
+            PaneDirection::Down => Some(CoreDirection::Down),
+            PaneDirection::Next | PaneDirection::Prev => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1015,8 +865,10 @@ mod tests {
         let mut layout = LayoutManager::new(0);
         layout.split(1, false).unwrap();
         layout.split(2, true).unwrap();
-        layout.set_split_ratio(SplitId(0), 0.65);
-        layout.set_split_ratio(SplitId(1), 0.3);
+        layout.compute_pane_rects(test_rect());
+        let dividers = layout.get_divider_rects();
+        assert!(layout.set_split_ratio(&dividers[0].id, 0.65));
+        assert!(layout.set_split_ratio(&dividers[1].id, 0.3));
         layout.compute_pane_rects(test_rect());
         let before: Vec<(usize, Rect)> = layout
             .panes()
@@ -1037,6 +889,32 @@ mod tests {
 
         assert_eq!(after, before);
         assert_eq!(restored.focused_session_idx(), Some(2));
+    }
+
+    #[test]
+    fn same_axis_splits_join_as_siblings_and_round_trip_through_binary_snapshots() {
+        let session_ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, false).unwrap();
+        layout.compute_pane_rects(test_rect());
+
+        // tmux join: three siblings in one vertical split → two dividers in
+        // the same root container, shares 0.5 / 0.25 / 0.25.
+        let dividers = layout.get_divider_rects();
+        assert_eq!(dividers.len(), 2);
+        assert_eq!(dividers[0].container_rect, test_rect());
+        assert_eq!(dividers[1].container_rect, test_rect());
+        let widths: Vec<f32> = layout.panes().iter().map(|p| p.rect.width()).collect();
+        assert_eq!(widths, vec![500.0, 250.0, 250.0]);
+
+        // The binary persisted format restores the exact same flat geometry.
+        let snapshot = layout.to_snapshot(&session_ids).unwrap();
+        let mut restored = LayoutManager::from_snapshot(&snapshot, &session_ids, 0);
+        restored.compute_pane_rects(test_rect());
+        let widths: Vec<f32> = restored.panes().iter().map(|p| p.rect.width()).collect();
+        assert_eq!(widths, vec![500.0, 250.0, 250.0]);
+        assert_eq!(restored.get_divider_rects().len(), 2);
     }
 
     #[test]
@@ -1221,6 +1099,7 @@ mod tests {
         let mut layout = LayoutManager::new(0);
         layout.split(1, false).unwrap();
         layout.split(2, true).unwrap();
+        layout.compute_pane_rects(test_rect());
 
         assert!(layout.focus_pane(PaneDirection::Up));
         assert_eq!(layout.focused_session_idx(), Some(1));
@@ -1240,13 +1119,13 @@ mod tests {
         layout.split(1, false).unwrap();
         layout.split(2, true).unwrap();
         layout.compute_pane_rects(test_rect());
-        let root_before = layout.get_divider_rects()[0];
-        let nested_before = layout.get_divider_rects()[1];
+        let root_before = layout.get_divider_rects()[0].clone();
+        let nested_before = layout.get_divider_rects()[1].clone();
 
         assert!(layout.resize_split(PaneDirection::Up, 0.05));
         layout.compute_pane_rects(test_rect());
-        let root_after = layout.get_divider_rects()[0];
-        let nested_after = layout.get_divider_rects()[1];
+        let root_after = layout.get_divider_rects()[0].clone();
+        let nested_after = layout.get_divider_rects()[1].clone();
         assert_eq!(root_before.rect, root_after.rect);
         assert!(nested_after.rect.center().y < nested_before.rect.center().y);
     }
@@ -1256,11 +1135,30 @@ mod tests {
         let mut layout = LayoutManager::new(0);
         layout.split(1, false).unwrap();
         layout.compute_pane_rects(test_rect());
-        let divider = layout.get_divider_rects()[0];
+        let divider = layout.get_divider_rects()[0].clone();
 
-        assert!(layout.set_split_ratio(divider.id, 0.7));
+        assert!(layout.set_split_ratio(&divider.id, 0.7));
         layout.compute_pane_rects(test_rect());
         assert_eq!(layout.get_divider_rects()[0].rect.center().x, 700.0);
+    }
+
+    #[test]
+    fn dragging_a_divider_snaps_near_the_even_point() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.compute_pane_rects(test_rect());
+        let divider = layout.get_divider_rects()[0].clone();
+
+        // From an uneven split, 510/1000 = 0.51 lands within the snap epsilon
+        // and settles exactly at the even point.
+        assert!(layout.set_split_ratio(&divider.id, 0.6));
+        assert!(layout.drag_divider_to(&divider.id, egui::pos2(510.0, 400.0)));
+        layout.compute_pane_rects(test_rect());
+        assert_eq!(layout.get_divider_rects()[0].rect.center().x, 500.0);
+
+        assert!(layout.drag_divider_to(&divider.id, egui::pos2(700.0, 400.0)));
+        layout.compute_pane_rects(test_rect());
+        assert!((layout.get_divider_rects()[0].rect.center().x - 700.0).abs() < 0.01);
     }
 
     #[test]
@@ -1292,8 +1190,8 @@ mod tests {
         layout.split(2, true).unwrap();
         layout.compute_pane_rects(test_rect());
         let dividers = layout.get_divider_rects();
-        assert!(layout.set_split_ratio(dividers[0].id, 0.7));
-        assert!(layout.set_split_ratio(dividers[1].id, 0.3));
+        assert!(layout.set_split_ratio(&dividers[0].id, 0.7));
+        assert!(layout.set_split_ratio(&dividers[1].id, 0.3));
 
         assert!(layout.equalize_splits());
         layout.compute_pane_rects(test_rect());
@@ -1314,8 +1212,8 @@ mod tests {
             egui::Pos2::ZERO,
             egui::vec2(100.0, 100.0),
         ));
-        let divider = layout.get_divider_rects()[0];
-        assert!(layout.set_split_ratio(divider.id, 0.9));
+        let divider = layout.get_divider_rects()[0].clone();
+        assert!(layout.set_split_ratio(&divider.id, 0.9));
         layout.compute_pane_rects(Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(100.0, 100.0),
@@ -1337,5 +1235,13 @@ mod tests {
 
         assert!(!layout.focus_pane(PaneDirection::Right));
         assert!(layout.is_zoomed());
+    }
+
+    #[test]
+    fn splitting_an_already_visible_session_is_rejected() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        assert!(layout.split(0, true).is_err());
+        assert_eq!(layout.panes().len(), 2);
     }
 }

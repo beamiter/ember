@@ -1683,7 +1683,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?branch=master#cc695689a748eadd8cd50bbf8a867e55446471b5"
+source = "git+https://github.com/beamiter/jterm_core.git?branch=master#8492d598fba4e05eceb80b3f8651f1e521186f10"
 dependencies = [
  "libc",
  "log",

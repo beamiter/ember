@@ -308,6 +308,9 @@ struct SavedCursorState {
     pending_wrap: bool,
 }
 
+/// 256-slot dynamic palette: `None` slots fall through to the theme/default.
+pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
+
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
@@ -427,6 +430,8 @@ pub struct TerminalState {
     pub dynamic_fg: Option<(u8, u8, u8)>,
     pub dynamic_bg: Option<(u8, u8, u8)>,
     pub dynamic_cursor_color: Option<(u8, u8, u8)>,
+    /// OSC 4 per-index palette overrides; OSC 104 resets (all or listed).
+    pub dynamic_palette: DynamicColorPalette,
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,

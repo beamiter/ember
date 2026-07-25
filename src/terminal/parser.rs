@@ -346,7 +346,11 @@ impl super::TerminalState {
                                 if let Ok(payload) =
                                     std::str::from_utf8(&data_slice[payload_start..payload_end])
                                 {
-                                    if let Some((command, value)) = payload.split_once(';') {
+                                    // OSC 104/110/111/112 are valid without a
+                                    // `;value` part — treat those as empty.
+                                    if let Some((command, value)) =
+                                        payload.split_once(';').or(Some((payload, "")))
+                                    {
                                         if command == "0" || command == "2" {
                                             self.window_title.clear();
                                             self.window_title.push_str(value);
@@ -381,11 +385,20 @@ impl super::TerminalState {
                                                 // OSC 8 ; ; (close hyperlink)
                                                 self.current_hyperlink = None;
                                             }
+                                        } else if command == "4" {
+                                            self.handle_osc_palette(value);
+                                        } else if command == "104" {
+                                            self.reset_osc_palette(value);
                                         } else if command == "10"
                                             || command == "11"
                                             || command == "12"
                                         {
                                             self.handle_osc_color(command, value);
+                                        } else if command == "110"
+                                            || command == "111"
+                                            || command == "112"
+                                        {
+                                            self.reset_osc_color(command);
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
                                             if self.pending_notifications.len() < 8 {

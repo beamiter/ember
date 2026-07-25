@@ -305,6 +305,7 @@ impl super::TerminalState {
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor_color: None,
+            dynamic_palette: [None; 256],
             pending_notifications: Vec::new(),
             total_lines_scrolled: 0,
             command_marks: VecDeque::new(),
@@ -359,6 +360,97 @@ impl super::TerminalState {
                 "11" => self.dynamic_bg = Some(rgb),
                 "12" => self.dynamic_cursor_color = Some(rgb),
                 _ => {}
+            }
+        }
+    }
+
+    /// OSC 110/111/112: reset one dynamic color back to the theme default.
+    pub(super) fn reset_osc_color(&mut self, command: &str) {
+        match command {
+            "110" => self.dynamic_fg = None,
+            "111" => self.dynamic_bg = None,
+            "112" => self.dynamic_cursor_color = None,
+            _ => {}
+        }
+    }
+
+    /// OSC 4: set or query 256-palette entries (`idx;spec` pairs; `?` queries).
+    pub(super) fn handle_osc_palette(&mut self, value: &str) {
+        let mut parts = value.split(';');
+        while let Some(idx_s) = parts.next() {
+            let Some(color_s) = parts.next() else {
+                break;
+            };
+            let Ok(idx) = idx_s.parse::<u8>() else {
+                continue;
+            };
+            if color_s == "?" {
+                let color = self.dynamic_palette[idx as usize]
+                    .unwrap_or_else(|| Self::default_256_color(idx));
+                self.append_osc_palette_response(idx, color);
+            } else if let Some(rgb) = Self::parse_color_spec(color_s) {
+                self.dynamic_palette[idx as usize] = Some(rgb);
+            }
+        }
+    }
+
+    /// OSC 104: reset the whole palette (empty payload) or the listed indices.
+    pub(super) fn reset_osc_palette(&mut self, value: &str) {
+        if value.is_empty() {
+            self.dynamic_palette = [None; 256];
+            return;
+        }
+        for idx_s in value.split(';').filter(|s| !s.is_empty()) {
+            if let Ok(idx) = idx_s.parse::<u8>() {
+                self.dynamic_palette[idx as usize] = None;
+            }
+        }
+    }
+
+    fn append_osc_palette_response(&mut self, idx: u8, color: (u8, u8, u8)) {
+        let response = format!(
+            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            idx,
+            (color.0 as u16) * 257,
+            (color.1 as u16) * 257,
+            (color.2 as u16) * 257,
+        );
+        self.output_buffer.extend_from_slice(response.as_bytes());
+    }
+
+    /// Standard xterm defaults for palette queries when no override is set.
+    fn default_256_color(idx: u8) -> (u8, u8, u8) {
+        const ANSI: [(u8, u8, u8); 16] = [
+            (0, 0, 0),
+            (205, 0, 0),
+            (0, 205, 0),
+            (205, 205, 0),
+            (0, 0, 238),
+            (205, 0, 205),
+            (0, 205, 205),
+            (229, 229, 229),
+            (127, 127, 127),
+            (255, 0, 0),
+            (0, 255, 0),
+            (255, 255, 0),
+            (92, 92, 255),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 255, 255),
+        ];
+        match idx {
+            0..=15 => ANSI[idx as usize],
+            16..=231 => {
+                let idx = idx - 16;
+                let r_idx = idx / 36;
+                let g_idx = (idx % 36) / 6;
+                let b_idx = idx % 6;
+                let scale = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                (scale(r_idx), scale(g_idx), scale(b_idx))
+            }
+            232..=255 => {
+                let gray = 8 + (idx - 232) * 10;
+                (gray, gray, gray)
             }
         }
     }

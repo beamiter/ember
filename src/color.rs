@@ -1,4 +1,4 @@
-use crate::terminal::Color;
+use crate::terminal::{Color, DynamicColorPalette};
 use crate::theme::Theme;
 use egui::Color32;
 
@@ -27,17 +27,33 @@ fn ansi_index(color: Color) -> Option<usize> {
 
 /// Resolve a foreground color using the theme palette, with VTE4-compatible
 /// bold-brightening and dim attenuation.
+#[allow(dead_code)]
 pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> Color32 {
+    resolve_fg_with_palette(color, theme, None, bold, dim)
+}
+
+/// Like [`resolve_fg`], but OSC 4 palette overrides win over the theme for
+/// indexed and named ANSI colors.
+pub fn resolve_fg_with_palette(
+    color: Color,
+    theme: &Theme,
+    palette: Option<&DynamicColorPalette>,
+    bold: bool,
+    dim: bool,
+) -> Color32 {
     let base = match color {
         Color::Default => theme.terminal_foreground(),
-        Color::Indexed(idx) => color_256(idx, theme),
+        Color::Indexed(idx) => color_256_with_palette(idx, theme, palette),
         Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         _ => {
             // 具名 ANSI 色必命中 ansi_index;兜底 7(white) 仅防未来新增 Color 变体漏配。
             let idx = ansi_index(color).unwrap_or(7);
             // VTE4: bold + standard color (0-7) promotes to bright variant (8-15)
             let idx = if bold && idx < 8 { idx + 8 } else { idx };
-            theme.ansi_color(idx)
+            palette
+                .and_then(|p| p[idx])
+                .map(|(r, g, b)| Color32::from_rgb(r, g, b))
+                .unwrap_or_else(|| theme.ansi_color(idx))
         }
     };
     if dim {
@@ -54,21 +70,47 @@ pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> Color32
 }
 
 /// Resolve a background color using the theme palette.
+#[allow(dead_code)]
 pub fn resolve_bg(color: Color, theme: &Theme) -> Color32 {
+    resolve_bg_with_palette(color, theme, None)
+}
+
+/// Like [`resolve_bg`], but OSC 4 palette overrides win over the theme.
+pub fn resolve_bg_with_palette(
+    color: Color,
+    theme: &Theme,
+    palette: Option<&DynamicColorPalette>,
+) -> Color32 {
     match color {
         Color::Default => theme.terminal_background(),
-        Color::Indexed(idx) => color_256(idx, theme),
+        Color::Indexed(idx) => color_256_with_palette(idx, theme, palette),
         Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         _ => {
             // 具名 ANSI 色必命中;兜底 0(black) 仅防未来新增 Color 变体漏配。
             let idx = ansi_index(color).unwrap_or(0);
-            theme.ansi_color(idx)
+            palette
+                .and_then(|p| p[idx])
+                .map(|(r, g, b)| Color32::from_rgb(r, g, b))
+                .unwrap_or_else(|| theme.ansi_color(idx))
         }
     }
 }
 
 /// 256-color palette resolution using theme colors for indices 0-15.
+#[allow(dead_code)]
 pub fn color_256(idx: u8, theme: &Theme) -> Color32 {
+    color_256_with_palette(idx, theme, None)
+}
+
+/// Like [`color_256`], but an OSC 4 override wins for any index.
+pub fn color_256_with_palette(
+    idx: u8,
+    theme: &Theme,
+    palette: Option<&DynamicColorPalette>,
+) -> Color32 {
+    if let Some((r, g, b)) = palette.and_then(|p| p[idx as usize]) {
+        return Color32::from_rgb(r, g, b);
+    }
     match idx {
         0..=15 => theme.ansi_color(idx as usize),
         16..=231 => {
