@@ -56,6 +56,10 @@ use ui::{grid_position_from_content, TerminalRenderer};
 
 // 全局标志，用于信号处理
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// A nonzero shell exit inside this window after spawn means the shell never
+/// became interactive: no human could have typed `exit` that fast.
+const SHELL_STARTUP_GRACE: Duration = Duration::from_millis(1500);
 #[cfg(test)]
 static NEXT_KITTY_PASTE_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
 #[cfg(test)]
@@ -2383,6 +2387,11 @@ impl eframe::App for TerminalApp {
         // 获取当前活跃会话（在所有快捷键处理完后）
         let session_count_before = self.session_manager.len();
         let mut shell_exited = false;
+        // A shell that dies before it could ever have shown a prompt is a
+        // startup failure, not the user leaving. Closing the window on it
+        // makes jterm2 look like it "exits as soon as it runs", hiding the
+        // real cause (bad `shell =` config, unusable cwd, wrong binary).
+        let mut shell_startup_failed = false;
 
         // Step 2.5: 搜索面板事件处理
         if self.pending_paste_confirm.is_none() && !self.search_replace_panel.is_open {
@@ -2682,9 +2691,18 @@ impl eframe::App for TerminalApp {
                     }
                     Ok(ShellEvent::Exit(code)) => {
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
-                        self.status_message = format!("Shell exited with code: {}", code);
-                        self.status_expires_at =
-                            Some(std::time::Instant::now() + Duration::from_secs(6));
+                        let uptime = session.shell.uptime();
+                        if code != 0 && uptime < SHELL_STARTUP_GRACE {
+                            shell_startup_failed = true;
+                            self.status_message = format!(
+                                "Shell failed to start (exit code {code}). Check the `shell` setting in the config panel."
+                            );
+                            self.status_expires_at = None;
+                        } else {
+                            self.status_message = format!("Shell exited with code: {}", code);
+                            self.status_expires_at =
+                                Some(std::time::Instant::now() + Duration::from_secs(6));
+                        }
                         has_new_output = true;
                         shell_exited = true;
                         break;
@@ -3625,6 +3643,11 @@ impl eframe::App for TerminalApp {
                     "[SHELL EXIT] closed session, remaining: {}",
                     self.session_manager.len()
                 );
+            } else if shell_startup_failed {
+                // The last shell never reached a prompt. Closing here would
+                // make the window vanish before the user can read why, so keep
+                // it open with the failure message on screen instead.
+                crate::debug_log!("[SHELL EXIT] startup failure, keeping window open");
             } else {
                 // Close the window if this is the only session
                 crate::debug_log!("[SHELL EXIT] closing window");

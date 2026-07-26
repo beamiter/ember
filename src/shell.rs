@@ -292,6 +292,10 @@ pub struct ShellSession {
     // 所有 PTY 写入都经此 channel 交给单一 writer 线程串行执行,保证每条消息原子写入、
     // 互不交错(否则键盘输入与异步粘贴会逐块交错,劈开括号粘贴标记 ESC[200~..201~)。
     write_tx: ShellWriteSender,
+    /// When the child was spawned. A shell that dies within moments of this
+    /// point never reached an interactive prompt, so the app must report the
+    /// failure instead of treating it as the user typing `exit`.
+    started_at: std::time::Instant,
 }
 
 impl ShellSession {
@@ -394,6 +398,7 @@ impl ShellSession {
                     child_pid,
                     shutdown,
                     write_tx,
+                    started_at: std::time::Instant::now(),
                 })
             }
             Err(e) => Err(format!("Failed to create shell session: {}", e)),
@@ -403,6 +408,11 @@ impl ShellSession {
     /// 获取事件接收器（用于读取 shell 事件）
     pub fn events(&self) -> &Receiver<ShellEvent> {
         &self.event_rx
+    }
+
+    /// 子进程启动至今的时长。用于区分"用户主动 exit"与"shell 根本没起来"。
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     fn send_event(

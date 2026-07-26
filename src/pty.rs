@@ -159,6 +159,22 @@ mod unix_pty {
         exec_cmd
     }
 
+    /// `rsh` is an ambiguous name: on most distributions `/usr/bin/rsh` is an
+    /// alternatives symlink to the legacy remote shell (today usually
+    /// `ssh`/`rlogin`), not the interactive shell jterm2 prefers. Launching it
+    /// makes the child reject `--session` and exit immediately (ssh exits 255),
+    /// which used to close the only tab and take the whole window down with it.
+    /// Accept the candidate only when it really resolves to an `rsh` program.
+    pub(super) fn is_interactive_rsh(path: &Path) -> bool {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let Some(name) = resolved.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        // Version-suffixed builds (rsh-0.3.0) stay eligible; ssh, rlogin,
+        // remsh and the netkit/redone compat wrappers do not.
+        name == "rsh" || name.starts_with("rsh-") || name.starts_with("rsh.")
+    }
+
     pub(super) fn choose_shell_with_path(
         configured_shell: Option<&str>,
         path_var: Option<&OsStr>,
@@ -189,7 +205,13 @@ mod unix_pty {
 
         // Priority 2: rsh (preferred shell with advanced features)
         if let Some(rsh_path) = find_executable_in_path_with("rsh", path_var) {
-            return Ok(rsh_path);
+            if is_interactive_rsh(Path::new(&rsh_path)) {
+                return Ok(rsh_path);
+            }
+            eprintln!(
+                "[PTY] Ignoring '{}': it resolves to the legacy remote shell, not the rsh shell",
+                rsh_path
+            );
         }
 
         // Priority 3: bash (fallback)
@@ -1035,6 +1057,55 @@ mod tests {
 
         assert_eq!(std::path::Path::new(&selected), executable);
         assert!(std::path::Path::new(&selected).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsh_symlinked_to_the_legacy_remote_shell_is_skipped() {
+        let root = ShellTestDir::new("rsh-alternatives");
+        let ssh = root.executable("ssh");
+        let bash = root.executable("bash");
+        // Mirrors /usr/bin/rsh -> /etc/alternatives/rsh -> /usr/bin/ssh.
+        std::os::unix::fs::symlink(&ssh, root.0.join("rsh")).unwrap();
+        let search_path = root.search_path();
+
+        let selected = super::unix_pty::choose_shell_with_path(
+            None,
+            Some(&search_path),
+            &root.0.join("missing-sh"),
+        )
+        .unwrap();
+
+        assert_eq!(std::path::Path::new(&selected), bash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_rsh_binary_is_still_preferred() {
+        let root = ShellTestDir::new("rsh-real");
+        let rsh = root.executable("rsh");
+        root.executable("bash");
+        let search_path = root.search_path();
+
+        let selected = super::unix_pty::choose_shell_with_path(
+            None,
+            Some(&search_path),
+            &root.0.join("missing-sh"),
+        )
+        .unwrap();
+
+        assert_eq!(std::path::Path::new(&selected), rsh);
+        assert!(super::unix_pty::is_interactive_rsh(&rsh));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn versioned_rsh_builds_remain_eligible() {
+        let root = ShellTestDir::new("rsh-versioned");
+        let versioned = root.executable("rsh-0.3.0");
+        std::os::unix::fs::symlink(&versioned, root.0.join("rsh")).unwrap();
+
+        assert!(super::unix_pty::is_interactive_rsh(&root.0.join("rsh")));
     }
 
     #[cfg(unix)]
