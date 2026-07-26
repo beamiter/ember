@@ -57,6 +57,8 @@ pub struct ConfigPanel {
     edit_ai_model: String,
     edit_ai_base_url: String,
     edit_ai_max_tokens: u32,
+    /// 温度草稿：空串 = 用 provider 默认。
+    edit_ai_temperature: String,
     edit_ai_redact_secrets: bool,
     edit_ai_api_key_file: String,
     edit_agent_max_turns: u32,
@@ -106,6 +108,7 @@ impl ConfigPanel {
             edit_ai_model: String::new(),
             edit_ai_base_url: String::new(),
             edit_ai_max_tokens: 1_024,
+            edit_ai_temperature: String::new(),
             edit_ai_redact_secrets: true,
             edit_ai_api_key_file: String::new(),
             edit_agent_max_turns: 20,
@@ -184,6 +187,10 @@ impl ConfigPanel {
         self.edit_ai_model = config.ai_model.clone();
         self.edit_ai_base_url = config.ai_base_url.clone();
         self.edit_ai_max_tokens = config.ai_max_tokens;
+        self.edit_ai_temperature = config
+            .ai_temperature
+            .map(|t| format!("{t}"))
+            .unwrap_or_default();
         self.edit_ai_redact_secrets = config.ai_redact_secrets;
         self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
         self.edit_agent_max_turns = config.agent_max_turns;
@@ -217,6 +224,12 @@ impl ConfigPanel {
         config.ai_model = self.edit_ai_model.trim().to_string();
         config.ai_base_url = self.edit_ai_base_url.trim().to_string();
         config.ai_max_tokens = self.edit_ai_max_tokens.clamp(64, 32_768);
+        config.ai_temperature = self
+            .edit_ai_temperature
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
         config.ai_redact_secrets = self.edit_ai_redact_secrets;
         config.ai_api_key_file = Some(self.edit_ai_api_key_file.trim().to_string())
             .filter(|path| !path.is_empty());
@@ -996,6 +1009,21 @@ impl ConfigPanel {
             {
                 self.has_changes = true;
             }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Temperature:");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.edit_ai_temperature)
+                        .hint_text("provider default")
+                        .desired_width(80.0),
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+            ui.label("0.0–2.0, empty = provider default");
         });
 
         ui.horizontal(|ui| {
