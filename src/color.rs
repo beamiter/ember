@@ -1,6 +1,6 @@
-use crate::theme::ThemeExt as _;
 use crate::terminal::{Color, DynamicColorPalette};
 use crate::theme::Theme;
+use crate::theme::ThemeExt as _;
 use egui::Color32;
 
 /// Map a Color enum variant to an index into the theme's 16-color ANSI palette.

@@ -4,9 +4,9 @@
 // 本面板对「当前选中文本」做查找替换，默认把结果复制到剪贴板；
 // 也可显式发送到 PTY（不带回车，避免误执行）。
 
-use crate::theme::ThemeExt as _;
 use crate::search_replace::{ReplaceOptions, SearchAndReplaceEngine, SearchConfig};
 use crate::theme::Theme;
+use crate::theme::ThemeExt as _;
 use eframe::egui;
 
 /// 调用方需要执行的动作（面板本身不持有终端/剪贴板）

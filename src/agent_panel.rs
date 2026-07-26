@@ -18,14 +18,16 @@
 
 use crate::config::Config;
 use crate::terminal::CompletedCommandOutput;
-use jterm_core::agent::{
-    is_dangerous, AgentSession, AgentState, ProposalId, ProposalStatus, Turn,
-};
+use jterm_core::agent::{is_dangerous, AgentSession, AgentState, ProposalId, ProposalStatus, Turn};
 use jterm_core::ai::{AiCancellationToken, AiClient, AiSettings, BlockContext};
 use std::sync::mpsc;
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("jterm2").join("agent_session.json"))
+    Some(
+        dirs::config_dir()?
+            .join("jterm2")
+            .join("agent_session.json"),
+    )
 }
 
 /// Side effects the panel asks the app to perform. The panel itself never
@@ -34,14 +36,17 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
 pub enum AgentEffect {
     /// Write this protocol-validated single-line command plus a carriage
     /// return to the bound session's input queue.
-    RunCommand { session_index: usize, command: String },
+    RunCommand {
+        session_index: usize,
+        command: String,
+    },
 }
 
 fn client_from_config(config: &Config) -> Result<AiClient, String> {
     AiClient::from_settings(&AiSettings {
         enabled: config.ai_enabled,
         provider: config.ai_provider.clone(),
-        api_key_file: config.ai_api_key_file.clone(),
+        api_key_file: jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref()),
         model: config.ai_model.clone(),
         base_url: config.ai_base_url.clone(),
         max_tokens: config.ai_max_tokens,
@@ -427,8 +432,7 @@ impl AgentPanel {
                                                 );
                                                 ui.horizontal(|ui| {
                                                     if ui.button("Approve edited").clicked() {
-                                                        approve =
-                                                            Some((*id, Some(buffer.clone())));
+                                                        approve = Some((*id, Some(buffer.clone())));
                                                     }
                                                     if ui.button("Cancel edit").clicked() {
                                                         cancel_edit = true;
@@ -453,9 +457,8 @@ impl AgentPanel {
                                                     };
                                                     let button = if danger.is_some() {
                                                         egui::Button::new(
-                                                            egui::RichText::new(label).color(
-                                                                ui.visuals().error_fg_color,
-                                                            ),
+                                                            egui::RichText::new(label)
+                                                                .color(ui.visuals().error_fg_color),
                                                         )
                                                     } else {
                                                         egui::Button::new(label)
@@ -464,8 +467,7 @@ impl AgentPanel {
                                                         approve = Some((*id, None));
                                                     }
                                                     if ui.button("Edit").clicked() {
-                                                        self.edit =
-                                                            Some((*id, command.clone()));
+                                                        self.edit = Some((*id, command.clone()));
                                                     }
                                                     if ui.button("Reject").clicked() {
                                                         reject = Some(*id);
@@ -479,16 +481,12 @@ impl AgentPanel {
                                                 ui.label(egui::RichText::new("✓ ran").weak());
                                             }
                                             ProposalStatus::Rejected => {
-                                                ui.label(
-                                                    egui::RichText::new("✗ rejected").weak(),
-                                                );
+                                                ui.label(egui::RichText::new("✗ rejected").weak());
                                             }
                                             ProposalStatus::ManualReview => {
                                                 ui.label(
-                                                    egui::RichText::new(
-                                                        "moved to manual review",
-                                                    )
-                                                    .weak(),
+                                                    egui::RichText::new("moved to manual review")
+                                                        .weak(),
                                                 );
                                             }
                                         }
@@ -685,12 +683,13 @@ mod tests {
     }
 
     fn ai_config() -> Config {
-        let mut config = Config::default();
-        config.ai_enabled = true;
-        config.ai_provider = "ollama".into();
-        config.ai_base_url = "http://localhost:11434".into();
-        config.ai_model = "codellama:7b".into();
-        config
+        Config {
+            ai_enabled: true,
+            ai_provider: "ollama".into(),
+            ai_base_url: "http://localhost:11434".into(),
+            ai_model: "codellama:7b".into(),
+            ..Config::default()
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // Rendering coordination module
 
-use crate::theme::ThemeExt as _;
 use super::state::TerminalApp;
+use crate::theme::ThemeExt as _;
 use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
 
@@ -872,9 +872,7 @@ impl TerminalApp {
                         match self.session_manager.get_session_mut(session_index) {
                             Some(session) => {
                                 if !session.queue_input(&bytes) {
-                                    self.set_status(
-                                        "Agent command rejected: input queue is full",
-                                    );
+                                    self.set_status("Agent command rejected: input queue is full");
                                 }
                             }
                             None => self.set_status("Agent session's terminal no longer exists"),

@@ -1,6 +1,6 @@
-use crate::theme::ThemeExt as _;
 use crate::config::{AppRendererType, Config, TabBarPosition};
 use crate::theme::Theme;
+use crate::theme::ThemeExt as _;
 use egui::{Color32, RichText};
 
 fn accent_color(theme: &Theme) -> Color32 {
@@ -61,6 +61,10 @@ pub struct ConfigPanel {
     edit_ai_temperature: String,
     edit_ai_redact_secrets: bool,
     edit_ai_api_key_file: String,
+    /// 待存储的 API key 明文；点击 Store 写成 0600 文件后立即清空，从不落盘。
+    edit_ai_key_draft: String,
+    /// 最近一次存 key 的结果提示（成功路径或错误信息）。
+    ai_key_store_status: Option<Result<String, String>>,
     edit_agent_max_turns: u32,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
@@ -111,6 +115,8 @@ impl ConfigPanel {
             edit_ai_temperature: String::new(),
             edit_ai_redact_secrets: true,
             edit_ai_api_key_file: String::new(),
+            edit_ai_key_draft: String::new(),
+            ai_key_store_status: None,
             edit_agent_max_turns: 20,
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
@@ -231,8 +237,8 @@ impl ConfigPanel {
             .ok()
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
         config.ai_redact_secrets = self.edit_ai_redact_secrets;
-        config.ai_api_key_file = Some(self.edit_ai_api_key_file.trim().to_string())
-            .filter(|path| !path.is_empty());
+        config.ai_api_key_file =
+            Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
     }
 
@@ -938,7 +944,6 @@ fn render_theme_editor(
 }
 
 impl ConfigPanel {
-
     fn render_ai_tab(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("AI & Agent").strong().size(14.0));
         ui.separator();
@@ -1042,12 +1047,49 @@ impl ConfigPanel {
         ui.label(
             RichText::new(
                 "Optional single-line key file owned by you with 0600 permissions. \
-                 Environment variables (JTERM2_AI_API_KEY, ANTHROPIC_API_KEY, …) \
-                 take precedence; the key itself is never written to config.toml.",
+                 Environment variables (JTERM2_AI_API_KEY_FILE, JTERM2_AI_API_KEY, \
+                 ANTHROPIC_API_KEY, …) take precedence; the key itself is never \
+                 written to config.toml.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
         );
+
+        ui.horizontal(|ui| {
+            ui.label("API key:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.edit_ai_key_draft)
+                    .password(true)
+                    .hint_text("paste key, Store writes a 600 file")
+                    .desired_width(200.0),
+            );
+            if ui.button("Store").clicked() {
+                // Same write-target rule as the rest of the family: the
+                // configured path, else the per-app default. The environment
+                // override stays read-only and is never written to.
+                let path = Some(self.edit_ai_api_key_file.trim().to_string())
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or_else(jterm_core::ai::default_api_key_path);
+                self.ai_key_store_status = Some(
+                    match jterm_core::ai::write_api_key_file(&path, &self.edit_ai_key_draft) {
+                        Ok(()) => {
+                            self.edit_ai_key_draft.clear();
+                            self.edit_ai_api_key_file = path.clone();
+                            self.has_changes = true;
+                            Ok(format!("Key stored in {path}"))
+                        }
+                        Err(error) => Err(error.to_string()),
+                    },
+                );
+            }
+        });
+        if let Some(status) = &self.ai_key_store_status {
+            let (text, color) = match status {
+                Ok(message) => (message.as_str(), ui.visuals().weak_text_color()),
+                Err(error) => (error.as_str(), ui.visuals().error_fg_color),
+            };
+            ui.label(RichText::new(text).size(11.0).color(color));
+        }
         ui.separator();
 
         if ui

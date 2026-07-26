@@ -246,7 +246,13 @@ impl LayoutManager {
 
     /// 组合两棵子树为一个 `axis` 分割；同轴子分割直接展平成兄弟节点
     /// （子比例按父级份额缩放），把保存时的嵌套二叉还原为 n 叉。
-    fn join(axis: SplitAxis, first: PaneTree, first_share: f32, second: PaneTree, second_share: f32) -> PaneTree {
+    fn join(
+        axis: SplitAxis,
+        first: PaneTree,
+        first_share: f32,
+        second: PaneTree,
+        second_share: f32,
+    ) -> PaneTree {
         let mut children = Vec::new();
         let mut ratios = Vec::new();
         for (node, share) in [(first, first_share), (second, second_share)] {
@@ -290,7 +296,10 @@ impl LayoutManager {
         } else {
             SplitAxis::Vertical
         };
-        if !self.tree.split_leaf(self.focused_pane_id.0, axis, session_idx) {
+        if !self
+            .tree
+            .split_leaf(self.focused_pane_id.0, axis, session_idx)
+        {
             return Err("Focused pane is missing from the layout".to_string());
         }
         self.focused_pane_id = PaneId(session_idx);
@@ -772,14 +781,20 @@ impl LayoutManager {
             if index + 1 < n {
                 let rect = match axis {
                     SplitAxis::Vertical => Rect::from_min_max(
-                        egui::pos2(boundary - Self::DIVIDER_HIT_HALF_WIDTH, container_rect.top()),
+                        egui::pos2(
+                            boundary - Self::DIVIDER_HIT_HALF_WIDTH,
+                            container_rect.top(),
+                        ),
                         egui::pos2(
                             boundary + Self::DIVIDER_HIT_HALF_WIDTH,
                             container_rect.bottom(),
                         ),
                     ),
                     SplitAxis::Horizontal => Rect::from_min_max(
-                        egui::pos2(container_rect.left(), boundary - Self::DIVIDER_HIT_HALF_WIDTH),
+                        egui::pos2(
+                            container_rect.left(),
+                            boundary - Self::DIVIDER_HIT_HALF_WIDTH,
+                        ),
                         egui::pos2(
                             container_rect.right(),
                             boundary + Self::DIVIDER_HIT_HALF_WIDTH,

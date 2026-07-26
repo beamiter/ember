@@ -4,8 +4,7 @@
 //! journal's neutral input type; everything else re-exports unchanged.
 
 pub(crate) use jterm_core::execution_journal::{
-    flush, request_history, HistoryLoad, HistoryRequestError, PersistedExecution,
-    PersistedExecutionOutput, SubmitError,
+    flush, request_history, HistoryLoad, HistoryRequestError, PersistedExecution, SubmitError,
 };
 
 use crate::terminal::CompletedCommandOutput;

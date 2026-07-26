@@ -507,7 +507,7 @@ impl TerminalApp {
                 ctx.request_repaint_after(Duration::from_millis(75));
                 return;
             }
-            Some(Err(())) => {
+            Some(Err(jterm_core::execution_journal::HistoryLoadDisconnected)) => {
                 self.command_sidebar.history_load = None;
                 self.command_sidebar.history_loaded = true;
                 self.command_sidebar.history_error =
@@ -1377,7 +1377,7 @@ mod tests {
             duration_ms: Some(12),
             cwd_after: Some("/tmp".to_owned()),
             ended_at_ms: Some(1_012),
-            output: Some(crate::execution_journal::PersistedExecutionOutput {
+            output: Some(jterm_core::execution_journal::PersistedExecutionOutput {
                 text: "hi".to_owned(),
                 truncated: false,
                 total_bytes: 2,

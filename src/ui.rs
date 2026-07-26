@@ -1,7 +1,7 @@
-use crate::theme::ThemeExt as _;
 use crate::color;
 use crate::gpu;
 use crate::terminal::{clamp_terminal_dimensions, TerminalState};
+use crate::theme::ThemeExt as _;
 use egui::{Color32, FontId, Response, Ui, Vec2};
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -1514,7 +1514,10 @@ impl TerminalRenderer {
                                 egui::pos2(x, underline_y),
                                 egui::pos2(x + cell_width, underline_y),
                             ],
-                            egui::Stroke::new(0.8, dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color())),
+                            egui::Stroke::new(
+                                0.8,
+                                dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color()),
+                            ),
                         );
                     }
                     crate::terminal::CursorShape::Beam => {
@@ -1523,7 +1526,10 @@ impl TerminalRenderer {
                                 egui::pos2(x + 0.25, y),
                                 egui::pos2(x + 0.25, y + line_height),
                             ],
-                            egui::Stroke::new(0.8, dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color())),
+                            egui::Stroke::new(
+                                0.8,
+                                dynamic_cursor.unwrap_or_else(|| self.theme.cursor_color()),
+                            ),
                         );
                     }
                 }
@@ -2129,13 +2135,13 @@ impl TerminalRenderer {
                         if col_idx >= m.col_start && col_idx < m.col_end {
                             is_search_match = true;
                             bg_color = color::resolve_fg_with_palette(
-                    cell.foreground,
-                    theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_fg,
-                    bold,
-                    dim,
-                );
+                                cell.foreground,
+                                theme,
+                                Some(&terminal.dynamic_palette),
+                                terminal.dynamic_fg,
+                                bold,
+                                dim,
+                            );
                             if active_match_pos == Some((m.line_id, m.col_start)) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
@@ -2367,11 +2373,11 @@ impl TerminalRenderer {
                     )
                 } else {
                     color::resolve_bg_with_palette(
-                    cell.background,
-                    &self.theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_bg,
-                )
+                        cell.background,
+                        &self.theme,
+                        Some(&terminal.dynamic_palette),
+                        terminal.dynamic_bg,
+                    )
                 };
 
                 let mut is_search_match = false;
@@ -2381,13 +2387,13 @@ impl TerminalRenderer {
                         if col_idx >= m.col_start && col_idx < m.col_end {
                             is_search_match = true;
                             bg_color = color::resolve_fg_with_palette(
-                        cell.foreground,
-                        &self.theme,
-                        Some(&terminal.dynamic_palette),
-                        terminal.dynamic_fg,
-                        bold,
-                        dim,
-                    );
+                                cell.foreground,
+                                &self.theme,
+                                Some(&terminal.dynamic_palette),
+                                terminal.dynamic_fg,
+                                bold,
+                                dim,
+                            );
                             if active_match == Some(*m) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
@@ -2458,11 +2464,11 @@ impl TerminalRenderer {
                     self.theme.selection_fg_color()
                 } else if cell.flags.inverse() {
                     color::resolve_bg_with_palette(
-                    cell.background,
-                    &self.theme,
-                    Some(&terminal.dynamic_palette),
-                    terminal.dynamic_bg,
-                )
+                        cell.background,
+                        &self.theme,
+                        Some(&terminal.dynamic_palette),
+                        terminal.dynamic_bg,
+                    )
                 } else {
                     color::resolve_fg_with_palette(
                         cell.foreground,
