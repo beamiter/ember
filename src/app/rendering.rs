@@ -70,6 +70,203 @@ impl TerminalApp {
         }
     }
 
+    /// Assemble one pane's header line.
+    ///
+    /// The working directory and the foreground command are read from `/proc`,
+    /// so the result goes through a per-session cache that refreshes a few
+    /// times a second instead of on every frame.
+    fn pane_status(
+        &mut self,
+        session_idx: usize,
+        now: std::time::Instant,
+    ) -> crate::pane_header::PaneStatus {
+        let Some(session) = self.session_manager.sessions().get(session_idx) else {
+            return crate::pane_header::PaneStatus::default();
+        };
+        let session_id = session.metadata.session_id.clone();
+        let custom_name = session
+            .metadata
+            .custom_name
+            .clone()
+            .filter(|name| !name.is_empty());
+        let fallback_name = session.metadata.name.clone();
+        let shell_pid = session.get_shell_pid();
+        // OSC 7 outranks /proc: under ssh or tmux the local shell's own cwd
+        // does not describe where the user actually is.
+        let (reported_cwd, reported_command) = {
+            let terminal = session.terminal.lock();
+            (
+                terminal.current_working_dir.clone(),
+                terminal.running_command().map(str::to_string),
+            )
+        };
+
+        self.pane_status_cache
+            .get(&session_id, now, || {
+                let cwd = reported_cwd
+                    .or_else(|| crate::session_manager::get_process_cwd(shell_pid))
+                    .map(|cwd| crate::pane_header::abbreviate_home(&cwd));
+                let title = custom_name
+                    .or_else(|| cwd.as_deref().map(crate::pane_header::path_leaf))
+                    .unwrap_or(fallback_name);
+                // Shells without OSC 133 integration report no command; the
+                // PTY's foreground process group still names one.
+                let running_command = reported_command
+                    .or_else(|| crate::session_manager::get_foreground_command(shell_pid));
+                crate::pane_header::PaneStatus {
+                    title,
+                    cwd,
+                    running_command,
+                }
+            })
+            .clone()
+    }
+
+    /// Draw the per-pane header strips and run the drag-to-rearrange gesture.
+    ///
+    /// Pressing a header focuses its pane through the ordinary click-to-focus
+    /// path; dragging it onto another pane swaps the two sessions. Only the
+    /// contents move — the split geometry the user arranged stays put.
+    fn render_pane_headers(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        panes: &[layout::Pane],
+        pane_chrome: &[(Option<egui::Rect>, egui::Rect)],
+        interaction_enabled: bool,
+    ) {
+        // Keep the status cache from growing with a long-lived window's tab churn.
+        let live_session_ids: std::collections::HashSet<String> = self
+            .session_manager
+            .sessions()
+            .iter()
+            .map(|session| session.metadata.session_id.clone())
+            .collect();
+        self.pane_status_cache.retain_sessions(&live_session_ids);
+
+        if !interaction_enabled {
+            self.pane_drag = None;
+        }
+
+        let now = std::time::Instant::now();
+        let statuses: Vec<crate::pane_header::PaneStatus> = panes
+            .iter()
+            .map(|pane| self.pane_status(pane.session_idx, now))
+            .collect();
+
+        let handles: Vec<(usize, egui::Response)> = panes
+            .iter()
+            .enumerate()
+            .filter_map(|(pane_idx, pane)| {
+                let header_rect = pane_chrome[pane_idx].0?;
+                let response = ui
+                    .interact(
+                        header_rect,
+                        ui.id().with(("pane-header", pane.session_idx)),
+                        egui::Sense::click_and_drag(),
+                    )
+                    .on_hover_text("Drag onto another pane to swap them");
+                Some((pane.session_idx, response))
+            })
+            .collect();
+
+        let pointer_pos = ctx.input(|input| input.pointer.latest_pos());
+
+        if interaction_enabled {
+            if self.pane_drag.is_none() {
+                if let Some((session_idx, origin)) = handles.iter().find_map(|(idx, response)| {
+                    response
+                        .drag_started()
+                        .then(|| response.interact_pointer_pos().map(|pos| (*idx, pos)))
+                        .flatten()
+                }) {
+                    // Anchor the drag to the session's stable ID: a background
+                    // shell can exit mid-drag, shifting every later index.
+                    if let Some(session) = self.session_manager.sessions().get(session_idx) {
+                        self.pane_drag = Some(super::state::PaneDrag {
+                            session_id: session.metadata.session_id.clone(),
+                            origin,
+                            active: false,
+                        });
+                    }
+                }
+            }
+            if let (Some(drag), Some(pos)) = (self.pane_drag.as_mut(), pointer_pos) {
+                if !drag.active
+                    && (pos - drag.origin).length() > crate::pane_header::PANE_DRAG_THRESHOLD
+                {
+                    drag.active = true;
+                }
+            }
+        }
+
+        let drag_source = self
+            .pane_drag
+            .as_ref()
+            .filter(|drag| drag.active)
+            .and_then(|drag| self.session_manager.index_of(&drag.session_id))
+            .filter(|session_idx| panes.iter().any(|pane| pane.session_idx == *session_idx));
+        let drop_target = drag_source.and_then(|source| {
+            pointer_pos
+                .and_then(|pos| self.layout_manager.session_at(pos))
+                .filter(|target| *target != source)
+        });
+
+        if drag_source.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+
+        let painter = ui.painter();
+        let accent = crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border);
+        for (pane_idx, pane) in panes.iter().enumerate() {
+            let is_target = drop_target == Some(pane.session_idx);
+            if is_target {
+                // Tint the whole pane, not just its strip: the strip is only a
+                // few pixels tall and the pointer is usually far from it.
+                painter.rect_filled(
+                    pane.rect,
+                    egui::CornerRadius::ZERO,
+                    accent.gamma_multiply(0.15),
+                );
+                painter.rect_stroke(
+                    pane.rect.shrink(1.0),
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(2.0, accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let Some(header_rect) = pane_chrome[pane_idx].0 else {
+                continue;
+            };
+            crate::pane_header::draw_pane_header(
+                painter,
+                header_rect,
+                &self.current_theme,
+                crate::pane_header::PaneHeaderVisual {
+                    index: pane_idx + 1,
+                    status: &statuses[pane_idx],
+                    focused: pane.focused,
+                    drag_source: drag_source == Some(pane.session_idx),
+                    drop_target: is_target,
+                },
+            );
+        }
+
+        // Resolve the gesture only after painting, so the swap's new geometry
+        // is drawn by the next frame rather than half-applied to this one.
+        if self.pane_drag.is_some() && ctx.input(|input| input.pointer.any_released()) {
+            if let (Some(source), Some(target)) = (drag_source, drop_target) {
+                if self.layout_manager.swap_sessions(source, target) {
+                    self.sync_active_session_to_focused_pane();
+                    self.schedule_session_save();
+                    self.set_status("Swapped panes");
+                    ctx.request_repaint();
+                }
+            }
+            self.pane_drag = None;
+        }
+    }
+
     pub fn render_terminal_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let interaction_enabled = !self.terminal_input_blocked(ctx);
         if !interaction_enabled {
@@ -111,17 +308,26 @@ impl TerminalApp {
             let divider_rects = self.layout_manager.get_divider_rects();
             let inactive_search = crate::search::SearchState::default();
 
+            // 每个窗格顶部让出一条状态栏；终端内容渲染在它下方的矩形里，
+            // 于是 shell 的 grid 尺寸、鼠标坐标映射、链接命中都基于同一个
+            // content rect,不会被标题栏挤偏一行。
+            let pane_chrome: Vec<(Option<egui::Rect>, egui::Rect)> = panes
+                .iter()
+                .map(|pane| crate::pane_header::split_header(pane.rect))
+                .collect();
+
             // 为每个窗格渲染
             for (pane_idx, pane) in panes.iter().enumerate() {
                 if pane_idx >= self.pane_renderers.len() {
                     break;
                 }
 
+                let content_rect = pane_chrome[pane_idx].1;
                 let session_idx = pane.session_idx;
                 // 按本窗格 rect 的尺寸 resize 该窗格会话的 shell + 终端 grid,
                 // 否则窗格内的 shell 仍以为自己拥有整窗口宽高,导致换行/清屏错乱。
                 let (pane_cols, pane_rows) =
-                    self.pane_renderers[pane_idx].grid_dimensions(pane.rect.size());
+                    self.pane_renderers[pane_idx].grid_dimensions(content_rect.size());
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
                     let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                     let mut terminal_guard = session.terminal.lock();
@@ -178,10 +384,14 @@ impl TerminalApp {
                         pane_search,
                         &links,
                         pane_hovered_link,
-                        pane.rect,
+                        content_rect,
                     );
                 }
             }
+
+            // 窗格标题栏。注册在分隔线之前:两者的命中区在窗格顶角重叠,
+            // 后注册的分隔线在那里胜出,拖动边界不会被标题栏抢走。
+            self.render_pane_headers(ui, ctx, &panes, &pane_chrome, interaction_enabled);
 
             // 用主题强调色标出当前输入 pane。边框画在终端内容之后，确保
             // GPU/Glow 两条渲染路径下都不会被背景覆盖。

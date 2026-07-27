@@ -663,6 +663,39 @@ impl LayoutManager {
             .then_some(self.focused_pane_id.0)
     }
 
+    /// 交换两个窗格显示的会话，用于拖拽标题栏重排布局。窗格的几何形状
+    /// 保持不变，只是内容互换；焦点跟随被拖动的会话，这样拖完之后键盘
+    /// 输入仍然落在用户刚刚移动的那个终端里。
+    pub fn swap_sessions(&mut self, dragged: usize, target: usize) -> bool {
+        if dragged == target
+            || !self.tree.contains_session(dragged)
+            || !self.tree.contains_session(target)
+        {
+            return false;
+        }
+        self.tree.remap_sessions(&|session| {
+            if session == dragged {
+                target
+            } else if session == target {
+                dragged
+            } else {
+                session
+            }
+        });
+        self.focused_pane_id = PaneId(dragged);
+        self.rebuild_panes();
+        true
+    }
+
+    /// 根据坐标命中窗格但不改变焦点。拖拽过程中需要知道指针悬停在哪个
+    /// 窗格上，而此时不应该把焦点提前移过去。
+    pub fn session_at(&self, pos: egui::Pos2) -> Option<usize> {
+        self.panes()
+            .iter()
+            .find(|pane| pane.rect.contains(pos))
+            .map(|pane| pane.session_idx)
+    }
+
     /// 根据坐标设置焦点窗格，命中则返回该窗格的 session 索引。
     pub fn focus_pane_at(&mut self, pos: egui::Pos2) -> Option<usize> {
         let hit = self
@@ -872,6 +905,50 @@ mod tests {
         assert_eq!(layout.focused_session_idx(), Some(2));
         assert_eq!(layout.panes[0].session_idx, 2);
         assert_eq!(layout.panes[1].session_idx, 1);
+    }
+
+    #[test]
+    fn swapping_sessions_exchanges_contents_and_keeps_geometry() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, true).unwrap();
+        layout.compute_pane_rects(test_rect());
+        let dividers = layout.get_divider_rects();
+        assert!(layout.set_split_ratio(&dividers[0].id, 0.65));
+        layout.compute_pane_rects(test_rect());
+        let rects_before: Vec<Rect> = layout.panes().iter().map(|pane| pane.rect).collect();
+        let sessions_before: Vec<usize> =
+            layout.panes().iter().map(|pane| pane.session_idx).collect();
+
+        assert!(layout.swap_sessions(0, 2));
+        layout.compute_pane_rects(test_rect());
+        let rects_after: Vec<Rect> = layout.panes().iter().map(|pane| pane.rect).collect();
+        let sessions_after: Vec<usize> =
+            layout.panes().iter().map(|pane| pane.session_idx).collect();
+
+        assert_eq!(
+            rects_before, rects_after,
+            "a swap must not disturb the split geometry"
+        );
+        let expected: Vec<usize> = sessions_before
+            .iter()
+            .map(|&session| match session {
+                0 => 2,
+                2 => 0,
+                other => other,
+            })
+            .collect();
+        assert_eq!(sessions_after, expected);
+        assert_eq!(
+            layout.focused_session_idx(),
+            Some(0),
+            "focus follows the dragged session into its new pane"
+        );
+
+        // Degenerate and out-of-layout requests are refused rather than
+        // silently remapping a session that is not on screen.
+        assert!(!layout.swap_sessions(0, 0));
+        assert!(!layout.swap_sessions(0, 9));
     }
 
     #[test]

@@ -289,6 +289,36 @@ pub fn get_process_cwd(pid: i32) -> Option<String> {
         .and_then(|path| path.to_str().map(|s| s.to_string()))
 }
 
+/// Name of the process group currently owning the session's PTY, i.e. the
+/// command the user is waiting on. `None` while the shell itself is in the
+/// foreground, so a pane header can fall back to showing the shell prompt.
+///
+/// Read from `/proc/<shell>/stat` rather than `tcgetpgrp`: the shell's own
+/// entry names its controlling terminal's foreground group, so no PTY master
+/// fd has to be threaded through the UI layer.
+pub fn get_foreground_command(shell_pid: i32) -> Option<String> {
+    let foreground_pgid = read_tpgid(shell_pid)?;
+    if foreground_pgid <= 0 || foreground_pgid == shell_pid {
+        return None;
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", foreground_pgid)).ok()?;
+    let comm = comm.trim();
+    (!comm.is_empty()).then(|| comm.to_string())
+}
+
+fn read_tpgid(pid: i32) -> Option<i32> {
+    parse_tpgid(&std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?)
+}
+
+/// Field 8 (`tpgid`) of a `/proc/<pid>/stat` line. The `comm` field is
+/// parenthesized and may itself contain spaces and parens, so fields are
+/// counted from the last `)` rather than by splitting the whole line.
+fn parse_tpgid(stat: &str) -> Option<i32> {
+    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
+    // state, ppid, pgrp, session, tty_nr, tpgid
+    after_comm.split_whitespace().nth(5)?.parse().ok()
+}
+
 /// SessionManager - 管理所有终端会话
 pub struct SessionManager {
     sessions: Vec<Session>,
@@ -769,6 +799,14 @@ impl SessionManager {
         self.sessions.len()
     }
 
+    /// 用稳定 session ID 反查当前索引。跨帧保存的引用（拖拽、待确认粘贴）
+    /// 必须走这里：索引会因关闭/重排而漂移。
+    pub fn index_of(&self, session_id: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.metadata.session_id == session_id)
+    }
+
     /// 重排会话顺序（拖拽）
     pub fn reorder_sessions(&mut self, from_idx: usize, to_idx: usize) {
         if from_idx < self.sessions.len() && to_idx < self.sessions.len() && from_idx != to_idx {
@@ -953,13 +991,34 @@ fn refreshed_unseen_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        background_pump_order, refreshed_unseen_output, restored_or_fresh_session_id,
+        background_pump_order, parse_tpgid, refreshed_unseen_output, restored_or_fresh_session_id,
         retry_pending_input, user_input_is_blocked_by_mouse_edge, ProtocolResponseLimits,
         ProtocolResponseQueueError, ProtocolResponseSender,
     };
     use crate::shell::ShellWriteError;
     use std::collections::HashSet;
     use std::time::Duration;
+
+    #[test]
+    fn tpgid_survives_a_comm_containing_spaces_and_parens() {
+        // Real layout: pid (comm) state ppid pgrp session tty_nr tpgid ...
+        assert_eq!(
+            parse_tpgid("1234 (bash) S 1 1234 1234 34816 4321 4194304 0"),
+            Some(4321)
+        );
+        // A process may rename itself to anything, parens included.
+        assert_eq!(
+            parse_tpgid("1234 (weird (name) here) S 1 1234 1234 34816 4321 0"),
+            Some(4321)
+        );
+        // No foreground group on the terminal.
+        assert_eq!(
+            parse_tpgid("1234 (bash) S 1 1234 1234 0 -1 4194304"),
+            Some(-1)
+        );
+        assert_eq!(parse_tpgid("garbage without parens"), None);
+        assert_eq!(parse_tpgid("1234 (bash) S 1 1234"), None);
+    }
 
     fn tiny_protocol_limits() -> ProtocolResponseLimits {
         ProtocolResponseLimits {

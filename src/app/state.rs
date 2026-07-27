@@ -36,6 +36,20 @@ pub struct PendingPasteConfirm {
     pub submit_after_paste: bool,
 }
 
+/// A pane header press that may become a rearrange drag.
+///
+/// The source is tracked by stable session ID rather than index: a background
+/// session can exit mid-drag, which shifts every later index and would
+/// otherwise make the release swap two unrelated panes.
+pub struct PaneDrag {
+    pub session_id: String,
+    /// Where the press landed, for the movement threshold.
+    pub origin: egui::Pos2,
+    /// True once the pointer moved far enough to mean "rearrange" rather than
+    /// "focus this pane".
+    pub active: bool,
+}
+
 /// Show the confirmation dialog when the paste contains a newline (the most
 /// common foot-gun: pasting a multi-line block that runs commands without
 /// review) or when the paste is large enough that the user probably wants
@@ -169,6 +183,12 @@ pub struct TerminalApp {
 
     // Divider drag state
     pub dragging_divider: Option<layout::DividerId>,
+
+    /// Cached per-pane header status (title / cwd / running command).
+    pub pane_status_cache: crate::pane_header::PaneStatusCache,
+
+    /// In-flight header drag used to rearrange panes.
+    pub pane_drag: Option<PaneDrag>,
 
     // Help panel
     pub help_panel: help::HelpPanel,

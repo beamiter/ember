@@ -1890,6 +1890,20 @@ impl super::TerminalState {
             .and_then(|index| self.command_records.get(index))
     }
 
+    /// The command the shell reported as running via OSC 133, if any.
+    ///
+    /// Only the newest record can be running; an earlier one still marked
+    /// `Running` means its `D` was lost, and reporting it in a pane header
+    /// would pin a stale command there forever.
+    pub fn running_command(&self) -> Option<&str> {
+        self.command_records
+            .back()
+            .filter(|record| !record.complete && record.state == CommandState::Running)
+            .and_then(|record| record.command.as_deref())
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+    }
+
     /// True after B and before C. This is the safe state for placing a
     /// command into the shell editor without racing a running foreground job.
     pub fn shell_is_prompt_ready(&self) -> bool {

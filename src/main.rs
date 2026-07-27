@@ -15,6 +15,7 @@ mod keybindings;
 mod kitty_graphics;
 mod layout;
 mod link;
+mod pane_header;
 mod pty;
 mod search;
 mod search_replace;
@@ -1685,6 +1686,8 @@ impl TerminalApp {
             layout_manager,
             pane_renderers,
             dragging_divider: None,
+            pane_status_cache: pane_header::PaneStatusCache::new(),
+            pane_drag: None,
             help_panel: help::HelpPanel::new(),
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),

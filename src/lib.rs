@@ -12,6 +12,7 @@ pub mod keybindings;
 pub mod kitty_graphics;
 pub mod layout;
 pub mod link;
+pub mod pane_header;
 pub mod pty;
 pub mod search;
 pub mod search_replace;
