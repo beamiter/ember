@@ -76,7 +76,7 @@ impl super::TerminalState {
         // unusually early, copy only a bounded control prefix from the new
         // fragment so an oversized rejection can still echo the identifier and
         // honor q without retaining the oversized packet.
-        let limit = crate::kitty_graphics::MAX_KITTY_CONTROL_BYTES;
+        let limit = jterm_core::kitty_graphics::MAX_CONTROL_BYTES;
         let mut recovery =
             Vec::with_capacity(limit.min(payload.len().saturating_add(suffix.len())));
         recovery.extend_from_slice(&payload[..payload.len().min(limit)]);

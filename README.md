@@ -39,6 +39,17 @@ crop, z-order, deletion, cursor movement and ordinary main-screen scrollback.
 Malformed, oversized and unsupported requests receive bounded protocol errors
 instead of being accepted silently.
 
+The structural half of the protocol is shared with the other jterm terminals
+(`jterm_core::kitty_graphics`): control-data parsing, chunk reassembly across
+`m=1` continuations, base64 decoding, raw-format length checks and the
+pre-decode PNG header sniff, together with the memory caps those steps enforce
+(64 MiB encoded, 64 MiB decoded, 16384 px per side, 16 KiB of control data).
+Chunked uploads are keyed per image id with a separate anonymous slot, so an
+upload for `i=1` is no longer destroyed by an unrelated single-shot transfer
+for `i=2`. The image store, placements, deletion, the PNG decoder and the
+protocol responder stay in jterm2, because a reply's dimensions and error text
+come from whichever decoder produced them.
+
 The following advanced parts of the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
 are not currently implemented: file/temporary-file/shared-memory media, zlib,

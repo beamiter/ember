@@ -1,33 +1,40 @@
-use base64::Engine;
+//! Kitty graphics protocol for jterm2.
+//!
+//! The *structural* half of the protocol — control-data parsing, chunk
+//! assembly across `m=1` continuations, base64 decoding, raw-format length
+//! validation and the pre-decode PNG sniff — lives in
+//! [`jterm_core::kitty_graphics`] and is shared with the other jterm
+//! terminals. This module owns everything that needs a decoded image or a
+//! reply on the wire: the image store and its LRU, placements and their
+//! screen/scrollback lifecycle, deletion, the process-global revision counter,
+//! the PNG decode (`image` crate, with its own `Limits`) and the protocol
+//! responder with its `q=`/`i=`/`I=`/`p=` rules.
+//!
+//! The responder is deliberately *not* hoisted: its replies take the image
+//! dimensions and the error text from whichever decoder produced them, so it
+//! has to sit next to the decoder.
+
+use jterm_core::kitty_graphics as kitty;
+use kitty::{Action, Assembled, Assembler, Caps, Command, Format, Step};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_KITTY_IMAGES: usize = 100;
 const MAX_KITTY_CACHE_MB: u64 = 256;
 const MAX_KITTY_PLACEMENTS: usize = 4096;
-const MAX_KITTY_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_KITTY_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_PENDING_RESPONSE_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_KITTY_CONTROL_BYTES: usize = 16 * 1024;
+/// jterm2 keeps a live screen image store, so a single image may legitimately
+/// cover a whole window: the shared `SCREEN` budget is jterm2's historical
+/// 64 MiB / 16384 px limits.
+const CAPS: Caps = Caps::SCREEN;
 static NEXT_IMAGE_REVISION: AtomicU64 = AtomicU64::new(1);
 
-/// 图像格式
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageFormat {
-    Png,
-    Rgb,
-    Rgba,
-}
-
-impl ImageFormat {
-    fn from_control(value: &str) -> Option<Self> {
-        match value {
-            "24" => Some(Self::Rgb),
-            "32" => Some(Self::Rgba),
-            "100" => Some(Self::Png),
-            _ => None,
-        }
-    }
+/// Render a structural failure from [`jterm_core::kitty_graphics`] as this
+/// module's error text. The responder classifies its own messages by
+/// substring, and none of these contain an `ENOENT`/`ENOSPC` marker, so every
+/// structural rejection is answered with `EINVAL` exactly as before.
+fn describe(error: kitty::Error) -> String {
+    error.to_string()
 }
 
 /// Kitty 图像
@@ -93,87 +100,52 @@ impl KittyPlacement {
     }
 }
 
-/// Kitty 图像协议参数
-#[derive(Debug, Clone)]
+/// The parts of a graphics command this module owns.
+///
+/// [`jterm_core::kitty_graphics::Command`] models the structural controls
+/// (`a`, `f`, `t`, `i`, `I`, `p`, `s`, `v`, `m`, `q`). What is left is the
+/// placement geometry and the delete selector — controls that only mean
+/// something to an app that actually draws — plus the identity the responder
+/// echoes back. Those are read out of the core command through
+/// `Command::get`/`u32_value`/`i32_value`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KittyGraphicsParams {
-    pub action: Option<String>,    // a: t=transfer, d=delete, p=place, q=query
-    pub image_id: Option<u32>,     // i
-    pub image_number: Option<u32>, // I
-    pub placement_id: Option<u32>, // p
-    pub delete: Option<char>,      // d: delete selector (case controls data lifetime)
-    pub format: Option<ImageFormat>, // f: 24=RGB, 32=RGBA, 100=PNG
-    pub transmission_medium: Option<char>, // t: d=direct (the only supported medium)
-    pub width: Option<u32>,        // s
-    pub height: Option<u32>,       // v
-    pub x: Option<u32>,            // x: source-image crop offset (not screen position)
-    pub y: Option<u32>,            // y: source-image crop offset (not screen position)
-    pub crop_width: Option<u32>,   // w: source crop width in pixels
-    pub crop_height: Option<u32>,  // h: source crop height in pixels
-    pub cell_x_offset: Option<u32>, // X: horizontal pixel offset in first cell
-    pub cell_y_offset: Option<u32>, // Y: vertical pixel offset in first cell
+    pub image_id: Option<u32>,        // i
+    pub image_number: Option<u32>,    // I
+    pub placement_id: Option<u32>,    // p
+    pub delete: Option<char>,         // d: delete selector (case controls data lifetime)
+    pub x: Option<u32>,               // x: source-image crop offset (not screen position)
+    pub y: Option<u32>,               // y: source-image crop offset (not screen position)
+    pub crop_width: Option<u32>,      // w: source crop width in pixels
+    pub crop_height: Option<u32>,     // h: source crop height in pixels
+    pub cell_x_offset: Option<u32>,   // X: horizontal pixel offset in first cell
+    pub cell_y_offset: Option<u32>,   // Y: vertical pixel offset in first cell
     pub display_columns: Option<u32>, // c: displayed width in terminal cells
-    pub display_rows: Option<u32>, // r: displayed height in terminal cells
-    pub cursor_policy: Option<u32>, // C: 1 keeps the cursor in place
-    pub z: Option<i32>,            // z: z-order
-    pub more: bool,                // m: 1=more data, 0=last
-    pub data: Option<String>,      // base64 encoded data
-    more_specified: bool,
+    pub display_rows: Option<u32>,    // r: displayed height in terminal cells
+    pub cursor_policy: Option<u32>,   // C: 1 keeps the cursor in place
+    pub z: Option<i32>,               // z: z-order
     quiet: Option<u8>,
-    has_first_chunk_metadata: bool,
     resolved_storage_id: Option<u32>,
 }
-
-impl Default for KittyGraphicsParams {
-    fn default() -> Self {
-        Self {
-            action: Some("t".to_string()),
-            image_id: None,
-            image_number: None,
-            placement_id: None,
-            delete: None,
-            format: None,
-            transmission_medium: None,
-            width: None,
-            height: None,
-            x: None,
-            y: None,
-            crop_width: None,
-            crop_height: None,
-            cell_x_offset: None,
-            cell_y_offset: None,
-            display_columns: None,
-            display_rows: None,
-            cursor_policy: None,
-            z: None,
-            more: false,
-            data: None,
-            more_specified: false,
-            quiet: None,
-            has_first_chunk_metadata: false,
-            resolved_storage_id: None,
-        }
-    }
-}
-
-/// 待传输的图像数据
-struct PendingTransfer {
-    metadata: KittyGraphicsParams,
-    data: Vec<u8>,
-}
-
-/// Hard cap on bytes buffered while waiting for a Kitty graphics
-/// chunked-transfer terminator (`m=0`). Without this a peer that keeps
-/// sending `m=1` chunks but never closes the transfer would grow
-/// `pending_transfer` without bound; the per-image `MAX_KITTY_CACHE_MB`
-/// only kicks in after the transfer completes.
-const MAX_PENDING_TRANSFER_BYTES: usize = MAX_KITTY_IMAGE_BYTES;
 
 /// Kitty 图像协议状态管理
 pub struct KittyGraphicsState {
     images: HashMap<u32, KittyImage>,
     placements: Vec<KittyPlacement>,
     hidden_screen_placements: Vec<KittyPlacement>,
-    pending_transfer: Option<PendingTransfer>,
+    /// Chunk assembly, base64 and every structural cap, shared with the other
+    /// jterm terminals.
+    assembler: Assembler,
+    /// The app-owned half of the first chunk of the transfer the assembler is
+    /// currently assembling. The final chunk of a chunked transfer carries no
+    /// metadata at all, so `a=T` placement geometry has to be held here for
+    /// the life of the transfer; the responder also falls back to this
+    /// identity when a continuation chunk is rejected.
+    ///
+    /// The assembler keys in-flight transfers per image id plus one anonymous
+    /// slot, but an id-less continuation always lands in the most recently
+    /// started chunked transfer, so a single slot mirrors it exactly.
+    current_transfer: Option<KittyGraphicsParams>,
     total_bytes_processed: u64,
     total_image_memory: u64,
     access_order: std::collections::VecDeque<u32>,
@@ -194,7 +166,8 @@ impl KittyGraphicsState {
             images: HashMap::new(),
             placements: Vec::new(),
             hidden_screen_placements: Vec::new(),
-            pending_transfer: None,
+            assembler: Assembler::new(CAPS),
+            current_transfer: None,
             total_bytes_processed: 0,
             total_image_memory: 0,
             access_order: std::collections::VecDeque::new(),
@@ -348,76 +321,133 @@ impl KittyGraphicsState {
     ) -> Result<(), String> {
         self.response_image_id = None;
         self.pending_cursor_movement = None;
+        let bytes = payload.as_bytes();
         let recovered_response = Self::recover_response_controls(payload);
-        let params = match Self::parse_params(payload) {
-            Ok(params) => params,
+
+        // Read the controls `jterm_core` does not model. The assembler parses
+        // the structural half again for itself; both passes borrow `payload`
+        // and allocate nothing, and both reject exactly the same commands.
+        let command = match kitty::parse_command(bytes, &CAPS) {
+            Ok(command) => command,
+            // Rejecting drops every in-flight transfer, which is what the
+            // assembler would have done with an unparseable packet too.
             Err(error) => {
-                // A malformed command cannot safely continue an in-flight
-                // transfer because its m flag/payload boundary is unknown.
-                let mut response_params = if recovered_response.image_id.is_some()
-                    || recovered_response.image_number.is_some()
-                {
-                    recovered_response
+                return Err(self.reject_with_identity(recovered_response, describe(error)))
+            }
+        };
+        let params = match Self::app_params(&command) {
+            Ok(params) => params,
+            Err(error) => return Err(self.reject_with_identity(recovered_response, error)),
+        };
+
+        // The assembler owns chunk assembly, base64 and every structural cap.
+        // It aborts the transfer a rejected packet could have continued, so
+        // its error already leaves the structural state consistent.
+        let step = match self.assembler.feed(bytes) {
+            Ok(step) => step,
+            Err(error) => {
+                return Err(self.reject_with_identity(recovered_response, describe(error)))
+            }
+        };
+
+        let (mut response_params, result) = match step {
+            // Unreachable: `parse_command` already rejected a payload that is
+            // not a graphics command.
+            Step::NotOurs => {
+                let error = "Kitty graphics command is missing its G prefix".to_string();
+                return Err(self.reject_with_identity(recovered_response, error));
+            }
+            // A buffered chunk is acknowledged only once its transfer
+            // completes, so there is nothing to answer yet. The protocol sends
+            // metadata on the first chunk only, so the app-owned controls have
+            // to be held until the last chunk arrives.
+            Step::NeedMore => {
+                match (self.current_transfer.as_mut(), command.is_continuation()) {
+                    (Some(pending), true) if command.get("q").is_some() => {
+                        pending.quiet = Some(command.quiet);
+                    }
+                    (_, false) => self.current_transfer = Some(params),
+                    _ => {}
+                }
+                return Ok(());
+            }
+            Step::Ready(assembled) => {
+                let params = if command.is_continuation() {
+                    self.current_transfer.take().unwrap_or(params)
                 } else {
-                    self.pending_transfer
-                        .as_ref()
-                        .map(|pending| pending.metadata.clone())
-                        .unwrap_or(recovered_response)
+                    params
                 };
-                if response_params.quiet.is_none() {
-                    response_params.quiet = self
-                        .pending_transfer
-                        .as_ref()
-                        .and_then(|pending| pending.metadata.quiet);
+                let response_params = KittyGraphicsParams {
+                    image_id: assembled.id,
+                    image_number: assembled.number,
+                    placement_id: assembled.placement,
+                    quiet: Some(assembled.quiet),
+                    ..KittyGraphicsParams::default()
+                };
+                let result = self.finish_transfer(params, assembled, cursor_col, cursor_row);
+                (response_params, result)
+            }
+            Step::Other { interrupted, .. } => {
+                self.current_transfer = None;
+                // A delete aborts an incomplete upload and then still executes.
+                // Every other action is a protocol error until the chunk chain
+                // is complete.
+                if interrupted && command.action != Action::Delete {
+                    let error = "Kitty chunked transfer interrupted by another action".to_string();
+                    self.queue_command_response(&params, Some(&error));
+                    return Err(error);
                 }
-                self.pending_transfer = None;
-                self.queue_command_response(&response_params, Some(&error));
-                return Err(error);
+                match command.action {
+                    Action::Placement => {
+                        let result = self.handle_placement(params.clone(), cursor_col, cursor_row);
+                        (params, result)
+                    }
+                    Action::Delete => {
+                        let result = self.handle_delete(params.clone(), cursor_col, cursor_row);
+                        (params, result)
+                    }
+                    // The query responder is self-contained: it answers with
+                    // the identifier the client used whether the probe
+                    // succeeded or not.
+                    Action::Query => return self.handle_query(params, &command),
+                    _ => (params, Err("Unknown action".to_string())),
+                }
             }
         };
 
-        let mut response_params = params.clone();
-        if params.action.as_deref() == Some("t") {
-            if let Some(pending) = &self.pending_transfer {
-                response_params = pending.metadata.clone();
-                if params.quiet.is_some() {
-                    response_params.quiet = params.quiet;
-                }
-            }
+        if response_params.image_id.is_none() {
+            response_params.image_id = self.response_image_id;
         }
-
-        if self.pending_transfer.is_some() && params.action.as_deref() != Some("t") {
-            self.pending_transfer = None;
-            // Delete commands abort an incomplete upload, then still execute
-            // the requested deletion. Other graphics actions are protocol
-            // errors until the chunk chain is complete.
-            if params.action.as_deref() != Some("d") {
-                let error = "Kitty chunked transfer interrupted by another action".to_string();
-                self.queue_command_response(&response_params, Some(&error));
-                return Err(error);
-            }
-        }
-
-        let action = params.action.clone();
-        let defer_success_response = matches!(action.as_deref(), Some("t" | "T")) && params.more;
-        let is_query = action.as_deref() == Some("q");
-        let result = match action.as_deref() {
-            Some("t" | "T") => self.handle_transfer(params, cursor_col, cursor_row),
-            Some("p") => self.handle_placement(params, cursor_col, cursor_row),
-            Some("d") => self.handle_delete(params, cursor_col, cursor_row),
-            Some("q") => self.handle_query(params),
-            _ => Err("Unknown action".to_string()),
-        };
-        if !is_query && (result.is_err() || !defer_success_response) {
-            if response_params.image_id.is_none() {
-                response_params.image_id = self.response_image_id;
-            }
-            self.queue_command_response(
-                &response_params,
-                result.as_ref().err().map(String::as_str),
-            );
-        }
+        self.queue_command_response(&response_params, result.as_ref().err().map(String::as_str));
         result
+    }
+
+    /// Answer a rejected command with whichever identifier could be recovered
+    /// from it, falling back to the in-flight transfer's. A malformed command
+    /// cannot safely continue any transfer, because its `m=` flag and payload
+    /// boundary are unknown and the byte stream is no longer trusted to be
+    /// aligned.
+    fn reject_with_identity(&mut self, recovered: KittyGraphicsParams, error: String) -> String {
+        let mut response_params =
+            if recovered.image_id.is_some() || recovered.image_number.is_some() {
+                recovered
+            } else {
+                self.current_transfer.clone().unwrap_or(recovered)
+            };
+        if response_params.quiet.is_none() {
+            response_params.quiet = self
+                .current_transfer
+                .as_ref()
+                .and_then(|params| params.quiet);
+        }
+        self.abort_transfers();
+        self.queue_command_response(&response_params, Some(&error));
+        error
+    }
+
+    fn abort_transfers(&mut self) {
+        self.assembler.reset();
+        self.current_transfer = None;
     }
 
     /// Reject an APC that could not reach the UTF-8/control parser (for
@@ -430,16 +460,16 @@ impl KittyGraphicsState {
         self.pending_cursor_movement = None;
         let mut response_params = Self::recover_response_controls_bytes(payload);
         if response_params.image_id.is_none() && response_params.image_number.is_none() {
-            if let Some(pending) = &self.pending_transfer {
-                response_params = pending.metadata.clone();
+            if let Some(pending) = &self.current_transfer {
+                response_params = pending.clone();
             }
         } else if response_params.quiet.is_none() {
             response_params.quiet = self
-                .pending_transfer
+                .current_transfer
                 .as_ref()
-                .and_then(|pending| pending.metadata.quiet);
+                .and_then(|pending| pending.quiet);
         }
-        self.pending_transfer = None;
+        self.abort_transfers();
         self.queue_command_response(&response_params, Some(error));
     }
 
@@ -503,7 +533,7 @@ impl KittyGraphicsState {
         let control = payload
             .split_once(';')
             .map_or(payload, |(control, _)| control);
-        let mut end = control.len().min(MAX_KITTY_CONTROL_BYTES);
+        let mut end = control.len().min(kitty::MAX_CONTROL_BYTES);
         while !control.is_char_boundary(end) {
             end = end.saturating_sub(1);
         }
@@ -514,9 +544,9 @@ impl KittyGraphicsState {
         let payload = payload.strip_prefix(b"G").unwrap_or(payload);
         let end = payload
             .iter()
-            .take(MAX_KITTY_CONTROL_BYTES)
+            .take(kitty::MAX_CONTROL_BYTES)
             .position(|byte| *byte == b';')
-            .unwrap_or_else(|| payload.len().min(MAX_KITTY_CONTROL_BYTES));
+            .unwrap_or_else(|| payload.len().min(kitty::MAX_CONTROL_BYTES));
         std::str::from_utf8(&payload[..end]).map_or_else(
             |_| KittyGraphicsParams::default(),
             Self::recover_response_controls_from_str,
@@ -540,286 +570,90 @@ impl KittyGraphicsState {
         params
     }
 
-    fn parse_params(payload: &str) -> Result<KittyGraphicsParams, String> {
-        let mut params = KittyGraphicsParams::default();
-        let payload = payload.strip_prefix('G').unwrap_or(payload);
-        let (control, data) = match payload.split_once(';') {
-            Some((control, data)) => (control, Some(data)),
-            None => (payload, None),
+    /// Read the controls `jterm_core` does not model out of a parsed command.
+    ///
+    /// The structural half (`a`, `f`, `t`, `i`, `I`, `p`, `s`, `v`, `m`, `q`,
+    /// plus the explicitly unsupported `U`/`P`/`Q`/`H`/`V`/`o`/`S`/`O`) has
+    /// already been validated by [`jterm_core::kitty_graphics::parse_command`]
+    /// by the time this runs.
+    fn app_params(command: &Command<'_>) -> Result<KittyGraphicsParams, String> {
+        let mut params = KittyGraphicsParams {
+            image_id: command.id,
+            image_number: command.number,
+            placement_id: command.placement,
+            x: Self::u32_control(command, "x")?,
+            y: Self::u32_control(command, "y")?,
+            crop_width: Self::u32_control(command, "w")?,
+            crop_height: Self::u32_control(command, "h")?,
+            cell_x_offset: Self::u32_control(command, "X")?,
+            cell_y_offset: Self::u32_control(command, "Y")?,
+            display_columns: Self::u32_control(command, "c")?,
+            display_rows: Self::u32_control(command, "r")?,
+            cursor_policy: Self::u32_control(command, "C")?,
+            z: Self::i32_control(command, "z")?,
+            quiet: command.get("q").map(|_| command.quiet),
+            ..KittyGraphicsParams::default()
         };
-        if control.len() > MAX_KITTY_CONTROL_BYTES {
-            return Err(format!(
-                "Kitty control data exceeded the {} byte limit",
-                MAX_KITTY_CONTROL_BYTES
-            ));
-        }
-        params.data = data.map(str::to_owned);
 
-        for pair in control.split(',') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (key, value) = pair
-                .split_once('=')
-                .ok_or_else(|| format!("Malformed Kitty control pair: {pair}"))?;
-
-            match key {
-                "a" => {
-                    if !matches!(value, "t" | "T" | "p" | "q" | "d") {
-                        return Err(format!("Unsupported Kitty action: {value}"));
-                    }
-                    params.action = Some(value.to_string());
-                    params.has_first_chunk_metadata = true;
-                }
-                "i" => {
-                    params.image_id = Some(Self::parse_u32_control("i", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "I" => {
-                    params.image_number = Some(Self::parse_u32_control("I", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "p" => {
-                    params.placement_id = Some(Self::parse_u32_control("p", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "d" => {
-                    let mut chars = value.chars();
-                    let selector = chars
-                        .next()
-                        .filter(|_| chars.next().is_none())
-                        .ok_or_else(|| format!("Invalid Kitty delete selector: {value}"))?;
-                    if !matches!(
-                        selector,
-                        'a' | 'A'
-                            | 'i'
-                            | 'I'
-                            | 'n'
-                            | 'N'
-                            | 'c'
-                            | 'C'
-                            | 'f'
-                            | 'F'
-                            | 'p'
-                            | 'P'
-                            | 'q'
-                            | 'Q'
-                            | 'r'
-                            | 'R'
-                            | 'x'
-                            | 'X'
-                            | 'y'
-                            | 'Y'
-                            | 'z'
-                            | 'Z'
-                    ) {
-                        return Err(format!("Unsupported Kitty delete selector: {value}"));
-                    }
-                    params.delete = Some(selector);
-                    params.has_first_chunk_metadata = true;
-                }
-                "f" => {
-                    params.format = Some(
-                        ImageFormat::from_control(value)
-                            .ok_or_else(|| format!("Unsupported Kitty image format: {value}"))?,
-                    );
-                    params.has_first_chunk_metadata = true;
-                }
-                "t" => {
-                    let mut chars = value.chars();
-                    let medium = chars
-                        .next()
-                        .filter(|_| chars.next().is_none())
-                        .ok_or_else(|| format!("Invalid Kitty transmission medium: {value}"))?;
-                    params.transmission_medium = Some(medium);
-                    params.has_first_chunk_metadata = true;
-                }
-                "s" => {
-                    params.width = Some(Self::parse_u32_control("s", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "v" => {
-                    params.height = Some(Self::parse_u32_control("v", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "x" => {
-                    params.x = Some(Self::parse_u32_control("x", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "y" => {
-                    params.y = Some(Self::parse_u32_control("y", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "w" => {
-                    params.crop_width = Some(Self::parse_u32_control("w", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "h" => {
-                    params.crop_height = Some(Self::parse_u32_control("h", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "X" => {
-                    params.cell_x_offset = Some(Self::parse_u32_control("X", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "Y" => {
-                    params.cell_y_offset = Some(Self::parse_u32_control("Y", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "c" => {
-                    params.display_columns = Some(Self::parse_u32_control("c", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "r" => {
-                    params.display_rows = Some(Self::parse_u32_control("r", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "C" => {
-                    let policy = Self::parse_u32_control("C", value)?;
-                    if policy > 1 {
-                        return Err(format!("Invalid Kitty cursor policy: {value}"));
-                    }
-                    params.cursor_policy = Some(policy);
-                    params.has_first_chunk_metadata = true;
-                }
-                "z" => {
-                    params.z = Some(Self::parse_i32_control("z", value)?);
-                    params.has_first_chunk_metadata = true;
-                }
-                "m" => {
-                    params.more = match value {
-                        "0" => false,
-                        "1" => true,
-                        _ => return Err(format!("Invalid Kitty chunk flag: {value}")),
-                    };
-                    params.more_specified = true;
-                }
-                "q" => {
-                    let quiet = Self::parse_u32_control("q", value)?;
-                    if quiet > 2 {
-                        return Err(format!("Invalid Kitty quiet flag: {value}"));
-                    }
-                    params.quiet = Some(quiet as u8);
-                }
-                "U" | "P" | "Q" | "H" | "V" => {
-                    return Err(format!(
-                        "Unsupported Kitty placement control: {key}={value}"
-                    ));
-                }
-                "o" => {
-                    return Err(format!(
-                        "Kitty data compression is not supported: o={value}"
-                    ));
-                }
-                "S" | "O" => {
-                    return Err(format!(
-                        "Unsupported Kitty external-data control: {key}={value}"
-                    ));
-                }
-                _ => {
-                    // Ignore forward-compatible control keys on the first
-                    // chunk, but remember that this is not a legal m/q-only
-                    // continuation command.
-                    params.has_first_chunk_metadata = true;
-                }
+        if let Some(policy) = params.cursor_policy {
+            if policy > 1 {
+                return Err(format!("Invalid Kitty cursor policy: {policy}"));
             }
         }
-
+        if let Some(value) = command.get("d") {
+            let mut chars = value.chars();
+            let selector = chars
+                .next()
+                .filter(|_| chars.next().is_none())
+                .ok_or_else(|| format!("Invalid Kitty delete selector: {value}"))?;
+            if !matches!(
+                selector,
+                'a' | 'A'
+                    | 'i'
+                    | 'I'
+                    | 'n'
+                    | 'N'
+                    | 'c'
+                    | 'C'
+                    | 'f'
+                    | 'F'
+                    | 'p'
+                    | 'P'
+                    | 'q'
+                    | 'Q'
+                    | 'r'
+                    | 'R'
+                    | 'x'
+                    | 'X'
+                    | 'y'
+                    | 'Y'
+                    | 'z'
+                    | 'Z'
+            ) {
+                return Err(format!("Unsupported Kitty delete selector: {value}"));
+            }
+            params.delete = Some(selector);
+        }
         Ok(params)
     }
 
-    fn parse_u32_control(key: &str, value: &str) -> Result<u32, String> {
-        value
-            .parse::<u32>()
-            .map_err(|_| format!("Invalid Kitty {key} value: {value}"))
+    fn u32_control(command: &Command<'_>, key: &str) -> Result<Option<u32>, String> {
+        command
+            .u32_value(key)
+            .map_err(|_| Self::control_error(command, key))
     }
 
-    fn parse_i32_control(key: &str, value: &str) -> Result<i32, String> {
-        value
-            .parse::<i32>()
-            .map_err(|_| format!("Invalid Kitty {key} value: {value}"))
+    fn i32_control(command: &Command<'_>, key: &str) -> Result<Option<i32>, String> {
+        command
+            .i32_value(key)
+            .map_err(|_| Self::control_error(command, key))
     }
 
-    /// 处理传输操作 (a=t)
-    fn handle_transfer(
-        &mut self,
-        mut params: KittyGraphicsParams,
-        cursor_col: u32,
-        cursor_row: u32,
-    ) -> Result<(), String> {
-        if self.pending_transfer.is_some() {
-            if !params.more_specified || params.has_first_chunk_metadata {
-                self.pending_transfer = None;
-                return Err(
-                    "Kitty continuation chunks may contain only m and optional q controls"
-                        .to_string(),
-                );
-            }
-
-            let remaining = MAX_PENDING_TRANSFER_BYTES
-                .saturating_sub(self.pending_transfer.as_ref().map_or(0, |p| p.data.len()));
-            let chunk = match Self::decode_base64_payload(
-                params.data.as_deref().unwrap_or_default(),
-                remaining,
-            ) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    self.pending_transfer = None;
-                    return Err(error);
-                }
-            };
-
-            let pending = self
-                .pending_transfer
-                .as_mut()
-                .ok_or("Missing pending Kitty transfer")?;
-            pending.data.extend_from_slice(&chunk);
-            if params.more {
-                return Ok(());
-            }
-
-            let pending = self
-                .pending_transfer
-                .take()
-                .ok_or("Missing pending Kitty transfer")?;
-            return self.finish_transfer(pending.metadata, pending.data, cursor_col, cursor_row);
-        }
-
-        Self::validate_transfer_metadata(&params)?;
-        let encoded = params.data.take().ok_or("No image data provided")?;
-        let data = Self::decode_base64_payload(&encoded, MAX_PENDING_TRANSFER_BYTES)?;
-
-        if params.more {
-            params.more = false;
-            params.more_specified = false;
-            params.data = None;
-            self.pending_transfer = Some(PendingTransfer {
-                metadata: params,
-                data,
-            });
-            return Ok(());
-        }
-
-        self.finish_transfer(params, data, cursor_col, cursor_row)
-    }
-
-    fn validate_transfer_metadata(params: &KittyGraphicsParams) -> Result<(), String> {
-        if params.transmission_medium.unwrap_or('d') != 'd' {
-            return Err("Only direct Kitty image transmission (t=d) is supported".to_string());
-        }
-        if params.image_id.is_some() && params.image_number.is_some() {
-            return Err("Kitty commands cannot specify both i and I".to_string());
-        }
-
-        match params.format.unwrap_or(ImageFormat::Rgba) {
-            ImageFormat::Rgb | ImageFormat::Rgba => {
-                let width = params.width.ok_or("Missing width for raw image format")?;
-                let height = params.height.ok_or("Missing height for raw image format")?;
-                Self::validate_decoded_size(width, height)?;
-            }
-            ImageFormat::Png => {}
-        }
-        Ok(())
+    fn control_error(command: &Command<'_>, key: &str) -> String {
+        format!(
+            "Invalid Kitty {key} value: {}",
+            command.get(key).unwrap_or_default()
+        )
     }
 
     fn allocate_generated_image_id(&mut self) -> Result<u32, String> {
@@ -860,10 +694,9 @@ impl KittyGraphicsState {
         })
     }
 
+    /// `i=` and `I=` are mutually exclusive; the core parser rejects a command
+    /// that carries both, so only one branch below can ever be taken.
     fn resolve_image_reference(&self, params: &KittyGraphicsParams) -> Result<u32, String> {
-        if params.image_id.is_some() && params.image_number.is_some() {
-            return Err("Kitty commands cannot specify both i and I".to_string());
-        }
         if let Some(image_id) = params.image_id {
             if image_id == 0 {
                 return Err("Anonymous Kitty images cannot be referenced by i=0".to_string());
@@ -935,98 +768,39 @@ impl KittyGraphicsState {
         }
     }
 
-    fn decode_base64_payload(encoded: &str, max_decoded: usize) -> Result<Vec<u8>, String> {
-        let max_encoded = max_decoded.saturating_add(2) / 3 * 4;
-        if encoded.len() > max_encoded {
-            return Err(format!(
-                "Pending Kitty transfer exceeded {} MiB; dropping",
-                MAX_PENDING_TRANSFER_BYTES / 1024 / 1024
-            ));
-        }
-
-        let standard = base64::engine::general_purpose::STANDARD;
-        let data = standard.decode(encoded).or_else(|standard_error| {
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(encoded)
-                .map_err(|_| standard_error)
-        });
-        let data = data.map_err(|error| format!("Base64 decode error: {error}"))?;
-        if data.len() > max_decoded {
-            return Err(format!(
-                "Pending Kitty transfer exceeded {} MiB; dropping",
-                MAX_PENDING_TRANSFER_BYTES / 1024 / 1024
-            ));
-        }
-        Ok(data)
-    }
-
     fn finish_transfer(
         &mut self,
         params: KittyGraphicsParams,
-        mut final_data: Vec<u8>,
+        assembled: Assembled,
         cursor_col: u32,
         cursor_row: u32,
     ) -> Result<(), String> {
-        Self::validate_transfer_metadata(&params)?;
+        // Direct-only transmission, i/I exclusivity and the raw geometry were
+        // all checked by the assembler before a byte was decoded.
+        let format = assembled.format;
+        let display = assembled.display;
+        let placement_id = assembled.placement;
         // Image numbers get a terminal-assigned protocol id. Anonymous images
         // use a private storage id while remaining i=0 on the wire, allowing
         // multiple anonymous a=T commands to coexist safely.
-        let (protocol_id, image_number, image_id) = if let Some(number) = params.image_number {
+        let (protocol_id, image_number, image_id) = if let Some(number) = assembled.number {
             let generated = self.allocate_generated_image_id()?;
             self.response_image_id = Some(generated);
             (generated, Some(number), generated)
-        } else if let Some(protocol_id) = params.image_id.filter(|id| *id != 0) {
+        } else if let Some(protocol_id) = assembled.id.filter(|id| *id != 0) {
             self.relocate_anonymous_storage_collision(protocol_id)?;
             (protocol_id, None, protocol_id)
         } else {
             (0, None, self.allocate_generated_image_id()?)
         };
-        let format = params.format.unwrap_or(ImageFormat::Rgba);
 
-        // Normalize all supported wire formats to RGBA for the renderer.
-        let (width, height) = match format {
-            ImageFormat::Png => {
-                let (decoded_data, width, height) = self.decode_png(final_data)?;
-                final_data = decoded_data;
-                (width, height)
-            }
-            ImageFormat::Rgb => {
-                let width = params.width.ok_or("Missing width for raw image format")?;
-                let height = params.height.ok_or("Missing height for raw image format")?;
-                let pixels = Self::validate_decoded_size(width, height)?;
-                let expected = pixels.checked_mul(3).ok_or("Image dimensions overflow")?;
-                if final_data.len() != expected {
-                    return Err(format!(
-                        "RGB data has {} bytes, expected {} for {}x{}",
-                        final_data.len(),
-                        expected,
-                        width,
-                        height
-                    ));
-                }
-                let mut rgba = Vec::with_capacity(pixels * 4);
-                for chunk in final_data.chunks_exact(3) {
-                    rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
-                }
-                final_data = rgba;
-                (width, height)
-            }
-            ImageFormat::Rgba => {
-                let width = params.width.ok_or("Missing width for raw image format")?;
-                let height = params.height.ok_or("Missing height for raw image format")?;
-                let pixels = Self::validate_decoded_size(width, height)?;
-                let expected = pixels.checked_mul(4).ok_or("Image dimensions overflow")?;
-                if final_data.len() != expected {
-                    return Err(format!(
-                        "RGBA data has {} bytes, expected {} for {}x{}",
-                        final_data.len(),
-                        expected,
-                        width,
-                        height
-                    ));
-                }
-                (width, height)
-            }
+        // Normalize all supported wire formats to RGBA for the renderer. The
+        // raw formats need no decoder: the assembler already checked that the
+        // payload is exactly s*v*channels bytes.
+        let (final_data, width, height) = if format == Format::Png {
+            self.decode_png(assembled.bytes)?
+        } else {
+            assembled.into_rgba8().map_err(describe)?
         };
 
         let data_size = final_data.len() as u64;
@@ -1061,10 +835,11 @@ impl KittyGraphicsState {
         );
         self.enforce_image_limits();
 
-        if params.action.as_deref() == Some("T") {
+        if display {
             let mut placement_params = params;
             placement_params.image_id = Some(protocol_id);
             placement_params.image_number = None;
+            placement_params.placement_id = placement_id;
             placement_params.resolved_storage_id = Some(image_id);
             self.handle_placement(placement_params, cursor_col, cursor_row)?;
         }
@@ -1082,20 +857,18 @@ impl KittyGraphicsState {
     }
 
     /// Decode f=100 strictly as PNG and return normalized RGBA pixels.
+    ///
+    /// The payload's signature and IHDR have already been sniffed against
+    /// [`CAPS`] by the assembler, so a hundred-byte packet can no longer make
+    /// the decoder reserve a gigapixel canvas. The post-decode check stays
+    /// here because only the decoder knows what the file really contained.
     fn decode_png(&self, data: Vec<u8>) -> Result<(Vec<u8>, u32, u32), String> {
-        if data.len() > MAX_KITTY_IMAGE_BYTES {
-            return Err(format!(
-                "Compressed image exceeds {} MiB",
-                MAX_KITTY_IMAGE_BYTES / 1024 / 1024
-            ));
-        }
-
         let mut reader =
             image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Png);
         let mut limits = image::Limits::default();
-        limits.max_image_width = Some(MAX_KITTY_IMAGE_DIMENSION);
-        limits.max_image_height = Some(MAX_KITTY_IMAGE_DIMENSION);
-        limits.max_alloc = Some(MAX_KITTY_IMAGE_BYTES as u64);
+        limits.max_image_width = Some(CAPS.max_dimension);
+        limits.max_image_height = Some(CAPS.max_dimension);
+        limits.max_alloc = Some(CAPS.max_decoded_bytes as u64);
         reader.limits(limits);
         let img = reader
             .decode()
@@ -1103,7 +876,7 @@ impl KittyGraphicsState {
 
         let width = img.width();
         let height = img.height();
-        Self::validate_decoded_size(width, height)?;
+        kitty::raw_layout(width, height, Format::Png, &CAPS).map_err(describe)?;
         let rgba_image = img.to_rgba8();
 
         log::debug!(
@@ -1114,30 +887,6 @@ impl KittyGraphicsState {
         );
 
         Ok((rgba_image.into_raw(), width, height))
-    }
-
-    fn validate_decoded_size(width: u32, height: u32) -> Result<usize, String> {
-        if width == 0
-            || height == 0
-            || width > MAX_KITTY_IMAGE_DIMENSION
-            || height > MAX_KITTY_IMAGE_DIMENSION
-        {
-            return Err(format!(
-                "Image dimensions {}x{} exceed the supported limit",
-                width, height
-            ));
-        }
-        let pixels = (width as usize)
-            .checked_mul(height as usize)
-            .ok_or("Image dimensions overflow")?;
-        let decoded_bytes = pixels.checked_mul(4).ok_or("Image dimensions overflow")?;
-        if decoded_bytes > MAX_KITTY_IMAGE_BYTES {
-            return Err(format!(
-                "Decoded image would use {} bytes (limit {})",
-                decoded_bytes, MAX_KITTY_IMAGE_BYTES
-            ));
-        }
-        Ok(pixels)
     }
 
     /// 处理放置操作 (a=p)
@@ -1494,52 +1243,41 @@ impl KittyGraphicsState {
     /// Apps probe protocol support by sending a query with an image id/number;
     /// the terminal must answer with an APC `OK` response (and must NOT store
     /// the image). The response echoes back whichever identifier the app used.
-    fn handle_query(&mut self, mut params: KittyGraphicsParams) -> Result<(), String> {
+    fn handle_query(
+        &mut self,
+        params: KittyGraphicsParams,
+        command: &Command<'_>,
+    ) -> Result<(), String> {
         let result = (|| {
-            if params.image_id.is_some() && params.image_number.is_some() {
-                return Err("Kitty commands cannot specify both i and I".to_string());
-            }
             if params.image_id.filter(|id| *id != 0).is_none()
                 && params.image_number.filter(|number| *number != 0).is_none()
             {
                 return Err("Kitty query requires a non-zero i or I identifier".to_string());
             }
-            if params.transmission_medium.unwrap_or('d') != 'd' {
-                return Err("Only direct Kitty image transmission (t=d) is supported".to_string());
-            }
+            // A query carries no image data for the assembler to buffer, so
+            // its transport is checked here rather than in `Assembler::feed`.
+            command.require_direct_transport().map_err(describe)?;
 
-            let encoded = params
-                .data
-                .take()
-                .filter(|encoded| !encoded.is_empty())
-                .ok_or("No image data provided for Kitty query")?;
-            let data = Self::decode_base64_payload(&encoded, MAX_PENDING_TRANSFER_BYTES)?;
-            match params.format.unwrap_or(ImageFormat::Rgba) {
-                ImageFormat::Png => {
-                    self.decode_png(data)?;
-                }
-                ImageFormat::Rgb | ImageFormat::Rgba => {
-                    let width = params
-                        .width
-                        .ok_or_else(|| "Missing width for raw image format".to_string())?;
-                    let height = params
-                        .height
-                        .ok_or_else(|| "Missing height for raw image format".to_string())?;
-                    let channels = if params.format == Some(ImageFormat::Rgb) {
-                        3
-                    } else {
-                        4
-                    };
-                    let expected = Self::validate_decoded_size(width, height)?
-                        .checked_mul(channels)
-                        .ok_or_else(|| "Image dimensions overflow".to_string())?;
-                    if data.len() != expected {
-                        return Err(format!(
-                            "Image data has {} bytes, expected {expected}",
-                            data.len()
-                        ));
-                    }
-                }
+            if command.payload_b64.is_empty() {
+                return Err("No image data provided for Kitty query".to_string());
+            }
+            let data = kitty::decode_base64(command.payload_b64.as_bytes(), CAPS.max_decoded_bytes)
+                .map_err(describe)?;
+            if command.format == Format::Png {
+                self.decode_png(data)?;
+                return Ok(());
+            }
+            let (width, height) = command
+                .declared()
+                .ok_or_else(|| "Missing width or height for raw image format".to_string())?;
+            let layout =
+                kitty::raw_layout(width, height, command.format, &CAPS).map_err(describe)?;
+            if data.len() != layout.source_bytes {
+                return Err(format!(
+                    "Image data has {} bytes, expected {}",
+                    data.len(),
+                    layout.source_bytes
+                ));
             }
             Ok(())
         })();
@@ -1753,6 +1491,7 @@ impl Default for KittyGraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use image::ImageEncoder;
 
     fn encode(data: &[u8]) -> String {
@@ -1784,15 +1523,104 @@ mod tests {
         png
     }
 
+    fn app_params(payload: &str) -> Result<KittyGraphicsParams, String> {
+        let command = kitty::parse_command(payload.as_bytes(), &CAPS).map_err(describe)?;
+        KittyGraphicsState::app_params(&command)
+    }
+
+    /// The structural controls are parsed by `jterm_core` (and pinned by its
+    /// own tests); what this module still parses is the placement geometry and
+    /// the delete selector, read back out of the shared command.
     #[test]
-    fn parses_standard_apc_and_preserves_base64_padding() {
-        let params = KittyGraphicsState::parse_params("Gf=24,i=1,s=1,v=1;AQI=").unwrap();
-        assert_eq!(params.action.as_deref(), Some("t"));
+    fn app_controls_are_read_out_of_the_core_command() {
+        let params = app_params("Ga=p,i=1,p=7,x=4,y=5,w=6,h=7,X=8,Y=9,c=2,r=3,z=-9,C=1").unwrap();
         assert_eq!(params.image_id, Some(1));
-        assert_eq!(params.width, Some(1));
-        assert_eq!(params.height, Some(1));
-        assert_eq!(params.format, Some(ImageFormat::Rgb));
-        assert_eq!(params.data.as_deref(), Some("AQI="));
+        assert_eq!(params.placement_id, Some(7));
+        assert_eq!((params.x, params.y), (Some(4), Some(5)));
+        assert_eq!((params.crop_width, params.crop_height), (Some(6), Some(7)));
+        assert_eq!(
+            (params.cell_x_offset, params.cell_y_offset),
+            (Some(8), Some(9))
+        );
+        assert_eq!(
+            (params.display_columns, params.display_rows),
+            (Some(2), Some(3))
+        );
+        assert_eq!(params.z, Some(-9));
+        assert_eq!(params.cursor_policy, Some(1));
+        assert_eq!(app_params("Ga=d,d=I,i=22").unwrap().delete, Some('I'));
+
+        assert_eq!(
+            app_params("Ga=p,i=1,x=nope"),
+            Err("Invalid Kitty x value: nope".to_string())
+        );
+        assert_eq!(
+            app_params("Ga=p,i=1,z=nope"),
+            Err("Invalid Kitty z value: nope".to_string())
+        );
+        assert_eq!(
+            app_params("Ga=p,i=1,C=2"),
+            Err("Invalid Kitty cursor policy: 2".to_string())
+        );
+        assert_eq!(
+            app_params("Ga=d,d=w,i=1"),
+            Err("Unsupported Kitty delete selector: w".to_string())
+        );
+    }
+
+    /// Behaviours the shared module standardized. jterm2 already agreed with
+    /// the exact-length and continuation rules; the rest are pinned here so a
+    /// future core change cannot loosen them silently.
+    #[test]
+    fn shared_structural_rules_are_enforced() {
+        let mut state = KittyGraphicsState::new();
+        // f= accepts only the three numeric protocol values.
+        for alias in ["png", "jpeg", "rgba", "0"] {
+            assert!(state
+                .parse_graphics_payload(&format!("Gf={alias},i=1,s=1,v=1;AQIDBA=="))
+                .is_err());
+        }
+        // i= and I= are mutually exclusive at parse time.
+        assert!(state
+            .parse_graphics_payload("Gf=32,i=1,I=2,s=1,v=1;AQIDBA==")
+            .is_err());
+        // base64: an impossible length and interior padding are rejected,
+        // whitespace and sloppy padding are not.
+        assert!(state
+            .parse_graphics_payload("Gf=32,i=1,s=1,v=1;AQIDBAU")
+            .is_err());
+        assert!(state
+            .parse_graphics_payload("Gf=32,i=1,s=1,v=1;AQ=DBA==")
+            .is_err());
+        state
+            .parse_graphics_payload("Gf=32,i=1,s=1,v=1; AQID BA \n")
+            .unwrap();
+        assert_eq!(state.get_image(1).unwrap().data, [1, 2, 3, 4]);
+        assert_eq!(state.image_count(), 1);
+    }
+
+    /// The shared assembler keys in-flight transfers per image id plus one
+    /// anonymous slot, so an unrelated single-shot upload no longer destroys a
+    /// chunked one. A non-transmit action still aborts everything, which
+    /// `delete_aborts_partial_transfer_and_still_executes` covers.
+    #[test]
+    fn a_chunked_upload_survives_an_unrelated_single_shot_transfer() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload("Ga=T,f=32,i=60,s=1,v=1,c=5,r=6,m=1;AQID")
+            .unwrap();
+        transfer_rgba(&mut state, 61, &[5, 6, 7, 8]);
+        assert!(state.assembler.has_pending());
+
+        // The id-less final chunk still lands in the chunked transfer, and
+        // still carries the placement geometry of its own first chunk.
+        state.parse_graphics_payload("Gm=0;BA==").unwrap();
+        assert_eq!(state.get_image(60).unwrap().data, [1, 2, 3, 4]);
+        assert_eq!(state.get_image(61).unwrap().data, [5, 6, 7, 8]);
+        let placement = &state.get_placements()[0];
+        assert_eq!(placement.image_id, 60);
+        assert_eq!((placement.width, placement.height), (5, 6));
+        assert!(!state.assembler.has_pending());
     }
 
     #[test]
@@ -1828,10 +1656,12 @@ mod tests {
         assert_eq!((image.width, image.height), (1, 1));
         assert_eq!(image.data, [10, 20, 30, 255]);
 
+        // The shared PNG sniff rejects the payload structurally, before the
+        // `image` decoder is ever handed a buffer.
         let error = state
             .parse_graphics_payload(&format!("Gf=100,i=8;{}", encode(b"not a PNG")))
             .unwrap_err();
-        assert!(error.contains("Failed to load image"));
+        assert!(error.contains("PNG header is truncated"), "{error}");
         assert!(state.get_image(8).is_none());
     }
 
@@ -1853,7 +1683,7 @@ mod tests {
         let image = state.get_image(9).unwrap();
         assert_eq!((image.width, image.height), (2, 1));
         assert_eq!(image.data, rgba);
-        assert!(state.pending_transfer.is_none());
+        assert!(!state.assembler.has_pending());
     }
 
     #[test]
@@ -1925,8 +1755,8 @@ mod tests {
             .parse_graphics_payload("Gf=32,i=11,s=1,v=1,m=1;AQID")
             .and_then(|()| state.parse_graphics_payload("Gi=11,m=0;BA=="))
             .unwrap_err();
-        assert!(error.contains("only m and optional q"));
-        assert!(state.pending_transfer.is_none());
+        assert!(error.contains("only m= and an optional q="), "{error}");
+        assert!(!state.assembler.has_pending());
         assert_eq!(state.image_count(), 0);
     }
 
@@ -1937,7 +1767,7 @@ mod tests {
             .parse_graphics_payload("Gf=32,i=12,s=1,v=1,m=1;AQID")
             .unwrap();
         assert!(state.parse_graphics_payload("Gm=0;%%%=").is_err());
-        assert!(state.pending_transfer.is_none());
+        assert!(!state.assembler.has_pending());
         assert!(state.get_image(12).is_none());
     }
 
@@ -1950,15 +1780,22 @@ mod tests {
             .unwrap();
 
         state.parse_graphics_payload("Ga=d,d=I,i=22").unwrap();
-        assert!(state.pending_transfer.is_none());
+        assert!(!state.assembler.has_pending());
         assert!(state.get_image(22).is_none());
         assert!(state.get_image(23).is_none());
     }
 
     #[test]
     fn final_chunk_cannot_bypass_total_transfer_limit() {
-        let error = KittyGraphicsState::decode_base64_payload("AAAA", 0).unwrap_err();
-        assert!(error.contains("exceeded"));
+        // The decoded length is computed and checked before a byte is
+        // reserved, so a zero budget cannot be bypassed by allocating first.
+        assert_eq!(
+            kitty::decode_base64(b"AAAA", 0),
+            Err(kitty::Error::TooLarge)
+        );
+        assert_eq!(CAPS, Caps::SCREEN);
+        assert_eq!(CAPS.max_decoded_bytes, 64 * 1024 * 1024);
+        assert_eq!(CAPS.max_dimension, 16_384);
     }
 
     #[test]
@@ -1968,7 +1805,10 @@ mod tests {
             let error = state
                 .parse_graphics_payload(&format!("Gf=32,i=13,s=1,v=1;{}", encode(rgba)))
                 .unwrap_err();
-            assert!(error.contains("expected 4"));
+            assert!(
+                error.contains("raw image length does not match s= and v="),
+                "{error}"
+            );
         }
         assert!(state.get_image(13).is_none());
     }
@@ -1976,22 +1816,25 @@ mod tests {
     #[test]
     fn oversized_raw_image_is_rejected_before_allocation() {
         let mut state = KittyGraphicsState::new();
-        let payload = format!(
-            "Gf=32,i=1,s={},v={};AAAA",
-            MAX_KITTY_IMAGE_DIMENSION, MAX_KITTY_IMAGE_DIMENSION
-        );
+        let payload = format!("Gf=32,i=1,s={0},v={0};AAAA", CAPS.max_dimension);
         let error = state.parse_graphics_payload(&payload).unwrap_err();
-        assert!(error.contains("Decoded image would use"));
+        assert!(error.contains("exceeds the configured limits"), "{error}");
         assert_eq!(state.image_count(), 0);
     }
 
     #[test]
     fn non_direct_transmission_is_rejected() {
         let mut state = KittyGraphicsState::new();
-        let error = state
-            .parse_graphics_payload("Gf=32,t=f,i=1,s=1,v=1;L3RtcC9pbWFnZQ==")
-            .unwrap_err();
-        assert!(error.contains("Only direct"));
+        for medium in ["f", "t", "s"] {
+            let error = state
+                .parse_graphics_payload(&format!("Gf=32,t={medium},i=1,s=1,v=1;L3RtcC9pbWFnZQ=="))
+                .unwrap_err();
+            assert!(
+                error.contains("unsupported kitty graphics transport"),
+                "{error}"
+            );
+        }
+        assert!(!state.assembler.has_pending());
     }
 
     #[test]
@@ -2048,7 +1891,10 @@ mod tests {
     fn query_rejects_an_unsupported_medium() {
         let mut state = KittyGraphicsState::new();
         let error = state.parse_graphics_payload("Ga=q,t=f,i=43;").unwrap_err();
-        assert!(error.contains("Only direct"));
+        assert!(
+            error.contains("unsupported kitty graphics transport"),
+            "{error}"
+        );
         let response = String::from_utf8(state.take_responses()).unwrap();
         assert!(response.starts_with("\x1b_Gi=43;EINVAL:"));
     }
@@ -2222,7 +2068,10 @@ mod tests {
             let error = state
                 .parse_graphics_payload(&format!("Ga=p,i=48,{control}"))
                 .unwrap_err();
-            assert!(error.contains("Unsupported Kitty placement control"));
+            assert!(
+                error.contains("unsupported kitty graphics placement control"),
+                "{error}"
+            );
             let response = String::from_utf8(state.take_responses()).unwrap();
             assert!(response.starts_with("\x1b_Gi=48;EINVAL:"));
             assert!(response.len() < 256);
@@ -2252,7 +2101,7 @@ mod tests {
         assert!(response.starts_with(b"\x1b_Gi=49;EINVAL:"));
         assert!(response.len() < 256);
 
-        let oversized = format!("Gi=49,{}", "x".repeat(MAX_KITTY_CONTROL_BYTES));
+        let oversized = format!("Gi=49,{}", "x".repeat(kitty::MAX_CONTROL_BYTES));
         assert!(state.parse_graphics_payload(&oversized).is_err());
         let response = state.take_responses();
         assert!(response.starts_with(b"\x1b_Gi=49;EINVAL:"));
