@@ -307,20 +307,23 @@ impl ShellSession {
         configured_shell: Option<&str>,
         repaint_ctx: egui::Context,
     ) -> std::result::Result<Self, String> {
-        Self::new_with_cwd(cols, rows, None, None, configured_shell, repaint_ctx)
+        Self::new_with_cwd(cols, rows, None, None, configured_shell, None, repaint_ctx)
     }
 
     /// 启动新的 shell session，指定初始工作目录和 session ID
+    /// `command_argv` replaces the interactive shell with an explicit argv, for
+    /// one-shot helper sessions such as the rsh installer.
     pub fn new_with_cwd(
         cols: usize,
         rows: usize,
         cwd: Option<&str>,
         session_id: Option<&str>,
         configured_shell: Option<&str>,
+        command_argv: Option<&[String]>,
         repaint_ctx: egui::Context,
     ) -> std::result::Result<Self, String> {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-        match Pty::new_with_cwd(cols, rows, cwd, session_id, configured_shell) {
+        match Pty::new_with_cwd(cols, rows, cwd, session_id, configured_shell, command_argv) {
             Ok(pty) => {
                 // 在把 pty 放入 Arc<Mutex> 前获取 child_pid
                 let child_pid = pty.get_child_pid();

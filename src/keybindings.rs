@@ -72,6 +72,10 @@ pub enum Command {
     // === 侧边栏 ===
     SidebarToggle,
     AgentToggle,
+
+    // === 配套 shell ===
+    /// 在独立会话里安装或更新 rsh。
+    RshInstall,
 }
 
 impl std::fmt::Display for Command {
@@ -127,6 +131,7 @@ impl std::fmt::Display for Command {
             Command::DebugToggle => write!(f, "debug:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
+            Command::RshInstall => write!(f, "rsh:install"),
         }
     }
 }
@@ -185,6 +190,7 @@ impl std::str::FromStr for Command {
             "debug:toggle" => Ok(Command::DebugToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
+            "rsh:install" => Ok(Command::RshInstall),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str

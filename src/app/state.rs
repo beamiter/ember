@@ -201,6 +201,8 @@ pub struct TerminalApp {
 
     // AI agent panel (per-command approval agent over jterm_core)
     pub agent_panel: crate::agent_panel::AgentPanel,
+    /// Background "is a newer rsh published?" check and the offer it produced.
+    pub rsh_notice: crate::rsh_ui::RshNotice,
 
     // Config system
     pub config: config::Config,

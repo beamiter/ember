@@ -17,6 +17,7 @@ mod layout;
 mod link;
 mod pane_header;
 mod pty;
+mod rsh_ui;
 mod search;
 mod search_replace;
 mod search_replace_panel;
@@ -1511,6 +1512,7 @@ impl TerminalApp {
             first_cwd.as_deref(),
             Some(&first_session_id),
             configured_shell.as_deref(),
+            None,
             repaint_ctx.clone(),
         ) {
             Ok(session) => {
@@ -1528,6 +1530,7 @@ impl TerminalApp {
                     None,
                     Some(&first_session_id),
                     configured_shell.as_deref(),
+                    None,
                     repaint_ctx.clone(),
                 ) {
                     Ok(session) => session,
@@ -1692,6 +1695,7 @@ impl TerminalApp {
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
+            rsh_notice: rsh_ui::RshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,
             config_save_deadline: std::time::Instant::now(),
@@ -2065,6 +2069,13 @@ impl TerminalApp {
             });
         if close_requested {
             return;
+        }
+
+        // jterm2 prefers rsh as its shell, so it is worth noticing when the
+        // machine has none or an old one. The row draws nothing until the
+        // background check has something actionable to offer.
+        if self.render_rsh_notice(root_ui) {
+            self.install_or_update_rsh();
         }
 
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。

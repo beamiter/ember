@@ -252,6 +252,7 @@ mod unix_pty {
             cwd: Option<&str>,
             session_id: Option<&str>,
             configured_shell: Option<&str>,
+            command_argv: Option<&[String]>,
         ) -> Result<Self> {
             // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
             // 所有的 libc 调用都检查了返回值并正确处理错误。
@@ -301,8 +302,35 @@ mod unix_pty {
                     None
                 };
 
+                // 一次性辅助进程(例如 rsh 安装脚本)按原样 exec 给定 argv:
+                // 不做登录 shell 包装,也不注入 --session。
+                let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
+                    Some(argv) => {
+                        let program = argv
+                            .first()
+                            .ok_or_else(|| anyhow!("Command argv must not be empty"))?;
+                        let program_path =
+                            find_executable_in_path(program).unwrap_or_else(|| program.clone());
+                        let mut args = Vec::with_capacity(argv.len());
+                        for arg in argv {
+                            args.push(
+                                CString::new(arg.as_str())
+                                    .map_err(|_| anyhow!("Invalid command argument"))?,
+                            );
+                        }
+                        Some((
+                            CString::new(program_path)
+                                .map_err(|_| anyhow!("Invalid command path"))?,
+                            args,
+                        ))
+                    }
+                    None => None,
+                };
+
                 let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
-                    if let Some(bash_path) = bash_path {
+                    if let Some(command) = command_cstrings {
+                        command
+                    } else if let Some(bash_path) = bash_path {
                         let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
                         (
                             CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
@@ -1141,9 +1169,10 @@ mod tests {
     fn missing_working_directory_is_reported_before_returning_a_pty() {
         let root = ShellTestDir::new("missing-cwd");
         let missing_cwd = root.0.join("deleted");
-        let error = super::Pty::new_with_cwd(80, 24, missing_cwd.to_str(), None, Some("/bin/sh"))
-            .err()
-            .expect("a missing cwd must fail before returning a PTY");
+        let error =
+            super::Pty::new_with_cwd(80, 24, missing_cwd.to_str(), None, Some("/bin/sh"), None)
+                .err()
+                .expect("a missing cwd must fail before returning a PTY");
 
         assert!(
             error
@@ -1163,13 +1192,53 @@ mod tests {
         std::fs::write(&invalid_shell, b"not an executable format").unwrap();
         std::fs::set_permissions(&invalid_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, invalid_shell.to_str())
-            .err()
-            .expect("execve failure must be reported synchronously");
+        let error =
+            super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, invalid_shell.to_str(), None)
+                .err()
+                .expect("execve failure must be reported synchronously");
 
         assert!(
             error.to_string().contains("Failed to execute shell"),
             "{error}"
+        );
+    }
+    /// The one-shot helper path (rsh installer) must exec the given argv
+    /// verbatim: no login-shell wrapping, no --session injection.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_argv_is_exec_ed_verbatim() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'argv0=%s arg=%s' \"$0\" \"$1\"".to_string(),
+            "jterm-command-label".to_string(),
+            "payload".to_string(),
+        ];
+        let mut pty = super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, None, Some(&argv))
+            .expect("explicit argv must spawn");
+
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut buf = [0u8; 1024];
+        while std::time::Instant::now() < deadline && !seen.contains("arg=payload") {
+            match pty.read(&mut buf) {
+                Ok(super::ReadOutcome::Data(n)) => {
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                Ok(super::ReadOutcome::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+
+        assert!(
+            seen.contains("argv0=jterm-command-label"),
+            "argv[0] must reach the child unchanged: {seen:?}"
+        );
+        assert!(
+            seen.contains("arg=payload"),
+            "remaining arguments must reach the child: {seen:?}"
         );
     }
 }

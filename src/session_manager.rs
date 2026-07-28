@@ -609,6 +609,31 @@ impl SessionManager {
         rows: usize,
         scrollback_lines: usize,
     ) -> usize {
+        self.insert_session(name, tags, cols, rows, scrollback_lines, None)
+    }
+
+    /// 以显式 argv 打开一次性辅助会话(例如 rsh 安装脚本)，而不是交互 shell。
+    /// 脚本自己打印进度，会话本身就是进度界面。
+    pub fn new_command_session(
+        &mut self,
+        name: String,
+        argv: Vec<String>,
+        cols: usize,
+        rows: usize,
+        scrollback_lines: usize,
+    ) -> usize {
+        self.insert_session(Some(name), None, cols, rows, scrollback_lines, Some(argv))
+    }
+
+    fn insert_session(
+        &mut self,
+        name: Option<String>,
+        tags: Option<Vec<String>>,
+        cols: usize,
+        rows: usize,
+        scrollback_lines: usize,
+        command_argv: Option<Vec<String>>,
+    ) -> usize {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let insert_index = self.active_index + 1;
         let name = name.unwrap_or_else(|| format!("Session {}", self.sessions.len() + 1));
@@ -634,6 +659,7 @@ impl SessionManager {
             cwd_ref,
             Some(&session_id),
             self.configured_shell.as_deref(),
+            command_argv.as_deref(),
             self.repaint_ctx.clone(),
         ) {
             Ok(shell) => {
@@ -895,6 +921,7 @@ impl SessionManager {
                 cwd_ref,
                 Some(&session_id),
                 self.configured_shell.as_deref(),
+                None,
                 self.repaint_ctx.clone(),
             );
             if let Err(error) = &shell_result {
@@ -908,6 +935,7 @@ impl SessionManager {
                         None,
                         Some(&session_id),
                         self.configured_shell.as_deref(),
+                        None,
                         self.repaint_ctx.clone(),
                     );
                 }
