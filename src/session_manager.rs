@@ -281,14 +281,6 @@ impl ProtocolResponseSender {
     }
 }
 
-/// 获取指定进程的工作目录
-pub fn get_process_cwd(pid: i32) -> Option<String> {
-    // 从 /proc/[pid]/cwd 获取指定进程的工作目录
-    std::fs::read_link(format!("/proc/{}/cwd", pid))
-        .ok()
-        .and_then(|path| path.to_str().map(|s| s.to_string()))
-}
-
 /// Name of the process group currently owning the session's PTY, i.e. the
 /// command the user is waiting on. `None` while the shell itself is in the
 /// foreground, so a pane header can fall back to showing the shell prompt.
@@ -297,26 +289,11 @@ pub fn get_process_cwd(pid: i32) -> Option<String> {
 /// entry names its controlling terminal's foreground group, so no PTY master
 /// fd has to be threaded through the UI layer.
 pub fn get_foreground_command(shell_pid: i32) -> Option<String> {
-    let foreground_pgid = read_tpgid(shell_pid)?;
-    if foreground_pgid <= 0 || foreground_pgid == shell_pid {
+    let foreground_pgid = jterm_core::process::foreground_pgid_via_stat(shell_pid)?;
+    if foreground_pgid == shell_pid {
         return None;
     }
-    let comm = std::fs::read_to_string(format!("/proc/{}/comm", foreground_pgid)).ok()?;
-    let comm = comm.trim();
-    (!comm.is_empty()).then(|| comm.to_string())
-}
-
-fn read_tpgid(pid: i32) -> Option<i32> {
-    parse_tpgid(&std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?)
-}
-
-/// Field 8 (`tpgid`) of a `/proc/<pid>/stat` line. The `comm` field is
-/// parenthesized and may itself contain spaces and parens, so fields are
-/// counted from the last `)` rather than by splitting the whole line.
-fn parse_tpgid(stat: &str) -> Option<i32> {
-    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
-    // state, ppid, pgrp, session, tty_nr, tpgid
-    after_comm.split_whitespace().nth(5)?.parse().ok()
+    jterm_core::process::process_comm(foreground_pgid)
 }
 
 /// SessionManager - 管理所有终端会话
@@ -644,7 +621,7 @@ impl SessionManager {
         let cwd = if !self.sessions.is_empty() {
             let active_session = &self.sessions[self.active_index];
             let osc7 = active_session.terminal.lock().current_working_dir.clone();
-            osc7.or_else(|| get_process_cwd(active_session.get_shell_pid()))
+            osc7.or_else(|| jterm_core::process::process_cwd(active_session.get_shell_pid()))
         } else {
             None
         };
@@ -868,7 +845,7 @@ impl SessionManager {
                     .lock()
                     .current_working_dir
                     .clone()
-                    .or_else(|| get_process_cwd(s.get_shell_pid()));
+                    .or_else(|| jterm_core::process::process_cwd(s.get_shell_pid()));
                 session_persistence::SessionSnapshot {
                     name: s.metadata.name.clone(),
                     tags: s.metadata.tags.clone(),
@@ -1019,34 +996,13 @@ fn refreshed_unseen_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        background_pump_order, parse_tpgid, refreshed_unseen_output, restored_or_fresh_session_id,
+        background_pump_order, refreshed_unseen_output, restored_or_fresh_session_id,
         retry_pending_input, user_input_is_blocked_by_mouse_edge, ProtocolResponseLimits,
         ProtocolResponseQueueError, ProtocolResponseSender,
     };
     use crate::shell::ShellWriteError;
     use std::collections::HashSet;
     use std::time::Duration;
-
-    #[test]
-    fn tpgid_survives_a_comm_containing_spaces_and_parens() {
-        // Real layout: pid (comm) state ppid pgrp session tty_nr tpgid ...
-        assert_eq!(
-            parse_tpgid("1234 (bash) S 1 1234 1234 34816 4321 4194304 0"),
-            Some(4321)
-        );
-        // A process may rename itself to anything, parens included.
-        assert_eq!(
-            parse_tpgid("1234 (weird (name) here) S 1 1234 1234 34816 4321 0"),
-            Some(4321)
-        );
-        // No foreground group on the terminal.
-        assert_eq!(
-            parse_tpgid("1234 (bash) S 1 1234 1234 0 -1 4194304"),
-            Some(-1)
-        );
-        assert_eq!(parse_tpgid("garbage without parens"), None);
-        assert_eq!(parse_tpgid("1234 (bash) S 1 1234"), None);
-    }
 
     fn tiny_protocol_limits() -> ProtocolResponseLimits {
         ProtocolResponseLimits {

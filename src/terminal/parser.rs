@@ -1085,7 +1085,7 @@ impl super::TerminalState {
             }
             'p' => {
                 if private_prefix == Some(b'?')
-                    && intermediates == [b'$']
+                    && intermediates == *b"$"
                     && params.first().copied() == Some(5522)
                 {
                     let state = if self.modes.contains(&5522) { 1 } else { 2 };
@@ -1216,7 +1216,7 @@ impl super::TerminalState {
                 }
 
                 // DECSCUSR - Set cursor style
-                if private_prefix.is_none() && intermediates == [b' '] {
+                if private_prefix.is_none() && intermediates == *b" " {
                     let shape = params.first().copied().unwrap_or(0) as u8;
                     self.cursor_shape = match shape {
                         0 | 1 => CursorShape::Block,

@@ -65,7 +65,7 @@ impl TerminalApp {
             }
         }
         let pid = session.get_shell_pid();
-        crate::session_manager::get_process_cwd(pid)
+        jterm_core::process::process_cwd(pid)
             .map(|cwd| {
                 if let Ok(home) = std::env::var("HOME") {
                     if cwd == home {

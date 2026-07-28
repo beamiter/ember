@@ -105,8 +105,7 @@ impl TerminalApp {
         let show_repo_strip = self.config.show_repo_strip;
         self.pane_status_cache
             .get(&session_id, now, || {
-                let raw_cwd =
-                    reported_cwd.or_else(|| crate::session_manager::get_process_cwd(shell_pid));
+                let raw_cwd = reported_cwd.or_else(|| jterm_core::process::process_cwd(shell_pid));
                 // The git probe rides the same sub-second cadence as the /proc
                 // reads, and its own cache only runs git when the session is
                 // new, changed directory, or finished a command.

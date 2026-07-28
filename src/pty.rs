@@ -125,38 +125,14 @@ mod unix_pty {
         Some(absolute.to_string_lossy().into_owned())
     }
 
+    /// Stays local rather than delegating to `jterm_core::host`: shell
+    /// selection needs an injectable PATH (launchers like wofi strip it) plus
+    /// the exec-bit and absolute-path guarantees of [`executable_path`], which
+    /// the core lookup deliberately does not impose.
     fn find_executable_in_path_with(exe_name: &str, path_var: Option<&OsStr>) -> Option<String> {
         std::env::split_paths(path_var?)
             .map(|dir| dir.join(exe_name))
             .find_map(|candidate| executable_path(&candidate))
-    }
-
-    fn find_executable_in_path(exe_name: &str) -> Option<String> {
-        let path_var = std::env::var_os("PATH")?;
-        find_executable_in_path_with(exe_name, Some(&path_var))
-    }
-
-    pub(crate) fn shell_single_quote(s: &str) -> String {
-        let mut quoted = String::with_capacity(s.len() + 2);
-        quoted.push('\'');
-        for ch in s.chars() {
-            if ch == '\'' {
-                quoted.push_str("'\"'\"'");
-            } else {
-                quoted.push(ch);
-            }
-        }
-        quoted.push('\'');
-        quoted
-    }
-
-    pub(crate) fn build_rsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
-        let mut exec_cmd = format!("exec {}", shell_single_quote(shell_path));
-        if let Some(sid) = session_id {
-            exec_cmd.push_str(" --session ");
-            exec_cmd.push_str(&shell_single_quote(sid));
-        }
-        exec_cmd
     }
 
     /// `rsh` is an ambiguous name: on most distributions `/usr/bin/rsh` is an
@@ -297,7 +273,9 @@ mod unix_pty {
                 let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
 
                 let bash_path = if shell_name == "rsh" {
-                    find_executable_in_path("bash").filter(|p| is_executable(Path::new(p)))
+                    jterm_core::host::find_executable_in_path("bash")
+                        .filter(|p| is_executable(p))
+                        .map(|p| p.to_string_lossy().into_owned())
                 } else {
                     None
                 };
@@ -309,8 +287,9 @@ mod unix_pty {
                         let program = argv
                             .first()
                             .ok_or_else(|| anyhow!("Command argv must not be empty"))?;
-                        let program_path =
-                            find_executable_in_path(program).unwrap_or_else(|| program.clone());
+                        let program_path = jterm_core::host::find_executable_in_path(program)
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| program.clone());
                         let mut args = Vec::with_capacity(argv.len());
                         for arg in argv {
                             args.push(
@@ -331,7 +310,8 @@ mod unix_pty {
                     if let Some(command) = command_cstrings {
                         command
                     } else if let Some(bash_path) = bash_path {
-                        let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
+                        let exec_cmd =
+                            jterm_core::process::build_rsh_exec_command(&shell_path, session_id);
                         (
                             CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
                             vec![
@@ -1045,28 +1025,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
         assert_eq!(attempts, 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_single_quote_escapes_embedded_quotes() {
-        assert_eq!(
-            super::unix_pty::shell_single_quote("/tmp/it's"),
-            "'/tmp/it'\"'\"'s'"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wrapped_rsh_receives_the_preassigned_session_id() {
-        assert_eq!(
-            super::unix_pty::build_rsh_exec_command("/tmp/rsh", Some("123-456")),
-            "exec '/tmp/rsh' --session '123-456'"
-        );
-        assert_eq!(
-            super::unix_pty::build_rsh_exec_command("/tmp/rsh", None),
-            "exec '/tmp/rsh'"
-        );
     }
 
     #[cfg(unix)]

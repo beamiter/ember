@@ -659,11 +659,6 @@ use app::state::TerminalApp;
 
 // normalize_terminal_shortcut_events moved to app::events module
 
-/// 用单引号安全包裹路径，供发送到 shell 的 cd 命令使用
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// True when a clipboard paste should ask the user to confirm before being
 /// sent to the PTY. Trips on:
 /// - any newline (`\n` after CRLF normalization), since the most common
@@ -1911,7 +1906,7 @@ impl TerminalApp {
             let reported_cwd = {
                 let session = self.session_manager.get_active_session_mut();
                 let osc7 = session.terminal.lock().current_working_dir.clone();
-                osc7.or_else(|| session_manager::get_process_cwd(session.get_shell_pid()))
+                osc7.or_else(|| jterm_core::process::process_cwd(session.get_shell_pid()))
             };
             let changed_directory = reported_cwd
                 .map(std::path::PathBuf::from)
@@ -2022,7 +2017,7 @@ impl TerminalApp {
             self.sidebar.selected_path = Some(p);
         }
         if let Some(p) = cd_path {
-            let quoted = shell_single_quote(&p.to_string_lossy());
+            let quoted = jterm_core::process::shell_quote_path(&p.to_string_lossy());
             let cmd = format!("cd {}\n", quoted);
             let paste_result = {
                 let session = self.session_manager.get_active_session_mut();

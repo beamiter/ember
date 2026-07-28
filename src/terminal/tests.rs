@@ -221,7 +221,7 @@ fn text_erase_keeps_graphics_except_for_full_ed2() {
 fn kitty_graphics_does_not_route_dcs_sos_pm_or_non_g_apc() {
     let body = b"Ga=t,i=41,f=32,s=1,v=1;/wAA/w==";
 
-    for introducer in [b'P', b'X', b'^'] {
+    for introducer in *b"PX^" {
         let mut terminal = TerminalState::new(8, 2);
         let mut sequence = vec![0x1b, introducer];
         sequence.extend_from_slice(body);
