@@ -101,11 +101,24 @@ impl TerminalApp {
             )
         };
 
+        let git_strip_cache = &mut self.git_strip_cache;
+        let show_repo_strip = self.config.show_repo_strip;
         self.pane_status_cache
             .get(&session_id, now, || {
-                let cwd = reported_cwd
-                    .or_else(|| crate::session_manager::get_process_cwd(shell_pid))
-                    .map(|cwd| crate::pane_header::abbreviate_home(&cwd));
+                let raw_cwd =
+                    reported_cwd.or_else(|| crate::session_manager::get_process_cwd(shell_pid));
+                // The git probe rides the same sub-second cadence as the /proc
+                // reads, and its own cache only runs git when the session is
+                // new, changed directory, or finished a command.
+                let git = show_repo_strip
+                    .then(|| {
+                        git_strip_cache.strip(&session_id, raw_cwd.as_deref(), |cwd| {
+                            jterm_core::git_meta::read(std::path::Path::new(cwd))
+                                .map(|meta| jterm_core::git_meta::format_strip(&meta))
+                        })
+                    })
+                    .flatten();
+                let cwd = raw_cwd.map(|cwd| crate::pane_header::abbreviate_home(&cwd));
                 let title = custom_name
                     .or_else(|| cwd.as_deref().map(crate::pane_header::path_leaf))
                     .unwrap_or(fallback_name);
@@ -117,6 +130,7 @@ impl TerminalApp {
                     title,
                     cwd,
                     running_command,
+                    git,
                 }
             })
             .clone()
@@ -143,6 +157,7 @@ impl TerminalApp {
             .map(|session| session.metadata.session_id.clone())
             .collect();
         self.pane_status_cache.retain_sessions(&live_session_ids);
+        self.git_strip_cache.retain_sessions(&live_session_ids);
 
         if !interaction_enabled {
             self.pane_drag = None;

@@ -3,8 +3,8 @@
 //! A single pane has no header: the window title and tab bar already name it,
 //! and the row would only cost terminal lines. Once the layout holds more than
 //! one pane the user needs to tell them apart at a glance, so each pane gets a
-//! compact strip with its index, title, working directory, and the command it
-//! is currently running.
+//! compact strip with its index, title, working directory, git branch/dirty
+//! state, and the command it is currently running.
 //!
 //! The header is also the drag handle for rearranging panes: pressing it and
 //! releasing over another pane swaps the two sessions.
@@ -38,6 +38,9 @@ pub struct PaneStatus {
     pub cwd: Option<String>,
     /// Foreground command, when the shell is not the one in the foreground.
     pub running_command: Option<String>,
+    /// Git branch/dirty strip for the working directory, already formatted by
+    /// [`jterm_core::git_meta::format_strip`]. None outside a repository.
+    pub git: Option<String>,
 }
 
 /// Per-session status cache keyed by the stable session ID rather than the
@@ -66,14 +69,81 @@ impl PaneStatusCache {
             .get(session_id)
             .is_none_or(|(fetched, _)| now.duration_since(*fetched) >= STATUS_REFRESH_INTERVAL);
         if stale {
-            self.entries
-                .insert(session_id.to_string(), (now, probe()));
+            self.entries.insert(session_id.to_string(), (now, probe()));
         }
         &self.entries[session_id].1
     }
 
     /// Drop entries for sessions that no longer exist, so a long-lived window
     /// that opens and closes many tabs does not accumulate them.
+    pub fn retain_sessions(&mut self, live: &HashSet<String>) {
+        self.entries.retain(|id, _| live.contains(id));
+    }
+}
+
+/// One session's cached git strip and the state that decides when to re-probe.
+#[derive(Debug, Default)]
+struct GitStripEntry {
+    /// The working directory the cached strip was probed in.
+    cwd: Option<String>,
+    /// Formatted branch/dirty text, or None when `cwd` is not in a repository.
+    strip: Option<String>,
+    /// A command finished since the last probe; branch/dirty state may have
+    /// changed even though the directory did not.
+    stale: bool,
+}
+
+/// Per-session git branch/dirty strip cache with jterm1's refresh triggers:
+/// a session's first probe, a working-directory change, and a completed
+/// command. Between triggers the cached text is returned without running git,
+/// so an idle pane costs nothing per frame.
+#[derive(Debug, Default)]
+pub struct GitStripCache {
+    entries: HashMap<String, GitStripEntry>,
+}
+
+impl GitStripCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `session_id` finished a command. The next [`Self::strip`]
+    /// call re-probes: the command may have switched branches, committed, or
+    /// dirtied the worktree without changing the directory. A session that has
+    /// never been probed needs no entry — its first probe happens on sight —
+    /// so single-pane commands (no headers rendered) cannot grow the map.
+    pub fn mark_command_finished(&mut self, session_id: &str) {
+        if let Some(entry) = self.entries.get_mut(session_id) {
+            entry.stale = true;
+        }
+    }
+
+    /// Cached strip for `session_id` in `cwd`, calling `probe` only when the
+    /// session is new, the directory changed, or a command finished since the
+    /// last probe. A missing `cwd` clears the strip — the user must never see
+    /// a stale branch from a previous directory.
+    pub fn strip(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        probe: impl FnOnce(&str) -> Option<String>,
+    ) -> Option<String> {
+        let (entry, is_new) = match self.entries.entry(session_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(occupied) => (occupied.into_mut(), false),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                (vacant.insert(GitStripEntry::default()), true)
+            }
+        };
+        if is_new || entry.stale || entry.cwd.as_deref() != cwd {
+            entry.cwd = cwd.map(str::to_string);
+            entry.strip = cwd.and_then(probe);
+            entry.stale = false;
+        }
+        entry.strip.clone()
+    }
+
+    /// Drop entries for sessions that no longer exist, mirroring
+    /// [`PaneStatusCache::retain_sessions`].
     pub fn retain_sessions(&mut self, live: &HashSet<String>) {
         self.entries.retain(|id, _| live.contains(id));
     }
@@ -152,7 +222,7 @@ pub fn split_header(pane_rect: Rect) -> (Option<Rect>, Rect) {
 }
 
 /// Compose the one-line summary drawn after the title: the working directory,
-/// then the running command when there is one.
+/// the git branch/dirty strip, then the running command when there is one.
 fn detail_text(status: &PaneStatus) -> String {
     let mut parts = Vec::new();
     if let Some(cwd) = &status.cwd {
@@ -162,6 +232,9 @@ fn detail_text(status: &PaneStatus) -> String {
             parts.push(cwd.clone());
         }
     }
+    if let Some(git) = &status.git {
+        parts.push(git.clone());
+    }
     if let Some(command) = &status.running_command {
         parts.push(format!("▶ {command}"));
     }
@@ -170,7 +243,11 @@ fn detail_text(status: &PaneStatus) -> String {
 
 /// Blend `overlay` over `base` by `t` (0 → base, 1 → overlay).
 fn mix(base: Color32, overlay: Color32, t: f32) -> Color32 {
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8;
+    let lerp = |a: u8, b: u8| {
+        (a as f32 + (b as f32 - a as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     Color32::from_rgb(
         lerp(base.r(), overlay.r()),
         lerp(base.g(), overlay.g()),
@@ -234,7 +311,10 @@ pub fn draw_pane_header(
         fade(accent.gamma_multiply(if visual.focused { 0.35 } else { 0.18 })),
     );
     painter.galley(
-        egui::pos2(chip.center().x - index_galley.size().x / 2.0, center_y - index_galley.size().y / 2.0),
+        egui::pos2(
+            chip.center().x - index_galley.size().x / 2.0,
+            center_y - index_galley.size().y / 2.0,
+        ),
         index_galley,
         fade(accent),
     );
@@ -345,6 +425,7 @@ mod tests {
             title: "~/src".to_string(),
             cwd: Some("~/src".to_string()),
             running_command: None,
+            git: None,
         };
         assert_eq!(detail_text(&status), "");
 
@@ -353,6 +434,78 @@ mod tests {
             ..status
         };
         assert_eq!(detail_text(&running), "▶ cargo");
+    }
+
+    #[test]
+    fn detail_places_the_git_strip_between_cwd_and_command() {
+        let status = PaneStatus {
+            title: "src".to_string(),
+            cwd: Some("~/src".to_string()),
+            running_command: Some("cargo build".to_string()),
+            git: Some("main ●".to_string()),
+        };
+        assert_eq!(detail_text(&status), "~/src  ·  main ●  ·  ▶ cargo build");
+    }
+
+    #[test]
+    fn git_strip_cache_probes_only_on_jterm1_triggers() {
+        let mut cache = GitStripCache::new();
+        let mut probes = 0;
+        let strip = |cache: &mut GitStripCache, cwd: Option<&str>, probes: &mut usize| {
+            cache.strip("session-a", cwd, |_| {
+                *probes += 1;
+                Some(format!("main #{probes}"))
+            })
+        };
+
+        // First sight of the session probes.
+        assert_eq!(
+            strip(&mut cache, Some("/repo"), &mut probes).as_deref(),
+            Some("main #1")
+        );
+        // Same directory, nothing happened: cached, no new probe.
+        assert_eq!(
+            strip(&mut cache, Some("/repo"), &mut probes).as_deref(),
+            Some("main #1")
+        );
+        assert_eq!(probes, 1);
+
+        // A finished command re-probes even though the directory is unchanged.
+        cache.mark_command_finished("session-a");
+        assert_eq!(
+            strip(&mut cache, Some("/repo"), &mut probes).as_deref(),
+            Some("main #2")
+        );
+        assert_eq!(probes, 2);
+
+        // A directory change re-probes.
+        assert_eq!(
+            strip(&mut cache, Some("/other"), &mut probes).as_deref(),
+            Some("main #3")
+        );
+        assert_eq!(probes, 3);
+
+        // Losing the cwd clears the strip without probing.
+        assert_eq!(strip(&mut cache, None, &mut probes), None);
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn git_strip_cache_does_not_resurrect_a_non_repo_probe() {
+        let mut cache = GitStripCache::new();
+        let mut probes = 0;
+        for _ in 0..3 {
+            let strip = cache.strip("session-a", Some("/not-a-repo"), |_| {
+                probes += 1;
+                None
+            });
+            assert_eq!(strip, None);
+        }
+        // Only the first sighting probed; the None result is cached.
+        assert_eq!(probes, 1);
+
+        cache.retain_sessions(&HashSet::new());
+        assert!(cache.entries.is_empty());
     }
 
     #[test]
@@ -381,17 +534,24 @@ mod tests {
         assert_eq!(first.title, "first");
 
         let cached = cache
-            .get("session-a", start + Duration::from_millis(100), || PaneStatus {
-                title: "second".to_string(),
-                ..Default::default()
+            .get("session-a", start + Duration::from_millis(100), || {
+                PaneStatus {
+                    title: "second".to_string(),
+                    ..Default::default()
+                }
             })
             .clone();
-        assert_eq!(cached.title, "first", "probe must not run before the interval");
+        assert_eq!(
+            cached.title, "first",
+            "probe must not run before the interval"
+        );
 
         let refreshed = cache
-            .get("session-a", start + STATUS_REFRESH_INTERVAL, || PaneStatus {
-                title: "second".to_string(),
-                ..Default::default()
+            .get("session-a", start + STATUS_REFRESH_INTERVAL, || {
+                PaneStatus {
+                    title: "second".to_string(),
+                    ..Default::default()
+                }
             })
             .clone();
         assert_eq!(refreshed.title, "second");

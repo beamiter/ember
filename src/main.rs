@@ -1046,6 +1046,25 @@ fn spawn_desktop_notification_worker() -> Option<crossbeam_channel::Sender<Deskt
     Some(tx)
 }
 
+/// Shared rate window for every desktop-notification source (OSC 9/777 and
+/// long-command toasts), so their combined output stays bounded.
+const NOTIFICATION_RATE_WINDOW: Duration = Duration::from_secs(5);
+const MAX_NOTIFICATIONS_PER_WINDOW: usize = 4;
+
+/// Restart the shared notification rate window once it has elapsed. Callers
+/// then check `notifications_in_window` against [`MAX_NOTIFICATIONS_PER_WINDOW`]
+/// and count their own successful sends.
+fn roll_notification_rate_window(
+    window_started: &mut std::time::Instant,
+    notifications_in_window: &mut usize,
+) {
+    let now = std::time::Instant::now();
+    if now.duration_since(*window_started) >= NOTIFICATION_RATE_WINDOW {
+        *window_started = now;
+        *notifications_in_window = 0;
+    }
+}
+
 fn show_desktop_notification(
     notification_tx: Option<&crossbeam_channel::Sender<DesktopNotification>>,
     window_started: &mut std::time::Instant,
@@ -1053,15 +1072,8 @@ fn show_desktop_notification(
     title: String,
     body: String,
 ) {
-    const WINDOW: Duration = Duration::from_secs(5);
-    const MAX_PER_WINDOW: usize = 4;
-
-    let now = std::time::Instant::now();
-    if now.duration_since(*window_started) >= WINDOW {
-        *window_started = now;
-        *notifications_in_window = 0;
-    }
-    if *notifications_in_window >= MAX_PER_WINDOW {
+    roll_notification_rate_window(window_started, notifications_in_window);
+    if *notifications_in_window >= MAX_NOTIFICATIONS_PER_WINDOW {
         return;
     }
     let Some(notification_tx) = notification_tx else {
@@ -1073,6 +1085,61 @@ fn show_desktop_notification(
     {
         *notifications_in_window += 1;
     }
+}
+
+/// jterm1-parity gate for the long-command desktop toast
+/// (`block_view`'s `notify_long_blocks` check): the command must be a real
+/// foreground command (jterm1 skips background blocks, whose command line is
+/// empty), the config flag must be on, and the measured duration must reach
+/// the threshold. jterm2 adds the egui window focus state: a completion the
+/// user just watched on screen needs no toast.
+fn should_notify_long_command(
+    config: &config::Config,
+    command: Option<&str>,
+    duration_ms: Option<u64>,
+    watched: bool,
+) -> bool {
+    if !config.notify_long_blocks || watched {
+        return false;
+    }
+    if !command.map(str::trim).is_some_and(|cmd| !cmd.is_empty()) {
+        return false;
+    }
+    duration_ms.is_some_and(|ms| ms >= config.notify_long_block_threshold_ms)
+}
+
+/// Post the long-command-finished notification when the gates above and the
+/// shared rate window allow it. Free function over disjoint fields because the
+/// completion sites hold a mutable borrow of the session manager.
+fn maybe_notify_long_command(
+    config: &config::Config,
+    window_started: &mut std::time::Instant,
+    notifications_in_window: &mut usize,
+    completed: &crate::terminal::CompletedCommandOutput,
+    watched: bool,
+) {
+    if !should_notify_long_command(
+        config,
+        completed.command.as_deref(),
+        completed.duration_ms,
+        watched,
+    ) {
+        return;
+    }
+    // An untrusted PTY can claim any `duration=` in OSC 133;D, so this path
+    // shares the OSC 9/777 rate window instead of trusting the threshold to
+    // keep notify-send spawns rare.
+    roll_notification_rate_window(window_started, notifications_in_window);
+    if *notifications_in_window >= MAX_NOTIFICATIONS_PER_WINDOW {
+        return;
+    }
+    *notifications_in_window += 1;
+    let command = completed.command.as_deref().unwrap_or_default().trim();
+    jterm_core::notify::long_block_finished(
+        command,
+        completed.exit_code.unwrap_or(0),
+        completed.duration_ms.unwrap_or(0),
+    );
 }
 
 fn reported_capture_button(capture: Option<(bool, u8)>) -> Option<u8> {
@@ -1690,6 +1757,7 @@ impl TerminalApp {
             pane_renderers,
             dragging_divider: None,
             pane_status_cache: pane_header::PaneStatusCache::new(),
+            git_strip_cache: pane_header::GitStripCache::new(),
             pane_drag: None,
             help_panel: help::HelpPanel::new(),
             config_panel: config_panel::ConfigPanel::new(),
@@ -2224,8 +2292,22 @@ impl eframe::App for TerminalApp {
             user_input_barrier_session_id.as_deref(),
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
+        let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         for (session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
             self.agent_panel.handle_completed(session_idx, &completed);
+            if let Some(session) = self.session_manager.sessions().get(session_idx) {
+                self.git_strip_cache
+                    .mark_command_finished(&session.metadata.session_id);
+            }
+            // A visible split pane is watched exactly when the window itself
+            // has focus; a hidden tab is never watched.
+            maybe_notify_long_command(
+                &self.config,
+                &mut self.notification_window_started,
+                &mut self.notifications_in_window,
+                &completed,
+                window_focused && visible_sessions.contains(&session_idx),
+            );
             if let Err(error) = execution_journal::submit(completed) {
                 log::warn!("rsh execution output journal queue rejected an event: {error:?}");
             }
@@ -2774,6 +2856,17 @@ impl eframe::App for TerminalApp {
                 for completed in completed_outputs {
                     self.agent_panel
                         .handle_completed(active_session_idx, &completed);
+                    self.git_strip_cache
+                        .mark_command_finished(&session.metadata.session_id);
+                    // The active pane is on screen, so its completion was
+                    // watched whenever the window itself had focus.
+                    maybe_notify_long_command(
+                        &self.config,
+                        &mut self.notification_window_started,
+                        &mut self.notifications_in_window,
+                        &completed,
+                        window_focused,
+                    );
                     if let Err(error) = execution_journal::submit(completed) {
                         log::warn!(
                             "rsh execution output journal queue rejected an event: {error:?}"
@@ -3713,9 +3806,10 @@ mod tests {
         encode_terminal_paste, flush_pending_mouse_controls, kitty_graphics_payload,
         mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalize_paste_text,
         osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, primary_copy_route,
-        queue_mouse_control, reported_capture_button, should_confirm_paste,
-        show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
-        wrap_bracketed_paste, ClipboardRequestGuard, DesktopNotification, PrimaryCopyRoute,
+        queue_mouse_control, reported_capture_button, roll_notification_rate_window,
+        should_confirm_paste, should_notify_long_command, show_desktop_notification,
+        take_tagged_cursor_move, wait_for_child_with_timeout, wrap_bracketed_paste,
+        ClipboardRequestGuard, DesktopNotification, PrimaryCopyRoute,
         DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
         OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
@@ -3750,6 +3844,84 @@ mod tests {
             wait_for_child_with_timeout(&mut slow, std::time::Duration::from_millis(20)).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(slow.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn long_command_notification_gates_mirror_jterm1() {
+        let config = crate::config::Config {
+            notify_long_blocks: true,
+            notify_long_block_threshold_ms: 10_000,
+            ..crate::config::Config::default()
+        };
+
+        // Long enough, unwatched, real command: notify.
+        assert!(should_notify_long_command(
+            &config,
+            Some("cargo build"),
+            Some(10_000),
+            false,
+        ));
+        // Below the threshold, or with no measured duration: stay silent.
+        assert!(!should_notify_long_command(
+            &config,
+            Some("cargo build"),
+            Some(9_999),
+            false,
+        ));
+        assert!(!should_notify_long_command(
+            &config,
+            Some("cargo build"),
+            None,
+            false,
+        ));
+        // jterm1's background blocks carry an empty command line and never
+        // notify; the same holds for a missing or whitespace-only command.
+        assert!(!should_notify_long_command(
+            &config,
+            None,
+            Some(60_000),
+            false
+        ));
+        assert!(!should_notify_long_command(
+            &config,
+            Some("   "),
+            Some(60_000),
+            false,
+        ));
+        // A completion the user watched on a focused visible pane is silent.
+        assert!(!should_notify_long_command(
+            &config,
+            Some("cargo build"),
+            Some(60_000),
+            true,
+        ));
+
+        let disabled = crate::config::Config {
+            notify_long_blocks: false,
+            ..config
+        };
+        assert!(!should_notify_long_command(
+            &disabled,
+            Some("cargo build"),
+            Some(60_000),
+            false,
+        ));
+    }
+
+    #[test]
+    fn notification_rate_window_resets_only_after_it_elapses() {
+        let mut window_started = std::time::Instant::now();
+        let mut in_window = super::MAX_NOTIFICATIONS_PER_WINDOW;
+
+        // Inside the window the exhausted counter stays exhausted.
+        roll_notification_rate_window(&mut window_started, &mut in_window);
+        assert_eq!(in_window, super::MAX_NOTIFICATIONS_PER_WINDOW);
+
+        // Once the window has elapsed the counter resets.
+        window_started = std::time::Instant::now() - super::NOTIFICATION_RATE_WINDOW;
+        roll_notification_rate_window(&mut window_started, &mut in_window);
+        assert_eq!(in_window, 0);
+        assert!(window_started.elapsed() < super::NOTIFICATION_RATE_WINDOW);
     }
 
     #[test]

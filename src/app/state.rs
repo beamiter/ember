@@ -187,6 +187,10 @@ pub struct TerminalApp {
     /// Cached per-pane header status (title / cwd / running command).
     pub pane_status_cache: crate::pane_header::PaneStatusCache,
 
+    /// Cached per-session git branch/dirty strip. Refreshed on jterm1's
+    /// triggers (new session, cwd change, command finished), never per frame.
+    pub git_strip_cache: crate::pane_header::GitStripCache,
+
     /// In-flight header drag used to rearrange panes.
     pub pane_drag: Option<PaneDrag>,
 

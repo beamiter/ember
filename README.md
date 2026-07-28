@@ -14,6 +14,9 @@ claimed.
 - Tabs, drag-to-reorder, rename, activity indicators and split-layout restore
 - Nested horizontal and vertical splits, focused-pane zoom and one-command
   divider equalization; every split starts an independent shell session
+- Per-pane status headers with working directory, git branch/dirty state and
+  the running command, plus desktop notifications when a long command
+  finishes unwatched (OSC 133)
 - Unicode width handling, combining characters, ligatures and font fallback
 - Full-scrollback search with auto-reveal navigation, bounded live refresh,
   selection-aware replace, and a continuous-grid
@@ -128,6 +131,14 @@ rsh_update_check = "daily"     # startup | daily | never
 osc52_clipboard_write = true
 osc52_clipboard_read = false
 paste_confirm = true
+
+# Desktop toast when a command that ran at least the threshold finishes while
+# its pane is not being watched (window unfocused, or a hidden tab).
+notify_long_blocks = true
+notify_long_block_threshold_ms = 10000
+
+# Git branch/dirty indicator in split-pane headers.
+show_repo_strip = true
 ```
 
 The Settings panel exposes the same clipboard and paste-confirmation policies

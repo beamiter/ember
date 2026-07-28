@@ -201,10 +201,30 @@ pub struct Config {
     /// 粘贴多行/大块内容时弹窗确认(默认开启)。用户可在确认对话框里选择不再询问。
     #[serde(default = "default_true")]
     pub paste_confirm: bool,
+
+    /// 长命令完成后发送桌面通知(默认开启)。仅当命令运行超过
+    /// `notify_long_block_threshold_ms` 且完成时用户没有盯着该 pane
+    /// (窗口失焦或会话在后台 tab)才触发。与 jterm1 的
+    /// `notify_long_blocks` 同名,保持家族配置一致。
+    #[serde(default = "default_true")]
+    pub notify_long_blocks: bool,
+
+    /// `notify_long_blocks` 的时长阈值(毫秒)。
+    #[serde(default = "default_notify_long_block_threshold_ms")]
+    pub notify_long_block_threshold_ms: u64,
+
+    /// 多 pane 布局的头部里显示 git 分支/脏状态(默认开启)。与 jterm1
+    /// 的 `show_repo_strip` 同名,保持家族配置一致。
+    #[serde(default = "default_true")]
+    pub show_repo_strip: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_notify_long_block_threshold_ms() -> u64 {
+    10_000
 }
 
 fn default_rsh_update_check() -> String {
@@ -396,6 +416,9 @@ impl Default for Config {
             osc52_clipboard_write: true,
             osc52_clipboard_read: false,
             paste_confirm: true,
+            notify_long_blocks: true,
+            notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
+            show_repo_strip: true,
         }
     }
 }

@@ -52,6 +52,9 @@ pub struct ConfigPanel {
     edit_paste_confirm: bool,
     edit_osc52_clipboard_write: bool,
     edit_osc52_clipboard_read: bool,
+    edit_notify_long_blocks: bool,
+    edit_notify_long_block_threshold_ms: u64,
+    edit_show_repo_strip: bool,
     edit_ai_enabled: bool,
     edit_ai_provider: String,
     edit_ai_model: String,
@@ -107,6 +110,9 @@ impl ConfigPanel {
             edit_paste_confirm: true,
             edit_osc52_clipboard_write: true,
             edit_osc52_clipboard_read: false,
+            edit_notify_long_blocks: true,
+            edit_notify_long_block_threshold_ms: 10_000,
+            edit_show_repo_strip: true,
             edit_ai_enabled: false,
             edit_ai_provider: "anthropic".to_string(),
             edit_ai_model: String::new(),
@@ -188,6 +194,9 @@ impl ConfigPanel {
         self.edit_paste_confirm = config.paste_confirm;
         self.edit_osc52_clipboard_write = config.osc52_clipboard_write;
         self.edit_osc52_clipboard_read = config.osc52_clipboard_read;
+        self.edit_notify_long_blocks = config.notify_long_blocks;
+        self.edit_notify_long_block_threshold_ms = config.notify_long_block_threshold_ms;
+        self.edit_show_repo_strip = config.show_repo_strip;
         self.edit_ai_enabled = config.ai_enabled;
         self.edit_ai_provider = config.ai_provider.clone();
         self.edit_ai_model = config.ai_model.clone();
@@ -225,6 +234,9 @@ impl ConfigPanel {
         config.paste_confirm = self.edit_paste_confirm;
         config.osc52_clipboard_write = self.edit_osc52_clipboard_write;
         config.osc52_clipboard_read = self.edit_osc52_clipboard_read;
+        config.notify_long_blocks = self.edit_notify_long_blocks;
+        config.notify_long_block_threshold_ms = self.edit_notify_long_block_threshold_ms;
+        config.show_repo_strip = self.edit_show_repo_strip;
         config.ai_enabled = self.edit_ai_enabled;
         config.ai_provider = self.edit_ai_provider.clone();
         config.ai_model = self.edit_ai_model.trim().to_string();
@@ -1155,6 +1167,45 @@ impl ConfigPanel {
 
         ui.separator();
 
+        ui.label(RichText::new("Notifications").strong());
+        if ui
+            .checkbox(
+                &mut self.edit_notify_long_blocks,
+                "Notify when a long command finishes unwatched",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Long-command threshold (ms):");
+            if ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.edit_notify_long_block_threshold_ms,
+                        1_000..=600_000,
+                    )
+                    .logarithmic(true)
+                    .show_value(true),
+                )
+                .changed()
+            {
+                self.has_changes = true;
+            }
+        });
+
+        if ui
+            .checkbox(
+                &mut self.edit_show_repo_strip,
+                "Show git branch/dirty state in pane headers",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+
+        ui.separator();
+
         ui.label(RichText::new("Security").strong());
         if ui
             .checkbox(
@@ -1348,5 +1399,33 @@ mod tests {
         assert!(applied.paste_confirm);
         assert!(applied.osc52_clipboard_write);
         assert!(!applied.osc52_clipboard_read);
+    }
+
+    #[test]
+    fn notification_and_repo_strip_settings_round_trip_through_panel_buffer() {
+        let source = Config {
+            notify_long_blocks: false,
+            notify_long_block_threshold_ms: 30_000,
+            show_repo_strip: false,
+            ..Config::default()
+        };
+
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+
+        assert!(!panel.edit_notify_long_blocks);
+        assert_eq!(panel.edit_notify_long_block_threshold_ms, 30_000);
+        assert!(!panel.edit_show_repo_strip);
+
+        panel.edit_notify_long_blocks = true;
+        panel.edit_notify_long_block_threshold_ms = 5_000;
+        panel.edit_show_repo_strip = true;
+
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+
+        assert!(applied.notify_long_blocks);
+        assert_eq!(applied.notify_long_block_threshold_ms, 5_000);
+        assert!(applied.show_repo_strip);
     }
 }
