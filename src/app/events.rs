@@ -327,7 +327,10 @@ pub fn key_to_string(key: egui::Key) -> Option<&'static str> {
         egui::Key::Plus => Some("+"),
         egui::Key::Minus => Some("-"),
         egui::Key::Slash => Some("/"),
-        egui::Key::Backslash => Some("\\"),
+        // canonical 存储形式是单词 `backslash`（jterm_core 的家族约定，
+        // 让 TOML/JSON 配置无需转义）；这里直接产出 canonical 形式，
+        // 绑定表查找就不会错过。
+        egui::Key::Backslash => Some("backslash"),
         egui::Key::Semicolon => Some(";"),
         egui::Key::Quote => Some("'"),
         egui::Key::OpenBracket => Some("["),
@@ -403,7 +406,7 @@ mod tests {
         };
         assert_eq!(
             build_keybinding_string(egui::Key::Backslash, ctrl).as_deref(),
-            Some("ctrl+\\")
+            Some("ctrl+backslash")
         );
 
         let ctrl_shift = egui::Modifiers {
@@ -414,6 +417,48 @@ mod tests {
             build_keybinding_string(egui::Key::Slash, ctrl_shift).as_deref(),
             Some("ctrl+shift+/")
         );
+    }
+
+    /// 运行时构造的查找键必须已经是 jterm_core 的 canonical 形式：
+    /// `get_command` 虽会再规范化一次，但这里锁死"构造即 canonical"，
+    /// 使查找永远不可能因拼写差异而错过绑定表键。
+    #[test]
+    fn build_keybinding_string_always_emits_core_canonical_chords() {
+        let mod_sets = [
+            egui::Modifiers::NONE,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..Default::default()
+            },
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+        ];
+        for key in egui::Key::ALL {
+            for modifiers in mod_sets {
+                let Some(chord) = build_keybinding_string(*key, modifiers) else {
+                    continue;
+                };
+                let parsed = jterm_core::keybindings::parse(&chord)
+                    .unwrap_or_else(|e| panic!("chord {chord:?} must parse in core: {e}"));
+                assert_eq!(
+                    parsed.canonical(),
+                    chord,
+                    "build_keybinding_string output must be a canonical fixed point"
+                );
+            }
+        }
     }
 
     #[test]

@@ -182,7 +182,7 @@ Defaults include:
 | Left/right / top/bottom split | `Ctrl+Shift+E` / `Ctrl+Shift+D` |
 | Focus pane by direction | `Ctrl+Alt+Arrow` |
 | Resize pane divider | `Ctrl+Alt+Shift+Arrow` |
-| Zoom / restore focused pane | `Ctrl+Shift+Enter` |
+| Zoom / restore focused pane | `Ctrl+Shift+Enter` / `Ctrl+Shift+Z` |
 | Equalize all pane dividers | Command palette: “Equalize Panes” |
 | Font size increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | Help | `Ctrl+Shift+/` |
@@ -199,9 +199,15 @@ a flat TOML table:
 "ctrl+shift+w" = "none" # remove a default binding
 ```
 
-Modifier order and common aliases (`Control`, `Cmd`, `Enter`, `ArrowLeft`,
-and similar) are normalized. Invalid entries are reported and skipped without
-discarding the other valid overrides.
+Chord parsing is shared with the other jterm terminals (`jterm_core`):
+modifier order and aliases (`Control`, `Option`, `Cmd`/`Win`/`Meta`, `Enter`,
+`Esc`, `ArrowLeft`, `PageUp`/`Prior` and similar) are normalized, `F1`–`F24`
+and `Space` are bindable, and the sidebar chord may be spelled either
+`"ctrl+\\"` or `"ctrl+backslash"` — both parse, and the word form is the
+canonical spelling so the file never needs escaping. Assigning `none`,
+`false`, `disabled`, `unbind` or an empty string removes a default binding.
+Invalid entries are reported and skipped without discarding the other valid
+overrides.
 
 The in-app help panel is generated from the active bindings, so it reflects
 customizations. Copy, paste and keyboard font zoom use this same command path;

@@ -1,4 +1,8 @@
 /// 快捷键可配置化系统
+///
+/// 组合键字符串的解析/规范化/美化交给家族共享的
+/// `jterm_core::keybindings`（四个 jterm 语法的并集，一个 canonical
+/// 存储形式）。本文件只保留 jterm2 的命令词表和绑定表本身。
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -296,10 +300,11 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+shift+/".to_string(), "help:toggle".to_string());
 
-        // 侧边栏
+        // 侧边栏。存储用共享语法的 canonical 拼写 `backslash`：用户配置里
+        // "ctrl+\\" 与 "ctrl+backslash" 都解析到同一 chord，TOML 无需转义。
         bindings
             .bindings
-            .insert("ctrl+\\".to_string(), "sidebar:toggle".to_string());
+            .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
 
         // AI agent 面板
         bindings
@@ -351,6 +356,11 @@ impl KeyBindings {
             "ctrl+shift+return".to_string(),
             "pane:zoom_toggle".to_string(),
         );
+        // 家族契约的 zoom 键位（jterm_core DEFAULT_CHORDS）。保留上面的
+        // ctrl+shift+return 以兼容既有肌肉记忆。
+        bindings
+            .bindings
+            .insert("ctrl+shift+z".to_string(), "pane:zoom_toggle".to_string());
 
         // OSC 133 命令跳转：上一/下一个 shell 提示符
         bindings.bindings.insert(
@@ -399,27 +409,14 @@ impl KeyBindings {
         out
     }
 
-    /// 将 "ctrl+shift+t" 美化为 "Ctrl+Shift+T"
+    /// 将 "ctrl+shift+t" 美化为 "Ctrl+Shift+T"（共享的 display 形式：
+    /// `return` 显示为 Enter、`backslash` 显示为 `\`）。无法解析的字符串
+    /// 原样返回，保证帮助面板不因单个坏键位而崩。
     fn prettify_binding(key: &str) -> String {
-        key.split('+')
-            .map(|tok| {
-                if tok == "return" {
-                    return "Enter".to_string();
-                }
-                if tok == "pageup" {
-                    return "PageUp".to_string();
-                }
-                if tok == "pagedown" {
-                    return "PageDown".to_string();
-                }
-                let mut chars = tok.chars();
-                match chars.next() {
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                    None => String::new(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("+")
+        match jterm_core::keybindings::parse(key) {
+            Ok(chord) => chord.display(),
+            Err(_) => key.to_string(),
+        }
     }
 
     /// 加载配置文件，与默认配置合并
@@ -455,7 +452,7 @@ impl KeyBindings {
                 }
             };
             let command = raw_command.trim().to_ascii_lowercase();
-            if matches!(command.as_str(), "none" | "unbind") {
+            if jterm_core::keybindings::is_unbind_token(&command) {
                 self.bindings.remove(&key);
                 continue;
             }
@@ -470,150 +467,15 @@ impl KeyBindings {
         warnings
     }
 
+    /// 组合键规范化：交给 `jterm_core::keybindings::parse`，返回共享的
+    /// canonical 存储形式（小写、ctrl+shift+alt+super 次序、`\` 折叠为
+    /// `backslash`）。相比旧的本地 allowlist，语法是四个 jterm 的并集：
+    /// `space` 可绑定、f13–f24 与 X11 风格符号名（`minus`、`grave`…）
+    /// 也能解析——这是有意的家族标准化。
     fn normalize_binding(binding: &str) -> Result<String, String> {
-        let binding = binding.trim().to_ascii_lowercase();
-        if binding.is_empty() {
-            return Err("key chord is empty".to_string());
-        }
-
-        // A literal plus key is represented as the final `+` in chords such as
-        // `ctrl++`; split the modifier prefix separately to retain it.
-        let (prefix, mut key) = if binding == "+" {
-            ("", "+")
-        } else if let Some(prefix) = binding.strip_suffix('+') {
-            (prefix.trim_end_matches('+'), "+")
-        } else {
-            match binding.rsplit_once('+') {
-                Some((prefix, key)) => (prefix, key),
-                None => ("", binding.as_str()),
-            }
-        };
-        key = match key.trim() {
-            "enter" => "return",
-            "arrowup" => "up",
-            "arrowdown" => "down",
-            "arrowleft" => "left",
-            "arrowright" => "right",
-            other => other,
-        };
-        if !Self::is_supported_key(key) {
-            return Err(format!("unsupported key '{key}'"));
-        }
-
-        let mut ctrl = false;
-        let mut shift = false;
-        let mut alt = false;
-        let mut super_key = false;
-        if !prefix.is_empty() {
-            for modifier in prefix.split('+').map(str::trim) {
-                let slot = match modifier {
-                    "ctrl" | "control" => &mut ctrl,
-                    "shift" => &mut shift,
-                    "alt" => &mut alt,
-                    "super" | "cmd" | "command" => &mut super_key,
-                    "" => return Err("empty modifier".to_string()),
-                    other => return Err(format!("unsupported modifier '{other}'")),
-                };
-                if *slot {
-                    return Err(format!("duplicate modifier '{modifier}'"));
-                }
-                *slot = true;
-            }
-        }
-
-        let mut normalized = String::with_capacity(binding.len());
-        for (enabled, name) in [
-            (ctrl, "ctrl+"),
-            (shift, "shift+"),
-            (alt, "alt+"),
-            (super_key, "super+"),
-        ] {
-            if enabled {
-                normalized.push_str(name);
-            }
-        }
-        normalized.push_str(key);
-        Ok(normalized)
-    }
-
-    fn is_supported_key(key: &str) -> bool {
-        matches!(
-            key,
-            "return"
-                | "escape"
-                | "backspace"
-                | "tab"
-                | "up"
-                | "down"
-                | "left"
-                | "right"
-                | "home"
-                | "end"
-                | "insert"
-                | "delete"
-                | "pageup"
-                | "pagedown"
-                | "f1"
-                | "f2"
-                | "f3"
-                | "f4"
-                | "f5"
-                | "f6"
-                | "f7"
-                | "f8"
-                | "f9"
-                | "f10"
-                | "f11"
-                | "f12"
-                | "a"
-                | "b"
-                | "c"
-                | "d"
-                | "e"
-                | "f"
-                | "g"
-                | "h"
-                | "i"
-                | "j"
-                | "k"
-                | "l"
-                | "m"
-                | "n"
-                | "o"
-                | "p"
-                | "q"
-                | "r"
-                | "s"
-                | "t"
-                | "u"
-                | "v"
-                | "w"
-                | "x"
-                | "y"
-                | "z"
-                | "0"
-                | "1"
-                | "2"
-                | "3"
-                | "4"
-                | "5"
-                | "6"
-                | "7"
-                | "8"
-                | "9"
-                | ","
-                | "."
-                | "+"
-                | "-"
-                | "/"
-                | "\\"
-                | ";"
-                | "'"
-                | "["
-                | "]"
-                | "="
-                | "`"
-        )
+        jterm_core::keybindings::parse(binding)
+            .map(|chord| chord.canonical())
+            .map_err(|error| error.to_string())
     }
 
     /// 获取配置文件路径
@@ -679,11 +541,12 @@ mod tests {
             ("ctrl+pagedown", Command::SessionNext),
             ("ctrl+pageup", Command::SessionPrev),
             ("ctrl+shift+o", Command::ConfigToggle),
-            ("ctrl+\\", Command::SidebarToggle),
+            ("ctrl+backslash", Command::SidebarToggle),
             ("ctrl+shift+a", Command::AgentToggle),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
             ("ctrl+shift+return", Command::PaneZoomToggle),
+            ("ctrl+shift+z", Command::PaneZoomToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+/", Command::HelpToggle),
             ("shift+insert", Command::EditPaste),
@@ -724,6 +587,92 @@ mod tests {
             );
         }
         assert_eq!(bindings.get_command("ctrl+0"), Some(Command::FontReset));
+
+        // 侧边栏存储为 canonical 的 "ctrl+backslash"，但字面反斜杠拼写
+        // （既有用户配置的写法）必须命中同一绑定。
+        assert_eq!(
+            bindings.get_command("ctrl+\\"),
+            Some(Command::SidebarToggle)
+        );
+    }
+
+    /// jterm2 对家族默认键位契约每一行的本地命令。jterm2 目前实现了
+    /// `DEFAULT_CHORDS` 的全部行（含 sidebar），因此没有跳过项；若
+    /// jterm_core 新增了 jterm2 尚未实现的行，穷举 match 会编译失败，
+    /// 迫使在这里显式选择：给出映射，或返回 `None` 并留注释说明跳过。
+    fn local_command_for(action: jterm_core::keybindings::CommonAction) -> Option<Command> {
+        use jterm_core::keybindings::CommonAction as A;
+        Some(match action {
+            A::NewTab => Command::SessionNew,
+            A::ClosePaneOrTab => Command::TerminalClosePane,
+            A::Copy => Command::EditCopy,
+            A::Paste => Command::EditPaste,
+            A::NextTab => Command::SessionNext,
+            A::PrevTab => Command::SessionPrev,
+            A::NextTabPage => Command::SessionNext,
+            A::PrevTabPage => Command::SessionPrev,
+            A::QuickSwitch(n) => Command::SessionJump(usize::from(n) - 1),
+            A::LastTab => Command::SessionLast,
+            A::FontIncrease => Command::FontIncrease,
+            A::FontDecrease => Command::FontDecrease,
+            A::FontReset => Command::FontReset,
+            A::Search => Command::SearchOpen,
+            A::CommandPalette => Command::CommandPaletteToggle,
+            A::Settings => Command::ConfigToggle,
+            A::Sidebar => Command::SidebarToggle,
+            A::DebugPanel => Command::DebugToggle,
+            A::ScrollUp => Command::TerminalScrollUp,
+            A::ScrollDown => Command::TerminalScrollDown,
+            A::PaneFocusLeft => Command::PaneFocusLeft,
+            A::PaneFocusRight => Command::PaneFocusRight,
+            A::PaneFocusUp => Command::PaneFocusUp,
+            A::PaneFocusDown => Command::PaneFocusDown,
+            A::PaneResizeLeft => Command::PaneResizeLeft,
+            A::PaneResizeRight => Command::PaneResizeRight,
+            A::PaneResizeUp => Command::PaneResizeUp,
+            A::PaneResizeDown => Command::PaneResizeDown,
+            A::SplitSideBySide => Command::TerminalSplitVertical,
+            A::SplitStacked => Command::TerminalSplitHorizontal,
+            A::PaneZoom => Command::PaneZoomToggle,
+        })
+    }
+
+    #[test]
+    fn default_bindings_implement_every_row_of_the_family_chord_contract() {
+        let bindings = KeyBindings::default_bindings();
+        for (action, chord) in jterm_core::keybindings::DEFAULT_CHORDS {
+            let Some(command) = local_command_for(*action) else {
+                continue; // 显式跳过：jterm2 未实现的契约行（目前没有）。
+            };
+            // 契约行必须以 canonical 拼写直接存在于绑定表中（map 键即
+            // canonical 形式），并且经 get_command 的规范化路径可解析。
+            assert_eq!(
+                bindings.bindings.get(*chord),
+                Some(&command.to_string()),
+                "family contract row {action:?} must be stored under canonical chord {chord:?}"
+            );
+            assert_eq!(
+                bindings.get_command(chord),
+                Some(command),
+                "family contract row {action:?} ({chord}) must resolve via get_command"
+            );
+        }
+    }
+
+    #[test]
+    fn default_binding_keys_are_core_canonical_and_commands_parse() {
+        let bindings = KeyBindings::default_bindings();
+        for (key, command) in &bindings.bindings {
+            assert_eq!(
+                KeyBindings::normalize_binding(key).as_deref(),
+                Ok(key.as_str()),
+                "default chord {key:?} must be a canonical fixed point, or runtime lookups miss it"
+            );
+            assert!(
+                command.parse::<Command>().is_ok(),
+                "default command {command:?} must parse"
+            );
+        }
     }
 
     #[test]
@@ -769,6 +718,9 @@ mod tests {
                     " SESSION:NEW ".to_string(),
                 ),
                 ("ctrl+shift+t".to_string(), "none".to_string()),
+                // 家族共享的解绑词表（is_unbind_token）：false/disabled/
+                // unbind 与 none 等价。
+                ("ctrl+shift+w".to_string(), "false".to_string()),
                 ("ctrl+shift+y".to_string(), "not:a:command".to_string()),
             ]),
         };
@@ -780,6 +732,7 @@ mod tests {
             Some(Command::SessionNew)
         );
         assert_eq!(bindings.get_command("ctrl+shift+t"), None);
+        assert_eq!(bindings.get_command("ctrl+shift+w"), None);
         assert_eq!(bindings.get_command("ctrl+shift+y"), None);
         assert_eq!(warnings.len(), 1);
     }
@@ -794,7 +747,41 @@ mod tests {
             KeyBindings::normalize_binding("ctrl++").as_deref(),
             Ok("ctrl++")
         );
+        // 两种反斜杠拼写折叠到同一 canonical 存储形式。
+        assert_eq!(
+            KeyBindings::normalize_binding("Ctrl+\\").as_deref(),
+            Ok("ctrl+backslash")
+        );
+        assert_eq!(
+            KeyBindings::normalize_binding("ctrl+backslash").as_deref(),
+            Ok("ctrl+backslash")
+        );
+        // 共享语法有意放宽的点：space 可绑定（旧 allowlist 拒绝它）。
+        assert_eq!(
+            KeyBindings::normalize_binding("ctrl+space").as_deref(),
+            Ok("ctrl+space")
+        );
         assert!(KeyBindings::normalize_binding("ctrl+ctrl+x").is_err());
-        assert!(KeyBindings::normalize_binding("ctrl+space").is_err());
+        assert!(KeyBindings::normalize_binding("ctrl+bogus").is_err());
+    }
+
+    #[test]
+    fn prettify_uses_the_family_display_form() {
+        assert_eq!(
+            KeyBindings::prettify_binding("ctrl+shift+t"),
+            "Ctrl+Shift+T"
+        );
+        assert_eq!(
+            KeyBindings::prettify_binding("ctrl+shift+return"),
+            "Ctrl+Shift+Enter"
+        );
+        assert_eq!(KeyBindings::prettify_binding("ctrl+backslash"), "Ctrl+\\");
+        assert_eq!(KeyBindings::prettify_binding("ctrl+pageup"), "Ctrl+PageUp");
+        assert_eq!(
+            KeyBindings::prettify_binding("ctrl+shift+/"),
+            "Ctrl+Shift+/"
+        );
+        // 解析失败时原样返回，帮助面板不因坏键位崩掉。
+        assert_eq!(KeyBindings::prettify_binding("ctrl+bogus"), "ctrl+bogus");
     }
 }
