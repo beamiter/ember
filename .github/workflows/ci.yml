@@ -36,45 +36,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  msrv:
-    name: MSRV (Rust 1.92)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            pkg-config \
-            libfontconfig1-dev \
-            libwayland-dev \
-            libx11-dev \
-            libx11-xcb-dev \
-            libxcb1-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxcursor-dev \
-            libxi-dev \
-            libxrandr-dev \
-            libxkbcommon-dev \
-            libegl1-mesa-dev \
-            libgl1-mesa-dev
-
-      - name: Install minimum supported Rust toolchain
-        uses: dtolnay/rust-toolchain@1.92.0
-
-      - name: Cache Rust build data
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: msrv-1.92
-
-      - name: Check minimum supported Rust version
-        run: cargo check --workspace --all-targets --all-features --locked
-
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

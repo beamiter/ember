@@ -60,9 +60,9 @@ not include images.
 
 ## Platform and prerequisites
 
-jterm2 currently targets Linux (X11 and Wayland). Building requires Rust 1.92
-or newer and the native window/graphics development packages used by winit and
-WGPU.
+jterm2 currently targets Linux (X11 and Wayland). Building requires a current
+Rust stable toolchain and the native window/graphics development packages used
+by winit and WGPU.
 
 On Ubuntu/Debian:
 
