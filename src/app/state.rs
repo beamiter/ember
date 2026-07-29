@@ -175,8 +175,9 @@ pub struct TerminalApp {
     // Theme system
     pub current_theme: crate::theme::Theme,
 
-    // Layout system (split panes)
-    pub layout_manager: layout::LayoutManager,
+    /// Split panes, owned per tab. Panes live and die with their tab; the tab
+    /// bar renders one entry per tab, never one per pane.
+    pub tabs: crate::tab_manager::TabManager,
 
     // Pane renderers (one per pane)
     pub pane_renderers: Vec<TerminalRenderer>,

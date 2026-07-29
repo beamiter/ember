@@ -22,6 +22,7 @@ pub mod session_manager;
 pub mod session_persistence;
 pub mod shell;
 pub mod sidebar;
+pub mod tab_manager;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

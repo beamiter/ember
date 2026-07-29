@@ -52,6 +52,16 @@ where
     Ok(serde_json::from_value(value).ok())
 }
 
+/// 同上，用于 per-tab 布局列表：整段解析失败退回空列表，启动端会回落到
+/// `layout` 字段（旧快照）或单 tab。
+fn deserialize_tab_layouts<'de, D>(deserializer: D) -> Result<Vec<LayoutSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 /// 会话持久化数据结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -73,8 +83,15 @@ pub struct SessionsSnapshot {
     pub sessions: Vec<SessionSnapshot>,
     #[serde(default)]
     pub active_index: Option<usize>,
+    /// 兼容字段：v3 及更早只有一棵全局布局树。写入时填当前 tab 的布局，
+    /// 让旧版本仍能打开新快照；读取时只在 `tabs` 缺失时用于迁移。
     #[serde(default, deserialize_with = "deserialize_optional_layout")]
     pub layout: Option<LayoutSnapshot>,
+    /// v4：每个 tab 一棵布局树。窗格归 tab 所有，因此布局也必须按 tab 存。
+    #[serde(default, deserialize_with = "deserialize_tab_layouts")]
+    pub tabs: Vec<LayoutSnapshot>,
+    #[serde(default)]
+    pub active_tab: Option<usize>,
 }
 
 impl SessionsSnapshot {
@@ -82,13 +99,22 @@ impl SessionsSnapshot {
     pub fn from_snapshots(
         sessions: Vec<SessionSnapshot>,
         active_index: Option<usize>,
-        layout: Option<LayoutSnapshot>,
+        tabs: Vec<LayoutSnapshot>,
+        active_tab: Option<usize>,
     ) -> Self {
+        // `layout` 保留给旧版本读取：给它当前 tab 的布局，旧版本至少能开出
+        // 用户最后看到的那组窗格，而不是一个空布局。
+        let layout = active_tab
+            .and_then(|idx| tabs.get(idx))
+            .or_else(|| tabs.first())
+            .cloned();
         SessionsSnapshot {
-            version: 3,
+            version: 4,
             sessions,
             active_index,
             layout,
+            tabs,
+            active_tab,
         }
     }
 
@@ -126,10 +152,12 @@ impl SessionsSnapshot {
         if !path.exists() {
             return Ok((
                 SessionsSnapshot {
-                    version: 3,
+                    version: 4,
                     sessions: vec![],
                     active_index: None,
                     layout: None,
+                    tabs: Vec::new(),
+                    active_tab: None,
                 },
                 Vec::new(),
             ));
@@ -230,39 +258,68 @@ impl SessionsSnapshot {
             warnings.push("active session index was outside the restored list".to_string());
         }
 
-        if let Some(layout) = self.layout.take() {
-            let allowed_session_ids = self
-                .sessions
-                .iter()
-                .filter_map(|session| session.session_id.as_ref())
-                .cloned()
-                .collect::<HashSet<_>>();
-            let mut used_session_ids = HashSet::new();
-            let mut node_count = 0usize;
-            let mut layout_repaired = false;
+        let allowed_session_ids = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.session_id.as_ref())
+            .cloned()
+            .collect::<HashSet<_>>();
+        // 一个会话至多出现在一个窗格里，而这个约束跨 tab 成立——否则两个
+        // tab 会争夺同一个 PTY。`used_session_ids` 因此在所有 tab 间共享。
+        let mut used_session_ids = HashSet::new();
+        let mut node_count = 0usize;
+        let mut layout_repaired = false;
+
+        let raw_tabs = std::mem::take(&mut self.tabs);
+        let migrating = raw_tabs.is_empty();
+        let raw_tabs = if migrating {
+            self.layout.take().into_iter().collect()
+        } else {
+            raw_tabs
+        };
+
+        for tab in raw_tabs {
             let root = sanitize_layout_node(
-                layout.root,
+                tab.root,
                 &allowed_session_ids,
                 &mut used_session_ids,
                 &mut node_count,
                 0,
                 &mut layout_repaired,
             );
-            let focused_session_id = layout.focused_session_id.filter(|session_id| {
-                let keep = used_session_ids.contains(session_id);
-                layout_repaired |= !keep;
-                keep
-            });
-            self.layout = root.map(|root| LayoutSnapshot {
-                root,
-                focused_session_id,
-            });
-            if self.layout.is_none() {
-                layout_repaired = true;
+            match root {
+                Some(root) => {
+                    let focused_session_id = tab.focused_session_id.filter(|session_id| {
+                        let keep = used_session_ids.contains(session_id);
+                        layout_repaired |= !keep;
+                        keep
+                    });
+                    self.tabs.push(LayoutSnapshot {
+                        root,
+                        focused_session_id,
+                    });
+                }
+                // 空 tab 不是可渲染的状态，整个丢掉；它的会话会在启动时
+                // 作为孤儿各自获得一个新 tab。
+                None => layout_repaired = true,
             }
-            if layout_repaired {
-                warnings.push("repaired an invalid or oversized pane layout".to_string());
-            }
+        }
+
+        if self
+            .active_tab
+            .is_some_and(|index| index >= self.tabs.len())
+        {
+            self.active_tab = self.tabs.len().checked_sub(1);
+            layout_repaired = true;
+        }
+        self.layout = self
+            .active_tab
+            .and_then(|idx| self.tabs.get(idx))
+            .or_else(|| self.tabs.first())
+            .cloned();
+
+        if layout_repaired {
+            warnings.push("repaired an invalid or oversized pane layout".to_string());
         }
         warnings
     }
@@ -650,16 +707,21 @@ mod tests {
             },
             focused_session_id: Some("second-session".to_string()),
         };
-        let snapshot = SessionsSnapshot::from_snapshots(snapshots, Some(1), Some(layout.clone()));
+        let snapshot =
+            SessionsSnapshot::from_snapshots(snapshots, Some(1), vec![layout.clone()], Some(0));
         assert_eq!(snapshot.sessions.len(), 2);
         assert_eq!(snapshot.sessions[0].cwd, Some("/home/user".to_string()));
         assert_eq!(snapshot.sessions[1].cwd, Some("/tmp".to_string()));
         assert_eq!(snapshot.active_index, Some(1));
-        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.version, 4);
+        assert_eq!(snapshot.tabs, vec![layout.clone()]);
+        // 旧字段仍然写出当前 tab 的布局，供旧版本读取。
         assert_eq!(snapshot.layout, Some(layout.clone()));
 
         let encoded = serde_json::to_string(&snapshot).unwrap();
         let decoded: SessionsSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.tabs, vec![layout.clone()]);
+        assert_eq!(decoded.active_tab, Some(0));
         assert_eq!(decoded.layout, Some(layout));
     }
 
@@ -687,6 +749,99 @@ mod tests {
         assert_eq!(snapshot.layout, None);
     }
 
+    /// v3 快照只有一棵全局布局树。它描述的是用户最后看到的那组窗格,所以
+    /// 迁移时应该原样变成第一个 tab,而不是散成一堆单窗格 tab。
+    #[test]
+    fn a_v3_snapshot_migrates_its_single_layout_into_the_first_tab() {
+        let json = r#"{
+            "version": 3,
+            "sessions": [
+                {"name": "a", "tags": [], "session_id": "session-a"},
+                {"name": "b", "tags": [], "session_id": "session-b"}
+            ],
+            "active_index": 1,
+            "layout": {
+                "root": {
+                    "kind": "split",
+                    "horizontal": true,
+                    "ratio": 0.5,
+                    "first": {"kind": "pane", "session_id": "session-a"},
+                    "second": {"kind": "pane", "session_id": "session-b"}
+                },
+                "focused_session_id": "session-b"
+            }
+        }"#;
+        let mut snapshot: SessionsSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.tabs.is_empty());
+
+        let warnings = snapshot.sanitize();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert_eq!(
+            snapshot.tabs[0].focused_session_id.as_deref(),
+            Some("session-b")
+        );
+        assert!(matches!(
+            snapshot.tabs[0].root,
+            LayoutNodeSnapshot::Split { .. }
+        ));
+    }
+
+    /// 同一个会话不能同时出现在两个 tab 的窗格里,否则两个 tab 会争夺同一个
+    /// PTY——去重必须跨 tab 生效,而不只是在单棵树内。
+    #[test]
+    fn a_session_cannot_appear_in_two_tabs() {
+        let pane = |id: &str| LayoutSnapshot {
+            root: LayoutNodeSnapshot::Pane {
+                session_id: id.to_string(),
+            },
+            focused_session_id: Some(id.to_string()),
+        };
+        let mut snapshot = SessionsSnapshot::from_snapshots(
+            vec![SessionSnapshot {
+                name: "a".to_string(),
+                tags: vec![],
+                cwd: None,
+                session_id: Some("session-a".to_string()),
+                custom_name: None,
+            }],
+            Some(0),
+            vec![pane("session-a"), pane("session-a")],
+            Some(0),
+        );
+
+        let warnings = snapshot.sanitize();
+
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_active_tab_is_clamped() {
+        let mut snapshot = SessionsSnapshot::from_snapshots(
+            vec![SessionSnapshot {
+                name: "a".to_string(),
+                tags: vec![],
+                cwd: None,
+                session_id: Some("session-a".to_string()),
+                custom_name: None,
+            }],
+            Some(0),
+            vec![LayoutSnapshot {
+                root: LayoutNodeSnapshot::Pane {
+                    session_id: "session-a".to_string(),
+                },
+                focused_session_id: None,
+            }],
+            Some(9),
+        );
+
+        snapshot.sanitize();
+
+        assert_eq!(snapshot.active_tab, Some(0));
+    }
+
     #[test]
     fn restored_sessions_and_fields_are_bounded_before_spawn() {
         let session = SessionSnapshot {
@@ -701,6 +856,7 @@ mod tests {
         let mut snapshot = SessionsSnapshot::from_snapshots(
             vec![session; MAX_RESTORED_SESSIONS + 10],
             Some(usize::MAX),
+            Vec::new(),
             None,
         );
 
@@ -754,7 +910,7 @@ mod tests {
         let snapshot = SessionsSnapshot::from_snapshots(
             sessions,
             Some(usize::MAX),
-            Some(LayoutSnapshot {
+            vec![LayoutSnapshot {
                 root: LayoutNodeSnapshot::Split {
                     horizontal: false,
                     ratio: f32::NAN,
@@ -766,7 +922,8 @@ mod tests {
                     }),
                 },
                 focused_session_id: Some("session-0".to_string()),
-            }),
+            }],
+            Some(0),
         );
 
         snapshot.save(&path).unwrap();
@@ -804,6 +961,7 @@ mod tests {
         let snapshot = SessionsSnapshot::from_snapshots(
             vec![session; MAX_RESTORED_SESSIONS + 1],
             Some(usize::MAX),
+            Vec::new(),
             None,
         );
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();

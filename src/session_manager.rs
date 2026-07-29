@@ -737,24 +737,6 @@ impl SessionManager {
         }
     }
 
-    /// 切换到下一个会话
-    pub fn switch_to_next_session(&mut self) -> usize {
-        let next = (self.active_index + 1) % self.sessions.len();
-        self.switch_session(next);
-        next
-    }
-
-    /// 切换到前一个会话
-    pub fn switch_to_prev_session(&mut self) -> usize {
-        let previous = if self.active_index == 0 {
-            self.sessions.len() - 1
-        } else {
-            self.active_index - 1
-        };
-        self.switch_session(previous);
-        previous
-    }
-
     /// 获取当前活跃会话的索引
     pub fn active_index(&self) -> usize {
         self.active_index
@@ -808,27 +790,6 @@ impl SessionManager {
         self.sessions
             .iter()
             .position(|session| session.metadata.session_id == session_id)
-    }
-
-    /// 重排会话顺序（拖拽）
-    pub fn reorder_sessions(&mut self, from_idx: usize, to_idx: usize) {
-        if from_idx < self.sessions.len() && to_idx < self.sessions.len() && from_idx != to_idx {
-            let session = self.sessions.remove(from_idx);
-            self.sessions.insert(to_idx, session);
-            let responses = self.protocol_responses.remove(from_idx);
-            self.protocol_responses.insert(to_idx, responses);
-
-            // 如果移动的是活跃会话，更新active_index
-            if self.active_index == from_idx {
-                self.active_index = to_idx;
-            } else if from_idx < self.active_index && to_idx >= self.active_index {
-                // 从左边移到右边，active_index向左移动
-                self.active_index -= 1;
-            } else if from_idx > self.active_index && to_idx <= self.active_index {
-                // 从右边移到左边，active_index向右移动
-                self.active_index += 1;
-            }
-        }
     }
 
     /// 获取会话列表的快照用于持久化（包含 cwd）

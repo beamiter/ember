@@ -1,0 +1,434 @@
+//! Tab ownership of split panes.
+//!
+//! Every tab owns a private [`LayoutManager`], so a split is a purely
+//! tab-local event: it never adds a row to the tab bar, and the panes it
+//! creates cannot outlive the tab. Previously a single global layout tree
+//! held every session and the tab bar rendered one tab per session, which
+//! made splitting look like it spawned tabs and made closing a tab yank one
+//! pane out from under a split.
+//!
+//! Session indices stay global (they index [`crate::session_manager::SessionManager`]'s
+//! flat vector); this type keeps every tab's tree agreeing with that vector
+//! as sessions are inserted and removed.
+
+use crate::layout::LayoutManager;
+
+pub struct TabManager {
+    tabs: Vec<LayoutManager>,
+    active: usize,
+}
+
+impl TabManager {
+    /// 单 tab、单窗格的初始状态。
+    pub fn new(session_idx: usize) -> Self {
+        TabManager {
+            tabs: vec![LayoutManager::new(session_idx)],
+            active: 0,
+        }
+    }
+
+    /// 从恢复出来的布局重建。空列表会退化成 `new(fallback_session_idx)`，
+    /// 因为「零个 tab」不是一个可渲染的状态。
+    pub fn from_layouts(
+        layouts: Vec<LayoutManager>,
+        active: usize,
+        fallback_session_idx: usize,
+    ) -> Self {
+        if layouts.is_empty() {
+            return TabManager::new(fallback_session_idx);
+        }
+        let active = active.min(layouts.len() - 1);
+        TabManager {
+            tabs: layouts,
+            active,
+        }
+    }
+
+    /// 从持久化快照重建 tab 列表。
+    ///
+    /// 关键的收尾是「收养孤儿」：sanitize 只保证同一个会话不会同时出现在两
+    /// 个 tab 里，不保证每个会话都被某个 tab 收下。恢复失败的分支、旧格式里
+    /// 游离在布局之外的会话都会落单，而落单的会话意味着一个活着却永远切不
+    /// 到的 PTY。它们各自获得一个单窗格 tab。
+    pub fn restore(
+        saved_tabs: &[crate::session_persistence::LayoutSnapshot],
+        session_ids: &[String],
+        active_session_idx: usize,
+        saved_active_tab: Option<usize>,
+    ) -> Self {
+        let mut layouts: Vec<LayoutManager> = saved_tabs
+            .iter()
+            .filter_map(|snapshot| LayoutManager::try_from_snapshot(snapshot, session_ids, None))
+            .collect();
+
+        let mut adopted: std::collections::HashSet<usize> = layouts
+            .iter()
+            .flat_map(|tab| tab.session_indices())
+            .collect();
+        for session_idx in 0..session_ids.len() {
+            if adopted.insert(session_idx) {
+                layouts.push(LayoutManager::new(session_idx));
+            }
+        }
+
+        let active = saved_active_tab
+            .filter(|idx| *idx < layouts.len())
+            // 没记录活跃 tab（或它已失效）时跟着活跃会话走。
+            .or_else(|| {
+                layouts
+                    .iter()
+                    .position(|tab| tab.contains_session(active_session_idx))
+            })
+            .unwrap_or(0);
+        Self::from_layouts(layouts, active, active_session_idx)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// 恒为 false——最后一个 tab 关不掉。留着是为了和 `len` 配对，避免
+    /// clippy::len_without_is_empty。
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn layouts(&self) -> &[LayoutManager] {
+        &self.tabs
+    }
+
+    /// 当前 tab 的布局。`active` 始终被维持在合法范围内，因此这里可以
+    /// 返回引用而不是 Option——渲染路径每帧都要用它。
+    pub fn active_layout(&self) -> &LayoutManager {
+        &self.tabs[self.active.min(self.tabs.len() - 1)]
+    }
+
+    pub fn active_layout_mut(&mut self) -> &mut LayoutManager {
+        let idx = self.active.min(self.tabs.len() - 1);
+        &mut self.tabs[idx]
+    }
+
+    pub fn set_active(&mut self, tab_idx: usize) -> bool {
+        if tab_idx >= self.tabs.len() || tab_idx == self.active {
+            return false;
+        }
+        self.active = tab_idx;
+        true
+    }
+
+    /// tab 的「当前选中窗格」所显示的会话。tab 标题、活跃会话路由都以它为准。
+    pub fn focused_session_of(&self, tab_idx: usize) -> Option<usize> {
+        self.tabs.get(tab_idx).and_then(|tab| {
+            tab.focused_session_idx()
+                .or_else(|| tab.session_indices().first().copied())
+        })
+    }
+
+    pub fn active_focused_session(&self) -> Option<usize> {
+        self.focused_session_of(self.active)
+    }
+
+    /// 某个 tab 拥有的全部会话。关闭 tab 时这些会话一起关闭。
+    pub fn sessions_in(&self, tab_idx: usize) -> Vec<usize> {
+        self.tabs
+            .get(tab_idx)
+            .map(|tab| tab.session_indices())
+            .unwrap_or_default()
+    }
+
+    /// 会话所属的 tab。布局保证一个会话至多出现在一个窗格里，因此至多一个 tab。
+    pub fn tab_of_session(&self, session_idx: usize) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.contains_session(session_idx))
+    }
+
+    /// 在当前 tab 之后插入一个新 tab 并激活它。会话索引必须已经存在于
+    /// SessionManager 中，并且调用方已经调用过 [`Self::on_session_inserted`]。
+    pub fn insert_tab_after_active(&mut self, session_idx: usize) -> usize {
+        let at = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(at, LayoutManager::new(session_idx));
+        self.active = at;
+        at
+    }
+
+    /// 移除一个 tab（它的会话已经由调用方关闭）。返回 false 表示这是最后
+    /// 一个 tab——窗口至少要留一个 tab。
+    pub fn remove_tab(&mut self, tab_idx: usize) -> bool {
+        if tab_idx >= self.tabs.len() || self.tabs.len() <= 1 {
+            return false;
+        }
+        self.tabs.remove(tab_idx);
+        if tab_idx < self.active {
+            self.active -= 1;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
+
+    pub fn reorder(&mut self, from_idx: usize, to_idx: usize) {
+        if from_idx == to_idx || from_idx >= self.tabs.len() || to_idx >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from_idx);
+        self.tabs.insert(to_idx, tab);
+        self.active = match self.active {
+            a if a == from_idx => to_idx,
+            a if from_idx < to_idx && a > from_idx && a <= to_idx => a - 1,
+            a if to_idx < from_idx && a >= to_idx && a < from_idx => a + 1,
+            a => a,
+        };
+    }
+
+    /// 新会话插入全局列表后，所有 tab 里 >= 插入点的索引整体右移。
+    pub fn on_session_inserted(&mut self, inserted_idx: usize) {
+        for tab in &mut self.tabs {
+            tab.on_session_inserted(inserted_idx);
+        }
+    }
+
+    /// 会话从全局列表中删除后同步所有 tab。拥有它的 tab 先摘掉对应窗格
+    /// （若那是它的最后一个窗格，则该 tab 已被调用方移除），其余 tab 只做
+    /// 索引左移。
+    pub fn on_session_removed(&mut self, removed_idx: usize) {
+        for tab in &mut self.tabs {
+            if tab.contains_session(removed_idx) {
+                tab.remove_session_leaf(removed_idx);
+            }
+        }
+        for tab in &mut self.tabs {
+            tab.shift_sessions_after_removal(removed_idx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split_active(tabs: &mut TabManager, session_idx: usize) {
+        tabs.active_layout_mut()
+            .split(session_idx, true)
+            .expect("split");
+    }
+
+    #[test]
+    fn splitting_stays_inside_the_active_tab() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        assert_eq!(tabs.len(), 2);
+
+        split_active(&mut tabs, 2);
+
+        // The split added a pane, not a tab.
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.sessions_in(1), vec![1, 2]);
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+    }
+
+    #[test]
+    fn a_tab_owns_every_session_in_its_panes() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        split_active(&mut tabs, 2);
+        split_active(&mut tabs, 3);
+
+        let owned = tabs.sessions_in(1);
+        assert_eq!(owned, vec![1, 2, 3]);
+        for session in owned {
+            assert_eq!(tabs.tab_of_session(session), Some(1));
+        }
+        assert_eq!(tabs.tab_of_session(0), Some(0));
+    }
+
+    #[test]
+    fn the_tab_reports_the_selected_panes_session() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        split_active(&mut tabs, 2);
+        // A fresh split focuses the new pane.
+        assert_eq!(tabs.active_focused_session(), Some(2));
+
+        tabs.active_layout_mut()
+            .focus_pane(crate::layout::PaneDirection::Prev);
+        assert_eq!(tabs.active_focused_session(), Some(1));
+        assert_eq!(tabs.focused_session_of(0), Some(0));
+    }
+
+    #[test]
+    fn removing_a_session_reindexes_other_tabs() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        split_active(&mut tabs, 2);
+        tabs.set_active(0);
+
+        // Session 1 closes: tab 1 loses that pane, and every index above it
+        // shifts down in every tab.
+        tabs.on_session_removed(1);
+
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        assert_eq!(tabs.sessions_in(1), vec![1]); // was session 2
+    }
+
+    #[test]
+    fn closing_a_tabs_last_pane_leaves_the_tab_removable() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+
+        // Tab 1 holds a single pane, so the layout refuses to empty itself.
+        assert!(!tabs.active_layout_mut().remove_session_leaf(1));
+        assert!(tabs.remove_tab(1));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs.active_index(), 0);
+    }
+
+    /// `TerminalApp::close_tab_synced` 的模型级复现:摘掉 tab,再按索引从大到
+    /// 小逐个关闭它的会话。真正的风险是索引漂移——邻居 tab 必须仍然指向原来
+    /// 那些会话。
+    #[test]
+    fn closing_a_tab_takes_all_its_sessions_without_disturbing_neighbours() {
+        let mut tabs = TabManager::new(0); // tab0: [0]
+        tabs.insert_tab_after_active(1); // tab1: [1]
+        split_active(&mut tabs, 2); // tab1: [1, 2]
+        split_active(&mut tabs, 3); // tab1: [1, 2, 3]
+        tabs.insert_tab_after_active(4); // tab2: [4]
+        assert_eq!(tabs.len(), 3);
+
+        let mut owned = tabs.sessions_in(1);
+        assert_eq!(owned, vec![1, 2, 3]);
+        assert!(tabs.remove_tab(1));
+        owned.sort_unstable_by(|a, b| b.cmp(a));
+        for session_idx in owned {
+            tabs.on_session_removed(session_idx);
+        }
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        // Session 4 was the only survivor above the closed tab, and it slid
+        // down to index 1 as the three sessions below it went away.
+        assert_eq!(tabs.sessions_in(1), vec![1]);
+    }
+
+    mod restore {
+        use super::*;
+        use crate::session_persistence::{LayoutNodeSnapshot, LayoutSnapshot};
+
+        fn ids(n: usize) -> Vec<String> {
+            (0..n).map(|i| format!("session-{i}")).collect()
+        }
+
+        fn pane(id: &str) -> LayoutNodeSnapshot {
+            LayoutNodeSnapshot::Pane {
+                session_id: id.to_string(),
+            }
+        }
+
+        fn tab(root: LayoutNodeSnapshot, focused: Option<&str>) -> LayoutSnapshot {
+            LayoutSnapshot {
+                root,
+                focused_session_id: focused.map(str::to_string),
+            }
+        }
+
+        #[test]
+        fn every_session_lands_in_exactly_one_tab() {
+            // Two sessions share a tab; the third is not mentioned anywhere.
+            let saved = vec![tab(
+                LayoutNodeSnapshot::Split {
+                    horizontal: true,
+                    ratio: 0.5,
+                    first: Box::new(pane("session-0")),
+                    second: Box::new(pane("session-1")),
+                },
+                Some("session-1"),
+            )];
+
+            let tabs = TabManager::restore(&saved, &ids(3), 0, Some(0));
+
+            assert_eq!(tabs.len(), 2);
+            assert_eq!(tabs.sessions_in(0), vec![0, 1]);
+            // The orphan was adopted instead of being left unreachable.
+            assert_eq!(tabs.sessions_in(1), vec![2]);
+            assert_eq!(tabs.focused_session_of(0), Some(1));
+        }
+
+        #[test]
+        fn a_tab_that_cannot_be_restored_does_not_duplicate_a_live_session() {
+            // The second tab references a session that no longer exists. It
+            // must vanish, not fall back to a pane showing session 0 — that
+            // would put session 0 in two tabs at once.
+            let saved = vec![
+                tab(pane("session-0"), Some("session-0")),
+                tab(pane("session-gone"), None),
+            ];
+
+            let tabs = TabManager::restore(&saved, &ids(1), 0, Some(0));
+
+            assert_eq!(tabs.len(), 1);
+            assert_eq!(tabs.sessions_in(0), vec![0]);
+        }
+
+        #[test]
+        fn no_saved_layout_gives_every_session_its_own_tab() {
+            let tabs = TabManager::restore(&[], &ids(3), 2, None);
+
+            assert_eq!(tabs.len(), 3);
+            assert_eq!(tabs.sessions_in(0), vec![0]);
+            assert_eq!(tabs.sessions_in(2), vec![2]);
+            // With no recorded active tab, the one owning the active session wins.
+            assert_eq!(tabs.active_index(), 2);
+        }
+
+        #[test]
+        fn an_out_of_range_active_tab_falls_back_to_the_active_session() {
+            let saved = vec![tab(pane("session-0"), None), tab(pane("session-1"), None)];
+
+            let tabs = TabManager::restore(&saved, &ids(2), 1, Some(7));
+
+            assert_eq!(tabs.active_index(), 1);
+            assert_eq!(tabs.active_focused_session(), Some(1));
+        }
+    }
+
+    #[test]
+    fn the_last_tab_never_goes_away() {
+        let mut tabs = TabManager::new(0);
+        assert!(!tabs.remove_tab(0));
+        assert_eq!(tabs.len(), 1);
+    }
+
+    #[test]
+    fn reordering_follows_the_active_tab() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        assert_eq!(tabs.active_index(), 2);
+
+        tabs.reorder(2, 0);
+        assert_eq!(tabs.active_index(), 0);
+        assert_eq!(tabs.sessions_in(0), vec![2]);
+        assert_eq!(tabs.sessions_in(1), vec![0]);
+        assert_eq!(tabs.sessions_in(2), vec![1]);
+    }
+
+    #[test]
+    fn inserting_a_session_shifts_indices_in_every_tab() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+
+        // A new session lands at index 1; everything at or above shifts up.
+        tabs.on_session_inserted(1);
+
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        assert_eq!(tabs.sessions_in(1), vec![2]);
+        assert_eq!(tabs.sessions_in(2), vec![3]);
+    }
+}

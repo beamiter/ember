@@ -50,7 +50,7 @@ impl TerminalApp {
     /// removes the old four-pane ceiling and also releases texture caches when
     /// panes are closed. Zoom keeps the underlying split renderers warm.
     fn ensure_pane_renderer_capacity(&mut self, ctx: &egui::Context) {
-        let pane_count = self.layout_manager.panes.len();
+        let pane_count = self.layout().panes.len();
         let required = if pane_count > 1 { pane_count } else { 0 };
         self.pane_renderers.truncate(required);
         while self.pane_renderers.len() < required {
@@ -222,7 +222,7 @@ impl TerminalApp {
             .filter(|session_idx| panes.iter().any(|pane| pane.session_idx == *session_idx));
         let drop_target = drag_source.and_then(|source| {
             pointer_pos
-                .and_then(|pos| self.layout_manager.session_at(pos))
+                .and_then(|pos| self.layout().session_at(pos))
                 .filter(|target| *target != source)
         });
 
@@ -270,7 +270,7 @@ impl TerminalApp {
         // is drawn by the next frame rather than half-applied to this one.
         if self.pane_drag.is_some() && ctx.input(|input| input.pointer.any_released()) {
             if let (Some(source), Some(target)) = (drag_source, drop_target) {
-                if self.layout_manager.swap_sessions(source, target) {
+                if self.layout_mut().swap_sessions(source, target) {
                     self.sync_active_session_to_focused_pane();
                     self.schedule_session_save();
                     self.set_status("Swapped panes");
@@ -292,14 +292,14 @@ impl TerminalApp {
         // Keep the focused pane's geometry current even in single-pane mode,
         // so split commands can validate the resulting child sizes before
         // creating another shell session.
-        self.layout_manager.compute_pane_rects(available_rect);
+        self.layout_mut().compute_pane_rects(available_rect);
         self.ensure_pane_renderer_capacity(ctx);
         let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
 
         // 单窗格才按整窗口尺寸 resize 活跃会话;多窗格时各窗格在下方
         // 各自按自己的 rect 尺寸 resize(否则活跃会话会被错误地撑成整窗口大小)。
-        let multi_pane = self.layout_manager.panes().len() > 1;
+        let multi_pane = self.layout().panes().len() > 1;
         if !multi_pane && (cols != self.cols || rows != self.rows || self.force_resize_session) {
             let session = self.session_manager.get_active_session_mut();
             let _ = session.shell.resize(cols, rows);
@@ -316,10 +316,10 @@ impl TerminalApp {
         }
 
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
-        if self.layout_manager.panes().len() > 1 {
+        if self.layout().panes().len() > 1 {
             // 获取所有窗格信息
-            let panes = self.layout_manager.panes().to_vec();
-            let divider_rects = self.layout_manager.get_divider_rects();
+            let panes = self.layout().panes().to_vec();
+            let divider_rects = self.layout().get_divider_rects();
             let inactive_search = crate::search::SearchState::default();
 
             // 每个窗格顶部让出一条状态栏；终端内容渲染在它下方的矩形里，
@@ -501,7 +501,7 @@ impl TerminalApp {
                     .map(|(divider, _)| divider.clone())
             });
             if let Some(divider) = double_clicked_divider.flatten() {
-                if self.layout_manager.set_split_ratio(&divider.id, 0.5) {
+                if self.layout_mut().set_split_ratio(&divider.id, 0.5) {
                     self.schedule_session_save();
                 }
                 self.dragging_divider = None;
@@ -519,7 +519,7 @@ impl TerminalApp {
                     // The layout resolves the divider's own node rectangle and
                     // snaps near even pair splits.
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        if self.layout_manager.drag_divider_to(&split_id, pos) {
+                        if self.layout_mut().drag_divider_to(&split_id, pos) {
                             self.schedule_session_save();
                         }
                     }
@@ -539,7 +539,7 @@ impl TerminalApp {
                     let on_divider = divider_rects
                         .iter()
                         .any(|divider| divider.rect.contains(pos));
-                    if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
+                    if !on_divider && self.layout_mut().focus_pane_at(pos).is_some() {
                         self.sync_active_session_to_focused_pane();
                     }
                 }

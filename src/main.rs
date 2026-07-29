@@ -26,6 +26,7 @@ mod session_manager;
 mod session_persistence;
 mod shell;
 mod sidebar;
+mod tab_manager;
 mod terminal;
 mod theme;
 mod ui;
@@ -1561,9 +1562,11 @@ impl TerminalApp {
             .filter(|id| session::is_valid_rsh_session_id(id))
             .unwrap_or_else(session::generate_session_id);
         let saved_active_index = saved_snapshot.as_ref().and_then(|s| s.active_index);
-        let saved_layout = saved_snapshot
+        let saved_tab_layouts: Vec<session_persistence::LayoutSnapshot> = saved_snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.layout.clone());
+            .map(|snapshot| snapshot.tabs.clone())
+            .unwrap_or_default();
+        let saved_active_tab = saved_snapshot.as_ref().and_then(|s| s.active_tab);
         let terminal = TerminalState::new(cols, rows);
 
         let configured_shell = std::env::var("JTERM2_SHELL").ok().or(cfg.shell.clone());
@@ -1661,20 +1664,14 @@ impl TerminalApp {
             .iter()
             .map(|session| session.metadata.session_id.clone())
             .collect();
-        let mut layout_manager = saved_layout
-            .as_ref()
-            .map(|snapshot| {
-                layout::LayoutManager::from_snapshot(
-                    snapshot,
-                    &restored_session_ids,
-                    session_manager.active_index(),
-                )
-            })
-            .unwrap_or_else(|| layout::LayoutManager::new(session_manager.active_index()));
-        if let Some(focused_idx) = layout_manager.focused_session_idx() {
+        let tabs = tab_manager::TabManager::restore(
+            &saved_tab_layouts,
+            &restored_session_ids,
+            session_manager.active_index(),
+            saved_active_tab,
+        );
+        if let Some(focused_idx) = tabs.active_focused_session() {
             session_manager.switch_session(focused_idx);
-        } else {
-            layout_manager.show_session(session_manager.active_index());
         }
 
         // Multi-pane renderers are allocated on demand and trimmed when panes
@@ -1748,7 +1745,7 @@ impl TerminalApp {
             command_palette,
             force_resize_session: false,
             current_theme,
-            layout_manager,
+            tabs,
             pane_renderers,
             dragging_divider: None,
             pane_status_cache: pane_header::PaneStatusCache::new(),
@@ -1856,7 +1853,9 @@ impl TerminalApp {
             self.session_manager
                 .new_session(name, tags, cols, rows, self.config.scrollback_lines);
         if self.session_manager.len() > old_len {
-            self.layout_manager.on_session_inserted(new_idx);
+            // 会话索引是全局的，所以插入要在每个 tab 的树里重编号，不只是
+            // 当前 tab。新会话本身还没有归属，由调用方决定是分屏还是开新 tab。
+            self.tabs.on_session_inserted(new_idx);
         }
         new_idx
     }
@@ -2269,12 +2268,7 @@ impl eframe::App for TerminalApp {
         // receive priority, while hidden tabs rotate fairly. Background
         // parsing consumes at most half of the global adaptive byte budget;
         // whatever it does not use remains available to the active session.
-        let visible_sessions: Vec<usize> = self
-            .layout_manager
-            .panes()
-            .iter()
-            .map(|pane| pane.session_idx)
-            .collect();
+        let visible_sessions: Vec<usize> = self.layout().session_indices();
         let background_budget = if self.session_manager.len() > 1 {
             self.adaptive_frame_budget / 2
         } else {
@@ -2368,12 +2362,26 @@ impl eframe::App for TerminalApp {
         }
         background_pump.exited_indices.sort_unstable();
         background_pump.exited_indices.dedup();
-        for session_idx in background_pump.exited_indices.iter().rev().copied() {
-            if self.session_manager.len() > 1
-                && session_idx < self.session_manager.len()
-                && session_idx != self.session_manager.active_index()
+        // 按稳定 ID 而不是索引关闭:关掉一个会话会让它之后的索引整体左移,
+        // 而关掉一个只剩一个窗格的 tab 还会连带关掉该 tab 的其他会话,索引
+        // 可能往任意方向漂移。ID 查不到就说明它已经被前一次关闭带走了。
+        let exited_ids: Vec<String> = background_pump
+            .exited_indices
+            .iter()
+            .filter_map(|&idx| {
+                self.session_manager
+                    .sessions()
+                    .get(idx)
+                    .map(|session| session.metadata.session_id.clone())
+            })
+            .collect();
+        for session_id in exited_ids {
+            let Some(session_idx) = self.session_manager.index_of(&session_id) else {
+                continue;
+            };
+            if self.session_manager.len() > 1 && session_idx != self.session_manager.active_index()
             {
-                self.close_session_synced(session_idx);
+                self.close_session_or_owning_tab(session_idx);
                 self.schedule_session_save();
             }
         }
@@ -2444,23 +2452,23 @@ impl eframe::App for TerminalApp {
                         .iter()
                         .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
             });
-        if pointer_targets_terminal && self.layout_manager.panes().len() > 1 {
+        if pointer_targets_terminal && self.layout().panes().len() > 1 {
             if let Some(pos) =
                 ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()))
             {
-                let on_divider = self.layout_manager.divider_at(pos).is_some();
-                if !on_divider && self.layout_manager.focus_pane_at(pos).is_some() {
+                let on_divider = self.layout().divider_at(pos).is_some();
+                if !on_divider && self.layout_mut().focus_pane_at(pos).is_some() {
                     self.sync_active_session_to_focused_pane();
                 }
             }
         }
 
         let active_session_idx = self.session_manager.active_index();
-        let active_pane_renderer_idx = (self.layout_manager.panes().len() > 1).then(|| {
-            self.layout_manager
+        let active_pane_renderer_idx = (self.layout().panes().len() > 1).then(|| {
+            self.layout()
                 .panes()
                 .iter()
-                .position(|pane| pane.id == self.layout_manager.focused_pane_id)
+                .position(|pane| pane.id == self.layout().focused_pane_id)
         });
         let active_pane_renderer_idx = active_pane_renderer_idx.flatten();
         let active_terminal_content_rect = if let Some(index) = active_pane_renderer_idx {
@@ -3738,8 +3746,9 @@ impl eframe::App for TerminalApp {
                 session_count_before
             );
             if session_count_before > 1 {
-                // Close the current session if there are multiple sessions
-                self.close_session_synced(active_session_idx);
+                // Close the current session if there are multiple sessions.
+                // If it was its tab's only pane, the tab goes with it.
+                self.close_session_or_owning_tab(active_session_idx);
                 self.schedule_session_save();
                 crate::debug_log!(
                     "[SHELL EXIT] closed session, remaining: {}",

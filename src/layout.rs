@@ -158,33 +158,32 @@ impl LayoutManager {
         }
     }
 
-    /// 从稳定 session ID 快照恢复布局。缺失/重复 session 的叶子会被移除，
-    /// 父 split 自动折叠；整个布局无效时安全退回 `fallback_session_idx`。
-    pub fn from_snapshot(
+    /// 从稳定 session ID 快照恢复一个 tab 的布局。缺失/重复 session 的叶子
+    /// 会被移除，父 split 自动折叠；整棵树都没有可用会话时返回 `None`。
+    ///
+    /// 失败时刻意不回退到「显示某个兜底会话的单窗格」：那个会话很可能已经
+    /// 属于另一个 tab，两个 tab 抢同一个 PTY 比丢掉一个空 tab 糟糕得多。空
+    /// tab 里的会话会在 [`crate::tab_manager::TabManager::restore`] 里作为
+    /// 孤儿被各自收养。
+    pub fn try_from_snapshot(
         snapshot: &crate::session_persistence::LayoutSnapshot,
         session_ids: &[String],
-        fallback_session_idx: usize,
-    ) -> Self {
+        fallback_session_idx: Option<usize>,
+    ) -> Option<Self> {
         let session_indices: HashMap<&str, usize> = session_ids
             .iter()
             .enumerate()
             .map(|(idx, id)| (id.as_str(), idx))
             .collect();
         let mut used_sessions = HashSet::new();
-        let root = Self::restore_node(&snapshot.root, &session_indices, &mut used_sessions, 0);
+        let tree = Self::restore_node(&snapshot.root, &session_indices, &mut used_sessions, 0)?;
 
-        let Some(tree) = root else {
-            return Self::new(fallback_session_idx);
-        };
         let focused = snapshot
             .focused_session_id
             .as_deref()
             .and_then(|focused_id| session_indices.get(focused_id).copied())
             .filter(|idx| tree.contains_session(*idx))
-            .or_else(|| {
-                tree.contains_session(fallback_session_idx)
-                    .then_some(fallback_session_idx)
-            })
+            .or_else(|| fallback_session_idx.filter(|idx| tree.contains_session(*idx)))
             .or_else(|| tree.leaves().first().copied())
             .expect("restored layout root has no pane");
 
@@ -196,7 +195,7 @@ impl LayoutManager {
             zoomed: false,
         };
         layout.rebuild_panes();
-        layout
+        Some(layout)
     }
 
     fn restore_node(
@@ -342,19 +341,6 @@ impl LayoutManager {
         available.is_finite() && minimum.is_finite() && minimum > 0.0 && available >= minimum * 2.0
     }
 
-    /// 让某个会话出现在当前布局中：若它已经在某个窗格中则只移动焦点，
-    /// 否则用它替换当前焦点窗格。用于 tab 切换时保持“活跃会话 = 可见焦点窗格”。
-    pub fn show_session(&mut self, session_idx: usize) {
-        if self.tree.contains_session(session_idx)
-            || self
-                .tree
-                .focus_or_replace_session(self.focused_pane_id.0, session_idx)
-        {
-            self.focused_pane_id = PaneId(session_idx);
-        }
-        self.rebuild_panes();
-    }
-
     /// 关闭当前焦点窗格。其父分割会自动折叠，被关窗格的份额并入兄弟。
     pub fn close_focused_pane(&mut self) -> Result<(), String> {
         let leaves = self.tree.leaves();
@@ -379,49 +365,68 @@ impl LayoutManager {
         Ok(())
     }
 
-    /// 某个会话被关闭后，移除显示它的窗格并修正剩余窗格的 session 索引。
-    pub fn on_session_removed(&mut self, removed_idx: usize, fallback_idx: usize) {
-        self.zoomed = false;
-        if self.tree.contains_session(removed_idx) && self.tree.leaf_count() > 1 {
-            self.tree.remove_leaf(removed_idx);
-            if self.focused_pane_id.0 == removed_idx {
-                if let Some(&first) = self.tree.leaves().first() {
-                    self.focused_pane_id = PaneId(first);
-                }
-            }
+    /// 把焦点移到显示 `session_idx` 的窗格。与 `show_session` 不同，这里
+    /// 绝不替换窗格内容：tab 内的窗格归属是固定的，点错了只该无事发生。
+    pub fn focus_session(&mut self, session_idx: usize) -> bool {
+        if !self.tree.contains_session(session_idx) {
+            return false;
         }
+        self.focused_pane_id = PaneId(session_idx);
+        self.rebuild_panes();
+        true
+    }
 
-        let remap = |session: usize| {
-            if session == removed_idx {
-                fallback_idx
-            } else if session > removed_idx {
-                session - 1
-            } else {
-                session
-            }
-        };
-        self.tree.remap_sessions(&remap);
-        self.focused_pane_id = PaneId(remap(self.focused_pane_id.0));
-        if !self.tree.contains_session(self.focused_pane_id.0) {
-            if let Some(&first) = self.tree.leaves().first() {
-                self.focused_pane_id = PaneId(first);
+    /// 本布局树里出现的所有 session 索引（DFS 顺序）。tab 用它来判断自己
+    /// 拥有哪些会话——关闭 tab 时这批会话要一起关掉。
+    pub fn session_indices(&self) -> Vec<usize> {
+        self.tree.leaves()
+    }
+
+    /// 该会话是否显示在本布局的某个窗格里。
+    pub fn contains_session(&self, session_idx: usize) -> bool {
+        self.tree.contains_session(session_idx)
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.tree.leaf_count()
+    }
+
+    /// 摘掉显示 `session_idx` 的窗格，其份额并入兄弟。返回 false 表示它不
+    /// 在本树中，或它是最后一个窗格——后者由调用方连整个 tab 一起关掉，
+    /// 布局树本身没有「空」这个状态。
+    pub fn remove_session_leaf(&mut self, session_idx: usize) -> bool {
+        if !self.tree.contains_session(session_idx) || self.tree.leaf_count() <= 1 {
+            return false;
+        }
+        let leaves = self.tree.leaves();
+        let next_focus = leaves
+            .iter()
+            .position(|&session| session == session_idx)
+            .and_then(|at| {
+                leaves
+                    .get(at + 1)
+                    .or_else(|| at.checked_sub(1).and_then(|prev| leaves.get(prev)))
+            })
+            .copied();
+        if !self.tree.remove_leaf(session_idx) {
+            return false;
+        }
+        self.zoomed = false;
+        if self.focused_pane_id.0 == session_idx {
+            if let Some(next) = next_focus.or_else(|| self.tree.leaves().first().copied()) {
+                self.focused_pane_id = PaneId(next);
             }
         }
         self.rebuild_panes();
+        true
     }
 
-    /// 会话 tab 重排后同步窗格中保存的索引，使窗格继续显示同一个会话。
-    pub fn on_session_reordered(&mut self, from_idx: usize, to_idx: usize) {
-        if from_idx == to_idx {
-            return;
-        }
+    /// 会话从全局列表中删除后，把本树里比它大的索引整体左移一位。窗格
+    /// 内容本身不变——这纯粹是索引重编号，供不拥有该会话的 tab 使用。
+    pub fn shift_sessions_after_removal(&mut self, removed_idx: usize) {
         let remap = move |session: usize| {
-            if session == from_idx {
-                to_idx
-            } else if from_idx < to_idx && session > from_idx && session <= to_idx {
+            if session > removed_idx {
                 session - 1
-            } else if to_idx < from_idx && session >= to_idx && session < from_idx {
-                session + 1
             } else {
                 session
             }
@@ -893,18 +898,19 @@ mod tests {
     }
 
     #[test]
-    fn showing_session_focuses_existing_pane_or_replaces_focused_pane() {
+    fn focusing_a_session_never_moves_it_between_panes() {
         let mut layout = LayoutManager::new(0);
         layout.split(1, false).unwrap();
 
-        layout.show_session(0);
+        assert!(layout.focus_session(0));
         assert_eq!(layout.focused_session_idx(), Some(0));
         assert_eq!(layout.panes[1].session_idx, 1);
 
-        layout.show_session(2);
-        assert_eq!(layout.focused_session_idx(), Some(2));
-        assert_eq!(layout.panes[0].session_idx, 2);
-        assert_eq!(layout.panes[1].session_idx, 1);
+        // A session this tab does not own is not pulled into a pane; that is
+        // the tab boundary the old `show_session` used to punch through.
+        assert!(!layout.focus_session(2));
+        assert_eq!(layout.focused_session_idx(), Some(0));
+        assert_eq!(layout.session_indices(), vec![0, 1]);
     }
 
     #[test]
@@ -971,7 +977,8 @@ mod tests {
         let snapshot = layout.to_snapshot(&session_ids).unwrap();
         let encoded = serde_json::to_string(&snapshot).unwrap();
         let decoded = serde_json::from_str(&encoded).unwrap();
-        let mut restored = LayoutManager::from_snapshot(&decoded, &session_ids, 0);
+        let mut restored =
+            LayoutManager::try_from_snapshot(&decoded, &session_ids, Some(0)).unwrap();
         restored.compute_pane_rects(test_rect());
         let after: Vec<(usize, Rect)> = restored
             .panes()
@@ -1002,7 +1009,8 @@ mod tests {
 
         // The binary persisted format restores the exact same flat geometry.
         let snapshot = layout.to_snapshot(&session_ids).unwrap();
-        let mut restored = LayoutManager::from_snapshot(&snapshot, &session_ids, 0);
+        let mut restored =
+            LayoutManager::try_from_snapshot(&snapshot, &session_ids, Some(0)).unwrap();
         restored.compute_pane_rects(test_rect());
         let widths: Vec<f32> = restored.panes().iter().map(|p| p.rect.width()).collect();
         assert_eq!(widths, vec![500.0, 250.0, 250.0]);
@@ -1034,7 +1042,7 @@ mod tests {
             focused_session_id: Some("missing".to_string()),
         };
         let session_ids = vec!["alpha".to_string(), "beta".to_string()];
-        let restored = LayoutManager::from_snapshot(&snapshot, &session_ids, 1);
+        let restored = LayoutManager::try_from_snapshot(&snapshot, &session_ids, Some(1)).unwrap();
 
         assert_eq!(restored.panes().len(), 1);
         assert_eq!(restored.focused_session_idx(), Some(0));
@@ -1042,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn entirely_unrestorable_layout_falls_back_to_active_session() {
+    fn entirely_unrestorable_layout_yields_no_tab() {
         use crate::session_persistence::{LayoutNodeSnapshot, LayoutSnapshot};
 
         let snapshot = LayoutSnapshot {
@@ -1052,10 +1060,10 @@ mod tests {
             focused_session_id: Some("gone".to_string()),
         };
         let session_ids = vec!["alpha".to_string(), "beta".to_string()];
-        let restored = LayoutManager::from_snapshot(&snapshot, &session_ids, 1);
 
-        assert_eq!(restored.panes().len(), 1);
-        assert_eq!(restored.focused_session_idx(), Some(1));
+        // No pane survives, so there is no tab to build. Substituting the
+        // active session here would hand a live PTY to two tabs at once.
+        assert!(LayoutManager::try_from_snapshot(&snapshot, &session_ids, Some(1)).is_none());
     }
 
     #[test]
@@ -1148,31 +1156,28 @@ mod tests {
         assert_eq!(layout.focused_session_idx(), Some(3));
 
         // Session 1 is removed; the remaining session shifts from 3 to 2.
-        layout.on_session_removed(1, 2);
+        layout.shift_sessions_after_removal(1);
         assert_eq!(layout.panes.len(), 1);
         assert_eq!(layout.focused_session_idx(), Some(2));
     }
 
     #[test]
-    fn removing_visible_session_collapses_its_split() {
+    fn removing_a_sessions_leaf_collapses_its_split() {
         let mut layout = LayoutManager::new(0);
         layout.split(1, false).unwrap();
 
-        layout.on_session_removed(1, 0);
+        assert!(layout.remove_session_leaf(1));
 
         assert_eq!(layout.panes.len(), 1);
         assert_eq!(layout.focused_session_idx(), Some(0));
     }
 
     #[test]
-    fn reordering_sessions_preserves_pane_identity() {
-        let mut layout = LayoutManager::new(1);
-        layout.split(3, false).unwrap();
-
-        layout.on_session_reordered(1, 3);
-
-        assert_eq!(layout.panes[0].session_idx, 3);
-        assert_eq!(layout.panes[1].session_idx, 2);
+    fn the_last_pane_refuses_to_leave_the_layout() {
+        let mut layout = LayoutManager::new(0);
+        // An empty tree is not renderable; emptying a tab is the tab's job.
+        assert!(!layout.remove_session_leaf(0));
+        assert_eq!(layout.session_indices(), vec![0]);
     }
 
     #[test]

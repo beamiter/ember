@@ -324,14 +324,12 @@ impl TerminalApp {
     ) -> bool {
         match command {
             keybindings::Command::SessionNew => {
-                let new_idx = self.create_session_with_current_config(None, None);
-                self.activate_session(new_idx);
-                self.schedule_session_save();
+                self.new_tab();
             }
             keybindings::Command::SessionClose => {
-                if self.session_manager.len() > 1 {
-                    let active_idx = self.session_manager.active_index();
-                    self.close_session_synced(active_idx);
+                // 关 tab 连带关掉它所有的分屏窗格。
+                let active_tab = self.tabs.active_index();
+                if self.close_tab_synced(active_tab) {
                     self.schedule_session_save();
                 } else {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -341,13 +339,14 @@ impl TerminalApp {
             keybindings::Command::SessionNext => self.activate_next_session(),
             keybindings::Command::SessionPrev => self.activate_prev_session(),
             keybindings::Command::SessionJump(index) => {
-                if !self.activate_session(index) {
-                    self.set_status(format!("Session {} is not available", index + 1));
+                // Alt+N 选第 N 个 tab,与 tab 栏上看到的顺序一致。
+                if !self.activate_tab(index) {
+                    self.set_status(format!("Tab {} is not available", index + 1));
                 }
             }
             keybindings::Command::SessionLast => {
-                if let Some(last_index) = self.session_manager.len().checked_sub(1) {
-                    self.activate_session(last_index);
+                if let Some(last_tab) = self.tabs.len().checked_sub(1) {
+                    self.activate_tab(last_tab);
                 }
             }
             keybindings::Command::SessionPrevActive => {
@@ -458,13 +457,13 @@ impl TerminalApp {
             keybindings::Command::TerminalSplitHorizontal => self.split_terminal(true),
             keybindings::Command::TerminalClosePane => self.close_focused_pane_or_session(),
             keybindings::Command::PaneFocusNext => {
-                if !self.layout_manager.focus_pane(layout::PaneDirection::Next) {
+                if !self.layout_mut().focus_pane(layout::PaneDirection::Next) {
                     self.set_status("Only one pane is open");
                 }
                 self.sync_active_session_to_focused_pane();
             }
             keybindings::Command::PaneFocusPrev => {
-                if !self.layout_manager.focus_pane(layout::PaneDirection::Prev) {
+                if !self.layout_mut().focus_pane(layout::PaneDirection::Prev) {
                     self.set_status("Only one pane is open");
                 }
                 self.sync_active_session_to_focused_pane();
@@ -492,10 +491,10 @@ impl TerminalApp {
                 self.resize_pane(layout::PaneDirection::Down, "down")
             }
             keybindings::Command::PaneZoomToggle => {
-                if self.layout_manager.toggle_focused_pane_zoom() {
+                if self.layout_mut().toggle_focused_pane_zoom() {
                     self.force_resize_session = true;
                     ctx.request_repaint();
-                    self.set_status(if self.layout_manager.is_zoomed() {
+                    self.set_status(if self.layout().is_zoomed() {
                         "Focused pane zoomed"
                     } else {
                         "Pane zoom restored"
@@ -505,7 +504,7 @@ impl TerminalApp {
                 }
             }
             keybindings::Command::PaneEqualize => {
-                if self.layout_manager.equalize_splits() {
+                if self.layout_mut().equalize_splits() {
                     self.schedule_session_save();
                     ctx.request_repaint();
                     self.set_status("Pane dividers reset to 50/50");
@@ -582,8 +581,9 @@ impl TerminalApp {
         self.dispatch_command(ctx, command)
     }
 
-    /// 切换活跃会话并同步分屏布局。若目标已在某个窗格中则聚焦它，否则
-    /// 将目标显示在当前焦点窗格，避免 tab 高亮、键盘输入和可见内容分离。
+    /// 切换活跃会话并同步分屏布局。会话归某个 tab 的某个窗格所有，因此这里
+    /// 先切到拥有它的 tab，再在 tab 内聚焦对应窗格——绝不把它搬进别的窗格，
+    /// 那会让 tab 高亮、键盘输入和可见内容三者分离。
     pub fn activate_session(&mut self, index: usize) -> bool {
         let target_session_id = self
             .session_manager
@@ -593,7 +593,10 @@ impl TerminalApp {
         if !self.session_manager.switch_session(index) {
             return false;
         }
-        self.layout_manager.show_session(index);
+        if let Some(tab_idx) = self.tabs.tab_of_session(index) {
+            self.tabs.set_active(tab_idx);
+            self.layout_mut().focus_session(index);
+        }
         self.force_resize_session = true;
         self.smooth_scroll_velocity = 0.0;
         self.smooth_scroll_pixel_offset = 0.0;
@@ -695,14 +698,22 @@ impl TerminalApp {
         self.reveal_current_search_match();
     }
 
+    /// Next/Prev 走 tab,不走底层会话向量:分屏产生的会话属于某个 tab 内部,
+    /// 让 Ctrl+Tab 轮询它们会把窗格当成 tab 来用。tab 内切窗格是 PaneNext/Prev。
     fn activate_next_session(&mut self) {
-        let index = self.session_manager.switch_to_next_session();
-        self.activate_session(index);
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let next = (self.tabs.active_index() + 1) % self.tabs.len();
+        self.activate_tab(next);
     }
 
     fn activate_prev_session(&mut self) {
-        let index = self.session_manager.switch_to_prev_session();
-        self.activate_session(index);
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let prev = (self.tabs.active_index() + self.tabs.len() - 1) % self.tabs.len();
+        self.activate_tab(prev);
     }
 
     fn activate_previous_session(&mut self) -> bool {
@@ -714,7 +725,7 @@ impl TerminalApp {
     }
 
     fn focus_physical_pane(&mut self, direction: layout::PaneDirection, label: &str) {
-        if self.layout_manager.focus_pane(direction) {
+        if self.layout_mut().focus_pane(direction) {
             self.sync_active_session_to_focused_pane();
         } else {
             self.set_status(format!("No pane {label}"));
@@ -723,7 +734,7 @@ impl TerminalApp {
 
     fn resize_pane(&mut self, direction: layout::PaneDirection, label: &str) {
         const RESIZE_STEP: f32 = 0.05;
-        if self.layout_manager.resize_split(direction, RESIZE_STEP) {
+        if self.layout_mut().resize_split(direction, RESIZE_STEP) {
             self.schedule_session_save();
         } else {
             self.set_status(format!("Cannot resize pane {label}"));
@@ -733,13 +744,15 @@ impl TerminalApp {
     /// 关闭 pane 时同时关闭它拥有的 shell session。旧行为只从布局中摘掉
     /// pane，却把 PTY 留成隐藏 tab，既泄漏后台进程，也让 split 看起来像
     /// 在拼接已有 session。
+    ///
+    /// 关掉 tab 里最后一个窗格,就等于关掉这个 tab。
     fn close_focused_pane_or_session(&mut self) {
-        if self.layout_manager.panes().len() > 1 {
-            let Some(closing_session_idx) = self.layout_manager.focused_session_idx() else {
+        if self.layout().pane_count() > 1 {
+            let Some(closing_session_idx) = self.layout().focused_session_idx() else {
                 self.set_status("No focused pane to close");
                 return;
             };
-            if let Err(error) = self.layout_manager.close_focused_pane() {
+            if let Err(error) = self.layout_mut().close_focused_pane() {
                 self.set_status(error);
                 return;
             }
@@ -755,11 +768,9 @@ impl TerminalApp {
             return;
         }
 
-        if self.session_manager.len() > 1 {
-            let active_idx = self.session_manager.active_index();
-            if self.close_session_synced(active_idx) {
-                self.schedule_session_save();
-            }
+        let active_tab = self.tabs.active_index();
+        if self.close_tab_synced(active_tab) {
+            self.schedule_session_save();
         } else {
             self.set_status("Cannot close the last pane");
         }
@@ -768,16 +779,14 @@ impl TerminalApp {
     /// 创建一个全新的 shell session，并从当前焦点 pane 原地分出新 pane。
     /// session 创建失败时不改变布局，布局更新失败时回滚刚创建的 session。
     fn split_terminal(&mut self, horizontal: bool) {
-        if !self.layout_manager.can_split() {
+        if !self.layout().can_split() {
             self.set_status("No focused pane to split");
             return;
         }
 
-        let active_idx = self.session_manager.active_index();
-        self.layout_manager.show_session(active_idx);
         let minimum_pane_size = self.renderer.minimum_split_pane_size();
         if !self
-            .layout_manager
+            .layout()
             .can_split_focused_pane(horizontal, minimum_pane_size)
         {
             self.set_status("Pane is too small to split; resize it or choose a larger pane");
@@ -791,7 +800,7 @@ impl TerminalApp {
             return;
         }
 
-        match self.layout_manager.split(new_session_idx, horizontal) {
+        match self.layout_mut().split(new_session_idx, horizontal) {
             Ok(()) => {
                 self.sync_active_session_to_focused_pane();
                 self.set_status(if horizontal {
@@ -812,7 +821,7 @@ impl TerminalApp {
     /// 把全局活跃会话切换到当前焦点窗格对应的会话,使键盘输入/复制等
     /// 路由到正确的分屏窗格。focus 变化(分屏、Next/Prev、关闭、点击)后调用。
     pub fn sync_active_session_to_focused_pane(&mut self) {
-        let Some(idx) = self.layout_manager.focused_session_idx() else {
+        let Some(idx) = self.layout().focused_session_idx() else {
             return;
         };
         if idx != self.session_manager.active_index() && self.activate_session(idx) {

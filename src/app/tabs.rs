@@ -5,8 +5,122 @@ use crate::theme::ThemeExt as _;
 use eframe::egui;
 
 impl TerminalApp {
+    /// 当前 tab 的窗格布局。所有分屏操作都作用在它上面,因此不会波及其他 tab。
+    pub fn layout(&self) -> &crate::layout::LayoutManager {
+        self.tabs.active_layout()
+    }
+
+    pub fn layout_mut(&mut self) -> &mut crate::layout::LayoutManager {
+        self.tabs.active_layout_mut()
+    }
+
+    /// tab 的显示状态取自它当前选中的窗格:标题、重命名目标、活跃指示都跟着
+    /// 选中窗格走,而不是跟着某个固定的"第一个"会话。
+    pub fn tab_display_session(&self, tab_idx: usize) -> Option<usize> {
+        self.tabs.focused_session_of(tab_idx)
+    }
+
+    pub fn tab_title(&self, tab_idx: usize) -> String {
+        self.tab_display_session(tab_idx)
+            .and_then(|idx| self.session_manager.sessions().get(idx))
+            .map(Self::session_cwd_title)
+            .unwrap_or_default()
+    }
+
+    /// 非活跃 tab 的活动指示:它任意一个窗格有未读输出就点亮。活跃 tab 的
+    /// 窗格全部可见,不需要指示。
+    pub fn tab_has_unseen_output(&self, tab_idx: usize) -> bool {
+        if tab_idx == self.tabs.active_index() {
+            return false;
+        }
+        self.tabs.sessions_in(tab_idx).into_iter().any(|idx| {
+            self.session_manager
+                .sessions()
+                .get(idx)
+                .map(|session| session.metadata.unseen_output)
+                .unwrap_or(false)
+        })
+    }
+
+    /// 只有当前 tab 的窗格在屏幕上,其他 tab 的会话一律按后台处理——即使它们
+    /// 也在某个分屏里。
+    pub fn refresh_unseen_flags_for_visible_panes(&mut self) {
+        let visible_sessions: Vec<usize> = self.layout().session_indices();
+        self.session_manager.refresh_unseen_flags(&visible_sessions);
+    }
+
+    /// 切换到某个 tab,并把键盘/剪贴板路由交给它当前选中的窗格。
+    pub fn activate_tab(&mut self, tab_idx: usize) -> bool {
+        if tab_idx >= self.tabs.len() {
+            return false;
+        }
+        self.tabs.set_active(tab_idx);
+        let target = self.tabs.focused_session_of(tab_idx);
+        if let Some(session_idx) = target {
+            self.activate_session(session_idx);
+        }
+        self.force_resize_session = true;
+        true
+    }
+
+    /// 关闭整个 tab:它的所有窗格连同背后的 shell 一起关掉。这正是 tab 拥有
+    /// 窗格的意义——不会有孤儿 PTY 以隐藏会话的形式留在后台。
+    /// 返回 false 表示这是最后一个 tab(调用方应转为关闭窗口)。
+    pub fn close_tab_synced(&mut self, tab_idx: usize) -> bool {
+        if tab_idx >= self.tabs.len() || self.tabs.len() <= 1 {
+            return false;
+        }
+        self.renaming_tab = None;
+        let mut owned = self.tabs.sessions_in(tab_idx);
+        // 先摘掉 tab,后续每次删除会话就只剩纯粹的索引平移;从大到小删除,
+        // 保证还没处理的索引不会因为前面的删除而漂移。
+        self.tabs.remove_tab(tab_idx);
+        owned.sort_unstable_by(|a, b| b.cmp(a));
+        for session_idx in owned {
+            self.close_session_synced(session_idx);
+        }
+        self.sync_active_session_to_focused_pane();
+        true
+    }
+
+    /// 关闭一个会话;若它是所属 tab 的最后一个窗格,则连整个 tab 一起关掉。
+    /// shell 自行退出这类"会话消失但没人点关闭按钮"的路径都应该走这里,
+    /// 否则那个 tab 会留下一个指向已删除会话的窗格。
+    pub fn close_session_or_owning_tab(&mut self, session_idx: usize) -> bool {
+        match self.tabs.tab_of_session(session_idx) {
+            Some(tab_idx) if self.tabs.sessions_in(tab_idx).len() <= 1 => {
+                self.close_tab_synced(tab_idx)
+            }
+            _ => {
+                let closed = self.close_session_synced(session_idx);
+                if closed {
+                    self.sync_active_session_to_focused_pane();
+                }
+                closed
+            }
+        }
+    }
+
+    /// 新建 tab:创建一个会话,并让它成为新 tab 的唯一窗格。
+    pub fn new_tab(&mut self) -> Option<usize> {
+        let old_len = self.session_manager.len();
+        let session_idx = self.create_session_with_current_config(None, None);
+        if self.session_manager.len() == old_len {
+            self.set_status("Failed to create session");
+            return None;
+        }
+        let tab_idx = self.tabs.insert_tab_after_active(session_idx);
+        self.activate_session(session_idx);
+        self.force_resize_session = true;
+        self.schedule_session_save();
+        Some(tab_idx)
+    }
+
     /// 关闭指定会话,并同步修正分屏窗格保存的 session_idx,避免删除后索引错位。
     /// 返回是否真的关闭了会话。
+    ///
+    /// 只处理单个会话。若它是所属 tab 的最后一个窗格,请改用
+    /// [`Self::close_tab_synced`],否则那个 tab 会留下指向已删除会话的窗格。
     pub fn close_session_synced(&mut self, index: usize) -> bool {
         let removed_session_id = self
             .session_manager
@@ -34,9 +148,7 @@ impl TerminalApp {
             self.terminal_mouse_capture = None;
             self.last_terminal_mouse_motion = None;
         }
-        let fallback = self.session_manager.active_index();
-        self.layout_manager.on_session_removed(index, fallback);
-        self.layout_manager.show_session(fallback);
+        self.tabs.on_session_removed(index);
         self.force_resize_session = true;
         if self.search_state.is_open {
             self.refresh_search_matches();
@@ -44,16 +156,14 @@ impl TerminalApp {
         true
     }
 
-    /// 重排 tab 并同步分屏窗格保存的会话索引。
-    pub fn reorder_sessions_synced(&mut self, from_idx: usize, to_idx: usize) {
-        if from_idx == to_idx
-            || from_idx >= self.session_manager.len()
-            || to_idx >= self.session_manager.len()
-        {
+    /// 重排 tab。tab 顺序是 UI 概念,底层会话向量不动——会话现在归 tab 所有,
+    /// 拖动一个 tab 不应该重排别的 tab 里的窗格。
+    pub fn reorder_tabs(&mut self, from_idx: usize, to_idx: usize) {
+        if from_idx == to_idx || from_idx >= self.tabs.len() || to_idx >= self.tabs.len() {
             return;
         }
-        self.session_manager.reorder_sessions(from_idx, to_idx);
-        self.layout_manager.on_session_reordered(from_idx, to_idx);
+        self.renaming_tab = None;
+        self.tabs.reorder(from_idx, to_idx);
     }
 
     /// 会话标题:用户双击重命名设置的 custom_name 优先;否则用 shell 当前工作
@@ -85,20 +195,10 @@ impl TerminalApp {
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
-        let visible_sessions: Vec<usize> = self
-            .layout_manager
-            .panes()
-            .iter()
-            .map(|pane| pane.session_idx)
-            .collect();
-        self.session_manager.refresh_unseen_flags(&visible_sessions);
-        let active = self.session_manager.active_index();
-        let infos: Vec<(usize, String, bool)> = self
-            .session_manager
-            .sessions()
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (i, Self::session_cwd_title(s), s.metadata.unseen_output))
+        self.refresh_unseen_flags_for_visible_panes();
+        let active = self.tabs.active_index();
+        let infos: Vec<(usize, String, bool)> = (0..self.tabs.len())
+            .map(|i| (i, self.tab_title(i), self.tab_has_unseen_output(i)))
             .collect();
         let multi = infos.len() > 1;
 
@@ -143,7 +243,7 @@ impl TerminalApp {
                                 if row_hovered {
                                     let close_resp = ui
                                         .add_sized([row_h, row_h], egui::Button::new("✕").small())
-                                        .on_hover_text("关闭会话");
+                                        .on_hover_text("关闭标签页(含其所有分屏)");
                                     if close_resp.clicked() {
                                         close_idx = Some(*i);
                                     }
@@ -294,36 +394,30 @@ impl TerminalApp {
         }
 
         ui.add_space(4.0);
-        if ui.button("＋ New session").clicked() {
+        if ui.button("＋ New tab").clicked() {
             new_session = true;
         }
 
         if let Some((from_idx, to_idx)) = reorder {
-            // 重排后索引会漂移,正在编辑的重命名失效,避免提交到错的会话
-            self.renaming_tab = None;
-            self.reorder_sessions_synced(from_idx, to_idx);
+            // 重排后索引会漂移,正在编辑的重命名失效,避免提交到错的 tab
+            self.reorder_tabs(from_idx, to_idx);
             self.schedule_session_save();
         }
         if let Some(i) = switch_to {
-            self.activate_session(i);
+            self.activate_tab(i);
         }
         if let Some(i) = close_idx {
-            if self.session_manager.len() > 1 {
-                self.renaming_tab = None;
-                self.close_session_synced(i);
+            if self.close_tab_synced(i) {
                 self.schedule_session_save();
             }
         }
         if new_session {
-            let idx = self.create_session_with_current_config(None, None);
-            self.activate_session(idx);
-            self.schedule_session_save();
+            self.new_tab();
         }
         if let Some(i) = begin_rename {
             let initial = self
-                .session_manager
-                .sessions()
-                .get(i)
+                .tab_display_session(i)
+                .and_then(|idx| self.session_manager.sessions().get(idx))
                 .map(|s| {
                     s.metadata
                         .custom_name
@@ -342,11 +436,15 @@ impl TerminalApp {
 
     /// 应用 tab 重命名:trim 后写入 custom_name(空串等同清除自定义名,回退到 CWD 标题)。
     /// 触发持久化,确保下次启动保留用户标签。
-    pub fn apply_rename(&mut self, i: usize, raw: String) {
+    ///
+    /// `tab_idx` 是 tab 序号;名字写在该 tab 当前选中窗格的会话上,与 tab 标题
+    /// 的取值口径保持一致。
+    pub fn apply_rename(&mut self, tab_idx: usize, raw: String) {
         let raw_trimmed_len = raw.trim().len();
         let trimmed = crate::session_persistence::bounded_session_name(&raw);
         let was_truncated = trimmed.len() < raw_trimmed_len;
-        if let Some(s) = self.session_manager.get_session_mut(i) {
+        let target = self.tab_display_session(tab_idx);
+        if let Some(s) = target.and_then(|idx| self.session_manager.get_session_mut(idx)) {
             s.metadata.custom_name = if trimmed.is_empty() {
                 None
             } else {
@@ -509,13 +607,7 @@ impl TerminalApp {
     }
 
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
-        let visible_sessions: Vec<usize> = self
-            .layout_manager
-            .panes()
-            .iter()
-            .map(|pane| pane.session_idx)
-            .collect();
-        self.session_manager.refresh_unseen_flags(&visible_sessions);
+        self.refresh_unseen_flags_for_visible_panes();
         let tab_height = 30.0;
         let close_btn_size = 14.0;
         let tab_rect = egui::Rect::from_min_size(
@@ -559,7 +651,7 @@ impl TerminalApp {
         let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 4.0;
         let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
 
-        let active_idx_for_layout = self.session_manager.active_index();
+        let active_idx_for_layout = self.tabs.active_index();
 
         // 文本测量闭包
         let measure = |text: &str| -> f32 {
@@ -625,20 +717,14 @@ impl TerminalApp {
         let active_max_text = max_tab_width + active_tab_extra - tab_padding;
         let inactive_max_text = max_tab_width - tab_padding;
 
-        let tab_unseen: Vec<bool> = self
-            .session_manager
-            .sessions()
-            .iter()
-            .map(|s| s.metadata.unseen_output)
+        let tab_unseen: Vec<bool> = (0..self.tabs.len())
+            .map(|idx| self.tab_has_unseen_output(idx))
             .collect();
 
-        let tab_infos: Vec<(usize, String, f32)> = self
-            .session_manager
-            .sessions()
-            .iter()
-            .enumerate()
-            .map(|(idx, session)| {
-                let tab_title = Self::session_cwd_title(session);
+        let tab_infos: Vec<(usize, String, f32)> = (0..self.tabs.len())
+            .map(|idx| {
+                // tab 的标题就是它当前选中窗格的标题。
+                let tab_title = self.tab_title(idx);
 
                 let max_text_w = if idx == active_idx_for_layout {
                     active_max_text
@@ -861,7 +947,7 @@ impl TerminalApp {
 
                             // 执行重排
                             if target_idx != from_idx {
-                                self.reorder_sessions_synced(from_idx, target_idx);
+                                self.reorder_tabs(from_idx, target_idx);
                             }
                         }
                     }
@@ -889,8 +975,9 @@ impl TerminalApp {
                             );
 
                             if close_btn_rect.contains(click_pos) {
-                                if self.session_manager.len() > 1 {
-                                    self.close_session_synced(i);
+                                // 关闭 tab = 关闭它所有的分屏窗格。最后一个 tab
+                                // 没有可回退的目标,等同于关闭窗口。
+                                if self.close_tab_synced(i) {
                                     self.schedule_session_save();
                                 } else {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -900,7 +987,7 @@ impl TerminalApp {
                                 self.drag_start_pos = None;
                                 break;
                             } else if tab_rect_item.contains(click_pos) {
-                                self.activate_session(i);
+                                self.activate_tab(i);
                                 self.dragging_tab = None;
                                 self.drag_start_pos = None;
                                 break;
@@ -977,7 +1064,7 @@ impl TerminalApp {
         let clipped_painter = painter.with_clip_rect(tab_clip_rect);
 
         let mut x_offset = scroll_base;
-        let active_idx = self.session_manager.active_index();
+        let active_idx = self.tabs.active_index();
         // 活跃指示条目标位置（非拖拽时用于滑动动画）
         let mut active_indicator_target: Option<(f32, f32, f32)> = None;
 
@@ -1262,9 +1349,7 @@ impl TerminalApp {
         if mouse_released {
             if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
                 if plus_btn_rect.contains(click_pos) {
-                    let new_idx = self.create_session_with_current_config(None, None);
-                    self.activate_session(new_idx);
-                    self.schedule_session_save();
+                    self.new_tab();
                 }
             }
         }
@@ -1331,12 +1416,11 @@ impl TerminalApp {
             egui::Sense::hover(),
         );
 
-        // 进入重命名:用 begin_rename_idx 标记的会话当前标题做初值。
+        // 进入重命名:用 begin_rename_idx 标记的 tab 当前标题做初值。
         if let Some(i) = begin_rename_idx {
             let initial = self
-                .session_manager
-                .sessions()
-                .get(i)
+                .tab_display_session(i)
+                .and_then(|idx| self.session_manager.sessions().get(idx))
                 .map(|s| {
                     s.metadata
                         .custom_name

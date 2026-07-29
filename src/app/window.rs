@@ -98,11 +98,20 @@ impl TerminalApp {
             .iter()
             .map(|session| session.metadata.session_id.clone())
             .collect();
-        let layout = self.layout_manager.to_snapshot(&session_ids);
+        // 每个 tab 存一棵树。转换失败的 tab（其会话缺少稳定 ID）整个跳过，
+        // 恢复时它的会话会各自落到单窗格 tab 上，而不是让整份布局作废。
+        let tabs: Vec<_> = self
+            .tabs
+            .layouts()
+            .iter()
+            .filter_map(|tab| tab.to_snapshot(&session_ids))
+            .collect();
+        let active_tab = Some(self.tabs.active_index()).filter(|idx| *idx < tabs.len());
         session_persistence::SessionsSnapshot::from_snapshots(
             snapshots,
             Some(self.session_manager.active_index()),
-            layout,
+            tabs,
+            active_tab,
         )
     }
 

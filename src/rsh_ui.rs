@@ -152,7 +152,10 @@ impl TerminalApp {
             self.config.scrollback_lines,
         );
         if self.session_manager.len() > old_len {
-            self.layout_manager.on_session_inserted(index);
+            self.tabs.on_session_inserted(index);
+            // 安装脚本自己就是进度界面，给它一个独立 tab，而不是塞进当前
+            // tab 的某个窗格里。
+            self.tabs.insert_tab_after_active(index);
         }
         self.activate_session(index);
         self.set_status("Installing rsh in a new session");

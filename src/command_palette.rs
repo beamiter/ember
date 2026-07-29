@@ -106,39 +106,39 @@ impl CommandPalette {
         let mut commands = vec![
             // === 会话管理 ===
             CommandInfo::new(
-                "New Session",
+                "New Tab",
                 CommandCategory::Session,
-                "Create a new terminal session",
+                "Open a new tab with a fresh terminal session",
                 crate::keybindings::Command::SessionNew,
             ),
             CommandInfo::new(
-                "Close Session",
+                "Close Tab",
                 CommandCategory::Session,
-                "Close the current session",
+                "Close the current tab and every pane in it",
                 crate::keybindings::Command::SessionClose,
             ),
             CommandInfo::new(
-                "Next Session",
+                "Next Tab",
                 CommandCategory::Session,
-                "Switch to the next session",
+                "Switch to the next tab",
                 crate::keybindings::Command::SessionNext,
             ),
             CommandInfo::new(
-                "Previous Session",
+                "Previous Tab",
                 CommandCategory::Session,
-                "Switch to the previous session",
+                "Switch to the previous tab",
                 crate::keybindings::Command::SessionPrev,
             ),
             CommandInfo::new(
-                "Last Session",
+                "Last Tab",
                 CommandCategory::Session,
-                "Switch to the last session",
+                "Switch to the last tab",
                 crate::keybindings::Command::SessionLast,
             ),
             CommandInfo::new(
                 "Last Active Session",
                 CommandCategory::Session,
-                "Switch back to the most recently focused session",
+                "Switch back to the most recently focused pane, in whichever tab it lives",
                 crate::keybindings::Command::SessionPrevActive,
             ),
             // === 编辑操作 ===
