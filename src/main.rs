@@ -1715,6 +1715,7 @@ impl TerminalApp {
             hovered_tab_index: None,
             dragging_tab: None,
             drag_start_pos: None,
+            tab_drag_origin: None,
             current_mouse_x: 0.0,
             tab_scroll_offset: 0.0,
             renaming_tab: None,
@@ -1723,14 +1724,9 @@ impl TerminalApp {
                 let mut sb = sidebar::Sidebar::new();
                 sb.visible = false; // 默认隐藏，opt-in 切换
 
-                // Top 模式没有 Sessions 视图；Commands 与 Files 在两种布局下都可用。
-                sb.view = if matches!(cfg.tab_bar_position, config::TabBarPosition::Top)
-                    && cfg.sidebar_view == sidebar::SidebarView::Sessions
-                {
-                    sidebar::SidebarView::Files
-                } else {
-                    cfg.sidebar_view
-                };
+                // 三个视图在两种 tab 栏布局下都可用：Top 模式下侧边栏的
+                // Sessions 列表与顶部 tab 栏并存(与 jterm3 一致)。
+                sb.view = cfg.sidebar_view;
                 sb
             },
             command_sidebar: Default::default(),
@@ -1873,12 +1869,7 @@ impl TerminalApp {
             config::TabBarPosition::Top => config::TabBarPosition::Sidebar,
             config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
         };
-        if matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
-            // Top 模式不提供 Sessions；Commands/Files 保持用户当前选择。
-            if self.sidebar.view == sidebar::SidebarView::Sessions {
-                self.sidebar.view = sidebar::SidebarView::Files;
-            }
-        } else {
+        if !matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
             // 标签移入侧边栏：恢复上次记住的视图并确保侧边栏可见，否则标签不可达
             self.sidebar.view = self.config.sidebar_view;
             self.sidebar.visible = true;
@@ -1915,15 +1906,6 @@ impl TerminalApp {
             }
         }
 
-        // Sessions 只属于侧边栏 tab 模式；Files/Commands 在两种布局下都可用。
-        let sidebar_tab_mode = matches!(
-            self.config.tab_bar_position,
-            config::TabBarPosition::Sidebar
-        );
-        if !sidebar_tab_mode && self.sidebar.view == sidebar::SidebarView::Sessions {
-            self.sidebar.view = sidebar::SidebarView::Files;
-        }
-
         // 树遍历期间只收集动作，闭包结束后再 mutate，规避借用冲突
         let mut toggle_path: Option<std::path::PathBuf> = None;
         let mut select_path: Option<std::path::PathBuf> = None;
@@ -1938,13 +1920,14 @@ impl TerminalApp {
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
-                    if sidebar_tab_mode
-                        && ui
-                            .selectable_label(
-                                self.sidebar.view == sidebar::SidebarView::Sessions,
-                                egui::RichText::new("Sessions").strong(),
-                            )
-                            .clicked()
+                    // Sessions 在两种 tab 栏布局下都可选：Top 模式下它是顶部
+                    // tab 栏之外的一份纵向标签列表，而非替代品。
+                    if ui
+                        .selectable_label(
+                            self.sidebar.view == sidebar::SidebarView::Sessions,
+                            egui::RichText::new("Sessions").strong(),
+                        )
+                        .clicked()
                     {
                         self.sidebar.view = sidebar::SidebarView::Sessions;
                         view_changed = true;

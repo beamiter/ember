@@ -1,10 +1,23 @@
 // Tab management module
 
-use super::state::TerminalApp;
+use super::state::{TabDragOrigin, TerminalApp};
 use crate::theme::ThemeExt as _;
 use eframe::egui;
 
 impl TerminalApp {
+    /// Drop the in-flight tab drag, but only if `origin` started it. The
+    /// horizontal top bar and the vertical sidebar list share the drag fields
+    /// and both run every frame in Top mode; the top bar draws first, so an
+    /// unconditional reset there would swallow a sidebar drag before the
+    /// sidebar ever sees the release.
+    fn clear_tab_drag(&mut self, origin: TabDragOrigin) {
+        if self.tab_drag_origin == Some(origin) {
+            self.dragging_tab = None;
+            self.drag_start_pos = None;
+            self.tab_drag_origin = None;
+        }
+    }
+
     /// 当前 tab 的窗格布局。所有分屏操作都作用在它上面,因此不会波及其他 tab。
     pub fn layout(&self) -> &crate::layout::LayoutManager {
         self.tabs.active_layout()
@@ -211,11 +224,15 @@ impl TerminalApp {
         let mut commit_rename: Option<(usize, String)> = None;
         let mut cancel_rename = false;
 
-        // 拖拽阈值与顶部 tab bar 保持一致(5px),用 y 轴判断
+        // 拖拽阈值与顶部 tab bar 保持一致(5px),用 y 轴判断。Top 模式下顶部
+        // tab 栏与本列表同帧存在且共享拖拽字段,所以只认本列表发起的拖拽。
         let ctx = ui.ctx().clone();
         let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
-        let is_actually_dragging = match (self.dragging_tab, self.drag_start_pos, pointer_pos) {
-            (Some(_), Some(start_y), Some(p)) => (p.y - start_y).abs() > 5.0,
+        let owns_drag = self.tab_drag_origin == Some(TabDragOrigin::Sidebar);
+        let is_actually_dragging = match (owns_drag, self.dragging_tab, self.drag_start_pos) {
+            (true, Some(_), Some(start_y)) => pointer_pos
+                .map(|p| (p.y - start_y).abs() > 5.0)
+                .unwrap_or(false),
             _ => false,
         };
 
@@ -302,6 +319,7 @@ impl TerminalApp {
                                     self.dragging_tab = Some(*i);
                                     self.drag_start_pos =
                                         resp.interact_pointer_pos().or(pointer_pos).map(|p| p.y);
+                                    self.tab_drag_origin = Some(TabDragOrigin::Sidebar);
                                 }
                                 if resp.double_clicked() {
                                     begin_rename = Some(*i);
@@ -347,8 +365,7 @@ impl TerminalApp {
                     }
                 }
             }
-            self.dragging_tab = None;
-            self.drag_start_pos = None;
+            self.clear_tab_drag(TabDragOrigin::Sidebar);
         }
 
         // 拖拽过程中绘制插入指示线
@@ -910,18 +927,20 @@ impl TerminalApp {
             }
         }
 
-        // 检查是否发生了实际的拖拽（超过阈值距离）
-        let is_actually_dragging =
-            if let (Some(_), Some(start_x)) = (self.dragging_tab, self.drag_start_pos) {
+        // 检查是否发生了实际的拖拽（超过阈值距离）。侧边栏 Sessions 列表
+        // 与本栏共享拖拽字段,所以只认本栏发起的拖拽。
+        let owns_drag = self.tab_drag_origin == Some(TabDragOrigin::TopBar);
+        let is_actually_dragging = match (owns_drag, self.dragging_tab, self.drag_start_pos) {
+            (true, Some(_), Some(start_x)) => {
                 if let Some(current_pos) = ctx.input(|i| i.pointer.latest_pos()) {
                     let distance = (current_pos.x - start_x).abs();
                     distance > 5.0 // 5px拖拽阈值
                 } else {
                     false
                 }
-            } else {
-                false
-            };
+            }
+            _ => false,
+        };
 
         // === 交互辅助：用 tab_widths 计算 tab 位置的宏 ===
         // scroll_base: 绝对坐标 x 基准（减去滚动偏移）
@@ -952,8 +971,7 @@ impl TerminalApp {
                         }
                     }
                 }
-                self.dragging_tab = None;
-                self.drag_start_pos = None;
+                self.clear_tab_drag(TabDragOrigin::TopBar);
             } else {
                 // 简单点击（没有发生实际拖拽）
                 if let Some(click_pos) = hover_pos.or_else(|| ctx.input(|i| i.pointer.latest_pos()))
@@ -983,13 +1001,11 @@ impl TerminalApp {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                     return true;
                                 }
-                                self.dragging_tab = None;
-                                self.drag_start_pos = None;
+                                self.clear_tab_drag(TabDragOrigin::TopBar);
                                 break;
                             } else if tab_rect_item.contains(click_pos) {
                                 self.activate_tab(i);
-                                self.dragging_tab = None;
-                                self.drag_start_pos = None;
+                                self.clear_tab_drag(TabDragOrigin::TopBar);
                                 break;
                             }
 
@@ -998,10 +1014,7 @@ impl TerminalApp {
                     }
                 }
                 // 清除拖拽状态（即使没有找到点击的tab）
-                if self.dragging_tab.is_some() {
-                    self.dragging_tab = None;
-                    self.drag_start_pos = None;
-                }
+                self.clear_tab_drag(TabDragOrigin::TopBar);
             }
         }
 
@@ -1028,6 +1041,7 @@ impl TerminalApp {
                         {
                             self.dragging_tab = Some(i);
                             self.drag_start_pos = Some(press_pos.x);
+                            self.tab_drag_origin = Some(TabDragOrigin::TopBar);
                             break;
                         }
 

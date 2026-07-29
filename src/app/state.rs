@@ -36,6 +36,15 @@ pub struct PendingPasteConfirm {
     pub submit_after_paste: bool,
 }
 
+/// Which tab list started the in-flight tab drag. The horizontal top bar and
+/// the vertical sidebar list can be on screen at the same time and share the
+/// drag fields, so each one ignores a drag the other owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabDragOrigin {
+    TopBar,
+    Sidebar,
+}
+
 /// A pane header press that may become a rearrange drag.
 ///
 /// The source is tracked by stable session ID rather than index: a background
@@ -132,7 +141,12 @@ pub struct TerminalApp {
     // Tab UI state
     pub hovered_tab_index: Option<usize>,
     pub dragging_tab: Option<usize>,
+    /// 拖拽起点在拖拽方向上的坐标:顶部栏取 x,侧边栏取 y。两处列表现在可以
+    /// 同帧显示,所以必须配合 [`Self::tab_drag_origin`] 才有意义。
     pub drag_start_pos: Option<f32>,
+    /// 哪个列表拥有当前的 tab 拖拽。Top 模式下顶部 tab 栏与侧边栏 Sessions
+    /// 列表并存,若不区分来源,一次横向拖拽会被纵向列表按 y 轴误判成重排。
+    pub tab_drag_origin: Option<TabDragOrigin>,
     pub current_mouse_x: f32,
     pub tab_scroll_offset: f32,
     /// 双击 tab 进入重命名:(会话索引, 编辑中的名称缓冲)。提交时写入
