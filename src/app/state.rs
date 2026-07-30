@@ -24,12 +24,21 @@ use std::sync::{atomic::AtomicBool, Arc};
 /// exceeds [`PASTE_CONFIRM_THRESHOLD_BYTES`]: pasting `rm -rf …` followed by
 /// a newline would otherwise execute immediately.
 pub struct PendingPasteConfirm {
+    /// The payload as the child will receive it: line endings folded and any
+    /// embedded paste marker already removed, so the preview cannot show
+    /// something other than what gets written. Re-encoding it on accept is a
+    /// no-op pass, which is what makes the backpressure retry exact.
     pub text: String,
     /// Stable identity of the session that initiated the paste. Indices can
     /// be reused after a tab exits, which could otherwise paste into a
     /// completely different PTY after confirmation.
     pub session_id: String,
-    pub bracketed: bool,
+    /// What `jterm_core::pty_input::classify_paste` found in the *clipboard*,
+    /// captured once when this became pending. Kept for
+    /// `had_embedded_paste_marker`: that flag is a bracketed-paste injection
+    /// attempt, and the dialog names it even though the encoder already removed
+    /// the marker.
+    pub risk: jterm_core::pty_input::PasteRisk,
     /// Trusted UI commands (currently the Files sidebar's quoted `cd`) keep
     /// the final Enter outside bracketed-paste mode so Readline executes them
     /// after confirmation instead of merely inserting them.
@@ -272,8 +281,9 @@ pub struct TerminalApp {
     pub smooth_scroll_pixel_offset: f32,
 
     /// Holds a paste payload waiting for user confirmation. Populated by the
-    /// paste handlers when [`should_confirm_paste`] returns true; cleared by
-    /// the modal renderer on confirm/cancel.
+    /// paste handlers when `jterm_core::pty_input::should_confirm` returns true
+    /// for the clipboard's classification; cleared by the modal renderer on
+    /// confirm/cancel.
     pub pending_paste_confirm: Option<PendingPasteConfirm>,
 
     /// 粘贴确认对话框里"不再询问"复选框的临时状态(跨帧保留,直到对话框关闭)。

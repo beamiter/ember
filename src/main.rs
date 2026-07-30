@@ -609,6 +609,10 @@ fn main() -> Result<(), eframe::Error> {
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
         app_name: "jterm2",
         app_id: "io.github.beamiter.jterm2",
+        // Reported to every child shell as TERM_PROGRAM_VERSION by
+        // jterm_core::child_env, so it has to be this crate's version and not
+        // the core library's.
+        app_version: env!("CARGO_PKG_VERSION"),
     });
 
     // Load configuration
@@ -660,24 +664,118 @@ use app::state::TerminalApp;
 
 // normalize_terminal_shortcut_events moved to app::events module
 
-/// True when a clipboard paste should ask the user to confirm before being
-/// sent to the PTY. Trips on:
-/// - any newline (`\n` after CRLF normalization), since the most common
-///   foot-gun is a multi-line block that runs commands without review;
-/// - large payloads (> [`PASTE_CONFIRM_THRESHOLD_BYTES`]) that the user
-///   probably wants to look at before unleashing.
+/// jterm2's side of the shared paste policy.
 ///
-/// Bracketed-paste mode is *not* enough on its own: the receiving program
-/// (e.g. plain `bash`) may still execute on the first newline.
-fn should_confirm_paste(text: &str) -> bool {
-    text.contains('\n') || text.len() > crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES
+/// `SendVerbatim` is this app's long-standing behaviour: a multiline payload is
+/// never truncated, because the confirmation modal — not silent mangling — is
+/// what stands between the clipboard and the shell.
+///
+/// `submit_after_paste` is only ever set for a trusted command this app built
+/// itself (the Files sidebar's quoted `cd`), so those take the `prompt_insert`
+/// policy: stripping control bytes out of a path we just quoted would `cd`
+/// somewhere else. Clipboard bytes get the de-fanging policy.
+fn paste_policy(submit_after_paste: bool) -> jterm_core::pty_input::PastePolicy {
+    use jterm_core::pty_input::{PastePolicy, UnbracketedMultiline::SendVerbatim};
+    if submit_after_paste {
+        PastePolicy {
+            submit: true,
+            ..PastePolicy::prompt_insert(SendVerbatim)
+        }
+    } else {
+        PastePolicy::clipboard(SendVerbatim)
+    }
 }
 
-/// Normalize every terminal line-ending form before applying the paste safety
-/// policy. A lone carriage return is an executable Enter in canonical shells,
-/// so leaving it untouched would bypass newline confirmation.
-fn normalize_paste_text(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+/// The payload exactly as the child will receive it, minus the framing: line
+/// endings folded and every embedded ESC[200~/ESC[201~ removed, however many
+/// passes that takes.
+///
+/// `bracketed: false` with `SendVerbatim` is the combination that neither frames
+/// nor truncates, so this is normalization only. It is what the confirmation
+/// modal previews and what gets framed on delivery.
+///
+/// The loop is the load-bearing part. `jterm_core`'s de-fanging deletes a marker
+/// and resumes *after* it, so deleting an inner marker can splice the bytes
+/// around it into a new one: `ESC [` + `ESC [ 2 0 1 ~` + `2 0 1 ~` becomes a
+/// live `ESC[201~` after a single pass. Under a policy that keeps control bytes
+/// (`prompt_insert`: the sidebar `cd`, command replay, an approved agent
+/// command) that reconstituted terminator would then be framed and would close
+/// the frame early — the very bracketed-paste injection this encoder exists to
+/// prevent. Nesting can be arbitrarily deep, so run to a fixed point.
+fn defanged_paste_body(text: &str, policy: jterm_core::pty_input::PastePolicy) -> String {
+    use jterm_core::pty_input::{encode_paste, PasteModes};
+    let unframed = PasteModes { bracketed: false };
+    let mut body = encode_paste(text, unframed, policy).echo_text;
+    // Every pass that changes anything deletes at least six bytes, so the
+    // original length bounds the iteration count; the cap only guards against a
+    // future encoder whose passes are not strictly shrinking.
+    for _ in 0..body.len() {
+        let next = encode_paste(&body, unframed, policy).echo_text;
+        if next == body {
+            break;
+        }
+        body = next;
+    }
+    body
+}
+
+/// [`defanged_paste_body`] under the policy jterm2 uses for a clipboard paste
+/// (or, when `submit_after_paste`, for a command this app composed itself).
+fn normalized_paste_body(text: &str, submit_after_paste: bool) -> String {
+    defanged_paste_body(text, paste_policy(submit_after_paste))
+}
+
+/// Bytes for a command this app submits on the user's behalf — currently the
+/// Agent panel's approved suggestion.
+///
+/// Goes through the shared encoder for the same reason every other writer does:
+/// the text is model output that a human only skimmed, so an `ESC[201~` in it
+/// must not be able to close the frame and turn the remainder into typed
+/// commands. The submitting CR lands outside the frame.
+fn encode_submitted_command(command: &str, bracketed: bool) -> Vec<u8> {
+    let policy = paste_policy(true);
+    jterm_core::pty_input::encode_paste(
+        &defanged_paste_body(command, policy),
+        jterm_core::pty_input::PasteModes { bracketed },
+        policy,
+    )
+    .bytes
+}
+
+/// Encode `text` for the child's *current* bracketed-paste mode and hand it to
+/// the shell writer.
+///
+/// DECSET 2004 is read here, at delivery time, and nowhere else. The
+/// confirmation modal can stay open for arbitrarily many frames, and a shell
+/// that enters or leaves bracketed-paste mode while it is up (finishing a
+/// `vim`, starting one) would otherwise have its payload framed for the mode
+/// that was advertised when the dialog opened: an unframed body pasted with
+/// ESC[200~ in front of it lands as literal garbage, and a framed body sent
+/// unframed executes every line.
+fn write_paste_to_session(
+    session: &mut Session,
+    text: &str,
+    submit_after_paste: bool,
+) -> Result<bool, crate::shell::ShellWriteError> {
+    let bracketed = {
+        let terminal = session.terminal.lock();
+        terminal.is_bracketed_paste_enabled()
+    };
+    let policy = paste_policy(submit_after_paste);
+    // De-fanged to a fixed point *before* framing, so nothing this function
+    // frames can still contain a terminator. Callers hand us an already-stable
+    // body, which makes this pass a no-op for them; doing it here anyway is what
+    // keeps the guarantee a property of the writer rather than of its callers.
+    let paste = jterm_core::pty_input::encode_paste(
+        &defanged_paste_body(text, policy),
+        jterm_core::pty_input::PasteModes { bracketed },
+        policy,
+    );
+    if paste.is_empty() {
+        return Ok(false);
+    }
+    session.shell.write(&paste.bytes)?;
+    Ok(true)
 }
 
 fn paste_text_into_session(
@@ -687,82 +785,48 @@ fn paste_text_into_session(
     submit_after_paste: bool,
     pending_paste_confirm: &mut Option<crate::app::state::PendingPasteConfirm>,
 ) -> Result<bool, crate::shell::ShellWriteError> {
-    let normalized = normalize_paste_text(&text);
-    if normalized.is_empty() {
+    // Classify the clipboard as it arrived: `should_confirm` also trips on an
+    // embedded paste marker, which the encoder below defuses but the user still
+    // deserves to be told about.
+    let risk = jterm_core::pty_input::classify_paste(&text);
+    if risk.bytes == 0 {
         return Ok(false);
     }
+    let body = normalized_paste_body(&text, submit_after_paste);
+    let session_id = session.metadata.session_id.clone();
 
-    let bracketed_paste = {
-        let terminal = session.terminal.lock();
-        terminal.is_bracketed_paste_enabled()
-    };
-
-    if paste_confirm && should_confirm_paste(&normalized) {
+    if paste_confirm
+        && jterm_core::pty_input::should_confirm(
+            &risk,
+            crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES,
+        )
+    {
         *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
-            text: normalized,
-            session_id: session.metadata.session_id.clone(),
-            bracketed: bracketed_paste,
+            text: body,
+            session_id,
+            risk,
             submit_after_paste,
         });
-    } else {
-        // Retain the normalized source until the all-or-nothing shell enqueue
-        // succeeds. On transient backpressure the confirmation flow becomes a
-        // durable retry surface even when confirmations were otherwise off.
-        let paste_bytes = encode_terminal_paste(&normalized, bracketed_paste, submit_after_paste);
-        if let Err(error) = session.shell.write(&paste_bytes) {
+        return Ok(true);
+    }
+
+    // Retain the normalized source until the all-or-nothing shell enqueue
+    // succeeds. On transient backpressure the confirmation flow becomes a
+    // durable retry surface even when confirmations were otherwise off.
+    match write_paste_to_session(session, &body, submit_after_paste) {
+        Ok(delivered) => Ok(delivered),
+        Err(error) => {
             if error.is_backpressure() {
                 *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
-                    text: normalized,
-                    session_id: session.metadata.session_id.clone(),
-                    bracketed: bracketed_paste,
+                    text: body,
+                    session_id,
+                    risk,
                     submit_after_paste,
                 });
             }
-            return Err(error);
+            Err(error)
         }
     }
-
-    Ok(true)
-}
-
-fn encode_terminal_paste(text: &str, bracketed: bool, submit_after_paste: bool) -> Vec<u8> {
-    let payload = if submit_after_paste {
-        text.strip_suffix('\n').unwrap_or(text)
-    } else {
-        text
-    };
-    let mut bytes = if bracketed {
-        wrap_bracketed_paste(payload.as_bytes().to_vec())
-    } else {
-        payload.as_bytes().to_vec()
-    };
-    if submit_after_paste {
-        // Enter must be outside ESC[200~/ESC[201~. Bash/Readline deliberately
-        // does not execute newlines contained inside a bracketed paste.
-        bytes.push(b'\r');
-    }
-    bytes
-}
-
-pub(crate) fn wrap_bracketed_paste(payload: Vec<u8>) -> Vec<u8> {
-    // 安全:剔除 payload 内嵌的粘贴结束序列 ESC[201~,否则恶意剪贴板可
-    // 提前结束粘贴模式并注入随后被 shell 执行的命令(bracketed-paste 注入)。
-    let end = b"\x1b[201~";
-    let mut sanitized = Vec::with_capacity(payload.len());
-    let mut i = 0;
-    while i < payload.len() {
-        if payload[i..].starts_with(end) {
-            i += end.len();
-        } else {
-            sanitized.push(payload[i]);
-            i += 1;
-        }
-    }
-    let mut wrapped = Vec::with_capacity(sanitized.len() + 12);
-    wrapped.extend_from_slice(b"\x1b[200~");
-    wrapped.append(&mut sanitized);
-    wrapped.extend_from_slice(b"\x1b[201~");
-    wrapped
 }
 
 fn osc_5522_packet(metadata: &str, payload: Option<&str>) -> Vec<u8> {
@@ -1520,7 +1584,11 @@ impl TerminalApp {
                                 "[SessionPersistence] Failed to load {}: {error}",
                                 path.display()
                             );
-                            match session_persistence::quarantine_corrupt_snapshot(&path) {
+                            // jterm2 donated this idea to the family; core's copy
+                            // is a strict superset (a *dangling* symlink at a
+                            // backup name no longer counts as free), so there is
+                            // one scheme, not two.
+                            match jterm_core::snapshot_file::quarantine_corrupt(&path) {
                                 Ok(backup) => {
                                     session_restore_notice = Some(format!(
                                         "Session restore failed; original moved to {}",
@@ -3796,15 +3864,15 @@ mod tests {
     use super::{
         bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
-        encode_terminal_paste, flush_pending_mouse_controls, kitty_graphics_payload,
-        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalize_paste_text,
-        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, primary_copy_route,
-        queue_mouse_control, reported_capture_button, roll_notification_rate_window,
-        should_confirm_paste, should_notify_long_command, show_desktop_notification,
-        take_tagged_cursor_move, wait_for_child_with_timeout, wrap_bracketed_paste,
-        ClipboardRequestGuard, DesktopNotification, PrimaryCopyRoute,
-        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
-        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
+        encode_submitted_command, flush_pending_mouse_controls, kitty_graphics_payload,
+        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
+        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
+        primary_copy_route, queue_mouse_control, reported_capture_button,
+        roll_notification_rate_window, should_notify_long_command, show_desktop_notification,
+        take_tagged_cursor_move, wait_for_child_with_timeout, ClipboardRequestGuard,
+        DesktopNotification, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
+        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
+        OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -3977,48 +4045,183 @@ mod tests {
         assert_eq!(sent, 1);
     }
 
+    /// The confirmation trigger is now `jterm_core`'s, but it must trip at the
+    /// same points jterm2's own predicate did — plus on an embedded paste
+    /// marker, which is an injection attempt worth surfacing.
     #[test]
     fn risky_paste_detection_covers_newlines_and_large_single_lines() {
-        assert!(!should_confirm_paste("printf safe"));
-        assert!(should_confirm_paste("first\nsecond"));
-        assert!(should_confirm_paste(
+        use jterm_core::pty_input::{classify_paste, should_confirm};
+        let risky = |text: &str| {
+            should_confirm(
+                &classify_paste(text),
+                crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES,
+            )
+        };
+
+        assert!(!risky("printf safe"));
+        assert!(risky("first\nsecond"));
+        assert!(risky(
             &"x".repeat(crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES + 1)
         ));
+        assert!(!risky(
+            &"x".repeat(crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES)
+        ));
+        assert!(risky("ok\x1b[201~rm -rf ~"));
     }
 
     #[test]
     fn paste_normalization_cannot_hide_enter_as_a_carriage_return() {
+        use jterm_core::pty_input::{classify_paste, should_confirm};
         assert_eq!(
-            normalize_paste_text("first\rsecond\r\nthird"),
+            normalized_paste_body("first\rsecond\r\nthird", false),
             "first\nsecond\nthird"
         );
-        assert!(should_confirm_paste(&normalize_paste_text(
-            "printf risky\r"
-        )));
+        // A lone CR is an executable Enter, so it has to count as a second line
+        // for the confirmation policy too.
+        assert!(should_confirm(
+            &classify_paste("printf risky\r"),
+            crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES
+        ));
     }
 
     #[test]
     fn bracketed_paste_cannot_embed_an_early_terminator() {
-        let wrapped = wrap_bracketed_paste(b"safe\x1b[201~injected".to_vec());
-        assert_eq!(wrapped, b"\x1b[200~safeinjected\x1b[201~");
+        use jterm_core::pty_input::{encode_paste, PasteModes};
+        let paste = encode_paste(
+            "safe\x1b[201~injected",
+            PasteModes { bracketed: true },
+            paste_policy(false),
+        );
+        assert_eq!(paste.bytes, b"\x1b[200~safeinjected\x1b[201~");
         assert_eq!(
-            wrapped
+            paste
+                .bytes
                 .windows(b"\x1b[201~".len())
                 .filter(|window| *window == b"\x1b[201~")
                 .count(),
             1
         );
+        // The body kept for the confirmation modal is already defused, so the
+        // preview shows exactly what the shell will receive.
+        assert_eq!(
+            normalized_paste_body("safe\x1b[201~injected", false),
+            "safeinjected"
+        );
     }
 
     #[test]
     fn submitted_ui_command_places_enter_after_bracketed_paste() {
+        use jterm_core::pty_input::{encode_paste, PasteModes};
         assert_eq!(
-            encode_terminal_paste("cd '/tmp'\n", true, true),
+            encode_paste(
+                "cd '/tmp'\n",
+                PasteModes { bracketed: true },
+                paste_policy(true)
+            )
+            .bytes,
             b"\x1b[200~cd '/tmp'\x1b[201~\r"
         );
         assert_eq!(
-            encode_terminal_paste("cd '/tmp'\n", false, true),
+            encode_paste(
+                "cd '/tmp'\n",
+                PasteModes { bracketed: false },
+                paste_policy(true)
+            )
+            .bytes,
             b"cd '/tmp'\r"
+        );
+    }
+
+    /// An approved agent suggestion is still model output: it must be framed
+    /// like any other payload so an embedded terminator cannot end the frame and
+    /// leave the rest as typed commands. Its Enter stays outside the frame.
+    #[test]
+    fn a_submitted_agent_command_is_framed_and_cannot_break_out() {
+        assert_eq!(
+            encode_submitted_command("ls -la", true),
+            b"\x1b[200~ls -la\x1b[201~\r"
+        );
+        assert_eq!(encode_submitted_command("ls -la", false), b"ls -la\r");
+        assert_eq!(
+            encode_submitted_command("ls\x1b[201~\rrm -rf ~", true),
+            b"\x1b[200~ls\nrm -rf ~\x1b[201~\r"
+        );
+        // Nothing to run means nothing is written — not a bare Enter.
+        assert!(encode_submitted_command("", true).is_empty());
+    }
+
+    /// One de-fanging pass is not a security boundary: `jterm_core` deletes a
+    /// marker and resumes after it, so `ESC [` + `ESC[201~` + `201~` collapses
+    /// into a *fresh* `ESC[201~`. The paths that keep control bytes (an approved
+    /// agent command, the sidebar `cd`) would then frame that terminator and hand
+    /// the shell an early frame close followed by executable lines. Exactly one
+    /// terminator may ever leave these encoders.
+    #[test]
+    fn a_nested_paste_terminator_cannot_be_spliced_back_into_the_frame() {
+        let terminators = |bytes: &[u8]| {
+            bytes
+                .windows(b"\x1b[201~".len())
+                .filter(|window| *window == b"\x1b[201~")
+                .count()
+        };
+        // Two levels of nesting; the payload after it is what a single pass
+        // would have let the shell run.
+        let nested = "\x1b[\x1b[\x1b[201~201~201~\rrm -rf ~";
+
+        let submitted = encode_submitted_command(nested, true);
+        assert_eq!(terminators(&submitted), 1, "{submitted:?}");
+        assert_eq!(submitted, b"\x1b[200~\nrm -rf ~\x1b[201~\r");
+
+        // Same for the body a paste keeps: no marker survives to be framed, and
+        // the preview therefore shows what the shell will really receive.
+        for submit_after_paste in [false, true] {
+            let body = normalized_paste_body(nested, submit_after_paste);
+            assert!(!body.contains("\x1b[201~"), "{body:?}");
+            assert_eq!(
+                normalized_paste_body(&body, submit_after_paste),
+                body,
+                "the stored body must be a fixed point of the encoder"
+            );
+        }
+    }
+
+    /// A trusted `cd` this app quoted itself keeps its bytes; a clipboard paste
+    /// is de-fanged. Stripping controls out of a quoted path would `cd`
+    /// somewhere other than the directory the user clicked.
+    #[test]
+    fn only_clipboard_pastes_are_stripped_of_control_bytes() {
+        assert_eq!(normalized_paste_body("a\x1b[31mb", false), "a[31mb");
+        assert_eq!(normalized_paste_body("a\x1b[31mb", true), "a\x1b[31mb");
+        // Multiline payloads are never truncated: the modal, not silent
+        // mangling, is what protects the user here.
+        assert_eq!(normalized_paste_body("one\ntwo", false), "one\ntwo");
+    }
+
+    /// The stored body is what the accept path re-encodes, in whichever
+    /// bracketed-paste mode is live *then*. Both framings must therefore be
+    /// reachable from one pending paste, and re-encoding must be a fixed point
+    /// so a backpressure retry sends the same bytes rather than a doubly
+    /// processed payload.
+    #[test]
+    fn a_pending_body_re_encodes_for_either_mode_without_drifting() {
+        use jterm_core::pty_input::{encode_paste, PasteModes};
+        let body = normalized_paste_body("echo one\r\necho \x1b[201~two", false);
+        assert_eq!(body, "echo one\necho two");
+
+        let framed = encode_paste(&body, PasteModes { bracketed: true }, paste_policy(false));
+        assert_eq!(framed.bytes, b"\x1b[200~echo one\necho two\x1b[201~");
+        let unframed = encode_paste(&body, PasteModes { bracketed: false }, paste_policy(false));
+        assert_eq!(unframed.bytes, body.as_bytes());
+
+        assert_eq!(normalized_paste_body(&body, false), body);
+        assert_eq!(
+            encode_paste(
+                &framed.echo_text,
+                PasteModes { bracketed: true },
+                paste_policy(false)
+            )
+            .bytes,
+            framed.bytes
         );
     }
 

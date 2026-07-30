@@ -769,11 +769,7 @@ impl TerminalApp {
             } else if run && replay_command_is_multiline(&command) {
                 ReplayOutcome::MultilineRun
             } else {
-                let mut payload = crate::wrap_bracketed_paste(command.as_bytes().to_vec());
-                if run {
-                    payload.push(b'\r');
-                }
-                match session.shell.write(&payload) {
+                match session.shell.write(&replay_payload(&command, run)) {
                     Ok(()) => {
                         session.terminal.lock().scroll_to_bottom();
                         if run {
@@ -1311,6 +1307,43 @@ fn format_byte_count(bytes: usize) -> String {
     }
 }
 
+/// Bytes that put a recalled command back on the child's prompt.
+///
+/// Only ever reached when the child advertised DECSET 2004 (see
+/// [`ReplayOutcome::BracketedPasteDisabled`]), so the payload is always framed;
+/// `jterm_core::pty_input` removes any paste marker the recorded command itself
+/// carries and keeps the submitting CR *outside* the frame, because Readline
+/// deliberately does not execute a newline that arrived inside a bracketed
+/// paste. Control bytes are kept: this text is a command jterm2 recorded from
+/// its own OSC 133 stream, not clipboard data.
+///
+/// The leading `Ctrl+U` matters even though the caller checked
+/// `shell_is_prompt_ready`: that flag says a prompt has been drawn, not that its
+/// line buffer is empty, so without the kill a replay is appended to whatever
+/// the user had already typed.
+fn replay_payload(command: &str, run: bool) -> Vec<u8> {
+    use jterm_core::pty_input::{
+        encode_prompt_insert, PasteModes, PastePolicy, UnbracketedMultiline,
+    };
+    let policy = PastePolicy {
+        submit: run,
+        ..PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim)
+    };
+    // A recorded command is not this app's own text: `OSC 133;C;cmd=` is
+    // percent-decoded verbatim (`terminal::state::percent_decode_osc_133`), so
+    // any program that printed the prompt marker chose these bytes, raw ESC
+    // included. `defanged_paste_body` therefore runs to a fixed point before the
+    // framing — one de-fanging pass can splice a *new* terminator out of a
+    // nested one and hand it straight to the frame.
+    encode_prompt_insert(
+        &crate::defanged_paste_body(command, policy),
+        PasteModes { bracketed: true },
+        policy,
+        true,
+    )
+    .bytes
+}
+
 fn trim_replay_command(command: &str) -> String {
     command.trim_end_matches(&['\r', '\n'][..]).to_string()
 }
@@ -1422,6 +1455,52 @@ mod tests {
             "printf 'a\\nb'"
         );
         assert_eq!(trim_replay_command(" echo hi  "), " echo hi  ");
+    }
+
+    #[test]
+    fn replay_payload_frames_the_command_and_clears_the_line_first() {
+        // Ctrl+U, then the frame, then — only when running — a CR outside it.
+        assert_eq!(
+            replay_payload("git status", false),
+            b"\x15\x1b[200~git status\x1b[201~"
+        );
+        assert_eq!(
+            replay_payload("git status", true),
+            b"\x15\x1b[200~git status\x1b[201~\r"
+        );
+    }
+
+    /// A recorded command is not clipboard data, so its escapes survive — but a
+    /// paste terminator inside it must not, or replaying it would end the frame
+    /// early and run the remainder as a command.
+    #[test]
+    fn replay_payload_keeps_escapes_but_never_an_embedded_terminator() {
+        assert_eq!(
+            replay_payload("printf '\x1b[31m'", false),
+            b"\x15\x1b[200~printf '\x1b[31m'\x1b[201~"
+        );
+        assert_eq!(
+            replay_payload("echo ok\x1b[201~\rrm -rf ~", false),
+            b"\x15\x1b[200~echo ok\nrm -rf ~\x1b[201~"
+        );
+    }
+
+    /// A replayed command comes from a percent-decoded `OSC 133;C;cmd=`, i.e.
+    /// from whatever program printed the prompt marker — raw ESC included. A
+    /// nested terminator must not survive one de-fanging pass and be spliced back
+    /// into the frame, which would close it early and run the remainder.
+    #[test]
+    fn a_nested_terminator_in_a_recorded_command_is_removed_to_a_fixed_point() {
+        let payload = replay_payload("echo ok\x1b[\x1b[\x1b[201~201~201~\rrm -rf ~", true);
+        assert_eq!(
+            payload
+                .windows(b"\x1b[201~".len())
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1,
+            "{payload:?}"
+        );
+        assert_eq!(payload, b"\x15\x1b[200~echo ok\nrm -rf ~\x1b[201~\r");
     }
 
     #[test]

@@ -163,28 +163,13 @@ impl SessionsSnapshot {
             ));
         }
 
-        let file_len = std::fs::metadata(path)?.len();
-        if file_len > MAX_SESSION_SNAPSHOT_BYTES {
-            return Err(format!(
-                "session snapshot is {file_len} bytes; limit is {MAX_SESSION_SNAPSHOT_BYTES}"
-            )
-            .into());
-        }
-
-        // Metadata is only an early rejection. `take` is the actual bound and
-        // remains correct if another process grows the file between metadata
-        // and read.
-        use std::io::Read;
-        let mut content = String::new();
-        std::fs::File::open(path)?
-            .take(MAX_SESSION_SNAPSHOT_BYTES + 1)
-            .read_to_string(&mut content)?;
-        if content.len() as u64 > MAX_SESSION_SNAPSHOT_BYTES {
-            return Err(format!(
-                "session snapshot grew beyond the {MAX_SESSION_SNAPSHOT_BYTES}-byte limit"
-            )
-            .into());
-        }
+        // The bounded read (metadata as an early rejection, `take` as the bound
+        // that actually holds when another process grows the file mid-read) is
+        // `jterm_core::snapshot_file`'s now, which additionally proves through
+        // `fstat` on the *open descriptor* that this is a regular file — so a
+        // fifo swapped in at this path cannot block startup, and nothing can
+        // exchange the path between the size check and the read.
+        let content = jterm_core::snapshot_file::read_bounded(path, MAX_SESSION_SNAPSHOT_BYTES)?;
         let mut snapshot: SessionsSnapshot = serde_json::from_str(&content)?;
         let warnings = snapshot.sanitize();
         eprintln!(
@@ -422,41 +407,6 @@ pub fn bounded_session_name(value: &str) -> String {
         end -= 1;
     }
     value[..end].to_string()
-}
-
-/// Move a malformed snapshot aside before any fresh session state is saved.
-/// `rename` operates on the directory entry itself, so a symlink is moved
-/// rather than followed.
-pub fn quarantine_corrupt_snapshot(
-    path: &std::path::Path,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let file_type = std::fs::symlink_metadata(path)?.file_type();
-    if !file_type.is_file() && !file_type.is_symlink() {
-        return Err("refusing to quarantine a non-file session snapshot path".into());
-    }
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or("session snapshot path has no file name")?;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-
-    for suffix in 0..100u8 {
-        let mut backup_name = file_name.to_os_string();
-        backup_name.push(format!(
-            ".corrupt-{timestamp}-{}-{suffix}",
-            std::process::id()
-        ));
-        let backup = parent.join(backup_name);
-        if backup.exists() {
-            continue;
-        }
-        std::fs::rename(path, &backup)?;
-        return Ok(backup);
-    }
-    Err("could not allocate a unique corrupt-snapshot backup name".into())
 }
 
 fn validate_instance_lock_file(file: &std::fs::File) -> std::io::Result<()> {
@@ -999,6 +949,10 @@ mod tests {
         assert!(error.contains("limit"), "{error}");
     }
 
+    /// The seam, not the mechanism (core owns and tests the naming): what this
+    /// pins is that jterm2's loader rejects a corrupt snapshot and that the
+    /// bytes survive being moved aside, in that order — startup writes fresh
+    /// state right after, and the evidence must already be out of its way.
     #[test]
     fn malformed_snapshot_is_quarantined_without_losing_its_bytes() {
         let root = TestDir::new("corrupt-snapshot");
@@ -1007,10 +961,28 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         assert!(SessionsSnapshot::load(&path).is_err());
-        let backup = quarantine_corrupt_snapshot(&path).unwrap();
+        let backup = jterm_core::snapshot_file::quarantine_corrupt(&path).unwrap();
 
         assert!(!path.exists());
         assert_eq!(std::fs::read(backup).unwrap(), original);
+    }
+
+    /// A snapshot path that is not a regular file must be rejected instead of
+    /// read: an attacker-planted fifo at a configured `session_history_file`
+    /// used to hang the whole startup inside `open`.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_snapshot_path_is_refused_rather_than_opened() {
+        let root = TestDir::new("fifo-snapshot");
+        let path = root.0.join("sessions.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return; // Some sandboxes forbid mkfifo; nothing to assert then.
+        }
+
+        let error = SessionsSnapshot::load(&path).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
     }
 
     #[test]

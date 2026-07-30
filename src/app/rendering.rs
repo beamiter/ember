@@ -1094,18 +1094,19 @@ impl TerminalApp {
                     crate::agent_panel::AgentEffect::RunCommand {
                         session_index,
                         command,
-                    } => {
-                        let mut bytes = command.into_bytes();
-                        bytes.push(b'\r');
-                        match self.session_manager.get_session_mut(session_index) {
-                            Some(session) => {
-                                if !session.queue_input(&bytes) {
-                                    self.set_status("Agent command rejected: input queue is full");
-                                }
+                    } => match self.session_manager.get_session_mut(session_index) {
+                        Some(session) => {
+                            let bracketed = {
+                                let terminal = session.terminal.lock();
+                                terminal.is_bracketed_paste_enabled()
+                            };
+                            let bytes = crate::encode_submitted_command(&command, bracketed);
+                            if !session.queue_input(&bytes) {
+                                self.set_status("Agent command rejected: input queue is full");
                             }
-                            None => self.set_status("Agent session's terminal no longer exists"),
                         }
-                    }
+                        None => self.set_status("Agent session's terminal no longer exists"),
+                    },
                 }
             }
         }
@@ -1177,6 +1178,9 @@ impl TerminalApp {
 
         let line_count = pending.text.lines().count();
         let byte_len = pending.text.len();
+        // 剪贴板里嵌有 ESC[200~/ESC[201~ 只可能是括号粘贴注入尝试:编码器已经
+        // 剔除,但用户有权知道自己复制到了什么。
+        let had_embedded_marker = pending.risk.had_embedded_paste_marker;
         // First few lines as a preview; truncate long single lines too.
         let preview: String = pending
             .text
@@ -1216,6 +1220,15 @@ impl TerminalApp {
                     ))
                     .color(text_color),
                 );
+                if had_embedded_marker {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ 剪贴板内嵌括号粘贴结束序列(ESC[201~),已剔除;\
+                             这通常意味着有人想让剩余内容被 shell 直接执行。",
+                        )
+                        .color(text_color),
+                    );
+                }
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style())
                     .stroke(egui::Stroke::new(1.0, border))
@@ -1300,14 +1313,12 @@ impl TerminalApp {
         {
             return;
         }
-        let paste_bytes = crate::encode_terminal_paste(
-            &pending.text,
-            pending.bracketed,
-            pending.submit_after_paste,
-        );
+        // Encoded here rather than when the dialog opened: the shell may have
+        // entered or left bracketed-paste mode while the modal was up, and the
+        // framing has to match the mode that is live at delivery time.
         let write_result = {
             let session = self.session_manager.get_active_session_mut();
-            session.shell.write(&paste_bytes)
+            crate::write_paste_to_session(session, &pending.text, pending.submit_after_paste)
         };
         if let Err(error) = write_result {
             let retryable = error.is_backpressure();

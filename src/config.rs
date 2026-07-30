@@ -5,6 +5,14 @@ use std::process::Command;
 
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
+/// Upper bound for `config.toml`. A hand-written terminal config is a few
+/// kilobytes; the bound exists so a file that is not really a config (a log
+/// rotated onto the path, a deliberately fattened file) is rejected with a
+/// size error instead of being read in full and then failing as a TOML parse
+/// error pointing at the wrong thing. Rejection sets `load_error`, which is
+/// what keeps the file from being overwritten by the next font zoom.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 // Nerd Font priority list
 const NERD_FONT_CANDIDATES: &[&str] = &[
     "SauceCodePro Nerd Font",
@@ -437,13 +445,20 @@ impl Default for Config {
     }
 }
 
+/// Read a config file under [`MAX_CONFIG_BYTES`]. Separate from
+/// [`Config::load`] only because `load` resolves the path from the environment
+/// and cannot be pointed at a fixture.
+pub(crate) fn read_config_file(path: &std::path::Path) -> std::io::Result<String> {
+    jterm_core::snapshot_file::read_bounded(path, MAX_CONFIG_BYTES)
+}
+
 impl Config {
     pub fn load() -> Self {
         // 记住失败原因:文件仍在磁盘上,拒绝回写才能保住用户手写的内容。
         let mut load_error = None;
         if let Ok(config_path) = Self::config_path() {
             if config_path.exists() {
-                match std::fs::read_to_string(&config_path) {
+                match read_config_file(&config_path) {
                     Ok(content) => match toml::from_str::<Config>(&content) {
                         Ok(mut config) => {
                             for warning in config.normalize() {
@@ -728,6 +743,25 @@ mod tests {
         assert!(Config::default().load_error.is_none());
         let repaired: Config = toml::from_str("font_size = 15.0").expect("valid config");
         assert!(repaired.load_error.is_none());
+    }
+
+    /// An oversized config is a read error, which sets `load_error` and so
+    /// makes `save` refuse: the user's file survives instead of being replaced
+    /// by defaults on the next font zoom.
+    #[test]
+    fn an_oversized_config_is_rejected_rather_than_parsed() {
+        let path = std::env::temp_dir().join(format!(
+            "jterm2-config-oversized-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+
+        let error = read_config_file(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+
+        std::fs::write(&path, b"font_size = 15.0").unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), "font_size = 15.0");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

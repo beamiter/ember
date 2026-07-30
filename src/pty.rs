@@ -2,10 +2,6 @@ use anyhow::{anyhow, Result};
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 
-const TERM_PROGRAM_NAME: &str = "jterm2";
-const TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
-const VTE_VERSION: &str = "7802";
-
 /// PTY 读取结果。流关闭与子进程退出必须分开判断：Linux 的 EIO/Hangup
 /// 只说明当前没有 slave fd，子进程仍可能存活；只有 waitpid 才能确认退出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +24,6 @@ pub enum WriteOutcome {
 mod unix_pty {
     use super::*;
     use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
     /// Retry an interrupted syscall while preserving every other error for
@@ -105,34 +100,13 @@ mod unix_pty {
         }
     }
 
-    fn is_executable(path: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-            .unwrap_or(false)
-    }
-
-    fn executable_path(path: &Path) -> Option<String> {
-        if !is_executable(path) {
-            return None;
-        }
-
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir().ok()?.join(path)
-        };
-        Some(absolute.to_string_lossy().into_owned())
-    }
-
-    /// Stays local rather than delegating to `jterm_core::host`: shell
-    /// selection needs an injectable PATH (launchers like wofi strip it) plus
-    /// the exec-bit and absolute-path guarantees of [`executable_path`], which
-    /// the core lookup deliberately does not impose.
+    /// Shell candidates are looked up through `jterm_core::host`, which now
+    /// imposes what jterm2's local copy used to: the execute bit, a regular
+    /// file, an absolute result, and an injectable `PATH` (launchers like wofi
+    /// strip it, so the process environment cannot be the only source).
     fn find_executable_in_path_with(exe_name: &str, path_var: Option<&OsStr>) -> Option<String> {
-        std::env::split_paths(path_var?)
-            .map(|dir| dir.join(exe_name))
-            .find_map(|candidate| executable_path(&candidate))
+        jterm_core::host::find_executable_in(exe_name, path_var)
+            .map(|path| path.to_string_lossy().into_owned())
     }
 
     /// A `jsh` on PATH need not be the interactive shell jterm2 prefers: the
@@ -163,20 +137,14 @@ mod unix_pty {
     ) -> Result<String> {
         // Priority 1: explicit config / env var (needed when PATH is stripped by launchers like wofi)
         if let Some(path) = configured_shell {
-            let configured_path = Path::new(path);
             // A bare name is a PATH lookup, never an implicit `./name`.
             // Otherwise opening a project directory containing a malicious
-            // executable named "bash" could hijack `shell = "bash"`.
-            let is_bare_name = configured_path
-                .file_name()
-                .is_some_and(|name| name == OsStr::new(path));
-            let resolved = if is_bare_name {
-                find_executable_in_path_with(path, path_var)
-            } else {
-                executable_path(configured_path)
-            };
-            if let Some(resolved) = resolved {
-                return Ok(resolved);
+            // executable named "bash" could hijack `shell = "bash"`. That rule
+            // now lives in `host::resolve_configured_program`, which keeps it
+            // verbatim (`file_name() == token` selects the PATH branch) and adds
+            // the absolutization the exec path needs.
+            if let Some(resolved) = jterm_core::host::resolve_configured_program(path, path_var) {
+                return Ok(resolved.to_string_lossy().into_owned());
             }
             eprintln!(
                 "[PTY] Configured shell '{}' is not executable, falling back",
@@ -205,8 +173,13 @@ mod unix_pty {
         if let Some(sh_path) = find_executable_in_path_with("sh", path_var) {
             return Ok(sh_path);
         }
-        if let Some(sh_path) = executable_path(sh_fallback) {
-            return Ok(sh_path);
+        // The fallback is a path, not a name: `resolve_configured_program` takes
+        // its directory branch and only checks that it is executable.
+        if let Some(sh_path) = sh_fallback
+            .to_str()
+            .and_then(|token| jterm_core::host::resolve_configured_program(token, None))
+        {
+            return Ok(sh_path.to_string_lossy().into_owned());
         }
 
         Err(anyhow!(
@@ -218,6 +191,26 @@ mod unix_pty {
     fn choose_shell(configured_shell: Option<&str>) -> Result<String> {
         let path_var = std::env::var_os("PATH");
         choose_shell_with_path(configured_shell, path_var.as_deref(), Path::new("/bin/sh"))
+    }
+
+    /// jterm2's child-environment policy.
+    ///
+    /// `less_default = "FR"` is deliberate and predates the shared module: no
+    /// `-X`, so `git`/`man` still get the alternate screen, and `F` quits on a
+    /// page that fits. `color_defaults` stays off because jterm2 has never
+    /// shipped an `LS_COLORS`, and the locale repair stays on: the GPU renderer
+    /// draws UTF-8 either way, but a `C`-locale child emits mojibake into it.
+    pub(super) fn child_environment() -> jterm_core::child_env::ChildEnv<'static> {
+        jterm_core::child_env::ChildEnv {
+            // Spelled out rather than taken from `identity`, which reports the
+            // *core* crate's version until `main` initializes it: the version a
+            // child reads has to be this binary's whatever the startup order is.
+            app_version: env!("CARGO_PKG_VERSION"),
+            less_default: Some("FR"),
+            color_defaults: false,
+            normalize_locale: true,
+            ..jterm_core::child_env::ChildEnv::from_identity()
+        }
     }
 
     pub struct Pty {
@@ -277,9 +270,11 @@ mod unix_pty {
                 let session_flag = CString::new("--session").unwrap();
                 let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
 
+                // `find_executable_in_path` is now exec-bit-checked and
+                // absolutizing in core, so the local re-check it used to need
+                // is gone.
                 let bash_path = if shell_name == "jsh" {
                     jterm_core::host::find_executable_in_path("bash")
-                        .filter(|p| is_executable(p))
                         .map(|p| p.to_string_lossy().into_owned())
                 } else {
                     None
@@ -292,9 +287,20 @@ mod unix_pty {
                         let program = argv
                             .first()
                             .ok_or_else(|| anyhow!("Command argv must not be empty"))?;
-                        let program_path = jterm_core::host::find_executable_in_path(program)
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| program.clone());
+                        // Resolve with `execvp` semantics *before* the fork: the
+                        // child can only call `execve`, and a helper that is not
+                        // installed has to fail here, where the caller can show
+                        // it, instead of as a pane that exits 127 silently.
+                        let program_path = jterm_core::host::resolve_executable(
+                            program,
+                            std::env::var_os("PATH").as_deref(),
+                            cwd,
+                        )
+                        .map_err(|error| {
+                            anyhow!("Command program '{program}' is not executable: {error}")
+                        })?
+                        .to_string_lossy()
+                        .into_owned();
                         let mut args = Vec::with_capacity(argv.len());
                         for arg in argv {
                             args.push(
@@ -354,59 +360,10 @@ mod unix_pty {
 
                 // 构建子进程环境:继承父进程环境,覆盖终端相关变量(避免在子进程调用
                 // 非异步信号安全的 setenv)。直接把构建好的 envp 传给 execve。
-                const OVERRIDDEN: [&[u8]; 5] = [
-                    b"TERM",
-                    b"COLORTERM",
-                    b"TERM_PROGRAM",
-                    b"TERM_PROGRAM_VERSION",
-                    b"VTE_VERSION",
-                ];
-                const LOCALE_KEYS: [&[u8]; 3] = [b"LANG", b"LC_ALL", b"LC_CTYPE"];
-                let has_utf8_locale = std::env::vars_os().any(|(k, v)| {
-                    let k_bytes = k.as_bytes();
-                    if !LOCALE_KEYS.contains(&k_bytes) {
-                        return false;
-                    }
-                    let value = v.to_string_lossy().to_ascii_lowercase();
-                    value.contains("utf-8") || value.contains("utf8")
-                });
-                let mut env_cstrings: Vec<CString> = Vec::new();
-                let mut has_less = false;
-                for (k, v) in std::env::vars_os() {
-                    let k_bytes = k.as_bytes();
-                    if k_bytes == b"LESS" {
-                        has_less = true;
-                    }
-                    if OVERRIDDEN.contains(&k_bytes) {
-                        continue;
-                    }
-                    if !has_utf8_locale && LOCALE_KEYS.contains(&k_bytes) {
-                        continue;
-                    }
-                    let mut entry = Vec::with_capacity(k_bytes.len() + 1 + v.len());
-                    entry.extend_from_slice(k_bytes);
-                    entry.push(b'=');
-                    entry.extend_from_slice(v.as_bytes());
-                    if let Ok(cs) = CString::new(entry) {
-                        env_cstrings.push(cs);
-                    }
-                }
-                env_cstrings.push(CString::new("TERM=xterm-256color").unwrap());
-                env_cstrings.push(CString::new("COLORTERM=truecolor").unwrap());
-                env_cstrings
-                    .push(CString::new(format!("TERM_PROGRAM={}", TERM_PROGRAM_NAME)).unwrap());
-                env_cstrings.push(
-                    CString::new(format!("TERM_PROGRAM_VERSION={}", TERM_PROGRAM_VERSION)).unwrap(),
-                );
-                env_cstrings.push(CString::new(format!("VTE_VERSION={}", VTE_VERSION)).unwrap());
-                if !has_utf8_locale {
-                    env_cstrings.push(CString::new("LANG=C.UTF-8").unwrap());
-                    env_cstrings.push(CString::new("LC_CTYPE=C.UTF-8").unwrap());
-                }
-                // LESS=FR(不含 -X)让 git 等正确使用备用屏幕;仅在用户未设置时添加。
-                if !has_less {
-                    env_cstrings.push(CString::new("LESS=FR").unwrap());
-                }
+                // 策略与变量集合由 jterm_core::child_env 持有,四个终端共用;这里
+                // 只声明 jterm2 的选择 —— LESS=FR、UTF-8 locale 修正、不接管 ls 颜色。
+                let env_cstrings = jterm_core::child_env::envp(&child_environment(), &[])
+                    .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
                 let mut envp: Vec<*const libc::c_char> =
                     env_cstrings.iter().map(|c| c.as_ptr()).collect();
                 envp.push(std::ptr::null());
@@ -1166,6 +1123,57 @@ mod tests {
             "{error}"
         );
     }
+    /// jterm2's child-environment choices are now flags on a shared policy, so
+    /// pin the ones a "colour fix" could quietly change: the pager stays `FR`,
+    /// `ls` colours stay the user's business, and the locale repair stays on.
+    #[cfg(unix)]
+    #[test]
+    fn child_environment_keeps_the_pager_and_locale_choices() {
+        let options = super::unix_pty::child_environment();
+        assert_eq!(options.less_default, Some("FR"));
+        assert!(!options.color_defaults);
+        assert!(options.normalize_locale);
+        assert_eq!(options.app_version, env!("CARGO_PKG_VERSION"));
+
+        let pairs = jterm_core::child_env::pairs(&options, &[]);
+        let value = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == std::ffi::OsStr::new(name))
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        // The reason for the whole exercise: a child that used to be told only
+        // TERM now learns the colour depth and which terminal build it is in.
+        assert_eq!(value("COLORTERM").as_deref(), Some("truecolor"));
+        assert_eq!(
+            value("TERM_PROGRAM_VERSION").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(value("TERM").as_deref(), Some("xterm-256color"));
+        assert_eq!(value("VTE_VERSION").as_deref(), Some("7802"));
+        assert_eq!(value("LS_COLORS"), None);
+        // `pairs` reads this process's environment, so only one of the two
+        // outcomes is available at a time — both are assertions about policy.
+        match std::env::var_os("LESS") {
+            Some(_) => assert_eq!(value("LESS"), None, "a user's LESS is never overridden"),
+            None => assert_eq!(value("LESS").as_deref(), Some("FR")),
+        }
+    }
+
+    /// Resolution moved ahead of the fork: a helper argv naming a program that
+    /// is not installed must fail where the caller can report it, instead of
+    /// opening a pane whose child exits 127 for no visible reason.
+    #[cfg(unix)]
+    #[test]
+    fn an_unresolvable_command_program_fails_before_forking() {
+        let argv = vec!["jterm2-definitely-not-installed-program".to_string()];
+        let error = super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, None, Some(&argv))
+            .err()
+            .expect("an unknown helper program must not spawn");
+
+        assert!(error.to_string().contains("is not executable"), "{error}");
+    }
+
     /// The one-shot helper path (jsh installer) must exec the given argv
     /// verbatim: no login-shell wrapping, no --session injection.
     #[cfg(unix)]

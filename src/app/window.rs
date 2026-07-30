@@ -174,7 +174,9 @@ impl TerminalApp {
         self.config_last_mtime = current_mtime;
 
         if let Ok(config_path) = config::Config::config_path() {
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
+            // Same bounded reader as the startup load: hot reload reads the
+            // very same file and must not be the unbounded way in.
+            if let Ok(content) = config::read_config_file(&config_path) {
                 match toml::from_str::<config::Config>(&content) {
                     Ok(mut new_config) => {
                         let mut notes = new_config.normalize();

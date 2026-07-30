@@ -18,6 +18,13 @@ pub struct HistorySnapshot {
     pub search_history: Vec<SearchHistoryEntry>,
 }
 
+/// Upper bound for `ui_history.json`. Recent commands are palette entries and
+/// search history is a handful of user queries, so real files are kilobytes;
+/// this only exists so a runaway or hostile file cannot be read into memory in
+/// full before anything gets to reject it. Same contract as the session
+/// snapshot, two orders of magnitude of headroom.
+const MAX_HISTORY_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
+
 fn default_version() -> u32 {
     1
 }
@@ -39,7 +46,7 @@ impl HistorySnapshot {
         if !path.exists() {
             return Self::default();
         }
-        match std::fs::read_to_string(path) {
+        match jterm_core::snapshot_file::read_bounded(path, MAX_HISTORY_SNAPSHOT_BYTES) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
                 Ok(snap) => snap,
                 Err(e) => {
@@ -67,5 +74,94 @@ impl HistorySnapshot {
         let json = serde_json::to_string_pretty(self)?;
         crate::atomic_file::write_atomic(path, json.as_bytes())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "jterm2-history-test-{label}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A history file over the bound must be rejected by the *reader*, not left
+    /// to fail as a parse error.
+    ///
+    /// The payload is therefore perfectly valid JSON: garbage over the limit
+    /// would fall back to defaults either way, so it would prove nothing about
+    /// the bound. Over the limit the snapshot must not load; the same shape just
+    /// under it must.
+    #[test]
+    fn an_oversized_history_file_is_rejected_instead_of_read() {
+        let root = TestDir::new("oversized");
+        let entry = |query: String| crate::search::SearchHistoryEntry {
+            query,
+            is_regex: false,
+            case_sensitive: false,
+            timestamp: "1970-01-01".to_string(),
+        };
+        let write = |path: &std::path::Path, query_len: usize| {
+            HistorySnapshot {
+                version: 1,
+                recent_commands: Vec::new(),
+                search_history: vec![entry("x".repeat(query_len))],
+            }
+            .save(path)
+            .unwrap();
+            std::fs::metadata(path).unwrap().len()
+        };
+
+        let over = root.0.join("over.json");
+        let written = write(&over, MAX_HISTORY_SNAPSHOT_BYTES as usize + 1);
+        assert!(written > MAX_HISTORY_SNAPSHOT_BYTES, "{written}");
+        let loaded = HistorySnapshot::load(&over);
+        assert!(loaded.recent_commands.is_empty());
+        assert!(
+            loaded.search_history.is_empty(),
+            "valid JSON over the bound must still be refused"
+        );
+
+        let under = root.0.join("under.json");
+        let written = write(&under, 1024);
+        assert!(written <= MAX_HISTORY_SNAPSHOT_BYTES, "{written}");
+        assert_eq!(HistorySnapshot::load(&under).search_history.len(), 1);
+    }
+
+    #[test]
+    fn a_saved_history_file_round_trips_through_the_bounded_loader() {
+        let root = TestDir::new("round-trip");
+        let path = root.0.join("ui_history.json");
+        let snapshot = HistorySnapshot {
+            version: 1,
+            recent_commands: Vec::new(),
+            search_history: vec![crate::search::SearchHistoryEntry {
+                query: "needle".to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                timestamp: "1970-01-01".to_string(),
+            }],
+        };
+        snapshot.save(&path).unwrap();
+
+        let loaded = HistorySnapshot::load(&path);
+        assert_eq!(loaded.search_history.len(), 1);
+        assert_eq!(loaded.search_history[0].query, "needle");
     }
 }
