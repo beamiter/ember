@@ -958,6 +958,10 @@ impl TerminalApp {
                     }
                 }
                 config_panel::ConfigAction::ResetToDefaults => {
+                    // Replacing the whole struct (never field-by-field) is what
+                    // makes Reset the escape hatch out of `Config::load_error`:
+                    // an explicit reset is the one time overwriting a broken
+                    // config file is what the user asked for.
                     self.config = config::Config::default();
                     self.current_theme =
                         theme::Theme::get_theme(&self.config.theme).unwrap_or_default();

@@ -77,6 +77,12 @@ impl TerminalApp {
             self.config_save_pending = false;
             if let Err(e) = self.config.save() {
                 eprintln!("[Config] Failed to save: {}", e);
+                // 只写 stderr 的话,拒写保护生效时用户会以为字号等改动已经落盘,
+                // 直到下次启动才发现全都没了。
+                self.set_status_for(
+                    format!("配置未保存：{e}"),
+                    std::time::Duration::from_secs(6),
+                );
             } else {
                 // Record our own write immediately so the hot-reload watcher
                 // does not treat it as an external edit in the same frame.
@@ -192,6 +198,11 @@ impl TerminalApp {
                         self.status_message = format!("配置解析失败,已沿用旧配置: {}", e);
                         self.status_expires_at =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
+                        // 沿用旧配置也意味着内存里的值与文件不再一致:此后任何
+                        // 自动保存都会用旧值覆盖用户刚写坏(但仍是他自己写的)
+                        // 内容。修好文件后 apply_hot_reload 会整体替换 config,
+                        // 这个标记随之消失。
+                        self.config.load_error = Some(format!("{}: {}", config_path.display(), e));
                     }
                 }
             }

@@ -1689,10 +1689,16 @@ impl TerminalApp {
         for entry in history.search_history.into_iter().take(50) {
             search_state.history.push_back(entry);
         }
-        let initial_status_expires_at = session_restore_notice
+        // 配置读不出来时优先报告它:此后所有保存都被拒绝(见 Config::load_error),
+        // 不说的话用户只会看到"设置改了但重启就没了"。
+        let startup_notice = match &cfg.load_error {
+            Some(error) => Some(format!("配置未生效,也不会被覆盖：{error}")),
+            None => session_restore_notice,
+        };
+        let initial_status_expires_at = startup_notice
             .as_ref()
             .map(|_| std::time::Instant::now() + Duration::from_secs(10));
-        let initial_status_message = session_restore_notice.unwrap_or_default();
+        let initial_status_message = startup_notice.unwrap_or_default();
 
         Ok(TerminalApp {
             session_manager,

@@ -217,6 +217,19 @@ pub struct Config {
     /// 的 `show_repo_strip` 同名,保持家族配置一致。
     #[serde(default = "default_true")]
     pub show_repo_strip: bool,
+
+    /// Why this run could not use the on-disk config, if it exists but could
+    /// not be read or parsed. Never serialized: it describes the load attempt,
+    /// not a user setting.
+    ///
+    /// While it is set, [`Config::save`] refuses to write. Otherwise the
+    /// built-in defaults sitting in this struct would be flushed over a
+    /// hand-written file by something as incidental as a Ctrl+wheel font zoom
+    /// or the save on Drop — one typo would cost the whole file. Recovery is
+    /// either fixing the file (hot reload clears this) or an explicit
+    /// "Reset to defaults", which replaces the whole struct.
+    #[serde(skip)]
+    pub load_error: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -419,12 +432,15 @@ impl Default for Config {
             notify_long_blocks: true,
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: true,
+            load_error: None,
         }
     }
 }
 
 impl Config {
     pub fn load() -> Self {
+        // 记住失败原因:文件仍在磁盘上,拒绝回写才能保住用户手写的内容。
+        let mut load_error = None;
         if let Ok(config_path) = Self::config_path() {
             if config_path.exists() {
                 match std::fs::read_to_string(&config_path) {
@@ -449,6 +465,7 @@ impl Config {
                                 "[Config] WARNING: your settings are ignored, using defaults. \
                                  Fix the file above to apply them."
                             );
+                            load_error = Some(format!("{}: {}", config_path.display(), e));
                         }
                     },
                     Err(e) => {
@@ -457,17 +474,30 @@ impl Config {
                             config_path.display(),
                             e
                         );
+                        load_error = Some(format!("{}: {}", config_path.display(), e));
                     }
                 }
             }
         }
         eprintln!("[Config] Using default configuration");
-        let config = Self::default();
+        let config = Self {
+            load_error,
+            ..Self::default()
+        };
         eprintln!("[Config] Font: {}", config.font_family);
         config
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // 拒写保护:`self` 此刻是内建默认值,一次字号缩放或退出时的自动保存
+        // 就会把无法解析的用户配置整体覆盖掉。见 `load_error` 的说明。
+        if let Some(error) = &self.load_error {
+            return Err(format!(
+                "refusing to overwrite the unparsable config ({error}); \
+                 fix the file or reset to defaults"
+            )
+            .into());
+        }
         let config_path = Self::config_path()?;
         // Persist only values that the runtime can safely consume. This also
         // protects callers outside the settings panel (or future migrations)
@@ -675,5 +705,43 @@ mod tests {
             config.resolved_session_history_path().unwrap(),
             PathBuf::from("/tmp/jterm2-sessions.json")
         );
+    }
+
+    #[test]
+    fn config_that_failed_to_load_refuses_to_be_overwritten() {
+        let broken = Config {
+            load_error: Some("/home/u/.config/jterm2/config.toml: expected `=`".to_string()),
+            ..Config::default()
+        };
+
+        // Must fail before touching the filesystem: the real user file is the
+        // thing being protected.
+        let error = broken
+            .save()
+            .expect_err("defaults must never be flushed over an unparsable config");
+        let message = error.to_string();
+        assert!(message.contains("refusing to overwrite"), "{message}");
+        assert!(message.contains("expected `=`"), "{message}");
+
+        // Both recovery paths hand over a struct that never failed to load:
+        // "Reset to defaults" builds one, a successful hot reload parses one.
+        assert!(Config::default().load_error.is_none());
+        let repaired: Config = toml::from_str("font_size = 15.0").expect("valid config");
+        assert!(repaired.load_error.is_none());
+    }
+
+    #[test]
+    fn load_error_never_round_trips_through_the_config_file() {
+        let broken = Config {
+            load_error: Some("boom".to_string()),
+            ..Config::default()
+        };
+
+        let serialized = toml::to_string_pretty(&broken).expect("config serializes");
+        assert!(!serialized.contains("load_error"), "{serialized}");
+
+        // 用户文件里若残留过这个键(或任何未知键),也不能让加载整体失败。
+        let parsed: Config = toml::from_str("load_error = \"stale\"").expect("config parses");
+        assert!(parsed.load_error.is_none());
     }
 }
