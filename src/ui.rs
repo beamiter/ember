@@ -4,6 +4,7 @@ use crate::terminal::{clamp_terminal_dimensions, TerminalState};
 use crate::theme::ThemeExt as _;
 use egui::{Color32, FontId, Response, Ui, Vec2};
 use lru::LruCache;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 
 /// Kitty reserves the lower half of the i32 z-index range for images that
@@ -149,82 +150,122 @@ fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
     application_cursor_keys: bool,
-) -> Option<&'static str> {
+) -> Option<Cow<'static, str>> {
+    // The functional-key family carries its modifiers as a CSI parameter, so it
+    // must be encoded before the guard below: returning None there is what used
+    // to make Ctrl+Left send zero bytes.
+    if let Some(sequence) = legacy_function_key_sequence(key, modifiers, application_cursor_keys) {
+        return Some(sequence);
+    }
+
+    // The remaining keys encode to a bare control byte with no room for a
+    // modifier parameter. Their modified chords belong to the shortcut table and
+    // to the Ctrl+letter mapping in `handle_keyboard_input`, so staying silent
+    // here keeps one keypress from being delivered twice.
     if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd || modifiers.command_only() {
         return None;
     }
 
     match key {
-        egui::Key::Enter => Some("\r"),
-        egui::Key::Escape => Some("\x1b"),
-        egui::Key::Backspace => Some("\x7f"), // Send DEL (0x7f)
+        egui::Key::Enter => Some(Cow::Borrowed("\r")),
+        egui::Key::Escape => Some(Cow::Borrowed("\x1b")),
+        egui::Key::Backspace => Some(Cow::Borrowed("\x7f")), // Send DEL (0x7f)
         egui::Key::Tab => {
             if modifiers.shift {
-                Some("\x1b[Z") // Shift+Tab -> backtab (CSI Z)
+                Some(Cow::Borrowed("\x1b[Z")) // Shift+Tab -> backtab (CSI Z)
             } else {
-                Some("\t")
+                Some(Cow::Borrowed("\t"))
             }
         }
-        egui::Key::ArrowUp => {
-            if application_cursor_keys {
-                Some("\x1bOA")
-            } else {
-                Some("\x1b[A")
-            }
-        }
-        egui::Key::ArrowDown => {
-            if application_cursor_keys {
-                Some("\x1bOB")
-            } else {
-                Some("\x1b[B")
-            }
-        }
-        egui::Key::ArrowRight => {
-            if application_cursor_keys {
-                Some("\x1bOC")
-            } else {
-                Some("\x1b[C")
-            }
-        }
-        egui::Key::ArrowLeft => {
-            if application_cursor_keys {
-                Some("\x1bOD")
-            } else {
-                Some("\x1b[D")
-            }
-        }
-        egui::Key::Home => {
-            if application_cursor_keys {
-                Some("\x1bOH")
-            } else {
-                Some("\x1b[H")
-            }
-        }
-        egui::Key::End => {
-            if application_cursor_keys {
-                Some("\x1bOF")
-            } else {
-                Some("\x1b[F")
-            }
-        }
-        egui::Key::Insert => Some("\x1b[2~"),
-        egui::Key::Delete => Some("\x1b[3~"),
-        egui::Key::PageUp => Some("\x1b[5~"),
-        egui::Key::PageDown => Some("\x1b[6~"),
-        egui::Key::F1 => Some("\x1bOP"),
-        egui::Key::F2 => Some("\x1bOQ"),
-        egui::Key::F3 => Some("\x1bOR"),
-        egui::Key::F4 => Some("\x1bOS"),
-        egui::Key::F5 => Some("\x1b[15~"),
-        egui::Key::F6 => Some("\x1b[17~"),
-        egui::Key::F7 => Some("\x1b[18~"),
-        egui::Key::F8 => Some("\x1b[19~"),
-        egui::Key::F9 => Some("\x1b[20~"),
-        egui::Key::F10 => Some("\x1b[21~"),
-        egui::Key::F11 => Some("\x1b[23~"),
-        egui::Key::F12 => Some("\x1b[24~"),
         _ => None,
     }
+}
+
+/// Encode the legacy xterm/terminfo functional-key family: cursor keys, the
+/// editing block, and F1-F12. A held modifier becomes the standard xterm
+/// parameter (`1 + shift + 2*alt + 4*ctrl + 8*meta`) instead of being dropped —
+/// without it Ctrl+Left/Ctrl+Right, the word-wise motions every shell binds,
+/// produced no bytes at all.
+///
+/// Each arm also spells out its unmodified bytes verbatim. That redundancy is
+/// deliberate: applications look these up through terminfo, so an unmodified
+/// press (SS3 form under DECCKM included) must stay byte-identical.
+fn legacy_function_key_sequence(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    application_cursor_keys: bool,
+) -> Option<Cow<'static, str>> {
+    let modifier = kitty_modifier_value(modifiers);
+    // 1 is the "no modifier" parameter value; xterm omits it entirely.
+    let modified = modifier > 1;
+
+    // Shift+PageUp/PageDown belong to the scrollback, as in xterm and in
+    // jterm3, so the viewport is their only handler. `viewport_scroll_delta`
+    // scrolls on every non-ctrl Page press, and this path used to also send a
+    // sequence for the shifted form — the pane and a full-screen app both moved
+    // on one keystroke.
+    if modifiers.shift
+        && !modifiers.ctrl
+        && !modifiers.alt
+        && matches!(key, egui::Key::PageUp | egui::Key::PageDown)
+    {
+        return None;
+    }
+
+    // Cursor keys and Home/End follow DECCKM only while unmodified: the
+    // parameterized form is always CSI, never SS3.
+    let cursor =
+        |normal: &'static str, application: &'static str, final_byte: char| -> Cow<'static, str> {
+            if modified {
+                Cow::Owned(format!("\x1b[1;{modifier}{final_byte}"))
+            } else if application_cursor_keys {
+                Cow::Borrowed(application)
+            } else {
+                Cow::Borrowed(normal)
+            }
+        };
+    let tilde = |plain: &'static str, code: u8| -> Cow<'static, str> {
+        if modified {
+            Cow::Owned(format!("\x1b[{code};{modifier}~"))
+        } else {
+            Cow::Borrowed(plain)
+        }
+    };
+    // F1-F4 are SS3 unmodified but join the CSI 1;<mod> form once modified;
+    // they are not affected by DECCKM.
+    let function = |plain: &'static str, final_byte: char| -> Cow<'static, str> {
+        if modified {
+            Cow::Owned(format!("\x1b[1;{modifier}{final_byte}"))
+        } else {
+            Cow::Borrowed(plain)
+        }
+    };
+
+    Some(match key {
+        egui::Key::ArrowUp => cursor("\x1b[A", "\x1bOA", 'A'),
+        egui::Key::ArrowDown => cursor("\x1b[B", "\x1bOB", 'B'),
+        egui::Key::ArrowRight => cursor("\x1b[C", "\x1bOC", 'C'),
+        egui::Key::ArrowLeft => cursor("\x1b[D", "\x1bOD", 'D'),
+        egui::Key::Home => cursor("\x1b[H", "\x1bOH", 'H'),
+        egui::Key::End => cursor("\x1b[F", "\x1bOF", 'F'),
+        egui::Key::Insert => tilde("\x1b[2~", 2),
+        egui::Key::Delete => tilde("\x1b[3~", 3),
+        egui::Key::PageUp => tilde("\x1b[5~", 5),
+        egui::Key::PageDown => tilde("\x1b[6~", 6),
+        egui::Key::F1 => function("\x1bOP", 'P'),
+        egui::Key::F2 => function("\x1bOQ", 'Q'),
+        egui::Key::F3 => function("\x1bOR", 'R'),
+        egui::Key::F4 => function("\x1bOS", 'S'),
+        egui::Key::F5 => tilde("\x1b[15~", 15),
+        egui::Key::F6 => tilde("\x1b[17~", 17),
+        egui::Key::F7 => tilde("\x1b[18~", 18),
+        egui::Key::F8 => tilde("\x1b[19~", 19),
+        egui::Key::F9 => tilde("\x1b[20~", 20),
+        egui::Key::F10 => tilde("\x1b[21~", 21),
+        egui::Key::F11 => tilde("\x1b[23~", 23),
+        egui::Key::F12 => tilde("\x1b[24~", 24),
+        _ => return None,
+    })
 }
 
 fn kitty_text_key_code(key: egui::Key) -> Option<u32> {
@@ -2745,13 +2786,227 @@ mod tests {
         let modifiers = egui::Modifiers::default();
 
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false),
+            key_to_terminal_sequence(egui::Key::ArrowUp, modifiers, false).as_deref(),
             Some("\x1b[A")
         );
         assert_eq!(
-            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true),
+            key_to_terminal_sequence(egui::Key::ArrowDown, modifiers, true).as_deref(),
             Some("\x1bOB")
         );
+    }
+
+    #[test]
+    fn modified_function_keys_keep_their_xterm_modifier_parameters() {
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl
+        };
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+
+        // Word-wise cursor motion: the whole point of the parameter.
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowLeft, ctrl, false).as_deref(),
+            Some("\x1b[1;5D")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowRight, ctrl, false).as_deref(),
+            Some("\x1b[1;5C")
+        );
+        // DECCKM must not change the modified form.
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::ArrowLeft, ctrl, true).as_deref(),
+            Some("\x1b[1;5D")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::Home, ctrl_shift, false).as_deref(),
+            Some("\x1b[1;6H")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::End, shift, true).as_deref(),
+            Some("\x1b[1;2F")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::PageDown, alt, false).as_deref(),
+            Some("\x1b[6;3~")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::Delete, ctrl, false).as_deref(),
+            Some("\x1b[3;5~")
+        );
+        // F1-F4 leave SS3 behind as soon as a modifier is held; F5+ keeps the
+        // tilde form with its own numeric code.
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::F1, ctrl_shift, false).as_deref(),
+            Some("\x1b[1;6P")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::F4, alt, false).as_deref(),
+            Some("\x1b[1;3S")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::F5, shift, false).as_deref(),
+            Some("\x1b[15;2~")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::F12, ctrl, false).as_deref(),
+            Some("\x1b[24;5~")
+        );
+    }
+
+    /// The scrollback owns Shift+Page, so nothing may also reach the child —
+    /// otherwise one keystroke moves both the pane and a full-screen app.
+    #[test]
+    fn shift_page_keys_belong_to_the_scrollback() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::PageUp, shift, false),
+            None
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::PageDown, shift, false),
+            None
+        );
+
+        // Ctrl+Shift+Page is a bound command, and the unshifted keys still
+        // reach the child, so neither may be swallowed here.
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::PageUp, ctrl_shift, false).as_deref(),
+            Some("\x1b[5;6~")
+        );
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::PageUp, egui::Modifiers::default(), false)
+                .as_deref(),
+            Some("\x1b[5~")
+        );
+    }
+
+    #[test]
+    fn unmodified_function_keys_keep_their_legacy_bytes() {
+        let none = egui::Modifiers::default();
+        let expected: &[(egui::Key, &str, &str)] = &[
+            (egui::Key::ArrowUp, "\x1b[A", "\x1bOA"),
+            (egui::Key::ArrowDown, "\x1b[B", "\x1bOB"),
+            (egui::Key::ArrowRight, "\x1b[C", "\x1bOC"),
+            (egui::Key::ArrowLeft, "\x1b[D", "\x1bOD"),
+            (egui::Key::Home, "\x1b[H", "\x1bOH"),
+            (egui::Key::End, "\x1b[F", "\x1bOF"),
+            (egui::Key::Insert, "\x1b[2~", "\x1b[2~"),
+            (egui::Key::Delete, "\x1b[3~", "\x1b[3~"),
+            (egui::Key::PageUp, "\x1b[5~", "\x1b[5~"),
+            (egui::Key::PageDown, "\x1b[6~", "\x1b[6~"),
+            (egui::Key::F1, "\x1bOP", "\x1bOP"),
+            (egui::Key::F2, "\x1bOQ", "\x1bOQ"),
+            (egui::Key::F3, "\x1bOR", "\x1bOR"),
+            (egui::Key::F4, "\x1bOS", "\x1bOS"),
+            (egui::Key::F5, "\x1b[15~", "\x1b[15~"),
+            (egui::Key::F6, "\x1b[17~", "\x1b[17~"),
+            (egui::Key::F7, "\x1b[18~", "\x1b[18~"),
+            (egui::Key::F8, "\x1b[19~", "\x1b[19~"),
+            (egui::Key::F9, "\x1b[20~", "\x1b[20~"),
+            (egui::Key::F10, "\x1b[21~", "\x1b[21~"),
+            (egui::Key::F11, "\x1b[23~", "\x1b[23~"),
+            (egui::Key::F12, "\x1b[24~", "\x1b[24~"),
+        ];
+
+        for (key, normal, application) in expected {
+            assert_eq!(
+                key_to_terminal_sequence(*key, none, false).as_deref(),
+                Some(*normal),
+                "{key:?} in normal cursor mode"
+            );
+            assert_eq!(
+                key_to_terminal_sequence(*key, none, true).as_deref(),
+                Some(*application),
+                "{key:?} in application cursor mode"
+            );
+        }
+
+        // Keys without a modifier parameter keep the old "silent while a
+        // modifier is held" contract, so Ctrl+letter/shortcut handling stays
+        // the single owner of those chords.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            key_to_terminal_sequence(egui::Key::Enter, none, false).as_deref(),
+            Some("\r")
+        );
+        assert!(key_to_terminal_sequence(egui::Key::Enter, ctrl, false).is_none());
+        assert!(key_to_terminal_sequence(egui::Key::Backspace, ctrl, false).is_none());
+        assert_eq!(
+            key_to_terminal_sequence(
+                egui::Key::Tab,
+                egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                false
+            )
+            .as_deref(),
+            Some("\x1b[Z")
+        );
+    }
+
+    #[test]
+    fn ctrl_arrows_reach_the_pty_through_the_full_key_encoder() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let ctrl_left = egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: Some(egui::Key::ArrowLeft),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        };
+
+        let mut encoded = Vec::new();
+        // Kitty disambiguation on: arrows are not text keys, so the CSI-u path
+        // must not swallow them before the legacy encoder runs.
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0b1,
+            false,
+            0,
+            0,
+            false,
+            false,
+            std::slice::from_ref(&ctrl_left),
+        );
+        assert_eq!(encoded, b"\x1b[1;5D");
     }
 
     #[test]
