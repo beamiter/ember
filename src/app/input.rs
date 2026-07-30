@@ -549,8 +549,8 @@ impl TerminalApp {
                     self.sidebar.refresh();
                 }
             }
-            keybindings::Command::RshInstall => {
-                self.install_or_update_rsh();
+            keybindings::Command::JshInstall => {
+                self.install_or_update_jsh();
             }
             keybindings::Command::AgentToggle => {
                 let active = self.session_manager.active_index();

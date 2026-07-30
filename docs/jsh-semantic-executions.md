@@ -1,12 +1,12 @@
-# rsh semantic execution protocol
+# jsh semantic execution protocol
 
-This document is the integration contract shared by rsh and the jterm family.
+This document is the integration contract shared by jsh and the jterm family.
 It keeps the terminal as one continuous character grid; semantic command
 records are an index over that grid, not a second block-based renderer.
 
 ## OSC 133 lifecycle
 
-rsh emits the standard FinalTerm lifecycle on the PTY:
+jsh emits the standard FinalTerm lifecycle on the PTY:
 
 ```text
 OSC 133;A ST
@@ -42,21 +42,21 @@ offer semantic fill/rerun while in the alternate screen.
 
 ## Shared execution journal
 
-rsh writes lifecycle metadata and jterm writes normalized text captured from
+jsh writes lifecycle metadata and jterm writes normalized text captured from
 the rendered range between `C` and `D`. Both append under an advisory lock:
 
 ```text
-${XDG_STATE_HOME:-$HOME/.local/state}/rsh/executions.jsonl
-${XDG_STATE_HOME:-$HOME/.local/state}/rsh/executions.lock
+${XDG_STATE_HOME:-$HOME/.local/state}/jsh/executions.jsonl
+${XDG_STATE_HOME:-$HOME/.local/state}/jsh/executions.lock
 ```
 
 Every line is an independent JSON object. Readers skip malformed lines,
 unknown versions, and unknown event types. Version 1 uses these envelopes:
 
 ```json
-{"rsh_execution_version":1,"event":"start","id":"...","session_id":"...","seq":1,"command":"...","command_truncated":false,"cwd":"...","started_at_ms":0}
-{"rsh_execution_version":1,"event":"finish","id":"...","exit_code":0,"duration_ms":12,"cwd_after":"...","ended_at_ms":12}
-{"rsh_execution_version":1,"event":"output","id":"...","text":"...","truncated":false,"total_bytes":3,"captured_at_ms":12}
+{"jsh_execution_version":1,"event":"start","id":"...","session_id":"...","seq":1,"command":"...","command_truncated":false,"cwd":"...","started_at_ms":0}
+{"jsh_execution_version":1,"event":"finish","id":"...","exit_code":0,"duration_ms":12,"cwd_after":"...","ended_at_ms":12}
+{"jsh_execution_version":1,"event":"output","id":"...","text":"...","truncated":false,"total_bytes":3,"captured_at_ms":12}
 ```
 
 Events can arrive slightly out of order because the shell and terminal are
@@ -68,16 +68,16 @@ applied. It intentionally represents what the user saw, not raw escape bytes.
 The state directory and files are user-only (`0700` and `0600`). Output is
 bounded to 256 KiB per execution with head and tail retained; the journal is
 compacted at 32 MiB and retains the most recent 2,000 executions. Set
-`RSH_EXECUTION_JOURNAL=0` in the environment to disable persistence while
+`JSH_EXECUTION_JOURNAL=0` in the environment to disable persistence while
 leaving the live OSC timeline available. An absolute
-`RSH_EXECUTION_JOURNAL_PATH` overrides the JSONL location for both rsh and
+`JSH_EXECUTION_JOURNAL_PATH` overrides the JSONL location for both jsh and
 jterm; its sibling `executions.lock` remains the coordination lock.
 
 jterm allocates a valid stable session ID before every shell spawn and passes
-that same ID to rsh with `--session`. The tab router, rsh session snapshot, and
+that same ID to jsh with `--session`. The tab router, jsh session snapshot, and
 each journal `start.session_id` therefore share one identity even for a brand
 new tab; an ID is never generated only after PTY output has begun. Restored IDs
-are validated against rsh's 1–128 byte ASCII grammar, and invalid or duplicate
+are validated against jsh's 1–128 byte ASCII grammar, and invalid or duplicate
 tab IDs are replaced before they can reach `--session`.
 
 ## UI behavior
@@ -100,11 +100,11 @@ creates rows solely from persisted records left by an earlier process. jterm
 may read that session's journal on a bounded background worker and merge exact
 metadata or captured output into a matching in-memory execution ID, but the
 merge cannot change the row count. Malformed, oversized, future-version,
-other-session, and orphan events are ignored using the same limits as rsh.
+other-session, and orphan events are ignored using the same limits as jsh.
 
 Fill and rerun require all of the following:
 
-- rsh has emitted `B` for the current prompt;
+- jsh has emitted `B` for the current prompt;
 - bracketed paste is enabled;
 - the terminal is not in the alternate screen;
 - no accepted input is waiting for PTY writer capacity.
@@ -114,6 +114,6 @@ the sanitized bracketed-paste packet plus `CR` as one ordered write. Multiline
 commands are not one-click rerun until a dedicated editor-control channel is
 available.
 
-AI providers receive persisted command output only under rsh's existing
+AI providers receive persisted command output only under jsh's existing
 extended-context policy: local providers can use it by default; cloud
 providers require the user's explicit context-sharing opt-in.

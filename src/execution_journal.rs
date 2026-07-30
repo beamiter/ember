@@ -1,4 +1,4 @@
-//! rsh execution-journal bridge, now shared via `jterm_core::execution_journal`.
+//! jsh execution-journal bridge, now shared via `jterm_core::execution_journal`.
 //!
 //! This module adapts the terminal's [`CompletedCommandOutput`] into the core
 //! journal's neutral input type; everything else re-exports unchanged.

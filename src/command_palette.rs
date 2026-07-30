@@ -368,10 +368,10 @@ impl CommandPalette {
                 crate::keybindings::Command::AgentToggle,
             ),
             CommandInfo::new(
-                "Install or update rsh",
+                "Install or update jsh",
                 CommandCategory::Terminal,
                 "Install jterm's companion shell, or update the installed one, in a new session",
-                crate::keybindings::Command::RshInstall,
+                crate::keybindings::Command::JshInstall,
             ),
             CommandInfo::new(
                 "Toggle Command Palette",
@@ -652,7 +652,7 @@ mod tests {
             Command::DebugToggle,
             Command::SidebarToggle,
             Command::AgentToggle,
-            Command::RshInstall,
+            Command::JshInstall,
         ];
 
         for command in fixed_commands {

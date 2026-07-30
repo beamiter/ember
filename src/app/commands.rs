@@ -995,11 +995,11 @@ fn render_command_detail(
                             );
                         });
                     let mut provenance = if detail.command_exact && detail.command_from_history {
-                        "exact rsh journal metadata".to_owned()
+                        "exact jsh journal metadata".to_owned()
                     } else if detail.command_exact {
                         "exact shell metadata".to_owned()
                     } else if detail.command_from_history {
-                        "truncated rsh journal metadata; replay disabled".to_owned()
+                        "truncated jsh journal metadata; replay disabled".to_owned()
                     } else {
                         "display-derived; replay disabled".to_owned()
                     };
@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_menu_guard_tracks_rsh_editor_safety_requirements() {
+    fn replay_menu_guard_tracks_jsh_editor_safety_requirements() {
         let exact = replay_test_row(true, false);
         assert_eq!(
             replay_disabled_reason(&exact, ready_replay_guard(), false),

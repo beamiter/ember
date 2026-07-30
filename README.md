@@ -20,7 +20,7 @@ claimed.
 - Unicode width handling, combining characters, ligatures and font fallback
 - Full-scrollback search with auto-reveal navigation, bounded live refresh,
   selection-aware replace, and a continuous-grid
-  [semantic command timeline](docs/rsh-semantic-executions.md) (OSC 133)
+  [semantic command timeline](docs/jsh-semantic-executions.md) (OSC 133)
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
@@ -136,7 +136,7 @@ scroll_speed = 3
 restore_session = true
 tab_bar_position = "top"      # top | sidebar
 shell = "/bin/bash"            # optional; JTERM2_SHELL has priority
-rsh_update_check = "daily"     # startup | daily | never
+jsh_update_check = "daily"     # startup | daily | never
 
 # Host clipboard policy. Reading is more sensitive than writing.
 osc52_clipboard_write = true
@@ -229,26 +229,26 @@ When old scrollback must be reflowed after a width change, jterm2 keeps the
 results and navigation but suppresses any historical highlight whose raw
 coordinate cannot yet be mapped exactly, rather than painting the wrong cell.
 
-## Installing and updating rsh
+## Installing and updating jsh
 
-jterm2 prefers its companion shell [`rsh`](https://github.com/beamiter/rsh) and
+jterm2 prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
 falls back to bash only when it cannot find one. The palette command
-**Install or update rsh** runs the installer in its own session: the session is
+**Install or update jsh** runs the installer in its own session: the session is
 the progress UI, so it can be interrupted with Ctrl+C and it waits for Enter
 before closing, instead of a failure flashing past.
 
-The installer is embedded in the binary, so a machine that has never had rsh can
+The installer is embedded in the binary, so a machine that has never had jsh can
 still bootstrap one. It verifies the download's checksum, swaps the binary in
 with `rename(2)` — **shells that are already running keep the version they
 started with; new sessions pick up the new one** — keeps the previous binary for
-rollback, and reports when `PATH` resolves `rsh` to `/usr/bin/rsh`, the BSD
-remote shell on Debian-family systems.
+rollback, and reports when `PATH` resolves `jsh` to some other binary of the
+same name rather than this shell.
 
-When rsh is missing or a newer one is published, a dismissible row appears under
+When jsh is missing or a newer one is published, a dismissible row appears under
 the tab bar with the same action. The check runs on a worker thread, never
 installs anything by itself, and stays silent when it cannot reach the network.
-`rsh_update_check = "daily"` (the default) reuses the installer's own cache
-(`~/.cache/rsh/update-check.json`), so several jterms open at once still cost one
+`jsh_update_check = "daily"` (the default) reuses the installer's own cache
+(`~/.cache/jsh/update-check.json`), so several jterms open at once still cost one
 request a day; `"startup"` asks every launch and `"never"` disables the check.
 
 ## Security notes

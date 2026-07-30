@@ -435,8 +435,8 @@ impl super::TerminalState {
                                             //   C           command output begins
                                             //   D[;<exit>]  command finished, optional exit code
                                             // Parameters are parsed centrally so C can carry
-                                            // Kitty's `cmdline_url` and rsh can correlate all
-                                            // phases with `rsh_id`/`id`.
+                                            // Kitty's `cmdline_url` and jsh can correlate all
+                                            // phases with `jsh_id`/`id`.
                                             self.handle_osc_133(value);
                                         } else if command == "5522" {
                                             let (metadata, osc_payload) =

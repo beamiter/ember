@@ -175,11 +175,11 @@ pub struct Config {
     #[serde(default)]
     pub shell: Option<String>,
 
-    /// When to look for a newer rsh: "startup", "daily" (default) or "never".
+    /// When to look for a newer jsh: "startup", "daily" (default) or "never".
     /// The check only decides whether the offer appears; installing always
     /// stays an explicit choice.
-    #[serde(default = "default_rsh_update_check")]
-    pub rsh_update_check: String,
+    #[serde(default = "default_jsh_update_check")]
+    pub jsh_update_check: String,
 
     /// 会话标签栏位置:顶部水平栏(默认)或集成进左侧侧边栏
     #[serde(default)]
@@ -227,8 +227,8 @@ fn default_notify_long_block_threshold_ms() -> u64 {
     10_000
 }
 
-fn default_rsh_update_check() -> String {
-    jterm_core::rsh_install::UpdateCheck::default()
+fn default_jsh_update_check() -> String {
+    jterm_core::jsh_install::UpdateCheck::default()
         .as_str()
         .to_string()
 }
@@ -377,7 +377,7 @@ fn default_font_ligatures() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            rsh_update_check: default_rsh_update_check(),
+            jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
             ai_provider: default_ai_provider(),
             ai_base_url: default_ai_base_url(),

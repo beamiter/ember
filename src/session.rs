@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// forever. Clipboard payloads that cannot fit remain in the paste-confirm
 /// flow instead of entering this queue.
 pub const PENDING_INPUT_BYTE_CAP: usize = 8 * 1024 * 1024;
-const MAX_RSH_SESSION_ID_BYTES: usize = 128;
+const MAX_JSH_SESSION_ID_BYTES: usize = 128;
 
 fn append_bounded_input(buffer: &mut Vec<u8>, input: &[u8], cap: usize) -> bool {
     let Some(total) = buffer.len().checked_add(input.len()) else {
@@ -22,7 +22,7 @@ fn append_bounded_input(buffer: &mut Vec<u8>, input: &[u8], cap: usize) -> bool 
     true
 }
 
-/// Generate a unique session ID for rsh session persistence.
+/// Generate a unique session ID for jsh session persistence.
 pub fn generate_session_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -31,12 +31,12 @@ pub fn generate_session_id() -> String {
     format!("{}-{}", std::process::id(), ts)
 }
 
-/// Match rsh's `--session` and execution-journal grammar. Persisted metadata
+/// Match jsh's `--session` and execution-journal grammar. Persisted metadata
 /// is user-editable, so callers must validate restored IDs before putting one
 /// on an argv or using it as a cross-process routing key.
-pub fn is_valid_rsh_session_id(id: &str) -> bool {
+pub fn is_valid_jsh_session_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= MAX_RSH_SESSION_ID_BYTES
+        && id.len() <= MAX_JSH_SESSION_ID_BYTES
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -65,11 +65,11 @@ impl SessionMetadata {
     }
 
     /// Build metadata around the ID that was assigned before the shell was
-    /// spawned. rsh receives the same value through `--session`, so terminal
+    /// spawned. jsh receives the same value through `--session`, so terminal
     /// routing, shell snapshots, and the execution journal share one stable
     /// identity from the first byte of PTY output onward.
     pub fn with_session_id(name: String, tags: Vec<String>, session_id: String) -> Self {
-        debug_assert!(is_valid_rsh_session_id(&session_id));
+        debug_assert!(is_valid_jsh_session_id(&session_id));
         SessionMetadata {
             name,
             tags,
@@ -190,12 +190,12 @@ mod tests {
     }
 
     #[test]
-    fn rsh_session_id_grammar_rejects_argv_unsafe_metadata() {
+    fn jsh_session_id_grammar_rejects_argv_unsafe_metadata() {
         for valid in ["123-456", "tab_1", "ABC"] {
-            assert!(is_valid_rsh_session_id(valid), "{valid}");
+            assert!(is_valid_jsh_session_id(valid), "{valid}");
         }
         for invalid in ["", "has.dot", "has space", "../escape", "雪"] {
-            assert!(!is_valid_rsh_session_id(invalid), "{invalid}");
+            assert!(!is_valid_jsh_session_id(invalid), "{invalid}");
         }
     }
 

@@ -1439,13 +1439,13 @@ fn osc_133_d_without_exit_code_leaves_none() {
 fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
     let mut terminal = TerminalState::new(16, 5);
 
-    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;rsh_id=exec-7\x07");
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=exec-7\x07");
     assert!(terminal.shell_is_prompt_ready());
     terminal.process_input(b"echo hi\r\n");
-    terminal.process_input(b"\x1b]133;C;rsh_id=exec-7;cmdline_url=echo%20hi;cwd=%2Ftmp\x07");
+    terminal.process_input(b"\x1b]133;C;jsh_id=exec-7;cmdline_url=echo%20hi;cwd=%2Ftmp\x07");
     assert!(!terminal.shell_is_prompt_ready());
     terminal.process_input(b"hello\r\n");
-    terminal.process_input(b"\x1b]133;D;0;rsh_id=exec-7;duration_ms=12\x07");
+    terminal.process_input(b"\x1b]133;D;0;jsh_id=exec-7;duration_ms=12\x07");
 
     let records = terminal.command_records();
     assert_eq!(records.len(), 1);
@@ -1547,19 +1547,19 @@ fn osc_133_invalid_or_oversized_ids_keep_the_terminal_local_identity() {
 }
 
 #[test]
-fn osc_133_decodes_kitty_command_and_percent_encoded_rsh_id() {
+fn osc_133_decodes_kitty_command_and_percent_encoded_jsh_id() {
     let mut terminal = TerminalState::new(24, 4);
     terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07");
     terminal.process_input(b"shown command\r\n");
-    terminal.process_input(b"\x1b]133;C;rsh_id=rsh%3A42;cmdline_url=printf%20%27a%3Bb%2Bc%27\x07");
-    terminal.process_input(b"a;b+c\x1b]133;D;exit_status=3;rsh_id=rsh%3A42\x07");
+    terminal.process_input(b"\x1b]133;C;jsh_id=jsh%3A42;cmdline_url=printf%20%27a%3Bb%2Bc%27\x07");
+    terminal.process_input(b"a;b+c\x1b]133;D;exit_status=3;jsh_id=jsh%3A42\x07");
 
-    let record = terminal.command_record("rsh:42").expect("decoded id");
+    let record = terminal.command_record("jsh:42").expect("decoded id");
     assert_eq!(record.command.as_deref(), Some("printf 'a;b+c'"));
     assert_eq!(record.exit_code, Some(3));
     assert_eq!(
         terminal
-            .command_output_text("rsh:42", 1024)
+            .command_output_text("jsh:42", 1024)
             .expect("output")
             .text,
         "a;b+c"
@@ -1569,9 +1569,9 @@ fn osc_133_decodes_kitty_command_and_percent_encoded_rsh_id() {
 #[test]
 fn command_output_joins_soft_wraps_and_skips_wide_continuations() {
     let mut terminal = TerminalState::new(4, 4);
-    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=wide\x07");
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;jsh_id=wide\x07");
     terminal.process_input("ab界c".as_bytes());
-    terminal.process_input(b"\x1b]133;D;0;rsh_id=wide\x07");
+    terminal.process_input(b"\x1b]133;D;0;jsh_id=wide\x07");
 
     let output = terminal
         .command_output_text("wide", 1024)
@@ -1583,9 +1583,9 @@ fn command_output_joins_soft_wraps_and_skips_wide_continuations() {
 #[test]
 fn bounded_command_output_keeps_utf8_safe_head_and_tail() {
     let mut terminal = TerminalState::new(32, 3);
-    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=bounded\x07");
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;jsh_id=bounded\x07");
     terminal.process_input("甲乙丙丁戊己".as_bytes());
-    terminal.process_input(b"\x1b]133;D;1;rsh_id=bounded\x07");
+    terminal.process_input(b"\x1b]133;D;1;jsh_id=bounded\x07");
 
     let output = terminal
         .command_output_text("bounded", 12)
@@ -1630,9 +1630,9 @@ fn anchor_and_absolute_range_apis_preserve_soft_wrap_semantics() {
 fn command_record_survives_output_eviction_but_anchors_report_unavailable() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.set_max_scrollback(1);
-    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=evicted\x07");
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;jsh_id=evicted\x07");
     terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour\r\n");
-    terminal.process_input(b"\x1b]133;D;0;rsh_id=evicted\x07");
+    terminal.process_input(b"\x1b]133;D;0;jsh_id=evicted\x07");
 
     assert!(terminal.command_record("evicted").is_some());
     assert!(terminal.command_output_text("evicted", 1024).is_none());
@@ -1646,9 +1646,9 @@ fn command_record_survives_output_eviction_but_anchors_report_unavailable() {
 fn completed_snapshot_keeps_output_after_later_scrollback_eviction() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.set_max_scrollback(1);
-    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;rsh_id=kept\x07");
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;jsh_id=kept\x07");
     terminal.process_input(b"kept\r\n");
-    terminal.process_input(b"\x1b]133;D;0;rsh_id=kept\x07");
+    terminal.process_input(b"\x1b]133;D;0;jsh_id=kept\x07");
     assert_eq!(
         terminal
             .command_output_text("kept", 1024)
@@ -1674,7 +1674,7 @@ fn captured_output_cache_evicts_oldest_payloads_at_session_cap() {
     let mut terminal = TerminalState::new(8, 2);
     for sequence in 0..65 {
         let lifecycle = format!(
-            "\x1b]133;A\x07\x1b]133;C;rsh_id=cache-{sequence}\x07\x1b]133;D;0;rsh_id=cache-{sequence}\x07"
+            "\x1b]133;A\x07\x1b]133;C;jsh_id=cache-{sequence}\x07\x1b]133;D;0;jsh_id=cache-{sequence}\x07"
         );
         terminal.process_input(lifecycle.as_bytes());
         let index = terminal.command_records().len() - 1;

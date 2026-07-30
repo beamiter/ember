@@ -135,20 +135,25 @@ mod unix_pty {
             .find_map(|candidate| executable_path(&candidate))
     }
 
-    /// `rsh` is an ambiguous name: on most distributions `/usr/bin/rsh` is an
-    /// alternatives symlink to the legacy remote shell (today usually
-    /// `ssh`/`rlogin`), not the interactive shell jterm2 prefers. Launching it
-    /// makes the child reject `--session` and exit immediately (ssh exits 255),
-    /// which used to close the only tab and take the whole window down with it.
-    /// Accept the candidate only when it really resolves to an `rsh` program.
-    pub(super) fn is_interactive_rsh(path: &Path) -> bool {
+    /// A `jsh` on PATH need not be the interactive shell jterm2 prefers: the
+    /// name can be taken by an unrelated binary, or be a symlink pointing
+    /// somewhere else entirely. Launching such a program makes the child reject
+    /// `--session` and exit immediately (ssh, for one, exits 255), which used to
+    /// close the only tab and take the whole window down with it. Accept the
+    /// candidate only when it really resolves to a `jsh` program.
+    ///
+    /// The shell was called `rsh` until 0.3; that name was an alternatives
+    /// symlink to the BSD remote shell on Debian-family systems, which is how
+    /// this guard came about. The rename removed that particular collision, but
+    /// resolving the candidate is still the only way to know what we exec.
+    pub(super) fn is_interactive_jsh(path: &Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let Some(name) = resolved.file_name().and_then(|name| name.to_str()) else {
             return false;
         };
-        // Version-suffixed builds (rsh-0.3.0) stay eligible; ssh, rlogin,
-        // remsh and the netkit/redone compat wrappers do not.
-        name == "rsh" || name.starts_with("rsh-") || name.starts_with("rsh.")
+        // Version-suffixed builds (jsh-0.3.0) stay eligible; anything the name
+        // resolves to under another basename does not.
+        name == "jsh" || name.starts_with("jsh-") || name.starts_with("jsh.")
     }
 
     pub(super) fn choose_shell_with_path(
@@ -179,14 +184,14 @@ mod unix_pty {
             );
         }
 
-        // Priority 2: rsh (preferred shell with advanced features)
-        if let Some(rsh_path) = find_executable_in_path_with("rsh", path_var) {
-            if is_interactive_rsh(Path::new(&rsh_path)) {
-                return Ok(rsh_path);
+        // Priority 2: jsh (preferred shell with advanced features)
+        if let Some(jsh_path) = find_executable_in_path_with("jsh", path_var) {
+            if is_interactive_jsh(Path::new(&jsh_path)) {
+                return Ok(jsh_path);
             }
             eprintln!(
-                "[PTY] Ignoring '{}': it resolves to the legacy remote shell, not the rsh shell",
-                rsh_path
+                "[PTY] Ignoring '{}': it resolves to another program, not the jsh shell",
+                jsh_path
             );
         }
 
@@ -205,7 +210,7 @@ mod unix_pty {
         }
 
         Err(anyhow!(
-            "No executable shell found (tried configured shell, rsh, bash, PATH sh, and {})",
+            "No executable shell found (tried configured shell, jsh, bash, PATH sh, and {})",
             sh_fallback.display()
         ))
     }
@@ -272,7 +277,7 @@ mod unix_pty {
                 let session_flag = CString::new("--session").unwrap();
                 let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
 
-                let bash_path = if shell_name == "rsh" {
+                let bash_path = if shell_name == "jsh" {
                     jterm_core::host::find_executable_in_path("bash")
                         .filter(|p| is_executable(p))
                         .map(|p| p.to_string_lossy().into_owned())
@@ -280,7 +285,7 @@ mod unix_pty {
                     None
                 };
 
-                // 一次性辅助进程(例如 rsh 安装脚本)按原样 exec 给定 argv:
+                // 一次性辅助进程(例如 jsh 安装脚本)按原样 exec 给定 argv:
                 // 不做登录 shell 包装,也不注入 --session。
                 let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
                     Some(argv) => {
@@ -311,7 +316,7 @@ mod unix_pty {
                         command
                     } else if let Some(bash_path) = bash_path {
                         let exec_cmd =
-                            jterm_core::process::build_rsh_exec_command(&shell_path, session_id);
+                            jterm_core::process::build_jsh_exec_command(&shell_path, session_id);
                         (
                             CString::new(bash_path).map_err(|_| anyhow!("Invalid bash path"))?,
                             vec![
@@ -326,7 +331,7 @@ mod unix_pty {
                         if let Some(ref arg) = login_arg {
                             argv.push(arg.clone());
                         }
-                        if shell_name == "rsh" {
+                        if shell_name == "jsh" {
                             if let Some(ref sid) = session_id_cstr {
                                 argv.push(session_flag.clone());
                                 argv.push(sid.clone());
@@ -496,7 +501,7 @@ mod unix_pty {
 
                     // 【关键】设置父进程死亡信号：当父进程(jterm2)死亡时，此进程会收到SIGTERM
                     // 这是最后一道防线，确保即使jterm2被SIGKILL强制杀死或panic崩溃，
-                    // rsh进程也会收到退出信号，不会变成孤儿进程继续运行。
+                    // jsh进程也会收到退出信号，不会变成孤儿进程继续运行。
                     #[cfg(target_os = "linux")]
                     {
                         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -1047,12 +1052,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rsh_symlinked_to_the_legacy_remote_shell_is_skipped() {
-        let root = ShellTestDir::new("rsh-alternatives");
+    fn jsh_symlinked_to_another_program_is_skipped() {
+        let root = ShellTestDir::new("jsh-alternatives");
         let ssh = root.executable("ssh");
         let bash = root.executable("bash");
-        // Mirrors /usr/bin/rsh -> /etc/alternatives/rsh -> /usr/bin/ssh.
-        std::os::unix::fs::symlink(&ssh, root.0.join("rsh")).unwrap();
+        // A `jsh` on PATH that is really a symlink to ssh: right name, wrong
+        // binary. Exec'ing it would exit 255 and close the only tab.
+        std::os::unix::fs::symlink(&ssh, root.0.join("jsh")).unwrap();
         let search_path = root.search_path();
 
         let selected = super::unix_pty::choose_shell_with_path(
@@ -1067,9 +1073,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_real_rsh_binary_is_still_preferred() {
-        let root = ShellTestDir::new("rsh-real");
-        let rsh = root.executable("rsh");
+    fn a_real_jsh_binary_is_still_preferred() {
+        let root = ShellTestDir::new("jsh-real");
+        let jsh = root.executable("jsh");
         root.executable("bash");
         let search_path = root.search_path();
 
@@ -1080,18 +1086,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(std::path::Path::new(&selected), rsh);
-        assert!(super::unix_pty::is_interactive_rsh(&rsh));
+        assert_eq!(std::path::Path::new(&selected), jsh);
+        assert!(super::unix_pty::is_interactive_jsh(&jsh));
     }
 
     #[cfg(unix)]
     #[test]
-    fn versioned_rsh_builds_remain_eligible() {
-        let root = ShellTestDir::new("rsh-versioned");
-        let versioned = root.executable("rsh-0.3.0");
-        std::os::unix::fs::symlink(&versioned, root.0.join("rsh")).unwrap();
+    fn versioned_jsh_builds_remain_eligible() {
+        let root = ShellTestDir::new("jsh-versioned");
+        let versioned = root.executable("jsh-0.3.0");
+        std::os::unix::fs::symlink(&versioned, root.0.join("jsh")).unwrap();
 
-        assert!(super::unix_pty::is_interactive_rsh(&root.0.join("rsh")));
+        assert!(super::unix_pty::is_interactive_jsh(&root.0.join("jsh")));
     }
 
     #[cfg(unix)]
@@ -1160,7 +1166,7 @@ mod tests {
             "{error}"
         );
     }
-    /// The one-shot helper path (rsh installer) must exec the given argv
+    /// The one-shot helper path (jsh installer) must exec the given argv
     /// verbatim: no login-shell wrapping, no --session injection.
     #[cfg(unix)]
     #[test]

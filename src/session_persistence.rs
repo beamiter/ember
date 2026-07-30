@@ -238,7 +238,7 @@ impl SessionsSnapshot {
             if session
                 .session_id
                 .as_deref()
-                .is_some_and(|id| !crate::session::is_valid_rsh_session_id(id))
+                .is_some_and(|id| !crate::session::is_valid_jsh_session_id(id))
             {
                 session.session_id = None;
                 repaired_fields += 1;

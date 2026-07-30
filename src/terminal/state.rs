@@ -1835,7 +1835,7 @@ impl super::TerminalState {
     }
 
     /// Parse and apply one OSC 133 payload (the part after `133;`). Supports
-    /// FinalTerm A/B/C/D, Kitty `cmdline_url`, and rsh correlation metadata.
+    /// FinalTerm A/B/C/D, Kitty `cmdline_url`, and jsh correlation metadata.
     pub(super) fn handle_osc_133(&mut self, value: &str) {
         let mut parts = value.split(';');
         let kind = parts.next().unwrap_or("");
@@ -1849,7 +1849,7 @@ impl super::TerminalState {
         for part in parts {
             if let Some((key, value)) = part.split_once('=') {
                 match key {
-                    "id" | "rsh_id" | "execution_id" | "command_id" => id = Some(value),
+                    "id" | "jsh_id" | "execution_id" | "command_id" => id = Some(value),
                     "cmdline_url" | "command_url" | "command" | "cmdline" => command = Some(value),
                     "cwd" | "cwd_url" => cwd = Some(value),
                     "exit" | "exit_code" | "exit_status" => {

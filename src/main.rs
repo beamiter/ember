@@ -11,13 +11,13 @@ mod execution_journal;
 mod gpu;
 mod help;
 mod history_persistence;
+mod jsh_ui;
 mod keybindings;
 mod kitty_graphics;
 mod layout;
 mod link;
 mod pane_header;
 mod pty;
-mod rsh_ui;
 mod search;
 mod search_replace;
 mod search_replace_panel;
@@ -69,7 +69,7 @@ static NEXT_KITTY_PASTE_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
 const KITTY_BASE64_CHUNK_BYTES: usize = 4096;
 
 /// 设置信号处理器，确保收到SIGINT/SIGTERM时能正常退出
-/// 这允许Drop逻辑执行，从而清理所有rsh子进程
+/// 这允许Drop逻辑执行，从而清理所有jsh子进程
 #[cfg(unix)]
 fn setup_signal_handlers() {
     extern "C" fn handle_signal(_: libc::c_int) {
@@ -598,7 +598,7 @@ fn main() -> Result<(), eframe::Error> {
     // 注意：panic时Drop可能不会被调用，但我们依赖PR_SET_PDEATHSIG确保子进程退出
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("[PANIC] jterm2 panicked: {}", panic_info);
-        eprintln!("[PANIC] Child rsh processes should exit due to PR_SET_PDEATHSIG");
+        eprintln!("[PANIC] Child jsh processes should exit due to PR_SET_PDEATHSIG");
     }));
 
     // 设置信号处理，确保收到SIGINT/SIGTERM时能正常清理
@@ -1559,7 +1559,7 @@ impl TerminalApp {
         let first_session_id = saved_snapshot
             .as_ref()
             .and_then(|s| s.sessions.first()?.session_id.as_deref().map(String::from))
-            .filter(|id| session::is_valid_rsh_session_id(id))
+            .filter(|id| session::is_valid_jsh_session_id(id))
             .unwrap_or_else(session::generate_session_id);
         let saved_active_index = saved_snapshot.as_ref().and_then(|s| s.active_index);
         let saved_tab_layouts: Vec<session_persistence::LayoutSnapshot> = saved_snapshot
@@ -1751,7 +1751,7 @@ impl TerminalApp {
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
-            rsh_notice: rsh_ui::RshNotice::default(),
+            jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,
             config_save_deadline: std::time::Instant::now(),
@@ -2116,11 +2116,11 @@ impl TerminalApp {
             return;
         }
 
-        // jterm2 prefers rsh as its shell, so it is worth noticing when the
+        // jterm2 prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. The row draws nothing until the
         // background check has something actionable to offer.
-        if self.render_rsh_notice(root_ui) {
-            self.install_or_update_rsh();
+        if self.render_jsh_notice(root_ui) {
+            self.install_or_update_jsh();
         }
 
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
@@ -2281,7 +2281,7 @@ impl eframe::App for TerminalApp {
                 window_focused && visible_sessions.contains(&session_idx),
             );
             if let Err(error) = execution_journal::submit(completed) {
-                log::warn!("rsh execution output journal queue rejected an event: {error:?}");
+                log::warn!("jsh execution output journal queue rejected an event: {error:?}");
             }
         }
         for (session_idx, error) in background_pump.errors.drain(..) {
@@ -2855,7 +2855,7 @@ impl eframe::App for TerminalApp {
                     );
                     if let Err(error) = execution_journal::submit(completed) {
                         log::warn!(
-                            "rsh execution output journal queue rejected an event: {error:?}"
+                            "jsh execution output journal queue rejected an event: {error:?}"
                         );
                     }
                 }
@@ -3778,9 +3778,9 @@ impl Drop for TerminalApp {
 
         // A completed command's rendered output is written off the UI thread.
         // Give already accepted snapshots a bounded chance to reach the shared
-        // rsh journal before process teardown terminates that worker.
+        // jsh journal before process teardown terminates that worker.
         if !execution_journal::flush(Duration::from_secs(2)) {
-            log::warn!("timed out flushing rsh execution output journal");
+            log::warn!("timed out flushing jsh execution output journal");
         }
     }
 }

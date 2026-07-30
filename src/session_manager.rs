@@ -366,7 +366,7 @@ fn restored_or_fresh_session_id(
     used_session_ids: &HashSet<String>,
 ) -> String {
     if let Some(id) = candidate
-        .filter(|id| crate::session::is_valid_rsh_session_id(id) && !used_session_ids.contains(id))
+        .filter(|id| crate::session::is_valid_jsh_session_id(id) && !used_session_ids.contains(id))
     {
         return id;
     }
@@ -589,7 +589,7 @@ impl SessionManager {
         self.insert_session(name, tags, cols, rows, scrollback_lines, None)
     }
 
-    /// 以显式 argv 打开一次性辅助会话(例如 rsh 安装脚本)，而不是交互 shell。
+    /// 以显式 argv 打开一次性辅助会话(例如 jsh 安装脚本)，而不是交互 shell。
     /// 脚本自己打印进度，会话本身就是进度界面。
     pub fn new_command_session(
         &mut self,
@@ -626,7 +626,7 @@ impl SessionManager {
             None
         };
 
-        // 在启动 shell 前分配稳定 ID；rsh 的 --session、tab 路由和执行
+        // 在启动 shell 前分配稳定 ID；jsh 的 --session、tab 路由和执行
         // journal 必须从第一条输出起使用同一个值。
         let session_id = crate::session::generate_session_id();
         let cwd_ref = cwd.as_deref();
@@ -1059,7 +1059,7 @@ mod tests {
             None,
         ] {
             let generated = restored_or_fresh_session_id(candidate, &used);
-            assert!(crate::session::is_valid_rsh_session_id(&generated));
+            assert!(crate::session::is_valid_jsh_session_id(&generated));
             assert!(!used.contains(&generated));
         }
     }

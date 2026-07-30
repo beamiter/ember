@@ -129,7 +129,7 @@ pub enum CommandState {
 /// representation used by command-history UI and AI context capture.
 #[derive(Clone, Debug)]
 pub struct CommandRecord {
-    /// Shell supplied `rsh_id`/`id`, or a terminal-local stable fallback.
+    /// Shell supplied `jsh_id`/`id`, or a terminal-local stable fallback.
     pub id: String,
     pub sequence: u64,
     /// Exact command supplied as `cmdline_url`, when available. For generic
