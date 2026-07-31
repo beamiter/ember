@@ -5,6 +5,7 @@ edition = "2021"
 description = "A GPU-accelerated terminal emulator built with Rust and egui"
 repository = "https://github.com/beamiter/jterm2"
 readme = "README.md"
+license = "MIT OR Apache-2.0"
 keywords = ["terminal", "terminal-emulator", "egui", "wgpu"]
 categories = ["command-line-utilities", "gui"]
 

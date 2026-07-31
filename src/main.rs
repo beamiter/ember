@@ -60,6 +60,15 @@ use ui::{grid_position_from_content, TerminalRenderer};
 // 全局标志，用于信号处理
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Must stay equal to the installed entry's basename
+/// (`data/io.github.beamiter.jterm2.desktop`): the desktop shell pairs a window
+/// with its launcher entry through this id.
+const WINDOW_APP_ID: &str = "io.github.beamiter.jterm2";
+
+/// The same artwork the installer puts in the icon theme, embedded so a window
+/// carries its icon even when the .desktop entry is not installed.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.jterm2-128.png");
+
 /// A nonzero shell exit inside this window after spawn means the shell never
 /// became interactive: no human could have typed `exit` that fast.
 const SHELL_STARTUP_GRACE: Duration = Duration::from_millis(1500);
@@ -624,10 +633,28 @@ fn main() -> Result<(), eframe::Error> {
     };
     let transparent = !matches!(renderer, eframe::Renderer::Glow);
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([cfg.initial_width, cfg.initial_height])
+        // The desktop shell matches a window to its .desktop entry by app_id,
+        // so this has to be the entry's basename or the shell shows an
+        // unbranded, unpinnable window instead of jterm2. egui sets it as
+        // winit's Wayland window name, which winit also reports as the X11
+        // WM_CLASS general class, so `StartupWMClass` in the entry is this same
+        // string rather than the program name a GTK app would report.
+        .with_app_id(WINDOW_APP_ID)
+        .with_transparent(transparent);
+
+    // The .desktop entry only covers windows the shell can match to it. Without
+    // an icon of its own the window has no _NET_WM_ICON at all, so anything
+    // else — a bare `cargo run`, a session where the entry is not installed —
+    // falls back to a blank placeholder in the dock and the window switcher.
+    match eframe::icon_data::from_png_bytes(WINDOW_ICON_PNG) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(err) => log::warn!("Failed to decode the embedded window icon: {err}"),
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([cfg.initial_width, cfg.initial_height])
-            .with_transparent(transparent),
+        viewport,
         renderer,
         ..Default::default()
     };

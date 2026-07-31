@@ -107,6 +107,49 @@ Enable deeper diagnostics when needed:
 RUST_LOG=jterm2=debug cargo run
 ```
 
+## Install with desktop integration
+
+```bash
+./scripts/install.sh              # build, then install binary + launcher entry
+./scripts/install.sh --dry-run    # print every command without changing files
+./scripts/install.sh --no-desktop # binary only
+./scripts/uninstall.sh            # remove both; configuration is preserved
+```
+
+This installs into `~/.local` by default (override with `--prefix`/`--bin-dir`,
+and `DESTDIR` for packaging):
+
+| File | Path |
+| --- | --- |
+| Binary | `~/.local/bin/jterm2` |
+| Launcher entry | `~/.local/share/applications/io.github.beamiter.jterm2.desktop` |
+| Icons | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.jterm2.*` |
+| AppStream metadata | `~/.local/share/metainfo/io.github.beamiter.jterm2.metainfo.xml` |
+
+That is what makes jterm2 appear in the GNOME/KDE application list with its own
+icon, ready to pin. Three details decide whether it shows up at all, and the
+installer handles each:
+
+- `Exec=`/`TryExec=` are rewritten to the binary's absolute path (system
+  prefixes such as `/usr` keep the relocatable bare name). A desktop session
+  fixes its `PATH` at login, so `TryExec=jterm2` fails and hides the entry
+  **completely** when `~/.local/bin` is not on that `PATH`.
+- `update-desktop-database` and `gtk-update-icon-cache` are refreshed after
+  install and uninstall; a stale icon cache shadows newly installed icons.
+  `DESTDIR` builds skip the refresh and leave it to the package manager.
+- `StartupWMClass` is `io.github.beamiter.jterm2`, matching the window's real
+  `WM_CLASS`. egui hands the app id to winit as its Wayland window name, which
+  also becomes the X11 general class, so both display servers agree — without
+  it the shell shows an unbranded window that cannot be pinned.
+
+The window also carries its own icon: `data/io.github.beamiter.jterm2-128.png`
+is embedded in the binary and handed to winit at startup, so `_NET_WM_ICON` is
+set even for a bare `cargo run` or a session where the entry is not installed.
+The launcher entry covers only windows the shell can match to it.
+
+Verify with `desktop-file-validate <entry>` and `gtk-launch
+io.github.beamiter.jterm2`.
+
 ## Configuration
 
 The main configuration is `~/.config/jterm2/config.toml`. It is created after
@@ -317,3 +360,10 @@ cargo bench
 GitHub Actions runs formatting, Clippy, tests and a release build. Please add a
 focused regression test for parser, input or persistence changes whenever the
 behavior can be exercised without a desktop session.
+
+## License
+
+jterm2 is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
+Full texts are in [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE). Contributions are accepted under the same
+dual terms.

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.beamiter.jterm2</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>jterm2</name>
+  <summary>GPU-accelerated terminal emulator built with Rust and egui</summary>
+  <description>
+    <p>
+      jterm2 renders its terminal grid on the GPU through egui and wgpu, with a
+      glow fallback for machines whose drivers prefer OpenGL.
+    </p>
+    <ul>
+      <li>Tabs and split panes over a shared PTY session model</li>
+      <li>Configurable themes, fonts, and UI scale, with CJK fallback fonts</li>
+      <li>A companion jsh shell that the palette can install or update</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.beamiter.jterm2.desktop</launchable>
+  <developer id="io.github.beamiter">
+    <name>beamiter</name>
+  </developer>
+  <url type="homepage">https://github.com/beamiter/jterm2</url>
+  <url type="bugtracker">https://github.com/beamiter/jterm2/issues</url>
+  <provides>
+    <binary>jterm2</binary>
+  </provides>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <content_rating type="oars-1.1"/>
+</component>
