@@ -11,6 +11,7 @@ HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
+PREFIX_EXPLICIT=0
 INSTALL_DESKTOP=1
 DRY_RUN=0
 
@@ -20,7 +21,8 @@ Usage: ./scripts/install.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (overrides --prefix)
+  --bin-dir PATH         Runtime binary directory (default: ~/.cargo/bin;
+                         with --prefix, defaults to PREFIX/bin)
   --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
   -h, --help             Show this help
@@ -143,10 +145,12 @@ while (($# > 0)); do
         --prefix)
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
+            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
+            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -184,7 +188,11 @@ done
 [[ -n "${PREFIX}" ]] || die "prefix must not be empty"
 [[ "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
 if [[ -z "${BIN_DIR}" ]]; then
-    BIN_DIR="${PREFIX}/bin"
+    if ((PREFIX_EXPLICIT == 1)); then
+        BIN_DIR="${PREFIX}/bin"
+    else
+        BIN_DIR="${HOME_DIR}/.cargo/bin"
+    fi
 fi
 [[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
 if [[ -n "${DESTDIR}" ]]; then
