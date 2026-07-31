@@ -43,6 +43,8 @@ pub enum Command {
     FontIncrease,
     FontDecrease,
     FontReset,
+    OpacityIncrease,
+    OpacityDecrease,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E
@@ -111,6 +113,8 @@ impl std::fmt::Display for Command {
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
+            Command::OpacityIncrease => write!(f, "opacity:increase"),
+            Command::OpacityDecrease => write!(f, "opacity:decrease"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -170,6 +174,8 @@ impl std::str::FromStr for Command {
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
+            "opacity:increase" => Ok(Command::OpacityIncrease),
+            "opacity:decrease" => Ok(Command::OpacityDecrease),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -386,6 +392,14 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+0".to_string(), "font:reset".to_string());
 
+        // 窗口透明度实时调节，与 jterm1/jterm4 相同的键位。
+        bindings
+            .bindings
+            .insert("ctrl+alt+=".to_string(), "opacity:increase".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+alt+-".to_string(), "opacity:decrease".to_string());
+
         bindings
     }
 
@@ -518,6 +532,8 @@ mod tests {
             Command::FontIncrease,
             Command::FontDecrease,
             Command::FontReset,
+            Command::OpacityIncrease,
+            Command::OpacityDecrease,
             Command::CommandPaletteToggle,
             Command::HelpToggle,
         ] {
@@ -553,6 +569,8 @@ mod tests {
             ("ctrl+=", Command::FontIncrease),
             ("ctrl+-", Command::FontDecrease),
             ("ctrl+0", Command::FontReset),
+            ("ctrl+alt+=", Command::OpacityIncrease),
+            ("ctrl+alt+-", Command::OpacityDecrease),
             ("f12", Command::DebugToggle),
         ];
         for (key, command) in expected {

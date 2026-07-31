@@ -314,6 +314,29 @@ impl TerminalApp {
         self.set_status(format!("{action}: {:.0} pt", self.config.font_size));
     }
 
+    fn adjust_opacity_from_command(&mut self, ctx: &egui::Context, delta: f32) {
+        let new_opacity = (self.config.opacity + delta).clamp(0.05, 1.0);
+        if (new_opacity - self.config.opacity).abs() <= f32::EPSILON {
+            self.set_status(format!(
+                "Opacity is already at {:.0}%",
+                self.config.opacity * 100.0
+            ));
+            return;
+        }
+
+        self.config.opacity = new_opacity;
+        // Surgical apply: only the renderers' opacity changes. The full
+        // apply_runtime_config path re-applies pixels_per_point and rebuilds
+        // fonts, which visibly rescales the whole UI on every keypress.
+        self.renderer.opacity = new_opacity;
+        for renderer in &mut self.pane_renderers {
+            renderer.opacity = new_opacity;
+        }
+        ctx.request_repaint();
+        self.schedule_config_save();
+        self.set_status(format!("Opacity: {:.0}%", self.config.opacity * 100.0));
+    }
+
     /// The one execution path for commands, independent of whether they came
     /// from a configurable keybinding or the command palette. `true` means the
     /// application requested that the viewport close.
@@ -453,6 +476,8 @@ impl TerminalApp {
             keybindings::Command::FontReset => {
                 self.set_font_size_from_command(ctx, config::DEFAULT_FONT_SIZE, "Font size reset")
             }
+            keybindings::Command::OpacityIncrease => self.adjust_opacity_from_command(ctx, 0.025),
+            keybindings::Command::OpacityDecrease => self.adjust_opacity_from_command(ctx, -0.025),
             keybindings::Command::TerminalSplitVertical => self.split_terminal(false),
             keybindings::Command::TerminalSplitHorizontal => self.split_terminal(true),
             keybindings::Command::TerminalClosePane => self.close_focused_pane_or_session(),

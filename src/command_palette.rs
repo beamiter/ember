@@ -350,6 +350,18 @@ impl CommandPalette {
             ),
             // === 窗口操作 ===
             CommandInfo::new(
+                "Increase Opacity",
+                CommandCategory::Window,
+                "Make the window background more opaque",
+                crate::keybindings::Command::OpacityIncrease,
+            ),
+            CommandInfo::new(
+                "Decrease Opacity",
+                CommandCategory::Window,
+                "Make the window background more transparent",
+                crate::keybindings::Command::OpacityDecrease,
+            ),
+            CommandInfo::new(
                 "Close Window",
                 CommandCategory::Window,
                 "Close the entire application",
@@ -628,6 +640,8 @@ mod tests {
             Command::FontIncrease,
             Command::FontDecrease,
             Command::FontReset,
+            Command::OpacityIncrease,
+            Command::OpacityDecrease,
             Command::TerminalSplitVertical,
             Command::TerminalSplitHorizontal,
             Command::TerminalClosePane,

@@ -239,6 +239,7 @@ Defaults include:
 | Zoom / restore focused pane | `Ctrl+Shift+Enter` / `Ctrl+Shift+Z` |
 | Equalize all pane dividers | Command palette: “Equalize Panes” |
 | Font size increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| Window opacity increase / decrease | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
 

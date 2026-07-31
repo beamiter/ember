@@ -631,7 +631,11 @@ fn main() -> Result<(), eframe::Error> {
         config::AppRendererType::Glow => eframe::Renderer::Glow,
         config::AppRendererType::Wgpu => eframe::Renderer::Wgpu,
     };
-    let transparent = !matches!(renderer, eframe::Renderer::Glow);
+    // Ask for an alpha-capable surface on both backends. Glow used to be
+    // excluded, which silently turned the whole `opacity` feature into a no-op
+    // whenever the config (or the wgpu fallback) picked it: the clear color
+    // and background alpha are only visible through a transparent window.
+    let transparent = true;
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([cfg.initial_width, cfg.initial_height])
@@ -671,6 +675,11 @@ fn main() -> Result<(), eframe::Error> {
                 .ui_scale
                 .unwrap_or_else(|| cc.egui_ctx.native_pixels_per_point().unwrap_or(1.0));
             cc.egui_ctx.set_pixels_per_point(scale);
+            // Font/UI zoom is owned by the configurable `font:*` commands and
+            // Ctrl+wheel. egui's built-in keyboard zoom must be off: its
+            // shortcut matching tolerates extra modifiers, so it would also
+            // fire on Ctrl+Alt+=/- (the opacity chords) and rescale the UI.
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             configure_fonts_and_gpu(&cc.egui_ctx, cc.wgpu_render_state.as_ref(), &cfg_clone);
             let initial_theme = theme::Theme::get_theme(&cfg_clone.theme).unwrap_or_default();
             apply_theme_visuals(&cc.egui_ctx, &initial_theme);

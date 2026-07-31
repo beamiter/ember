@@ -689,7 +689,8 @@ impl ConfigPanel {
             if ui
                 .add(
                     egui::Slider::new(&mut self.edit_opacity, 0.05..=1.0)
-                        .step_by(0.05)
+                        .step_by(0.025)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                         .show_value(true),
                 )
                 .changed()
