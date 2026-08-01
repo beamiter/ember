@@ -140,6 +140,70 @@ pub(crate) fn read_revision(path: &Path, max_bytes: u64) -> io::Result<FileRevis
 
 /// Read one owned regular UTF-8 file without ever consuming more than the
 /// caller's limit plus the single byte needed to detect growth.
+/// Highest number of same-millisecond claim attempts before giving up. A
+/// caller retrying a hundred times inside one millisecond is looping, not
+/// making progress.
+const MAX_CLAIM_ATTEMPTS: u32 = 100;
+
+/// Atomically take exclusive ownership of `path`, returning the private name
+/// the file now lives at.
+///
+/// This is the one-winner primitive behind a restore: only the caller whose
+/// no-clobber link succeeds ever observes the snapshot, so two simultaneous
+/// openers cannot both resume the same session — and neither can a read that
+/// is later followed by a separate delete. `hard_link` acts on the directory
+/// entry rather than its target, so a symlink at `path` is retired without
+/// touching what it points to.
+pub fn claim_exclusive(path: &Path) -> io::Result<PathBuf> {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    if !file_type.is_file() && !file_type.is_symlink() {
+        return Err(invalid_path("refusing to claim a non-file snapshot path"));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_path("snapshot path has no file name"))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    for attempt in 0..MAX_CLAIM_ATTEMPTS {
+        let mut claimed_name = file_name.to_os_string();
+        claimed_name.push(format!(
+            ".claimed-{timestamp}-{}-{attempt}",
+            std::process::id()
+        ));
+        let claimed = parent.join(claimed_name);
+        #[cfg(unix)]
+        match fs::hard_link(path, &claimed) {
+            Ok(()) => match fs::remove_file(path) {
+                Ok(()) => return Ok(claimed),
+                Err(error) => {
+                    let _ = fs::remove_file(&claimed);
+                    return Err(error);
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        #[cfg(not(unix))]
+        {
+            // symlink_metadata, not `exists()`: a dangling symlink at this
+            // name reports "does not exist" and must not be overwritten.
+            if fs::symlink_metadata(&claimed).is_ok() {
+                continue;
+            }
+            fs::rename(path, &claimed)?;
+            return Ok(claimed);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique claimed-snapshot name",
+    ))
+}
+
 pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     let revision = read_revision(path, max_bytes)?;
     let bytes = revision.bytes().ok_or_else(|| {

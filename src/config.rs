@@ -201,8 +201,11 @@ pub struct Config {
     #[serde(default = "default_sidebar_view")]
     pub sidebar_view: crate::sidebar::SidebarView,
 
-    /// 允许程序通过 OSC 52 写入系统剪贴板(默认允许)。
-    #[serde(default = "default_true")]
+    /// 允许程序通过 OSC 52 写入系统剪贴板(默认禁止)。
+    /// 写入会让终端里运行的任意程序(包括 ssh 对端)悄悄改写系统剪贴板,
+    /// 下一次粘贴就可能粘出别人准备好的内容,因此新安装和缺省配置一律关闭;
+    /// 显式写成 `true` 的配置会原样保留。
+    #[serde(default)]
     pub osc52_clipboard_write: bool,
 
     /// 允许程序通过 OSC 52 读取系统剪贴板(默认禁止)。
@@ -444,7 +447,7 @@ impl Default for Config {
             shell: None,
             tab_bar_position: TabBarPosition::default(),
             sidebar_view: default_sidebar_view(),
-            osc52_clipboard_write: true,
+            osc52_clipboard_write: false,
             osc52_clipboard_read: false,
             paste_confirm: true,
             notify_long_blocks: true,

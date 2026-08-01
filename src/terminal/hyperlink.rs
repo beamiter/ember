@@ -32,37 +32,41 @@ impl HyperlinkId {
     }
 }
 
-/// Return whether an OSC 8 target is safe for the platform URL opener.
+/// Return whether an OSC 8 target may become a click action.
 ///
-/// Keeping this as an allow-list makes an accidental construction of a
-/// `Link` elsewhere unable to turn `javascript:`, `data:`, or shell-like
-/// schemes into a click action.
+/// The policy is an allow-list of exactly one shape: an absolute HTTP(S) URL
+/// with an authority and no userinfo. Everything a terminal-controlled string
+/// could otherwise reach — `javascript:`, `data:`, `file:` (a click that opens
+/// a local file with its default application), `ssh:` and `git:` (a click that
+/// starts a network client), or `https://user:token@host` (a credential the
+/// user never typed) — fails closed here rather than at the opener.
+///
+/// Whitespace, controls, and visually ambiguous characters are refused too: a
+/// hyperlink's label is chosen by the same process that chose its target, so
+/// the only thing keeping the two honest is that the target reads as the origin
+/// it resolves to.
 pub(crate) fn is_supported_hyperlink_uri(uri: &str) -> bool {
     if uri.is_empty()
         || uri.len() > MAX_OSC8_URI_BYTES
         || uri
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
+        || crate::review_text::contains_visual_spoofing(uri)
+        || uri.contains('\\')
     {
         return false;
     }
 
-    let Some((scheme, _rest)) = uri.split_once(':') else {
+    let Some((scheme, rest)) = uri.split_once("://") else {
         return false;
     };
-    if scheme.is_empty()
-        || !scheme.as_bytes()[0].is_ascii_alphabetic()
-        || !scheme
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-    {
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
         return false;
     }
-
-    matches!(
-        scheme.to_ascii_lowercase().as_str(),
-        "http" | "https" | "ftp" | "ftps" | "git" | "ssh" | "mailto" | "file"
-    )
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // An empty authority is `http:///path`, which resolves relative to the
+    // opener's idea of a default host rather than to anything the target names.
+    !authority.is_empty() && !authority.contains('@')
 }
 
 fn params_are_valid(params: &str) -> bool {
@@ -107,14 +111,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_supported_schemes_case_insensitively() {
+    fn only_plain_http_targets_with_an_authority_become_clickable() {
         assert!(is_supported_hyperlink_uri("HTTPS://example.com/path"));
-        assert!(is_supported_hyperlink_uri("mailto:person@example.com"));
-        assert!(is_supported_hyperlink_uri("ssh://host.example/path"));
-        assert!(is_supported_hyperlink_uri("git://host.example/repository"));
-        assert!(!is_supported_hyperlink_uri("javascript:alert(1)"));
-        assert!(!is_supported_hyperlink_uri("data:text/html,hello"));
-        assert!(!is_supported_hyperlink_uri("relative/path"));
+        assert!(is_supported_hyperlink_uri("http://example.com"));
+        assert!(is_supported_hyperlink_uri("https://example.com/a?b=c#d"));
+
+        for rejected in [
+            // Schemes that would start a client or open a local file.
+            "mailto:person@example.com",
+            "ssh://host.example/path",
+            "git://host.example/repository",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,hello",
+            // Not an absolute URL at all.
+            "relative/path",
+            "https:/example.com",
+            // No authority: resolves against the opener's default, not the
+            // origin the target appears to name.
+            "https:///path",
+            // Userinfo would hand a credential to the opener.
+            "https://user:token@example.com/",
+            "https://user@example.com/",
+            // Ambiguous or invisible characters in the authority.
+            "https://exam\u{200b}ple.com/",
+            "https://example.com/\u{202e}path",
+            "https://example.com/a b",
+            "https://example.com\\evil",
+        ] {
+            assert!(
+                !is_supported_hyperlink_uri(rejected),
+                "{rejected:?} must not be clickable"
+            );
+        }
     }
 
     #[test]

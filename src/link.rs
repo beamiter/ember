@@ -364,56 +364,92 @@ pub fn open_link(link: &Link) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 打开 URL（使用系统默认浏览器）
+/// Absolute openers, in preference order, per platform.
+///
+/// A clicked link is terminal-controlled data, so the program that receives it
+/// must not be chosen by a mutable `PATH`: a directory the user happened to
+/// open, or a `~/.local/bin` entry an unrelated install dropped there, would
+/// otherwise decide what a click runs. Only a non-user-writable absolute path
+/// is accepted.
 #[cfg(target_os = "linux")]
-fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    std::process::Command::new("xdg-open").arg(url).spawn()?;
-    Ok(())
-}
-
+const OPENER_CANDIDATES: &[&str] = &["/usr/bin/xdg-open", "/bin/xdg-open"];
 #[cfg(target_os = "macos")]
-fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    std::process::Command::new("open").arg(url).spawn()?;
-    Ok(())
+const OPENER_CANDIDATES: &[&str] = &["/usr/bin/open"];
+#[cfg(target_os = "windows")]
+const OPENER_CANDIDATES: &[&str] = &[r"C:\Windows\explorer.exe"];
+
+fn trusted_opener() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    for candidate in OPENER_CANDIDATES {
+        let path = std::path::Path::new(candidate);
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = metadata.permissions().mode();
+            // Executable, and not writable by this user, its group, or others.
+            if mode & 0o111 == 0
+                || mode & 0o022 != 0
+                || (metadata.uid() == unsafe { libc::geteuid() } && mode & 0o200 != 0)
+            {
+                continue;
+            }
+        }
+        return Ok(path.to_path_buf());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no trusted system opener is available",
+    )
+    .into())
 }
 
-#[cfg(target_os = "windows")]
+/// 打开 URL（使用系统默认浏览器）
 fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Never route PTY-controlled text through `cmd /C start`: cmd.exe parses
-    // metacharacters inside arguments and would turn a clicked URL into a
-    // command-injection surface. Explorer accepts the URL as one argv value.
-    std::process::Command::new("explorer.exe")
+    // Re-check at the boundary: `open_link` validated this target, but this
+    // function is the one that actually hands bytes to another program.
+    if !crate::terminal::is_supported_hyperlink_uri(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported or unsafe URL",
+        )
+        .into());
+    }
+    let mut child = std::process::Command::new(trusted_opener()?)
         .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
+    // The opener returns immediately after handing off to the desktop; reap it
+    // so a clicked link does not leave a zombie behind.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
 /// 打开文件路径（使用系统默认应用）
-#[cfg(target_os = "linux")]
 fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let expanded_path = expand_path(path);
-
-    std::process::Command::new("xdg-open")
+    let mut command = std::process::Command::new(trusted_opener()?);
+    // `--` first: a detected path beginning with `-` is a file operand, never
+    // an option for the opener.
+    #[cfg(not(target_os = "windows"))]
+    command.arg("--");
+    let mut child = command
         .arg(&expanded_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = expand_path(path);
-    std::process::Command::new("open")
-        .arg(&expanded_path)
-        .spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = expand_path(path);
-    std::process::Command::new("explorer")
-        .arg(&expanded_path)
-        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
