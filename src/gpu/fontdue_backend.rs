@@ -47,31 +47,42 @@ struct GidGlyphKey {
 /// Owned shaping output kept after releasing the immutable font-face borrow.
 type ShapedGlyphData = (u16, u32, f32, f32, f32);
 
-/// 自包含的整形字体:`face` 借用同结构体内 `_data` Arc 持有的字节。
-/// 把"face 的 'static 生命周期是伪造的、实际借用 _data"这一不安全不变量
-/// 局部化到这里——字段顺序(face 在 _data 之前)是该不变量的一部分,使 face
-/// 先于底层字节析构,避免悬垂引用。除 `new()` 外不应在别处重建这种借用关系。
+/// Parsed HarfRust shaping data backed by immutable owned font bytes.
+///
+/// `ShaperData` caches the expensive font-derived tables without borrowing the
+/// source. A lightweight `FontRef` is recreated for each shape call, avoiding
+/// the self-referential forged `'static` lifetime the old RustyBuzz wrapper
+/// required.
 struct ShapingFont {
-    face: rustybuzz::Face<'static>,
-    // 必须保留:为 face 提供底层字节存储。声明在 face 之后以保证后析构。
-    #[allow(dead_code)]
-    _data: Arc<Vec<u8>>,
+    data: Arc<Vec<u8>>,
+    shaper_data: harfrust::ShaperData,
+    has_gsub: bool,
 }
 
 impl ShapingFont {
     fn new(data: Arc<Vec<u8>>) -> Option<Self> {
-        // SAFETY: 将借用提升为 'static 仅用于与底层 Arc 一同存储在本结构体内。
-        // `_data` 在 ShapingFont 存活期间保持该 Arc 不被释放,Arc<Vec<u8>> 的堆缓冲
-        // 指针稳定(内容绝不改写)。`face` 字段先于 `_data` 声明,析构顺序正确。
-        let face = rustybuzz::Face::from_slice(
-            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(data.as_slice()) },
-            0,
-        )?;
-        Some(ShapingFont { face, _data: data })
+        let font = harfrust::FontRef::from_index(data.as_slice(), 0).ok()?;
+        let has_gsub = font.table_data(harfrust::Tag::new(b"GSUB")).is_some();
+        let shaper_data = harfrust::ShaperData::new(&font);
+        Some(Self {
+            data,
+            shaper_data,
+            has_gsub,
+        })
     }
 
-    fn face(&self) -> &rustybuzz::Face<'static> {
-        &self.face
+    fn shape(&self, mut buffer: harfrust::UnicodeBuffer) -> (harfrust::GlyphBuffer, f32) {
+        // `new` parsed these same immutable bytes successfully. Rebuilding the
+        // borrowed view cannot fail unless that invariant is broken.
+        let font = harfrust::FontRef::from_index(self.data.as_slice(), 0)
+            .expect("validated immutable shaping font");
+        let shaper = self.shaper_data.shaper(&font).build();
+        let units_per_em = shaper.units_per_em() as f32;
+        // RustyBuzz's free `shape` function guessed direction/script/language
+        // internally. HarfRust exposes shaping as a method and requires the
+        // caller to establish those segment properties before plan creation.
+        buffer.guess_segment_properties();
+        (shaper.shape(buffer, &[]), units_per_em)
     }
 }
 
@@ -111,15 +122,14 @@ pub struct FontdueAtlas {
     cached_ascent: f32,
     cached_descent: f32,
     cached_advance_width: f32,
-    /// 预解析的 rustybuzz 整形字体,避免每次 shape 缓存未命中都重新解析整份字体
-    /// (from_slice 会解析所有字体表,是大量输出时的主要 CPU 开销)。
-    /// 底层字节存储与生命周期不变量见 [`ShapingFont`]。
+    /// HarfRust's cached shaping tables. The borrowed `FontRef` itself is cheap
+    /// to reconstruct; the expensive derived state lives in [`ShapingFont`].
     shape_regular: Option<ShapingFont>,
     shape_bold: Option<ShapingFont>,
     shaping_enabled: bool,
-    /// Reusable rustybuzz buffer to avoid allocating one per shape miss. Held
+    /// Reusable HarfRust buffer to avoid allocating one per shape miss. Held
     /// in an Option so we can `take` it across the consume-by-shape boundary.
-    shape_buffer: Option<rustybuzz::UnicodeBuffer>,
+    shape_buffer: Option<harfrust::UnicodeBuffer>,
     // Subpixel rendering
     subpixel_rendering: bool,
 }
@@ -162,21 +172,18 @@ impl FontdueAtlas {
         let (cached_ascent, cached_descent) = Self::compute_metrics(&font_regular, font_size_px);
         let cached_advance_width = font_regular.metrics('0', font_size_px).advance_width;
 
-        // Check if font supports shaping (has GSUB table for ligatures)
+        // Parse and cache HarfRust's font-derived shaping data once. Preserve
+        // the prior behavior of enabling the ligature path only for GSUB fonts.
         let font_data_arc = Arc::new(font_data_regular.to_vec());
         let font_data_bold_arc = font_data_bold.map(|d| Arc::new(d.to_vec()));
-        let shaping_enabled = ttf_parser::Face::parse(&font_data_arc, 0)
-            .map(|face| face.tables().gsub.is_some())
-            .unwrap_or(false);
-
-        // 整形字体的不安全借用关系封装在 ShapingFont 内(见其定义)。
         let shape_regular = ShapingFont::new(font_data_arc);
         let shape_bold = font_data_bold_arc.and_then(ShapingFont::new);
+        let shaping_enabled = shape_regular.as_ref().is_some_and(|font| font.has_gsub);
 
         let mut atlas = FontdueAtlas {
             shape_regular,
             shape_bold,
-            shape_buffer: Some(rustybuzz::UnicodeBuffer::new()),
+            shape_buffer: Some(harfrust::UnicodeBuffer::new()),
             font_regular,
             font_bold,
             fallback_fonts,
@@ -824,7 +831,7 @@ impl FontBackend for FontdueAtlas {
         }
 
         // Fast path: identical runs recur every frame (e.g. a static prompt line).
-        // Returning the cached Arc avoids re-parsing the rustybuzz face and
+        // Returning the cached Arc avoids rebuilding the HarfRust shaper and
         // re-running the shaper on every dirty row. The cache is cleared whenever
         // the atlas grows/resets, so cached regions are always current.
         let cache_key = ShapeCacheKey {
@@ -840,27 +847,25 @@ impl FontBackend for FontdueAtlas {
         // glyphs below; if that happens, earlier regions are stale and must not be cached.
         let generation_before = self.atlas_generation;
 
-        // 使用构造时预解析好的 Face，避免每次缓存未命中都重新解析整个字体。
-        let face = if bold {
+        // Use the cached HarfRust table data prepared at construction.
+        let shaping_font = if bold {
             self.shape_bold.as_ref().or(self.shape_regular.as_ref())
         } else {
             self.shape_regular.as_ref()
-        }
-        .map(ShapingFont::face);
+        };
 
-        // 收集本次整形得到的字形信息为自有数据，随后即可释放对 Face（&self）的借用，
+        // 收集本次整形得到的字形信息为自有数据，随后即可释放对字体（&self）的借用，
         // 以便调用需要 &mut self 的 rasterize_gid。复用 UnicodeBuffer 避免每次
         // 缓存未命中都新分配一个。
-        let shaped: Option<Vec<ShapedGlyphData>> = face.map(|face| {
+        let shaped: Option<Vec<ShapedGlyphData>> = shaping_font.map(|font| {
             let mut buffer = self.shape_buffer.take().unwrap_or_default();
             buffer.push_str(text);
 
-            let glyph_buffer = rustybuzz::shape(face, &[], buffer);
+            let (glyph_buffer, units_per_em) = font.shape(buffer);
             let infos = glyph_buffer.glyph_infos();
             let positions = glyph_buffer.glyph_positions();
 
-            let upem = face.units_per_em() as f32;
-            let scale = self.font_size_px / upem;
+            let scale = self.font_size_px / units_per_em;
 
             let collected: Vec<_> = infos
                 .iter()
@@ -921,5 +926,38 @@ impl FontBackend for FontdueAtlas {
         }
 
         arc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harfrust_shaper_rejects_invalid_font_bytes() {
+        assert!(ShapingFont::new(Arc::new(b"not a font".to_vec())).is_none());
+    }
+
+    #[test]
+    fn harfrust_shaper_guesses_segment_properties_and_reuses_its_buffer() {
+        // egui's default-font feature gives the test a deterministic bundled
+        // font, independent of whichever fonts happen to be installed on CI.
+        let definitions = egui::FontDefinitions::default();
+        let hack = definitions
+            .font_data
+            .get("Hack")
+            .expect("bundled Hack font");
+        let shaping_font =
+            ShapingFont::new(Arc::new(hack.font.to_vec())).expect("parse bundled Hack font");
+        assert!(shaping_font.has_gsub);
+
+        let mut input = harfrust::UnicodeBuffer::new();
+        input.push_str("a->b");
+        let (glyphs, units_per_em) = shaping_font.shape(input);
+
+        assert!(units_per_em.is_finite() && units_per_em > 0.0);
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.glyph_infos().iter().all(|glyph| glyph.cluster < 4));
+        assert!(glyphs.clear().is_empty());
     }
 }

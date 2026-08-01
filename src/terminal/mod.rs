@@ -152,6 +152,9 @@ pub struct CommandRecord {
     pub complete: bool,
     pub started_at: Option<std::time::SystemTime>,
     pub finished_at: Option<std::time::SystemTime>,
+    /// Locally armed Agent approval associated with this exact command
+    /// lifecycle. This value never comes from PTY-controlled OSC metadata.
+    pub agent_generation: Option<u64>,
     /// Bounded normalized output captured at D. This survives scrollback
     /// eviction; `truncated`/`total_bytes` describe the original range.
     pub captured_output: Option<ExtractedText>,
@@ -181,6 +184,16 @@ pub struct CompletedCommandOutput {
     pub output_available: bool,
     pub truncated: bool,
     pub total_bytes: usize,
+    /// One-shot local Agent approval generation. `None` for every command
+    /// that was not armed by the application before its bytes were queued.
+    pub agent_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ArmedAgentExecution {
+    generation: u64,
+    command_sequence: u64,
+    command: String,
 }
 
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
@@ -191,12 +204,15 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
 }
 
 mod grid;
+mod hyperlink;
 mod parser;
 mod state;
 #[cfg(test)]
 mod tests;
 
 pub use grid::*;
+pub(crate) use hyperlink::is_supported_hyperlink_uri;
+pub use hyperlink::HyperlinkId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMode {
@@ -412,8 +428,10 @@ pub struct TerminalState {
     /// O(1) while the first lookup for a new viewport performs one scan.
     viewport_mapping_exact_cache: std::cell::Cell<Option<ViewportMappingExactCache>>,
 
-    // OSC 8 hyperlink tracking
-    current_hyperlink: Option<(String, Option<String>)>, // (url, id)
+    // OSC 8 hyperlink tracking. Cells retain only the compact id; the URI is
+    // stored once in a bounded table rather than cloned into every cell.
+    hyperlinks: hyperlink::HyperlinkTable,
+    current_hyperlink: HyperlinkId,
 
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
     pub sync_output_active: bool,
@@ -451,4 +469,6 @@ pub struct TerminalState {
     next_command_sequence: u64,
     pending_completed_command_outputs: VecDeque<CompletedCommandOutput>,
     captured_command_output_bytes: usize,
+    agent_prompt_input_tainted: bool,
+    armed_agent_execution: Option<ArmedAgentExecution>,
 }

@@ -1083,17 +1083,18 @@ impl ConfigPanel {
                 let path = Some(self.edit_ai_api_key_file.trim().to_string())
                     .filter(|path| !path.is_empty())
                     .unwrap_or_else(jterm_core::ai::default_api_key_path);
-                self.ai_key_store_status = Some(
-                    match jterm_core::ai::write_api_key_file(&path, &self.edit_ai_key_draft) {
-                        Ok(()) => {
-                            self.edit_ai_key_draft.clear();
-                            self.edit_ai_api_key_file = path.clone();
-                            self.has_changes = true;
-                            Ok(format!("Key stored in {path}"))
-                        }
-                        Err(error) => Err(error.to_string()),
-                    },
-                );
+                self.ai_key_store_status = Some(match crate::persistence_file::write_api_key_file(
+                    &path,
+                    &self.edit_ai_key_draft,
+                ) {
+                    Ok(()) => {
+                        self.edit_ai_key_draft.clear();
+                        self.edit_ai_api_key_file = path.clone();
+                        self.has_changes = true;
+                        Ok(format!("Key stored in {path}"))
+                    }
+                    Err(error) => Err(error.to_string()),
+                });
             }
         });
         if let Some(status) = &self.ai_key_store_status {

@@ -366,24 +366,21 @@ impl super::TerminalState {
                                         } else if command == "8" {
                                             // OSC 8 - Hyperlinks
                                             // Format: ESC ] 8 ; params ; URI ST
-                                            // params can include id=<identifier>
-                                            // Empty URI = close hyperlink
+                                            // Empty URI closes the current hyperlink. Invalid,
+                                            // oversized, or unsafe openings also clear it so a
+                                            // rejected sequence cannot accidentally extend the
+                                            // preceding safe link over later text.
                                             if let Some((params, uri)) = value.split_once(';') {
                                                 if uri.is_empty() {
-                                                    // Close hyperlink
-                                                    self.current_hyperlink = None;
+                                                    self.current_hyperlink = HyperlinkId::NONE;
                                                 } else {
-                                                    // Open hyperlink
-                                                    let id = params
-                                                        .split(':')
-                                                        .find_map(|p| p.strip_prefix("id="))
-                                                        .map(|s| s.to_string());
-                                                    self.current_hyperlink =
-                                                        Some((uri.to_string(), id));
+                                                    self.current_hyperlink = self
+                                                        .hyperlinks
+                                                        .intern(params, uri)
+                                                        .unwrap_or(HyperlinkId::NONE);
                                                 }
-                                            } else if value.is_empty() {
-                                                // OSC 8 ; ; (close hyperlink)
-                                                self.current_hyperlink = None;
+                                            } else {
+                                                self.current_hyperlink = HyperlinkId::NONE;
                                             }
                                         } else if command == "4" {
                                             self.handle_osc_palette(value);
@@ -1439,6 +1436,7 @@ impl super::TerminalState {
                     foreground: Color::Default,
                     background: bg_color,
                     flags: StyleFlags::default(),
+                    hyperlink_id: HyperlinkId::NONE,
                 };
             }
         }

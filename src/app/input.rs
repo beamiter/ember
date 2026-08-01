@@ -279,6 +279,7 @@ impl TerminalApp {
                     session,
                     text,
                     self.config.paste_confirm,
+                    crate::PasteOrigin::Clipboard,
                     false,
                     &mut self.pending_paste_confirm,
                 ) {
@@ -571,15 +572,22 @@ impl TerminalApp {
             keybindings::Command::SidebarToggle => {
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible {
-                    self.sidebar.refresh();
+                    if let Some(error) = self.sidebar.refresh() {
+                        self.set_status(format!("文件树刷新失败：{error}"));
+                    }
                 }
             }
             keybindings::Command::JshInstall => {
                 self.install_or_update_jsh();
             }
             keybindings::Command::AgentToggle => {
-                let active = self.session_manager.active_index();
-                self.agent_panel.toggle(&self.config, active);
+                let session_id = self
+                    .session_manager
+                    .get_active_session_mut()
+                    .metadata
+                    .session_id
+                    .clone();
+                self.agent_panel.toggle(&self.config, session_id);
                 self.set_status(if self.agent_panel.is_open {
                     "AI agent 已打开：每条命令都需要你批准后才会执行"
                 } else {

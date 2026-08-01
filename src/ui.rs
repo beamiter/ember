@@ -469,7 +469,7 @@ pub struct TerminalRenderer {
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
     pub opacity: f32,
-    /// Whether to enable font ligatures (rustybuzz shaping of ASCII runs)
+    /// Whether to enable font ligatures (HarfRust shaping of ASCII runs)
     pub font_ligatures: bool,
     /// Whether to use GPU-accelerated grid rendering
     pub gpu_rendering: bool,

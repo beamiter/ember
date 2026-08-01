@@ -43,10 +43,7 @@ impl HistorySnapshot {
     /// 加载持久化历史;文件不存在或解析失败时返回 Default。
     /// 解析失败只打印日志,不让旧/坏数据阻止应用启动。
     pub fn load(path: &std::path::Path) -> Self {
-        if !path.exists() {
-            return Self::default();
-        }
-        match jterm_core::snapshot_file::read_bounded(path, MAX_HISTORY_SNAPSHOT_BYTES) {
+        match crate::persistence_file::read_bounded(path, MAX_HISTORY_SNAPSHOT_BYTES) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
                 Ok(snap) => snap,
                 Err(e) => {
@@ -58,6 +55,7 @@ impl HistorySnapshot {
                     Self::default()
                 }
             },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
                 eprintln!(
                     "[HistoryPersistence] Failed to read {}: {} (using defaults)",
@@ -72,7 +70,17 @@ impl HistorySnapshot {
     /// 原子写入(临时文件 + fsync + rename),失败返回 Err 由调用方决定如何提示。
     pub fn save(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::to_string_pretty(self)?;
-        crate::atomic_file::write_atomic(path, json.as_bytes())?;
+        if json.len() as u64 > MAX_HISTORY_SNAPSHOT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "serialized UI history is {} bytes; limit is {MAX_HISTORY_SNAPSHOT_BYTES}",
+                    json.len()
+                ),
+            )
+            .into());
+        }
+        crate::persistence_file::write_atomic(path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -91,6 +99,11 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self(path)
         }
     }
@@ -109,7 +122,7 @@ mod tests {
     /// the bound. Over the limit the snapshot must not load; the same shape just
     /// under it must.
     #[test]
-    fn an_oversized_history_file_is_rejected_instead_of_read() {
+    fn oversized_history_is_rejected_on_read_and_write() {
         let root = TestDir::new("oversized");
         let entry = |query: String| crate::search::SearchHistoryEntry {
             query,
@@ -117,20 +130,31 @@ mod tests {
             case_sensitive: false,
             timestamp: "1970-01-01".to_string(),
         };
+        let snapshot = |query_len: usize| HistorySnapshot {
+            version: 1,
+            recent_commands: Vec::new(),
+            search_history: vec![entry("x".repeat(query_len))],
+        };
+
         let write = |path: &std::path::Path, query_len: usize| {
-            HistorySnapshot {
-                version: 1,
-                recent_commands: Vec::new(),
-                search_history: vec![entry("x".repeat(query_len))],
-            }
-            .save(path)
-            .unwrap();
+            snapshot(query_len).save(path).unwrap();
             std::fs::metadata(path).unwrap().len()
         };
 
         let over = root.0.join("over.json");
-        let written = write(&over, MAX_HISTORY_SNAPSHOT_BYTES as usize + 1);
-        assert!(written > MAX_HISTORY_SNAPSHOT_BYTES, "{written}");
+        std::fs::write(&over, b"last-good").unwrap();
+        assert!(snapshot(MAX_HISTORY_SNAPSHOT_BYTES as usize + 1)
+            .save(&over)
+            .is_err());
+        assert_eq!(std::fs::read(&over).unwrap(), b"last-good");
+
+        // A hostile externally-created valid document over the limit is also
+        // rejected by the reader.
+        std::fs::write(
+            &over,
+            serde_json::to_vec(&snapshot(MAX_HISTORY_SNAPSHOT_BYTES as usize + 1)).unwrap(),
+        )
+        .unwrap();
         let loaded = HistorySnapshot::load(&over);
         assert!(loaded.recent_commands.is_empty());
         assert!(
@@ -163,5 +187,34 @@ mod tests {
         let loaded = HistorySnapshot::load(&path);
         assert_eq!(loaded.search_history.len(), 1);
         assert_eq!(loaded.search_history[0].query, "needle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_loader_does_not_follow_a_valid_snapshot_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("symlink");
+        let target = root.0.join("target.json");
+        let link = root.0.join("ui_history.json");
+        let snapshot = HistorySnapshot {
+            version: 1,
+            recent_commands: Vec::new(),
+            search_history: vec![crate::search::SearchHistoryEntry {
+                query: "must-not-load".to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                timestamp: "1970-01-01".to_string(),
+            }],
+        };
+        std::fs::write(&target, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let loaded = HistorySnapshot::load(&link);
+        assert!(loaded.search_history.is_empty());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            serde_json::to_vec(&snapshot).unwrap()
+        );
     }
 }

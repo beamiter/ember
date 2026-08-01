@@ -284,12 +284,73 @@ impl LinkDetector {
 
         all_links
     }
+
+    /// Detect both textual links and explicit OSC 8 hyperlinks. Explicit
+    /// links take precedence over regex matches and carry the resolved target,
+    /// which may intentionally differ from the text displayed in the cells.
+    pub fn detect_links_in_visible_cells_with_wrapping_and_hyperlinks<F>(
+        &self,
+        visible_cells: &[Vec<crate::terminal::TerminalCell>],
+        row_wrapped: &[bool],
+        mut resolve_hyperlink: F,
+    ) -> Vec<Link>
+    where
+        F: FnMut(crate::terminal::HyperlinkId) -> Option<String>,
+    {
+        let mut explicit_links = Vec::new();
+
+        for (line_idx, row) in visible_cells.iter().enumerate() {
+            let mut col = 0;
+            while col < row.len() {
+                let id = row[col].hyperlink_id;
+                if id.is_none() {
+                    col += 1;
+                    continue;
+                }
+
+                let col_start = col;
+                col += 1;
+                while col < row.len() && row[col].hyperlink_id == id {
+                    col += 1;
+                }
+
+                if let Some(target) = resolve_hyperlink(id) {
+                    explicit_links.push(Link {
+                        line: line_idx,
+                        col_start,
+                        col_end: col,
+                        link_type: LinkType::Url,
+                        text: target,
+                    });
+                }
+            }
+        }
+
+        let mut detected =
+            self.detect_links_in_visible_cells_with_wrapping(visible_cells, row_wrapped);
+        detected.retain(|candidate| {
+            !explicit_links.iter().any(|explicit| {
+                explicit.line == candidate.line
+                    && explicit.col_start < candidate.col_end
+                    && candidate.col_start < explicit.col_end
+            })
+        });
+        explicit_links.extend(detected);
+        explicit_links
+    }
 }
 
 /// 打开链接
 pub fn open_link(link: &Link) -> Result<(), Box<dyn std::error::Error>> {
     match link.link_type {
         LinkType::Url => {
+            if !crate::terminal::is_supported_hyperlink_uri(&link.text) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "unsupported or unsafe URL scheme",
+                )
+                .into());
+            }
             open_url(&link.text)?;
         }
         LinkType::FilePath => {
@@ -318,8 +379,11 @@ fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(target_os = "windows")]
 fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    std::process::Command::new("cmd")
-        .args(&["/C", "start", url])
+    // Never route PTY-controlled text through `cmd /C start`: cmd.exe parses
+    // metacharacters inside arguments and would turn a clicked URL into a
+    // command-injection surface. Explorer accepts the URL as one argv value.
+    std::process::Command::new("explorer.exe")
+        .arg(url)
         .spawn()?;
     Ok(())
 }
@@ -366,6 +430,72 @@ fn expand_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::TerminalState;
+
+    #[test]
+    fn osc8_masked_label_resolves_to_real_target() {
+        const TARGET: &str = "https://example.test/real-target";
+        let mut terminal = TerminalState::new(24, 2);
+        terminal.process_input(
+            format!("\x1b]8;id=masked;{TARGET}\x1b\\click here\x1b]8;;\x1b\\").as_bytes(),
+        );
+        let cells = terminal.get_visible_cells();
+        let wrapped = terminal.get_visible_row_wrapped();
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+
+        let links = detector.detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+            &cells,
+            &wrapped,
+            |id| terminal.hyperlink_uri(id).map(str::to_owned),
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, TARGET);
+        assert_eq!(
+            (links[0].line, links[0].col_start, links[0].col_end),
+            (0, 0, 10)
+        );
+    }
+
+    #[test]
+    fn osc8_target_takes_precedence_over_decoy_url_label() {
+        const TARGET: &str = "https://real.example/landing";
+        let mut terminal = TerminalState::new(32, 2);
+        terminal.process_input(
+            format!("\x1b]8;;{TARGET}\x1b\\https://decoy.example\x1b]8;;\x1b\\").as_bytes(),
+        );
+        let cells = terminal.get_visible_cells();
+        let wrapped = terminal.get_visible_row_wrapped();
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+
+        let links = detector.detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+            &cells,
+            &wrapped,
+            |id| terminal.hyperlink_uri(id).map(str::to_owned),
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, TARGET);
+        assert_eq!(links[0].col_end, "https://decoy.example".len());
+    }
+
+    #[test]
+    fn open_link_rejects_dangerous_and_unsupported_url_schemes() {
+        for target in [
+            "javascript:alert(1)",
+            "data:text/html,hello",
+            "shell:touch-dangerous",
+        ] {
+            let link = Link {
+                line: 0,
+                col_start: 0,
+                col_end: 1,
+                link_type: LinkType::Url,
+                text: target.to_string(),
+            };
+            assert!(open_link(&link).is_err(), "accepted unsafe target {target}");
+        }
+    }
 
     #[test]
     fn test_url_detection() {

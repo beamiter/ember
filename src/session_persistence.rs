@@ -124,6 +124,7 @@ impl SessionsSnapshot {
         // can originate in text fields, so writing it verbatim could otherwise
         // create a snapshot that this application rejects on its next launch.
         let mut bounded = self.clone();
+        bounded.version = 4;
         let warnings = bounded.sanitize();
         for warning in warnings {
             eprintln!("[SessionPersistence] WARNING while saving: {warning}");
@@ -140,7 +141,7 @@ impl SessionsSnapshot {
             )
             .into());
         }
-        crate::atomic_file::write_atomic(path, &json)?;
+        crate::persistence_file::write_atomic(path, &json)?;
         eprintln!("[SessionPersistence] Sessions saved to {}", path.display());
         Ok(())
     }
@@ -149,28 +150,35 @@ impl SessionsSnapshot {
     pub fn load_with_warnings(
         path: &std::path::Path,
     ) -> Result<(Self, Vec<String>), Box<dyn std::error::Error>> {
-        if !path.exists() {
-            return Ok((
-                SessionsSnapshot {
-                    version: 4,
-                    sessions: vec![],
-                    active_index: None,
-                    layout: None,
-                    tabs: Vec::new(),
-                    active_tab: None,
-                },
-                Vec::new(),
-            ));
-        }
-
-        // The bounded read (metadata as an early rejection, `take` as the bound
-        // that actually holds when another process grows the file mid-read) is
-        // `jterm_core::snapshot_file`'s now, which additionally proves through
-        // `fstat` on the *open descriptor* that this is a regular file — so a
-        // fifo swapped in at this path cannot block startup, and nothing can
-        // exchange the path between the size check and the read.
-        let content = jterm_core::snapshot_file::read_bounded(path, MAX_SESSION_SNAPSHOT_BYTES)?;
+        // The local boundary deliberately fronts the pinned core revision: it
+        // opens with O_NOFOLLOW/O_NONBLOCK, validates owner/link count through
+        // the descriptor, and keeps the total read under the hard limit.
+        let content = match crate::persistence_file::read_bounded(path, MAX_SESSION_SNAPSHOT_BYTES)
+        {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((
+                    SessionsSnapshot {
+                        version: 4,
+                        sessions: vec![],
+                        active_index: None,
+                        layout: None,
+                        tabs: Vec::new(),
+                        active_tab: None,
+                    },
+                    Vec::new(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut snapshot: SessionsSnapshot = serde_json::from_str(&content)?;
+        if !(1..=4).contains(&snapshot.version) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported session snapshot version {}", snapshot.version),
+            )
+            .into());
+        }
         let warnings = snapshot.sanitize();
         eprintln!(
             "[SessionPersistence] Sessions loaded from {}",
@@ -197,28 +205,35 @@ impl SessionsSnapshot {
 
         let mut repaired_fields = 0usize;
         for session in &mut self.sessions {
-            repaired_fields +=
-                usize::from(truncate_utf8(&mut session.name, MAX_SESSION_NAME_BYTES));
+            repaired_fields += usize::from(sanitize_display_text(
+                &mut session.name,
+                MAX_SESSION_NAME_BYTES,
+            ));
+            if session.name.is_empty() {
+                session.name = "Session".to_string();
+                repaired_fields += 1;
+            }
             if session.tags.len() > MAX_SESSION_TAGS {
                 session.tags.truncate(MAX_SESSION_TAGS);
                 repaired_fields += 1;
             }
             for tag in &mut session.tags {
-                repaired_fields += usize::from(truncate_utf8(tag, MAX_SESSION_TAG_BYTES));
+                repaired_fields += usize::from(sanitize_display_text(tag, MAX_SESSION_TAG_BYTES));
             }
             if session
                 .cwd
-                .as_mut()
-                .is_some_and(|cwd| truncate_utf8(cwd, MAX_SESSION_CWD_BYTES))
+                .as_ref()
+                .is_some_and(|cwd| cwd.len() > MAX_SESSION_CWD_BYTES || cwd.as_bytes().contains(&0))
             {
+                session.cwd = None;
                 repaired_fields += 1;
             }
-            if session
-                .custom_name
-                .as_mut()
-                .is_some_and(|name| truncate_utf8(name, MAX_SESSION_NAME_BYTES))
-            {
-                repaired_fields += 1;
+            if let Some(name) = session.custom_name.as_mut() {
+                repaired_fields += usize::from(sanitize_display_text(name, MAX_SESSION_NAME_BYTES));
+                if name.is_empty() {
+                    session.custom_name = None;
+                    repaired_fields += 1;
+                }
             }
             if session
                 .session_id
@@ -397,16 +412,29 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) -> bool {
     true
 }
 
+fn is_bidi_display_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn sanitize_display_text(value: &mut String, max_bytes: usize) -> bool {
+    let original = value.clone();
+    value.retain(|ch| !ch.is_control() && !is_bidi_display_control(ch));
+    *value = value.trim().to_string();
+    truncate_utf8(value, max_bytes);
+    *value != original
+}
+
 pub fn bounded_session_name(value: &str) -> String {
-    let value = value.trim();
-    if value.len() <= MAX_SESSION_NAME_BYTES {
-        return value.to_string();
-    }
-    let mut end = MAX_SESSION_NAME_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
+    let mut value = value.to_string();
+    sanitize_display_text(&mut value, MAX_SESSION_NAME_BYTES);
+    value
 }
 
 fn validate_instance_lock_file(file: &std::fs::File) -> std::io::Result<()> {
@@ -420,12 +448,22 @@ fn validate_instance_lock_file(file: &std::fs::File) -> std::io::Result<()> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.nlink() != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "instance lock must have exactly one hard link",
             ));
+        }
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "instance lock is not owned by the current user",
+            ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
 
@@ -480,9 +518,7 @@ pub(crate) fn inherited_instance_lock_fd() -> libc::c_int {
 fn try_acquire_instance_lock_at(
     lock_path: &std::path::Path,
 ) -> std::io::Result<Option<std::fs::File>> {
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    crate::persistence_file::ensure_parent(lock_path)?;
 
     // Do not truncate before flock: a losing second instance must leave the
     // lock owner's diagnostic PID intact.
@@ -493,7 +529,7 @@ fn try_acquire_instance_lock_at(
         use std::os::unix::fs::OpenOptionsExt;
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let mut file = options.open(lock_path)?;
     validate_instance_lock_file(&file)?;
@@ -571,12 +607,7 @@ pub fn try_acquire_instance_lock() -> Option<InstanceLock> {
 pub fn ensure_session_history_dir(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    Ok(())
+    crate::persistence_file::ensure_parent(path).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -585,6 +616,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_LOCK_TEST: AtomicU64 = AtomicU64::new(0);
+
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     struct TestDir(std::path::PathBuf);
 
@@ -596,6 +636,11 @@ mod tests {
                 std::process::id()
             ));
             std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self(path)
         }
     }
@@ -826,10 +871,7 @@ mod tests {
                 .tags
                 .iter()
                 .all(|tag| tag.len() <= MAX_SESSION_TAG_BYTES));
-            assert!(session
-                .cwd
-                .as_ref()
-                .is_some_and(|cwd| cwd.len() <= MAX_SESSION_CWD_BYTES));
+            assert!(session.cwd.is_none());
             assert!(session.session_id.is_none());
             assert!(session
                 .custom_name
@@ -897,6 +939,32 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_save_preserves_a_shared_parent_and_refuses_a_linked_parent() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("configured-parent");
+        let shared = root.0.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let snapshot = SessionsSnapshot::from_snapshots(Vec::new(), None, Vec::new(), None);
+
+        snapshot.save(&shared.join("sessions.json")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let victim = root.0.join("victim");
+        let linked_parent = root.0.join("linked-parent");
+        std::fs::create_dir(&victim).unwrap();
+        symlink(&victim, &linked_parent).unwrap();
+        assert!(ensure_session_history_dir(&linked_parent.join("sessions.json")).is_err());
+        assert!(snapshot.save(&linked_parent.join("sessions.json")).is_err());
+        assert!(!victim.join("sessions.json").exists());
+    }
+
     #[test]
     fn load_with_warnings_sanitizes_the_real_file_path() {
         let root = TestDir::new("bounded-load-integration");
@@ -914,7 +982,7 @@ mod tests {
             Vec::new(),
             None,
         );
-        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        write_private(&path, serde_json::to_vec(&snapshot).unwrap());
 
         let (loaded, warnings) = SessionsSnapshot::load_with_warnings(&path).unwrap();
 
@@ -937,13 +1005,34 @@ mod tests {
         assert_eq!(bounded, "雪".repeat(85));
         assert_eq!(bounded.len(), 255);
         assert_eq!(bounded_session_name("  short name  "), "short name");
+        assert_eq!(
+            bounded_session_name("safe\n\u{202e}spoof\u{7f}"),
+            "safespoof"
+        );
+    }
+
+    #[test]
+    fn future_snapshot_versions_are_rejected_before_restore() {
+        let root = TestDir::new("future-version");
+        let path = root.0.join("sessions.json");
+        write_private(
+            &path,
+            br#"{"version":99,"sessions":[{"name":"future","tags":[]}]}"#,
+        );
+
+        let error = SessionsSnapshot::load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported session snapshot version 99"),
+            "{error}"
+        );
+        assert!(path.exists());
     }
 
     #[test]
     fn oversized_snapshot_is_rejected_before_reading_it() {
         let root = TestDir::new("oversized-snapshot");
         let path = root.0.join("sessions.json");
-        std::fs::write(&path, vec![b' '; MAX_SESSION_SNAPSHOT_BYTES as usize + 1]).unwrap();
+        write_private(&path, vec![b' '; MAX_SESSION_SNAPSHOT_BYTES as usize + 1]);
 
         let error = SessionsSnapshot::load(&path).unwrap_err().to_string();
         assert!(error.contains("limit"), "{error}");
@@ -958,7 +1047,7 @@ mod tests {
         let root = TestDir::new("corrupt-snapshot");
         let path = root.0.join("sessions.json");
         let original = b"{ definitely not valid JSON";
-        std::fs::write(&path, original).unwrap();
+        write_private(&path, original);
 
         assert!(SessionsSnapshot::load(&path).is_err());
         let backup = jterm_core::snapshot_file::quarantine_corrupt(&path).unwrap();
@@ -985,11 +1074,33 @@ mod tests {
         assert!(error.contains("not a regular file"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_hardlink_snapshots_are_not_restored() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("linked-snapshot");
+        let target = root.0.join("target.json");
+        let symlink_path = root.0.join("symlink.json");
+        let hardlink_path = root.0.join("hardlink.json");
+        let snapshot = SessionsSnapshot::from_snapshots(Vec::new(), None, Vec::new(), None);
+        write_private(&target, serde_json::to_vec(&snapshot).unwrap());
+
+        symlink(&target, &symlink_path).unwrap();
+        assert!(SessionsSnapshot::load(&symlink_path).is_err());
+
+        std::fs::hard_link(&target, &hardlink_path).unwrap();
+        let error = SessionsSnapshot::load(&hardlink_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hard link"), "{error}");
+    }
+
     #[test]
     fn contending_instance_does_not_truncate_owner_pid() {
         let root = TestDir::new("contending");
         let path = root.0.join("instance.lock");
-        std::fs::write(&path, "stale-and-long-owner-value").unwrap();
+        write_private(&path, "stale-and-long-owner-value");
 
         let owner = try_acquire_instance_lock_at(&path)
             .unwrap()
@@ -1117,7 +1228,7 @@ mod tests {
         let root = TestDir::new("symlink");
         let target = root.0.join("do-not-touch");
         let lock_path = root.0.join("instance.lock");
-        std::fs::write(&target, "sentinel contents").unwrap();
+        write_private(&target, "sentinel contents");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
         symlink(&target, &lock_path).unwrap();
 
@@ -1138,7 +1249,7 @@ mod tests {
         let root = TestDir::new("hard-link");
         let target = root.0.join("do-not-touch");
         let lock_path = root.0.join("instance.lock");
-        std::fs::write(&target, "sentinel contents").unwrap();
+        write_private(&target, "sentinel contents");
         std::fs::hard_link(&target, &lock_path).unwrap();
 
         assert!(try_acquire_instance_lock_at(&lock_path).is_err());
@@ -1146,5 +1257,21 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "sentinel contents"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+
+        let root = TestDir::new("fifo");
+        let lock_path = root.0.join("instance.lock");
+        let encoded = CString::new(lock_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: encoded is a live NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        assert!(try_acquire_instance_lock_at(&lock_path).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

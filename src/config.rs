@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::persistence_file::FileRevision;
+
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
 /// Upper bound for `config.toml`. A hand-written terminal config is a few
@@ -12,6 +14,8 @@ pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// error pointing at the wrong thing. Rejection sets `load_error`, which is
 /// what keeps the file from being overwritten by the next font zoom.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_CONFIG_NAME_BYTES: usize = 256;
+const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
 
 // Nerd Font priority list
 const NERD_FONT_CANDIDATES: &[&str] = &[
@@ -238,6 +242,12 @@ pub struct Config {
     /// "Reset to defaults", which replaces the whole struct.
     #[serde(skip)]
     pub load_error: Option<String>,
+
+    /// Exact bytes this in-memory value was loaded or saved against. `None`
+    /// is reserved for an explicit default/reset value (force-write) or a
+    /// path that could not be inspected at all.
+    #[serde(skip)]
+    pub(crate) revision: Option<FileRevision>,
 }
 
 fn default_true() -> bool {
@@ -441,6 +451,7 @@ impl Default for Config {
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: true,
             load_error: None,
+            revision: None,
         }
     }
 }
@@ -448,62 +459,110 @@ impl Default for Config {
 /// Read a config file under [`MAX_CONFIG_BYTES`]. Separate from
 /// [`Config::load`] only because `load` resolves the path from the environment
 /// and cannot be pointed at a fixture.
+#[cfg(test)]
 pub(crate) fn read_config_file(path: &std::path::Path) -> std::io::Result<String> {
-    jterm_core::snapshot_file::read_bounded(path, MAX_CONFIG_BYTES)
+    crate::persistence_file::read_bounded(path, MAX_CONFIG_BYTES)
 }
 
 impl Config {
     pub fn load() -> Self {
-        // 记住失败原因:文件仍在磁盘上,拒绝回写才能保住用户手写的内容。
-        let mut load_error = None;
-        if let Ok(config_path) = Self::config_path() {
-            if config_path.exists() {
-                match read_config_file(&config_path) {
-                    Ok(content) => match toml::from_str::<Config>(&content) {
-                        Ok(mut config) => {
-                            for warning in config.normalize() {
-                                eprintln!("[Config] WARNING: {}", warning);
-                            }
-                            eprintln!("[Config] Loaded from {}", config_path.display());
-                            eprintln!("[Config] Font: {}", config.font_family);
-                            return config;
-                        }
-                        Err(e) => {
-                            // 显示具体的解析错误(含行列/原因),便于用户修正配置;
-                            // 否则会静默回退到默认值,用户的设置被忽略却毫不知情。
-                            eprintln!(
-                                "[Config] WARNING: failed to parse {}: {}",
-                                config_path.display(),
-                                e
-                            );
-                            eprintln!(
-                                "[Config] WARNING: your settings are ignored, using defaults. \
-                                 Fix the file above to apply them."
-                            );
-                            load_error = Some(format!("{}: {}", config_path.display(), e));
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!(
-                            "[Config] WARNING: failed to read {}: {}",
-                            config_path.display(),
-                            e
-                        );
-                        load_error = Some(format!("{}: {}", config_path.display(), e));
-                    }
-                }
+        let config_path = match Self::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                return Self {
+                    load_error: Some(format!("cannot locate config: {error}")),
+                    ..Self::default()
+                };
+            }
+        };
+        let revision = match crate::persistence_file::read_revision(&config_path, MAX_CONFIG_BYTES)
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                eprintln!(
+                    "[Config] WARNING: failed to read {}: {}",
+                    config_path.display(),
+                    error
+                );
+                return Self {
+                    load_error: Some(format!("{}: {error}", config_path.display())),
+                    ..Self::default()
+                };
+            }
+        };
+        if revision == FileRevision::Missing {
+            eprintln!("[Config] Using default configuration");
+            let config = Self {
+                revision: Some(revision),
+                ..Self::default()
+            };
+            eprintln!("[Config] Font: {}", config.font_family);
+            return config;
+        }
+        match Self::from_revision(&config_path, &revision) {
+            Ok(config) => {
+                eprintln!("[Config] Loaded from {}", config_path.display());
+                eprintln!("[Config] Font: {}", config.font_family);
+                config
+            }
+            Err(error) => {
+                eprintln!("[Config] WARNING: {error}");
+                eprintln!(
+                    "[Config] WARNING: your settings are ignored, using defaults. \
+                     Fix the file above to apply them."
+                );
+                let config = Self {
+                    load_error: Some(error),
+                    revision: Some(revision),
+                    ..Self::default()
+                };
+                eprintln!("[Config] Using default configuration");
+                eprintln!("[Config] Font: {}", config.font_family);
+                config
             }
         }
-        eprintln!("[Config] Using default configuration");
-        let config = Self {
-            load_error,
-            ..Self::default()
-        };
-        eprintln!("[Config] Font: {}", config.font_family);
-        config
     }
 
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn from_revision(
+        path: &std::path::Path,
+        revision: &FileRevision,
+    ) -> Result<Self, String> {
+        let bytes = revision
+            .bytes()
+            .ok_or_else(|| format!("cannot parse {}: file does not exist", path.display()))?;
+        let content = std::str::from_utf8(bytes)
+            .map_err(|error| format!("cannot read {} as UTF-8: {error}", path.display()))?;
+        let mut config = toml::from_str::<Config>(content)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        for warning in config.normalize() {
+            eprintln!("[Config] WARNING: {warning}");
+        }
+        config.revision = Some(revision.clone());
+        config.load_error = None;
+        Ok(config)
+    }
+
+    #[allow(dead_code)] // used by the binary's hot-reload module, not the lib target
+    pub(crate) fn current_revision() -> Result<FileRevision, String> {
+        let path = Self::config_path().map_err(|error| error.to_string())?;
+        crate::persistence_file::read_revision(&path, MAX_CONFIG_BYTES)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))
+    }
+
+    #[allow(dead_code)] // used by the binary's hot-reload module, not the lib target
+    pub(crate) fn observed_revision(&self) -> Option<&FileRevision> {
+        self.revision.as_ref()
+    }
+
+    pub fn save(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let config_path = Self::config_path()?;
+        self.save_path(&config_path)
+    }
+
+    fn save_path(
+        &mut self,
+        config_path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // 拒写保护:`self` 此刻是内建默认值,一次字号缩放或退出时的自动保存
         // 就会把无法解析的用户配置整体覆盖掉。见 `load_error` 的说明。
         if let Some(error) = &self.load_error {
@@ -513,7 +572,6 @@ impl Config {
             )
             .into());
         }
-        let config_path = Self::config_path()?;
         // Persist only values that the runtime can safely consume. This also
         // protects callers outside the settings panel (or future migrations)
         // from writing NaN/zero dimensions that make the next startup fail.
@@ -522,7 +580,50 @@ impl Config {
             eprintln!("[Config] WARNING while saving: {}", warning);
         }
         let content = toml::to_string_pretty(&normalized)?;
-        crate::atomic_file::write_atomic(&config_path, content.as_bytes())?;
+        if content.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "serialized config is {} bytes; limit is {MAX_CONFIG_BYTES}",
+                    content.len()
+                ),
+            )
+            .into());
+        }
+        let intended = FileRevision::from_bytes(content.as_bytes());
+        let write_result = match self.revision.as_ref() {
+            Some(expected) => crate::persistence_file::write_atomic_if_unchanged(
+                config_path,
+                content.as_bytes(),
+                expected,
+                MAX_CONFIG_BYTES,
+            ),
+            None => crate::persistence_file::write_atomic(config_path, content.as_bytes())
+                .map(|()| intended.clone()),
+        };
+        match write_result {
+            Ok(revision) => {
+                normalized.revision = Some(revision);
+                normalized.load_error = None;
+                *self = normalized;
+            }
+            Err(error) => {
+                // A rename is visible before the final directory fsync. If
+                // that boundary alone failed, adopt the exact published bytes
+                // in memory while still reporting the durability error.
+                let current =
+                    crate::persistence_file::read_revision(config_path, MAX_CONFIG_BYTES).ok();
+                if current.as_ref() == Some(&intended) {
+                    normalized.revision = Some(intended);
+                    normalized.load_error = None;
+                    *self = normalized;
+                } else if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    self.revision = current;
+                    self.load_error = Some(format!("{}: {error}", config_path.display()));
+                }
+                return Err(error.into());
+            }
+        }
         eprintln!("[Config] Saved to {}", config_path.display());
         Ok(())
     }
@@ -549,13 +650,6 @@ impl Config {
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
         Ok(config_dir.join("jterm2").join("config.toml"))
-    }
-
-    pub fn config_mtime() -> Option<std::time::SystemTime> {
-        Self::config_path()
-            .ok()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok())
     }
 
     pub fn get_font_family(&self) -> &str {
@@ -660,6 +754,92 @@ impl Config {
             self.ui_scale = Some(normalized);
         }
 
+        let old_ai_max_tokens = self.ai_max_tokens;
+        self.ai_max_tokens = self.ai_max_tokens.clamp(64, 32_768);
+        if self.ai_max_tokens != old_ai_max_tokens {
+            warnings.push(format!(
+                "ai_max_tokens={old_ai_max_tokens} is outside 64..=32768; using {}",
+                self.ai_max_tokens
+            ));
+        }
+        if self.ai_temperature.is_some_and(|temperature| {
+            !temperature.is_finite() || !(0.0..=2.0).contains(&temperature)
+        }) {
+            self.ai_temperature = None;
+            warnings.push("ai_temperature is invalid; using the provider default".to_string());
+        }
+        let old_agent_max_turns = self.agent_max_turns;
+        self.agent_max_turns = self.agent_max_turns.clamp(1, 100);
+        if self.agent_max_turns != old_agent_max_turns {
+            warnings.push(format!(
+                "agent_max_turns={old_agent_max_turns} is outside 1..=100; using {}",
+                self.agent_max_turns
+            ));
+        }
+        if normalize_required_text(
+            &mut self.ai_provider,
+            MAX_CONFIG_NAME_BYTES,
+            default_ai_provider,
+        ) {
+            warnings.push(
+                "ai_provider is empty, oversized, or contains controls; using default".into(),
+            );
+        }
+        if normalize_required_text(
+            &mut self.ai_base_url,
+            MAX_CONFIG_VALUE_BYTES,
+            default_ai_base_url,
+        ) {
+            warnings.push(
+                "ai_base_url is empty, oversized, or contains controls; using default".into(),
+            );
+        }
+        if normalize_required_text(&mut self.ai_model, MAX_CONFIG_NAME_BYTES, default_ai_model) {
+            warnings
+                .push("ai_model is empty, oversized, or contains controls; using default".into());
+        }
+        if normalize_optional_text(&mut self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES) {
+            warnings.push(
+                "ai_api_key_file is empty, oversized, or contains controls; ignoring it".into(),
+            );
+        }
+        if normalize_required_text(
+            &mut self.font_family,
+            MAX_CONFIG_NAME_BYTES,
+            default_font_family,
+        ) {
+            warnings.push(
+                "font_family is empty, oversized, or contains controls; using default".into(),
+            );
+        }
+        if normalize_required_text(&mut self.theme, MAX_CONFIG_NAME_BYTES, default_theme) {
+            warnings.push("theme is empty, oversized, or contains controls; using default".into());
+        }
+        if normalize_optional_text(&mut self.shell, MAX_CONFIG_VALUE_BYTES) {
+            warnings.push(
+                "shell is empty, oversized, or contains controls; using automatic detection".into(),
+            );
+        }
+        if self
+            .session_history_file
+            .as_ref()
+            .is_some_and(|path| !valid_config_path(path))
+        {
+            self.session_history_file = None;
+            warnings.push(
+                "session_history_file is empty, oversized, or contains controls; using default"
+                    .into(),
+            );
+        }
+        let normalized_update_check =
+            jterm_core::jsh_install::UpdateCheck::parse(&self.jsh_update_check)
+                .as_str()
+                .to_string();
+        if normalized_update_check != self.jsh_update_check {
+            self.jsh_update_check = normalized_update_check;
+            warnings.push("jsh_update_check was normalized to a supported value".into());
+        }
+
         warnings
     }
 
@@ -672,9 +852,50 @@ impl Config {
     }
 }
 
+fn valid_config_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn normalize_required_text(value: &mut String, max_bytes: usize, fallback: fn() -> String) -> bool {
+    let normalized = value.trim().to_string();
+    if valid_config_text(&normalized, max_bytes) {
+        let changed = *value != normalized;
+        *value = normalized;
+        changed
+    } else {
+        *value = fallback();
+        true
+    }
+}
+
+fn normalize_optional_text(value: &mut Option<String>, max_bytes: usize) -> bool {
+    let original = value.clone();
+    *value = value
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| valid_config_text(value, max_bytes));
+    *value != original
+}
+
+fn valid_config_path(path: &std::path::Path) -> bool {
+    let value = path.to_string_lossy();
+    !value.is_empty()
+        && value.len() <= MAX_CONFIG_VALUE_BYTES
+        && !value.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     #[test]
     fn normalize_repairs_unsafe_hand_edited_values() {
@@ -690,6 +911,9 @@ mod tests {
             scroll_speed: 0,
             ui_scale: Some(f32::INFINITY),
             shell: Some("   ".to_string()),
+            ai_max_tokens: u32::MAX,
+            ai_temperature: Some(f32::INFINITY),
+            agent_max_turns: u32::MAX,
             ..Config::default()
         };
 
@@ -707,6 +931,41 @@ mod tests {
         assert_eq!(config.scroll_speed, 1);
         assert_eq!(config.ui_scale, Some(1.0));
         assert_eq!(config.shell, None);
+        assert_eq!(config.ai_max_tokens, 32_768);
+        assert_eq!(config.ai_temperature, None);
+        assert_eq!(config.agent_max_turns, 100);
+    }
+
+    #[test]
+    fn normalize_drops_oversized_or_control_bearing_config_strings() {
+        let mut config = Config {
+            ai_provider: "p".repeat(MAX_CONFIG_NAME_BYTES + 1),
+            ai_base_url: format!(
+                "https://example.test/{}",
+                "x".repeat(MAX_CONFIG_VALUE_BYTES)
+            ),
+            ai_model: "model\nspoof".to_string(),
+            ai_api_key_file: Some("/tmp/key\0suffix".to_string()),
+            font_family: "f".repeat(MAX_CONFIG_NAME_BYTES + 1),
+            theme: "bad\ntheme".to_string(),
+            shell: Some("/bin/sh\0--arg".to_string()),
+            session_history_file: Some(PathBuf::from("x".repeat(MAX_CONFIG_VALUE_BYTES + 1))),
+            jsh_update_check: "unexpected".to_string(),
+            ..Config::default()
+        };
+
+        let warnings = config.normalize();
+
+        assert!(!warnings.is_empty());
+        assert_eq!(config.ai_provider, default_ai_provider());
+        assert_eq!(config.ai_base_url, default_ai_base_url());
+        assert_eq!(config.ai_model, default_ai_model());
+        assert_eq!(config.ai_api_key_file, None);
+        assert_eq!(config.font_family, default_font_family());
+        assert_eq!(config.theme, default_theme());
+        assert_eq!(config.shell, None);
+        assert_eq!(config.session_history_file, None);
+        assert_eq!(config.jsh_update_check, "daily");
     }
 
     #[test]
@@ -724,7 +983,7 @@ mod tests {
 
     #[test]
     fn config_that_failed_to_load_refuses_to_be_overwritten() {
-        let broken = Config {
+        let mut broken = Config {
             load_error: Some("/home/u/.config/jterm2/config.toml: expected `=`".to_string()),
             ..Config::default()
         };
@@ -745,6 +1004,67 @@ mod tests {
         assert!(repaired.load_error.is_none());
     }
 
+    #[test]
+    fn exact_revisions_allow_only_one_concurrent_config_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "jterm2-config-cas-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("config.toml");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for font_size in [17.0, 29.0] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                let mut config = Config {
+                    font_size,
+                    revision: Some(FileRevision::Missing),
+                    ..Config::default()
+                };
+                barrier.wait();
+                (
+                    font_size,
+                    config.save_path(&path).map_err(|error| error.to_string()),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, result)| result.is_err())
+                .count(),
+            1
+        );
+        let winner = outcomes
+            .iter()
+            .find_map(|(font_size, result)| result.as_ref().ok().map(|()| *font_size))
+            .unwrap();
+        let revision = crate::persistence_file::read_revision(&path, MAX_CONFIG_BYTES).unwrap();
+        assert_eq!(
+            Config::from_revision(&path, &revision).unwrap().font_size,
+            winner
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// An oversized config is a read error, which sets `load_error` and so
     /// makes `save` refuse: the user's file survives instead of being replaced
     /// by defaults on the next font zoom.
@@ -754,14 +1074,33 @@ mod tests {
             "jterm2-config-oversized-{}.toml",
             std::process::id()
         ));
-        std::fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        write_private(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]);
 
         let error = read_config_file(&path).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
 
-        std::fs::write(&path, b"font_size = 15.0").unwrap();
+        write_private(&path, b"font_size = 15.0");
         assert_eq!(read_config_file(&path).unwrap(), "font_size = 15.0");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_reader_never_follows_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("jterm2-config-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("target.toml");
+        let link = root.join("config.toml");
+        write_private(&target, b"font_size = 15.0");
+        symlink(&target, &link).unwrap();
+
+        assert!(read_config_file(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"font_size = 15.0");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

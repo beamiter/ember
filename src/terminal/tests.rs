@@ -1,6 +1,7 @@
+use super::hyperlink::{MAX_OSC8_PARAMS_BYTES, MAX_OSC8_URI_BYTES};
 use super::{
-    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, ScrollbackLine,
-    TerminalCell, TerminalState, UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES,
+    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, HyperlinkId,
+    ScrollbackLine, TerminalCell, TerminalState, UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES,
     MAX_COMPLETED_COMMAND_OUTPUT_BYTES, MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES,
     MAX_PENDING_ESCAPE,
 };
@@ -8,6 +9,110 @@ use super::{
 // `a=t` is the protocol default. Omitting it also guards against regressing to
 // heuristic routing based on searching the body for an `a=` substring.
 const KITTY_ONE_PIXEL_RGBA_APC: &[u8] = b"\x1b_Gi=41,f=32,s=1,v=1;/wAA/w==\x1b\\";
+
+#[test]
+fn osc8_hyperlink_survives_every_input_batch_boundary() {
+    const TARGET: &str = "https://example.test/real-target";
+    const LABEL: &str = "masked label";
+    let opening = format!("\x1b]8;id=fragmented;{TARGET}\x1b\\");
+
+    for split_at in 1..opening.len() {
+        let mut terminal = TerminalState::new(32, 2);
+        terminal.process_input(&opening.as_bytes()[..split_at]);
+        terminal.process_input(&opening.as_bytes()[split_at..]);
+        terminal.process_input(LABEL.as_bytes());
+        terminal.process_input(b"\x1b]8;;\x1b\\X");
+
+        let id = terminal.grid[0][0].hyperlink_id;
+        assert!(!id.is_none(), "OSC 8 was lost at input split {split_at}");
+        assert_eq!(terminal.hyperlink_uri(id), Some(TARGET));
+        assert!(terminal.grid[0][..LABEL.len()]
+            .iter()
+            .all(|cell| cell.hyperlink_id == id));
+        assert_eq!(terminal.grid[0][LABEL.len()].character, 'X');
+        assert_eq!(
+            terminal.grid[0][LABEL.len()].hyperlink_id,
+            HyperlinkId::NONE
+        );
+    }
+}
+
+#[test]
+fn osc8_rejects_oversized_control_and_unsafe_targets() {
+    fn rendered_id(params: &str, target: &str) -> HyperlinkId {
+        let mut terminal = TerminalState::new(4, 1);
+        let sequence = format!("\x1b]8;{params};{target}\x1b\\X");
+        terminal.process_input(sequence.as_bytes());
+        terminal.grid[0][0].hyperlink_id
+    }
+
+    assert!(rendered_id(&"p".repeat(MAX_OSC8_PARAMS_BYTES + 1), "https://safe.test").is_none());
+    assert!(rendered_id("id=bad\u{1}", "https://safe.test").is_none());
+    assert!(rendered_id(
+        "",
+        &format!("https://safe.test/{}", "x".repeat(MAX_OSC8_URI_BYTES))
+    )
+    .is_none());
+    assert!(rendered_id("", "https://safe.test/bad\u{7f}").is_none());
+    assert!(rendered_id("", "javascript:alert(1)").is_none());
+    assert!(rendered_id("", "data:text/html,hello").is_none());
+    assert!(rendered_id("", "unknown-scheme:payload").is_none());
+
+    // A rejected opening must not leave the preceding safe target active.
+    let mut terminal = TerminalState::new(4, 1);
+    terminal.process_input(b"\x1b]8;;https://safe.test\x1b\\A\x1b]8;;javascript:alert(1)\x1b\\B");
+    assert!(!terminal.grid[0][0].hyperlink_id.is_none());
+    assert!(terminal.grid[0][1].hyperlink_id.is_none());
+}
+
+#[test]
+fn osc8_link_ids_survive_scrollback_reflow_and_selection() {
+    const TARGET: &str = "https://example.test/history";
+    let mut terminal = TerminalState::new(5, 2);
+    terminal.process_input(format!("\x1b]8;;{TARGET}\x1b\\abcdefghijk\x1b]8;;\x1b\\").as_bytes());
+
+    assert!(!terminal.scrollback.is_empty());
+    let archived = terminal.scrollback[0].decompress();
+    let id = archived[0].hyperlink_id;
+    assert!(!id.is_none());
+    assert_eq!(terminal.hyperlink_uri(id), Some(TARGET));
+    assert!(archived[..5].iter().all(|cell| cell.hyperlink_id == id));
+
+    let historical: Vec<ScrollbackLine> = terminal.scrollback.iter().cloned().collect();
+    let reflowed = TerminalState::reflow_lines(&historical, 3, &TerminalCell::default());
+    let reflowed_linked: Vec<_> = reflowed
+        .iter()
+        .flat_map(ScrollbackLine::decompress)
+        .filter(|cell| cell.character != ' ')
+        .collect();
+    assert_eq!(reflowed_linked.len(), 5);
+    assert!(reflowed_linked.iter().all(|cell| cell.hyperlink_id == id));
+
+    terminal.on_resize(3, 2);
+    terminal.scroll(1);
+    let visible = terminal.get_visible_cells();
+    assert!(visible.iter().flatten().any(|cell| cell.hyperlink_id == id));
+
+    // Selection copies the masked text and leaves the cell metadata intact.
+    terminal.scroll(-1);
+    terminal.start_selection((0, 0));
+    terminal.update_selection((0, 2));
+    let before = terminal.grid[0][0].hyperlink_id;
+    assert_eq!(terminal.copy_selection().as_deref(), Some("fgh"));
+    assert_eq!(terminal.grid[0][0].hyperlink_id, before);
+    assert_eq!(terminal.hyperlink_uri(before), Some(TARGET));
+}
+
+#[test]
+fn osc8_marks_both_cells_of_a_wide_masked_label() {
+    let mut terminal = TerminalState::new(4, 1);
+    terminal.process_input("\x1b]8;;https://example.test/wide\x1b\\点\x1b]8;;\x1b\\".as_bytes());
+
+    let id = terminal.grid[0][0].hyperlink_id;
+    assert!(!id.is_none());
+    assert_eq!(terminal.grid[0][1].hyperlink_id, id);
+    assert!(terminal.grid[0][1].flags.wide_continuation());
+}
 
 #[test]
 fn kitty_graphics_routes_only_standard_g_apc() {
@@ -587,6 +692,10 @@ fn assert_cell_grids_equal(
             assert_eq!(
                 actual_cell.flags, expected_cell.flags,
                 "{context}: flags at ({row_index}, {column_index})"
+            );
+            assert_eq!(
+                actual_cell.hyperlink_id, expected_cell.hyperlink_id,
+                "{context}: hyperlink at ({row_index}, {column_index})"
             );
         }
     }
@@ -1477,6 +1586,52 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
     assert_eq!(completed[0].output, "hello\n");
     assert!(completed[0].output_available);
     assert!(terminal.take_completed_command_outputs().is_empty());
+}
+
+#[test]
+fn agent_generation_is_local_one_shot_and_requires_a_fresh_empty_prompt() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    terminal
+        .arm_agent_execution(41, "ls -la")
+        .expect("fresh empty prompt can be armed");
+    terminal.process_input(b"ls -la\r\n\x1b]133;C;cmdline_url=ls%20-la\x07ok\r\n");
+    terminal.process_input(b"\x1b]133;D;0\x07");
+
+    let completed = terminal.take_completed_command_outputs();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].command.as_deref(), Some("ls -la"));
+    assert_eq!(completed[0].agent_generation, Some(41));
+
+    // A later identical command does not inherit the consumed generation.
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07ls -la\r\n");
+    terminal.process_input(b"\x1b]133;C;cmdline_url=ls%20-la\x07ok\r\n\x1b]133;D;0\x07");
+    assert_eq!(
+        terminal.take_completed_command_outputs()[0].agent_generation,
+        None
+    );
+}
+
+#[test]
+fn agent_arm_rejects_input_before_pty_echo() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    terminal.note_user_input(b"already queued");
+
+    assert!(terminal.arm_agent_execution(1, "echo safe").is_err());
+}
+
+#[test]
+fn agent_arm_fails_closed_when_the_prompt_anchor_is_unavailable() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    terminal
+        .command_records
+        .back_mut()
+        .expect("editing record")
+        .command_start = None;
+
+    assert!(terminal.arm_agent_execution(1, "echo safe").is_err());
 }
 
 #[test]

@@ -535,7 +535,9 @@ impl TerminalApp {
             if mouse_released {
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible {
-                    self.sidebar.refresh();
+                    if let Some(error) = self.sidebar.refresh() {
+                        self.set_status(format!("文件树刷新失败：{error}"));
+                    }
                 }
             }
         }
@@ -915,7 +917,9 @@ impl TerminalApp {
                 if mouse_released {
                     self.sidebar.visible = !self.sidebar.visible;
                     if self.sidebar.visible {
-                        self.sidebar.refresh();
+                        if let Some(error) = self.sidebar.refresh() {
+                            self.set_status(format!("文件树刷新失败：{error}"));
+                        }
                     }
                 }
             }

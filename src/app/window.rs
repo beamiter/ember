@@ -84,9 +84,8 @@ impl TerminalApp {
                     std::time::Duration::from_secs(6),
                 );
             } else {
-                // Record our own write immediately so the hot-reload watcher
-                // does not treat it as an external edit in the same frame.
-                self.config_last_mtime = config::Config::config_mtime();
+                // Config::save adopts the exact bytes it published, so the
+                // hot-reload watcher recognizes this generation immediately.
             }
         }
     }
@@ -162,51 +161,75 @@ impl TerminalApp {
         }
         self.config_last_check = now;
 
-        // Don't reload if we just saved (avoid feedback loop)
+        let disk_revision = match config::Config::current_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                eprintln!("[Config] Hot-reload read error: {error}");
+                self.set_status_for(
+                    format!("配置暂时无法读取，已保留当前值：{error}"),
+                    std::time::Duration::from_secs(6),
+                );
+                return;
+            }
+        };
+        if self.config.observed_revision() == Some(&disk_revision) {
+            return;
+        }
+
+        // A settings panel owns a stable editing surface. If the user saves
+        // it after an external edit, the exact-revision CAS below rejects the
+        // stale write instead of silently merging or overwriting fields.
+        if self.config_panel.is_open {
+            return;
+        }
+
         if self.config_save_pending {
+            self.config_save_pending = false;
+            self.config.revision = Some(disk_revision);
+            self.config.load_error = Some(
+                "config changed outside this window while local edits were pending; reset or edit the file again before saving"
+                    .to_string(),
+            );
+            self.set_status_for(
+                "配置在本地修改待保存时被外部更改；已停止自动写入",
+                std::time::Duration::from_secs(8),
+            );
             return;
         }
 
-        let current_mtime = config::Config::config_mtime();
-        if current_mtime == self.config_last_mtime {
-            return;
-        }
-        self.config_last_mtime = current_mtime;
-
-        if let Ok(config_path) = config::Config::config_path() {
-            // Same bounded reader as the startup load: hot reload reads the
-            // very same file and must not be the unbounded way in.
-            if let Ok(content) = config::read_config_file(&config_path) {
-                match toml::from_str::<config::Config>(&content) {
-                    Ok(mut new_config) => {
-                        let mut notes = new_config.normalize();
-                        notes.extend(self.apply_hot_reload(new_config, ctx));
-                        eprintln!("[Config] Hot-reloaded from {}", config_path.display());
-                        if notes.is_empty() {
-                            self.set_status("配置已热重载");
-                        } else {
-                            for note in &notes {
-                                eprintln!("[Config] WARNING: {}", note);
-                            }
-                            self.set_status_for(
-                                format!("配置已重载（{} 项已调整）", notes.len()),
-                                std::time::Duration::from_secs(5),
-                            );
-                        }
+        let config_path = match config::Config::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.set_status_for(
+                    format!("无法定位配置文件：{error}"),
+                    std::time::Duration::from_secs(6),
+                );
+                return;
+            }
+        };
+        match config::Config::from_revision(&config_path, &disk_revision) {
+            Ok(new_config) => {
+                let notes = self.apply_hot_reload(new_config, ctx);
+                eprintln!("[Config] Hot-reloaded from {}", config_path.display());
+                if notes.is_empty() {
+                    self.set_status("配置已热重载");
+                } else {
+                    for note in &notes {
+                        eprintln!("[Config] WARNING: {note}");
                     }
-                    Err(e) => {
-                        eprintln!("[Config] Hot-reload parse error: {}", e);
-                        // 同时在状态栏提示用户,避免改坏配置后毫无反馈、误以为已生效。
-                        self.status_message = format!("配置解析失败,已沿用旧配置: {}", e);
-                        self.status_expires_at =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
-                        // 沿用旧配置也意味着内存里的值与文件不再一致:此后任何
-                        // 自动保存都会用旧值覆盖用户刚写坏(但仍是他自己写的)
-                        // 内容。修好文件后 apply_hot_reload 会整体替换 config,
-                        // 这个标记随之消失。
-                        self.config.load_error = Some(format!("{}: {}", config_path.display(), e));
-                    }
+                    self.set_status_for(
+                        format!("配置已重载（{} 项已调整）", notes.len()),
+                        std::time::Duration::from_secs(5),
+                    );
                 }
+            }
+            Err(error) => {
+                eprintln!("[Config] Hot-reload parse error: {error}");
+                self.status_message = format!("配置解析失败,已沿用旧配置: {error}");
+                self.status_expires_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
+                self.config.revision = Some(disk_revision);
+                self.config.load_error = Some(error);
             }
         }
     }

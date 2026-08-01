@@ -22,6 +22,10 @@ fn append_bounded_input(buffer: &mut Vec<u8>, input: &[u8], cap: usize) -> bool 
     true
 }
 
+fn shell_owns_foreground_group(shell_pid: i32, foreground_pgid: Option<i32>) -> bool {
+    foreground_pgid == Some(shell_pid)
+}
+
 /// Generate a unique session ID for jsh session persistence.
 pub fn generate_session_id() -> String {
     let ts = SystemTime::now()
@@ -112,7 +116,29 @@ impl Session {
     /// Append bytes to this session's strict input FIFO without crossing its
     /// memory cap. `false` guarantees that no byte was appended.
     pub fn queue_input(&mut self, input: &[u8]) -> bool {
+        let queued = append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP);
+        if queued {
+            self.terminal.lock().note_user_input(input);
+        }
+        queued
+    }
+
+    /// Queue an already-armed Agent command without marking it as unrelated
+    /// local input. Callers must arm the terminal generation first.
+    pub fn queue_agent_input(&mut self, input: &[u8]) -> bool {
         append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP)
+    }
+
+    /// An OSC 133 prompt marker is necessary but not sufficient for Agent
+    /// approval: a foreground editor/test can emit the same bytes. Require the
+    /// interactive shell's own process group to own the controlling terminal
+    /// immediately before arming and queueing the reviewed command.
+    pub fn shell_owns_foreground_pty(&self) -> bool {
+        let shell_pid = self.get_shell_pid();
+        shell_owns_foreground_group(
+            shell_pid,
+            jterm_core::process::foreground_pgid_via_stat(shell_pid),
+        )
     }
 
     #[allow(dead_code)]
@@ -212,5 +238,12 @@ mod tests {
         assert_eq!(pending, b"old12");
         assert!(!append_bounded_input(&mut pending, b"x", 5));
         assert_eq!(pending, b"old12");
+    }
+
+    #[test]
+    fn agent_requires_the_shell_process_group_in_the_foreground() {
+        assert!(shell_owns_foreground_group(100, Some(100)));
+        assert!(!shell_owns_foreground_group(100, Some(200)));
+        assert!(!shell_owns_foreground_group(100, None));
     }
 }

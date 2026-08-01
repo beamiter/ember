@@ -11,7 +11,8 @@ categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 libc = "0.2"
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", branch = "master" }
+# Pin the shared contract so a branch move cannot silently change a release build.
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "3855746e9e20a1c3658fb56a069ba6340e45935a" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"
@@ -25,7 +26,7 @@ egui-wgpu = "0.35.0"
 wgpu = "=29.0.4"
 bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
-fontdue = "0.9"
+fontdue = "0.9.4"
 unicode-width = "0.2"
 unicode-normalization = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -41,8 +42,9 @@ lru = "0.18"
 smallvec = "1.15"
 once_cell = "1.21"
 
-rustybuzz = "0.20"
-ttf-parser = "0.25"
+# HarfRust is the maintained RustyBuzz successor. It is already shared with
+# egui's font stack, and uses read-fonts instead of adding another parser.
+harfrust = "0.7"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

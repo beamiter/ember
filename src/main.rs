@@ -17,7 +17,9 @@ mod kitty_graphics;
 mod layout;
 mod link;
 mod pane_header;
+mod persistence_file;
 mod pty;
+mod review_text;
 mod search;
 mod search_replace;
 mod search_replace_panel;
@@ -40,7 +42,6 @@ use app::events::{
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
 use eframe::egui;
-pub(crate) use jterm_core::atomic_file;
 pub(crate) use jterm_core::char_width;
 use parking_lot::Mutex as ParkingMutex;
 use session::Session;
@@ -700,16 +701,54 @@ use app::state::TerminalApp;
 
 // normalize_terminal_shortcut_events moved to app::events module
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasteOrigin {
+    Clipboard,
+    PromptInsert,
+}
+
+#[derive(Debug)]
+enum PasteRequestError {
+    Unsafe(crate::review_text::ReviewTextError),
+    Write(crate::shell::ShellWriteError),
+}
+
+impl std::fmt::Display for PasteRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsafe(error) => write!(formatter, "unsafe prompt text: {error}"),
+            Self::Write(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PasteRequestError {}
+
+fn paste_requires_confirmation(
+    origin: PasteOrigin,
+    configured: bool,
+    risk: &jterm_core::pty_input::PasteRisk,
+    had_visual_spoofing: bool,
+) -> bool {
+    (origin == PasteOrigin::Clipboard && had_visual_spoofing)
+        || (configured
+            && jterm_core::pty_input::should_confirm(
+                risk,
+                crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES,
+            ))
+}
+
 /// jterm2's side of the shared paste policy.
 ///
 /// `SendVerbatim` is this app's long-standing behaviour: a multiline payload is
 /// never truncated, because the confirmation modal — not silent mangling — is
 /// what stands between the clipboard and the shell.
 ///
-/// `submit_after_paste` is only ever set for a trusted command this app built
-/// itself (the Files sidebar's quoted `cd`), so those take the `prompt_insert`
-/// policy: stripping control bytes out of a path we just quoted would `cd`
-/// somewhere else. Clipboard bytes get the de-fanging policy.
+/// The pinned core's `prompt_insert` policy preserves control bytes, so it is
+/// a trusted *post-validation* boundary, never an input classifier. The Files
+/// sidebar reaches it only after `sanitize_prompt_payload` strips C0/C1 and
+/// rejects hidden Unicode; Agent commands reach it only after strict proposal
+/// validation. Clipboard/search bytes use the de-fanging policy as well.
 fn paste_policy(submit_after_paste: bool) -> jterm_core::pty_input::PastePolicy {
     use jterm_core::pty_input::{PastePolicy, UnbracketedMultiline::SendVerbatim};
     if submit_after_paste {
@@ -818,30 +857,39 @@ fn paste_text_into_session(
     session: &mut Session,
     text: String,
     paste_confirm: bool,
+    origin: PasteOrigin,
     submit_after_paste: bool,
     pending_paste_confirm: &mut Option<crate::app::state::PendingPasteConfirm>,
-) -> Result<bool, crate::shell::ShellWriteError> {
+) -> Result<bool, PasteRequestError> {
     // Classify the clipboard as it arrived: `should_confirm` also trips on an
     // embedded paste marker, which the encoder below defuses but the user still
     // deserves to be told about.
     let risk = jterm_core::pty_input::classify_paste(&text);
-    if risk.bytes == 0 {
+    let (max_bytes, disposition) = match origin {
+        PasteOrigin::Clipboard => (
+            usize::MAX,
+            crate::review_text::VisualSpoofDisposition::PreserveForConfirmation,
+        ),
+        PasteOrigin::PromptInsert => (
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+            crate::review_text::VisualSpoofDisposition::Reject,
+        ),
+    };
+    let sanitized = crate::review_text::sanitize_prompt_payload(&text, max_bytes, disposition)
+        .map_err(PasteRequestError::Unsafe)?;
+    let body = normalized_paste_body(&sanitized.text, submit_after_paste);
+    if body.is_empty() {
         return Ok(false);
     }
-    let body = normalized_paste_body(&text, submit_after_paste);
     let session_id = session.metadata.session_id.clone();
 
-    if paste_confirm
-        && jterm_core::pty_input::should_confirm(
-            &risk,
-            crate::app::state::PASTE_CONFIRM_THRESHOLD_BYTES,
-        )
-    {
+    if paste_requires_confirmation(origin, paste_confirm, &risk, sanitized.had_visual_spoofing) {
         *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
             text: body,
             session_id,
             risk,
             submit_after_paste,
+            had_visual_spoofing: sanitized.had_visual_spoofing,
         });
         return Ok(true);
     }
@@ -858,9 +906,10 @@ fn paste_text_into_session(
                     session_id,
                     risk,
                     submit_after_paste,
+                    had_visual_spoofing: sanitized.had_visual_spoofing,
                 });
             }
-            Err(error)
+            Err(PasteRequestError::Write(error))
         }
     }
 }
@@ -1198,7 +1247,7 @@ fn should_notify_long_command(
     if !config.notify_long_blocks || watched {
         return false;
     }
-    if !command.map(str::trim).is_some_and(|cmd| !cmd.is_empty()) {
+    if command.map(str::trim).is_none_or(str::is_empty) {
         return false;
     }
     duration_ms.is_some_and(|ms| ms >= config.notify_long_block_threshold_ms)
@@ -1878,7 +1927,6 @@ impl TerminalApp {
             paste_key_state: Default::default(),
             keyboard_input_buffer: Vec::new(),
             adaptive_frame_budget: 65536, // 初始值 64KB
-            config_last_mtime: config::Config::config_mtime(),
             config_last_check: std::time::Instant::now(),
             smooth_scroll_velocity: 0.0,
             smooth_scroll_pixel_offset: 0.0,
@@ -1983,7 +2031,9 @@ impl TerminalApp {
             // 标签移入侧边栏：恢复上次记住的视图并确保侧边栏可见，否则标签不可达
             self.sidebar.view = self.config.sidebar_view;
             self.sidebar.visible = true;
-            self.sidebar.refresh();
+            if let Some(error) = self.sidebar.refresh() {
+                self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+            }
         }
         self.config_panel.sync_from_config(&self.config);
         self.schedule_config_save();
@@ -1999,6 +2049,10 @@ impl TerminalApp {
             return;
         }
 
+        if let Some(error) = self.sidebar.poll_scan_results().into_iter().last() {
+            self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
+        }
+
         // Follow the shell's authoritative OSC 7 cwd (or the local process
         // cwd fallback) instead of guessing that a queued `cd` succeeded.
         // This also keeps the file tree correct after users type `cd` by hand.
@@ -2010,9 +2064,14 @@ impl TerminalApp {
             };
             let changed_directory = reported_cwd
                 .map(std::path::PathBuf::from)
-                .filter(|path| path.is_dir() && self.sidebar.current_dir != *path);
+                .filter(|path| self.sidebar.current_dir != *path);
             if let Some(path) = changed_directory {
-                self.sidebar.set_current_dir(path);
+                if let Some(error) = self.sidebar.set_current_dir(path) {
+                    self.set_status_for(
+                        format!("文件树目录切换失败：{error}"),
+                        Duration::from_secs(5),
+                    );
+                }
             }
         }
 
@@ -2020,6 +2079,7 @@ impl TerminalApp {
         let mut toggle_path: Option<std::path::PathBuf> = None;
         let mut select_path: Option<std::path::PathBuf> = None;
         let mut cd_path: Option<std::path::PathBuf> = None;
+        let mut show_more_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
         let mut view_changed = false;
 
@@ -2084,7 +2144,18 @@ impl TerminalApp {
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if let Some(root) = &self.sidebar.root {
-                                for child in &root.children {
+                                if root.is_loading() {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("正在读取目录…");
+                                    });
+                                } else if let Some(error) = root.load_error() {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        format!("无法读取目录：{error}"),
+                                    );
+                                }
+                                for child in root.visible_children() {
                                     Self::draw_tree_node(
                                         ui,
                                         child,
@@ -2092,6 +2163,24 @@ impl TerminalApp {
                                         &mut toggle_path,
                                         &mut select_path,
                                         &mut cd_path,
+                                        &mut show_more_path,
+                                    );
+                                }
+                                let remaining = root.remaining_children();
+                                if remaining > 0
+                                    && ui
+                                        .button(format!("显示更多（剩余 {remaining} 项）"))
+                                        .clicked()
+                                {
+                                    show_more_path = Some(root.path.clone());
+                                }
+                                if root.entries_truncated() {
+                                    ui.colored_label(
+                                        ui.visuals().warn_fg_color,
+                                        format!(
+                                            "目录过大：仅显示前 {} 项",
+                                            sidebar::MAX_DIRECTORY_ENTRIES
+                                        ),
                                     );
                                 }
                             }
@@ -2103,7 +2192,12 @@ impl TerminalApp {
         // 闭包结束，安全 mutate
         self.execute_pending_command_sidebar_action();
         if let Some(p) = toggle_path {
-            self.sidebar.toggle_node(&p);
+            if let Some(error) = self.sidebar.toggle_node(&p) {
+                self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
+            }
+        }
+        if let Some(p) = show_more_path {
+            self.sidebar.show_more(&p);
         }
         if let Some(p) = select_path {
             self.sidebar.selected_path = Some(p);
@@ -2117,6 +2211,7 @@ impl TerminalApp {
                     session,
                     cmd,
                     self.config.paste_confirm,
+                    PasteOrigin::PromptInsert,
                     true,
                     &mut self.pending_paste_confirm,
                 )
@@ -2147,12 +2242,24 @@ impl TerminalApp {
             }
         }
         if do_refresh {
-            self.sidebar.refresh();
+            if let Some(error) = self.sidebar.refresh() {
+                self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+            }
         }
         if view_changed {
             // 记住用户选择的视图，下次默认沿用。
             self.config.sidebar_view = self.sidebar.view;
             self.schedule_config_save();
+            if self.sidebar.view == sidebar::SidebarView::Files {
+                if let Some(error) = self.sidebar.refresh() {
+                    self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                }
+            }
+        }
+        if self.sidebar.has_pending_scan() {
+            root_ui
+                .ctx()
+                .request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -2164,6 +2271,7 @@ impl TerminalApp {
         toggle: &mut Option<std::path::PathBuf>,
         select: &mut Option<std::path::PathBuf>,
         cd: &mut Option<std::path::PathBuf>,
+        show_more: &mut Option<std::path::PathBuf>,
     ) {
         let is_selected = selected.as_deref() == Some(node.path.as_path());
         if node.is_dir {
@@ -2180,8 +2288,30 @@ impl TerminalApp {
             resp.on_hover_text("单击展开/折叠，双击进入目录 (cd)");
             if node.expanded {
                 ui.indent(node.path.to_string_lossy(), |ui| {
-                    for child in &node.children {
-                        Self::draw_tree_node(ui, child, selected, toggle, select, cd);
+                    if node.is_loading() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("正在读取…");
+                        });
+                    } else if let Some(error) = node.load_error() {
+                        ui.colored_label(ui.visuals().error_fg_color, format!("无法读取：{error}"));
+                    }
+                    for child in node.visible_children() {
+                        Self::draw_tree_node(ui, child, selected, toggle, select, cd, show_more);
+                    }
+                    let remaining = node.remaining_children();
+                    if remaining > 0
+                        && ui
+                            .button(format!("显示更多（剩余 {remaining} 项）"))
+                            .clicked()
+                    {
+                        *show_more = Some(node.path.clone());
+                    }
+                    if node.entries_truncated() {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!("目录过大：仅显示前 {} 项", sidebar::MAX_DIRECTORY_ENTRIES),
+                        );
                     }
                 });
             }
@@ -2376,8 +2506,9 @@ impl eframe::App for TerminalApp {
         let mut terminal_parse_time = background_parse_started.elapsed();
         let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         for (session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
-            self.agent_panel.handle_completed(session_idx, &completed);
             if let Some(session) = self.session_manager.sessions().get(session_idx) {
+                self.agent_panel
+                    .handle_completed(&session.metadata.session_id, &completed);
                 self.git_strip_cache
                     .mark_command_finished(&session.metadata.session_id);
             }
@@ -2710,6 +2841,7 @@ impl eframe::App for TerminalApp {
                                     session,
                                     text,
                                     self.config.paste_confirm,
+                                    PasteOrigin::Clipboard,
                                     false,
                                     &mut self.pending_paste_confirm,
                                 ) {
@@ -2951,7 +3083,7 @@ impl eframe::App for TerminalApp {
                 drop(terminal);
                 for completed in completed_outputs {
                     self.agent_panel
-                        .handle_completed(active_session_idx, &completed);
+                        .handle_completed(&session.metadata.session_id, &completed);
                     self.git_strip_cache
                         .mark_command_finished(&session.metadata.session_id);
                     // The active pane is on screen, so its completion was
@@ -3156,6 +3288,7 @@ impl eframe::App for TerminalApp {
                     session,
                     text,
                     self.config.paste_confirm,
+                    PasteOrigin::Clipboard,
                     false,
                     &mut self.pending_paste_confirm,
                 ) {
@@ -3661,7 +3794,11 @@ impl eframe::App for TerminalApp {
                     let row_wrapped = terminal.get_visible_row_wrapped();
                     let links = self
                         .link_detector
-                        .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
+                        .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+                            &visible_cells,
+                            &row_wrapped,
+                            |id| terminal.hyperlink_uri(id).map(str::to_owned),
+                        );
                     if let Some(renderer) = self.pane_renderers.get_mut(renderer_idx) {
                         renderer.cached_links = Arc::new(links);
                         renderer.cached_links_grid_version = grid_version;
@@ -3692,7 +3829,11 @@ impl eframe::App for TerminalApp {
                     let row_wrapped = terminal.get_visible_row_wrapped();
                     self.cached_links = self
                         .link_detector
-                        .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
+                        .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+                            &visible_cells,
+                            &row_wrapped,
+                            |id| terminal.hyperlink_uri(id).map(str::to_owned),
+                        );
                     self.cached_links_grid_version = grid_version;
                     self.cached_links_scroll_offset = scroll_offset;
                     self.cached_links_terminal_ptr = terminal_ptr;
@@ -3903,12 +4044,12 @@ mod tests {
         encode_submitted_command, flush_pending_mouse_controls, kitty_graphics_payload,
         mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
         osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
-        primary_copy_route, queue_mouse_control, reported_capture_button,
-        roll_notification_rate_window, should_notify_long_command, show_desktop_notification,
-        take_tagged_cursor_move, wait_for_child_with_timeout, ClipboardRequestGuard,
-        DesktopNotification, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
-        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
-        OSC_5522_DATA_CHUNK_BYTES,
+        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
+        reported_capture_button, roll_notification_rate_window, should_notify_long_command,
+        show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
+        ClipboardRequestGuard, DesktopNotification, PasteOrigin, PrimaryCopyRoute,
+        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
+        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -4106,6 +4247,25 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_visual_spoofing_forces_confirmation_even_when_disabled() {
+        let ordinary_unicode = jterm_core::pty_input::classify_paste("printf '雪🙂'");
+        assert!(!paste_requires_confirmation(
+            PasteOrigin::Clipboard,
+            false,
+            &ordinary_unicode,
+            false,
+        ));
+
+        let hidden = jterm_core::pty_input::classify_paste("printf safe\u{202e}hidden");
+        assert!(paste_requires_confirmation(
+            PasteOrigin::Clipboard,
+            false,
+            &hidden,
+            true,
+        ));
+    }
+
+    #[test]
     fn paste_normalization_cannot_hide_enter_as_a_carriage_return() {
         use jterm_core::pty_input::{classify_paste, should_confirm};
         assert_eq!(
@@ -4221,13 +4381,28 @@ mod tests {
         }
     }
 
-    /// A trusted `cd` this app quoted itself keeps its bytes; a clipboard paste
-    /// is de-fanged. Stripping controls out of a quoted path would `cd`
-    /// somewhere other than the directory the user clicked.
+    /// The shared prompt boundary strips terminal controls before either
+    /// framing branch, while the local validation still rejects visual spoofing.
     #[test]
-    fn only_clipboard_pastes_are_stripped_of_control_bytes() {
+    fn control_preserving_prompt_policy_is_post_validation_only() {
         assert_eq!(normalized_paste_body("a\x1b[31mb", false), "a[31mb");
-        assert_eq!(normalized_paste_body("a\x1b[31mb", true), "a\x1b[31mb");
+        assert_eq!(normalized_paste_body("a\x1b[31mb", true), "a[31mb");
+
+        let sanitized = crate::review_text::sanitize_prompt_payload(
+            "a\x1b[31mb",
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+            crate::review_text::VisualSpoofDisposition::Reject,
+        )
+        .unwrap();
+        assert_eq!(normalized_paste_body(&sanitized.text, true), "a[31mb");
+        assert!(matches!(
+            crate::review_text::sanitize_prompt_payload(
+                "safe\u{2066}hidden",
+                crate::review_text::MAX_PROMPT_INSERT_BYTES,
+                crate::review_text::VisualSpoofDisposition::Reject,
+            ),
+            Err(crate::review_text::ReviewTextError::VisualSpoof)
+        ));
         // Multiline payloads are never truncated: the modal, not silent
         // mangling, is what protects the user here.
         assert_eq!(normalized_paste_body("one\ntwo", false), "one\ntwo");

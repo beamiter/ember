@@ -111,6 +111,7 @@ enum ReplayOutcome {
     BracketedPasteDisabled,
     PendingInput,
     EmptyCommand,
+    UnsafeCommand(String),
     MultilineRun,
     WriteFailed(crate::shell::ShellWriteError),
 }
@@ -139,11 +140,18 @@ impl TerminalApp {
                 .command_records()
                 .iter()
                 .filter_map(|record| {
-                    let command = record
-                        .command
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|command| !command.is_empty());
+                    let command = record.command.as_deref().filter(|command| {
+                        !command
+                            .trim_matches(|character| matches!(character, ' ' | '\r' | '\n' | '\t'))
+                            .is_empty()
+                    });
+                    let replayable_command = command.and_then(|command| {
+                        crate::review_text::sanitize_history_replay(
+                            command,
+                            crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+                        )
+                        .ok()
+                    });
                     let display = command.or_else(|| {
                         record
                             .command_truncated
@@ -167,9 +175,8 @@ impl TerminalApp {
                         command_preview: single_line_command_preview(display, 512),
                         command_exact: record.command_exact
                             && !record.command_truncated
-                            && command.is_some(),
-                        command_multiline: record
-                            .command
+                            && replayable_command.is_some(),
+                        command_multiline: replayable_command
                             .as_deref()
                             .is_some_and(replay_command_is_multiline),
                         cwd: record
@@ -189,9 +196,20 @@ impl TerminalApp {
                 .filter(|target| target.session_id == session_id)
                 .and_then(|target| {
                     let record = terminal.command_record(&target.execution_id)?;
-                    let command = record.command.as_deref().map(|command| {
-                        detail_text_snapshot(
+                    let replayable_command = record.command.as_deref().and_then(|command| {
+                        crate::review_text::sanitize_history_replay(
                             command,
+                            crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+                        )
+                        .ok()
+                    });
+                    let command = record.command.as_deref().map(|command| {
+                        let visible = crate::review_text::visible_bounded(
+                            command,
+                            COMMAND_DETAIL_COMMAND_BYTES,
+                        );
+                        detail_text_snapshot(
+                            &visible,
                             false,
                             command.len(),
                             COMMAND_DETAIL_COMMAND_BYTES,
@@ -216,7 +234,9 @@ impl TerminalApp {
                     Some(CommandDetailSnapshot {
                         target: target.clone(),
                         command,
-                        command_exact: record.command_exact && !record.command_truncated,
+                        command_exact: record.command_exact
+                            && !record.command_truncated
+                            && replayable_command.is_some(),
                         command_omitted: record.command_truncated && record.command.is_none(),
                         output,
                         output_copy_available,
@@ -622,8 +642,14 @@ impl TerminalApp {
             .and_then(|session| {
                 let terminal = session.terminal.lock();
                 let record = terminal.command_record(&target.execution_id)?;
-                let command = record.command.clone().unwrap_or_default();
-                let command_exact = record.command_exact && !record.command_truncated;
+                let raw_command = record.command.as_deref().unwrap_or_default();
+                let command = crate::review_text::sanitize_history_replay(
+                    raw_command,
+                    crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+                )
+                .unwrap_or_default();
+                let command_exact =
+                    record.command_exact && !record.command_truncated && !command.is_empty();
                 let output = match kind {
                     CopyKind::Command => None,
                     CopyKind::Output | CopyKind::Combined => terminal
@@ -636,6 +662,11 @@ impl TerminalApp {
                 Some((command, command_exact, output))
             });
         let persisted_captured = self.persisted_sidebar_execution(target).map(|record| {
+            let command = crate::review_text::sanitize_history_replay(
+                &record.command,
+                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+            )
+            .unwrap_or_default();
             let output = match kind {
                 CopyKind::Command => None,
                 CopyKind::Output | CopyKind::Combined => record
@@ -644,8 +675,8 @@ impl TerminalApp {
                     .map(|output| (output.text.clone(), output.truncated)),
             };
             (
-                record.command.clone(),
-                !record.command_truncated && !record.command.is_empty(),
+                command.clone(),
+                !record.command_truncated && !command.is_empty(),
                 output,
             )
         });
@@ -755,7 +786,15 @@ impl TerminalApp {
             let Some(command) = replay.0 else {
                 return self.set_status("Exact command text is unavailable");
             };
-            let command = trim_replay_command(&command);
+            let command = match prepare_replay_command(&command) {
+                Ok(command) => command,
+                Err(error) => {
+                    return self.set_status_for(
+                        format!("Command replay rejected: {error}"),
+                        Duration::from_secs(5),
+                    );
+                }
+            };
             if replay.2 {
                 ReplayOutcome::AlternateScreen
             } else if !replay.1 {
@@ -769,16 +808,19 @@ impl TerminalApp {
             } else if run && replay_command_is_multiline(&command) {
                 ReplayOutcome::MultilineRun
             } else {
-                match session.shell.write(&replay_payload(&command, run)) {
-                    Ok(()) => {
-                        session.terminal.lock().scroll_to_bottom();
-                        if run {
-                            ReplayOutcome::Ran
-                        } else {
-                            ReplayOutcome::Filled
+                match replay_payload(&command, run) {
+                    Err(error) => ReplayOutcome::UnsafeCommand(error.to_string()),
+                    Ok(payload) => match session.shell.write(&payload) {
+                        Ok(()) => {
+                            session.terminal.lock().scroll_to_bottom();
+                            if run {
+                                ReplayOutcome::Ran
+                            } else {
+                                ReplayOutcome::Filled
+                            }
                         }
-                    }
-                    Err(error) => ReplayOutcome::WriteFailed(error),
+                        Err(error) => ReplayOutcome::WriteFailed(error),
+                    },
                 }
             }
         };
@@ -799,6 +841,10 @@ impl TerminalApp {
                 self.set_status("Wait for pending terminal input to be delivered")
             }
             ReplayOutcome::EmptyCommand => self.set_status("Command text is empty"),
+            ReplayOutcome::UnsafeCommand(error) => self.set_status_for(
+                format!("Command replay rejected: {error}"),
+                Duration::from_secs(5),
+            ),
             ReplayOutcome::MultilineRun => {
                 self.set_status("Run again is disabled for multiline commands; use Fill instead")
             }
@@ -837,14 +883,20 @@ fn enrich_current_tab_rows_from_history(
 
 fn enrich_live_row_from_history(row: &mut CommandRowSnapshot, record: &PersistedExecution) {
     let exact_command = (!record.command_truncated)
-        .then_some(record.command.trim())
-        .filter(|command| !command.is_empty());
+        .then(|| {
+            crate::review_text::sanitize_history_replay(
+                &record.command,
+                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+            )
+            .ok()
+        })
+        .flatten();
     if !row.command_exact {
-        if let Some(command) = exact_command {
+        if let Some(command) = exact_command.as_deref() {
             row.command_summary = single_line_command_preview(command, 160);
             row.command_preview = single_line_command_preview(command, 512);
             row.command_exact = true;
-            row.command_multiline = replay_command_is_multiline(&record.command);
+            row.command_multiline = replay_command_is_multiline(command);
         }
     }
     row.output_copy_available |= record
@@ -857,16 +909,27 @@ fn enrich_live_detail_from_history(
     detail: &mut CommandDetailSnapshot,
     record: &PersistedExecution,
 ) {
-    if !detail.command_exact && !record.command_truncated && !record.command.is_empty() {
-        detail.command = Some(detail_text_snapshot(
-            &record.command,
-            false,
-            record.command.len(),
-            COMMAND_DETAIL_COMMAND_BYTES,
-        ));
-        detail.command_exact = true;
-        detail.command_omitted = false;
-        detail.command_from_history = true;
+    let replayable = (!record.command_truncated)
+        .then(|| {
+            crate::review_text::sanitize_history_replay(
+                &record.command,
+                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+            )
+            .ok()
+        })
+        .flatten();
+    if !detail.command_exact {
+        if let Some(command) = replayable.as_deref() {
+            detail.command = Some(detail_text_snapshot(
+                &crate::review_text::visible_bounded(command, COMMAND_DETAIL_COMMAND_BYTES),
+                false,
+                command.len(),
+                COMMAND_DETAIL_COMMAND_BYTES,
+            ));
+            detail.command_exact = true;
+            detail.command_omitted = false;
+            detail.command_from_history = true;
+        }
     }
     if detail.output.is_none() {
         if let Some(output) = record.output.as_ref() {
@@ -1314,14 +1377,18 @@ fn format_byte_count(bytes: usize) -> String {
 /// `jterm_core::pty_input` removes any paste marker the recorded command itself
 /// carries and keeps the submitting CR *outside* the frame, because Readline
 /// deliberately does not execute a newline that arrived inside a bracketed
-/// paste. Control bytes are kept: this text is a command jterm2 recorded from
-/// its own OSC 133 stream, not clipboard data.
+/// paste. OSC 133 and journal text are untrusted protocol input: the local
+/// compatibility boundary rejects visual spoofing and removes C0/C1 controls,
+/// retaining only newline/tab where Fill's product semantics require them.
 ///
 /// The leading `Ctrl+U` matters even though the caller checked
 /// `shell_is_prompt_ready`: that flag says a prompt has been drawn, not that its
 /// line buffer is empty, so without the kill a replay is appended to whatever
 /// the user had already typed.
-fn replay_payload(command: &str, run: bool) -> Vec<u8> {
+fn replay_payload(
+    command: &str,
+    run: bool,
+) -> Result<Vec<u8>, crate::review_text::ReviewTextError> {
     use jterm_core::pty_input::{
         encode_prompt_insert, PasteModes, PastePolicy, UnbracketedMultiline,
     };
@@ -1335,17 +1402,21 @@ fn replay_payload(command: &str, run: bool) -> Vec<u8> {
     // included. `defanged_paste_body` therefore runs to a fixed point before the
     // framing — one de-fanging pass can splice a *new* terminator out of a
     // nested one and hand it straight to the frame.
-    encode_prompt_insert(
-        &crate::defanged_paste_body(command, policy),
+    let command = prepare_replay_command(command)?;
+    Ok(encode_prompt_insert(
+        &crate::defanged_paste_body(&command, policy),
         PasteModes { bracketed: true },
         policy,
         true,
     )
-    .bytes
+    .bytes)
 }
 
-fn trim_replay_command(command: &str) -> String {
-    command.trim_end_matches(&['\r', '\n'][..]).to_string()
+fn prepare_replay_command(command: &str) -> Result<String, crate::review_text::ReviewTextError> {
+    crate::review_text::sanitize_history_replay(
+        command.trim_end_matches(&['\r', '\n'][..]),
+        crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+    )
 }
 
 fn replay_command_is_multiline(command: &str) -> bool {
@@ -1372,7 +1443,13 @@ fn single_line_command_preview(command: &str, max_chars: usize) -> String {
                 preview.push_str(" ↵ ");
             }
             '\n' => preview.push_str(" ↵ "),
-            control if control.is_control() => preview.push('�'),
+            '\t' => preview.push_str(" ⇥ "),
+            unsafe_character
+                if unsafe_character.is_control()
+                    || crate::review_text::is_visual_spoof(unsafe_character) =>
+            {
+                preview.push_str(&format!("\\u{{{:X}}}", unsafe_character as u32));
+            }
             visible => preview.push(visible),
         }
     }
@@ -1449,39 +1526,38 @@ mod tests {
     }
 
     #[test]
-    fn replay_trims_only_trailing_line_endings() {
+    fn replay_normalizes_trailing_line_endings_without_trimming_spaces() {
         assert_eq!(
-            trim_replay_command("printf 'a\\nb'\r\n\n"),
+            prepare_replay_command("printf 'a\\nb'\r\n\n").unwrap(),
             "printf 'a\\nb'"
         );
-        assert_eq!(trim_replay_command(" echo hi  "), " echo hi  ");
+        assert_eq!(prepare_replay_command(" echo hi  ").unwrap(), " echo hi  ");
     }
 
     #[test]
     fn replay_payload_frames_the_command_and_clears_the_line_first() {
         // Ctrl+U, then the frame, then — only when running — a CR outside it.
         assert_eq!(
-            replay_payload("git status", false),
+            replay_payload("git status", false).unwrap(),
             b"\x15\x1b[200~git status\x1b[201~"
         );
         assert_eq!(
-            replay_payload("git status", true),
+            replay_payload("git status", true).unwrap(),
             b"\x15\x1b[200~git status\x1b[201~\r"
         );
     }
 
-    /// A recorded command is not clipboard data, so its escapes survive — but a
-    /// paste terminator inside it must not, or replaying it would end the frame
-    /// early and run the remainder as a command.
+    /// A recorded command is untrusted OSC/journal data. C0/C1 controls are
+    /// removed before framing, while newline keeps Fill's multiline semantics.
     #[test]
-    fn replay_payload_keeps_escapes_but_never_an_embedded_terminator() {
+    fn replay_payload_strips_controls_and_never_embeds_a_terminator() {
         assert_eq!(
-            replay_payload("printf '\x1b[31m'", false),
-            b"\x15\x1b[200~printf '\x1b[31m'\x1b[201~"
+            replay_payload("printf '\x1b[31m'", false).unwrap(),
+            b"\x15\x1b[200~printf '[31m'\x1b[201~"
         );
         assert_eq!(
-            replay_payload("echo ok\x1b[201~\rrm -rf ~", false),
-            b"\x15\x1b[200~echo ok\nrm -rf ~\x1b[201~"
+            replay_payload("echo ok\x1b[201~\rrm -rf ~", false).unwrap(),
+            b"\x15\x1b[200~echo ok[201~\nrm -rf ~\x1b[201~"
         );
     }
 
@@ -1491,7 +1567,7 @@ mod tests {
     /// into the frame, which would close it early and run the remainder.
     #[test]
     fn a_nested_terminator_in_a_recorded_command_is_removed_to_a_fixed_point() {
-        let payload = replay_payload("echo ok\x1b[\x1b[\x1b[201~201~201~\rrm -rf ~", true);
+        let payload = replay_payload("echo ok\x1b[\x1b[\x1b[201~201~201~\rrm -rf ~", true).unwrap();
         assert_eq!(
             payload
                 .windows(b"\x1b[201~".len())
@@ -1500,7 +1576,23 @@ mod tests {
             1,
             "{payload:?}"
         );
-        assert_eq!(payload, b"\x15\x1b[200~echo ok\nrm -rf ~\x1b[201~\r");
+        assert_eq!(
+            payload,
+            b"\x15\x1b[200~echo ok[[[201~201~201~\nrm -rf ~\x1b[201~\r"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_visual_spoofing_and_preview_makes_it_explicit() {
+        let command = "printf safe\u{202e}; rm -rf important";
+        assert!(matches!(
+            replay_payload(command, false),
+            Err(crate::review_text::ReviewTextError::VisualSpoof)
+        ));
+        assert_eq!(
+            single_line_command_preview(command, 100),
+            "printf safe\\u{202E}; rm -rf important"
+        );
     }
 
     #[test]

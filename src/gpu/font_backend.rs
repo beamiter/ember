@@ -40,7 +40,7 @@ pub struct AtlasGlyphKey {
     pub subpixel_offset: u8,
 }
 
-/// A shaped glyph from rustybuzz, ready for rendering.
+/// A shaped glyph from HarfRust, ready for rendering.
 #[derive(Clone, Debug)]
 pub struct ShapedGlyph {
     pub cluster: u32,

@@ -295,7 +295,8 @@ impl super::TerminalState {
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
             viewport_mapping_exact_cache: std::cell::Cell::new(None),
-            current_hyperlink: None,
+            hyperlinks: hyperlink::HyperlinkTable::default(),
+            current_hyperlink: HyperlinkId::NONE,
             sync_output_active: false,
             sync_output_start: None,
             last_archived_screen_snapshot: Vec::new(),
@@ -313,6 +314,8 @@ impl super::TerminalState {
             next_command_sequence: 1,
             pending_completed_command_outputs: VecDeque::new(),
             captured_command_output_bytes: 0,
+            agent_prompt_input_tainted: false,
+            armed_agent_execution: None,
         }
     }
 
@@ -835,6 +838,7 @@ impl super::TerminalState {
         cell.foreground = self.current_fg;
         cell.background = self.current_bg;
         cell.flags = self.current_flags;
+        cell.hyperlink_id = self.current_hyperlink;
         cell.flags.set_wide(width == 2);
         cell.flags.set_wide_continuation(false);
 
@@ -842,6 +846,7 @@ impl super::TerminalState {
         if width == 2 && self.cursor_col + 1 < cols {
             let cont_cell = self.grid.get_mut(self.cursor_row, self.cursor_col + 1);
             *cont_cell = blank_cell;
+            cont_cell.hyperlink_id = self.current_hyperlink;
             cont_cell.flags.set_wide_continuation(true);
         }
 
@@ -891,6 +896,7 @@ impl super::TerminalState {
             // (avoids recomputing row*cols + bounds-check on every cell)
             let fg = self.current_fg;
             let bg = self.current_bg;
+            let hyperlink_id = self.current_hyperlink;
             let mut flags = self.current_flags;
             flags.set_wide(false);
             flags.set_wide_continuation(false);
@@ -901,6 +907,7 @@ impl super::TerminalState {
                 cell.foreground = fg;
                 cell.background = bg;
                 cell.flags = flags;
+                cell.hyperlink_id = hyperlink_id;
             }
 
             self.cursor_col += chunk_len;
@@ -940,6 +947,7 @@ impl super::TerminalState {
             foreground: Color::Default,
             background: self.current_bg, // Preserve current background color
             flags: StyleFlags::default(),
+            hyperlink_id: HyperlinkId::NONE,
         }
     }
 
@@ -972,6 +980,7 @@ impl super::TerminalState {
                 && cell.foreground == blank.foreground
                 && cell.background == blank.background
                 && cell.flags == blank.flags
+                && cell.hyperlink_id == blank.hyperlink_id
         })
     }
 
@@ -1183,6 +1192,7 @@ impl super::TerminalState {
             foreground: Color::Default,
             background: bg_color,
             flags: StyleFlags::default(),
+            hyperlink_id: HyperlinkId::NONE,
         };
         // If clearing a continuation cell, also clear the wide character body
         if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
@@ -1229,6 +1239,11 @@ impl super::TerminalState {
     /// P4：获取网格版本号（用于缓存比较）
     pub fn get_grid_version(&self) -> u64 {
         self.grid_version
+    }
+
+    /// Resolve the compact hyperlink reference carried by a cell.
+    pub fn hyperlink_uri(&self, id: HyperlinkId) -> Option<&str> {
+        self.hyperlinks.resolve(id)
     }
 
     pub fn take_osc52_clipboard_set(&mut self) -> Option<String> {
@@ -1562,6 +1577,7 @@ impl super::TerminalState {
             complete: false,
             started_at: None,
             finished_at: None,
+            agent_generation: None,
             captured_output: None,
             started_instant: None,
         });
@@ -1596,6 +1612,10 @@ impl super::TerminalState {
         if self.use_alt_buffer {
             return;
         }
+        // A fresh shell prompt is the only unambiguous boundary that clears
+        // local input and any approval that never reached command start.
+        self.agent_prompt_input_tainted = false;
+        self.armed_agent_execution = None;
         let anchor = self.current_buffer_anchor();
 
         // Only coalesce truly duplicated A markers. A new A on the same row
@@ -1687,6 +1707,25 @@ impl super::TerminalState {
                 .started_instant
                 .get_or_insert_with(std::time::Instant::now);
         }
+
+        // Bind the local one-shot generation only after the shell begins the
+        // exact command that was reviewed. OSC ids/commands are PTY input and
+        // therefore never supply this authorization identity themselves.
+        let armed_generation = self
+            .armed_agent_execution
+            .as_ref()
+            .filter(|armed| {
+                !self.agent_prompt_input_tainted
+                    && self.command_records.get(index).is_some_and(|record| {
+                        record.sequence == armed.command_sequence
+                            && record.command.as_deref() == Some(armed.command.as_str())
+                    })
+            })
+            .map(|armed| armed.generation);
+        if let Some(record) = self.command_records.get_mut(index) {
+            record.agent_generation = armed_generation;
+        }
+        self.armed_agent_execution = None;
     }
 
     pub(super) fn store_captured_command_output(&mut self, index: usize, output: ExtractedText) {
@@ -1766,6 +1805,7 @@ impl super::TerminalState {
                 output_available,
                 truncated: extracted.truncated,
                 total_bytes: extracted.total_bytes,
+                agent_generation: record.agent_generation,
             });
     }
 
@@ -1911,6 +1951,80 @@ impl super::TerminalState {
             .back()
             .map(|record| !record.complete && record.state == CommandState::Editing)
             .unwrap_or(false)
+    }
+
+    /// Record accepted non-Agent input before PTY echo arrives. Clearing the
+    /// visible line does not silently re-authorize an approval; only a fresh
+    /// OSC 133 prompt resets this bit.
+    pub fn note_user_input(&mut self, input: &[u8]) {
+        if !input.is_empty() && self.shell_is_prompt_ready() {
+            self.agent_prompt_input_tainted = true;
+        }
+    }
+
+    /// Arm one approved command on the current fresh, empty prompt. The
+    /// generation is application-local and is consumed at OSC 133 C.
+    pub fn arm_agent_execution(
+        &mut self,
+        generation: u64,
+        command: &str,
+    ) -> Result<(), &'static str> {
+        if generation == 0 || command.is_empty() {
+            return Err("invalid Agent execution identity");
+        }
+        if crate::review_text::validate_single_line(
+            command,
+            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+        )
+        .is_err()
+        {
+            return Err("the Agent command is unsafe to review or execute");
+        }
+        if self.agent_prompt_input_tainted {
+            return Err("the shell prompt already contains local input");
+        }
+        if self.armed_agent_execution.is_some() {
+            return Err("another Agent command is already armed");
+        }
+        let Some(record) = self.command_records.back() else {
+            return Err("shell integration has not reported a prompt");
+        };
+        if record.complete || record.state != CommandState::Editing {
+            return Err("the shell is not waiting at an editable prompt");
+        }
+        let sequence = record.sequence;
+        let visible_input = record
+            .command_start
+            .and_then(|start| {
+                self.extract_text_range(
+                    start,
+                    self.current_buffer_anchor(),
+                    MAX_OSC_133_COMMAND_BYTES,
+                )
+            })
+            .map(|text| text.text.trim().is_empty())
+            // A missing/evicted anchor means we cannot prove the prompt is
+            // empty, so approval must fail closed.
+            .unwrap_or(false);
+        if !visible_input {
+            return Err("the shell prompt is not empty");
+        }
+        self.armed_agent_execution = Some(ArmedAgentExecution {
+            generation,
+            command_sequence: sequence,
+            command: command.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn disarm_agent_execution(&mut self, generation: u64) {
+        if self
+            .armed_agent_execution
+            .as_ref()
+            .is_some_and(|armed| armed.generation == generation)
+        {
+            self.armed_agent_execution = None;
+        }
     }
 
     pub fn take_completed_command_outputs(&mut self) -> Vec<CompletedCommandOutput> {

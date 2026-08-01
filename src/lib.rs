@@ -1,6 +1,5 @@
 // Library export for benchmarks and testing
 
-pub(crate) use jterm_core::atomic_file;
 pub use jterm_core::char_width; // P5：字符宽度缓存（已抽取到 jterm_core）
 pub mod clipboard;
 pub mod color;
@@ -13,7 +12,9 @@ pub mod kitty_graphics;
 pub mod layout;
 pub mod link;
 pub mod pane_header;
+pub mod persistence_file;
 pub mod pty;
+pub mod review_text;
 pub mod search;
 pub mod search_replace;
 pub mod search_replace_panel;

@@ -18,9 +18,15 @@
 
 use crate::config::Config;
 use crate::terminal::CompletedCommandOutput;
-use jterm_core::agent::{is_dangerous, AgentSession, AgentState, ProposalId, ProposalStatus, Turn};
-use jterm_core::ai::{AiCancellationToken, AiClient, AiSettings, BlockContext};
+use jterm_core::agent::{
+    is_dangerous, AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ModelOutcome,
+    ProposalId, ProposalStatus, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
+};
+use jterm_core::ai::{AiCancellationToken, AiClient, BlockContext, Provider};
+use std::path::Path;
 use std::sync::mpsc;
+
+const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
     Some(
@@ -30,6 +36,120 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// Read an Agent snapshot through jterm2's hardened persistence boundary.
+/// Failures are deliberately best-effort so a hostile or corrupt entry never
+/// prevents opening a fresh Agent session.
+fn read_snapshot_file(path: &Path) -> Option<AgentSessionSnapshot> {
+    let encoded =
+        crate::persistence_file::read_bounded(path, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64).ok()?;
+    AgentSessionSnapshot::from_json(&encoded).ok()
+}
+
+fn restore_snapshot_session(
+    snapshot: AgentSessionSnapshot,
+) -> Result<AgentSession, AgentSnapshotError> {
+    let session = AgentSession::restore(snapshot)?;
+    let mut proposal_ids = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    for turn in session.transcript() {
+        if let Turn::AssistantProposed {
+            id,
+            command,
+            status,
+        } = turn
+        {
+            if crate::review_text::validate_single_line(
+                command,
+                crate::review_text::MAX_AGENT_COMMAND_BYTES,
+            )
+            .is_err()
+            {
+                return Err(AgentSnapshotError::Invalid(
+                    "proposal command is unsafe to display or execute",
+                ));
+            }
+            if !proposal_ids.insert(id.get()) {
+                return Err(AgentSnapshotError::Invalid("duplicate proposal id"));
+            }
+            if *status == ProposalStatus::Pending {
+                pending.push(*id);
+            }
+        }
+    }
+    match session.state() {
+        AgentState::AwaitingApproval { proposal_id } if pending.as_slice() == [proposal_id] => {}
+        AgentState::AwaitingApproval { .. } => {
+            return Err(AgentSnapshotError::Invalid(
+                "pending proposal state does not match transcript",
+            ));
+        }
+        _ if !pending.is_empty() => {
+            return Err(AgentSnapshotError::Invalid(
+                "pending proposal exists outside approval state",
+            ));
+        }
+        _ => {}
+    }
+    Ok(session)
+}
+
+fn proposal_command(session: &AgentSession, proposal_id: ProposalId) -> Option<&str> {
+    session.transcript().iter().find_map(|turn| match turn {
+        Turn::AssistantProposed { id, command, .. } if *id == proposal_id => Some(command.as_str()),
+        _ => None,
+    })
+}
+
+/// The pinned jagent parser mutates the transcript before returning its
+/// proposal. Keep a safe checkpoint so a command rejected only by the newer
+/// visual-spoof contract never survives long enough to reach the next frame.
+fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<(), String> {
+    let checkpoint = session.snapshot();
+    let outcome = session
+        .accept_model_reply(raw)
+        .map_err(|error| error.to_string())?;
+    let ModelOutcome::Proposal { command, .. } = outcome else {
+        return Ok(());
+    };
+    let Err(error) = crate::review_text::validate_single_line(
+        &command,
+        crate::review_text::MAX_AGENT_COMMAND_BYTES,
+    ) else {
+        return Ok(());
+    };
+
+    let message = format!("model proposal rejected before display: {error}");
+    if let Some(snapshot) = checkpoint {
+        match restore_snapshot_session(snapshot) {
+            Ok(mut restored) => {
+                let _ = restored.model_failed(message.clone());
+                *session = restored;
+            }
+            Err(_) => session.cancel(),
+        }
+    } else {
+        session.cancel();
+    }
+    Err(message)
+}
+
+/// Serialize under jagent's exact snapshot budget, then use jterm2's
+/// create-new, same-directory atomic replacement instead of the pinned core's
+/// legacy predictable staging name.
+fn write_snapshot_file(
+    path: &Path,
+    snapshot: &AgentSessionSnapshot,
+) -> Result<(), AgentSnapshotError> {
+    let encoded = snapshot.to_json()?;
+    if encoded.len() > MAX_AGENT_SNAPSHOT_JSON_BYTES {
+        return Err(AgentSnapshotError::TooLarge {
+            limit: MAX_AGENT_SNAPSHOT_JSON_BYTES,
+        });
+    }
+    crate::persistence_file::write_atomic(path, encoded.as_bytes())
+        .map_err(|error| AgentSnapshotError::Encode(format!("write {}: {error}", path.display())))
+}
+
 /// Side effects the panel asks the app to perform. The panel itself never
 /// touches a PTY.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,31 +157,68 @@ pub enum AgentEffect {
     /// Write this protocol-validated single-line command plus a carriage
     /// return to the bound session's input queue.
     RunCommand {
-        session_index: usize,
+        session_id: String,
         command: String,
+        generation: u64,
     },
 }
 
+#[derive(Clone, Debug)]
+struct PendingAgentExecution {
+    proposal_id: ProposalId,
+    command: String,
+    generation: u64,
+}
+
 fn client_from_config(config: &Config) -> Result<AiClient, String> {
-    AiClient::from_settings(&AiSettings {
-        enabled: config.ai_enabled,
-        provider: config.ai_provider.clone(),
-        api_key_file: jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref()),
-        model: config.ai_model.clone(),
-        base_url: config.ai_base_url.clone(),
-        max_tokens: config.ai_max_tokens,
-        temperature: config.ai_temperature,
-        redact_secrets: config.ai_redact_secrets,
-    })
+    if !config.ai_enabled {
+        return Err("AI features are disabled by configuration".to_string());
+    }
+    let provider = config
+        .ai_provider
+        .parse::<Provider>()
+        .map_err(|error| error.to_string())?;
+    let app_key_name = format!(
+        "{}_AI_API_KEY",
+        jterm_core::identity::get().app_name.to_ascii_uppercase()
+    );
+    let provider_key_name = match provider {
+        Provider::Anthropic => "ANTHROPIC_API_KEY",
+        Provider::OpenAiCompatible => "OPENAI_API_KEY",
+        Provider::Ollama => "OLLAMA_API_KEY",
+    };
+    let nonempty_env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let api_key = match nonempty_env(&app_key_name).or_else(|| nonempty_env(provider_key_name)) {
+        Some(key) => Some(key),
+        None => jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref())
+            .as_deref()
+            .map(crate::persistence_file::read_api_key_file)
+            .transpose()
+            .map_err(|error| format!("AI API key file: {error}"))?,
+    };
+    AiClient::new(
+        provider,
+        api_key,
+        config.ai_model.clone(),
+        config.ai_base_url.clone(),
+        config.ai_max_tokens,
+        config.ai_temperature,
+        config.ai_redact_secrets,
+    )
     .map_err(|error| error.to_string())
 }
 
 pub struct AgentPanel {
     pub is_open: bool,
     session: Option<AgentSession>,
-    bound_session: Option<usize>,
+    bound_session_id: Option<String>,
     /// Approved proposal currently executing in the bound session.
-    awaiting: Option<(ProposalId, String)>,
+    awaiting: Option<PendingAgentExecution>,
     /// Most recent command the user ran manually in the bound session while
     /// the panel was open. Attached to model requests as untrusted block
     /// context so "why did that fail?" has something to look at.
@@ -74,6 +231,7 @@ pub struct AgentPanel {
     provider_label: String,
     result_rx: Option<mpsc::Receiver<Result<String, String>>>,
     cancel: Option<AiCancellationToken>,
+    execution_generation: u64,
 }
 
 impl AgentPanel {
@@ -81,7 +239,7 @@ impl AgentPanel {
         Self {
             is_open: false,
             session: None,
-            bound_session: None,
+            bound_session_id: None,
             awaiting: None,
             last_manual_completed: None,
             input: String::new(),
@@ -91,22 +249,23 @@ impl AgentPanel {
             provider_label: String::new(),
             result_rx: None,
             cancel: None,
+            execution_generation: 0,
         }
     }
 
-    /// Open the panel bound to `session_index`, replacing any previous
+    /// Open the panel bound to stable `session_id`, replacing any previous
     /// session (whose in-flight request is cancelled first). A snapshot
     /// persisted by the previous run is restored one-shot and rebound to the
     /// current terminal session.
-    pub fn open(&mut self, config: &Config, session_index: usize) {
+    pub fn open(&mut self, config: &Config, session_id: String) {
         self.close_session();
         self.is_open = true;
-        self.bound_session = Some(session_index);
+        self.bound_session_id = Some(session_id);
         self.status.clear();
         let restored = snapshot_path().and_then(|path| {
-            let snapshot = jterm_core::agent::read_snapshot_file(&path)?;
+            let snapshot = read_snapshot_file(&path)?;
             jterm_core::agent::remove_snapshot_file(&path);
-            AgentSession::restore(snapshot).ok()
+            restore_snapshot_session(snapshot).ok()
         });
         match restored {
             Some(session) => {
@@ -130,9 +289,26 @@ impl AgentPanel {
         let Some(path) = snapshot_path() else {
             return;
         };
+        if self.session.as_ref().is_some_and(|session| {
+            session.transcript().iter().any(|turn| {
+                matches!(
+                    turn,
+                    Turn::AssistantProposed { command, .. }
+                        if crate::review_text::validate_single_line(
+                            command,
+                            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                        )
+                        .is_err()
+                )
+            })
+        }) {
+            log::warn!("agent: refusing to persist an unsafe proposal command");
+            jterm_core::agent::remove_snapshot_file(&path);
+            return;
+        }
         match self.session.as_ref().and_then(|session| session.snapshot()) {
             Some(snapshot) => {
-                if let Err(error) = jterm_core::agent::write_snapshot_file(&path, &snapshot) {
+                if let Err(error) = write_snapshot_file(&path, &snapshot) {
                     log::warn!("agent: could not persist session: {error}");
                 }
             }
@@ -140,11 +316,11 @@ impl AgentPanel {
         }
     }
 
-    pub fn toggle(&mut self, config: &Config, session_index: usize) {
+    pub fn toggle(&mut self, config: &Config, session_id: String) {
         if self.is_open {
             self.close();
         } else {
-            self.open(config, session_index);
+            self.open(config, session_id);
         }
     }
 
@@ -162,7 +338,7 @@ impl AgentPanel {
             session.cancel();
         }
         self.session = None;
-        self.bound_session = None;
+        self.bound_session_id = None;
         self.awaiting = None;
         self.last_manual_completed = None;
         self.result_rx = None;
@@ -185,11 +361,22 @@ impl AgentPanel {
                     self.loading = false;
                     if let Some(session) = self.session.as_mut() {
                         let outcome = match result {
-                            Ok(raw) => session.accept_model_reply(&raw).map(|_| ()),
-                            Err(error) => session.model_failed(error).map(|_| ()),
+                            Ok(raw) if raw.len() <= MAX_AGENT_MODEL_REPLY_BYTES => {
+                                accept_model_reply_compat(session, &raw)
+                            }
+                            Ok(_) => session
+                                .model_failed(format!(
+                                    "AI reply exceeded the {MAX_AGENT_MODEL_REPLY_BYTES}-byte limit"
+                                ))
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                            Err(error) => session
+                                .model_failed(error)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
                         };
                         if let Err(error) = outcome {
-                            self.status = error.to_string();
+                            self.status = error;
                         }
                     }
                 }
@@ -265,8 +452,8 @@ impl AgentPanel {
     /// completion matching the approved proposal becomes an observation;
     /// anything else is remembered as the user's most recent manual command
     /// and attached to later model requests as untrusted block context.
-    pub fn handle_completed(&mut self, session_index: usize, completed: &CompletedCommandOutput) {
-        if !self.is_open || self.bound_session != Some(session_index) {
+    pub fn handle_completed(&mut self, session_id: &str, completed: &CompletedCommandOutput) {
+        if !self.is_open || self.bound_session_id.as_deref() != Some(session_id) {
             return;
         }
         let output = if completed.output_available {
@@ -274,26 +461,60 @@ impl AgentPanel {
         } else {
             "(command output was not captured)"
         };
-        let reported = completed.command.as_deref().map(str::trim);
-        if let Some((proposal_id, approved_command)) = self.awaiting.clone() {
-            if reported == Some(approved_command.trim()) {
+        let reported = completed.command.as_deref();
+        if let Some(pending) = self.awaiting.as_ref() {
+            if completed.agent_generation == Some(pending.generation) {
+                if completed.command.as_deref() != Some(pending.command.as_str()) {
+                    let generation = pending.generation;
+                    self.execution_start_failed(
+                        generation,
+                        "Agent stopped: approved command completion failed strict correlation",
+                    );
+                    return;
+                }
+                let Some(exit_code) = completed.exit_code else {
+                    let generation = pending.generation;
+                    self.execution_start_failed(
+                        generation,
+                        "Agent stopped: approved command completion had no exit status",
+                    );
+                    return;
+                };
+                let Some(pending) = self.awaiting.take() else {
+                    return;
+                };
                 if let Some(session) = self.session.as_mut() {
-                    match session.observe(proposal_id, completed.exit_code.unwrap_or(0), output) {
-                        Ok(()) => self.awaiting = None,
+                    match session.observe(pending.proposal_id, exit_code, output) {
+                        Ok(()) => {}
                         Err(error) => self.status = error.to_string(),
                     }
                 }
                 return;
             }
         }
-        let Some(command) = reported.filter(|command| !command.is_empty()) else {
+        if completed.agent_generation.is_some() {
+            return;
+        }
+        let Some(command) = reported else {
             return;
         };
+        let Ok(command) = crate::review_text::sanitize_history_replay(
+            command,
+            crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+        ) else {
+            return;
+        };
+        let command = command
+            .trim_matches(|character| matches!(character, ' ' | '\n' | '\t'))
+            .to_string();
+        if command.is_empty() {
+            return;
+        }
         self.last_manual_completed = Some(BlockContext {
-            cmd: command.to_string(),
+            cmd: command,
             output: output.to_string(),
             cwd: completed.cwd.clone(),
-            exit_code: completed.exit_code.unwrap_or(0),
+            exit_code: completed.exit_code.unwrap_or(1),
             truncated: completed.truncated,
         });
     }
@@ -315,6 +536,7 @@ impl AgentPanel {
         let mut approve: Option<(ProposalId, Option<String>)> = None;
         let mut reject: Option<ProposalId> = None;
         let mut cancel_edit = false;
+        let mut edit_rejected: Option<String> = None;
         let mut continue_task = false;
         let mut new_task = false;
         let mut clear_context = false;
@@ -425,11 +647,37 @@ impl AgentPanel {
                                         }
                                         if let Some((edit_id, buffer)) = self.edit.as_mut() {
                                             if edit_id == id {
-                                                ui.add(
+                                                if !buffer.is_empty() {
+                                                    if let Err(error) =
+                                                        crate::review_text::validate_single_line(
+                                                            buffer,
+                                                            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                                                        )
+                                                    {
+                                                        buffer.clear();
+                                                        edit_rejected = Some(format!(
+                                                            "Agent edit cleared before display: {error}"
+                                                        ));
+                                                    }
+                                                }
+                                                let response = ui.add(
                                                     egui::TextEdit::singleline(buffer)
                                                         .font(egui::TextStyle::Monospace)
                                                         .desired_width(f32::INFINITY),
                                                 );
+                                                if response.changed() && !buffer.is_empty() {
+                                                    if let Err(error) =
+                                                        crate::review_text::validate_single_line(
+                                                            buffer,
+                                                            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                                                        )
+                                                    {
+                                                        buffer.clear();
+                                                        edit_rejected = Some(format!(
+                                                            "Agent edit cleared before display: {error}"
+                                                        ));
+                                                    }
+                                                }
                                                 ui.horizontal(|ui| {
                                                     if ui.button("Approve edited").clicked() {
                                                         approve = Some((*id, Some(buffer.clone())));
@@ -443,7 +691,13 @@ impl AgentPanel {
                                         }
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(command.as_str()).monospace(),
+                                                egui::RichText::new(
+                                                    crate::review_text::visible_bounded(
+                                                        command,
+                                                        crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                                                    ),
+                                                )
+                                                .monospace(),
                                             )
                                             .wrap(),
                                         );
@@ -543,7 +797,11 @@ impl AgentPanel {
                         ui.label(
                             egui::RichText::new(format!(
                                 "attached context: `{}` (exit {})",
-                                context.cmd, context.exit_code
+                                crate::review_text::visible_bounded(
+                                    &context.cmd,
+                                    crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+                                ),
+                                context.exit_code
                             ))
                             .weak()
                             .small(),
@@ -581,6 +839,9 @@ impl AgentPanel {
 
         if submit {
             self.submit_input();
+        }
+        if let Some(error) = edit_rejected {
+            self.status = error;
         }
         if continue_task || new_task {
             self.edit = None;
@@ -641,19 +902,49 @@ impl AgentPanel {
     }
 
     fn approve(&mut self, id: ProposalId, edited: Option<String>) -> Option<AgentEffect> {
-        let session_index = self.bound_session?;
+        let session_id = self.bound_session_id.clone()?;
         let session = self.session.as_mut()?;
+        let candidate = edited.as_deref().or_else(|| proposal_command(session, id));
+        let Some(candidate) = candidate else {
+            self.status = "proposal command is unavailable".to_string();
+            return None;
+        };
+        if let Err(error) = crate::review_text::validate_single_line(
+            candidate,
+            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+        ) {
+            self.status = format!("Agent command rejected: {error}");
+            return None;
+        }
         let approved = match edited {
             Some(command) => session.edit_and_approve(id, command),
             None => session.approve(id),
         };
         match approved {
             Ok(approved) => {
-                self.awaiting = Some((approved.proposal_id, approved.command.clone()));
+                if let Err(error) = crate::review_text::validate_single_line(
+                    &approved.command,
+                    crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                ) {
+                    session.cancel();
+                    self.status = format!("Agent command rejected after approval: {error}");
+                    return None;
+                }
+                self.execution_generation = self.execution_generation.wrapping_add(1);
+                if self.execution_generation == 0 {
+                    self.execution_generation = 1;
+                }
+                let generation = self.execution_generation;
+                self.awaiting = Some(PendingAgentExecution {
+                    proposal_id: approved.proposal_id,
+                    command: approved.command.clone(),
+                    generation,
+                });
                 self.status.clear();
                 Some(AgentEffect::RunCommand {
-                    session_index,
+                    session_id,
                     command: approved.command,
+                    generation,
                 })
             }
             Err(error) => {
@@ -662,11 +953,34 @@ impl AgentPanel {
             }
         }
     }
+
+    pub fn execution_start_failed(&mut self, generation: u64, message: impl Into<String>) {
+        if self
+            .awaiting
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.awaiting = None;
+            if let Some(session) = self.session.as_mut() {
+                session.cancel();
+            }
+            self.status = message.into();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     fn completed(command: &str, exit: i32, output: &str) -> CompletedCommandOutput {
         CompletedCommandOutput {
@@ -679,6 +993,7 @@ mod tests {
             output_available: true,
             truncated: false,
             total_bytes: output.len(),
+            agent_generation: None,
         }
     }
 
@@ -692,10 +1007,180 @@ mod tests {
         }
     }
 
+    fn snapshot_fixture() -> AgentSessionSnapshot {
+        let mut session = AgentSession::new(4);
+        session.submit_user("persist this session").unwrap();
+        session
+            .snapshot()
+            .expect("non-empty session has a snapshot")
+    }
+
+    #[test]
+    fn local_snapshot_io_round_trips_and_enforces_the_exact_budget() {
+        let root =
+            std::env::temp_dir().join(format!("jterm2-agent-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("agent_session.json");
+        let snapshot = snapshot_fixture();
+
+        write_snapshot_file(&path, &snapshot).unwrap();
+        let restored = read_snapshot_file(&path).expect("snapshot should round trip");
+        assert!(AgentSession::restore(restored).is_ok());
+
+        let oversized = root.join("oversized.json");
+        write_private(&oversized, vec![b'x'; MAX_AGENT_SNAPSHOT_JSON_BYTES + 1]);
+        assert!(read_snapshot_file(&oversized).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restored_snapshot_rejects_duplicate_proposal_id_confusion() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("list files").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let mut encoded: serde_json::Value =
+            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
+        let transcript = encoded["transcript"].as_array_mut().unwrap();
+        let duplicate = transcript
+            .iter()
+            .find(|turn| turn.get("AssistantProposed").is_some())
+            .unwrap()
+            .clone();
+        transcript.insert(1, duplicate);
+        let encoded = serde_json::to_string(&encoded).unwrap();
+        let snapshot = AgentSessionSnapshot::from_json(&encoded).unwrap();
+
+        assert!(matches!(
+            restore_snapshot_session(snapshot),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("proposal id")
+        ));
+    }
+
+    #[test]
+    fn restored_snapshot_rejects_visually_spoofed_proposals() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("list files").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let mut encoded: serde_json::Value =
+            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
+        let transcript = encoded["transcript"].as_array_mut().unwrap();
+        let proposed = transcript
+            .iter_mut()
+            .find(|turn| turn.get("AssistantProposed").is_some())
+            .unwrap();
+        proposed["AssistantProposed"]["command"] =
+            serde_json::Value::String("printf safe\u{202e}; rm -rf important".into());
+        let snapshot = AgentSessionSnapshot::from_json(&encoded.to_string()).unwrap();
+
+        assert!(matches!(
+            restore_snapshot_session(snapshot),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("proposal command")
+        ));
+    }
+
+    #[test]
+    fn model_and_edit_proposals_fail_closed_on_visual_spoofing() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("run safely").unwrap();
+        let error = accept_model_reply_compat(
+            &mut session,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf safe\u{202e}; rm -rf important",
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("command"));
+        assert!(session.transcript().iter().all(|turn| !matches!(
+            turn,
+            Turn::AssistantProposed { command, .. }
+                if crate::review_text::contains_visual_spoofing(command)
+        )));
+
+        session.retry_model().unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf safe"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let mut panel = AgentPanel::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some("session".into());
+        panel.session = Some(session);
+        assert!(panel
+            .approve(id, Some("printf safe\u{2066}hidden".into()))
+            .is_none());
+        assert!(panel.status.contains("rejected"));
+        assert!(matches!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::AwaitingApproval { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_snapshot_io_rejects_unsafe_entries_and_never_uses_the_legacy_stage() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm2-agent-snapshot-unsafe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("agent_session.json");
+        let victim = root.join("victim.json");
+        let legacy_stage = root.join(format!(".agent_session.json.next.{}", std::process::id()));
+        write_private(&victim, b"sentinel");
+        symlink(&victim, &legacy_stage).unwrap();
+
+        write_snapshot_file(&path, &snapshot_fixture()).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel");
+        assert!(std::fs::symlink_metadata(&legacy_stage)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let linked = root.join("linked.json");
+        symlink(&path, &linked).unwrap();
+        assert!(read_snapshot_file(&linked).is_none());
+
+        let hard_linked = root.join("hard-linked.json");
+        std::fs::hard_link(&path, &hard_linked).unwrap();
+        assert!(read_snapshot_file(&hard_linked).is_none());
+
+        let fifo = root.join("fifo.json");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is NUL-terminated and remains live for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(read_snapshot_file(&fifo).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn approval_yields_a_run_effect_for_the_bound_session_only() {
         let mut panel = AgentPanel::new();
-        panel.open(&ai_config(), 3);
+        panel.open(&ai_config(), "session-three".into());
         let session = panel.session.as_mut().unwrap();
         session.submit_user("list files").unwrap();
         let outcome = session
@@ -705,29 +1190,39 @@ mod tests {
             panic!("expected proposal");
         };
         let effect = panel.approve(id, None).expect("approval must yield effect");
-        assert_eq!(
-            effect,
-            AgentEffect::RunCommand {
-                session_index: 3,
-                command: "ls -la".into()
-            }
-        );
+        let AgentEffect::RunCommand {
+            session_id,
+            command,
+            generation,
+        } = effect;
+        assert_eq!(session_id, "session-three");
+        assert_eq!(command, "ls -la");
+        assert_ne!(generation, 0);
         assert!(panel.awaiting.is_some());
 
         // Completion from another session is ignored entirely.
-        panel.handle_completed(1, &completed("ls -la", 0, "total 0"));
+        panel.handle_completed("session-one", &completed("ls -la", 0, "total 0"));
         assert!(panel.awaiting.is_some());
         assert!(panel.last_manual_completed.is_none());
         // A different command in the bound session becomes manual context,
         // not an observation.
-        panel.handle_completed(3, &completed("pwd", 0, "/tmp"));
+        panel.handle_completed("session-three", &completed("pwd", 0, "/tmp"));
         assert!(panel.awaiting.is_some());
         assert_eq!(
             panel.last_manual_completed.as_ref().map(|c| c.cmd.as_str()),
             Some("pwd")
         );
-        // The matching completion becomes the observation.
-        panel.handle_completed(3, &completed("ls -la", 0, "total 0"));
+        // Identical text alone is not authorization.
+        panel.handle_completed(
+            "session-three",
+            &completed("ls -la", 0, "unrelated same command"),
+        );
+        assert!(panel.awaiting.is_some());
+
+        // Only the locally armed generation becomes the observation.
+        let mut approved = completed("ls -la", 0, "total 0");
+        approved.agent_generation = Some(generation);
+        panel.handle_completed("session-three", &approved);
         assert!(panel.awaiting.is_none());
         assert_eq!(
             panel.session.as_ref().unwrap().state(),
@@ -736,9 +1231,37 @@ mod tests {
     }
 
     #[test]
+    fn approved_completion_without_exit_status_fails_closed() {
+        let mut panel = AgentPanel::new();
+        panel.open(&ai_config(), "session-three".into());
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("list files").unwrap();
+        let outcome = session
+            .accept_model_reply(r#"{"action":"run","command":"ls -la"}"#)
+            .unwrap();
+        let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
+            panic!("expected proposal");
+        };
+        let AgentEffect::RunCommand { generation, .. } =
+            panel.approve(id, None).expect("approval must yield effect");
+        let mut completion = completed("ls -la", 0, "total 0");
+        completion.exit_code = None;
+        completion.agent_generation = Some(generation);
+
+        panel.handle_completed("session-three", &completion);
+
+        assert!(panel.awaiting.is_none());
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+        assert!(panel.status.contains("no exit status"));
+    }
+
+    #[test]
     fn closing_the_panel_seals_the_session() {
         let mut panel = AgentPanel::new();
-        panel.open(&ai_config(), 0);
+        panel.open(&ai_config(), "session-zero".into());
         panel.session.as_mut().unwrap().submit_user("hi").unwrap();
         panel.close();
         assert!(!panel.is_open);
@@ -749,7 +1272,7 @@ mod tests {
     #[test]
     fn disabled_ai_reports_a_configuration_status() {
         let mut panel = AgentPanel::new();
-        panel.open(&Config::default(), 0);
+        panel.open(&Config::default(), "session-zero".into());
         assert!(panel.status.contains("disabled"));
     }
 }

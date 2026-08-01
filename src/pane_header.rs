@@ -57,7 +57,7 @@ impl PaneStatusCache {
     }
 
     /// Cached status for `session_id`, calling `probe` only when the entry is
-    /// missing or older than [`STATUS_REFRESH_INTERVAL`].
+    /// missing or older than `STATUS_REFRESH_INTERVAL`.
     pub fn get(
         &mut self,
         session_id: &str,

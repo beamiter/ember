@@ -124,7 +124,8 @@ impl TerminalApp {
                 // Shells without OSC 133 integration report no command; the
                 // PTY's foreground process group still names one.
                 let running_command = reported_command
-                    .or_else(|| crate::session_manager::get_foreground_command(shell_pid));
+                    .or_else(|| crate::session_manager::get_foreground_command(shell_pid))
+                    .map(|command| crate::review_text::visible_bounded(&command, 512));
                 crate::pane_header::PaneStatus {
                     title,
                     cwd,
@@ -945,7 +946,6 @@ impl TerminalApp {
                     // Save to file
                     match self.config.save() {
                         Ok(()) => {
-                            self.config_last_mtime = config::Config::config_mtime();
                             self.set_status("Settings saved");
                         }
                         Err(error) => {
@@ -1002,6 +1002,7 @@ impl TerminalApp {
                                         session,
                                         result,
                                         self.config.paste_confirm,
+                                        crate::PasteOrigin::PromptInsert,
                                         false,
                                         &mut self.pending_paste_confirm,
                                     )
@@ -1092,20 +1093,57 @@ impl TerminalApp {
             for effect in effects {
                 match effect {
                     crate::agent_panel::AgentEffect::RunCommand {
-                        session_index,
+                        session_id,
                         command,
-                    } => match self.session_manager.get_session_mut(session_index) {
-                        Some(session) => {
+                        generation,
+                    } => match self.session_manager.index_of(&session_id) {
+                        Some(session_index) => {
+                            let Some(session) = self.session_manager.get_session_mut(session_index)
+                            else {
+                                self.agent_panel.execution_start_failed(
+                                    generation,
+                                    "Agent session's terminal no longer exists",
+                                );
+                                continue;
+                            };
+                            if !session.shell_owns_foreground_pty() {
+                                self.agent_panel.execution_start_failed(
+                                    generation,
+                                    "Agent command was not started: the interactive shell does not own the foreground PTY",
+                                );
+                                continue;
+                            }
                             let bracketed = {
-                                let terminal = session.terminal.lock();
+                                let mut terminal = session.terminal.lock();
+                                if let Err(error) =
+                                    terminal.arm_agent_execution(generation, &command)
+                                {
+                                    drop(terminal);
+                                    self.agent_panel.execution_start_failed(
+                                        generation,
+                                        format!("Agent command was not started: {error}"),
+                                    );
+                                    continue;
+                                }
                                 terminal.is_bracketed_paste_enabled()
                             };
                             let bytes = crate::encode_submitted_command(&command, bracketed);
-                            if !session.queue_input(&bytes) {
+                            if !session.queue_agent_input(&bytes) {
+                                session.terminal.lock().disarm_agent_execution(generation);
+                                self.agent_panel.execution_start_failed(
+                                    generation,
+                                    "Agent command rejected: input queue is full",
+                                );
                                 self.set_status("Agent command rejected: input queue is full");
                             }
                         }
-                        None => self.set_status("Agent session's terminal no longer exists"),
+                        None => {
+                            self.agent_panel.execution_start_failed(
+                                generation,
+                                "Agent session's terminal no longer exists",
+                            );
+                            self.set_status("Agent session's terminal no longer exists");
+                        }
                     },
                 }
             }
@@ -1181,26 +1219,37 @@ impl TerminalApp {
         // 剪贴板里嵌有 ESC[200~/ESC[201~ 只可能是括号粘贴注入尝试:编码器已经
         // 剔除,但用户有权知道自己复制到了什么。
         let had_embedded_marker = pending.risk.had_embedded_paste_marker;
+        let had_visual_spoofing = pending.had_visual_spoofing;
         // First few lines as a preview; truncate long single lines too.
+        let mut clipped_line = false;
         let preview: String = pending
             .text
             .lines()
             .take(8)
             .map(|l| {
-                if l.len() > 200 {
-                    let clipped: String = l.chars().take(200).collect();
+                // The preview itself is part of the approval boundary: never
+                // let bidi/default-ignorable scalars disguise what will be
+                // delivered after confirmation.
+                let visible = crate::review_text::visible_bounded(l, 8 * 1024);
+                if visible.chars().count() > 200 {
+                    clipped_line = true;
+                    let clipped: String = visible.chars().take(200).collect();
                     format!("{}…", clipped)
                 } else {
-                    l.to_string()
+                    visible
                 }
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let truncated_preview = line_count > 8 || pending.text.len() != preview.len();
+        let truncated_preview = line_count > 8 || clipped_line;
 
         let mut decision: Option<bool> = None;
         // 通过引用让 checkbox 在 self 上持久(对话框可能跨多帧)。
-        let mut dont_ask_again = self.paste_dont_ask_again;
+        let mut dont_ask_again = if had_visual_spoofing {
+            false
+        } else {
+            self.paste_dont_ask_again
+        };
         // Some(true) = paste, Some(false) = cancel.
         let modal_response = egui::Modal::new(egui::Id::new("paste_confirmation_modal"))
             .frame(egui::Frame {
@@ -1229,6 +1278,15 @@ impl TerminalApp {
                         .color(text_color),
                     );
                 }
+                if had_visual_spoofing {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ 剪贴板包含不可见、双向或非标准空白字符；预览已将其转义。\
+                             此类粘贴始终需要逐次确认。",
+                        )
+                        .color(text_color),
+                    );
+                }
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style())
                     .stroke(egui::Stroke::new(1.0, border))
@@ -1251,7 +1309,9 @@ impl TerminalApp {
                             });
                     });
                 ui.add_space(8.0);
-                ui.checkbox(&mut dont_ask_again, "不再询问(可在配置里重新开启)");
+                if !had_visual_spoofing {
+                    ui.checkbox(&mut dont_ask_again, "不再询问(可在配置里重新开启)");
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("取消").clicked() {
@@ -1283,9 +1343,7 @@ impl TerminalApp {
         if dont_ask_again && self.config.paste_confirm {
             self.config.paste_confirm = false;
             match self.config.save() {
-                Ok(()) => {
-                    self.config_last_mtime = config::Config::config_mtime();
-                }
+                Ok(()) => {}
                 Err(error) => {
                     eprintln!(
                         "[Config] failed to save paste_confirm preference: {}",

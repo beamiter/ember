@@ -24,7 +24,11 @@ claimed.
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
-- Clickable URLs, IP addresses and local paths
+- End-to-end OSC 8 hyperlinks plus detected URLs, IP addresses and local paths;
+  hyperlink metadata survives scrollback, selection and reflow while unsafe or
+  oversized targets remain inert
+- A bounded-worker, lazy file sidebar whose scans and pagination never block
+  the UI thread; stale slow-directory results are discarded after navigation
 - Built-in/custom themes, live configuration reload and resilient configurable bindings
 - Bounded PTY channels, parser-work adaptive budgets, viewport-only historical
   reflow and dirty-row GPU uploads

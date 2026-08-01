@@ -1,3 +1,5 @@
+use super::hyperlink::HyperlinkId;
+
 /// 连续内存网格存储 - 优化内存局部性和缓存命中率
 /// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
 #[derive(Clone)]
@@ -396,6 +398,7 @@ impl ScrollbackLine {
                     && c.flags.is_default_style()
                     && !c.flags.wide()
                     && !c.flags.wide_continuation()
+                    && c.hyperlink_id.is_none()
             })
             .count();
 
@@ -406,6 +409,7 @@ impl ScrollbackLine {
                 && c.flags.is_default_style()
                 && !c.flags.wide()
                 && !c.flags.wide_continuation()
+                && c.hyperlink_id.is_none()
         });
 
         if all_default_attrs {
@@ -585,6 +589,7 @@ impl ScrollbackLine {
                     && next.foreground == cell.foreground
                     && next.background == cell.background
                     && next.flags == cell.flags
+                    && next.hyperlink_id == cell.hyperlink_id
                 {
                     run += 1;
                 } else {
@@ -592,7 +597,8 @@ impl ScrollbackLine {
                 }
             }
 
-            // Format: [char_len:1][char_bytes][fg][bg][flags:1][wide_bits:1][run:1]
+            // Format: [char_len:1][char_bytes][fg][bg][flags:1]
+            //         [wide_bits:1][hyperlink_id:2][run:1]
             buf.push(ch_bytes.len() as u8);
             buf.extend_from_slice(ch_bytes);
             Self::encode_color(&cell.foreground, &mut buf);
@@ -602,6 +608,7 @@ impl ScrollbackLine {
             let wide_bits = if cell.flags.wide() { 1u8 } else { 0 }
                 | if cell.flags.wide_continuation() { 2 } else { 0 };
             buf.push(wide_bits);
+            buf.extend_from_slice(&cell.hyperlink_id.as_raw().to_le_bytes());
             buf.push(run);
 
             i += run as usize;
@@ -630,6 +637,11 @@ impl ScrollbackLine {
             pos += 1;
             let wide_bits = data.get(pos).copied().unwrap_or(0);
             pos += 1;
+            let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
+                data.get(pos).copied().unwrap_or(0),
+                data.get(pos + 1).copied().unwrap_or(0),
+            ]));
+            pos += 2;
             let run = data.get(pos).copied().unwrap_or(1).max(1);
             pos += 1;
 
@@ -642,6 +654,7 @@ impl ScrollbackLine {
                 foreground: fg,
                 background: bg,
                 flags,
+                hyperlink_id,
             };
             for _ in 0..run {
                 cells.push(cell);
@@ -659,6 +672,7 @@ pub struct TerminalCell {
     pub foreground: Color,
     pub background: Color,
     pub flags: StyleFlags,
+    pub hyperlink_id: HyperlinkId,
 }
 
 impl Default for TerminalCell {
@@ -668,6 +682,7 @@ impl Default for TerminalCell {
             foreground: Color::Default,
             background: Color::Default,
             flags: StyleFlags::new(),
+            hyperlink_id: HyperlinkId::NONE,
         }
     }
 }
@@ -682,6 +697,7 @@ impl TerminalCell {
             && self.background == Color::Default
             && !self.flags.wide()
             && !self.flags.wide_continuation()
+            && self.hyperlink_id.is_none()
     }
 }
 

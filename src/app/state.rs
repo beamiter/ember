@@ -20,9 +20,9 @@ use parking_lot::Mutex as ParkingMutex;
 use std::sync::{atomic::AtomicBool, Arc};
 
 /// Text from the clipboard waiting for the user to confirm before being
-/// written to the active session. Created when a paste contains a newline or
-/// exceeds [`PASTE_CONFIRM_THRESHOLD_BYTES`]: pasting `rm -rf …` followed by
-/// a newline would otherwise execute immediately.
+/// written to the active session. Created when a paste contains a newline,
+/// exceeds [`PASTE_CONFIRM_THRESHOLD_BYTES`], carries an embedded frame marker,
+/// or contains visual-spoof Unicode that requires an explicit one-shot review.
 pub struct PendingPasteConfirm {
     /// The payload as the child will receive it: line endings folded and any
     /// embedded paste marker already removed, so the preview cannot show
@@ -39,6 +39,10 @@ pub struct PendingPasteConfirm {
     /// attempt, and the dialog names it even though the encoder already removed
     /// the marker.
     pub risk: jterm_core::pty_input::PasteRisk,
+    /// Current core pins cannot classify Unicode display spoofing. A true value
+    /// forces this dialog even when routine paste confirmation is disabled,
+    /// and makes the preview render every hidden scalar as an ASCII escape.
+    pub had_visual_spoofing: bool,
     /// Trusted UI commands (currently the Files sidebar's quoted `cd`) keep
     /// the final Enter outside bracketed-paste mode so Readline executes them
     /// after confirmation instead of merely inserting them.
@@ -273,7 +277,6 @@ pub struct TerminalApp {
     pub adaptive_frame_budget: usize,
 
     // Config hot-reload
-    pub config_last_mtime: Option<std::time::SystemTime>,
     pub config_last_check: std::time::Instant,
 
     // Smooth scrolling
