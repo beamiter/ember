@@ -915,6 +915,14 @@ impl TerminalApp {
             self.dispatch_palette_command(ctx, command);
         }
 
+        // 远程主机选择器（浮动窗口）
+        if let Some(host) =
+            self.remote_picker
+                .show(ctx, &self.config.remote_hosts.clone(), &self.current_theme)
+        {
+            self.connect_remote_host(&host);
+        }
+
         // 帮助面板 UI（浮动窗口）
         let mut help_open = self.help_panel.is_open;
         self.help_panel.show(

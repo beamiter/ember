@@ -380,6 +380,12 @@ impl CommandPalette {
                 crate::keybindings::Command::AgentToggle,
             ),
             CommandInfo::new(
+                "Connect to remote host",
+                CommandCategory::Session,
+                "Open a [[remote_hosts]] destination (ssh or container) in a new session",
+                crate::keybindings::Command::RemotePicker,
+            ),
+            CommandInfo::new(
                 "Install or update jsh",
                 CommandCategory::Terminal,
                 "Install jterm's companion shell, or update the installed one, in a new session",

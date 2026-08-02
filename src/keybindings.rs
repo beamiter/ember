@@ -82,6 +82,10 @@ pub enum Command {
     // === 配套 shell ===
     /// 在独立会话里安装或更新 jsh。
     JshInstall,
+
+    // === 远程 ===
+    /// 打开远程主机选择器（[[remote_hosts]] 配置的 ssh/容器目标）。
+    RemotePicker,
 }
 
 impl std::fmt::Display for Command {
@@ -140,6 +144,7 @@ impl std::fmt::Display for Command {
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
             Command::JshInstall => write!(f, "jsh:install"),
+            Command::RemotePicker => write!(f, "remote:picker"),
         }
     }
 }
@@ -201,6 +206,7 @@ impl std::str::FromStr for Command {
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
             "jsh:install" => Ok(Command::JshInstall),
+            "remote:picker" => Ok(Command::RemotePicker),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str
@@ -316,6 +322,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+a".to_string(), "agent:toggle".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+s".to_string(), "remote:picker".to_string());
 
         // 终端操作
         bindings

@@ -114,6 +114,12 @@ pub struct Config {
     #[serde(default = "default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// Remote destinations for the host picker (Ctrl+Shift+S). Grammar,
+    /// validation and the argv a tab runs are the family-shared
+    /// `jterm_core::jsh_remote::RemoteHostConfig`.
+    #[serde(default)]
+    pub remote_hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+
     #[serde(default = "default_font_size")]
     pub font_size: f32,
 
@@ -421,6 +427,7 @@ impl Default for Config {
             ai_redact_secrets: true,
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
+            remote_hosts: Vec::new(),
             font_size: default_font_size(),
             font_family: default_font_family(),
             font_weight: default_font_weight(),
@@ -1119,5 +1126,30 @@ mod tests {
         // 用户文件里若残留过这个键(或任何未知键),也不能让加载整体失败。
         let parsed: Config = toml::from_str("load_error = \"stale\"").expect("config parses");
         assert!(parsed.load_error.is_none());
+    }
+
+    #[test]
+    fn remote_hosts_deserialize_through_the_shared_family_type() {
+        let config: Config = toml::from_str(
+            r#"
+[[remote_hosts]]
+name = "build"
+host = "myubuntu"
+docker = true
+deploy = "incognito"
+
+[[remote_hosts]]
+host = "dev.example.com"
+user = "yj"
+ssh_args = ["-p", "2222"]
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.remote_hosts.len(), 2);
+        assert!(config.remote_hosts.iter().all(|h| h.validate().is_ok()));
+        assert_eq!(config.remote_hosts[0].display_name(), "build");
+        // A config without the key stays empty rather than failing.
+        let config: Config = toml::from_str("").expect("parse empty");
+        assert!(config.remote_hosts.is_empty());
     }
 }

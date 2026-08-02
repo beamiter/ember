@@ -19,6 +19,7 @@ mod link;
 mod pane_header;
 mod persistence_file;
 mod pty;
+mod remote_picker;
 mod review_text;
 mod search;
 mod search_replace;
@@ -1907,6 +1908,7 @@ impl TerminalApp {
             git_strip_cache: pane_header::GitStripCache::new(),
             pane_drag: None,
             help_panel: help::HelpPanel::new(),
+            remote_picker: Default::default(),
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),

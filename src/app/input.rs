@@ -580,6 +580,12 @@ impl TerminalApp {
             keybindings::Command::JshInstall => {
                 self.install_or_update_jsh();
             }
+            keybindings::Command::RemotePicker => {
+                self.remote_picker.toggle();
+                if self.remote_picker.is_open && self.config.remote_hosts.is_empty() {
+                    self.set_status("配置里还没有 [[remote_hosts]]；面板里有可以照抄的示例");
+                }
+            }
             keybindings::Command::AgentToggle => {
                 let session_id = self
                     .session_manager

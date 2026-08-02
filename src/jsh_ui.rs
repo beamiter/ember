@@ -160,4 +160,44 @@ impl TerminalApp {
         self.activate_session(index);
         self.set_status("Installing jsh in a new session");
     }
+
+    /// Open a `[[remote_hosts]]` destination in its own session. The argv
+    /// comes from the shared family builder: the deploy launcher when the
+    /// entry asks for it — lending the local jsh when that one is static —
+    /// and a plain ssh / `docker exec` otherwise.
+    pub fn connect_remote_host(&mut self, host: &jterm_core::jsh_remote::RemoteHostConfig) {
+        if let Err(problem) = host.validate() {
+            self.set_status(format!("Remote host {}: {problem}", host.display_name()));
+            return;
+        }
+        let (argv, degraded) = host.tab_argv();
+        if let Some(error) = degraded {
+            // The tab still opens — a plain connection beats no connection —
+            // but quietly pretending jsh was deployed would be worse than
+            // either.
+            log::warn!("cannot publish jsh-remote.sh: {error}; connecting without deployment");
+            self.set_status(format!(
+                "Deploy unavailable ({error}); connecting to {} plainly",
+                host.display_name()
+            ));
+        } else {
+            self.set_status(format!("Connecting to {}", host.display_name()));
+        }
+
+        let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
+        let old_len = self.session_manager.len();
+        let index = self.session_manager.new_command_session(
+            host.display_name().to_string(),
+            argv,
+            cols,
+            rows,
+            self.config.scrollback_lines,
+        );
+        if self.session_manager.len() > old_len {
+            self.tabs.on_session_inserted(index);
+            // 远程会话拿独立 tab，而不是塞进当前 tab 的分屏里。
+            self.tabs.insert_tab_after_active(index);
+        }
+        self.activate_session(index);
+    }
 }

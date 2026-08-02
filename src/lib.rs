@@ -14,6 +14,7 @@ pub mod link;
 pub mod pane_header;
 pub mod persistence_file;
 pub mod pty;
+pub mod remote_picker;
 pub mod review_text;
 pub mod search;
 pub mod search_replace;
