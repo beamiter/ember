@@ -197,6 +197,10 @@ notify_long_block_threshold_ms = 10000
 
 # Git branch/dirty indicator in split-pane headers.
 show_repo_strip = true
+
+# Family-wide bottom status bar: working directory, git branch, last command
+# status/duration, grid size and tab position. Same key in every jterm.
+bottom_bar = true
 ```
 
 The Settings panel exposes the same clipboard and paste-confirmation policies

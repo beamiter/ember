@@ -102,18 +102,19 @@ impl TerminalApp {
         };
 
         let git_strip_cache = &mut self.git_strip_cache;
-        let show_repo_strip = self.config.show_repo_strip;
+        // The pane headers and the bottom bar share one probe; skipping it
+        // entirely needs both consumers switched off.
+        let probe_git = self.config.show_repo_strip || self.config.bottom_bar;
         self.pane_status_cache
             .get(&session_id, now, || {
                 let raw_cwd = reported_cwd.or_else(|| jterm_core::process::process_cwd(shell_pid));
                 // The git probe rides the same sub-second cadence as the /proc
                 // reads, and its own cache only runs git when the session is
                 // new, changed directory, or finished a command.
-                let git = show_repo_strip
+                let git = probe_git
                     .then(|| {
-                        git_strip_cache.strip(&session_id, raw_cwd.as_deref(), |cwd| {
+                        git_strip_cache.meta(&session_id, raw_cwd.as_deref(), |cwd| {
                             jterm_core::git_meta::read(std::path::Path::new(cwd))
-                                .map(|meta| jterm_core::git_meta::format_strip(&meta))
                         })
                     })
                     .flatten();
@@ -134,6 +135,68 @@ impl TerminalApp {
                 }
             })
             .clone()
+    }
+
+    /// Draw the family-wide bottom status bar across the full window width.
+    ///
+    /// Declared before the sidebar (like the top bar) so egui hands it the
+    /// entire bottom edge; the CentralPanel then re-grids the terminal from
+    /// whatever height remains. Content is composed by
+    /// `jterm_core::bottom_bar` from the focused session's state, so the bar
+    /// reads the same in every jterm.
+    pub(crate) fn render_bottom_bar(&mut self, root_ui: &mut egui::Ui) {
+        if !self.config.bottom_bar {
+            return;
+        }
+        let active_idx = self.session_manager.active_index();
+        let status = self.pane_status(active_idx, std::time::Instant::now());
+
+        // The last *complete* record carries the exit/duration to show. Only
+        // a tail record past its C mark counts as running: a Prompt/Editing
+        // record is merely the shell waiting at an idle prompt, and treating
+        // it as running would pin an ellipsis to the bar forever.
+        let (cols, rows, last_exit, last_duration_ms, tail_running) =
+            match self.session_manager.sessions().get(active_idx) {
+                Some(session) => {
+                    let terminal = session.terminal.lock();
+                    let records = terminal.command_records();
+                    let last = records.iter().rev().find(|record| record.complete);
+                    (
+                        terminal.grid.row_len() as u16,
+                        terminal.grid.rows() as u16,
+                        last.and_then(|record| record.exit_code),
+                        last.and_then(|record| record.duration_ms),
+                        records.back().is_some_and(|record| {
+                            record.state == crate::terminal::CommandState::Running
+                        }),
+                    )
+                }
+                None => (0, 0, None, None, false),
+            };
+
+        let snapshot = jterm_core::bottom_bar::Snapshot {
+            // PaneStatus.cwd is already `~`-abbreviated, so compose needs no
+            // home directory to collapse it again.
+            cwd: status.cwd.as_deref().map(std::path::Path::new),
+            home: None,
+            git: status.git.as_ref(),
+            running: status.running_command.is_some() || tail_running,
+            last_exit,
+            last_duration_ms,
+            cols,
+            rows,
+            tab_index: self.tabs.active_index(),
+            tab_count: self.tabs.len(),
+        };
+        let content = jterm_core::bottom_bar::compose(&snapshot);
+
+        egui::Panel::bottom("bottom_bar")
+            .exact_size(jterm_core::bottom_bar::BAR_HEIGHT)
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .show(root_ui, |ui| {
+                crate::bottom_bar::draw(ui, &self.current_theme, &content);
+            });
     }
 
     /// Draw the per-pane header strips and run the drag-to-rearrange gesture.
@@ -164,10 +227,17 @@ impl TerminalApp {
         }
 
         let now = std::time::Instant::now();
-        let statuses: Vec<crate::pane_header::PaneStatus> = panes
+        let mut statuses: Vec<crate::pane_header::PaneStatus> = panes
             .iter()
             .map(|pane| self.pane_status(pane.session_idx, now))
             .collect();
+        // The status may carry git metadata probed for the bottom bar; the
+        // headers' repo strip stays gated by its own toggle.
+        if !self.config.show_repo_strip {
+            for status in &mut statuses {
+                status.git = None;
+            }
+        }
 
         let handles: Vec<(usize, egui::Response)> = panes
             .iter()
@@ -943,8 +1013,15 @@ impl TerminalApp {
                     self.apply_runtime_config(ctx);
                 }
                 config_panel::ConfigAction::SaveRequested => {
+                    let bottom_bar_was = self.config.bottom_bar;
                     // Apply all buffered edit values to config
                     self.config_panel.apply_to_config(&mut self.config);
+                    // The bottom bar takes/returns a strip of window height;
+                    // re-grid the PTY at once instead of waiting for the next
+                    // natural resize.
+                    if self.config.bottom_bar != bottom_bar_was {
+                        self.force_resize_session = true;
+                    }
                     // Update theme
                     if let Some(t) = theme::Theme::get_theme(&self.config.theme) {
                         self.current_theme = t.clone();
@@ -966,11 +1043,15 @@ impl TerminalApp {
                     }
                 }
                 config_panel::ConfigAction::ResetToDefaults => {
+                    let bottom_bar_was = self.config.bottom_bar;
                     // Replacing the whole struct (never field-by-field) is what
                     // makes Reset the escape hatch out of `Config::load_error`:
                     // an explicit reset is the one time overwriting a broken
                     // config file is what the user asked for.
                     self.config = config::Config::default();
+                    if self.config.bottom_bar != bottom_bar_was {
+                        self.force_resize_session = true;
+                    }
                     self.current_theme =
                         theme::Theme::get_theme(&self.config.theme).unwrap_or_default();
                     self.apply_runtime_config(ctx);

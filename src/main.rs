@@ -1,5 +1,6 @@
 mod agent_panel;
 mod app;
+mod bottom_bar;
 mod clipboard;
 mod color;
 mod command_palette;
@@ -2364,6 +2365,10 @@ impl TerminalApp {
         if self.render_jsh_notice(root_ui) {
             self.install_or_update_jsh();
         }
+
+        // 底部状态栏(全宽)：同顶栏一样在侧边栏之前声明，因此它横跨整个
+        // 窗口底边，侧边栏落在顶栏与它之间。
+        self.render_bottom_bar(root_ui);
 
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
         self.render_sidebar(root_ui);

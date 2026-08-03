@@ -11,6 +11,7 @@
 
 use crate::theme::{Theme, ThemeExt as _};
 use egui::{Align2, Color32, FontId, Rect, Stroke, Vec2};
+use jterm_core::git_meta::RepoMeta;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -38,9 +39,11 @@ pub struct PaneStatus {
     pub cwd: Option<String>,
     /// Foreground command, when the shell is not the one in the foreground.
     pub running_command: Option<String>,
-    /// Git branch/dirty strip for the working directory, already formatted by
-    /// [`jterm_core::git_meta::format_strip`]. None outside a repository.
-    pub git: Option<String>,
+    /// Git metadata for the working directory, formatted at render time by
+    /// [`jterm_core::git_meta::format_strip`]. Kept structured rather than
+    /// pre-formatted so the bottom status bar can hand the same probe result
+    /// to [`jterm_core::bottom_bar::Snapshot`]. None outside a repository.
+    pub git: Option<RepoMeta>,
 }
 
 /// Per-session status cache keyed by the stable session ID rather than the
@@ -81,22 +84,23 @@ impl PaneStatusCache {
     }
 }
 
-/// One session's cached git strip and the state that decides when to re-probe.
+/// One session's cached git metadata and the state that decides when to
+/// re-probe.
 #[derive(Debug, Default)]
 struct GitStripEntry {
-    /// The working directory the cached strip was probed in.
+    /// The working directory the cached metadata was probed in.
     cwd: Option<String>,
-    /// Formatted branch/dirty text, or None when `cwd` is not in a repository.
-    strip: Option<String>,
+    /// Probed repository metadata, or None when `cwd` is not in a repository.
+    meta: Option<RepoMeta>,
     /// A command finished since the last probe; branch/dirty state may have
     /// changed even though the directory did not.
     stale: bool,
 }
 
-/// Per-session git branch/dirty strip cache with jterm1's refresh triggers:
-/// a session's first probe, a working-directory change, and a completed
-/// command. Between triggers the cached text is returned without running git,
-/// so an idle pane costs nothing per frame.
+/// Per-session git metadata cache with jterm1's refresh triggers: a session's
+/// first probe, a working-directory change, and a completed command. Between
+/// triggers the cached metadata is returned without running git, so an idle
+/// pane costs nothing per frame.
 #[derive(Debug, Default)]
 pub struct GitStripCache {
     entries: HashMap<String, GitStripEntry>,
@@ -107,7 +111,7 @@ impl GitStripCache {
         Self::default()
     }
 
-    /// Record that `session_id` finished a command. The next [`Self::strip`]
+    /// Record that `session_id` finished a command. The next [`Self::meta`]
     /// call re-probes: the command may have switched branches, committed, or
     /// dirtied the worktree without changing the directory. A session that has
     /// never been probed needs no entry — its first probe happens on sight —
@@ -118,16 +122,16 @@ impl GitStripCache {
         }
     }
 
-    /// Cached strip for `session_id` in `cwd`, calling `probe` only when the
-    /// session is new, the directory changed, or a command finished since the
-    /// last probe. A missing `cwd` clears the strip — the user must never see
-    /// a stale branch from a previous directory.
-    pub fn strip(
+    /// Cached metadata for `session_id` in `cwd`, calling `probe` only when
+    /// the session is new, the directory changed, or a command finished since
+    /// the last probe. A missing `cwd` clears the metadata — the user must
+    /// never see a stale branch from a previous directory.
+    pub fn meta(
         &mut self,
         session_id: &str,
         cwd: Option<&str>,
-        probe: impl FnOnce(&str) -> Option<String>,
-    ) -> Option<String> {
+        probe: impl FnOnce(&str) -> Option<RepoMeta>,
+    ) -> Option<RepoMeta> {
         let (entry, is_new) = match self.entries.entry(session_id.to_string()) {
             std::collections::hash_map::Entry::Occupied(occupied) => (occupied.into_mut(), false),
             std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -136,10 +140,10 @@ impl GitStripCache {
         };
         if is_new || entry.stale || entry.cwd.as_deref() != cwd {
             entry.cwd = cwd.map(str::to_string);
-            entry.strip = cwd.and_then(probe);
+            entry.meta = cwd.and_then(probe);
             entry.stale = false;
         }
-        entry.strip.clone()
+        entry.meta.clone()
     }
 
     /// Drop entries for sessions that no longer exist, mirroring
@@ -233,7 +237,7 @@ fn detail_text(status: &PaneStatus) -> String {
         }
     }
     if let Some(git) = &status.git {
-        parts.push(git.clone());
+        parts.push(jterm_core::git_meta::format_strip(git));
     }
     if let Some(command) = &status.running_command {
         parts.push(format!("▶ {command}"));
@@ -369,8 +373,9 @@ pub fn draw_pane_header(
 }
 
 /// Lay `text` out on a single row, ellipsizing rather than wrapping when it
-/// does not fit `max_width`.
-fn clipped_galley(
+/// does not fit `max_width`. Shared with the bottom status bar, which clips
+/// its left group the same way.
+pub(crate) fn clipped_galley(
     painter: &egui::Painter,
     text: &str,
     font: FontId,
@@ -436,13 +441,24 @@ mod tests {
         assert_eq!(detail_text(&running), "▶ cargo");
     }
 
+    fn repo_meta(branch: &str) -> RepoMeta {
+        RepoMeta {
+            branch: branch.to_string(),
+            dirty: true,
+            ahead: None,
+            behind: None,
+        }
+    }
+
     #[test]
     fn detail_places_the_git_strip_between_cwd_and_command() {
+        // Formatting moved from probe time to render time; the rendered text
+        // must stay byte-identical to the previously cached strip.
         let status = PaneStatus {
             title: "src".to_string(),
             cwd: Some("~/src".to_string()),
             running_command: Some("cargo build".to_string()),
-            git: Some("main ●".to_string()),
+            git: Some(repo_meta("main")),
         };
         assert_eq!(detail_text(&status), "~/src  ·  main ●  ·  ▶ cargo build");
     }
@@ -451,21 +467,23 @@ mod tests {
     fn git_strip_cache_probes_only_on_jterm1_triggers() {
         let mut cache = GitStripCache::new();
         let mut probes = 0;
-        let strip = |cache: &mut GitStripCache, cwd: Option<&str>, probes: &mut usize| {
-            cache.strip("session-a", cwd, |_| {
-                *probes += 1;
-                Some(format!("main #{probes}"))
-            })
+        let meta = |cache: &mut GitStripCache, cwd: Option<&str>, probes: &mut usize| {
+            cache
+                .meta("session-a", cwd, |_| {
+                    *probes += 1;
+                    Some(repo_meta(&format!("main #{probes}")))
+                })
+                .map(|meta| meta.branch)
         };
 
         // First sight of the session probes.
         assert_eq!(
-            strip(&mut cache, Some("/repo"), &mut probes).as_deref(),
+            meta(&mut cache, Some("/repo"), &mut probes).as_deref(),
             Some("main #1")
         );
         // Same directory, nothing happened: cached, no new probe.
         assert_eq!(
-            strip(&mut cache, Some("/repo"), &mut probes).as_deref(),
+            meta(&mut cache, Some("/repo"), &mut probes).as_deref(),
             Some("main #1")
         );
         assert_eq!(probes, 1);
@@ -473,20 +491,20 @@ mod tests {
         // A finished command re-probes even though the directory is unchanged.
         cache.mark_command_finished("session-a");
         assert_eq!(
-            strip(&mut cache, Some("/repo"), &mut probes).as_deref(),
+            meta(&mut cache, Some("/repo"), &mut probes).as_deref(),
             Some("main #2")
         );
         assert_eq!(probes, 2);
 
         // A directory change re-probes.
         assert_eq!(
-            strip(&mut cache, Some("/other"), &mut probes).as_deref(),
+            meta(&mut cache, Some("/other"), &mut probes).as_deref(),
             Some("main #3")
         );
         assert_eq!(probes, 3);
 
-        // Losing the cwd clears the strip without probing.
-        assert_eq!(strip(&mut cache, None, &mut probes), None);
+        // Losing the cwd clears the metadata without probing.
+        assert_eq!(meta(&mut cache, None, &mut probes), None);
         assert_eq!(probes, 3);
     }
 
@@ -495,11 +513,11 @@ mod tests {
         let mut cache = GitStripCache::new();
         let mut probes = 0;
         for _ in 0..3 {
-            let strip = cache.strip("session-a", Some("/not-a-repo"), |_| {
+            let meta = cache.meta("session-a", Some("/not-a-repo"), |_| {
                 probes += 1;
                 None
             });
-            assert_eq!(strip, None);
+            assert_eq!(meta, None);
         }
         // Only the first sighting probed; the None result is cached.
         assert_eq!(probes, 1);

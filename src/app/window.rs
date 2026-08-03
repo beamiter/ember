@@ -270,6 +270,11 @@ impl TerminalApp {
 
         let configured_shell = std::env::var("JTERM2_SHELL").ok().or(new.shell.clone());
         self.session_manager.set_configured_shell(configured_shell);
+        // A toggled bottom bar changes the height left for the grid; re-grid
+        // the PTY at once instead of waiting for the next natural resize.
+        if new.bottom_bar != self.config.bottom_bar {
+            self.force_resize_session = true;
+        }
         self.config = new;
         self.config_panel.sync_from_config(&self.config);
         self.apply_runtime_config(ctx);

@@ -239,6 +239,12 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub show_repo_strip: bool,
 
+    /// 窗口底部的家族统一状态栏(cwd、git 分支、上一条命令结果、grid 尺寸、
+    /// tab 位置;默认开启)。四个 jterm 共用 `bottom_bar` 键与默认值,
+    /// 内容由 `jterm_core::bottom_bar` 统一编排。
+    #[serde(default = "default_bottom_bar")]
+    pub bottom_bar: bool,
+
     /// Why this run could not use the on-disk config, if it exists but could
     /// not be read or parsed. Never serialized: it describes the load attempt,
     /// not a user setting.
@@ -261,6 +267,10 @@ pub struct Config {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_bottom_bar() -> bool {
+    jterm_core::bottom_bar::ENABLED_BY_DEFAULT
 }
 
 fn default_notify_long_block_threshold_ms() -> u64 {
@@ -460,6 +470,7 @@ impl Default for Config {
             notify_long_blocks: true,
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: true,
+            bottom_bar: default_bottom_bar(),
             load_error: None,
             revision: None,
         }
