@@ -90,11 +90,17 @@ impl RemotePicker {
                     if hosts.is_empty() {
                         ui.label(
                             RichText::new(
-                                "No [[remote_hosts]] configured. Add one to config.toml:\n\n\
+                                "No [[remote_hosts]] configured. Add one in \
+                                 Settings → Remote, or in config.toml:\n\n\
                                  [[remote_hosts]]\n\
-                                 host = \"myubuntu\"\n\
+                                 host = \"dev.example.com\"\n\
+                                 user = \"yj\"\n\
+                                 deploy = \"persist\"\n\
+                                 ssh_args = [\"-p\", \"22\"]\n\n\
+                                 [[remote_hosts]]\n\
+                                 host = \"myubuntu\"  # running container\n\
                                  docker = true\n\
-                                 deploy = \"incognito\"",
+                                 deploy = \"persist\"",
                             )
                             .color(dim_color)
                             .monospace(),

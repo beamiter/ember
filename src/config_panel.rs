@@ -2,6 +2,7 @@ use crate::config::{AppRendererType, Config, TabBarPosition};
 use crate::theme::Theme;
 use crate::theme::ThemeExt as _;
 use egui::{Color32, RichText};
+use jterm_core::jsh_remote::RemoteHostConfig;
 
 fn accent_color(theme: &Theme) -> Color32 {
     Theme::rgb_to_color32(theme.tabbar.active_border)
@@ -21,6 +22,55 @@ pub enum ConfigTab {
     Appearance,
     Advanced,
     Ai,
+    Remote,
+}
+
+/// One `[[remote_hosts]]` entry under edit. Wraps the full family type so
+/// fields the tab does not surface (ssh_args, session, remote_shell,
+/// deploy_artifact) round-trip untouched; `user` gets its own buffer because
+/// an `Option<String>` is edited as text, with empty meaning None.
+#[derive(Clone, Debug)]
+struct RemoteHostDraft {
+    host: RemoteHostConfig,
+    user: String,
+}
+
+impl RemoteHostDraft {
+    fn from_config(host: &RemoteHostConfig) -> Self {
+        Self {
+            user: host.user.clone().unwrap_or_default(),
+            host: host.clone(),
+        }
+    }
+
+    /// The entry as apply_to_config would write it: trimmed, empty user →
+    /// None. Validation runs on this form so the label matches what Save
+    /// actually persists.
+    fn applied(&self) -> RemoteHostConfig {
+        let mut host = self.host.clone();
+        host.name = host.name.trim().to_string();
+        host.host = host.host.trim().to_string();
+        let user = self.user.trim();
+        host.user = (!user.is_empty()).then(|| user.to_string());
+        host
+    }
+
+    fn template() -> Self {
+        Self {
+            host: RemoteHostConfig {
+                name: String::new(),
+                host: String::new(),
+                user: None,
+                docker: false,
+                remote_shell: "jsh".to_string(),
+                session: None,
+                ssh_args: Vec::new(),
+                deploy: "persist".to_string(),
+                deploy_artifact: None,
+            },
+            user: String::new(),
+        }
+    }
 }
 
 pub enum ConfigAction {
@@ -70,6 +120,7 @@ pub struct ConfigPanel {
     /// 最近一次存 key 的结果提示（成功路径或错误信息）。
     ai_key_store_status: Option<Result<String, String>>,
     edit_agent_max_turns: u32,
+    edit_remote_hosts: Vec<RemoteHostDraft>,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
     all_fonts: Vec<String>,
@@ -126,6 +177,7 @@ impl ConfigPanel {
             edit_ai_key_draft: String::new(),
             ai_key_store_status: None,
             edit_agent_max_turns: 20,
+            edit_remote_hosts: Vec::new(),
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
             available_themes: Vec::new(),
@@ -212,6 +264,11 @@ impl ConfigPanel {
         self.edit_ai_redact_secrets = config.ai_redact_secrets;
         self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
         self.edit_agent_max_turns = config.agent_max_turns;
+        self.edit_remote_hosts = config
+            .remote_hosts
+            .iter()
+            .map(RemoteHostDraft::from_config)
+            .collect();
     }
 
     /// Apply all buffered edit values to the given Config.
@@ -256,6 +313,11 @@ impl ConfigPanel {
         config.ai_api_key_file =
             Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
+        config.remote_hosts = self
+            .edit_remote_hosts
+            .iter()
+            .map(RemoteHostDraft::applied)
+            .collect();
     }
 
     pub fn close(&mut self) {
@@ -318,6 +380,7 @@ impl ConfigPanel {
                     ui.selectable_value(&mut self.active_tab, ConfigTab::Appearance, "Appearance");
                     ui.selectable_value(&mut self.active_tab, ConfigTab::Advanced, "Advanced");
                     ui.selectable_value(&mut self.active_tab, ConfigTab::Ai, "AI");
+                    ui.selectable_value(&mut self.active_tab, ConfigTab::Remote, "Remote");
                 });
                 ui.separator();
 
@@ -337,6 +400,9 @@ impl ConfigPanel {
                         }
                         ConfigTab::Ai => {
                             self.render_ai_tab(ui);
+                        }
+                        ConfigTab::Remote => {
+                            self.render_remote_tab(ui, theme);
                         }
                     });
 
@@ -1322,6 +1388,119 @@ impl ConfigPanel {
             self.edit_gpu_rendering = false;
         }
     }
+
+    fn render_remote_tab(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.label(RichText::new("Remote Hosts").strong().size(14.0));
+        ui.separator();
+        ui.label(
+            RichText::new(
+                "Destinations for the remote host picker (Ctrl+Shift+S): an ssh \
+                 host, or a running container reached with docker exec. \
+                 ssh_args, session, remote_shell and deploy_artifact are kept \
+                 as configured; edit those in config.toml.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(4.0);
+
+        let mut changed = false;
+        let mut delete_index = None;
+        for (index, draft) in self.edit_remote_hosts.iter_mut().enumerate() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut draft.host.name)
+                                .hint_text("display name (host when empty)")
+                                .desired_width(180.0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Delete").clicked() {
+                            delete_index = Some(index);
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Host:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut draft.host.host)
+                                .hint_text("ssh host or container name")
+                                .desired_width(180.0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.label("User:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut draft.user)
+                                .hint_text("optional")
+                                .desired_width(100.0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut draft.host.docker, "docker (exec into a container)")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.label("Deploy:");
+                    // The empty spelling means Off ([`Deploy::parse`]); the
+                    // combo writes it back explicitly so the saved file reads
+                    // the way the picker displays it.
+                    let current = if draft.host.deploy.is_empty() {
+                        "off".to_string()
+                    } else {
+                        draft.host.deploy.clone()
+                    };
+                    egui::ComboBox::from_id_salt(("remote_host_deploy", index))
+                        .selected_text(current.clone())
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for mode in ["off", "persist", "incognito"] {
+                                if ui.selectable_label(current == mode, mode).clicked()
+                                    && current != mode
+                                {
+                                    draft.host.deploy = mode.to_string();
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+                // Save is never blocked on this: an invalid entry persists and
+                // the picker shows it struck through with the same reason.
+                if let Err(problem) = draft.applied().validate() {
+                    ui.colored_label(warning_color(theme), problem);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(index) = delete_index {
+            self.edit_remote_hosts.remove(index);
+            changed = true;
+        }
+
+        if ui.button("+ Add host").clicked() {
+            self.edit_remote_hosts.push(RemoteHostDraft::template());
+            changed = true;
+        }
+        if changed {
+            self.has_changes = true;
+        }
+    }
 }
 
 // Helper: RGB color row with label + color picker
@@ -1386,7 +1565,7 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigPanel;
+    use super::{ConfigPanel, RemoteHostDraft};
     use crate::config::Config;
 
     #[test]
@@ -1443,5 +1622,65 @@ mod tests {
         assert!(applied.notify_long_blocks);
         assert_eq!(applied.notify_long_block_threshold_ms, 5_000);
         assert!(applied.show_repo_strip);
+    }
+
+    #[test]
+    fn remote_host_drafts_survive_rename_delete_add_and_a_config_round_trip() {
+        let source: Config = toml::from_str(
+            r#"
+[[remote_hosts]]
+name = "build"
+host = "dev.example.com"
+user = "yj"
+deploy = "persist"
+ssh_args = ["-p", "22"]
+
+[[remote_hosts]]
+name = "sandbox"
+host = "myubuntu"
+docker = true
+deploy = "persist"
+"#,
+        )
+        .expect("parse");
+
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+        assert_eq!(panel.edit_remote_hosts.len(), 2);
+        assert_eq!(panel.edit_remote_hosts[0].user, "yj");
+
+        // Rename the ssh host, drop the container, add a fresh entry whose
+        // user needs the empty→None and trim treatment.
+        panel.edit_remote_hosts[0].host.name = "builder".to_string();
+        panel.edit_remote_hosts.remove(1);
+        let mut added = RemoteHostDraft::template();
+        added.host.host = "staging".to_string();
+        added.user = " deploy ".to_string();
+        panel.edit_remote_hosts.push(added);
+        let mut blank = RemoteHostDraft::template();
+        blank.host.host = "docker-box".to_string();
+        blank.host.docker = true;
+        blank.user = "   ".to_string();
+        panel.edit_remote_hosts.push(blank);
+
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+
+        assert_eq!(applied.remote_hosts.len(), 3);
+        assert_eq!(applied.remote_hosts[0].display_name(), "builder");
+        // A field the tab does not surface must ride through unmodified.
+        assert_eq!(applied.remote_hosts[0].ssh_args, ["-p", "22"]);
+        assert_eq!(applied.remote_hosts[1].host, "staging");
+        assert_eq!(applied.remote_hosts[1].user.as_deref(), Some("deploy"));
+        assert_eq!(applied.remote_hosts[1].deploy, "persist");
+        assert_eq!(applied.remote_hosts[2].user, None);
+        assert!(applied.remote_hosts[2].docker);
+        assert!(applied.remote_hosts.iter().all(|h| h.validate().is_ok()));
+
+        // The same serialization Config::save() performs must bring the
+        // entries back intact.
+        let serialized = toml::to_string_pretty(&applied).expect("serialize");
+        let reparsed: Config = toml::from_str(&serialized).expect("reparse");
+        assert_eq!(reparsed.remote_hosts, applied.remote_hosts);
     }
 }

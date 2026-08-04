@@ -311,17 +311,23 @@ session:
 
 ```toml
 [[remote_hosts]]
-name = "myubuntu"
-host = "myubuntu"
-docker = true
-deploy = "incognito"
-
-[[remote_hosts]]
+name = "devbox"
 host = "dev.example.com"
 user = "yj"
-ssh_args = ["-p", "2222"]
+deploy = "persist"
+ssh_args = ["-p", "22"]
+
+[[remote_hosts]]
+name = "myubuntu"
+host = "myubuntu"      # a running container's name
+docker = true
 deploy = "persist"
 ```
+
+The Remote tab of the Settings panel adds and removes these entries without
+editing the file by hand; the less common fields (`ssh_args`, `session`,
+`remote_shell`, `deploy_artifact`) stay config-file only and survive the panel
+untouched.
 
 `deploy = "off"` (the default) connects plainly and runs `remote_shell`
 (default `jsh`) as found on the destination. `"persist"` and `"incognito"`
