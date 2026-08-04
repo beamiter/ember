@@ -2161,3 +2161,19 @@ fn application_cursor_keys_switch_the_arrow_encoding() {
     terminal.process_input(b"\x1b[?1h");
     assert_eq!(terminal.click_cursor_move(0, 11, true), b"\x1bOD".to_vec());
 }
+
+#[test]
+fn a_terminal_inside_its_mutex_is_not_at_the_mutex_address() {
+    // Click-to-place-cursor tags its bytes with the address of the
+    // `&mut TerminalState` the renderer holds, and the router finds the owning
+    // session by that tag. Matching it against `Arc::as_ptr` — the address of
+    // the `Mutex` — silently dropped every move, because the payload does not
+    // start at the lock. `data_ptr()` is the one that lines up.
+    let terminal = std::sync::Arc::new(parking_lot::Mutex::new(TerminalState::new(8, 2)));
+    let mutex_address = std::sync::Arc::as_ptr(&terminal) as usize;
+    let payload_address = terminal.data_ptr() as usize;
+    assert_ne!(mutex_address, payload_address);
+
+    let guard = terminal.lock();
+    assert_eq!(&*guard as *const TerminalState as usize, payload_address);
+}

@@ -1637,11 +1637,16 @@ impl TerminalApp {
         let mut had_input = false;
         let mut overflow = false;
         for (target, bytes) in tagged_moves {
+            // `data_ptr`, not `Arc::as_ptr`: the tag is taken at render time
+            // from the `&mut TerminalState` the renderer holds, which is the
+            // mutex's *contents*. Comparing it against the address of the
+            // `Mutex` itself never matched, and every click-to-cursor move was
+            // silently dropped here.
             let routed = self
                 .session_manager
                 .sessions_mut()
                 .iter_mut()
-                .find(|session| Arc::as_ptr(&session.terminal) as usize == target);
+                .find(|session| session.terminal.data_ptr() as usize == target);
             if let Some(session) = routed {
                 had_input = true;
                 overflow |= !session.queue_input(&bytes);
