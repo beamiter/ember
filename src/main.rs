@@ -1,5 +1,6 @@
 mod agent_panel;
 mod app;
+mod block_mode;
 mod bottom_bar;
 mod clipboard;
 mod color;
@@ -1838,6 +1839,7 @@ impl TerminalApp {
         renderer.opacity = cfg.opacity;
         renderer.font_ligatures = cfg.font_ligatures;
         renderer.click_moves_cursor = cfg.click_moves_cursor;
+        renderer.block_mode = cfg.block_mode;
         renderer.gpu_rendering = cfg.gpu_rendering;
         renderer.wgpu_render_state = wgpu_render_state.clone();
 
@@ -1920,6 +1922,7 @@ impl TerminalApp {
                 sb
             },
             command_sidebar: Default::default(),
+            block_selection: None,
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
@@ -2004,6 +2007,7 @@ impl TerminalApp {
         self.renderer.opacity = self.config.opacity;
         self.renderer.font_ligatures = self.config.font_ligatures;
         self.renderer.click_moves_cursor = self.config.click_moves_cursor;
+        self.renderer.block_mode = self.config.block_mode;
         self.renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
         self.renderer.sync_font_metrics(ctx);
         self.renderer.invalidate_font_cache();
@@ -2017,6 +2021,7 @@ impl TerminalApp {
             renderer.opacity = self.config.opacity;
             renderer.font_ligatures = self.config.font_ligatures;
             renderer.click_moves_cursor = self.config.click_moves_cursor;
+            renderer.block_mode = self.config.block_mode;
             renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
             renderer.sync_font_metrics(ctx);
             renderer.invalidate_font_cache();
@@ -3001,6 +3006,12 @@ impl eframe::App for TerminalApp {
         }
 
         let has_keyboard_input = !self.keyboard_input_buffer.is_empty();
+
+        // 真实键盘输入送往 PTY 时丢弃 block 选中（jterm1 先例：真实输入
+        // 清除选中；不劫持 Escape）。
+        if has_keyboard_input {
+            self.block_selection = None;
+        }
 
         // 有输入活动时更新最后活动时间
         if has_keyboard_input || has_cursor_move_input {

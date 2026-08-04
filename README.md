@@ -201,6 +201,11 @@ show_repo_strip = true
 # Family-wide bottom status bar: working directory, git branch, last command
 # status/duration, grid size and tab position. Same key in every jterm.
 bottom_bar = true
+
+# Command-block chrome (Warp-style): a colored gutter stripe, separator and
+# outcome badge per OSC 133 command block. The block:* palette commands
+# (jump to first failure, copy, recall) keep working when this is off.
+block_mode = true
 ```
 
 The Settings panel exposes the same clipboard and paste-confirmation policies

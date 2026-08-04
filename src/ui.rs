@@ -447,6 +447,15 @@ fn xterm_encode_modify_other_keys(
     }
 }
 
+/// Per-frame owned snapshot of one visible command block, used for both the
+/// gutter click hit test and the chrome painting.
+struct BlockChromeEntry {
+    id: String,
+    span: crate::block_mode::VisibleBlockSpan,
+    outcome: crate::block_mode::BlockOutcome,
+    duration_ms: Option<u64>,
+}
+
 pub struct TerminalRenderer {
     pub font_size: f32,
     pub char_width: f32,
@@ -473,6 +482,16 @@ pub struct TerminalRenderer {
     pub font_ligatures: bool,
     /// Whether a plain click places the shell's edit cursor (`click_moves_cursor`)
     pub click_moves_cursor: bool,
+    /// Whether to draw command-block chrome (`block_mode`): gutter stripes,
+    /// separators and outcome badges derived from OSC 133 records.
+    pub block_mode: bool,
+    /// Record id of the app-selected block for the terminal this renderer is
+    /// about to draw. Set by the app each frame; an id that matches no record
+    /// simply draws nothing (selection must never dangle).
+    pub selected_block_id: Option<String>,
+    /// Block-mode hit-test outcome of this frame's click, drained by the app
+    /// the way `cursor_move_input` is.
+    pub block_click: Option<crate::block_mode::BlockClick>,
     /// Whether to use GPU-accelerated grid rendering
     pub gpu_rendering: bool,
     /// wgpu render state for GPU-accelerated grid rendering
@@ -561,6 +580,9 @@ impl TerminalRenderer {
             opacity: 1.0,
             font_ligatures: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
+            block_mode: true,
+            selected_block_id: None,
+            block_click: None,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             texture_cache_bytes: 0,
@@ -919,6 +941,216 @@ impl TerminalRenderer {
         (content_rect, scrollbar_rect)
     }
 
+    /// Snapshot the visible command blocks, or `None` when chrome must not be
+    /// drawn: `block_mode` is off, the pane is on the alternate screen, or
+    /// visible scrollback was reflowed after a width change (the same gate
+    /// search overlays use, via `viewport_buffer_mapping_is_exact`).
+    fn compute_block_chrome(
+        &self,
+        terminal: &TerminalState,
+        rows: usize,
+    ) -> Option<Vec<BlockChromeEntry>> {
+        if !self.block_mode
+            || terminal.is_alt_buffer_active()
+            || !terminal.viewport_buffer_mapping_is_exact()
+        {
+            return None;
+        }
+        let records = terminal.command_records();
+        if records.is_empty() {
+            return None;
+        }
+        // Normalize pending-wrap anchors (`column == cols`): the prompt
+        // renders on the row after the one the anchor names.
+        let cols = terminal.grid.row_len();
+        let prompt_line_ids: Vec<u64> = records
+            .iter()
+            .map(|record| {
+                crate::block_mode::prompt_row_line_id(
+                    record.prompt_start.line_id,
+                    record.prompt_start.column,
+                    cols,
+                )
+            })
+            .collect();
+        let spans = crate::block_mode::visible_block_spans(
+            &prompt_line_ids,
+            terminal.viewport_top_line_id(),
+            rows,
+        );
+        let newest = records.len() - 1;
+        Some(
+            spans
+                .into_iter()
+                .map(|span| {
+                    let record = &records[span.record_index];
+                    BlockChromeEntry {
+                        id: record.id.clone(),
+                        outcome: crate::block_mode::classify_outcome(
+                            record.command.as_deref(),
+                            record.exit_code,
+                            record.state,
+                            record.complete,
+                            span.record_index == newest,
+                        ),
+                        duration_ms: record.duration_ms,
+                        span,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Outcome → theme color, using the same sources the bottom bar maps
+    /// `Tone::Positive`/`Negative` to (ANSI green/red), the cursor accent for
+    /// the running block, and disabled text for background/unknown.
+    fn block_outcome_color(&self, outcome: crate::block_mode::BlockOutcome) -> Color32 {
+        use crate::block_mode::BlockOutcome;
+        match outcome {
+            BlockOutcome::Success => {
+                crate::theme::Theme::rgb_to_color32(self.theme.terminal.ansi_colors[2])
+            }
+            BlockOutcome::Failed(_) => {
+                crate::theme::Theme::rgb_to_color32(self.theme.terminal.ansi_colors[1])
+            }
+            BlockOutcome::Running => self.theme.cursor_color(),
+            BlockOutcome::Prompt | BlockOutcome::Background | BlockOutcome::Unknown => {
+                crate::theme::Theme::rgb_to_color32(self.theme.ui.text_disabled)
+            }
+        }
+    }
+
+    /// Paint all block chrome for one pane with plain painter calls, the way
+    /// the pane header and bottom bar draw. Never touches the grid instances.
+    fn draw_block_chrome(
+        &self,
+        painter: &egui::Painter,
+        entries: &[BlockChromeEntry],
+        grid: &[Vec<crate::terminal::TerminalCell>],
+        content_rect: egui::Rect,
+        char_width: f32,
+        line_height: f32,
+    ) {
+        use crate::block_mode::{self, BlockOutcome};
+        const BADGE_PAD_X: f32 = 4.0;
+        const BADGE_PAD_Y: f32 = 1.0;
+        const BADGE_RIGHT_MARGIN: f32 = 4.0;
+
+        let separator_color = {
+            let [r, g, b] = self.theme.ui.text_disabled;
+            Color32::from_rgba_unmultiplied(r, g, b, 56)
+        };
+        let badge_bg = {
+            let [r, g, b] = self.theme.tabbar.bg;
+            Color32::from_rgba_unmultiplied(r, g, b, 220)
+        };
+        let badge_font = FontId::proportional(11.0);
+
+        for entry in entries {
+            let selected = self.selected_block_id.as_deref() == Some(entry.id.as_str());
+            let (top_y, _) = snapped_span(content_rect.top(), entry.span.first_row, line_height);
+            let (last_y, last_height) =
+                snapped_span(content_rect.top(), entry.span.last_row, line_height);
+            let bottom_y = last_y + last_height;
+
+            // 1px separator on the block's first row — only when that row
+            // really is the prompt row, not a clipped continuation.
+            if entry.span.starts_in_viewport {
+                painter.hline(
+                    content_rect.left()..=content_rect.right(),
+                    top_y + 0.5,
+                    egui::Stroke::new(1.0, separator_color),
+                );
+            }
+
+            // Gutter stripe over the block's visible rows. The live prompt
+            // block gets no stripe (separator only).
+            if entry.outcome != BlockOutcome::Prompt {
+                let color = self.block_outcome_color(entry.outcome);
+                let (width, alpha) = if selected {
+                    (block_mode::GUTTER_STRIPE_SELECTED_WIDTH, 255)
+                } else {
+                    (block_mode::GUTTER_STRIPE_WIDTH, 170)
+                };
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(content_rect.left(), top_y),
+                        egui::pos2(content_rect.left() + width, bottom_y),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+                );
+            }
+
+            // Selected block: 1px outline around its visible row span.
+            if selected {
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(
+                        egui::pos2(content_rect.left(), top_y),
+                        egui::pos2(content_rect.right(), bottom_y),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(1.0, self.block_outcome_color(entry.outcome)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            // Right-aligned outcome badge on the first row, drawn only when
+            // every cell it would cover is blank — never over prompt text.
+            if !entry.span.starts_in_viewport {
+                continue;
+            }
+            let Some(text) = block_mode::badge_text(entry.outcome, entry.duration_ms) else {
+                continue;
+            };
+            let color = self.block_outcome_color(entry.outcome);
+            let galley = painter.layout_no_wrap(text, badge_font.clone(), color);
+            let text_size = galley.size();
+            let bg_size = egui::vec2(
+                text_size.x + 2.0 * BADGE_PAD_X,
+                text_size.y + 2.0 * BADGE_PAD_Y,
+            );
+            if bg_size.y > line_height {
+                continue; // 小字号下徽章会溢出到下一行,整个跳过。
+            }
+            let bg_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    content_rect.right() - BADGE_RIGHT_MARGIN - bg_size.x,
+                    top_y + ((line_height - bg_size.y).max(0.0)) / 2.0,
+                ),
+                bg_size,
+            );
+            if bg_rect.left() < content_rect.left() || char_width <= 0.0 {
+                continue; // 内容区太窄,放不下徽章。
+            }
+            let start_col = ((bg_rect.left() - content_rect.left()) / char_width).floor() as usize;
+            // Map wide-char continuation cells to a non-blank marker so the
+            // badge never paints over half a glyph.
+            let row_chars: Vec<char> = grid
+                .get(entry.span.first_row)
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| {
+                            if cell.flags.wide_continuation() {
+                                '\u{fffd}'
+                            } else {
+                                cell.character
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if block_mode::badge_covers_only_blank_cells(&row_chars, start_col) {
+                painter.rect_filled(bg_rect, 3.0, badge_bg);
+                painter.galley(
+                    bg_rect.min + egui::vec2(BADGE_PAD_X, BADGE_PAD_Y),
+                    galley,
+                    color,
+                );
+            }
+        }
+    }
+
     fn scrollbar_thumb_height(visible_lines: usize, total_lines: usize, track_height: f32) -> f32 {
         if total_lines == 0 || !track_height.is_finite() || track_height <= 0.0 {
             return 0.0;
@@ -1084,6 +1316,10 @@ impl TerminalRenderer {
 
         let (content_rect, scrollbar_rect) = self.layout_rects(rect);
         self.last_content_rect = Some(content_rect);
+        // Owned per-frame snapshot of visible command blocks, shared by the
+        // gutter hit test below and the chrome painting after the grid.
+        // `None` while chrome is gated off (config, alt screen, reflow).
+        let block_chrome = self.compute_block_chrome(terminal, rows);
         let cursor_pos = terminal.get_cursor_pos();
         let ime_rect = cursor_rect(
             content_rect,
@@ -1268,7 +1504,7 @@ impl TerminalRenderer {
         // clicks replace it in their dedicated handlers below.
         let click_pos = response.interact_pointer_pos();
         let pointer_in_content = click_pos.is_some_and(|pos| pos.x < scrollbar_x);
-        if interaction_enabled
+        let plain_content_click = interaction_enabled
             && should_clear_selection_on_click(
                 local_selection_enabled,
                 ui.input(|input| input.modifiers.ctrl),
@@ -1277,8 +1513,47 @@ impl TerminalRenderer {
                 response.triple_clicked(),
                 self.dragging_scrollbar,
                 pointer_in_content,
-            )
-        {
+            );
+        // Block-mode gutter hit test: a plain click inside the narrow band at
+        // the content left edge selects the block on that row and consumes
+        // the click (no cursor move). Only stripe-bearing blocks are
+        // selectable; on the live prompt block (Prompt/Editing — exactly
+        // where click-to-place-cursor matters) the click falls through to
+        // normal handling.
+        let gutter_selected_block = if plain_content_click {
+            click_pos
+                .filter(|pos| {
+                    pos.x >= content_rect.left()
+                        && pos.x < content_rect.left() + crate::block_mode::GUTTER_CLICK_BAND_PX
+                })
+                .and_then(|pos| {
+                    let entries = block_chrome.as_ref()?;
+                    let (row, _) = grid_position_from_content(
+                        pos,
+                        content_rect,
+                        char_width,
+                        line_height,
+                        cols,
+                        rows,
+                    );
+                    entries
+                        .iter()
+                        .find(|entry| entry.span.first_row <= row && row <= entry.span.last_row)
+                        .filter(|entry| entry.outcome != crate::block_mode::BlockOutcome::Prompt)
+                        .map(|entry| entry.id.clone())
+                })
+        } else {
+            None
+        };
+        if let Some(id) = gutter_selected_block {
+            // A consumed gutter click still dismisses the text selection, so
+            // a stale highlight cannot survive and be copied later.
+            terminal.selection = None;
+            self.block_click = Some(crate::block_mode::BlockClick::Select(id));
+        } else if plain_content_click {
+            // Any other plain content click drops the app-level block
+            // selection along with the local text selection.
+            self.block_click = Some(crate::block_mode::BlockClick::Clear);
             terminal.selection = None;
 
             if let Some(pos) = click_pos {
@@ -1321,6 +1596,9 @@ impl TerminalRenderer {
                         0
                     };
                     terminal.select_line_at(row);
+                    // Replacing the text selection drops the block selection
+                    // too, like any other real content interaction.
+                    self.block_click = Some(crate::block_mode::BlockClick::Clear);
                 }
             }
         // Double-click: select word at cursor position
@@ -1347,6 +1625,8 @@ impl TerminalRenderer {
                         0
                     };
                     terminal.select_word_at(row, col);
+                    // 同上:双击换选中也一并清掉 block 选中。
+                    self.block_click = Some(crate::block_mode::BlockClick::Clear);
                 }
             }
         }
@@ -1495,6 +1775,20 @@ impl TerminalRenderer {
             line_height,
             KittyImageLayer::AboveText,
         );
+
+        // Command-block chrome (gutter stripes, separators, outcome badges).
+        // Painter overlays recomputed every frame, drawn after the grid so
+        // they never interact with the GPU path's dirty tracking.
+        if let Some(entries) = &block_chrome {
+            self.draw_block_chrome(
+                &painter,
+                entries,
+                &grid,
+                content_rect,
+                char_width,
+                line_height,
+            );
+        }
 
         // Render cursor - direct O(1) positioning instead of full grid scan
         if cursor_visible && cursor_pos.0 < rows && cursor_pos.1 < cols {

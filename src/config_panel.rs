@@ -106,6 +106,7 @@ pub struct ConfigPanel {
     edit_notify_long_block_threshold_ms: u64,
     edit_show_repo_strip: bool,
     edit_bottom_bar: bool,
+    edit_block_mode: bool,
     edit_ai_enabled: bool,
     edit_ai_provider: String,
     edit_ai_model: String,
@@ -166,6 +167,7 @@ impl ConfigPanel {
             edit_notify_long_block_threshold_ms: 10_000,
             edit_show_repo_strip: true,
             edit_bottom_bar: jterm_core::bottom_bar::ENABLED_BY_DEFAULT,
+            edit_block_mode: true,
             edit_ai_enabled: false,
             edit_ai_provider: "anthropic".to_string(),
             edit_ai_model: String::new(),
@@ -252,6 +254,7 @@ impl ConfigPanel {
         self.edit_notify_long_block_threshold_ms = config.notify_long_block_threshold_ms;
         self.edit_show_repo_strip = config.show_repo_strip;
         self.edit_bottom_bar = config.bottom_bar;
+        self.edit_block_mode = config.block_mode;
         self.edit_ai_enabled = config.ai_enabled;
         self.edit_ai_provider = config.ai_provider.clone();
         self.edit_ai_model = config.ai_model.clone();
@@ -298,6 +301,7 @@ impl ConfigPanel {
         config.notify_long_block_threshold_ms = self.edit_notify_long_block_threshold_ms;
         config.show_repo_strip = self.edit_show_repo_strip;
         config.bottom_bar = self.edit_bottom_bar;
+        config.block_mode = self.edit_block_mode;
         config.ai_enabled = self.edit_ai_enabled;
         config.ai_provider = self.edit_ai_provider.clone();
         config.ai_model = self.edit_ai_model.trim().to_string();
@@ -1280,6 +1284,16 @@ impl ConfigPanel {
             .checkbox(
                 &mut self.edit_bottom_bar,
                 "Show the bottom status bar (cwd, git, last command)",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+
+        if ui
+            .checkbox(
+                &mut self.edit_block_mode,
+                "Show command-block chrome (gutter stripes, outcome badges)",
             )
             .changed()
         {

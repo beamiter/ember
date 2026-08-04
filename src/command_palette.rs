@@ -240,6 +240,31 @@ impl CommandPalette {
                 "Jump to the next shell command mark",
                 crate::keybindings::Command::TerminalJumpNextMark,
             ),
+            // === 命令块（block mode）===
+            CommandInfo::new(
+                "Jump to First Failed Block",
+                CommandCategory::Terminal,
+                "Select and reveal the oldest command that exited nonzero",
+                crate::keybindings::Command::BlockJumpFirstFailed,
+            ),
+            CommandInfo::new(
+                "Copy Block Command",
+                CommandCategory::Terminal,
+                "Copy the selected (or most recent) command block's command text",
+                crate::keybindings::Command::BlockCopyCommand,
+            ),
+            CommandInfo::new(
+                "Copy Block Output",
+                CommandCategory::Terminal,
+                "Copy the selected (or most recent) command block's output",
+                crate::keybindings::Command::BlockCopyOutput,
+            ),
+            CommandInfo::new(
+                "Recall Block Command",
+                CommandCategory::Terminal,
+                "Insert the selected (or latest) command at the prompt without running it",
+                crate::keybindings::Command::BlockRecallCommand,
+            ),
             CommandInfo::new(
                 "Split Vertically",
                 CommandCategory::Terminal,
@@ -643,6 +668,10 @@ mod tests {
             Command::TerminalScrollDown,
             Command::TerminalJumpPrevMark,
             Command::TerminalJumpNextMark,
+            Command::BlockJumpFirstFailed,
+            Command::BlockCopyCommand,
+            Command::BlockCopyOutput,
+            Command::BlockRecallCommand,
             Command::FontIncrease,
             Command::FontDecrease,
             Command::FontReset,

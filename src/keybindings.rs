@@ -40,6 +40,17 @@ pub enum Command {
     TerminalScrollDown,
     TerminalJumpPrevMark,
     TerminalJumpNextMark,
+
+    // === 命令块（block mode）===
+    /// 跳到最早一条 exit != 0 的命令块并选中它。
+    BlockJumpFirstFailed,
+    #[allow(clippy::enum_variant_names)]
+    BlockCopyCommand,
+    BlockCopyOutput,
+    /// 把选中/最近的命令放回提示符（只填入，绝不执行）。
+    #[allow(clippy::enum_variant_names)]
+    BlockRecallCommand,
+
     FontIncrease,
     FontDecrease,
     FontReset,
@@ -114,6 +125,10 @@ impl std::fmt::Display for Command {
             Command::TerminalScrollDown => write!(f, "terminal:scroll_down"),
             Command::TerminalJumpPrevMark => write!(f, "terminal:jump_prev_command"),
             Command::TerminalJumpNextMark => write!(f, "terminal:jump_next_command"),
+            Command::BlockJumpFirstFailed => write!(f, "block:jump_first_failed"),
+            Command::BlockCopyCommand => write!(f, "block:copy_command"),
+            Command::BlockCopyOutput => write!(f, "block:copy_output"),
+            Command::BlockRecallCommand => write!(f, "block:recall_command"),
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
@@ -176,6 +191,10 @@ impl std::str::FromStr for Command {
             "terminal:scroll_down" => Ok(Command::TerminalScrollDown),
             "terminal:jump_prev_command" => Ok(Command::TerminalJumpPrevMark),
             "terminal:jump_next_command" => Ok(Command::TerminalJumpNextMark),
+            "block:jump_first_failed" => Ok(Command::BlockJumpFirstFailed),
+            "block:copy_command" => Ok(Command::BlockCopyCommand),
+            "block:copy_output" => Ok(Command::BlockCopyOutput),
+            "block:recall_command" => Ok(Command::BlockRecallCommand),
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
@@ -386,6 +405,12 @@ impl KeyBindings {
             "ctrl+shift+down".to_string(),
             "terminal:jump_next_command".to_string(),
         );
+        // 跳到最早的失败命令块,与 jterm1/jterm4 的 filter_failed_blocks
+        // 同键位。其余 block:* 命令默认不绑定,走命令面板。
+        bindings.bindings.insert(
+            "ctrl+shift+x".to_string(),
+            "block:jump_first_failed".to_string(),
+        );
         // Keep font zoom in the same configurable command path as every other
         // keyboard shortcut. Different keyboard layouts can report `+` either
         // with or without Shift, while `Ctrl+=` is the conventional spelling.
@@ -545,6 +570,10 @@ mod tests {
             Command::OpacityDecrease,
             Command::CommandPaletteToggle,
             Command::HelpToggle,
+            Command::BlockJumpFirstFailed,
+            Command::BlockCopyCommand,
+            Command::BlockCopyOutput,
+            Command::BlockRecallCommand,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
@@ -581,6 +610,7 @@ mod tests {
             ("ctrl+alt+=", Command::OpacityIncrease),
             ("ctrl+alt+-", Command::OpacityDecrease),
             ("f12", Command::DebugToggle),
+            ("ctrl+shift+x", Command::BlockJumpFirstFailed),
         ];
         for (key, command) in expected {
             assert_eq!(

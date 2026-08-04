@@ -2052,6 +2052,14 @@ impl super::TerminalState {
         Some((absolute_row, anchor.column))
     }
 
+    /// Monotonic line id of the top visible viewport row. Only a meaningful
+    /// per-row mapping when [`Self::viewport_buffer_mapping_is_exact`]; block
+    /// chrome shares that gate with search overlays.
+    pub fn viewport_top_line_id(&self) -> u64 {
+        self.total_lines_scrolled
+            .saturating_sub(self.scroll_offset as u64)
+    }
+
     /// Whether raw scrollback rows and the currently rendered visual rows have
     /// a one-to-one coordinate mapping. Historical lines are reflowed lazily
     /// after a width change; until the terminal model exposes per-cell origins,

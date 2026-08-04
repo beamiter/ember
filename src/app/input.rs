@@ -283,7 +283,8 @@ impl TerminalApp {
                     false,
                     &mut self.pending_paste_confirm,
                 ) {
-                    Ok(true) => {}
+                    // 粘贴也是用户字节:与键盘输入一样丢弃 block 选中。
+                    Ok(true) => self.block_selection = None,
                     Ok(false) => self.set_status("Clipboard contains no text"),
                     Err(error) => self.set_status_for(
                         format!("Paste failed: {error}"),
@@ -468,6 +469,10 @@ impl TerminalApp {
                     self.set_status("No next command mark");
                 }
             }
+            keybindings::Command::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            keybindings::Command::BlockCopyCommand => self.block_copy_command(),
+            keybindings::Command::BlockCopyOutput => self.block_copy_output(),
+            keybindings::Command::BlockRecallCommand => self.block_recall_command(),
             keybindings::Command::FontIncrease => {
                 self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")
             }
@@ -1019,6 +1024,10 @@ impl TerminalApp {
                         crate::debug_log!("[IME] Commit: {:?}", text);
                         terminal.clear_preedit();
                         drop(terminal);
+                        if !text.is_empty() {
+                            // IME 提交同样是送往 PTY 的真实输入:清 block 选中。
+                            self.block_selection = None;
+                        }
                         if !text.is_empty() && !session.queue_input(text.as_bytes()) {
                             log::warn!("terminal input retry buffer full; IME commit retained by neither PTY nor UI");
                             self.status_message =

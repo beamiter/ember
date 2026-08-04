@@ -747,6 +747,130 @@ impl TerminalApp {
         }
     }
 
+    /// The current block selection as a sidebar-style target, or `None` when
+    /// it dangles (session closed or record evicted) — never a panic.
+    fn live_block_target(&self) -> Option<CommandTarget> {
+        let (session_id, record_id) = self.block_selection.as_ref()?;
+        let session = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| &session.metadata.session_id == session_id)?;
+        session
+            .terminal
+            .lock()
+            .command_record(record_id)
+            .is_some()
+            .then(|| CommandTarget {
+                session_id: session_id.clone(),
+                execution_id: record_id.clone(),
+            })
+    }
+
+    /// Fallback target for `block:*` commands without a live selection: the
+    /// most recent complete record of the active session that satisfies
+    /// `wanted` (a command to copy/recall, or output to copy).
+    fn latest_block_target(
+        &mut self,
+        wanted: impl Fn(&crate::terminal::CommandRecord) -> bool,
+    ) -> Option<CommandTarget> {
+        let session = self.session_manager.get_active_session_mut();
+        let session_id = session.metadata.session_id.clone();
+        let terminal = session.terminal.lock();
+        terminal
+            .command_records()
+            .iter()
+            .rev()
+            .find(|record| record.complete && wanted(record))
+            .map(|record| CommandTarget {
+                session_id,
+                execution_id: record.id.clone(),
+            })
+    }
+
+    fn record_has_command(record: &crate::terminal::CommandRecord) -> bool {
+        record
+            .command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty())
+    }
+
+    fn record_has_output(record: &crate::terminal::CommandRecord) -> bool {
+        record
+            .captured_output
+            .as_ref()
+            .is_some_and(|output| !output.text.is_empty())
+            || record
+                .output_start
+                .zip(record.output_end)
+                .is_some_and(|(start, end)| end > start)
+    }
+
+    /// `block:jump_first_failed`: select and reveal the OLDEST record that
+    /// exited nonzero in the active session.
+    pub(crate) fn block_jump_first_failed(&mut self) {
+        let target = {
+            let session = self.session_manager.get_active_session_mut();
+            let session_id = session.metadata.session_id.clone();
+            let terminal = session.terminal.lock();
+            crate::block_mode::oldest_failed_index(
+                terminal
+                    .command_records()
+                    .iter()
+                    .map(|record| record.exit_code),
+            )
+            .and_then(|index| terminal.command_records().get(index))
+            .map(|record| CommandTarget {
+                session_id,
+                execution_id: record.id.clone(),
+            })
+        };
+        let Some(target) = target else {
+            self.set_status("No failed command in this session");
+            return;
+        };
+        self.block_selection = Some((target.session_id.clone(), target.execution_id.clone()));
+        self.jump_to_sidebar_command(&target);
+    }
+
+    /// `block:copy_command`: copy the selected block's command, falling back
+    /// to the most recent complete record with one.
+    pub(crate) fn block_copy_command(&mut self) {
+        let target = self
+            .live_block_target()
+            .or_else(|| self.latest_block_target(Self::record_has_command));
+        match target {
+            Some(target) => self.copy_sidebar_command_text(&target, CopyKind::Command),
+            None => self.set_status("No command block to copy from"),
+        }
+    }
+
+    /// `block:copy_output`: copy the selected block's output (captured text,
+    /// or extracted from its output anchors), falling back to the most recent
+    /// complete record with output.
+    pub(crate) fn block_copy_output(&mut self) {
+        let target = self
+            .live_block_target()
+            .or_else(|| self.latest_block_target(Self::record_has_output));
+        match target {
+            Some(target) => self.copy_sidebar_command_text(&target, CopyKind::Output),
+            None => self.set_status("No command block with output to copy"),
+        }
+    }
+
+    /// `block:recall_command`: insert (never execute) the selected/latest
+    /// command at the prompt, through the sidebar Fill action's prompt-ready
+    /// guard machinery.
+    pub(crate) fn block_recall_command(&mut self) {
+        let target = self
+            .live_block_target()
+            .or_else(|| self.latest_block_target(Self::record_has_command));
+        match target {
+            Some(target) => self.replay_sidebar_command(&target, false),
+            None => self.set_status("No command block to recall"),
+        }
+    }
+
     fn replay_sidebar_command(&mut self, target: &CommandTarget, run: bool) {
         let Some(index) = self.target_session_index(target) else {
             self.set_status("Command session is no longer available");

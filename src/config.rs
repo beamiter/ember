@@ -251,6 +251,12 @@ pub struct Config {
     #[serde(default = "default_click_moves_cursor")]
     pub click_moves_cursor: bool,
 
+    /// 命令块 chrome(默认开启):按 OSC 133 记录绘制每个命令块的侧边条纹、
+    /// 分隔线与结果徽章,与 jterm1/jterm4 的 block UI 一致。关闭后
+    /// `block:*` 命令(跳转/复制/召回)仍然可用。
+    #[serde(default = "default_block_mode")]
+    pub block_mode: bool,
+
     /// Why this run could not use the on-disk config, if it exists but could
     /// not be read or parsed. Never serialized: it describes the load attempt,
     /// not a user setting.
@@ -281,6 +287,10 @@ fn default_bottom_bar() -> bool {
 
 fn default_click_moves_cursor() -> bool {
     jterm_core::click_cursor::ENABLED_BY_DEFAULT
+}
+
+fn default_block_mode() -> bool {
+    true
 }
 
 fn default_notify_long_block_threshold_ms() -> u64 {
@@ -482,6 +492,7 @@ impl Default for Config {
             show_repo_strip: true,
             bottom_bar: default_bottom_bar(),
             click_moves_cursor: default_click_moves_cursor(),
+            block_mode: default_block_mode(),
             load_error: None,
             revision: None,
         }
@@ -937,6 +948,15 @@ mod tests {
         let config: Config =
             toml::from_str("click_moves_cursor = false\n").expect("override parses");
         assert!(!config.click_moves_cursor);
+    }
+
+    #[test]
+    fn block_mode_defaults_on_and_can_be_disabled() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        assert!(config.block_mode);
+
+        let config: Config = toml::from_str("block_mode = false\n").expect("override parses");
+        assert!(!config.block_mode);
     }
 
     #[test]

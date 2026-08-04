@@ -64,6 +64,7 @@ impl TerminalApp {
             renderer.opacity = self.renderer.opacity;
             renderer.font_ligatures = self.renderer.font_ligatures;
             renderer.click_moves_cursor = self.renderer.click_moves_cursor;
+            renderer.block_mode = self.renderer.block_mode;
             renderer.gpu_rendering = self.renderer.gpu_rendering;
             renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
             renderer.sync_font_metrics(ctx);
@@ -387,6 +388,10 @@ impl TerminalApp {
             self.force_resize_session = false;
         }
 
+        // Block-mode gutter clicks reported by whichever renderer drew the
+        // clicked pane this frame, applied after every pane has rendered.
+        let mut pending_block_click: Option<(String, crate::block_mode::BlockClick)> = None;
+
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
         if self.layout().panes().len() > 1 {
             // 获取所有窗格信息
@@ -460,6 +465,13 @@ impl TerminalApp {
                         &None
                     };
 
+                    // 本 pane 的会话若持有 block 选中,让 renderer 高亮它。
+                    renderer.selected_block_id = self
+                        .block_selection
+                        .as_ref()
+                        .filter(|(session_id, _)| session_id == &session.metadata.session_id)
+                        .map(|(_, record_id)| record_id.clone());
+
                     // 在指定矩形内渲染（多窗格模式专用方法）
                     renderer.render_in_rect(
                         ui,
@@ -472,6 +484,10 @@ impl TerminalApp {
                         pane_hovered_link,
                         content_rect,
                     );
+
+                    if let Some(click) = renderer.block_click.take() {
+                        pending_block_click = Some((session.metadata.session_id.clone(), click));
+                    }
                 }
             }
 
@@ -620,6 +636,12 @@ impl TerminalApp {
             // 单窗格渲染（原有逻辑）
             {
                 let session = self.session_manager.get_active_session_mut();
+                let session_id = session.metadata.session_id.clone();
+                self.renderer.selected_block_id = self
+                    .block_selection
+                    .as_ref()
+                    .filter(|(selected_session, _)| selected_session == &session_id)
+                    .map(|(_, record_id)| record_id.clone());
                 let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                 let mut terminal_guard = session.terminal.lock();
 
@@ -649,6 +671,21 @@ impl TerminalApp {
                     &self.cached_links,
                     &self.hovered_link,
                 );
+                drop(terminal_guard);
+                if let Some(click) = self.renderer.block_click.take() {
+                    pending_block_click = Some((session_id, click));
+                }
+            }
+        }
+
+        if let Some((session_id, click)) = pending_block_click {
+            match click {
+                crate::block_mode::BlockClick::Select(record_id) => {
+                    self.block_selection = Some((session_id, record_id));
+                }
+                crate::block_mode::BlockClick::Clear => {
+                    self.block_selection = None;
+                }
             }
         }
     }

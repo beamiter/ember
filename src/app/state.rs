@@ -176,6 +176,11 @@ pub struct TerminalApp {
     // Semantic command timeline sidebar
     pub command_sidebar: CommandSidebarState,
 
+    /// Block mode 当前选中的命令块：(session_id, record id)。record 被淘汰
+    /// 或 session 关闭时一律按“无选中”处理（绝不 panic）；真实键盘输入
+    /// 送往 PTY 时清空（jterm1 先例）。
+    pub block_selection: Option<(String, String)>,
+
     // Find & Replace (operates on selection)
     pub search_replace_panel: search_replace_panel::SearchReplacePanel,
 
