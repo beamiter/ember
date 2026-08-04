@@ -5,6 +5,11 @@ use wgpu::util::DeviceExt;
 /// [`GridDrawSurface`].
 pub struct GridPipeline {
     pipeline: wgpu::RenderPipeline,
+    /// Foreground pipeline using dual-source blending, when the device offers
+    /// it. Per-channel (LCD subpixel) glyph alpha then survives over
+    /// transparent default-background cells; without it those glyphs collapse
+    /// to a single scalar alpha in [`Self::pipeline`].
+    foreground_dual_pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -102,7 +107,8 @@ impl GridPipeline {
             immediate_size: 0,
         });
 
-        let fs_entry = if target_format.is_srgb() {
+        let is_srgb = target_format.is_srgb();
+        let fs_entry = if is_srgb {
             eprintln!(
                 "[GPU] sRGB framebuffer {:?}, using fs_main_linear",
                 target_format
@@ -141,8 +147,78 @@ impl GridPipeline {
             cache: None,
         });
 
+        let foreground_dual_pipeline = if device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
+            eprintln!("[GPU] Dual-source blending available, using per-channel glyph alpha");
+            // The `enable` directive must precede all declarations, and a module
+            // containing it only validates on devices with the feature — hence a
+            // separate module built by concatenation instead of one shared source.
+            let dual_src = format!(
+                "enable dual_source_blending;\n\n{}\n{}",
+                shader_src,
+                include_str!("shader_fg_dual.wgsl")
+            );
+            let dual_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("grid_shader_fg_dual"),
+                source: wgpu::ShaderSource::Wgsl(dual_src.into()),
+            });
+            let dual_entry = if is_srgb {
+                "fs_fg_dual_linear"
+            } else {
+                "fs_fg_dual_gamma"
+            };
+            // final = src.color (premultiplied) + dst * (1 - src.mask), per channel.
+            let dual_blend = wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrc1Alpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            };
+            Some(
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("grid_pipeline_fg_dual"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &dual_module,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[CellInstance::vertex_buffer_layout()],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &dual_module,
+                        entry_point: Some(dual_entry),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend: Some(dual_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                }),
+            )
+        } else {
+            None
+        };
+
         GridPipeline {
             pipeline,
+            foreground_dual_pipeline,
             bind_group_layout,
         }
     }
@@ -203,6 +279,14 @@ impl GridPipeline {
 
     pub fn pipeline(&self) -> &wgpu::RenderPipeline {
         &self.pipeline
+    }
+
+    /// Pipeline for the foreground (glyph) pass: dual-source when the device
+    /// supports it, otherwise the shared single-source pipeline.
+    pub fn foreground_pipeline(&self) -> &wgpu::RenderPipeline {
+        self.foreground_dual_pipeline
+            .as_ref()
+            .unwrap_or(&self.pipeline)
     }
 }
 

@@ -1,7 +1,6 @@
 use super::font_backend::{
-    alpha_from_coverage, create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey,
-    DirtyRect, FontBackend, GlyphRegion, ShapedGlyph, GLYPH_PADDING, INITIAL_ATLAS_SIZE,
-    MAX_ATLAS_SIZE,
+    create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey, DirtyRect, FontBackend,
+    GlyphRegion, ShapedGlyph, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE,
 };
 use lru::LruCache;
 use std::collections::HashMap;
@@ -42,6 +41,50 @@ struct GidGlyphKey {
     gid: u16,
     bold: bool,
     subpixel_offset: u8,
+}
+
+/// Raster data handed to atlas placement: whole-pixel grayscale coverage, or
+/// fontdue's true 3x-horizontal subpixel RGB coverage (`width*3` bytes/row).
+enum RasterInput<'a> {
+    Gray(&'a [u8]),
+    Subpixel(&'a [u8]),
+}
+
+fn raster_input(use_subpixel: bool, bitmap: &[u8]) -> RasterInput<'_> {
+    if use_subpixel {
+        RasterInput::Subpixel(bitmap)
+    } else {
+        RasterInput::Gray(bitmap)
+    }
+}
+
+/// FreeType's default 5-tap LCD FIR filter (`FIR5 0x08 0x4D 0x56 0x4D 0x08`),
+/// run along the subpixel stream to suppress color fringing. The filter spills
+/// coverage one full pixel to each side, so the output is `width + 2` pixels
+/// wide (RGB triplets); callers must shift `bearing_x` left by one pixel.
+fn lcd_filter_expand(src: &[u8], width: usize, height: usize, weight_boost: f32) -> Vec<u8> {
+    const FIR: [u32; 5] = [8, 77, 86, 77, 8];
+    let out_w = width + 2;
+    let mut out = vec![0u8; out_w * 3 * height];
+    for y in 0..height {
+        let src_row = &src[y * width * 3..(y + 1) * width * 3];
+        let dst_row = &mut out[y * out_w * 3..(y + 1) * out_w * 3];
+        for (i, dst) in dst_row.iter_mut().enumerate() {
+            // Output subpixel i sits one pixel (3 subpixels) left of the input.
+            let center = i as i32 - 3;
+            let mut acc = 0u32;
+            for (k, &wt) in FIR.iter().enumerate() {
+                let s = center + k as i32 - 2;
+                if s >= 0 && (s as usize) < width * 3 {
+                    acc += wt * src_row[s as usize] as u32;
+                }
+            }
+            let coverage = ((acc + 128) / 256) as f32 / 255.0;
+            let boosted = (coverage * weight_boost).min(1.0);
+            *dst = (boosted * 255.0 + 0.5) as u8;
+        }
+    }
+    out
 }
 
 /// Owned shaping output kept after releasing the immutable font-face borrow.
@@ -321,18 +364,46 @@ impl FontdueAtlas {
     fn rasterize_and_place(
         &mut self,
         metrics: &fontdue::Metrics,
-        glyph_bitmap: &[u8],
+        input: RasterInput<'_>,
         bold: bool,
         key: AtlasGlyphKey,
     ) -> GlyphRegion {
-        let glyph_w = metrics.width as u32;
-        let glyph_h = metrics.height as u32;
+        let weight_boost = if bold { 1.0 } else { self.font_weight };
+        let region = self.place_glyph(metrics, input, weight_boost, key.subpixel_offset);
+        self.cache_insert(key, region);
+        region
+    }
 
-        if glyph_w == 0 || glyph_h == 0 {
-            let region = empty_glyph_region();
-            self.cache_insert(key, region);
-            return region;
+    /// Shared placement path for character and shaped-gid glyphs: filter (for
+    /// subpixel input), allocate atlas space, write raw coverage pixels and
+    /// compute the glyph region. The atlas stores *unboosted* linear coverage;
+    /// perceptual weight is restored by the luminance-corrected blend in the
+    /// fragment shader.
+    fn place_glyph(
+        &mut self,
+        metrics: &fontdue::Metrics,
+        input: RasterInput<'_>,
+        weight_boost: f32,
+        subpixel_offset: u8,
+    ) -> GlyphRegion {
+        if metrics.width == 0 || metrics.height == 0 {
+            return empty_glyph_region();
         }
+
+        let glyph_h = metrics.height as u32;
+        // The LCD FIR widens subpixel glyphs by one pixel on each side.
+        let (glyph_w, filtered): (u32, Option<Vec<u8>>) = match input {
+            RasterInput::Gray(_) => (metrics.width as u32, None),
+            RasterInput::Subpixel(src) => (
+                metrics.width as u32 + 2,
+                Some(lcd_filter_expand(
+                    src,
+                    metrics.width,
+                    metrics.height,
+                    weight_boost,
+                )),
+            ),
+        };
 
         let padded_w = glyph_w + GLYPH_PADDING * 2;
         let padded_h = glyph_h + GLYPH_PADDING * 2;
@@ -347,14 +418,10 @@ impl FontdueAtlas {
                 self.needs_compaction = true;
                 self.shape_cache.clear();
                 self.atlas_generation = self.atlas_generation.wrapping_add(1);
-                let region = empty_glyph_region();
-                self.cache_insert(key, region);
-                return region;
+                return empty_glyph_region();
             }
             if !self.allocate_shelf(padded_w, padded_h) {
-                let region = empty_glyph_region();
-                self.cache_insert(key, region);
-                return region;
+                return empty_glyph_region();
             }
         }
 
@@ -363,44 +430,60 @@ impl FontdueAtlas {
         let bx = atlas_x + GLYPH_PADDING;
         let by = atlas_y + GLYPH_PADDING;
 
-        let weight_boost = if bold { 1.0 } else { self.font_weight };
-        let use_subpixel = self.subpixel_rendering && !is_cjk_or_wide(key.ch);
-
-        if use_subpixel {
-            self.rasterize_subpixel(glyph_bitmap, glyph_w, glyph_h, bx, by, weight_boost);
-        } else {
-            for gy in 0..glyph_h {
-                for gx in 0..glyph_w {
-                    let src_idx = (gy * glyph_w + gx) as usize;
-                    let dst_x = bx + gx;
-                    let dst_y = by + gy;
-                    if dst_x < self.width && dst_y < self.height {
-                        let coverage = glyph_bitmap[src_idx] as f32 / 255.0;
-                        let boosted = (coverage * weight_boost).min(1.0);
-                        let alpha = alpha_from_coverage(boosted);
-                        let a8 = (alpha * 255.0 + 0.5) as u8;
-                        let pixel = [a8, a8, a8, a8];
-                        let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
-                        self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+        match (&input, &filtered) {
+            (_, Some(rgb)) => {
+                for gy in 0..glyph_h {
+                    for gx in 0..glyph_w {
+                        let dst_x = bx + gx;
+                        let dst_y = by + gy;
+                        if dst_x < self.width && dst_y < self.height {
+                            let src_idx = ((gy * glyph_w + gx) * 3) as usize;
+                            let r = rgb[src_idx];
+                            let g = rgb[src_idx + 1];
+                            let b = rgb[src_idx + 2];
+                            let pixel = [r, g, b, r.max(g).max(b)];
+                            let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
+                            self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+                        }
                     }
                 }
             }
+            (RasterInput::Gray(src), _) => {
+                for gy in 0..glyph_h {
+                    for gx in 0..glyph_w {
+                        let src_idx = (gy * glyph_w + gx) as usize;
+                        let dst_x = bx + gx;
+                        let dst_y = by + gy;
+                        if dst_x < self.width && dst_y < self.height {
+                            let coverage = src[src_idx] as f32 / 255.0;
+                            let boosted = (coverage * weight_boost).min(1.0);
+                            let a8 = (boosted * 255.0 + 0.5) as u8;
+                            let pixel = [a8, a8, a8, a8];
+                            let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
+                            self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
+                        }
+                    }
+                }
+            }
+            (RasterInput::Subpixel(_), None) => unreachable!("subpixel input is always filtered"),
         }
 
         // Record dirty rectangle (with padding)
         self.dirty_rects
             .push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
 
-        let subpixel_shift = match key.subpixel_offset {
+        let subpixel_shift = match subpixel_offset {
             1 => 0.25,
             2 => 0.5,
             3 => 0.75,
             _ => 0.0,
         };
-        let bearing_x = metrics.xmin as f32 + subpixel_shift;
+        // Subpixel glyphs were widened one pixel to the left by the FIR.
+        let lcd_expand = if filtered.is_some() { 1.0 } else { 0.0 };
+        let bearing_x = metrics.xmin as f32 - lcd_expand + subpixel_shift;
         let bearing_y = self.cached_ascent - (metrics.ymin as f32 + metrics.height as f32);
 
-        let region = GlyphRegion {
+        GlyphRegion {
             u0: bx as f32 / self.width as f32,
             v0: by as f32 / self.height as f32,
             u1: (bx + glyph_w) as f32 / self.width as f32,
@@ -409,84 +492,6 @@ impl FontdueAtlas {
             height_px: glyph_h as f32,
             bearing_x,
             bearing_y,
-        };
-        self.cache_insert(key, region);
-        region
-    }
-
-    fn rasterize_subpixel(
-        &mut self,
-        glyph_bitmap: &[u8],
-        glyph_w: u32,
-        glyph_h: u32,
-        bx: u32,
-        by: u32,
-        weight_boost: f32,
-    ) {
-        // For subpixel rendering, the input bitmap is 1x resolution grayscale.
-        // We treat each pixel as 3 subpixels (RGB) and use a simple box filter
-        // weighted by the neighboring pixels to produce per-channel coverage.
-        // FIR filter weights (simple 1/3-weight kernel centered on each subpixel)
-        const W: [f32; 5] = [1.0 / 9.0, 2.0 / 9.0, 3.0 / 9.0, 2.0 / 9.0, 1.0 / 9.0];
-
-        for gy in 0..glyph_h {
-            for gx in 0..glyph_w {
-                let dst_x = bx + gx;
-                let dst_y = by + gy;
-                if dst_x >= self.width || dst_y >= self.height {
-                    continue;
-                }
-
-                // Sample 5 horizontal neighbors (clamped)
-                let mut samples = [0.0f32; 5];
-                for i in 0..5i32 {
-                    let sx = (gx as i32 + i - 2).clamp(0, glyph_w as i32 - 1) as u32;
-                    let src_idx = (gy * glyph_w + sx) as usize;
-                    let cov = glyph_bitmap[src_idx] as f32 / 255.0;
-                    samples[i as usize] = (cov * weight_boost).min(1.0);
-                }
-
-                // R subpixel: centered at -1/3 pixel offset
-                let r_cov = samples[0] * W[0]
-                    + samples[1] * W[1]
-                    + samples[2] * W[2]
-                    + samples[3] * W[3]
-                    + samples[4] * W[4];
-                // G subpixel: centered at 0
-                let g_cov = {
-                    let src_idx = (gy * glyph_w + gx) as usize;
-                    let cov = glyph_bitmap[src_idx] as f32 / 255.0;
-                    (cov * weight_boost).min(1.0)
-                };
-                // B subpixel: centered at +1/3 pixel offset
-                // Use shifted samples
-                let mut b_samples = [0.0f32; 5];
-                for i in 0..5i32 {
-                    let sx = (gx as i32 + i - 1).clamp(0, glyph_w as i32 - 1) as u32;
-                    let src_idx = (gy * glyph_w + sx) as usize;
-                    let cov = glyph_bitmap[src_idx] as f32 / 255.0;
-                    b_samples[i as usize] = (cov * weight_boost).min(1.0);
-                }
-                let b_cov = b_samples[0] * W[0]
-                    + b_samples[1] * W[1]
-                    + b_samples[2] * W[2]
-                    + b_samples[3] * W[3]
-                    + b_samples[4] * W[4];
-
-                let r = alpha_from_coverage(r_cov);
-                let g = alpha_from_coverage(g_cov);
-                let b = alpha_from_coverage(b_cov);
-                let a = r.max(g).max(b);
-
-                let pixel = [
-                    (r * 255.0 + 0.5) as u8,
-                    (g * 255.0 + 0.5) as u8,
-                    (b * 255.0 + 0.5) as u8,
-                    (a * 255.0 + 0.5) as u8,
-                ];
-                let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
-                self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
-            }
         }
     }
 
@@ -506,7 +511,12 @@ impl FontdueAtlas {
             &self.font_regular
         };
 
-        let (metrics, glyph_bitmap) = font.rasterize_indexed(gid, self.font_size_px);
+        let use_subpixel = self.subpixel_rendering;
+        let (metrics, glyph_bitmap) = if use_subpixel {
+            font.rasterize_indexed_subpixel(gid, self.font_size_px)
+        } else {
+            font.rasterize_indexed(gid, self.font_size_px)
+        };
 
         if glyph_bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
             let region = empty_glyph_region();
@@ -514,72 +524,13 @@ impl FontdueAtlas {
             return region;
         }
 
-        let glyph_w = metrics.width as u32;
-        let glyph_h = metrics.height as u32;
-        let padded_w = glyph_w + GLYPH_PADDING * 2;
-        let padded_h = glyph_h + GLYPH_PADDING * 2;
-
-        if !self.allocate_shelf(padded_w, padded_h) {
-            if !self.grow() {
-                self.needs_compaction = true;
-                self.shape_cache.clear();
-                self.atlas_generation = self.atlas_generation.wrapping_add(1);
-                let region = empty_glyph_region();
-                self.gid_cache.put(key, region);
-                return region;
-            }
-            if !self.allocate_shelf(padded_w, padded_h) {
-                let region = empty_glyph_region();
-                self.gid_cache.put(key, region);
-                return region;
-            }
-        }
-
-        let atlas_x = self.shelf_x - padded_w;
-        let atlas_y = self.shelf_y;
-        let bx = atlas_x + GLYPH_PADDING;
-        let by = atlas_y + GLYPH_PADDING;
-
         let weight_boost = if bold { 1.0 } else { self.font_weight };
-
-        for gy in 0..glyph_h {
-            for gx in 0..glyph_w {
-                let src_idx = (gy * glyph_w + gx) as usize;
-                let dst_x = bx + gx;
-                let dst_y = by + gy;
-                if dst_x < self.width && dst_y < self.height {
-                    let coverage = glyph_bitmap[src_idx] as f32 / 255.0;
-                    let boosted = (coverage * weight_boost).min(1.0);
-                    let alpha = alpha_from_coverage(boosted);
-                    let pixel = [255, 255, 255, (alpha * 255.0 + 0.5) as u8];
-                    let dst_idx = ((dst_y * self.width + dst_x) * 4) as usize;
-                    self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
-                }
-            }
-        }
-
-        self.dirty_rects
-            .push(DirtyRect::new(atlas_x, atlas_y, padded_w, padded_h));
-
-        let subpixel_shift = match subpixel_offset {
-            1 => 0.25,
-            2 => 0.5,
-            3 => 0.75,
-            _ => 0.0,
+        let input = if use_subpixel {
+            RasterInput::Subpixel(&glyph_bitmap)
+        } else {
+            RasterInput::Gray(&glyph_bitmap)
         };
-        let bearing_x = metrics.xmin as f32 + subpixel_shift;
-        let bearing_y = self.cached_ascent - (metrics.ymin as f32 + metrics.height as f32);
-
-        let region = GlyphRegion {
-            u0: bx as f32 / self.width as f32,
-            v0: by as f32 / self.height as f32,
-            u1: (bx + glyph_w) as f32 / self.width as f32,
-            v1: (by + glyph_h) as f32 / self.height as f32,
-            width_px: glyph_w as f32,
-            height_px: glyph_h as f32,
-            bearing_x,
-            bearing_y,
-        };
+        let region = self.place_glyph(&metrics, input, weight_boost, subpixel_offset);
         self.gid_cache.put(key, region);
         region
     }
@@ -618,6 +569,17 @@ impl FontBackend for FontdueAtlas {
             &self.font_regular
         };
 
+        // True 3x subpixel rasterization applies to every script; the CJK
+        // special-casing only concerns the (currently single-bin) positional
+        // binning above.
+        let use_subpixel = self.subpixel_rendering;
+        let rasterize = |f: &fontdue::Font| {
+            if use_subpixel {
+                f.rasterize_subpixel(ch, self.font_size_px)
+            } else {
+                f.rasterize(ch, self.font_size_px)
+            }
+        };
         // Check if glyph exists in primary font
         let glyph_index = font.lookup_glyph_index(ch);
         let has_glyph = glyph_index != 0;
@@ -627,17 +589,27 @@ impl FontBackend for FontdueAtlas {
             for fb in &self.fallback_fonts {
                 let fb_glyph_index = fb.lookup_glyph_index(ch);
                 if fb_glyph_index != 0 {
-                    let (fb_metrics, fb_bitmap) = fb.rasterize(ch, self.font_size_px);
-                    return self.rasterize_and_place(&fb_metrics, &fb_bitmap, bold, key);
+                    let (fb_metrics, fb_bitmap) = rasterize(fb);
+                    return self.rasterize_and_place(
+                        &fb_metrics,
+                        raster_input(use_subpixel, &fb_bitmap),
+                        bold,
+                        key,
+                    );
                 }
             }
             // Glyph not found in any font, use .notdef
-            let (metrics, glyph_bitmap) = font.rasterize(ch, self.font_size_px);
-            return self.rasterize_and_place(&metrics, &glyph_bitmap, bold, key);
+            let (metrics, glyph_bitmap) = rasterize(font);
+            return self.rasterize_and_place(
+                &metrics,
+                raster_input(use_subpixel, &glyph_bitmap),
+                bold,
+                key,
+            );
         }
 
         // Glyph exists (or is space/control), rasterize from primary font
-        let (metrics, glyph_bitmap) = font.rasterize(ch, self.font_size_px);
+        let (metrics, glyph_bitmap) = rasterize(font);
 
         if glyph_bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
             // Space, control chars, etc. — just return advance width with subpixel offset
@@ -661,7 +633,12 @@ impl FontBackend for FontdueAtlas {
             return region;
         }
 
-        self.rasterize_and_place(&metrics, &glyph_bitmap, bold, key)
+        self.rasterize_and_place(
+            &metrics,
+            raster_input(use_subpixel, &glyph_bitmap),
+            bold,
+            key,
+        )
     }
 
     fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -932,6 +909,36 @@ impl FontBackend for FontdueAtlas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lcd_filter_widens_by_one_pixel_and_conserves_energy() {
+        // A single fully covered pixel: three subpixel samples at 255.
+        let src = [255u8, 255, 255];
+        let out = lcd_filter_expand(&src, 1, 1, 1.0);
+        // One pixel of FIR spill on each side: 3 pixels * 3 subpixels.
+        assert_eq!(out.len(), 9);
+        // The FIR weights sum to 256/256, so total coverage is preserved
+        // (up to per-tap rounding).
+        let sum_in: i64 = src.iter().map(|&v| v as i64).sum();
+        let sum_out: i64 = out.iter().map(|&v| v as i64).sum();
+        assert!((sum_in - sum_out).abs() <= 5);
+        // Coverage stays centered: the middle pixel holds the peak.
+        assert!(out[4] > out[3] && out[4] > out[5]);
+        assert!(out[3] > out[0] && out[5] > out[8]);
+        // Symmetric input must filter symmetrically.
+        assert_eq!(out[3], out[5]);
+        assert_eq!(out[0], out[8]);
+    }
+
+    #[test]
+    fn lcd_filter_weight_boost_clamps_coverage() {
+        let src = [255u8; 6]; // two fully covered pixels
+        let out = lcd_filter_expand(&src, 2, 1, 2.0);
+        // The interior subpixels saturate exactly at full coverage under a
+        // 2x boost — the clamp keeps u8 arithmetic from wrapping.
+        let mid = &out[3..9];
+        assert!(mid.iter().all(|&v| v == 255));
+    }
 
     #[test]
     fn harfrust_shaper_rejects_invalid_font_bytes() {

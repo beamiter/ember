@@ -101,14 +101,6 @@ pub const GLYPH_PADDING: u32 = 2;
 pub const INITIAL_ATLAS_SIZE: u32 = 1024;
 pub const MAX_ATLAS_SIZE: u32 = 4096;
 
-/// Convert coverage alpha to baked color using TwoCoverageMinusCoverageSq function.
-/// This matches egui's approach: alpha = 2c - c² where c is coverage in `0..=1`.
-/// Produces perceptually correct blending for both light and dark backgrounds.
-pub fn alpha_from_coverage(coverage: f32) -> f32 {
-    let c = coverage.clamp(0.0, 1.0);
-    2.0 * c - c * c
-}
-
 pub fn create_gpu_resources(
     device: &wgpu::Device,
     width: u32,

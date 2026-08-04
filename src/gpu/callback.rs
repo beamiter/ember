@@ -352,7 +352,7 @@ impl egui_wgpu::CallbackTrait for GridForegroundCallback {
             );
             return;
         };
-        render_pass.set_pipeline(res.pipeline.pipeline());
+        render_pass.set_pipeline(res.pipeline.foreground_pipeline());
         render_pass.set_bind_group(0, &entry.surface.foreground_bind_group, &[]);
         render_pass.set_vertex_buffer(0, entry.surface.instance_buffer().slice(..));
         render_pass.draw(0..6, 0..self.instance_count);

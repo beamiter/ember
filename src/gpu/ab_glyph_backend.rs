@@ -1,6 +1,6 @@
 use super::font_backend::{
-    alpha_from_coverage, create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey,
-    DirtyRect, FontBackend, GlyphRegion, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE,
+    create_gpu_resources, empty_glyph_region, upload_bitmap, AtlasGlyphKey, DirtyRect, FontBackend,
+    GlyphRegion, GLYPH_PADDING, INITIAL_ATLAS_SIZE, MAX_ATLAS_SIZE,
 };
 use ab_glyph::{point, Font, FontVec, GlyphId, PxScale, ScaleFont};
 use lru::LruCache;
@@ -384,9 +384,12 @@ impl FontBackend for AbGlyphAtlas {
                 let px = bx + x;
                 let py = by + y;
                 if px < self.width && py < self.height {
+                    // The fragment shader reads coverage from the RGB channels;
+                    // store raw (unboosted-curve) coverage there like the
+                    // fontdue backend does.
                     let boosted_alpha = (alpha * weight_boost).min(1.0);
-                    let coverage_alpha = alpha_from_coverage(boosted_alpha);
-                    let pixel = [255, 255, 255, (coverage_alpha * 255.0 + 0.5) as u8];
+                    let a8 = (boosted_alpha * 255.0 + 0.5) as u8;
+                    let pixel = [a8, a8, a8, a8];
                     let dst_idx = ((py * self.width + px) * 4) as usize;
                     self.bitmap[dst_idx..dst_idx + 4].copy_from_slice(&pixel);
                 }

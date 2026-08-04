@@ -660,9 +660,32 @@ fn main() -> Result<(), eframe::Error> {
         Err(err) => log::warn!("Failed to decode the embedded window icon: {err}"),
     }
 
+    // Request dual-source blending when the adapter offers it: the terminal
+    // foreground pipeline then applies per-channel (LCD subpixel) glyph alpha
+    // over transparent default-background cells. Wrap egui's default
+    // device_descriptor so its limits/feature choices are preserved.
+    // eframe's winit integration fills in the display handle automatically
+    // when it is left empty.
+    let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    let base_device_descriptor = std::sync::Arc::clone(&wgpu_setup.device_descriptor);
+    wgpu_setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+        let mut descriptor = base_device_descriptor(adapter);
+        if adapter
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
+            descriptor.required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
+        }
+        descriptor
+    });
+
     let options = eframe::NativeOptions {
         viewport,
         renderer,
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

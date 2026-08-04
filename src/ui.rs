@@ -1991,9 +1991,16 @@ impl TerminalRenderer {
 
         let instance_count = self.cached_instances.len() as u32;
         let frame_nr = ui.ctx().cumulative_frame_nr();
+        // Mirror egui-wgpu's viewport rounding: it rounds each rect edge to the
+        // physical-pixel grid before calling set_viewport. Deriving the px→NDC
+        // scale from the *unrounded* size would rescale the whole grid by a
+        // sub-pixel factor, drifting glyphs off the pixel grid toward the
+        // right/bottom edges and defeating the shader's crispness snap.
+        let vp_width_px = (content_rect.max.x * ppp).round() - (content_rect.min.x * ppp).round();
+        let vp_height_px = (content_rect.max.y * ppp).round() - (content_rect.min.y * ppp).round();
         let background_uniforms = gpu::instance::GridUniforms {
-            viewport_width: content_rect.width() * ppp,
-            viewport_height: content_rect.height() * ppp,
+            viewport_width: vp_width_px.max(1.0),
+            viewport_height: vp_height_px.max(1.0),
             cell_width: target_cell_width,
             cell_height: target_cell_height,
             atlas_width: atlas_w,

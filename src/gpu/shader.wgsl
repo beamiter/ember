@@ -117,8 +117,35 @@ fn gamma_from_linear_rgb(linear: vec3<f32>) -> vec3<f32> {
     return select(higher, lower, cutoff);
 }
 
-// Compute final fragment color (shared by both entry points)
-fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
+fn perceived_luminance(lin: vec3<f32>) -> f32 {
+    return dot(lin, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// Coverage correction for linear-space glyph compositing.
+//
+// Pure linear blending is physically correct but thins bright-on-dark text,
+// because font stroke weights were tuned against perceptual (gamma-space)
+// rasterizers. Pure gamma-space blending keeps the expected weight but shifts
+// hues on colored text. This picks per-channel blend factors so the blended
+// *luminance* matches gamma-space blending while chroma still mixes linearly —
+// the same idea as Ghostty's "linear-corrected" text blending.
+fn corrected_coverage(cov: vec3<f32>, fg_lin: vec3<f32>, bg_lin: vec3<f32>) -> vec3<f32> {
+    let lum_fg = perceived_luminance(fg_lin);
+    let lum_bg = perceived_luminance(bg_lin);
+    let delta = lum_fg - lum_bg;
+    if abs(delta) < 1e-4 {
+        return cov;
+    }
+    let gamma_fg = gamma_from_linear_rgb(vec3<f32>(lum_fg)).x;
+    let gamma_bg = gamma_from_linear_rgb(vec3<f32>(lum_bg)).x;
+    let target_lum = linear_from_gamma_rgb(mix(vec3<f32>(gamma_bg), vec3<f32>(gamma_fg), cov));
+    return clamp((target_lum - vec3<f32>(lum_bg)) / delta, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Compute final fragment color (shared by both entry points).
+// `linear_target` marks the sRGB-framebuffer entry point, whose translucent
+// output is alpha-blended by the hardware in linear space.
+fn compute_fragment_color(in: VertexOutput, linear_target: bool) -> vec4<f32> {
     let has_glyph = (in.flags & 1u) != 0u;
     let underline_style = (in.flags >> 2u) & 7u; // bits 2-4: 0=none,1=single,2=double,3=curly,4=dotted,5=dashed
     let has_strikethrough = (in.flags & 32u) != 0u;
@@ -157,22 +184,29 @@ fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
             }
         } else {
             let texel = textureSample(atlas_texture, atlas_sampler, uv);
-            let coverage = texel.rgb;
-            let cov = coverage * in_bounds;
-            let a = max(cov.r, max(cov.g, cov.b));
+            // Atlas texels hold raw linear coverage (per RGB subpixel channel
+            // when LCD rendering is enabled, replicated gray otherwise).
+            let cov = texel.rgb * in_bounds;
+            let a = dot(cov, vec3<f32>(1.0 / 3.0));
             if a > 0.001 {
+                let fg_lin = linear_from_gamma_rgb(in.fg_color.rgb);
+                let bg_lin = linear_from_gamma_rgb(in.bg_color.rgb);
                 if in.bg_color.a <= 0.001 {
                     // Default cells are transparent over the Kitty image
                     // layer, so alpha-blend the glyph instead of baking the
-                    // terminal base color into its antialiased edge.
-                    color = vec4<f32>(in.fg_color.rgb, a);
+                    // terminal base color into its antialiased edge. The cell's
+                    // bg rgb still carries the terminal base color, which is
+                    // the backdrop in all but the rare image-covered cells —
+                    // use it to weight-correct the hardware linear blend.
+                    var alpha = a;
+                    if linear_target {
+                        alpha = corrected_coverage(vec3<f32>(a), fg_lin, bg_lin).x;
+                    }
+                    color = vec4<f32>(in.fg_color.rgb, alpha);
                 } else {
-                    let blended = vec3<f32>(
-                        mix(in.bg_color.r, in.fg_color.r, cov.r),
-                        mix(in.bg_color.g, in.fg_color.g, cov.g),
-                        mix(in.bg_color.b, in.fg_color.b, cov.b),
-                    );
-                    color = vec4<f32>(blended, 1.0);
+                    let ac = corrected_coverage(cov, fg_lin, bg_lin);
+                    let blended_lin = mix(bg_lin, fg_lin, ac);
+                    color = vec4<f32>(gamma_from_linear_rgb(blended_lin), 1.0);
                 }
             }
         }
@@ -226,12 +260,12 @@ fn compute_fragment_color(in: VertexOutput) -> vec4<f32> {
 
 @fragment
 fn fs_main_gamma(in: VertexOutput) -> @location(0) vec4<f32> {
-    return compute_fragment_color(in);
+    return compute_fragment_color(in, false);
 }
 
 @fragment
 fn fs_main_linear(in: VertexOutput) -> @location(0) vec4<f32> {
-    let result_gamma = compute_fragment_color(in);
+    let result_gamma = compute_fragment_color(in, true);
     let result_linear_rgb = linear_from_gamma_rgb(result_gamma.rgb);
     return vec4<f32>(result_linear_rgb, result_gamma.a);
 }
