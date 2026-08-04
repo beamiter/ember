@@ -1,5 +1,6 @@
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
+use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::collections::{HashSet, VecDeque};
 

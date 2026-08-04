@@ -245,6 +245,12 @@ pub struct Config {
     #[serde(default = "default_bottom_bar")]
     pub bottom_bar: bool,
 
+    /// 单击终端内容区把 shell 的编辑光标移动到点击处(默认开启)。四个 jterm
+    /// 共用 `click_moves_cursor` 键与默认值,移动量由
+    /// `jterm_core::click_cursor` 统一计算。
+    #[serde(default = "default_click_moves_cursor")]
+    pub click_moves_cursor: bool,
+
     /// Why this run could not use the on-disk config, if it exists but could
     /// not be read or parsed. Never serialized: it describes the load attempt,
     /// not a user setting.
@@ -271,6 +277,10 @@ fn default_true() -> bool {
 
 fn default_bottom_bar() -> bool {
     jterm_core::bottom_bar::ENABLED_BY_DEFAULT
+}
+
+fn default_click_moves_cursor() -> bool {
+    jterm_core::click_cursor::ENABLED_BY_DEFAULT
 }
 
 fn default_notify_long_block_threshold_ms() -> u64 {
@@ -471,6 +481,7 @@ impl Default for Config {
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: true,
             bottom_bar: default_bottom_bar(),
+            click_moves_cursor: default_click_moves_cursor(),
             load_error: None,
             revision: None,
         }
@@ -916,6 +927,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+    }
+
+    #[test]
+    fn click_moves_cursor_defaults_on_and_can_be_disabled() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        assert!(config.click_moves_cursor);
+
+        let config: Config =
+            toml::from_str("click_moves_cursor = false\n").expect("override parses");
+        assert!(!config.click_moves_cursor);
     }
 
     #[test]

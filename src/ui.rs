@@ -471,6 +471,8 @@ pub struct TerminalRenderer {
     pub opacity: f32,
     /// Whether to enable font ligatures (HarfRust shaping of ASCII runs)
     pub font_ligatures: bool,
+    /// Whether a plain click places the shell's edit cursor (`click_moves_cursor`)
+    pub click_moves_cursor: bool,
     /// Whether to use GPU-accelerated grid rendering
     pub gpu_rendering: bool,
     /// wgpu render state for GPU-accelerated grid rendering
@@ -558,6 +560,7 @@ impl TerminalRenderer {
             last_ime_rect: None,
             opacity: 1.0,
             font_ligatures: true,
+            click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             texture_cache_bytes: 0,
@@ -1279,40 +1282,25 @@ impl TerminalRenderer {
             terminal.selection = None;
 
             if let Some(pos) = click_pos {
-                if !terminal.is_mouse_enabled() {
-                    let (click_row, click_col) = grid_position_from_content(
-                        pos,
-                        content_rect,
-                        char_width,
-                        line_height,
-                        cols,
-                        rows,
-                    );
+                let (click_row, click_col) = grid_position_from_content(
+                    pos,
+                    content_rect,
+                    char_width,
+                    line_height,
+                    cols,
+                    rows,
+                );
 
-                    let (cursor_row, cursor_col) = terminal.get_cursor_pos();
+                // A newer click supersedes any prior not-yet-routed synthetic
+                // movement, including a click the terminal declines to act on.
+                self.cursor_move_input.clear();
+                self.cursor_move_terminal_ptr = None;
 
-                    if click_row == cursor_row {
-                        let col_diff = click_col as isize - cursor_col as isize;
-                        // A newer click supersedes any prior not-yet-routed
-                        // synthetic movement, including a no-op click.
-                        self.cursor_move_input.clear();
-                        self.cursor_move_terminal_ptr = None;
-
-                        if col_diff != 0 {
-                            self.cursor_move_terminal_ptr = Some(rendered_terminal);
-                            let app_cursor_keys = terminal.is_application_cursor_keys();
-                            let (right, left): (&[u8], &[u8]) = if app_cursor_keys {
-                                (b"\x1bOC", b"\x1bOD")
-                            } else {
-                                (b"\x1b[C", b"\x1b[D")
-                            };
-                            let arrow_seq = if col_diff > 0 { right } else { left };
-
-                            for _ in 0..col_diff.unsigned_abs() {
-                                self.cursor_move_input.extend_from_slice(arrow_seq);
-                            }
-                        }
-                    }
+                let bytes =
+                    terminal.click_cursor_move(click_row, click_col, self.click_moves_cursor);
+                if !bytes.is_empty() {
+                    self.cursor_move_terminal_ptr = Some(rendered_terminal);
+                    self.cursor_move_input = bytes;
                 }
             }
         }

@@ -63,6 +63,7 @@ impl TerminalApp {
             );
             renderer.opacity = self.renderer.opacity;
             renderer.font_ligatures = self.renderer.font_ligatures;
+            renderer.click_moves_cursor = self.renderer.click_moves_cursor;
             renderer.gpu_rendering = self.renderer.gpu_rendering;
             renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
             renderer.sync_font_metrics(ctx);

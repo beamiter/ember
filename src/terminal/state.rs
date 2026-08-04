@@ -2769,6 +2769,115 @@ impl super::TerminalState {
         (self.cursor_row, self.cursor_col)
     }
 
+    /// How much of the shell's work this terminal can actually see.
+    fn shell_phase(&self) -> click_cursor::ShellPhase {
+        match self.command_records.back() {
+            Some(record) if record.complete => click_cursor::ShellPhase::Unknown,
+            Some(record) => match record.state {
+                CommandState::Running => click_cursor::ShellPhase::Running,
+                CommandState::Editing => click_cursor::ShellPhase::Editing,
+                _ => click_cursor::ShellPhase::Unknown,
+            },
+            // A shell without OSC 133 integration. Staying `Unknown` keeps the
+            // feature working under plain bash.
+            None => click_cursor::ShellPhase::Unknown,
+        }
+    }
+
+    /// The cells a click is allowed to travel over: the whole soft-wrapped
+    /// logical line the cursor sits on, ending one past its last character.
+    ///
+    /// The prompt is inside this span. That is deliberate — clicking it means
+    /// "go to the start of the line", and a line editor ignores the extra
+    /// `Left`s once the buffer start is reached. The *end* is what has to be
+    /// exact: a `Right` past the buffer end is what accepts jsh's inline
+    /// suggestion.
+    fn editable_span(&self) -> Option<click_cursor::InputSpan> {
+        let rows = self.grid.rows();
+        let cols = self.grid.cols();
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+
+        let cursor_row = self.cursor_row.min(rows - 1);
+        let mut first = cursor_row;
+        while first > 0 && self.grid.row_wrapped[first - 1] {
+            first -= 1;
+        }
+        let mut last = cursor_row;
+        while last + 1 < rows && self.grid.row_wrapped[last] {
+            last += 1;
+        }
+
+        let mut end = click_cursor::Cell::new(first as i64, 0);
+        'scan: for row in (first..=last).rev() {
+            for col in (0..cols).rev() {
+                let cell = self.grid.get(row, col);
+                // A wide character's continuation cell holds a blank but is
+                // still occupied, so trailing CJK must not be trimmed away.
+                if cell.flags.wide_continuation()
+                    || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
+                {
+                    end = click_cursor::Cell::new(row as i64, col as i64 + 1);
+                    break 'scan;
+                }
+            }
+        }
+
+        // Trailing spaces the user typed are part of the buffer even though the
+        // scan above cannot tell them from padding, so never place the end
+        // before where the shell has its cursor.
+        let cursor = click_cursor::Cell::new(cursor_row as i64, self.cursor_col as i64);
+        if (end.row, end.col) < (cursor.row, cursor.col) {
+            end = cursor;
+        }
+
+        Some(click_cursor::InputSpan {
+            start: click_cursor::Cell::new(first as i64, 0),
+            end,
+        })
+    }
+
+    /// Arrow-key bytes that walk the shell's line editor to a clicked cell, or
+    /// nothing when this click must not move it.
+    ///
+    /// `click_row`/`click_col` are viewport coordinates, which only line up
+    /// with the grid while the scrollback is at the bottom — the
+    /// `scrolled_back` guard is what makes that assumption safe.
+    pub fn click_cursor_move(&self, click_row: usize, click_col: usize, enabled: bool) -> Vec<u8> {
+        let guards = click_cursor::Guards {
+            enabled,
+            mouse_reporting: self.is_mouse_enabled(),
+            alt_screen: self.is_alt_buffer_active(),
+            scrolled_back: self.scroll_offset != 0,
+            phase: self.shell_phase(),
+        };
+        if !click_cursor::click_may_move_cursor(&guards) {
+            return Vec::new();
+        }
+
+        let columns = self.grid.cols() as i64;
+        let cursor = click_cursor::Cell::new(self.cursor_row as i64, self.cursor_col as i64);
+        let click = click_cursor::Cell::new(click_row as i64, click_col as i64);
+        let Some(target) = click_cursor::target_cell(cursor, click, columns, self.editable_span())
+        else {
+            return Vec::new();
+        };
+
+        let steps = click_cursor::char_steps(cursor, target, columns, |row, col| {
+            row >= 0
+                && col >= 0
+                && (row as usize) < self.grid.rows()
+                && (col as usize) < self.grid.cols()
+                && self
+                    .grid
+                    .get(row as usize, col as usize)
+                    .flags
+                    .wide_continuation()
+        });
+        click_cursor::arrow_bytes(steps, self.is_application_cursor_keys())
+    }
+
     /// 获取当前可见行的wrapped状态，用于跨行链接检测
     pub fn get_visible_row_wrapped(&self) -> Vec<bool> {
         let rows = self.grid.rows();

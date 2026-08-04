@@ -2040,3 +2040,124 @@ fn osc_110_to_112_reset_dynamic_colors() {
     assert_eq!(terminal.dynamic_bg, None);
     assert_eq!(terminal.dynamic_cursor_color, None);
 }
+
+// --- click-to-place-cursor ------------------------------------------------
+//
+// The arithmetic lives in `jterm_core::click_cursor`; what these pin is the
+// terminal's half of the contract — which cells count as the editable span,
+// and which states refuse the click outright.
+
+/// A prompt with `cmd` typed at it and the cursor left at the end.
+fn terminal_at_prompt(cols: usize, rows: usize, cmd: &str) -> TerminalState {
+    let mut terminal = TerminalState::new(cols, rows);
+    terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\");
+    terminal.process_input(cmd.as_bytes());
+    terminal
+}
+
+#[test]
+fn a_click_left_of_the_cursor_walks_back_to_it() {
+    let terminal = terminal_at_prompt(32, 4, "echo hello");
+    // "$ echo hello" — cursor sits at column 12, the click lands on the `h`.
+    assert_eq!(terminal.get_cursor_pos(), (0, 12));
+    assert_eq!(
+        terminal.click_cursor_move(0, 7, true),
+        b"\x1b[D".repeat(5),
+        "five characters back from the end of `hello`"
+    );
+}
+
+#[test]
+fn a_click_past_the_command_stops_at_its_end() {
+    // The dangerous direction: in jsh a `Right` at end-of-buffer accepts the
+    // inline suggestion, so clicking the empty space after a command must not
+    // spend a single extra arrow.
+    let terminal = terminal_at_prompt(32, 4, "echo hi");
+    assert!(
+        terminal.click_cursor_move(0, 30, true).is_empty(),
+        "the cursor is already at the end of the input"
+    );
+
+    // With the cursor moved back inside the command, the same click may only
+    // travel as far as its last character.
+    let mut terminal = terminal;
+    terminal.process_input(b"\x1b[D\x1b[D\x1b[D");
+    assert_eq!(terminal.get_cursor_pos(), (0, 6));
+    assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(3));
+}
+
+#[test]
+fn a_click_on_the_prompt_goes_to_the_start_of_the_line() {
+    let terminal = terminal_at_prompt(32, 4, "ls");
+    // Column 0 is the prompt itself. Clamping to the line start is what a
+    // line editor does with the surplus `Left`s anyway.
+    assert_eq!(terminal.click_cursor_move(0, 0, true), b"\x1b[D".repeat(4));
+}
+
+#[test]
+fn a_click_follows_a_soft_wrap_onto_the_previous_row() {
+    // 10 columns: "$ " plus 12 characters wraps onto a second row.
+    let terminal = terminal_at_prompt(10, 4, "abcdefghijkl");
+    assert_eq!(terminal.get_cursor_pos(), (1, 4));
+    // Click the `c` on the first row: 4 back to the row start, then the 6
+    // remaining cells of row 0.
+    assert_eq!(terminal.click_cursor_move(0, 4, true), b"\x1b[D".repeat(10));
+}
+
+#[test]
+fn wide_characters_cost_one_arrow_each() {
+    let terminal = terminal_at_prompt(32, 4, "echo 你好世界");
+    // "$ echo " is 7 cells, then four CJK characters occupy 8 cells.
+    assert_eq!(terminal.get_cursor_pos(), (0, 15));
+    assert_eq!(
+        terminal.click_cursor_move(0, 7, true),
+        b"\x1b[D".repeat(4),
+        "four characters, not the eight cells they cover"
+    );
+}
+
+#[test]
+fn a_disabled_config_sends_nothing() {
+    let terminal = terminal_at_prompt(32, 4, "echo hello");
+    assert!(terminal.click_cursor_move(0, 7, false).is_empty());
+}
+
+#[test]
+fn a_running_command_keeps_the_click() {
+    // OSC 133 C means a foreground program owns the PTY. Its arrows are its
+    // own business — a pager would read them as scrolling.
+    let mut terminal = terminal_at_prompt(32, 4, "less big.log");
+    terminal.process_input(b"\x1b]133;C\x1b\\");
+    assert!(terminal.click_cursor_move(0, 7, true).is_empty());
+}
+
+#[test]
+fn mouse_reporting_and_the_alternate_screen_keep_the_click() {
+    let mut terminal = terminal_at_prompt(32, 4, "echo hello");
+    terminal.process_input(b"\x1b[?1000h");
+    assert!(terminal.click_cursor_move(0, 7, true).is_empty());
+    terminal.process_input(b"\x1b[?1000l");
+    assert!(!terminal.click_cursor_move(0, 7, true).is_empty());
+
+    terminal.process_input(b"\x1b[?1049h");
+    assert!(terminal.click_cursor_move(0, 7, true).is_empty());
+}
+
+#[test]
+fn scrolled_back_clicks_are_history_not_input() {
+    let mut terminal = terminal_at_prompt(20, 3, "echo hello");
+    // Fill the scrollback so there is something to scroll into, then walk up.
+    terminal.process_input(b"\r\nfiller\r\nfiller\r\nfiller\r\n");
+    terminal.scroll_offset = 1;
+    assert!(
+        terminal.click_cursor_move(0, 3, true).is_empty(),
+        "viewport rows no longer line up with grid rows"
+    );
+}
+
+#[test]
+fn application_cursor_keys_switch_the_arrow_encoding() {
+    let mut terminal = terminal_at_prompt(32, 4, "echo hello");
+    terminal.process_input(b"\x1b[?1h");
+    assert_eq!(terminal.click_cursor_move(0, 11, true), b"\x1bOD".to_vec());
+}
