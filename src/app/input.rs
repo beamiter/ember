@@ -310,7 +310,7 @@ impl TerminalApp {
 
         self.config.font_size = new_font_size;
         self.font_size_accumulator = 0.0;
-        self.apply_runtime_config(ctx);
+        self.apply_font_size_change(ctx);
         self.schedule_config_save();
         self.set_status(format!("{action}: {:.0} pt", self.config.font_size));
     }
@@ -1088,7 +1088,7 @@ impl TerminalApp {
 
                     if (new_font_size - self.config.font_size).abs() > 0.01 {
                         self.config.font_size = new_font_size;
-                        self.apply_runtime_config(ctx);
+                        self.apply_font_size_change(ctx);
                         self.schedule_config_save();
                     }
 

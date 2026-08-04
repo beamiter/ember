@@ -466,6 +466,14 @@ impl FontBackend for AbGlyphAtlas {
         self.needs_rebind = true;
     }
 
+    fn set_font_size_px(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, font_size_px: f32) {
+        if (self.font_size_px - font_size_px).abs() < 0.01 {
+            return;
+        }
+        self.font_size_px = font_size_px;
+        self.reset(device, queue);
+    }
+
     fn font_metrics(&self) -> (f32, f32, f32) {
         let scale = PxScale::from(self.font_size_px);
         let scaled = self.font_regular.as_scaled(scale);

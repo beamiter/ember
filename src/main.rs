@@ -2030,6 +2030,40 @@ impl TerminalApp {
         ctx.request_repaint();
     }
 
+    /// Surgical apply for font-size-only changes (Ctrl+wheel / font:* keys).
+    /// The full apply_runtime_config path re-resolves fonts through fontconfig
+    /// (subprocess per candidate), re-reads the font files from disk and swaps
+    /// the whole egui font atlas — none of which a size change needs, and all
+    /// of which makes interactive zooming stutter. Resize the live GPU atlas in
+    /// place and refresh the renderers' cell metrics instead.
+    fn apply_font_size_change(&mut self, ctx: &egui::Context) {
+        if let Some(render_state) = self.renderer.wgpu_render_state.as_ref() {
+            let font_size_px = self.config.font_size * ctx.pixels_per_point();
+            let mut renderer = render_state.renderer.write();
+            if let Some(gpu_res) = renderer
+                .callback_resources
+                .get_mut::<gpu::callback::GpuResources>()
+            {
+                gpu_res.atlas.set_font_size_px(
+                    &render_state.device,
+                    &render_state.queue,
+                    font_size_px,
+                );
+            }
+        }
+
+        self.renderer.font_size = self.config.font_size;
+        self.renderer.sync_font_metrics(ctx);
+        self.renderer.invalidate_font_cache();
+        for renderer in &mut self.pane_renderers {
+            renderer.font_size = self.config.font_size;
+            renderer.sync_font_metrics(ctx);
+            renderer.invalidate_font_cache();
+        }
+
+        ctx.request_repaint();
+    }
+
     fn create_session_with_current_config(
         &mut self,
         name: Option<String>,

@@ -677,6 +677,16 @@ impl FontBackend for FontdueAtlas {
         self.needs_rebind = true;
     }
 
+    fn set_font_size_px(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, font_size_px: f32) {
+        if (self.font_size_px - font_size_px).abs() < 0.01 {
+            return;
+        }
+        self.font_size_px = font_size_px;
+        // reset() recomputes cached metrics from font_size_px and re-rasterizes
+        // the ASCII prepopulation at the new size; everything else fills lazily.
+        self.reset(device, queue);
+    }
+
     fn font_metrics(&self) -> (f32, f32, f32) {
         (
             self.cached_ascent,

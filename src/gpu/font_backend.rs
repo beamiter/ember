@@ -57,9 +57,11 @@ pub struct ShapedGlyph {
 
 pub trait FontBackend: Send + Sync {
     fn get_or_rasterize(&mut self, ch: char, bold: bool, subpixel_offset: u8) -> GlyphRegion;
-    // Part of the backend trait surface; not invoked on the current render path.
-    #[allow(dead_code)]
     fn reset(&mut self, device: &wgpu::Device, queue: &wgpu::Queue);
+    /// Re-target the atlas to a new pixel size, keeping the already-parsed
+    /// fonts. Interactive zoom calls this instead of rebuilding the backend,
+    /// which would re-resolve and re-read font files from disk.
+    fn set_font_size_px(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, font_size_px: f32);
     fn font_metrics(&self) -> (f32, f32, f32);
     fn ensure_uploaded(&mut self, device: &wgpu::Device, queue: &wgpu::Queue);
     #[allow(dead_code)]
