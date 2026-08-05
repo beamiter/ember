@@ -25,6 +25,12 @@ pub struct LayoutSnapshot {
     pub root: LayoutNodeSnapshot,
     #[serde(default)]
     pub focused_session_id: Option<String>,
+    /// 固定的 tab 重启后仍固定。旧快照没有这个字段，恢复为未固定。
+    #[serde(default)]
+    pub pinned: bool,
+    /// 同上，用于「重要」标记（多选模型）。
+    #[serde(default)]
+    pub marked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,6 +303,8 @@ impl SessionsSnapshot {
                     self.tabs.push(LayoutSnapshot {
                         root,
                         focused_session_id,
+                        pinned: tab.pinned,
+                        marked: tab.marked,
                     });
                 }
                 // 空 tab 不是可渲染的状态，整个丢掉；它的会话会在启动时
@@ -701,6 +709,8 @@ mod tests {
                 }),
             },
             focused_session_id: Some("second-session".to_string()),
+            pinned: false,
+            marked: false,
         };
         let snapshot =
             SessionsSnapshot::from_snapshots(snapshots, Some(1), vec![layout.clone()], Some(0));
@@ -792,6 +802,8 @@ mod tests {
                 session_id: id.to_string(),
             },
             focused_session_id: Some(id.to_string()),
+            pinned: false,
+            marked: false,
         };
         let mut snapshot = SessionsSnapshot::from_snapshots(
             vec![SessionSnapshot {
@@ -828,6 +840,8 @@ mod tests {
                     session_id: "session-a".to_string(),
                 },
                 focused_session_id: None,
+                pinned: false,
+                marked: false,
             }],
             Some(9),
         );
@@ -914,6 +928,8 @@ mod tests {
                     }),
                 },
                 focused_session_id: Some("session-0".to_string()),
+                pinned: false,
+                marked: false,
             }],
             Some(0),
         );

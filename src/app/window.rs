@@ -108,8 +108,14 @@ impl TerminalApp {
         let tabs: Vec<_> = self
             .tabs
             .layouts()
-            .iter()
-            .filter_map(|tab| tab.to_snapshot(&session_ids))
+            .filter_map(|(tab, flags)| {
+                tab.to_snapshot(&session_ids).map(|mut snapshot| {
+                    // 固定/标记是 tab 级别的状态，布局快照本身不知道它们。
+                    snapshot.pinned = flags.pinned;
+                    snapshot.marked = flags.marked;
+                    snapshot
+                })
+            })
             .collect();
         let active_tab = Some(self.tabs.active_index()).filter(|idx| *idx < tabs.len());
         session_persistence::SessionsSnapshot::from_snapshots(

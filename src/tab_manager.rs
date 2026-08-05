@@ -13,8 +13,35 @@
 
 use crate::layout::LayoutManager;
 
+/// Per-tab flags the tab list and its context menu act on. They are pure UI
+/// state — no session or pane depends on them — but both survive a restart,
+/// so they live next to the layout that is already persisted per tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabFlags {
+    /// Pinned tabs sort to the front of the list and stay there.
+    pub pinned: bool,
+    /// Marking is the family's multi-select model: "关闭已标记标签页" acts on
+    /// exactly this set.
+    pub marked: bool,
+}
+
+/// One tab: its private pane layout plus the flags the user set on it.
+struct Tab {
+    layout: LayoutManager,
+    flags: TabFlags,
+}
+
+impl Tab {
+    fn new(layout: LayoutManager) -> Self {
+        Tab {
+            layout,
+            flags: TabFlags::default(),
+        }
+    }
+}
+
 pub struct TabManager {
-    tabs: Vec<LayoutManager>,
+    tabs: Vec<Tab>,
     active: usize,
 }
 
@@ -22,26 +49,32 @@ impl TabManager {
     /// 单 tab、单窗格的初始状态。
     pub fn new(session_idx: usize) -> Self {
         TabManager {
-            tabs: vec![LayoutManager::new(session_idx)],
+            tabs: vec![Tab::new(LayoutManager::new(session_idx))],
             active: 0,
         }
     }
 
     /// 从恢复出来的布局重建。空列表会退化成 `new(fallback_session_idx)`，
     /// 因为「零个 tab」不是一个可渲染的状态。
-    pub fn from_layouts(
-        layouts: Vec<LayoutManager>,
+    fn from_layouts(
+        layouts: impl IntoIterator<Item = (LayoutManager, TabFlags)>,
         active: usize,
         fallback_session_idx: usize,
     ) -> Self {
-        if layouts.is_empty() {
+        let tabs: Vec<Tab> = layouts
+            .into_iter()
+            .map(|(layout, flags)| Tab { layout, flags })
+            .collect();
+        if tabs.is_empty() {
             return TabManager::new(fallback_session_idx);
         }
-        let active = active.min(layouts.len() - 1);
-        TabManager {
-            tabs: layouts,
-            active,
-        }
+        let active = active.min(tabs.len() - 1);
+        let mut manager = TabManager { tabs, active };
+        // A snapshot written before pinning existed — or hand-edited — can
+        // interleave pinned and unpinned tabs. Restoring re-establishes the
+        // invariant instead of showing an order the app itself never produces.
+        manager.reorder_pinned_first();
+        manager
     }
 
     /// 从持久化快照重建 tab 列表。
@@ -56,18 +89,28 @@ impl TabManager {
         active_session_idx: usize,
         saved_active_tab: Option<usize>,
     ) -> Self {
-        let mut layouts: Vec<LayoutManager> = saved_tabs
+        let mut layouts: Vec<(LayoutManager, TabFlags)> = saved_tabs
             .iter()
-            .filter_map(|snapshot| LayoutManager::try_from_snapshot(snapshot, session_ids, None))
+            .filter_map(|snapshot| {
+                LayoutManager::try_from_snapshot(snapshot, session_ids, None).map(|layout| {
+                    (
+                        layout,
+                        TabFlags {
+                            pinned: snapshot.pinned,
+                            marked: snapshot.marked,
+                        },
+                    )
+                })
+            })
             .collect();
 
         let mut adopted: std::collections::HashSet<usize> = layouts
             .iter()
-            .flat_map(|tab| tab.session_indices())
+            .flat_map(|(tab, _)| tab.session_indices())
             .collect();
         for session_idx in 0..session_ids.len() {
             if adopted.insert(session_idx) {
-                layouts.push(LayoutManager::new(session_idx));
+                layouts.push((LayoutManager::new(session_idx), TabFlags::default()));
             }
         }
 
@@ -77,7 +120,7 @@ impl TabManager {
             .or_else(|| {
                 layouts
                     .iter()
-                    .position(|tab| tab.contains_session(active_session_idx))
+                    .position(|(tab, _)| tab.contains_session(active_session_idx))
             })
             .unwrap_or(0);
         Self::from_layouts(layouts, active, active_session_idx)
@@ -98,19 +141,78 @@ impl TabManager {
         self.active
     }
 
-    pub fn layouts(&self) -> &[LayoutManager] {
-        &self.tabs
+    /// 每个 tab 的布局与它的标记状态，按 tab 顺序。持久化按这个顺序写出。
+    pub fn layouts(&self) -> impl Iterator<Item = (&LayoutManager, TabFlags)> {
+        self.tabs.iter().map(|tab| (&tab.layout, tab.flags))
     }
 
     /// 当前 tab 的布局。`active` 始终被维持在合法范围内，因此这里可以
     /// 返回引用而不是 Option——渲染路径每帧都要用它。
     pub fn active_layout(&self) -> &LayoutManager {
-        &self.tabs[self.active.min(self.tabs.len() - 1)]
+        &self.tabs[self.active.min(self.tabs.len() - 1)].layout
     }
 
     pub fn active_layout_mut(&mut self) -> &mut LayoutManager {
         let idx = self.active.min(self.tabs.len() - 1);
-        &mut self.tabs[idx]
+        &mut self.tabs[idx].layout
+    }
+
+    pub fn flags(&self, tab_idx: usize) -> TabFlags {
+        self.tabs
+            .get(tab_idx)
+            .map(|tab| tab.flags)
+            .unwrap_or_default()
+    }
+
+    /// 已标记的 tab 序号，升序。「关闭已标记标签页」以此为准。
+    pub fn marked_tabs(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.flags.marked)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// 翻转标记位。返回翻转后的值；越界时返回 false 且不改变任何状态。
+    pub fn toggle_marked(&mut self, tab_idx: usize) -> bool {
+        match self.tabs.get_mut(tab_idx) {
+            Some(tab) => {
+                tab.flags.marked = !tab.flags.marked;
+                tab.flags.marked
+            }
+            None => false,
+        }
+    }
+
+    /// 翻转固定位并立即重排。返回翻转后的值。
+    pub fn toggle_pinned(&mut self, tab_idx: usize) -> bool {
+        let Some(tab) = self.tabs.get_mut(tab_idx) else {
+            return false;
+        };
+        tab.flags.pinned = !tab.flags.pinned;
+        let pinned = tab.flags.pinned;
+        self.reorder_pinned_first();
+        pinned
+    }
+
+    /// 稳定重排，让固定的 tab 排到最前，同时保持 `active` 指向原来那个 tab。
+    /// 与 jterm1 的 `reorder_pinned_first` 语义一致。
+    pub fn reorder_pinned_first(&mut self) {
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by_key(|&idx| !self.tabs[idx].flags.pinned);
+        if order.iter().enumerate().all(|(new, &old)| new == old) {
+            return;
+        }
+        self.active = order
+            .iter()
+            .position(|&old| old == self.active)
+            .unwrap_or(self.active);
+        let mut taken: Vec<Option<Tab>> = self.tabs.drain(..).map(Some).collect();
+        self.tabs = order
+            .into_iter()
+            .filter_map(|old| taken[old].take())
+            .collect();
     }
 
     pub fn set_active(&mut self, tab_idx: usize) -> bool {
@@ -124,8 +226,9 @@ impl TabManager {
     /// tab 的「当前选中窗格」所显示的会话。tab 标题、活跃会话路由都以它为准。
     pub fn focused_session_of(&self, tab_idx: usize) -> Option<usize> {
         self.tabs.get(tab_idx).and_then(|tab| {
-            tab.focused_session_idx()
-                .or_else(|| tab.session_indices().first().copied())
+            tab.layout
+                .focused_session_idx()
+                .or_else(|| tab.layout.session_indices().first().copied())
         })
     }
 
@@ -137,7 +240,7 @@ impl TabManager {
     pub fn sessions_in(&self, tab_idx: usize) -> Vec<usize> {
         self.tabs
             .get(tab_idx)
-            .map(|tab| tab.session_indices())
+            .map(|tab| tab.layout.session_indices())
             .unwrap_or_default()
     }
 
@@ -145,14 +248,15 @@ impl TabManager {
     pub fn tab_of_session(&self, session_idx: usize) -> Option<usize> {
         self.tabs
             .iter()
-            .position(|tab| tab.contains_session(session_idx))
+            .position(|tab| tab.layout.contains_session(session_idx))
     }
 
     /// 在当前 tab 之后插入一个新 tab 并激活它。会话索引必须已经存在于
     /// SessionManager 中，并且调用方已经调用过 [`Self::on_session_inserted`]。
     pub fn insert_tab_after_active(&mut self, session_idx: usize) -> usize {
         let at = (self.active + 1).min(self.tabs.len());
-        self.tabs.insert(at, LayoutManager::new(session_idx));
+        self.tabs
+            .insert(at, Tab::new(LayoutManager::new(session_idx)));
         self.active = at;
         at
     }
@@ -190,7 +294,7 @@ impl TabManager {
     /// 新会话插入全局列表后，所有 tab 里 >= 插入点的索引整体右移。
     pub fn on_session_inserted(&mut self, inserted_idx: usize) {
         for tab in &mut self.tabs {
-            tab.on_session_inserted(inserted_idx);
+            tab.layout.on_session_inserted(inserted_idx);
         }
     }
 
@@ -199,12 +303,12 @@ impl TabManager {
     /// 索引左移。
     pub fn on_session_removed(&mut self, removed_idx: usize) {
         for tab in &mut self.tabs {
-            if tab.contains_session(removed_idx) {
-                tab.remove_session_leaf(removed_idx);
+            if tab.layout.contains_session(removed_idx) {
+                tab.layout.remove_session_leaf(removed_idx);
             }
         }
         for tab in &mut self.tabs {
-            tab.shift_sessions_after_removal(removed_idx);
+            tab.layout.shift_sessions_after_removal(removed_idx);
         }
     }
 }
@@ -334,7 +438,48 @@ mod tests {
             LayoutSnapshot {
                 root,
                 focused_session_id: focused.map(str::to_string),
+                pinned: false,
+                marked: false,
             }
+        }
+
+        /// 固定/标记是纯 UI 状态，但它们和布局一样必须跨重启存活，否则
+        /// 「固定」在下次启动就成了空操作。
+        #[test]
+        fn pin_and_mark_survive_a_restore_and_pinned_tabs_lead() {
+            let mut plain = tab(pane("session-0"), Some("session-0"));
+            let mut marked = tab(pane("session-1"), Some("session-1"));
+            marked.marked = true;
+            let mut pinned = tab(pane("session-2"), Some("session-2"));
+            pinned.pinned = true;
+            plain.pinned = false;
+
+            let tabs = TabManager::restore(&[plain, marked, pinned], &ids(3), 1, Some(1));
+
+            // 快照里固定的 tab 排在最后，恢复时被提到最前。
+            assert_eq!(tabs.sessions_in(0), vec![2]);
+            assert!(tabs.flags(0).pinned);
+            assert_eq!(tabs.sessions_in(1), vec![0]);
+            assert_eq!(tabs.sessions_in(2), vec![1]);
+            assert!(tabs.flags(2).marked);
+            assert_eq!(tabs.marked_tabs(), vec![2]);
+            // 重排跟着「用户上次看的那个 tab」走，而不是停在原来的序号上。
+            assert_eq!(tabs.active_focused_session(), Some(1));
+        }
+
+        /// 旧快照没有这些字段，必须解析成「未固定未标记」而不是解析失败。
+        #[test]
+        fn legacy_snapshots_without_the_flags_restore_as_plain_tabs() {
+            let legacy: LayoutSnapshot = serde_json::from_str(
+                r#"{"root":{"kind":"pane","session_id":"session-0"},
+                    "focused_session_id":"session-0"}"#,
+            )
+            .expect("legacy snapshot parses");
+            assert!(!legacy.pinned);
+            assert!(!legacy.marked);
+
+            let tabs = TabManager::restore(&[legacy], &ids(1), 0, Some(0));
+            assert_eq!(tabs.flags(0), TabFlags::default());
         }
 
         #[test]
@@ -395,6 +540,78 @@ mod tests {
             assert_eq!(tabs.active_index(), 1);
             assert_eq!(tabs.active_focused_session(), Some(1));
         }
+    }
+
+    /// 固定重排必须稳定（组内相对顺序不变），并且 `active` 要跟着原来那个
+    /// tab 走——否则用户一固定标签页，屏幕上显示的就换成了别的会话。
+    #[test]
+    fn pinning_moves_a_tab_to_the_front_without_switching_the_active_one() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        tabs.insert_tab_after_active(3);
+        tabs.set_active(1); // 会话 1
+        assert_eq!(tabs.active_focused_session(), Some(1));
+
+        assert!(tabs.toggle_pinned(2)); // 固定持有会话 2 的那个 tab
+
+        assert_eq!(tabs.sessions_in(0), vec![2]);
+        assert!(tabs.flags(0).pinned);
+        // 未固定的三个 tab 保持原有相对顺序。
+        assert_eq!(tabs.sessions_in(1), vec![0]);
+        assert_eq!(tabs.sessions_in(2), vec![1]);
+        assert_eq!(tabs.sessions_in(3), vec![3]);
+        // 活跃的仍然是会话 1，只是序号从 1 变成了 2。
+        assert_eq!(tabs.active_index(), 2);
+        assert_eq!(tabs.active_focused_session(), Some(1));
+
+        // 取消固定把它放回未固定组的最前面，活跃标签页依旧不变。
+        assert!(!tabs.toggle_pinned(0));
+        assert_eq!(tabs.active_focused_session(), Some(1));
+    }
+
+    #[test]
+    fn marking_tracks_exactly_the_tabs_the_user_marked() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+
+        assert!(tabs.marked_tabs().is_empty());
+        assert!(tabs.toggle_marked(0));
+        assert!(tabs.toggle_marked(2));
+        assert_eq!(tabs.marked_tabs(), vec![0, 2]);
+
+        assert!(!tabs.toggle_marked(0));
+        assert_eq!(tabs.marked_tabs(), vec![2]);
+        // 越界的目标既不改状态也不 panic。
+        assert!(!tabs.toggle_marked(9));
+        assert_eq!(tabs.marked_tabs(), vec![2]);
+    }
+
+    /// 标记跟着 tab 走，而不是跟着序号走：删掉前面的 tab 之后，标记必须
+    /// 还在原来那个 tab 上。
+    #[test]
+    fn flags_follow_their_tab_across_removal() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        assert!(tabs.toggle_marked(2));
+        assert!(tabs.toggle_pinned(2));
+        // 固定后它排到了最前。
+        assert_eq!(tabs.sessions_in(0), vec![2]);
+
+        assert!(tabs.remove_tab(1)); // 移除持有会话 0 的 tab
+        tabs.on_session_removed(0);
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(
+            tabs.flags(0),
+            TabFlags {
+                pinned: true,
+                marked: true
+            }
+        );
+        assert_eq!(tabs.flags(1), TabFlags::default());
     }
 
     #[test]

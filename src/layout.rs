@@ -100,9 +100,13 @@ impl LayoutManager {
             .focused_session_idx()
             .and_then(|idx| session_ids.get(idx))
             .cloned();
+        // Tab 级别的标记由 TabManager 拥有，布局本身不知道它们；调用方在
+        // 写快照时补上。
         Some(crate::session_persistence::LayoutSnapshot {
             root,
             focused_session_id,
+            pinned: false,
+            marked: false,
         })
     }
 
@@ -1040,6 +1044,8 @@ mod tests {
                 }),
             },
             focused_session_id: Some("missing".to_string()),
+            pinned: false,
+            marked: false,
         };
         let session_ids = vec!["alpha".to_string(), "beta".to_string()];
         let restored = LayoutManager::try_from_snapshot(&snapshot, &session_ids, Some(1)).unwrap();
@@ -1058,6 +1064,8 @@ mod tests {
                 session_id: "gone".to_string(),
             },
             focused_session_id: Some("gone".to_string()),
+            pinned: false,
+            marked: false,
         };
         let session_ids = vec!["alpha".to_string(), "beta".to_string()];
 

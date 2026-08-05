@@ -1,8 +1,35 @@
 // Tab management module
 
 use super::state::{TabDragOrigin, TerminalApp};
+use crate::tab_manager::TabFlags;
 use crate::theme::ThemeExt as _;
 use eframe::egui;
+
+/// 侧边栏标签列表一行所需的全部信息,渲染前一次性算好。行渲染闭包内不能
+/// 再读 self(它已经被可变借用),所以标题/未读/标记都先落到这里。
+struct SidebarTabInfo {
+    index: usize,
+    title: String,
+    unseen: bool,
+    flags: TabFlags,
+}
+
+/// 侧边栏标签右键菜单选中的操作。菜单闭包只记录意图,真正的状态变更在
+/// 列表渲染结束后执行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTabAction {
+    NewTab,
+    Duplicate(usize),
+    Rename(usize),
+    ToggleMarked(usize),
+    TogglePinned(usize),
+    Close(usize),
+    CloseOthers(usize),
+    CloseToRight(usize),
+    CloseMarked,
+    /// 配置里 `[[remote_hosts]]` 的序号。
+    ConnectRemote(usize),
+}
 
 impl TerminalApp {
     /// Drop the in-flight tab drag, but only if `origin` started it. The
@@ -207,19 +234,36 @@ impl TerminalApp {
 
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
+    /// 右键任意一行打开标签页操作菜单(与 jterm1/jterm4 的侧边栏标签右键菜单同款)。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
         self.refresh_unseen_flags_for_visible_panes();
         let active = self.tabs.active_index();
-        let infos: Vec<(usize, String, bool)> = (0..self.tabs.len())
-            .map(|i| (i, self.tab_title(i), self.tab_has_unseen_output(i)))
+        let infos: Vec<SidebarTabInfo> = (0..self.tabs.len())
+            .map(|i| SidebarTabInfo {
+                index: i,
+                title: self.tab_title(i),
+                unseen: self.tab_has_unseen_output(i),
+                flags: self.tabs.flags(i),
+            })
             .collect();
         let multi = infos.len() > 1;
+        // 右键菜单只读这些预先算好的值,菜单闭包内不再碰 self,避免与列表
+        // 渲染闭包争借用。
+        let marked_count = infos.iter().filter(|info| info.flags.marked).count();
+        let remote_entries: Vec<(usize, String)> = self
+            .config
+            .remote_hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| (index, host.display_name().to_string()))
+            .collect();
 
         let mut switch_to: Option<usize> = None;
         let mut close_idx: Option<usize> = None;
         let mut new_session = false;
         let mut reorder: Option<(usize, usize)> = None;
         let mut begin_rename: Option<usize> = None;
+        let mut menu_action: Option<SidebarTabAction> = None;
         // 提交/取消重命名需要在循环外处理,这里只收集事件,避免与 self 借用冲突。
         let mut commit_rename: Option<(usize, String)> = None;
         let mut cancel_rename = false;
@@ -243,7 +287,13 @@ impl TerminalApp {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 let row_h = ui.spacing().interact_size.y;
-                for (i, title, unseen) in &infos {
+                for info in &infos {
+                    let SidebarTabInfo {
+                        index: i,
+                        title,
+                        unseen,
+                        flags,
+                    } = info;
                     let is_active = *i == active;
                     let is_dragging_this = self.dragging_tab == Some(*i);
                     let is_renaming_this =
@@ -293,26 +343,38 @@ impl TerminalApp {
                                     cancel_rename = true;
                                 }
                             } else {
-                                // 后台 tab 有未查看输出时用圆点提醒。
-                                let marker = if !is_active && *unseen { "• " } else { "  " };
+                                // 后台 tab 有未查看输出时用圆点提醒;固定/标记
+                                // 各占一个前缀符号,与 jterm1 的 tab-pinned /
+                                // tab-marked 样式同义。
+                                let marker = if !is_active && *unseen { "•" } else { " " };
+                                let pin = if flags.pinned { "◆" } else { "" };
+                                let mark = if flags.marked { "★" } else { "" };
                                 // 拖拽中的源 tab 略微淡化
                                 let dim = is_dragging_this && is_actually_dragging;
                                 let btn = egui::Button::selectable(
                                     is_active,
-                                    egui::RichText::new(format!("{}{}", marker, title)).color(
-                                        if dim {
+                                    egui::RichText::new(format!("{marker}{pin}{mark} {title}"))
+                                        .color(if dim {
                                             ui.visuals().weak_text_color()
-                                        } else if is_active {
+                                        } else if is_active || flags.marked {
                                             ui.visuals().strong_text_color()
                                         } else {
                                             ui.visuals().text_color()
-                                        },
-                                    ),
+                                        }),
                                 )
                                 .sense(egui::Sense::click_and_drag());
+                                // 这个按钮是右键菜单的宿主,菜单挂在它的 id 上。
+                                // 自动 id 是「本行第几个控件」推导出来的,而它前面
+                                // 的关闭按钮只在悬停时存在:指针一移向刚弹出的菜单,
+                                // 关闭按钮消失、id 改变,egui 就连同菜单一起丢掉,
+                                // 表现为菜单还没走到就自己关了。固定的 id 作用域让
+                                // 宿主 id 与悬停状态无关。
                                 let resp = ui
-                                    .add_sized([ui.available_width(), row_h], btn)
-                                    .on_hover_text("双击重命名");
+                                    .push_id(("sidebar-tab", *i), |ui| {
+                                        ui.add_sized([ui.available_width(), row_h], btn)
+                                    })
+                                    .inner
+                                    .on_hover_text(Self::sidebar_tab_tooltip(*flags));
 
                                 // 拖拽开始:仅在按下且尚未跟踪时记录起点
                                 if resp.drag_started() {
@@ -326,6 +388,18 @@ impl TerminalApp {
                                 } else if resp.clicked() && !is_actually_dragging {
                                     switch_to = Some(*i);
                                 }
+                                // 右键菜单挂在标签行上。菜单项只写 menu_action,
+                                // 真正的状态变更留到渲染闭包之外执行。
+                                resp.context_menu(|ui| {
+                                    Self::sidebar_tab_menu(
+                                        ui,
+                                        info,
+                                        infos.len(),
+                                        marked_count,
+                                        &remote_entries,
+                                        &mut menu_action,
+                                    );
+                                });
                             }
                         });
                     });
@@ -431,6 +505,14 @@ impl TerminalApp {
         if new_session {
             self.new_tab();
         }
+        // 右键菜单的操作在渲染闭包外统一执行。重命名走列表内的行内编辑器,
+        // 因此只是把它转成本帧的 begin_rename。
+        if let Some(action) = menu_action {
+            match action {
+                SidebarTabAction::Rename(i) => begin_rename = Some(i),
+                other => self.apply_sidebar_tab_action(other),
+            }
+        }
         if let Some(i) = begin_rename {
             let initial = self
                 .tab_display_session(i)
@@ -448,6 +530,209 @@ impl TerminalApp {
             self.apply_rename(i, new_name);
         } else if cancel_rename {
             self.renaming_tab = None;
+        }
+    }
+
+    /// 侧边栏标签行的悬停提示。固定/标记状态在这里说明,列表里的符号才有解释。
+    fn sidebar_tab_tooltip(flags: crate::tab_manager::TabFlags) -> String {
+        let mut lines = vec!["双击重命名 · 右键打开标签页菜单".to_string()];
+        if flags.pinned {
+            lines.push("◆ 已固定(始终排在最前)".to_string());
+        }
+        if flags.marked {
+            lines.push("★ 已标记为重要".to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// 侧边栏标签的右键菜单。与 jterm1/jterm4 的标签右键菜单同一套条目:
+    /// 新建/复制/重命名/标记/固定/关闭,外加配置里的远程主机直连入口。
+    ///
+    /// 纯函数式:只把用户选中的条目写进 `action`,不触碰应用状态,这样它可以
+    /// 安全地嵌在列表渲染闭包里。
+    fn sidebar_tab_menu(
+        ui: &mut egui::Ui,
+        info: &SidebarTabInfo,
+        tab_count: usize,
+        marked_count: usize,
+        remote_entries: &[(usize, String)],
+        action: &mut Option<SidebarTabAction>,
+    ) {
+        let index = info.index;
+        ui.label(egui::RichText::new(&info.title).weak().small());
+        ui.separator();
+
+        let mut item = |ui: &mut egui::Ui, label: &str, chosen: SidebarTabAction| {
+            if ui.button(label).clicked() {
+                *action = Some(chosen);
+                ui.close();
+            }
+        };
+
+        item(ui, "New Tab", SidebarTabAction::NewTab);
+        item(ui, "Duplicate", SidebarTabAction::Duplicate(index));
+        item(ui, "Rename", SidebarTabAction::Rename(index));
+        item(
+            ui,
+            if info.flags.marked {
+                "Unmark"
+            } else {
+                "Mark Important"
+            },
+            SidebarTabAction::ToggleMarked(index),
+        );
+        item(
+            ui,
+            if info.flags.pinned {
+                "Unpin Tab"
+            } else {
+                "Pin Tab"
+            },
+            SidebarTabAction::TogglePinned(index),
+        );
+
+        ui.separator();
+        // 最后一个标签页关不掉(窗口至少留一个),所以这些条目在单标签时不出现。
+        if tab_count > 1 {
+            item(ui, "Close", SidebarTabAction::Close(index));
+            item(ui, "Close Others", SidebarTabAction::CloseOthers(index));
+        }
+        if index + 1 < tab_count {
+            item(
+                ui,
+                "Close to the Right",
+                SidebarTabAction::CloseToRight(index),
+            );
+        }
+        if marked_count > 0 && tab_count > 1 {
+            item(
+                ui,
+                &format!("Close Marked Tabs ({marked_count})"),
+                SidebarTabAction::CloseMarked,
+            );
+        }
+
+        if !remote_entries.is_empty() {
+            ui.separator();
+            for (host_index, name) in remote_entries {
+                item(
+                    ui,
+                    &format!("Remote: {name}"),
+                    SidebarTabAction::ConnectRemote(*host_index),
+                );
+            }
+        }
+    }
+
+    /// 执行侧边栏右键菜单选中的操作。`Rename` 不在这里:它由列表内的行内
+    /// 编辑器接管。
+    fn apply_sidebar_tab_action(&mut self, action: SidebarTabAction) {
+        match action {
+            SidebarTabAction::NewTab => {
+                self.new_tab();
+            }
+            SidebarTabAction::Duplicate(index) => self.duplicate_tab(index),
+            // 由调用方转成行内重命名。
+            SidebarTabAction::Rename(_) => {}
+            SidebarTabAction::ToggleMarked(index) => self.toggle_tab_marked(index),
+            SidebarTabAction::TogglePinned(index) => self.toggle_tab_pinned(index),
+            SidebarTabAction::Close(index) => {
+                if self.close_tab_synced(index) {
+                    self.schedule_session_save();
+                }
+            }
+            SidebarTabAction::CloseOthers(keep) => {
+                let targets = (0..self.tabs.len()).filter(|i| *i != keep).collect();
+                self.close_tabs(targets, "其他标签页");
+            }
+            SidebarTabAction::CloseToRight(anchor) => {
+                let targets = ((anchor + 1)..self.tabs.len()).collect();
+                self.close_tabs(targets, "右侧标签页");
+            }
+            SidebarTabAction::CloseMarked => {
+                let targets = self.tabs.marked_tabs();
+                self.close_tabs(targets, "已标记标签页");
+            }
+            SidebarTabAction::ConnectRemote(index) => {
+                let Some(host) = self.config.remote_hosts.get(index).cloned() else {
+                    self.set_status("Remote host is no longer configured");
+                    return;
+                };
+                self.connect_remote_host(&host);
+            }
+        }
+    }
+
+    /// 复制标签页:在它右侧新开一个标签,继承它当前选中窗格的工作目录和
+    /// 自定义标题(与 jterm1/jterm4 的 Duplicate 一致)。
+    ///
+    /// 新会话的 cwd 取自「当前活跃会话」,所以先切到源标签页——复制本来也
+    /// 会把焦点带到新标签,这一步不额外改变用户预期。
+    pub fn duplicate_tab(&mut self, tab_idx: usize) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        let custom_name = self
+            .tab_display_session(tab_idx)
+            .and_then(|idx| self.session_manager.sessions().get(idx))
+            .and_then(|session| session.metadata.custom_name.clone());
+        self.activate_tab(tab_idx);
+        let Some(new_tab) = self.new_tab() else {
+            return;
+        };
+        if let Some(name) = custom_name {
+            self.apply_rename(new_tab, name);
+        }
+    }
+
+    /// 翻转「重要」标记。标记是本家族的多选模型:「Close Marked Tabs」正是
+    /// 作用在这一组上。
+    pub fn toggle_tab_marked(&mut self, tab_idx: usize) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        let marked = self.tabs.toggle_marked(tab_idx);
+        self.schedule_session_save();
+        self.set_status(if marked {
+            "标签页已标记为重要"
+        } else {
+            "已取消标签页标记"
+        });
+    }
+
+    /// 翻转固定状态。固定会把标签页重排到最前,因此正在进行的行内重命名
+    /// (它按序号定位)必须作废。
+    pub fn toggle_tab_pinned(&mut self, tab_idx: usize) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        let pinned = self.tabs.toggle_pinned(tab_idx);
+        self.renaming_tab = None;
+        self.clear_tab_drag(TabDragOrigin::Sidebar);
+        self.schedule_session_save();
+        self.set_status(if pinned {
+            "标签页已固定"
+        } else {
+            "已取消固定标签页"
+        });
+    }
+
+    /// 批量关闭标签页。从大到小关闭,前面的序号才不会因为删除而漂移;
+    /// 最后一个标签页关不掉,所以实际关闭数可能小于请求数。
+    fn close_tabs(&mut self, mut targets: Vec<usize>, what: &str) {
+        targets.sort_unstable_by(|a, b| b.cmp(a));
+        targets.dedup();
+        let mut closed = 0usize;
+        for tab_idx in targets {
+            if self.close_tab_synced(tab_idx) {
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            self.schedule_session_save();
+            self.set_status(format!("已关闭 {closed} 个{what}"));
+        } else {
+            self.set_status(format!("没有可关闭的{what}"));
         }
     }
 
