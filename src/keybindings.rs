@@ -57,6 +57,11 @@ pub enum Command {
     BlockCopyBlock,
     /// 以 Markdown 文档形式复制块（与 frost 相同的固定格式）。
     BlockCopyMarkdown,
+    /// 键盘选块（只在失败块之间跳）：更旧/更新的 FAILED 块。
+    BlockJumpPrevFailed,
+    BlockJumpNextFailed,
+    /// 跨块搜索选择器（命令文本 + 输出行的大小写不敏感子串匹配）。
+    BlockSearchToggle,
 
     FontIncrease,
     FontDecrease,
@@ -140,6 +145,9 @@ impl std::fmt::Display for Command {
             Command::BlockSelectNext => write!(f, "block:select_next"),
             Command::BlockCopyBlock => write!(f, "block:copy_block"),
             Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
+            Command::BlockJumpPrevFailed => write!(f, "block:jump_prev_failed"),
+            Command::BlockJumpNextFailed => write!(f, "block:jump_next_failed"),
+            Command::BlockSearchToggle => write!(f, "block:search"),
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
@@ -210,6 +218,9 @@ impl std::str::FromStr for Command {
             "block:select_next" => Ok(Command::BlockSelectNext),
             "block:copy_block" => Ok(Command::BlockCopyBlock),
             "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
+            "block:jump_prev_failed" => Ok(Command::BlockJumpPrevFailed),
+            "block:jump_next_failed" => Ok(Command::BlockJumpNextFailed),
+            "block:search" => Ok(Command::BlockSearchToggle),
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
@@ -422,12 +433,18 @@ impl KeyBindings {
         );
         // 跳到最早的失败命令块,与 anvil/forge 的 filter_failed_blocks
         // 同键位。其余 block:* 命令默认不绑定,走命令面板——包括
-        // block:select_prev/next:它们想要的 ctrl+alt+up/down 已被
-        // pane:focus_up/down 占用。
+        // block:select_prev/next 与 block:jump_prev/next_failed:它们想要
+        // 的 ctrl+alt+up/down 和 ctrl+alt+left/right 已被 pane:focus_*
+        // 占用。
         bindings.bindings.insert(
             "ctrl+shift+x".to_string(),
             "block:jump_first_failed".to_string(),
         );
+        // 跨块搜索,与 anvil 的 cross-block search 同键位(ember 的默认
+        // 表里 ctrl+shift+g 空闲)。
+        bindings
+            .bindings
+            .insert("ctrl+shift+g".to_string(), "block:search".to_string());
         // Keep font zoom in the same configurable command path as every other
         // keyboard shortcut. Different keyboard layouts can report `+` either
         // with or without Shift, while `Ctrl+=` is the conventional spelling.
@@ -595,6 +612,9 @@ mod tests {
             Command::BlockSelectNext,
             Command::BlockCopyBlock,
             Command::BlockCopyMarkdown,
+            Command::BlockJumpPrevFailed,
+            Command::BlockJumpNextFailed,
+            Command::BlockSearchToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
@@ -632,6 +652,7 @@ mod tests {
             ("ctrl+alt+-", Command::OpacityDecrease),
             ("f12", Command::DebugToggle),
             ("ctrl+shift+x", Command::BlockJumpFirstFailed),
+            ("ctrl+shift+g", Command::BlockSearchToggle),
         ];
         for (key, command) in expected {
             assert_eq!(

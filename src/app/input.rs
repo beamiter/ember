@@ -14,6 +14,7 @@ pub(crate) fn should_block_terminal_input(
     replace_open: bool,
     paste_confirmation_open: bool,
     command_palette_open: bool,
+    block_search_open: bool,
     text_edit_focused: bool,
 ) -> bool {
     search_open
@@ -21,6 +22,7 @@ pub(crate) fn should_block_terminal_input(
         || replace_open
         || paste_confirmation_open
         || command_palette_open
+        || block_search_open
         || text_edit_focused
 }
 
@@ -227,6 +229,7 @@ impl TerminalApp {
             self.search_replace_panel.is_open,
             self.pending_paste_confirm.is_some(),
             self.command_palette.is_open,
+            self.block_search.is_open,
             ctx.text_edit_focused(),
         )
     }
@@ -477,6 +480,9 @@ impl TerminalApp {
             keybindings::Command::BlockSelectNext => self.block_select_next(),
             keybindings::Command::BlockCopyBlock => self.block_copy_block(),
             keybindings::Command::BlockCopyMarkdown => self.block_copy_markdown(),
+            keybindings::Command::BlockJumpPrevFailed => self.block_jump_prev_failed(),
+            keybindings::Command::BlockJumpNextFailed => self.block_jump_next_failed(),
+            keybindings::Command::BlockSearchToggle => self.block_search_toggle(),
             keybindings::Command::FontIncrease => {
                 self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")
             }
@@ -952,6 +958,41 @@ impl TerminalApp {
         (close_requested, true)
     }
 
+    /// Handle keys the block-search picker owns (same routing pattern as the
+    /// command palette; the `block:search` chord itself closes it through the
+    /// modal-command path in `handle_keybindings`). Returns whether the
+    /// picker owned this frame's input; it never requests a viewport close.
+    pub fn handle_block_search_input(&mut self) -> bool {
+        if !self.block_search.is_open {
+            return false;
+        }
+
+        let events_copy = self.frame_events.clone();
+        let mut confirm = false;
+        for evt in &events_copy {
+            let egui::Event::Key {
+                key, pressed: true, ..
+            } = evt
+            else {
+                continue;
+            };
+            match key {
+                egui::Key::Escape => self.block_search.close(),
+                egui::Key::ArrowUp => self.block_search.select_prev(),
+                egui::Key::ArrowDown => self.block_search.select_next(),
+                egui::Key::Enter => {
+                    confirm = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if confirm {
+            self.block_search_confirm();
+        }
+        true
+    }
+
     /// 处理可配置快捷键派发。返回 true 仅表示 update 应提前返回
     /// （例如请求关闭窗口）。普通快捷键会从本帧事件里移除，避免继续透传给 PTY，
     /// 但仍允许本帧继续渲染，防止透明窗口被 clear 后空一帧。
@@ -980,6 +1021,7 @@ impl TerminalApp {
                         self.config_panel.is_open
                     }
                     keybindings::Command::CommandPaletteToggle => self.command_palette.is_open,
+                    keybindings::Command::BlockSearchToggle => self.block_search.is_open,
                     keybindings::Command::SearchReplaceToggle => self.search_replace_panel.is_open,
                     _ => false,
                 };
@@ -1127,26 +1169,27 @@ mod tests {
     #[test]
     fn interactive_ui_surfaces_block_terminal_input() {
         assert!(!should_block_terminal_input(
-            false, false, false, false, false, false
+            false, false, false, false, false, false, false
         ));
-        assert!(should_block_terminal_input(
-            false, false, true, false, false, false
-        ));
-        assert!(should_block_terminal_input(
-            false, false, false, true, false, false
-        ));
-        assert!(should_block_terminal_input(
-            false, false, false, false, true, false
-        ));
-        assert!(should_block_terminal_input(
-            false, false, false, false, false, true
-        ));
-        assert!(should_block_terminal_input(
-            true, false, false, false, false, false
-        ));
-        assert!(should_block_terminal_input(
-            false, true, false, false, false, false
-        ));
+        // Each surface blocks on its own: search, settings, replace, paste
+        // confirmation, palette, block-search picker, focused text edit.
+        for index in 0..7 {
+            let mut flags = [false; 7];
+            flags[index] = true;
+            let [search, config, replace, paste, palette, block_search, text_edit] = flags;
+            assert!(
+                should_block_terminal_input(
+                    search,
+                    config,
+                    replace,
+                    paste,
+                    palette,
+                    block_search,
+                    text_edit
+                ),
+                "surface {index} must block terminal input"
+            );
+        }
     }
 
     #[test]
@@ -1347,6 +1390,7 @@ mod tests {
             true,  // Find & Replace remains open behind the confirmation
             true,  // paste confirmation owns keyboard focus
             false, // command palette
+            false, // block search picker
             false, // no unrelated text editor focus
         );
 

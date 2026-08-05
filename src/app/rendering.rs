@@ -681,10 +681,19 @@ impl TerminalApp {
         if let Some((session_id, click)) = pending_block_click {
             match click {
                 crate::block_mode::BlockClick::Select(record_id) => {
-                    self.block_selection = Some((session_id, record_id));
+                    self.block_selection = Some((session_id.clone(), record_id.clone()));
+                    // A gutter click highlights the matching Commands-sidebar
+                    // row, like keyboard selection and jump_first_failed do.
+                    self.sync_block_selection_to_sidebar(&super::commands::CommandTarget {
+                        session_id,
+                        execution_id: record_id,
+                    });
                 }
                 crate::block_mode::BlockClick::Clear => {
                     self.block_selection = None;
+                    // Full-duplex sync: deselecting the block also drops the
+                    // Commands-sidebar row highlight it mirrored.
+                    self.command_sidebar.selected = None;
                 }
             }
         }
@@ -1021,6 +1030,179 @@ impl TerminalApp {
         }
         if let Some(command) = clicked_palette_command {
             self.dispatch_palette_command(ctx, command);
+        }
+
+        // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
+        let mut clicked_hit_index = None;
+        let mut hovered_hit_index = None;
+        if self.block_search.is_open {
+            // Hits always describe the ACTIVE session and the current query:
+            // recompute on open, per keystroke, and after a tab switch. Only
+            // open/tab-switch rebuilds the extraction cache; keystrokes just
+            // rescan it (see refresh_block_search_hits).
+            let active_session_id = self
+                .session_manager
+                .get_active_session_mut()
+                .metadata
+                .session_id
+                .clone();
+            if self.block_search.needs_refresh(&active_session_id) {
+                self.refresh_block_search_hits();
+            }
+
+            let screen_rect = ctx.viewport_rect();
+            let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
+            let picker_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
+            let picker_pos = egui::pos2(
+                screen_rect.center().x - picker_width / 2.0,
+                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
+            );
+
+            egui::Window::new("Block Search")
+                .title_bar(false)
+                .resizable(false)
+                .movable(false)
+                .default_pos(picker_pos)
+                .default_size([picker_width, picker_height])
+                .fixed_size([picker_width, picker_height])
+                .frame(egui::Frame {
+                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
+                    stroke: egui::Stroke::new(
+                        1.0,
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
+                    ),
+                    corner_radius: egui::CornerRadius::same(10),
+                    inner_margin: egui::Margin::same(8),
+                    ..Default::default()
+                })
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("🔍");
+                        let search_response = ui.text_edit_singleline(&mut self.block_search.query);
+                        if search_response.changed() {
+                            self.refresh_block_search_hits();
+                        }
+                        if self.block_search.needs_focus {
+                            search_response.request_focus();
+                            self.block_search.needs_focus = false;
+                        }
+                        if search_response.has_focus() && self.block_search.query.is_empty() {
+                            ui.label("Search block commands and output...");
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(self.block_search.count_label())
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+
+                    // Own a snapshot so pointer actions can be applied after
+                    // the window closure (palette precedent).
+                    let hits = self.block_search.hits.clone();
+                    let selected_index = self.block_search.selected_index;
+                    let query_is_empty = self.block_search.query.trim().is_empty();
+
+                    egui::ScrollArea::vertical()
+                        .max_height(picker_height - 120.0)
+                        .show(ui, |ui| {
+                            for (idx, hit) in hits.iter().enumerate() {
+                                let is_selected = idx == selected_index;
+                                let bg_color = if is_selected {
+                                    crate::theme::Theme::rgb_to_color32(
+                                        self.current_theme.tabbar.active_border,
+                                    )
+                                    .gamma_multiply(0.18)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+
+                                let item_response = ui.horizontal(|ui| {
+                                    let item_rect = ui.available_rect_before_wrap();
+                                    ui.painter().rect_filled(item_rect, 2.0, bg_color);
+
+                                    let (marker, marker_color) = match hit.line_no {
+                                        Some(line_no) => (
+                                            format!("L{line_no}"),
+                                            egui::Color32::from_rgb(255, 200, 100),
+                                        ),
+                                        None => (
+                                            "cmd".to_string(),
+                                            egui::Color32::from_rgb(150, 150, 255),
+                                        ),
+                                    };
+                                    ui.colored_label(marker_color, marker);
+
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&hit.command_preview)
+                                                .monospace()
+                                                .strong(),
+                                        );
+                                        if hit.is_output_line {
+                                            ui.label(
+                                                egui::RichText::new(&hit.line_text)
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(ui.visuals().weak_text_color()),
+                                            );
+                                        }
+                                    });
+                                });
+
+                                if is_selected {
+                                    item_response
+                                        .response
+                                        .scroll_to_me(Some(egui::Align::Center));
+                                }
+
+                                let click_response = ui
+                                    .interact(
+                                        item_response.response.rect,
+                                        item_response.response.id.with("block_search_click"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if click_response.hovered() {
+                                    hovered_hit_index = Some(idx);
+                                }
+                                if click_response.clicked() {
+                                    clicked_hit_index = Some(idx);
+                                }
+
+                                ui.separator();
+                            }
+
+                            if hits.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(if query_is_empty {
+                                        "Type to search every command block in this session"
+                                    } else {
+                                        "No matches"
+                                    })
+                                    .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                        });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("↑↓ Navigate  Enter Jump  Esc Close")
+                                .size(10.0)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+                });
+        }
+
+        if let Some(index) = hovered_hit_index {
+            self.block_search.selected_index = index;
+        }
+        if let Some(index) = clicked_hit_index {
+            self.block_search.selected_index = index;
+            self.block_search_confirm();
         }
 
         // 远程主机选择器（浮动窗口）

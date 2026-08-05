@@ -231,6 +231,201 @@ pub fn next_selected_index(
     }
 }
 
+/// Keyboard failed-block navigation for `block:jump_prev_failed` /
+/// `block:jump_next_failed`: step only over FAILED blocks (the same
+/// classification the scrollbar markers use). `current` is the resolved index
+/// of the currently selected record — any block, failed or not — or `None`
+/// when nothing is selected (dangling/cross-session selections resolve to
+/// `None`), in which case both directions pick the NEWEST failed block.
+/// Returns the index to select, or `None` when nothing qualifies: no failed
+/// block strictly older/newer than `current` (silent no-op), or no failed
+/// block at all (the caller toasts).
+pub fn next_failed_index(
+    outcomes: &[BlockOutcome],
+    current: Option<usize>,
+    step: SelectStep,
+) -> Option<usize> {
+    let mut failed = outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| matches!(outcome, BlockOutcome::Failed(_)))
+        .map(|(index, _)| index);
+    match current {
+        None => failed.next_back(),
+        Some(current) => match step {
+            SelectStep::Older => failed.take_while(|&index| index < current).last(),
+            SelectStep::Newer => failed.find(|&index| index > current),
+        },
+    }
+}
+
+/// Hard cap on cross-block search hits. Scanning stops at the cap, and the
+/// caller feeds records NEWEST FIRST so the cap keeps recent history.
+pub const MAX_BLOCK_SEARCH_HITS: usize = 500;
+/// Display clip for a hit's matching line.
+pub const BLOCK_SEARCH_LINE_TEXT_CHARS: usize = 200;
+/// Display clip for a hit's command preview.
+pub const BLOCK_SEARCH_COMMAND_PREVIEW_CHARS: usize = 80;
+
+/// One `block:search` result row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSearchHit {
+    pub record_id: String,
+    /// False for a hit on the record's command text.
+    pub is_output_line: bool,
+    /// 1-based line number within the record's output; `None` for command
+    /// hits. Numbering restarts at 1 for every record.
+    pub line_no: Option<usize>,
+    /// The matching line, single-line clipped to
+    /// [`BLOCK_SEARCH_LINE_TEXT_CHARS`].
+    pub line_text: String,
+    /// The record's command, single-line clipped to
+    /// [`BLOCK_SEARCH_COMMAND_PREVIEW_CHARS`]; `"(no command)"` for
+    /// background blocks.
+    pub command_preview: String,
+}
+
+/// One record's precomputed text for [`search_blocks`]. Built once per
+/// picker-open (and rebuilt on a session switch while open), so every
+/// keystroke scans these strings instead of re-extracting terminal output.
+/// The lowercase copies are precomputed here so a query run allocates
+/// nothing beyond its needle and its hits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedBlockSearchRecord {
+    pub record_id: String,
+    /// The record's command, original case; `None` for background blocks
+    /// (absent or blank command).
+    pub command: Option<String>,
+    /// Lowercased `command`, for case-insensitive matching.
+    pub command_lowercase: Option<String>,
+    /// The record's output, original case; `None` when it has none.
+    pub output: Option<String>,
+    /// Lowercased `output`. Unicode lowercasing never adds or removes line
+    /// breaks, so `output.lines()` and `output_lowercase.lines()` stay in
+    /// step and hits can report original-case line text.
+    pub output_lowercase: Option<String>,
+}
+
+impl CachedBlockSearchRecord {
+    /// Normalize one record at cache-build time: a blank command counts as
+    /// none (background block), and the lowercase copies are precomputed.
+    pub fn new(record_id: &str, command: Option<&str>, output: Option<String>) -> Self {
+        let command = command
+            .filter(|command| !command.trim().is_empty())
+            .map(str::to_string);
+        let command_lowercase = command.as_deref().map(str::to_lowercase);
+        let output_lowercase = output.as_deref().map(str::to_lowercase);
+        Self {
+            record_id: record_id.to_string(),
+            command,
+            command_lowercase,
+            output,
+            output_lowercase,
+        }
+    }
+}
+
+/// [`search_blocks`] result: hits in scan order (records newest first;
+/// within a record, the command hit before its output hits).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockSearchResults {
+    pub hits: Vec<BlockSearchHit>,
+    /// True when scanning stopped at [`MAX_BLOCK_SEARCH_HITS`].
+    pub capped: bool,
+}
+
+/// Collapse `text` to a single line (newlines/CR/tabs become spaces) and clip
+/// it to `max_chars` characters, appending `…` when cut.
+pub fn single_line_clip(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, character) in text.chars().enumerate() {
+        if count >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(match character {
+            '\n' | '\r' | '\t' => ' ',
+            character => character,
+        });
+    }
+    out
+}
+
+/// Case-insensitive substring search (no regex) across the cached command
+/// text and output lines of every offered record. `query` is trimmed; an
+/// empty query matches nothing. Scanning stops as soon as the hit cap is
+/// reached, and `capped` reports that stop — i.e. that older content went
+/// unscanned — regardless of whether it would have matched. Beyond the
+/// lowercased needle, allocations happen only for hits.
+pub fn search_blocks<'a, I>(records: I, query: &str) -> BlockSearchResults
+where
+    I: IntoIterator<Item = &'a CachedBlockSearchRecord>,
+{
+    let needle = query.trim().to_lowercase();
+    let mut results = BlockSearchResults::default();
+    if needle.is_empty() {
+        return results;
+    }
+    for record in records {
+        if results.hits.len() >= MAX_BLOCK_SEARCH_HITS {
+            results.capped = true;
+            return results;
+        }
+        // Shared by the record's hits; computed only when one exists.
+        let mut command_preview: Option<String> = None;
+        let mut preview = |command: Option<&str>| -> String {
+            command_preview
+                .get_or_insert_with(|| {
+                    command
+                        .map(|command| {
+                            single_line_clip(command, BLOCK_SEARCH_COMMAND_PREVIEW_CHARS)
+                        })
+                        .unwrap_or_else(|| "(no command)".to_string())
+                })
+                .clone()
+        };
+        if let (Some(command), Some(lowercase)) = (
+            record.command.as_deref(),
+            record.command_lowercase.as_deref(),
+        ) {
+            if lowercase.contains(&needle) {
+                let command_preview = preview(Some(command));
+                results.hits.push(BlockSearchHit {
+                    record_id: record.record_id.clone(),
+                    is_output_line: false,
+                    line_no: None,
+                    line_text: single_line_clip(command, BLOCK_SEARCH_LINE_TEXT_CHARS),
+                    command_preview,
+                });
+            }
+        }
+        let (Some(output), Some(output_lowercase)) =
+            (record.output.as_deref(), record.output_lowercase.as_deref())
+        else {
+            continue;
+        };
+        for (line_index, (line, line_lowercase)) in
+            output.lines().zip(output_lowercase.lines()).enumerate()
+        {
+            if line_lowercase.contains(&needle) {
+                if results.hits.len() >= MAX_BLOCK_SEARCH_HITS {
+                    results.capped = true;
+                    return results;
+                }
+                let command_preview = preview(record.command.as_deref());
+                results.hits.push(BlockSearchHit {
+                    record_id: record.record_id.clone(),
+                    is_output_line: true,
+                    line_no: Some(line_index + 1),
+                    line_text: single_line_clip(line.trim_end(), BLOCK_SEARCH_LINE_TEXT_CHARS),
+                    command_preview,
+                });
+            }
+        }
+    }
+    results
+}
+
 /// anvil's `markdown_fence` rule: the fence must be strictly longer than any
 /// backtick run inside the fenced body, and never shorter than the CommonMark
 /// minimum of three.
@@ -468,15 +663,15 @@ pub fn scrollbar_marker_fraction(
     Some((line_id - oldest_line_id) as f32 / span as f32)
 }
 
-/// Index of the OLDEST record that completed with a nonzero exit code.
-/// `None` exit codes are unreported, not failures.
-pub fn oldest_failed_index<I>(exit_codes: I) -> Option<usize>
-where
-    I: IntoIterator<Item = Option<i32>>,
-{
-    exit_codes
-        .into_iter()
-        .position(|code| matches!(code, Some(code) if code != 0))
+/// Index of the OLDEST FAILED block — the same [`classify_outcome`]-based
+/// definition the scrollbar markers and `next_failed_index` use (complete,
+/// non-empty command, nonzero exit), so every failed-block feature agrees.
+/// Unreported exit codes are `Unknown`, and an empty-command completion with
+/// a nonzero exit is `Background`; neither is a failure.
+pub fn oldest_failed_index(outcomes: &[BlockOutcome]) -> Option<usize> {
+    outcomes
+        .iter()
+        .position(|outcome| matches!(outcome, BlockOutcome::Failed(_)))
 }
 
 /// Result of a click routed through block-mode hit testing. `Select` carries
@@ -755,6 +950,200 @@ mod tests {
     }
 
     #[test]
+    fn failed_navigation_starts_at_the_newest_failed_block() {
+        use BlockOutcome::*;
+        let outcomes = [Failed(1), Success, Failed(2), Background, Prompt];
+        // No selection (or a dangling/cross-session one resolved to None):
+        // both directions jump to the NEWEST failed block.
+        assert_eq!(
+            next_failed_index(&outcomes, None, SelectStep::Older),
+            Some(2)
+        );
+        assert_eq!(
+            next_failed_index(&outcomes, None, SelectStep::Newer),
+            Some(2)
+        );
+        // Zero failed blocks → None, whether or not something is selected.
+        let no_failures = [Success, Background, Running];
+        assert_eq!(
+            next_failed_index(&no_failures, None, SelectStep::Older),
+            None
+        );
+        assert_eq!(
+            next_failed_index(&no_failures, Some(1), SelectStep::Newer),
+            None
+        );
+        assert_eq!(next_failed_index(&[], None, SelectStep::Older), None);
+    }
+
+    #[test]
+    fn failed_navigation_steps_strictly_older_or_newer_and_clamps() {
+        use BlockOutcome::*;
+        let outcomes = [Failed(1), Success, Failed(2), Failed(3), Prompt];
+        // From a failed block: the nearest failed strictly beyond it.
+        assert_eq!(
+            next_failed_index(&outcomes, Some(2), SelectStep::Older),
+            Some(0)
+        );
+        assert_eq!(
+            next_failed_index(&outcomes, Some(2), SelectStep::Newer),
+            Some(3)
+        );
+        // Clamped at either end: silent no-op.
+        assert_eq!(
+            next_failed_index(&outcomes, Some(0), SelectStep::Older),
+            None
+        );
+        assert_eq!(
+            next_failed_index(&outcomes, Some(3), SelectStep::Newer),
+            None
+        );
+        // From a NON-failed selection: strict comparison still applies.
+        assert_eq!(
+            next_failed_index(&outcomes, Some(1), SelectStep::Older),
+            Some(0)
+        );
+        assert_eq!(
+            next_failed_index(&outcomes, Some(1), SelectStep::Newer),
+            Some(2)
+        );
+    }
+
+    fn search_record(
+        record_id: &str,
+        command: Option<&str>,
+        output: Option<&str>,
+    ) -> CachedBlockSearchRecord {
+        CachedBlockSearchRecord::new(record_id, command, output.map(str::to_string))
+    }
+
+    #[test]
+    fn block_search_matches_commands_and_output_lines_case_insensitively() {
+        let records = vec![
+            search_record("new", Some("Cargo Test"), Some("running\nerror: FAILED\n")),
+            search_record("old", Some("ls"), Some("cargo.toml\n")),
+        ];
+        let results = search_blocks(&records, "cARGo");
+        assert!(!results.capped);
+        assert_eq!(
+            results.hits,
+            vec![
+                // Records are scanned in the given (newest-first) order; the
+                // command hit precedes the record's output hits.
+                BlockSearchHit {
+                    record_id: "new".to_string(),
+                    is_output_line: false,
+                    line_no: None,
+                    line_text: "Cargo Test".to_string(),
+                    command_preview: "Cargo Test".to_string(),
+                },
+                BlockSearchHit {
+                    record_id: "old".to_string(),
+                    is_output_line: true,
+                    line_no: Some(1),
+                    line_text: "cargo.toml".to_string(),
+                    command_preview: "ls".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn block_search_line_numbers_are_one_based_and_restart_per_record() {
+        let records = vec![
+            search_record("b", None, Some("x\nmatch here\nx\nmatch again\n")),
+            search_record("a", Some("echo match"), Some("match\n")),
+        ];
+        let results = search_blocks(&records, "match");
+        let numbering: Vec<(&str, Option<usize>, bool)> = results
+            .hits
+            .iter()
+            .map(|hit| (hit.record_id.as_str(), hit.line_no, hit.is_output_line))
+            .collect();
+        assert_eq!(
+            numbering,
+            vec![
+                ("b", Some(2), true),
+                ("b", Some(4), true),
+                ("a", None, false),
+                ("a", Some(1), true),
+            ]
+        );
+        // A background record (no command) still labels its hits.
+        assert_eq!(results.hits[0].command_preview, "(no command)");
+    }
+
+    #[test]
+    fn block_search_caps_hits_and_keeps_the_newest_records() {
+        let many_lines = "match\n".repeat(MAX_BLOCK_SEARCH_HITS + 50);
+        let records = vec![
+            search_record("newest", None, Some(many_lines.as_str())),
+            search_record("older", None, Some("match\n")),
+            search_record("oldest", None, Some("match\n")),
+        ];
+        let results = search_blocks(&records, "match");
+        assert_eq!(results.hits.len(), MAX_BLOCK_SEARCH_HITS);
+        // `capped` means the scan stopped early: older content went
+        // unscanned, whether or not it would have matched.
+        assert!(results.capped);
+        // Newest-first scan: the cap keeps recent history only.
+        assert!(results.hits.iter().all(|hit| hit.record_id == "newest"));
+
+        let records = vec![search_record("only", None, Some("match\n"))];
+        let uncapped = search_blocks(&records, "match");
+        assert_eq!(uncapped.hits.len(), 1);
+        assert!(!uncapped.capped);
+    }
+
+    #[test]
+    fn cache_build_precomputes_lowercase_and_drops_blank_commands() {
+        let record = CachedBlockSearchRecord::new(
+            "id",
+            Some("Cargo TEST"),
+            Some("Mixed Case\nSECOND".to_string()),
+        );
+        assert_eq!(record.record_id, "id");
+        assert_eq!(record.command.as_deref(), Some("Cargo TEST"));
+        assert_eq!(record.command_lowercase.as_deref(), Some("cargo test"));
+        assert_eq!(record.output.as_deref(), Some("Mixed Case\nSECOND"));
+        assert_eq!(
+            record.output_lowercase.as_deref(),
+            Some("mixed case\nsecond")
+        );
+
+        // Blank commands normalize to None (background block), and a record
+        // without output caches none.
+        let background = CachedBlockSearchRecord::new("bg", Some("  \t"), None);
+        assert_eq!(background.command, None);
+        assert_eq!(background.command_lowercase, None);
+        assert_eq!(background.output, None);
+        assert_eq!(background.output_lowercase, None);
+    }
+
+    #[test]
+    fn block_search_ignores_empty_queries_and_clips_long_lines() {
+        let records = vec![search_record("a", Some("ls"), Some("ls\n"))];
+        assert_eq!(search_blocks(&records, "  ").hits, Vec::new());
+        let long = format!("{}needle", "x".repeat(BLOCK_SEARCH_LINE_TEXT_CHARS));
+        let records = vec![search_record("a", Some(long.as_str()), None)];
+        let results = search_blocks(&records, "needle");
+        // The match is beyond the clip, but the hit still reports it; the
+        // display texts are clipped with an ellipsis.
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(
+            results.hits[0].line_text,
+            format!("{}…", "x".repeat(BLOCK_SEARCH_LINE_TEXT_CHARS))
+        );
+        assert_eq!(
+            results.hits[0].command_preview,
+            format!("{}…", "x".repeat(BLOCK_SEARCH_COMMAND_PREVIEW_CHARS))
+        );
+        // Multiline commands collapse to one display line.
+        assert_eq!(single_line_clip("a\nb\tc", 10), "a b c");
+        assert_eq!(single_line_clip("short", 10), "short");
+    }
+
+    #[test]
     fn markdown_fence_grows_past_the_longest_backtick_run() {
         assert_eq!(markdown_fence("plain text"), "```");
         assert_eq!(markdown_fence("inline `code` span"), "```");
@@ -1025,12 +1414,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_jump_picks_the_oldest_failure() {
+    fn failed_jump_picks_the_oldest_classified_failure() {
+        use BlockOutcome::*;
         assert_eq!(
-            oldest_failed_index([Some(0), None, Some(2), Some(130)]),
+            oldest_failed_index(&[Success, Unknown, Failed(2), Failed(130)]),
             Some(2)
         );
-        assert_eq!(oldest_failed_index([Some(0), None]), None);
-        assert_eq!(oldest_failed_index([]), None);
+        // Same failed set as the scrollbar markers and prev/next_failed:
+        // Background (empty-command completion, even with a nonzero exit)
+        // and Unknown (unreported exit) are NOT jump targets.
+        assert_eq!(
+            oldest_failed_index(&[Background, Unknown, Success, Prompt]),
+            None
+        );
+        assert_eq!(oldest_failed_index(&[]), None);
     }
 }

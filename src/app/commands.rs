@@ -415,6 +415,14 @@ impl TerminalApp {
                         }
                         if response.clicked() {
                             self.command_sidebar.selected = Some(row.target.clone());
+                            // Full-duplex sync with the terminal's block
+                            // selection (id-based, same session): a sidebar
+                            // click selects the block, just as selecting a
+                            // block highlights the sidebar row.
+                            self.block_selection = Some((
+                                row.target.session_id.clone(),
+                                row.target.execution_id.clone(),
+                            ));
                             action = Some(CommandAction {
                                 target: row.target.clone(),
                                 kind: CommandActionKind::Jump,
@@ -822,31 +830,22 @@ impl TerminalApp {
                 .is_some_and(|(start, end)| end > start)
     }
 
-    /// `block:jump_first_failed`: select and reveal the OLDEST record that
-    /// exited nonzero in the active session.
+    /// `block:jump_first_failed`: select and reveal the OLDEST FAILED block
+    /// in the active session — the same `classify_outcome`-based failed set
+    /// as the scrollbar markers and `block:jump_prev/next_failed`, so all
+    /// failed-block features agree. Alt-screen is a silent no-op like the
+    /// rest of keyboard block navigation.
     pub(crate) fn block_jump_first_failed(&mut self) {
-        let target = {
-            let session = self.session_manager.get_active_session_mut();
-            let session_id = session.metadata.session_id.clone();
-            let terminal = session.terminal.lock();
-            crate::block_mode::oldest_failed_index(
-                terminal
-                    .command_records()
-                    .iter()
-                    .map(|record| record.exit_code),
-            )
-            .and_then(|index| terminal.command_records().get(index))
-            .map(|record| CommandTarget {
-                session_id,
-                execution_id: record.id.clone(),
-            })
+        let Some(navigation) =
+            self.block_navigation(|outcomes, _| crate::block_mode::oldest_failed_index(outcomes))
+        else {
+            return;
         };
-        let Some(target) = target else {
+        let Some(target) = navigation.target else {
             self.set_status("No failed command in this session");
             return;
         };
-        self.block_selection = Some((target.session_id.clone(), target.execution_id.clone()));
-        self.jump_to_sidebar_command(&target);
+        self.apply_block_selection(target);
     }
 
     /// `block:copy_command`: copy the selected block's command; with no
@@ -902,53 +901,224 @@ impl TerminalApp {
     /// selection is kept silently; a dangling selected id counts as no
     /// selection and both directions restart at the newest selectable block.
     fn block_select_step(&mut self, step: crate::block_mode::SelectStep) {
-        let (target, had_selection) = {
-            let session = self.session_manager.get_active_session_mut();
-            let session_id = session.metadata.session_id.clone();
-            let terminal = session.terminal.lock();
-            if terminal.is_alt_buffer_active() {
-                // vim/btop 全屏应用下块界面不可见,导航只会隐形跳动:静默忽略。
-                return;
-            }
-            let records = terminal.command_records();
-            let newest = records.len().checked_sub(1);
-            let outcomes: Vec<crate::block_mode::BlockOutcome> = records
-                .iter()
-                .enumerate()
-                .map(|(index, record)| {
-                    crate::block_mode::classify_outcome(
-                        record.command.as_deref(),
-                        record.exit_code,
-                        record.state,
-                        record.complete,
-                        Some(index) == newest,
-                    )
-                })
-                .collect();
-            let current = self
-                .block_selection
-                .as_ref()
-                .filter(|(selected_session, _)| selected_session == &session_id)
-                .and_then(|(_, record_id)| {
-                    records.iter().position(|record| &record.id == record_id)
-                });
-            let target = crate::block_mode::next_selected_index(&outcomes, current, step)
-                .and_then(|index| records.get(index))
-                .map(|record| CommandTarget {
-                    session_id: session_id.clone(),
-                    execution_id: record.id.clone(),
-                });
-            (target, current.is_some())
+        let Some(navigation) = self.block_navigation(|outcomes, current| {
+            crate::block_mode::next_selected_index(outcomes, current, step)
+        }) else {
+            return;
         };
-        let Some(target) = target else {
+        let Some(target) = navigation.target else {
             // 到达两端时静默保持当前选中;只有完全没有可选块才提示。
-            if !had_selection {
+            if !navigation.had_selection {
                 self.set_status("No command block to select");
             }
             return;
         };
+        self.apply_block_selection(target);
+    }
+
+    /// `block:jump_prev_failed`: move the block selection to the nearest
+    /// FAILED block older than the selection (newest failed with none).
+    pub(crate) fn block_jump_prev_failed(&mut self) {
+        self.block_jump_failed_step(crate::block_mode::SelectStep::Older);
+    }
+
+    /// `block:jump_next_failed`: move the block selection to the nearest
+    /// FAILED block newer than the selection (newest failed with none).
+    pub(crate) fn block_jump_next_failed(&mut self) {
+        self.block_jump_failed_step(crate::block_mode::SelectStep::Newer);
+    }
+
+    /// Failed-only keyboard navigation (same failed classification as the
+    /// scrollbar markers). The selection may sit on any block, failed or not;
+    /// the step is strictly older/newer. No failed block in the requested
+    /// direction is a silent no-op; zero failed blocks toasts with
+    /// `block:jump_first_failed`'s wording.
+    fn block_jump_failed_step(&mut self, step: crate::block_mode::SelectStep) {
+        let Some(navigation) = self.block_navigation(|outcomes, current| {
+            crate::block_mode::next_failed_index(outcomes, current, step)
+        }) else {
+            return;
+        };
+        let Some(target) = navigation.target else {
+            if !navigation.any_failed {
+                self.set_status("No failed command in this session");
+            }
+            return;
+        };
+        self.apply_block_selection(target);
+    }
+
+    /// Shared snapshot for keyboard block navigation: classify the active
+    /// session's records, resolve the current selection (cross-session or
+    /// dangling ids count as no selection), and let `pick` choose the record
+    /// index to select. `None` when the alt buffer is active.
+    fn block_navigation(
+        &mut self,
+        pick: impl FnOnce(&[crate::block_mode::BlockOutcome], Option<usize>) -> Option<usize>,
+    ) -> Option<BlockNavigation> {
+        let session = self.session_manager.get_active_session_mut();
+        let session_id = session.metadata.session_id.clone();
+        let terminal = session.terminal.lock();
+        if terminal.is_alt_buffer_active() {
+            // vim/btop 全屏应用下块界面不可见,导航只会隐形跳动:静默忽略。
+            return None;
+        }
+        let records = terminal.command_records();
+        let newest = records.len().checked_sub(1);
+        let outcomes: Vec<crate::block_mode::BlockOutcome> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                crate::block_mode::classify_outcome(
+                    record.command.as_deref(),
+                    record.exit_code,
+                    record.state,
+                    record.complete,
+                    Some(index) == newest,
+                )
+            })
+            .collect();
+        let current = self
+            .block_selection
+            .as_ref()
+            .filter(|(selected_session, _)| selected_session == &session_id)
+            .and_then(|(_, record_id)| records.iter().position(|record| &record.id == record_id));
+        let target = pick(&outcomes, current)
+            .and_then(|index| records.get(index))
+            .map(|record| CommandTarget {
+                session_id: session_id.clone(),
+                execution_id: record.id.clone(),
+            });
+        Some(BlockNavigation {
+            target,
+            had_selection: current.is_some(),
+            any_failed: outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, crate::block_mode::BlockOutcome::Failed(_))),
+        })
+    }
+
+    /// Select `target` and reveal it: set `block_selection`, highlight the
+    /// Commands-sidebar row, and scroll to the block (the same jump path as
+    /// `block:jump_first_failed`).
+    fn apply_block_selection(&mut self, target: CommandTarget) {
         self.block_selection = Some((target.session_id.clone(), target.execution_id.clone()));
+        self.sync_block_selection_to_sidebar(&target);
         self.jump_to_sidebar_command(&target);
+    }
+
+    /// Highlight the newly selected block's row in the Commands sidebar.
+    /// This IS the sidebar's own selection model — the same field a row
+    /// click sets — so the row also expands its detail panel, exactly as if
+    /// it had been clicked. Set unconditionally (id-based, no rendering):
+    /// opening the sidebar on the Commands view later shows the highlight.
+    pub(crate) fn sync_block_selection_to_sidebar(&mut self, target: &CommandTarget) {
+        self.command_sidebar.selected = Some(target.clone());
+    }
+
+    /// `block:search`: toggle the cross-block search picker. Like keyboard
+    /// block navigation, it never OPENS over a fullscreen (alt-buffer) app —
+    /// blocks are invisible there and Enter's jump could only toast — but
+    /// closing an already-open picker is always allowed.
+    pub(crate) fn block_search_toggle(&mut self) {
+        if self.block_search.is_open {
+            self.block_search.close();
+            return;
+        }
+        let alt_buffer_active = {
+            let session = self.session_manager.get_active_session_mut();
+            session.terminal.lock().is_alt_buffer_active()
+        };
+        if alt_buffer_active {
+            // vim/btop 全屏应用下块界面不可见:与块导航一致,静默忽略。
+            return;
+        }
+        self.block_search.open();
+    }
+
+    /// Recompute the picker's hits for the active session and current query.
+    ///
+    /// Record text is NOT re-extracted per keystroke: it lives in the
+    /// extraction cache built by `rebuild_block_search_cache`, refreshed here
+    /// only when `session_id` is stale (first refresh after opening, or a tab
+    /// switch while open). A keystroke therefore only rescans the cached
+    /// strings — no allocation beyond the needle and the hits. Accepted
+    /// staleness: blocks that finish while the picker is open are not seen
+    /// until it is reopened or the session switches.
+    pub(crate) fn refresh_block_search_hits(&mut self) {
+        let query = self.block_search.query.clone();
+        let session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        if self.block_search.session_id.as_deref() != Some(session_id.as_str()) {
+            self.rebuild_block_search_cache();
+        }
+        let results = crate::block_mode::search_blocks(&self.block_search.cache, &query);
+        self.block_search.hits = results.hits;
+        self.block_search.capped = results.capped;
+        // The result set changed under the highlight: restart at the top
+        // (newest) hit, the palette's update_search_results precedent.
+        self.block_search.selected_index = 0;
+        self.block_search.session_id = Some(session_id);
+        self.block_search.computed_query = Some(query);
+    }
+
+    /// Build the picker's extraction cache from the active session's records,
+    /// newest first (so the hit cap keeps recent history). Output text comes
+    /// from the same source as `block:copy_output`: the captured snapshot —
+    /// read directly off the record, no by-id lookup — with live anchor
+    /// extraction as the fallback for records that have no capture yet, each
+    /// bounded by the captured-output cap. This is the one extraction pass
+    /// per picker-open; per-keystroke searches never touch the terminal.
+    fn rebuild_block_search_cache(&mut self) {
+        let session = self.session_manager.get_active_session_mut();
+        let terminal = session.terminal.lock();
+        let cache: Vec<crate::block_mode::CachedBlockSearchRecord> = terminal
+            .command_records()
+            .iter()
+            .rev()
+            .map(|record| {
+                let output = match record.captured_output.as_ref() {
+                    // Captures are produced under MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
+                    // so the snapshot is already bounded.
+                    Some(captured) => Some(captured.text.clone()),
+                    None => terminal
+                        .command_output_text(&record.id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
+                        .map(|text| text.text),
+                };
+                crate::block_mode::CachedBlockSearchRecord::new(
+                    &record.id,
+                    record.command.as_deref(),
+                    output,
+                )
+            })
+            .collect();
+        drop(terminal);
+        self.block_search.cache = cache;
+    }
+
+    /// Enter (or a click) on a hit: close the picker, then select and reveal
+    /// the hit's block through the same path as select_prev/next. With no
+    /// hits Enter is a no-op and the picker stays open (palette precedent).
+    /// A record that scrolled out of reach in the meantime degrades to the
+    /// jump path's own toast.
+    pub(crate) fn block_search_confirm(&mut self) {
+        let Some(target) = self
+            .block_search
+            .selected_hit()
+            .zip(self.block_search.session_id.as_ref())
+            .map(|(hit, session_id)| CommandTarget {
+                session_id: session_id.clone(),
+                execution_id: hit.record_id.clone(),
+            })
+        else {
+            return;
+        };
+        self.block_search.close();
+        self.apply_block_selection(target);
     }
 
     /// Shared targeting rule for every `block:*` copy/recall command: a
@@ -1220,6 +1390,15 @@ enum CopyKind {
     Command,
     Output,
     Combined,
+}
+
+/// One keyboard block-navigation snapshot — see
+/// [`TerminalApp::block_navigation`]. `had_selection`/`any_failed` let the
+/// callers distinguish a silent clamp from a "nothing to select" toast.
+struct BlockNavigation {
+    target: Option<CommandTarget>,
+    had_selection: bool,
+    any_failed: bool,
 }
 
 /// `(command, command_exact, output)` where output is `(text, truncated)` —

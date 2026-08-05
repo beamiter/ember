@@ -181,6 +181,10 @@ pub struct TerminalApp {
     /// 送往 PTY 时清空（anvil 先例）。
     pub block_selection: Option<(String, String)>,
 
+    /// `block:search` 跨块搜索选择器（palette 式浮层）。打开期间拥有键盘
+    /// 输入,终端事件被拦截,因此不会顺带清掉 block_selection。
+    pub block_search: crate::block_search::BlockSearchState,
+
     // Find & Replace (operates on selection)
     pub search_replace_panel: search_replace_panel::SearchReplacePanel,
 

@@ -1,6 +1,7 @@
 mod agent_panel;
 mod app;
 mod block_mode;
+mod block_search;
 mod bottom_bar;
 mod clipboard;
 mod color;
@@ -1923,6 +1924,7 @@ impl TerminalApp {
             },
             command_sidebar: Default::default(),
             block_selection: None,
+            block_search: Default::default(),
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
@@ -2725,7 +2727,12 @@ impl eframe::App for TerminalApp {
             return;
         }
 
-        if self.handle_keybindings(ctx, terminal_input_blocked || palette_owned_input) {
+        // Block-search picker keys (Enter/Escape/arrows), routed like the
+        // palette's so the overlay owns the whole frame's keyboard input.
+        let block_search_owned_input = self.handle_block_search_input();
+        let overlay_owned_input = palette_owned_input || block_search_owned_input;
+
+        if self.handle_keybindings(ctx, terminal_input_blocked || overlay_owned_input) {
             return;
         }
 
@@ -2735,7 +2742,7 @@ impl eframe::App for TerminalApp {
         // into the PTY after the modal-closing shortcut.
         terminal_input_blocked = app::input::terminal_input_blocked_after_commands(
             terminal_input_blocked,
-            palette_owned_input,
+            overlay_owned_input,
             self.terminal_input_blocked(ctx),
         );
 
