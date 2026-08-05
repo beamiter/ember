@@ -94,7 +94,7 @@ mod tests {
     impl TestDir {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "jterm2-history-test-{label}-{}",
+                "ember-history-test-{label}-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&path);

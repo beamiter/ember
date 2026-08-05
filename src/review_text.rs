@@ -1,4 +1,4 @@
-//! Compatibility boundary for untrusted command text while jterm2 remains
+//! Compatibility boundary for untrusted command text while ember remains
 //! pinned to the last published `jterm_core`/`jagent` contract.
 //!
 //! The pinned revisions reject C0/C1 injection, but predate the complete
@@ -109,7 +109,7 @@ fn is_c0_or_c1(character: char) -> bool {
 
 /// Prepare text that will enter the shell's editable prompt.
 ///
-/// LF/tab retain jterm2's structural paste semantics and CR/CRLF normalize to
+/// LF/tab retain ember's structural paste semantics and CR/CRLF normalize to
 /// LF. Other C0/C1 characters are stripped. Search/sidebar insertions reject
 /// non-control visual spoofing; a real clipboard may retain it only when the
 /// caller routes the result through a mandatory, explicit confirmation.

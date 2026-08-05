@@ -151,7 +151,7 @@ pub fn normalize_terminal_shortcut_events(
         }
 
         // OSC 5522 owns the application's ordinary Ctrl+V paste event, but
-        // Ctrl+Shift+V is jterm2's explicit host-text paste shortcut. Egui
+        // Ctrl+Shift+V is ember's explicit host-text paste shortcut. Egui
         // represents both as Event::Paste, so keeping the shifted event here
         // would incorrectly send Codex an OSC 5522 MIME notification and make
         // it try an image paste instead of inserting the clipboard text.

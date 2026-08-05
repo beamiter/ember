@@ -57,7 +57,7 @@ pub(crate) fn safe_window_title(reported: &str, fallback: &str) -> String {
     }
 
     if title.is_empty() {
-        title.push_str("JTerm2");
+        title.push_str("Ember");
     } else if truncated {
         title.push('…');
     }
@@ -274,7 +274,7 @@ impl TerminalApp {
             }
         }
 
-        let configured_shell = std::env::var("JTERM2_SHELL").ok().or(new.shell.clone());
+        let configured_shell = std::env::var("EMBER_SHELL").ok().or(new.shell.clone());
         self.session_manager.set_configured_shell(configured_shell);
         // A toggled bottom bar changes the height left for the grid; re-grid
         // the PTY at once instead of waiting for the next natural resize.
@@ -294,8 +294,8 @@ mod tests {
 
     #[test]
     fn empty_or_control_only_osc_title_uses_a_safe_fallback() {
-        assert_eq!(safe_window_title("", "~/work — JTerm2"), "~/work — JTerm2");
-        assert_eq!(safe_window_title("\u{1b}\u{202e}", ""), "JTerm2");
+        assert_eq!(safe_window_title("", "~/work — Ember"), "~/work — Ember");
+        assert_eq!(safe_window_title("\u{1b}\u{202e}", ""), "Ember");
     }
 
     #[test]

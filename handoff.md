@@ -36,7 +36,7 @@ fail closed.
 `src/session_persistence.rs` still constructs snapshots and intermediate layout
 `serde_json::Value`s before enforcing the 64-session, tag, tab, layout-depth,
 field, and cumulative budgets. Replace that path with bounded seeds/visitors —
-jterm1's `src/session.rs` now has a worked example for the same shape — and add
+anvil's `src/session.rs` now has a worked example for the same shape — and add
 adversarial wide, deep, and cumulative tests.
 
 ### Bound the app-owned helpers and configuration files

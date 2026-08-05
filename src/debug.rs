@@ -7,7 +7,7 @@ pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
 
     *ENABLED.get_or_init(|| {
-        std::env::var_os("JTERM2_DEBUG")
+        std::env::var_os("EMBER_DEBUG")
             .map(|value| value != "0")
             .unwrap_or(false)
     })

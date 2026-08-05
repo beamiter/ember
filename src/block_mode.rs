@@ -1,4 +1,4 @@
-//! Warp/jterm1/jterm4-style command-block chrome: outcome classification,
+//! Warp/anvil/forge-style command-block chrome: outcome classification,
 //! duration/badge composition and visible-span math.
 //!
 //! Everything here is pure so the contract can be pinned by unit tests; the
@@ -7,7 +7,7 @@
 //! *i* spans from its `prompt_start` line to the line before the next record's
 //! `prompt_start`, so late output after `OSC 133;D` still belongs visually to
 //! the block that produced it (finalize happens at the next `A`, as in
-//! jterm1/jterm4).
+//! anvil/forge).
 
 use crate::terminal::CommandState;
 
@@ -67,7 +67,7 @@ pub fn classify_outcome(
     }
 }
 
-/// jterm4's `format_block_duration` contract, ported verbatim: `<1s` →
+/// forge's `format_block_duration` contract, ported verbatim: `<1s` →
 /// `"743ms"`, `<60s` → `"12.3s"`, `<1h` → `"1m32s"` (seconds retained; a
 /// zero remainder collapses to `"1m"`), else `"2h05m"` (or `"1h"`).
 pub fn format_block_duration(dur_ms: u64) -> String {
@@ -96,7 +96,7 @@ pub fn format_block_duration(dur_ms: u64) -> String {
 
 /// Badge text for the block's first row, or `None` for outcomes that carry no
 /// badge (running, live prompt, background). `Unknown` is a bare `?` glyph:
-/// jterm1/4 show no exit badge for an unreported status.
+/// anvil/4 show no exit badge for an unreported status.
 pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<String> {
     match outcome {
         BlockOutcome::Success => Some(match duration_ms {
@@ -209,7 +209,7 @@ where
 /// Result of a click routed through block-mode hit testing. `Select` carries
 /// the record id of the block whose gutter band was clicked; `Clear` is any
 /// other plain content click (block selection follows real interaction, like
-/// jterm1's precedent that real input clears it).
+/// anvil's precedent that real input clears it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockClick {
     Select(String),
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn duration_format_matches_the_jterm4_contract() {
+    fn duration_format_matches_the_forge_contract() {
         assert_eq!(format_block_duration(743), "743ms");
         assert_eq!(format_block_duration(999), "999ms");
         assert_eq!(format_block_duration(1_000), "1.0s");
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(format_block_duration(92_000), "1m32s");
         assert_eq!(format_block_duration(3_599_000), "59m59s");
         assert_eq!(format_block_duration(7_500_000), "2h05m");
-        // jterm4's own pins (block_view/blocks.rs), byte-identical.
+        // forge's own pins (block_view/blocks.rs), byte-identical.
         assert_eq!(format_block_duration(250), "250ms");
         assert_eq!(format_block_duration(2500), "2.5s");
         assert_eq!(format_block_duration(59_940), "59.9s");

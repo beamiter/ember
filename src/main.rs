@@ -65,13 +65,13 @@ use ui::{grid_position_from_content, TerminalRenderer};
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Must stay equal to the installed entry's basename
-/// (`data/io.github.beamiter.jterm2.desktop`): the desktop shell pairs a window
+/// (`data/io.github.beamiter.ember.desktop`): the desktop shell pairs a window
 /// with its launcher entry through this id.
-const WINDOW_APP_ID: &str = "io.github.beamiter.jterm2";
+const WINDOW_APP_ID: &str = "io.github.beamiter.ember";
 
 /// The same artwork the installer puts in the icon theme, embedded so a window
 /// carries its icon even when the .desktop entry is not installed.
-const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.jterm2-128.png");
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.ember-128.png");
 
 /// A nonzero shell exit inside this window after spawn means the shell never
 /// became interactive: no human could have typed `exit` that fast.
@@ -601,7 +601,7 @@ fn apply_theme_visuals(ctx: &egui::Context, theme: &theme::Theme) {
 
 fn main() -> Result<(), eframe::Error> {
     // Keep operational failures observable by default while allowing
-    // `RUST_LOG=jterm2=debug` (or any normal env_logger filter) to opt into
+    // `RUST_LOG=ember=debug` (or any normal env_logger filter) to opt into
     // deeper diagnostics.
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp_millis()
@@ -610,7 +610,7 @@ fn main() -> Result<(), eframe::Error> {
     // 设置panic hook，记录panic信息
     // 注意：panic时Drop可能不会被调用，但我们依赖PR_SET_PDEATHSIG确保子进程退出
     std::panic::set_hook(Box::new(|panic_info| {
-        eprintln!("[PANIC] jterm2 panicked: {}", panic_info);
+        eprintln!("[PANIC] ember panicked: {}", panic_info);
         eprintln!("[PANIC] Child jsh processes should exit due to PR_SET_PDEATHSIG");
     }));
 
@@ -620,8 +620,8 @@ fn main() -> Result<(), eframe::Error> {
     // Shared jterm_core modules brand themselves per app (env prefixes,
     // prompt strings) from this identity.
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
-        app_name: "jterm2",
-        app_id: "io.github.beamiter.jterm2",
+        app_name: "ember",
+        app_id: "io.github.beamiter.ember",
         // Reported to every child shell as TERM_PROGRAM_VERSION by
         // jterm_core::child_env, so it has to be this crate's version and not
         // the core library's.
@@ -645,7 +645,7 @@ fn main() -> Result<(), eframe::Error> {
         .with_inner_size([cfg.initial_width, cfg.initial_height])
         // The desktop shell matches a window to its .desktop entry by app_id,
         // so this has to be the entry's basename or the shell shows an
-        // unbranded, unpinnable window instead of jterm2. egui sets it as
+        // unbranded, unpinnable window instead of ember. egui sets it as
         // winit's Wayland window name, which winit also reports as the X11
         // WM_CLASS general class, so `StartupWMClass` in the entry is this same
         // string rather than the program name a GTK app would report.
@@ -693,7 +693,7 @@ fn main() -> Result<(), eframe::Error> {
     let cfg = std::sync::Arc::new(cfg);
 
     eframe::run_native(
-        "JTerm2",
+        "Ember",
         options,
         Box::new(move |cc| {
             let cfg_clone = cfg.clone();
@@ -764,7 +764,7 @@ fn paste_requires_confirmation(
             ))
 }
 
-/// jterm2's side of the shared paste policy.
+/// ember's side of the shared paste policy.
 ///
 /// `SendVerbatim` is this app's long-standing behaviour: a multiline payload is
 /// never truncated, because the confirmation modal — not silent mangling — is
@@ -820,7 +820,7 @@ fn defanged_paste_body(text: &str, policy: jterm_core::pty_input::PastePolicy) -
     body
 }
 
-/// [`defanged_paste_body`] under the policy jterm2 uses for a clipboard paste
+/// [`defanged_paste_body`] under the policy ember uses for a clipboard paste
 /// (or, when `submit_after_paste`, for a command this app composed itself).
 fn normalized_paste_body(text: &str, submit_after_paste: bool) -> String {
     defanged_paste_body(text, paste_policy(submit_after_paste))
@@ -1258,11 +1258,11 @@ fn show_desktop_notification(
     }
 }
 
-/// jterm1-parity gate for the long-command desktop toast
+/// anvil-parity gate for the long-command desktop toast
 /// (`block_view`'s `notify_long_blocks` check): the command must be a real
-/// foreground command (jterm1 skips background blocks, whose command line is
+/// foreground command (anvil skips background blocks, whose command line is
 /// empty), the config flag must be on, and the measured duration must reach
-/// the threshold. jterm2 adds the egui window focus state: a completion the
+/// the threshold. ember adds the egui window focus state: a completion the
 /// user just watched on screen needs no toast.
 fn should_notify_long_command(
     config: &config::Config,
@@ -1700,7 +1700,7 @@ impl TerminalApp {
                                 "[SessionPersistence] Failed to load {}: {error}",
                                 path.display()
                             );
-                            // jterm2 donated this idea to the family; core's copy
+                            // ember donated this idea to the family; core's copy
                             // is a strict superset (a *dangling* symlink at a
                             // backup name no longer counts as free), so there is
                             // one scheme, not two.
@@ -1753,7 +1753,7 @@ impl TerminalApp {
         let saved_active_tab = saved_snapshot.as_ref().and_then(|s| s.active_tab);
         let terminal = TerminalState::new(cols, rows);
 
-        let configured_shell = std::env::var("JTERM2_SHELL").ok().or(cfg.shell.clone());
+        let configured_shell = std::env::var("EMBER_SHELL").ok().or(cfg.shell.clone());
 
         let shell = match ShellSession::new_with_cwd(
             cols,
@@ -1917,7 +1917,7 @@ impl TerminalApp {
                 sb.visible = false; // 默认隐藏，opt-in 切换
 
                 // 三个视图在两种 tab 栏布局下都可用：Top 模式下侧边栏的
-                // Sessions 列表与顶部 tab 栏并存(与 jterm3 一致)。
+                // Sessions 列表与顶部 tab 栏并存(与 frost 一致)。
                 sb.view = cfg.sidebar_view;
                 sb
             },
@@ -2429,7 +2429,7 @@ impl TerminalApp {
             return;
         }
 
-        // jterm2 prefers jsh as its shell, so it is worth noticing when the
+        // ember prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. The row draws nothing until the
         // background check has something actionable to offer.
         if self.render_jsh_notice(root_ui) {
@@ -2789,7 +2789,7 @@ impl eframe::App for TerminalApp {
         let mut shell_exited = false;
         // A shell that dies before it could ever have shown a prompt is a
         // startup failure, not the user leaving. Closing the window on it
-        // makes jterm2 look like it "exits as soon as it runs", hiding the
+        // makes ember look like it "exits as soon as it runs", hiding the
         // real cause (bad `shell =` config, unusable cwd, wrong binary).
         let mut shell_startup_failed = false;
 
@@ -3007,7 +3007,7 @@ impl eframe::App for TerminalApp {
 
         let has_keyboard_input = !self.keyboard_input_buffer.is_empty();
 
-        // 真实键盘输入送往 PTY 时丢弃 block 选中（jterm1 先例：真实输入
+        // 真实键盘输入送往 PTY 时丢弃 block 选中（anvil 先例：真实输入
         // 清除选中；不劫持 Escape）。
         if has_keyboard_input {
             self.block_selection = None;
@@ -4168,7 +4168,7 @@ mod tests {
     }
 
     #[test]
-    fn long_command_notification_gates_mirror_jterm1() {
+    fn long_command_notification_gates_mirror_anvil() {
         let config = crate::config::Config {
             notify_long_blocks: true,
             notify_long_block_threshold_ms: 10_000,
@@ -4195,7 +4195,7 @@ mod tests {
             None,
             false,
         ));
-        // jterm1's background blocks carry an empty command line and never
+        // anvil's background blocks carry an empty command line and never
         // notify; the same holds for a missing or whitespace-only command.
         assert!(!should_notify_long_command(
             &config,
@@ -4306,7 +4306,7 @@ mod tests {
     }
 
     /// The confirmation trigger is now `jterm_core`'s, but it must trip at the
-    /// same points jterm2's own predicate did — plus on an embedded paste
+    /// same points ember's own predicate did — plus on an embedded paste
     /// marker, which is an injection attempt worth surfacing.
     #[test]
     fn risky_paste_detection_covers_newlines_and_large_single_lines() {

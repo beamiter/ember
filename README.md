@@ -1,6 +1,6 @@
-# jterm2
+# ember
 
-jterm2 is a Linux terminal emulator written in Rust. It combines an egui
+ember is a Linux terminal emulator written in Rust. It combines an egui
 desktop shell with a WGPU text pipeline, a built-in VTE/ANSI parser, tabs,
 split panes, searchable scrollback and Kitty protocol extensions.
 
@@ -37,7 +37,7 @@ claimed.
 
 ### Kitty graphics compatibility
 
-jterm2 implements the core 7-bit Kitty graphics APC path for direct RGB,
+ember implements the core 7-bit Kitty graphics APC path for direct RGB,
 RGBA and PNG transfers (`t=d`, `f=24/32/100`), chunking, queries, placement,
 crop, z-order, deletion, cursor movement and ordinary main-screen scrollback.
 Malformed, oversized and unsupported requests receive bounded protocol errors
@@ -51,7 +51,7 @@ pre-decode PNG header sniff, together with the memory caps those steps enforce
 Chunked uploads are keyed per image id with a separate anonymous slot, so an
 upload for `i=1` is no longer destroyed by an unrelated single-shot transfer
 for `i=2`. The image store, placements, deletion, the PNG decoder and the
-protocol responder stay in jterm2, because a reply's dimensions and error text
+protocol responder stay in ember, because a reply's dimensions and error text
 come from whichever decoder produced them.
 
 The following advanced parts of the
@@ -64,7 +64,7 @@ not include images.
 
 ## Platform and prerequisites
 
-jterm2 currently targets Linux (X11 and Wayland). Building requires a current
+ember currently targets Linux (X11 and Wayland). Building requires a current
 Rust stable toolchain and the native window/graphics development packages used
 by winit and WGPU.
 
@@ -94,13 +94,13 @@ cargo run
 
 # Optimized binary (thin LTO, one codegen unit, stripped symbols)
 cargo build --release
-./target/release/jterm2
+./target/release/ember
 ```
 
-Set `JTERM2_SHELL` to override shell detection for one launch:
+Set `EMBER_SHELL` to override shell detection for one launch:
 
 ```bash
-JTERM2_SHELL=/bin/zsh cargo run --release
+EMBER_SHELL=/bin/zsh cargo run --release
 ```
 
 Bare shell names are resolved through `PATH`; relative paths such as
@@ -108,7 +108,7 @@ Bare shell names are resolved through `PATH`; relative paths such as
 Enable deeper diagnostics when needed:
 
 ```bash
-RUST_LOG=jterm2=debug cargo run
+RUST_LOG=ember=debug cargo run
 ```
 
 ## Install with desktop integration
@@ -125,38 +125,38 @@ and `DESTDIR` for packaging):
 
 | File | Path |
 | --- | --- |
-| Binary | `~/.local/bin/jterm2` |
-| Launcher entry | `~/.local/share/applications/io.github.beamiter.jterm2.desktop` |
-| Icons | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.jterm2.*` |
-| AppStream metadata | `~/.local/share/metainfo/io.github.beamiter.jterm2.metainfo.xml` |
+| Binary | `~/.local/bin/ember` |
+| Launcher entry | `~/.local/share/applications/io.github.beamiter.ember.desktop` |
+| Icons | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.ember.*` |
+| AppStream metadata | `~/.local/share/metainfo/io.github.beamiter.ember.metainfo.xml` |
 
-That is what makes jterm2 appear in the GNOME/KDE application list with its own
+That is what makes ember appear in the GNOME/KDE application list with its own
 icon, ready to pin. Three details decide whether it shows up at all, and the
 installer handles each:
 
 - `Exec=`/`TryExec=` are rewritten to the binary's absolute path (system
   prefixes such as `/usr` keep the relocatable bare name). A desktop session
-  fixes its `PATH` at login, so `TryExec=jterm2` fails and hides the entry
+  fixes its `PATH` at login, so `TryExec=ember` fails and hides the entry
   **completely** when `~/.local/bin` is not on that `PATH`.
 - `update-desktop-database` and `gtk-update-icon-cache` are refreshed after
   install and uninstall; a stale icon cache shadows newly installed icons.
   `DESTDIR` builds skip the refresh and leave it to the package manager.
-- `StartupWMClass` is `io.github.beamiter.jterm2`, matching the window's real
+- `StartupWMClass` is `io.github.beamiter.ember`, matching the window's real
   `WM_CLASS`. egui hands the app id to winit as its Wayland window name, which
   also becomes the X11 general class, so both display servers agree — without
   it the shell shows an unbranded window that cannot be pinned.
 
-The window also carries its own icon: `data/io.github.beamiter.jterm2-128.png`
+The window also carries its own icon: `data/io.github.beamiter.ember-128.png`
 is embedded in the binary and handed to winit at startup, so `_NET_WM_ICON` is
 set even for a bare `cargo run` or a session where the entry is not installed.
 The launcher entry covers only windows the shell can match to it.
 
 Verify with `desktop-file-validate <entry>` and `gtk-launch
-io.github.beamiter.jterm2`.
+io.github.beamiter.ember`.
 
 ## Configuration
 
-The main configuration is `~/.config/jterm2/config.toml`. It is created after
+The main configuration is `~/.config/ember/config.toml`. It is created after
 settings are saved. Hand-edited values are validated on startup and hot reload;
 unsafe dimensions and non-finite/out-of-range numeric values are normalized.
 
@@ -182,7 +182,7 @@ scrollback_lines = 10000
 scroll_speed = 3
 restore_session = true
 tab_bar_position = "top"      # top | sidebar
-shell = "/bin/bash"            # optional; JTERM2_SHELL has priority
+shell = "/bin/bash"            # optional; EMBER_SHELL has priority
 jsh_update_check = "daily"     # startup | daily | never
 
 # Host clipboard policy. Reading is more sensitive than writing.
@@ -220,7 +220,7 @@ state is stored beside the config:
 - `keybindings.toml` — user binding overrides
 - `themes/*.toml` — custom themes
 
-Only the first running jterm2 instance owns and updates the shared session
+Only the first running ember instance owns and updates the shared session
 snapshot, preventing a secondary window from overwriting the primary state.
 Restore is capped at 64 sessions and 4 MiB of snapshot data. Malformed or
 oversized snapshots are moved to a timestamped `.corrupt-*` backup before a
@@ -256,7 +256,7 @@ Defaults include:
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
 
-Bindings in `~/.config/jterm2/keybindings.toml` override defaults. The file is
+Bindings in `~/.config/ember/keybindings.toml` override defaults. The file is
 a flat TOML table:
 
 ```toml
@@ -282,13 +282,13 @@ customizations. Copy, paste and keyboard font zoom use this same command path;
 there are no separate hard-coded shortcuts that bypass user overrides.
 
 Search results are capped at 20,000 matches to keep broad queries bounded.
-When old scrollback must be reflowed after a width change, jterm2 keeps the
+When old scrollback must be reflowed after a width change, ember keeps the
 results and navigation but suppresses any historical highlight whose raw
 coordinate cannot yet be mapped exactly, rather than painting the wrong cell.
 
 ## Installing and updating jsh
 
-jterm2 prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
+ember prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
 falls back to bash only when it cannot find one. The palette command
 **Install or update jsh** runs the installer in its own session: the session is
 the progress UI, so it can be interrupted with Ctrl+C and it waits for Enter
@@ -425,7 +425,7 @@ behavior can be exercised without a desktop session.
 
 ## License
 
-jterm2 is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
+ember is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
 Full texts are in [`LICENSE-MIT`](LICENSE-MIT) and
 [`LICENSE-APACHE`](LICENSE-APACHE). Contributions are accepted under the same
 dual terms.

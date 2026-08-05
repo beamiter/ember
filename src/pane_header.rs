@@ -97,7 +97,7 @@ struct GitStripEntry {
     stale: bool,
 }
 
-/// Per-session git metadata cache with jterm1's refresh triggers: a session's
+/// Per-session git metadata cache with anvil's refresh triggers: a session's
 /// first probe, a working-directory change, and a completed command. Between
 /// triggers the cached metadata is returned without running git, so an idle
 /// pane costs nothing per frame.
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn git_strip_cache_probes_only_on_jterm1_triggers() {
+    fn git_strip_cache_probes_only_on_anvil_triggers() {
         let mut cache = GitStripCache::new();
         let mut probes = 0;
         let meta = |cache: &mut GitStripCache, cwd: Option<&str>, probes: &mut usize| {

@@ -619,7 +619,7 @@ impl super::TerminalState {
         };
 
         if request == "." {
-            // Clipboard type enumeration is itself a host read. jterm2 sends
+            // Clipboard type enumeration is itself a host read. ember sends
             // the sanitized MIME list proactively only after an actual user
             // paste, together with a short-lived capability. A PTY-originated
             // discovery request must not spawn host clipboard helpers.

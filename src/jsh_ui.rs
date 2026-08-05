@@ -6,7 +6,7 @@
 //! thread and the row stays hidden until it has an answer.
 //!
 //! The decisions live in `jterm_core::jsh_install`, shared with the other
-//! terminals; this file is only jterm2's surface for them.
+//! terminals; this file is only ember's surface for them.
 
 use crate::app::state::TerminalApp;
 use eframe::egui;
@@ -62,7 +62,7 @@ impl JshNotice {
                     // Some other binary named jsh, earlier on PATH. Installing
                     // does not fix PATH order, so the installer explains it in
                     // the session; here it is only worth a log line.
-                    log::warn!("PATH resolves jsh to {other}, which jterm2 does not manage");
+                    log::warn!("PATH resolves jsh to {other}, which ember does not manage");
                 }
                 // A check that failed, or found nothing to do, stays silent: an
                 // offline laptop must not grow a row it cannot act on.

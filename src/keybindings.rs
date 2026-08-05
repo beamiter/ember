@@ -2,7 +2,7 @@
 ///
 /// 组合键字符串的解析/规范化/美化交给家族共享的
 /// `jterm_core::keybindings`（四个 jterm 语法的并集，一个 canonical
-/// 存储形式）。本文件只保留 jterm2 的命令词表和绑定表本身。
+/// 存储形式）。本文件只保留 ember 的命令词表和绑定表本身。
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -405,7 +405,7 @@ impl KeyBindings {
             "ctrl+shift+down".to_string(),
             "terminal:jump_next_command".to_string(),
         );
-        // 跳到最早的失败命令块,与 jterm1/jterm4 的 filter_failed_blocks
+        // 跳到最早的失败命令块,与 anvil/forge 的 filter_failed_blocks
         // 同键位。其余 block:* 命令默认不绑定,走命令面板。
         bindings.bindings.insert(
             "ctrl+shift+x".to_string(),
@@ -426,7 +426,7 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+0".to_string(), "font:reset".to_string());
 
-        // 窗口透明度实时调节，与 jterm1/jterm4 相同的键位。
+        // 窗口透明度实时调节，与 anvil/forge 相同的键位。
         bindings
             .bindings
             .insert("ctrl+alt+=".to_string(), "opacity:increase".to_string());
@@ -529,7 +529,7 @@ impl KeyBindings {
     /// 获取配置文件路径
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Could not determine config directory")?;
-        Ok(config_dir.join("jterm2/keybindings.toml"))
+        Ok(config_dir.join("ember/keybindings.toml"))
     }
 }
 
@@ -653,9 +653,9 @@ mod tests {
         );
     }
 
-    /// jterm2 对家族默认键位契约每一行的本地命令。jterm2 目前实现了
+    /// ember 对家族默认键位契约每一行的本地命令。ember 目前实现了
     /// `DEFAULT_CHORDS` 的全部行（含 sidebar），因此没有跳过项；若
-    /// jterm_core 新增了 jterm2 尚未实现的行，穷举 match 会编译失败，
+    /// jterm_core 新增了 ember 尚未实现的行，穷举 match 会编译失败，
     /// 迫使在这里显式选择：给出映射，或返回 `None` 并留注释说明跳过。
     fn local_command_for(action: jterm_core::keybindings::CommonAction) -> Option<Command> {
         use jterm_core::keybindings::CommonAction as A;
@@ -699,7 +699,7 @@ mod tests {
         let bindings = KeyBindings::default_bindings();
         for (action, chord) in jterm_core::keybindings::DEFAULT_CHORDS {
             let Some(command) = local_command_for(*action) else {
-                continue; // 显式跳过：jterm2 未实现的契约行（目前没有）。
+                continue; // 显式跳过：ember 未实现的契约行（目前没有）。
             };
             // 契约行必须以 canonical 拼写直接存在于绑定表中（map 键即
             // canonical 形式），并且经 get_command 的规范化路径可解析。

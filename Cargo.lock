@@ -900,6 +900,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "ember"
+version = "0.4.0"
+dependencies = [
+ "ab_glyph",
+ "anyhow",
+ "base64",
+ "bytemuck",
+ "criterion",
+ "crossbeam-channel",
+ "dirs",
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "env_logger",
+ "fontdue",
+ "fuzzy-matcher",
+ "harfrust",
+ "image",
+ "jterm_core",
+ "libc",
+ "log",
+ "lru",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "toml",
+ "unicode-normalization",
+ "unicode-width",
+ "uuid",
+ "wgpu",
+]
+
+[[package]]
 name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1651,42 +1687,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jterm2"
-version = "0.4.0"
-dependencies = [
- "ab_glyph",
- "anyhow",
- "base64",
- "bytemuck",
- "criterion",
- "crossbeam-channel",
- "dirs",
- "eframe",
- "egui",
- "egui-wgpu",
- "env_logger",
- "fontdue",
- "fuzzy-matcher",
- "harfrust",
- "image",
- "jterm_core",
- "libc",
- "log",
- "lru",
- "once_cell",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "smallvec",
- "toml",
- "unicode-normalization",
- "unicode-width",
- "uuid",
- "wgpu",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! Agent mode — a multi-turn LLM that proposes shell commands, watches their
 //! output, and iterates. UI is egui; the protocol state machine, provider
 //! client, transport, and redaction all live in `jterm_core` (shared with
-//! jterm1/jterm4).
+//! anvil/forge).
 //!
 //! ## Safety model (immutable, by design)
 //!
@@ -31,12 +31,12 @@ const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 fn snapshot_path() -> Option<std::path::PathBuf> {
     Some(
         dirs::config_dir()?
-            .join("jterm2")
+            .join("ember")
             .join("agent_session.json"),
     )
 }
 
-/// Read an Agent snapshot through jterm2's hardened persistence boundary.
+/// Read an Agent snapshot through ember's hardened persistence boundary.
 /// Failures are deliberately best-effort so a hostile or corrupt entry never
 /// prevents opening a fresh Agent session. Production restores go through
 /// [`claim_snapshot_session`], which claims the file before reading it.
@@ -165,7 +165,7 @@ fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<()
     Err(message)
 }
 
-/// Serialize under jagent's exact snapshot budget, then use jterm2's
+/// Serialize under jagent's exact snapshot budget, then use ember's
 /// create-new, same-directory atomic replacement instead of the pinned core's
 /// legacy predictable staging name.
 fn write_snapshot_file(
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     fn private_test_dir(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("jterm2-{label}-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("ember-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
         {
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn local_snapshot_io_round_trips_and_enforces_the_exact_budget() {
         let root =
-            std::env::temp_dir().join(format!("jterm2-agent-snapshot-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ember-agent-snapshot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
         {
@@ -1234,7 +1234,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let root = std::env::temp_dir().join(format!(
-            "jterm2-agent-snapshot-unsafe-{}",
+            "ember-agent-snapshot-unsafe-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&root).unwrap();

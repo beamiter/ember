@@ -167,7 +167,7 @@ impl DirectoryScanService {
             let results = result_tx.clone();
             let scanner = scanner.clone();
             std::thread::Builder::new()
-                .name(format!("jterm2-file-tree-{worker_index}"))
+                .name(format!("ember-file-tree-{worker_index}"))
                 .spawn(move || scan_worker(requests, results, scanner))?;
         }
         drop(result_tx);

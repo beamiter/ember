@@ -1,8 +1,8 @@
-//! Hardened I/O boundary for jterm2's small text persistence files.
+//! Hardened I/O boundary for ember's small text persistence files.
 //!
 //! The pinned `jterm_core` revision bounds reads and rejects non-regular
 //! descriptors, but it predates the symlink, hard-link and ownership checks
-//! required by jterm2's configurable snapshot paths. Keep those checks local
+//! required by ember's configurable snapshot paths. Keep those checks local
 //! until the hardened core implementation is part of the pinned contract.
 
 use std::ffi::OsString;
@@ -309,7 +309,7 @@ pub fn read_api_key_file(raw_path: &str) -> io::Result<String> {
     Ok(key.to_string())
 }
 
-/// Store one settings-entered API key through jterm2's private atomic writer.
+/// Store one settings-entered API key through ember's private atomic writer.
 /// Existing symlinks, hard links, non-regular files, foreign owners and loose
 /// permissions are rejected before replacement.
 pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
@@ -591,7 +591,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jterm2-persistence-file-{label}-{}-{id}",
+                "ember-persistence-file-{label}-{}-{id}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&path);

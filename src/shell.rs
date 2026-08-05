@@ -781,7 +781,7 @@ impl ShellSession {
 impl Drop for ShellSession {
     /// 清理shell进程及其子进程
     ///
-    /// 多层保护机制确保jsh进程在jterm2退出时被清理：
+    /// 多层保护机制确保jsh进程在ember退出时被清理：
     /// 1. 正常退出：Drop被调用，发送SIGHUP/SIGTERM/SIGKILL到进程组
     /// 2. SIGINT/SIGTERM：信号处理器触发正常退出，Drop被调用
     /// 3. SIGKILL或panic：PR_SET_PDEATHSIG确保子进程收到SIGTERM
@@ -968,7 +968,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let unique = format!(
-            "jterm2-pty-hangup-test-{}-{}",
+            "ember-pty-hangup-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

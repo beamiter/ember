@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Install jterm2 and its Linux desktop integration from a source checkout.
+# Install ember and its Linux desktop integration from a source checkout.
 
 set -Eeuo pipefail
 umask 077
 
-APP_ID="io.github.beamiter.jterm2"
+APP_ID="io.github.beamiter.ember"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 HOME_DIR="${HOME:-}"
@@ -34,7 +34,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm2 install: %s\n' "$*" >&2
+    printf 'ember install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -54,7 +54,7 @@ run() {
 run_optional() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
-        "$@" || printf 'jterm2 install: warning: %s failed (non-fatal)\n' "$1" >&2
+        "$@" || printf 'ember install: warning: %s failed (non-fatal)\n' "$1" >&2
     fi
 }
 
@@ -65,7 +65,7 @@ run_optional_public() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
         (umask 022 && "$@") \
-            || printf 'jterm2 install: warning: %s failed (non-fatal)\n' "$1" >&2
+            || printf 'ember install: warning: %s failed (non-fatal)\n' "$1" >&2
     fi
 }
 
@@ -93,13 +93,13 @@ bin_dir_on_path() {
 }
 
 # A desktop session fixes its PATH at login, so an entry that only says
-# `Exec=jterm2` fails TryExec and is hidden from the launcher whenever the
+# `Exec=ember` fails TryExec and is hidden from the launcher whenever the
 # binary lives in a per-user bin dir that PATH does not list. Point the entry at
 # the real path unless the target is a system bin dir that is always on PATH.
 desktop_exec_path() {
     case "${BIN_DIR}" in
-        /usr/bin | /usr/local/bin | /bin) printf 'jterm2' ;;
-        *) printf '%s/jterm2' "${BIN_DIR}" ;;
+        /usr/bin | /usr/local/bin | /bin) printf 'ember' ;;
+        *) printf '%s/ember' "${BIN_DIR}" ;;
     esac
 }
 
@@ -110,7 +110,7 @@ install_desktop_entry() {
     ((DRY_RUN == 0)) || return 0
     install -d -m 0755 "$(dirname -- "${dest}")"
     awk -v exec_path="${exec_path}" '
-        /^Exec=jterm2([[:space:]]|$)/ || /^TryExec=jterm2([[:space:]]|$)/ {
+        /^Exec=ember([[:space:]]|$)/ || /^TryExec=ember([[:space:]]|$)/ {
             eq = index($0, "=")
             print substr($0, 1, eq) exec_path substr($0, eq + 7)
             next
@@ -206,11 +206,11 @@ if [[ "${TARGET_DIR}" != /* ]]; then
 fi
 export CARGO_TARGET_DIR="${TARGET_DIR}"
 
-printf 'Building jterm2...\n'
+printf 'Building ember...\n'
 require_command cargo
 run_in_repo cargo build --release --locked
 
-BINARY="${TARGET_DIR}/release/jterm2"
+BINARY="${TARGET_DIR}/release/ember"
 if ((DRY_RUN == 0)) && [[ ! -x "${BINARY}" ]]; then
     die "release binary was not produced at ${BINARY}"
 fi
@@ -218,12 +218,15 @@ fi
 require_command install
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
-run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/jterm2"
+run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/ember"
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
 if ((INSTALL_DESKTOP == 1)); then
     install_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
         "${SHARE_DIR}/applications/${APP_ID}.desktop"
+    # Launcher left by installs from before the jterm2 -> ember rename; left in
+    # place it shows up as a second "jterm2" entry beside the new one.
+    run rm -f -- "${SHARE_DIR}/applications/io.github.beamiter.jterm2.desktop"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
         "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
@@ -235,28 +238,28 @@ if ((INSTALL_DESKTOP == 1)); then
     refresh_desktop_caches
 fi
 
-printf 'Installed jterm2 to %s\n' "${BIN_DIR}/jterm2"
+printf 'Installed ember to %s\n' "${BIN_DIR}/ember"
 if ((INSTALL_DESKTOP == 1)); then
     printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
     printf 'Launcher entry: %s (Exec=%s)\n' \
         "${SHARE_DIR}/applications/${APP_ID}.desktop" "$(desktop_exec_path)"
 fi
 if [[ -n "${DESTDIR}" ]]; then
-    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/jterm2"
+    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/ember"
 fi
 if [[ -z "${DESTDIR}" ]]; then
     if ! bin_dir_on_path; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
-        printf 'but shells will not find jterm2 until you add it, for example:\n'
+        printf 'but shells will not find ember until you add it, for example:\n'
         printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
     fi
-    SHADOWING_BIN="$(command -v jterm2 2>/dev/null || true)"
-    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/jterm2" ]]; then
-        printf '\nNote: typing `jterm2` still runs %s, an older copy earlier in PATH.\n' \
+    SHADOWING_BIN="$(command -v ember 2>/dev/null || true)"
+    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/ember" ]]; then
+        printf '\nNote: typing `ember` still runs %s, an older copy earlier in PATH.\n' \
             "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
         printf 'The launcher entry is unaffected: it runs %s directly.\n' \
-            "${BIN_DIR}/jterm2"
+            "${BIN_DIR}/ember"
     fi
 fi

@@ -586,7 +586,7 @@ fn try_acquire_instance_lock_at(
 
 /// 尝试获取实例锁文件。成功返回持锁守卫，失败表示已有实例在运行。
 pub fn try_acquire_instance_lock() -> Option<InstanceLock> {
-    let lock_path = dirs::config_dir()?.join("jterm2").join("instance.lock");
+    let lock_path = dirs::config_dir()?.join("ember").join("instance.lock");
     match try_acquire_instance_lock_at(&lock_path) {
         Ok(Some(file)) => match InstanceLock::register(file) {
             Ok(lock) => Some(lock),
@@ -640,7 +640,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = NEXT_LOCK_TEST.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jterm2-instance-lock-test-{}-{label}-{id}",
+                "ember-instance-lock-test-{}-{label}-{id}",
                 std::process::id()
             ));
             std::fs::create_dir(&path).unwrap();
@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     /// The seam, not the mechanism (core owns and tests the naming): what this
-    /// pins is that jterm2's loader rejects a corrupt snapshot and that the
+    /// pins is that ember's loader rejects a corrupt snapshot and that the
     /// bytes survive being moved aside, in that order — startup writes fresh
     /// state right after, and the evidence must already be out of its way.
     #[test]

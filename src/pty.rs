@@ -101,7 +101,7 @@ mod unix_pty {
     }
 
     /// Shell candidates are looked up through `jterm_core::host`, which now
-    /// imposes what jterm2's local copy used to: the execute bit, a regular
+    /// imposes what ember's local copy used to: the execute bit, a regular
     /// file, an absolute result, and an injectable `PATH` (launchers like wofi
     /// strip it, so the process environment cannot be the only source).
     fn find_executable_in_path_with(exe_name: &str, path_var: Option<&OsStr>) -> Option<String> {
@@ -109,7 +109,7 @@ mod unix_pty {
             .map(|path| path.to_string_lossy().into_owned())
     }
 
-    /// A `jsh` on PATH need not be the interactive shell jterm2 prefers: the
+    /// A `jsh` on PATH need not be the interactive shell ember prefers: the
     /// name can be taken by an unrelated binary, or be a symlink pointing
     /// somewhere else entirely. Launching such a program makes the child reject
     /// `--session` and exit immediately (ssh, for one, exits 255), which used to
@@ -193,11 +193,11 @@ mod unix_pty {
         choose_shell_with_path(configured_shell, path_var.as_deref(), Path::new("/bin/sh"))
     }
 
-    /// jterm2's child-environment policy.
+    /// ember's child-environment policy.
     ///
     /// `less_default = "FR"` is deliberate and predates the shared module: no
     /// `-X`, so `git`/`man` still get the alternate screen, and `F` quits on a
-    /// page that fits. `color_defaults` stays off because jterm2 has never
+    /// page that fits. `color_defaults` stays off because ember has never
     /// shipped an `LS_COLORS`, and the locale repair stays on: the GPU renderer
     /// draws UTF-8 either way, but a `C`-locale child emits mojibake into it.
     pub(super) fn child_environment() -> jterm_core::child_env::ChildEnv<'static> {
@@ -361,7 +361,7 @@ mod unix_pty {
                 // 构建子进程环境:继承父进程环境,覆盖终端相关变量(避免在子进程调用
                 // 非异步信号安全的 setenv)。直接把构建好的 envp 传给 execve。
                 // 策略与变量集合由 jterm_core::child_env 持有,四个终端共用;这里
-                // 只声明 jterm2 的选择 —— LESS=FR、UTF-8 locale 修正、不接管 ls 颜色。
+                // 只声明 ember 的选择 —— LESS=FR、UTF-8 locale 修正、不接管 ls 颜色。
                 let env_cstrings = jterm_core::child_env::envp(&child_environment(), &[])
                     .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
                 let mut envp: Vec<*const libc::c_char> =
@@ -456,8 +456,8 @@ mod unix_pty {
                     }
                     libc::sigaction(libc::SIGINT, &default_signal_action, std::ptr::null_mut());
 
-                    // 【关键】设置父进程死亡信号：当父进程(jterm2)死亡时，此进程会收到SIGTERM
-                    // 这是最后一道防线，确保即使jterm2被SIGKILL强制杀死或panic崩溃，
+                    // 【关键】设置父进程死亡信号：当父进程(ember)死亡时，此进程会收到SIGTERM
+                    // 这是最后一道防线，确保即使ember被SIGKILL强制杀死或panic崩溃，
                     // jsh进程也会收到退出信号，不会变成孤儿进程继续运行。
                     #[cfg(target_os = "linux")]
                     {
@@ -486,7 +486,7 @@ mod unix_pty {
 
                     // 设置 slave 为控制终端
                     if libc::ioctl(slave, libc::TIOCSCTTY, 0) != 0 {
-                        write_stderr(b"jterm2: ioctl TIOCSCTTY failed\n");
+                        write_stderr(b"ember: ioctl TIOCSCTTY failed\n");
                     }
 
                     // 重定向 stdin/stdout/stderr 到 PTY slave
@@ -936,7 +936,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = NEXT_SHELL_TEST.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jterm2-shell-test-{label}-{}-{id}",
+                "ember-shell-test-{label}-{}-{id}",
                 std::process::id()
             ));
             std::fs::create_dir(&path).unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
             "{error}"
         );
     }
-    /// jterm2's child-environment choices are now flags on a shared policy, so
+    /// ember's child-environment choices are now flags on a shared policy, so
     /// pin the ones a "colour fix" could quietly change: the pager stays `FR`,
     /// `ls` colours stay the user's business, and the locale repair stays on.
     #[cfg(unix)]
@@ -1166,7 +1166,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unresolvable_command_program_fails_before_forking() {
-        let argv = vec!["jterm2-definitely-not-installed-program".to_string()];
+        let argv = vec!["ember-definitely-not-installed-program".to_string()];
         let error = super::Pty::new_with_cwd(80, 24, Some("/tmp"), None, None, Some(&argv))
             .err()
             .expect("an unknown helper program must not spawn");

@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.beamiter.jterm2</id>
+  <id>io.github.beamiter.ember</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>jterm2</name>
+  <name>ember</name>
   <summary>GPU-accelerated terminal emulator built with Rust and egui</summary>
   <description>
     <p>
-      jterm2 renders its terminal grid on the GPU through egui and wgpu, with a
+      ember renders its terminal grid on the GPU through egui and wgpu, with a
       glow fallback for machines whose drivers prefer OpenGL.
     </p>
     <ul>
@@ -16,14 +16,14 @@
       <li>A companion jsh shell that the palette can install or update</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.beamiter.jterm2.desktop</launchable>
+  <launchable type="desktop-id">io.github.beamiter.ember.desktop</launchable>
   <developer id="io.github.beamiter">
     <name>beamiter</name>
   </developer>
-  <url type="homepage">https://github.com/beamiter/jterm2</url>
-  <url type="bugtracker">https://github.com/beamiter/jterm2/issues</url>
+  <url type="homepage">https://github.com/beamiter/ember</url>
+  <url type="bugtracker">https://github.com/beamiter/ember/issues</url>
   <provides>
-    <binary>jterm2</binary>
+    <binary>ember</binary>
   </provides>
   <recommends>
     <control>keyboard</control>

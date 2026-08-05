@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Remove jterm2 and its Linux desktop integration.
+# Remove ember and its Linux desktop integration.
 
 set -Eeuo pipefail
 
-APP_ID="io.github.beamiter.jterm2"
+APP_ID="io.github.beamiter.ember"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
@@ -26,7 +26,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm2 uninstall: %s\n' "$*" >&2
+    printf 'ember uninstall: %s\n' "$*" >&2
     exit 1
 }
 
@@ -100,12 +100,18 @@ if [[ -n "${DESTDIR}" ]]; then
 fi
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
-remove_file "${DESTDIR}${BIN_DIR}/jterm2"
+remove_file "${DESTDIR}${BIN_DIR}/ember"
 remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
 remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
 remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
 remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
 remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+# Desktop integration from before the jterm2 -> ember rename.
+remove_file "${SHARE_DIR}/applications/io.github.beamiter.jterm2.desktop"
+remove_file "${SHARE_DIR}/metainfo/io.github.beamiter.jterm2.metainfo.xml"
+remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/io.github.beamiter.jterm2.svg"
+remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/io.github.beamiter.jterm2.png"
+remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/io.github.beamiter.jterm2.png"
 
 # Without this the launcher keeps offering a dead entry and a cached icon.
 if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
@@ -121,6 +127,6 @@ if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
     fi
 fi
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/jterm2"
-printf 'Removed jterm2 from %s\n' "${BIN_DIR}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/ember"
+printf 'Removed ember from %s\n' "${BIN_DIR}"
 printf 'Preserved configuration and history under %s\n' "${CONFIG_DIR}"

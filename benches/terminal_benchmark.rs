@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use jterm2::terminal::TerminalState;
+use ember::terminal::TerminalState;
 use std::hint::black_box;
 
 /// Benchmark ANSI escape sequence parsing
@@ -149,7 +149,7 @@ fn bench_link_detection(c: &mut Criterion) {
     ];
 
     group.bench_function("detect_links", |b| {
-        use jterm2::link::{LinkDetectionConfig, LinkDetector};
+        use ember::link::{LinkDetectionConfig, LinkDetector};
         let _detector = LinkDetector::new(LinkDetectionConfig::default());
 
         b.iter(|| {

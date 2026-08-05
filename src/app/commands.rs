@@ -1754,10 +1754,10 @@ mod tests {
     fn semantic_filters_compose_with_command_and_cwd_search() {
         let mut row = replay_test_row(true, false);
         row.command_preview = "cargo test".to_owned();
-        row.cwd = Some("/work/jterm2".to_owned());
+        row.cwd = Some("/work/ember".to_owned());
 
         assert!(command_row_matches(&row, "cargo", CommandFilter::All));
-        assert!(command_row_matches(&row, "jterm2", CommandFilter::All));
+        assert!(command_row_matches(&row, "ember", CommandFilter::All));
         assert!(!command_row_matches(&row, "missing", CommandFilter::All));
         assert!(!command_row_matches(&row, "", CommandFilter::Failed));
 

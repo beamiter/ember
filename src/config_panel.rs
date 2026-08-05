@@ -1123,7 +1123,7 @@ impl ConfigPanel {
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut self.edit_ai_api_key_file)
-                        .hint_text("~/.config/jterm2/ai.key (chmod 600)")
+                        .hint_text("~/.config/ember/ai.key (chmod 600)")
                         .desired_width(260.0),
                 )
                 .changed()
@@ -1134,7 +1134,7 @@ impl ConfigPanel {
         ui.label(
             RichText::new(
                 "Optional single-line key file owned by you with 0600 permissions. \
-                 Environment variables (JTERM2_AI_API_KEY_FILE, JTERM2_AI_API_KEY, \
+                 Environment variables (EMBER_AI_API_KEY_FILE, EMBER_AI_API_KEY, \
                  ANTHROPIC_API_KEY, …) take precedence; the key itself is never \
                  written to config.toml.",
             )

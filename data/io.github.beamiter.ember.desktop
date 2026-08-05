@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=jterm2
+Name=ember
 GenericName=Terminal Emulator
 Comment=GPU-accelerated terminal emulator built with egui and wgpu
-Exec=jterm2
-TryExec=jterm2
-Icon=io.github.beamiter.jterm2
+Exec=ember
+TryExec=ember
+Icon=io.github.beamiter.ember
 Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;shell;console;command;developer;gpu;egui;wgpu;
@@ -13,9 +13,9 @@ StartupNotify=true
 # Measured with xprop, not assumed: egui applies the app_id through winit's
 # Wayland name, which also lands in the X11 WM_CLASS as the general class with
 # an empty instance. Anything else here leaves X11 windows unmatched.
-StartupWMClass=io.github.beamiter.jterm2
+StartupWMClass=io.github.beamiter.ember
 Actions=NewWindow;
 
 [Desktop Action NewWindow]
 Name=New Window
-Exec=jterm2
+Exec=ember

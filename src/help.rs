@@ -68,7 +68,7 @@ impl HelpPanel {
                 ..Default::default()
             })
             .show(ctx, |ui| {
-                ui.heading(RichText::new("JTerm2 快捷键").size(18.0).color(text_color));
+                ui.heading(RichText::new("Ember 快捷键").size(18.0).color(text_color));
                 ui.label(
                     RichText::new("从这里开始：用命令面板发现功能，用本页查找快捷键。")
                         .size(12.0)

@@ -234,7 +234,7 @@ impl TerminalApp {
 
     /// 在侧边栏内以垂直列表渲染会话标签(Sidebar tab 模式)。
     /// 与顶部 tab bar 行为对齐:支持按住 5px 阈值后竖向拖拽重排,松开时插入到目标行位置。
-    /// 右键任意一行打开标签页操作菜单(与 jterm1/jterm4 的侧边栏标签右键菜单同款)。
+    /// 右键任意一行打开标签页操作菜单(与 anvil/forge 的侧边栏标签右键菜单同款)。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
         self.refresh_unseen_flags_for_visible_panes();
         let active = self.tabs.active_index();
@@ -344,7 +344,7 @@ impl TerminalApp {
                                 }
                             } else {
                                 // 后台 tab 有未查看输出时用圆点提醒;固定/标记
-                                // 各占一个前缀符号,与 jterm1 的 tab-pinned /
+                                // 各占一个前缀符号,与 anvil 的 tab-pinned /
                                 // tab-marked 样式同义。
                                 let marker = if !is_active && *unseen { "•" } else { " " };
                                 let pin = if flags.pinned { "◆" } else { "" };
@@ -545,7 +545,7 @@ impl TerminalApp {
         lines.join("\n")
     }
 
-    /// 侧边栏标签的右键菜单。与 jterm1/jterm4 的标签右键菜单同一套条目:
+    /// 侧边栏标签的右键菜单。与 anvil/forge 的标签右键菜单同一套条目:
     /// 新建/复制/重命名/标记/固定/关闭,外加配置里的远程主机直连入口。
     ///
     /// 纯函数式:只把用户选中的条目写进 `action`,不触碰应用状态,这样它可以
@@ -664,7 +664,7 @@ impl TerminalApp {
     }
 
     /// 复制标签页:在它右侧新开一个标签,继承它当前选中窗格的工作目录和
-    /// 自定义标题(与 jterm1/jterm4 的 Duplicate 一致)。
+    /// 自定义标题(与 anvil/forge 的 Duplicate 一致)。
     ///
     /// 新会话的 cwd 取自「当前活跃会话」,所以先切到源标签页——复制本来也
     /// 会把焦点带到新标签,这一步不额外改变用户预期。

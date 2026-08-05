@@ -200,7 +200,7 @@ fn legacy_function_key_sequence(
     let modified = modifier > 1;
 
     // Shift+PageUp/PageDown belong to the scrollback, as in xterm and in
-    // jterm3, so the viewport is their only handler. `viewport_scroll_delta`
+    // frost, so the viewport is their only handler. `viewport_scroll_delta`
     // scrolls on every non-ctrl Page press, and this path used to also send a
     // sequence for the shifted form — the pane and a full-screen app both moved
     // on one keystroke.

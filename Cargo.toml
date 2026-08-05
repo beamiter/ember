@@ -1,9 +1,9 @@
 [package]
-name = "jterm2"
+name = "ember"
 version = "0.4.0"
 edition = "2021"
 description = "A GPU-accelerated terminal emulator built with Rust and egui"
-repository = "https://github.com/beamiter/jterm2"
+repository = "https://github.com/beamiter/ember"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["terminal", "terminal-emulator", "egui", "wgpu"]

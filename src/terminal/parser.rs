@@ -399,7 +399,7 @@ impl super::TerminalState {
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
                                             if self.pending_notifications.len() < 8 {
-                                                let title = "jterm2".to_string();
+                                                let title = "ember".to_string();
                                                 let body = value.chars().take(256).collect();
                                                 self.pending_notifications.push((title, body));
                                             }

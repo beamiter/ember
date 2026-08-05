@@ -227,7 +227,7 @@ pub struct Config {
 
     /// 长命令完成后发送桌面通知(默认开启)。仅当命令运行超过
     /// `notify_long_block_threshold_ms` 且完成时用户没有盯着该 pane
-    /// (窗口失焦或会话在后台 tab)才触发。与 jterm1 的
+    /// (窗口失焦或会话在后台 tab)才触发。与 anvil 的
     /// `notify_long_blocks` 同名,保持家族配置一致。
     #[serde(default = "default_true")]
     pub notify_long_blocks: bool,
@@ -236,7 +236,7 @@ pub struct Config {
     #[serde(default = "default_notify_long_block_threshold_ms")]
     pub notify_long_block_threshold_ms: u64,
 
-    /// 多 pane 布局的头部里显示 git 分支/脏状态(默认开启)。与 jterm1
+    /// 多 pane 布局的头部里显示 git 分支/脏状态(默认开启)。与 anvil
     /// 的 `show_repo_strip` 同名,保持家族配置一致。
     #[serde(default = "default_true")]
     pub show_repo_strip: bool,
@@ -254,7 +254,7 @@ pub struct Config {
     pub click_moves_cursor: bool,
 
     /// 命令块 chrome(默认开启):按 OSC 133 记录绘制每个命令块的侧边条纹、
-    /// 分隔线与结果徽章,与 jterm1/jterm4 的 block UI 一致。关闭后
+    /// 分隔线与结果徽章,与 anvil/forge 的 block UI 一致。关闭后
     /// `block:*` 命令(跳转/复制/召回)仍然可用。
     #[serde(default = "default_block_mode")]
     pub block_mode: bool,
@@ -715,7 +715,7 @@ impl Config {
 
     pub fn session_history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
-        Ok(config_dir.join("jterm2").join("session_history.json"))
+        Ok(config_dir.join("ember").join("session_history.json"))
     }
 
     /// Resolve the session snapshot path, honoring the documented per-user
@@ -729,12 +729,12 @@ impl Config {
 
     pub fn ui_history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
-        Ok(config_dir.join("jterm2").join("ui_history.json"))
+        Ok(config_dir.join("ember").join("ui_history.json"))
     }
 
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
-        Ok(config_dir.join("jterm2").join("config.toml"))
+        Ok(config_dir.join("ember").join("config.toml"))
     }
 
     pub fn get_font_family(&self) -> &str {
@@ -1075,20 +1075,20 @@ mod tests {
     #[test]
     fn resolved_session_history_path_honors_override() {
         let config = Config {
-            session_history_file: Some(PathBuf::from("/tmp/jterm2-sessions.json")),
+            session_history_file: Some(PathBuf::from("/tmp/ember-sessions.json")),
             ..Config::default()
         };
 
         assert_eq!(
             config.resolved_session_history_path().unwrap(),
-            PathBuf::from("/tmp/jterm2-sessions.json")
+            PathBuf::from("/tmp/ember-sessions.json")
         );
     }
 
     #[test]
     fn config_that_failed_to_load_refuses_to_be_overwritten() {
         let mut broken = Config {
-            load_error: Some("/home/u/.config/jterm2/config.toml: expected `=`".to_string()),
+            load_error: Some("/home/u/.config/ember/config.toml: expected `=`".to_string()),
             ..Config::default()
         };
 
@@ -1111,7 +1111,7 @@ mod tests {
     #[test]
     fn exact_revisions_allow_only_one_concurrent_config_generation() {
         let root = std::env::temp_dir().join(format!(
-            "jterm2-config-cas-{}-{}",
+            "ember-config-cas-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -1175,7 +1175,7 @@ mod tests {
     #[test]
     fn an_oversized_config_is_rejected_rather_than_parsed() {
         let path = std::env::temp_dir().join(format!(
-            "jterm2-config-oversized-{}.toml",
+            "ember-config-oversized-{}.toml",
             std::process::id()
         ));
         write_private(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]);
@@ -1194,7 +1194,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root =
-            std::env::temp_dir().join(format!("jterm2-config-symlink-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ember-config-symlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let target = root.join("target.toml");

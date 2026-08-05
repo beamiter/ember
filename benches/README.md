@@ -1,6 +1,6 @@
-# jterm2 Performance Benchmarks
+# ember Performance Benchmarks
 
-This directory contains performance benchmarks for critical code paths in jterm2.
+This directory contains performance benchmarks for critical code paths in ember.
 
 ## Running Benchmarks
 

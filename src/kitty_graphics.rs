@@ -1,4 +1,4 @@
-//! Kitty graphics protocol for jterm2.
+//! Kitty graphics protocol for ember.
 //!
 //! The *structural* half of the protocol — control-data parsing, chunk
 //! assembly across `m=1` continuations, base64 decoding, raw-format length
@@ -23,8 +23,8 @@ const MAX_KITTY_IMAGES: usize = 100;
 const MAX_KITTY_CACHE_MB: u64 = 256;
 const MAX_KITTY_PLACEMENTS: usize = 4096;
 const MAX_PENDING_RESPONSE_BYTES: usize = 64 * 1024;
-/// jterm2 keeps a live screen image store, so a single image may legitimately
-/// cover a whole window: the shared `SCREEN` budget is jterm2's historical
+/// ember keeps a live screen image store, so a single image may legitimately
+/// cover a whole window: the shared `SCREEN` budget is ember's historical
 /// 64 MiB / 16384 px limits.
 const CAPS: Caps = Caps::SCREEN;
 static NEXT_IMAGE_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -1568,7 +1568,7 @@ mod tests {
         );
     }
 
-    /// Behaviours the shared module standardized. jterm2 already agreed with
+    /// Behaviours the shared module standardized. ember already agreed with
     /// the exact-length and continuation rules; the rest are pinned here so a
     /// future core change cannot loosen them silently.
     #[test]

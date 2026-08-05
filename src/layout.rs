@@ -1,9 +1,9 @@
-//! Split-pane layout for jterm2, backed by `jterm_core::pane_layout`.
+//! Split-pane layout for ember, backed by `jterm_core::pane_layout`.
 //!
 //! The tmux-style n-ary [`PaneTree`] (leaves are session indices) replaces the
 //! old app-local binary tree: splitting along a node's existing axis joins the
 //! new pane as a sibling instead of nesting, and divider drags snap near even.
-//! This module keeps jterm2's public `LayoutManager` API and the persisted
+//! This module keeps ember's public `LayoutManager` API and the persisted
 //! binary `LayoutSnapshot` format: snapshots are converted to and from the
 //! n-ary tree on save/restore, so existing session files keep working.
 

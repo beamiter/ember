@@ -178,7 +178,7 @@ pub struct TerminalApp {
 
     /// Block mode 当前选中的命令块：(session_id, record id)。record 被淘汰
     /// 或 session 关闭时一律按“无选中”处理（绝不 panic）；真实键盘输入
-    /// 送往 PTY 时清空（jterm1 先例）。
+    /// 送往 PTY 时清空（anvil 先例）。
     pub block_selection: Option<(String, String)>,
 
     // Find & Replace (operates on selection)
@@ -220,7 +220,7 @@ pub struct TerminalApp {
     /// Cached per-pane header status (title / cwd / running command).
     pub pane_status_cache: crate::pane_header::PaneStatusCache,
 
-    /// Cached per-session git branch/dirty strip. Refreshed on jterm1's
+    /// Cached per-session git branch/dirty strip. Refreshed on anvil's
     /// triggers (new session, cwd change, command finished), never per frame.
     pub git_strip_cache: crate::pane_header::GitStripCache,
 

@@ -197,7 +197,7 @@ impl TabManager {
     }
 
     /// 稳定重排，让固定的 tab 排到最前，同时保持 `active` 指向原来那个 tab。
-    /// 与 jterm1 的 `reorder_pinned_first` 语义一致。
+    /// 与 anvil 的 `reorder_pinned_first` 语义一致。
     pub fn reorder_pinned_first(&mut self) {
         let mut order: Vec<usize> = (0..self.tabs.len()).collect();
         order.sort_by_key(|&idx| !self.tabs[idx].flags.pinned);
