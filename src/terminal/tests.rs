@@ -1651,6 +1651,22 @@ fn osc_133_truncated_command_is_never_reconstructed_as_exact() {
 }
 
 #[test]
+fn osc_133_truncated_flag_on_d_also_voids_the_command() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07displayed editor text\r\n");
+    terminal.process_input(b"\x1b]133;C;id=late-flag;cmdline_url=unsafe-prefix\x07");
+    terminal.process_input(b"output\x1b]133;D;0;id=late-flag;cmd_truncated=1\x07");
+
+    let record = terminal
+        .command_record("late-flag")
+        .expect("semantic record");
+    assert!(record.command.is_none());
+    assert!(!record.command_exact);
+    assert!(record.command_truncated);
+    assert_eq!(record.exit_code, Some(0));
+}
+
+#[test]
 fn osc_133_invalid_utf8_command_is_rejected_instead_of_accepting_a_prefix() {
     let mut terminal = TerminalState::new(24, 4);
     terminal.process_input(b"\x1b]133;A\x07> \x1b]133;B\x07shown command\r\n");

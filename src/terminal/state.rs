@@ -1840,6 +1840,7 @@ impl super::TerminalState {
         cwd: Option<&str>,
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
+        command_truncated: bool,
     ) {
         if self.use_alt_buffer {
             return;
@@ -1867,6 +1868,13 @@ impl super::TerminalState {
             return;
         }
         self.apply_record_metadata(index, id, command, cwd);
+        if command_truncated {
+            if let Some(record) = self.command_records.get_mut(index) {
+                record.command = None;
+                record.command_truncated = true;
+                record.command_exact = false;
+            }
+        }
         let anchor = self.current_buffer_anchor();
         self.finish_command_record(index, anchor, exit_code, duration_ms);
         if let Some(mark) = self.command_marks.back_mut() {
@@ -1913,7 +1921,14 @@ impl super::TerminalState {
             "A" => self.record_prompt_start_with_metadata(id, command, cwd),
             "B" => self.record_command_start(id, command, cwd),
             "C" => self.record_output_start(id, command, cwd, command_truncated),
-            "D" => self.record_command_exit_with_metadata(id, command, cwd, exit_code, duration_ms),
+            "D" => self.record_command_exit_with_metadata(
+                id,
+                command,
+                cwd,
+                exit_code,
+                duration_ms,
+                command_truncated,
+            ),
             _ => {}
         }
     }

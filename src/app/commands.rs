@@ -630,15 +630,21 @@ impl TerminalApp {
         }
     }
 
-    fn copy_sidebar_command_text(&mut self, target: &CommandTarget, kind: CopyKind) {
-        let Some(index) = self.target_session_index(target) else {
-            self.set_status("Command session is no longer available");
-            return;
-        };
+    /// Command/output for one block target, exactly as the copy commands see
+    /// it: the live record first, merged with the persisted sidebar record
+    /// (exact command text, and output once the live anchors are gone).
+    /// Returns `(command, command_exact, output)` where output is
+    /// `(text, truncated)`; `None` when neither source knows the record.
+    fn captured_block_text(
+        &self,
+        target: &CommandTarget,
+        want_output: bool,
+    ) -> Option<CapturedBlockText> {
         let live_captured = self
             .session_manager
             .sessions()
-            .get(index)
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
             .and_then(|session| {
                 let terminal = session.terminal.lock();
                 let record = terminal.command_record(&target.execution_id)?;
@@ -650,15 +656,16 @@ impl TerminalApp {
                 .unwrap_or_default();
                 let command_exact =
                     record.command_exact && !record.command_truncated && !command.is_empty();
-                let output = match kind {
-                    CopyKind::Command => None,
-                    CopyKind::Output | CopyKind::Combined => terminal
-                        .command_output_text(
-                            &target.execution_id,
-                            MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-                        )
-                        .map(|text| (text.text, text.truncated)),
-                };
+                let output = want_output
+                    .then(|| {
+                        terminal
+                            .command_output_text(
+                                &target.execution_id,
+                                MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
+                            )
+                            .map(|text| (text.text, text.truncated))
+                    })
+                    .flatten();
                 Some((command, command_exact, output))
             });
         let persisted_captured = self.persisted_sidebar_execution(target).map(|record| {
@@ -667,20 +674,21 @@ impl TerminalApp {
                 crate::review_text::MAX_HISTORY_COMMAND_BYTES,
             )
             .unwrap_or_default();
-            let output = match kind {
-                CopyKind::Command => None,
-                CopyKind::Output | CopyKind::Combined => record
-                    .output
-                    .as_ref()
-                    .map(|output| (output.text.clone(), output.truncated)),
-            };
+            let output = want_output
+                .then(|| {
+                    record
+                        .output
+                        .as_ref()
+                        .map(|output| (output.text.clone(), output.truncated))
+                })
+                .flatten();
             (
                 command.clone(),
                 !record.command_truncated && !command.is_empty(),
                 output,
             )
         });
-        let captured = match (live_captured, persisted_captured) {
+        match (live_captured, persisted_captured) {
             (Some((mut command, mut command_exact, mut output)), Some(persisted)) => {
                 if !command_exact && persisted.1 {
                     command = persisted.0;
@@ -693,8 +701,16 @@ impl TerminalApp {
             }
             (Some(captured), None) | (None, Some(captured)) => Some(captured),
             (None, None) => None,
-        };
-        let Some(captured) = captured else {
+        }
+    }
+
+    fn copy_sidebar_command_text(&mut self, target: &CommandTarget, kind: CopyKind) {
+        if self.target_session_index(target).is_none() {
+            self.set_status("Command session is no longer available");
+            return;
+        }
+        let want_output = !matches!(kind, CopyKind::Command);
+        let Some(captured) = self.captured_block_text(target, want_output) else {
             self.set_status("Command record is no longer available");
             return;
         };
@@ -833,41 +849,260 @@ impl TerminalApp {
         self.jump_to_sidebar_command(&target);
     }
 
-    /// `block:copy_command`: copy the selected block's command, falling back
-    /// to the most recent complete record with one.
+    /// `block:copy_command`: copy the selected block's command; with no
+    /// selection, the most recent complete record with one.
     pub(crate) fn block_copy_command(&mut self) {
-        let target = self
-            .live_block_target()
-            .or_else(|| self.latest_block_target(Self::record_has_command));
-        match target {
-            Some(target) => self.copy_sidebar_command_text(&target, CopyKind::Command),
-            None => self.set_status("No command block to copy from"),
-        }
+        let Some(target) =
+            self.block_target_or_newest(Self::record_has_command, "No command block to copy from")
+        else {
+            return;
+        };
+        self.copy_sidebar_command_text(&target, CopyKind::Command);
     }
 
     /// `block:copy_output`: copy the selected block's output (captured text,
-    /// or extracted from its output anchors), falling back to the most recent
-    /// complete record with output.
+    /// or extracted from its output anchors); with no selection, the most
+    /// recent complete record with output.
     pub(crate) fn block_copy_output(&mut self) {
-        let target = self
-            .live_block_target()
-            .or_else(|| self.latest_block_target(Self::record_has_output));
-        match target {
-            Some(target) => self.copy_sidebar_command_text(&target, CopyKind::Output),
-            None => self.set_status("No command block with output to copy"),
-        }
+        let Some(target) = self.block_target_or_newest(
+            Self::record_has_output,
+            "No command block with output to copy",
+        ) else {
+            return;
+        };
+        self.copy_sidebar_command_text(&target, CopyKind::Output);
     }
 
     /// `block:recall_command`: insert (never execute) the selected/latest
     /// command at the prompt, through the sidebar Fill action's prompt-ready
     /// guard machinery.
     pub(crate) fn block_recall_command(&mut self) {
-        let target = self
-            .live_block_target()
-            .or_else(|| self.latest_block_target(Self::record_has_command));
-        match target {
-            Some(target) => self.replay_sidebar_command(&target, false),
-            None => self.set_status("No command block to recall"),
+        let Some(target) =
+            self.block_target_or_newest(Self::record_has_command, "No command block to recall")
+        else {
+            return;
+        };
+        self.replay_sidebar_command(&target, false);
+    }
+
+    /// `block:select_prev`: move the block selection to the next-older
+    /// selectable block (or start at the newest when nothing is selected).
+    pub(crate) fn block_select_prev(&mut self) {
+        self.block_select_step(crate::block_mode::SelectStep::Older);
+    }
+
+    /// `block:select_next`: move the block selection to the next-newer
+    /// selectable block (or start at the newest when nothing is selected).
+    pub(crate) fn block_select_next(&mut self) {
+        self.block_select_step(crate::block_mode::SelectStep::Newer);
+    }
+
+    /// Keyboard navigation over the same selectable set as gutter clicks
+    /// (`outcome != Prompt`, Running included). Clamped at either end the
+    /// selection is kept silently; a dangling selected id counts as no
+    /// selection and both directions restart at the newest selectable block.
+    fn block_select_step(&mut self, step: crate::block_mode::SelectStep) {
+        let (target, had_selection) = {
+            let session = self.session_manager.get_active_session_mut();
+            let session_id = session.metadata.session_id.clone();
+            let terminal = session.terminal.lock();
+            if terminal.is_alt_buffer_active() {
+                // vim/btop 全屏应用下块界面不可见,导航只会隐形跳动:静默忽略。
+                return;
+            }
+            let records = terminal.command_records();
+            let newest = records.len().checked_sub(1);
+            let outcomes: Vec<crate::block_mode::BlockOutcome> = records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    crate::block_mode::classify_outcome(
+                        record.command.as_deref(),
+                        record.exit_code,
+                        record.state,
+                        record.complete,
+                        Some(index) == newest,
+                    )
+                })
+                .collect();
+            let current = self
+                .block_selection
+                .as_ref()
+                .filter(|(selected_session, _)| selected_session == &session_id)
+                .and_then(|(_, record_id)| {
+                    records.iter().position(|record| &record.id == record_id)
+                });
+            let target = crate::block_mode::next_selected_index(&outcomes, current, step)
+                .and_then(|index| records.get(index))
+                .map(|record| CommandTarget {
+                    session_id: session_id.clone(),
+                    execution_id: record.id.clone(),
+                });
+            (target, current.is_some())
+        };
+        let Some(target) = target else {
+            // 到达两端时静默保持当前选中;只有完全没有可选块才提示。
+            if !had_selection {
+                self.set_status("No command block to select");
+            }
+            return;
+        };
+        self.block_selection = Some((target.session_id.clone(), target.execution_id.clone()));
+        self.jump_to_sidebar_command(&target);
+    }
+
+    /// Shared targeting rule for every `block:*` copy/recall command: a
+    /// selection in the ACTIVE session wins — and when its record is gone it
+    /// toasts and does nothing, never silently retargeting — while a
+    /// selection belonging to another session counts as no selection at all
+    /// (matching keyboard navigation, which is active-session scoped). With
+    /// no usable selection, fall back to the newest complete record of the
+    /// active session matching `wanted`, toasting `missing` when none does.
+    fn block_target_or_newest(
+        &mut self,
+        wanted: impl Fn(&crate::terminal::CommandRecord) -> bool,
+        missing: &str,
+    ) -> Option<CommandTarget> {
+        let active_session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let selection_in_active_session = self
+            .block_selection
+            .as_ref()
+            .is_some_and(|(session_id, _)| session_id == &active_session_id);
+        if selection_in_active_session {
+            let target = self.live_block_target();
+            if target.is_none() {
+                self.set_status("Selected command block is no longer available");
+            }
+            target
+        } else {
+            let target = self.latest_block_target(wanted);
+            if target.is_none() {
+                self.set_status(missing.to_string());
+            }
+            target
+        }
+    }
+
+    /// Whether the target's live record carries a real command line; a
+    /// background block (no command) copies output only.
+    fn target_record_has_command(&self, target: &CommandTarget) -> bool {
+        self.session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .and_then(|session| {
+                session
+                    .terminal
+                    .lock()
+                    .command_record(&target.execution_id)
+                    .map(Self::record_has_command)
+            })
+            .unwrap_or(false)
+    }
+
+    /// `block:copy_block`: the whole block as plain text — command line,
+    /// newline, output. Background blocks copy output only (anvil/forge
+    /// `block_clipboard_text` family rule).
+    pub(crate) fn block_copy_block(&mut self) {
+        let Some(target) = self.block_target_or_newest(
+            |record| Self::record_has_command(record) || Self::record_has_output(record),
+            "No command block to copy",
+        ) else {
+            return;
+        };
+        let kind = if self.target_record_has_command(&target) {
+            CopyKind::Combined
+        } else {
+            CopyKind::Output
+        };
+        self.copy_sidebar_command_text(&target, kind);
+    }
+
+    /// `block:copy_markdown`: the block as a Markdown document. The exact
+    /// shape (and its sanitization) is pinned in `block_mode` tests; frost
+    /// ships the same format.
+    pub(crate) fn block_copy_markdown(&mut self) {
+        let Some(target) = self.block_target_or_newest(
+            |record| Self::record_has_command(record) || Self::record_has_output(record),
+            "No command block to copy",
+        ) else {
+            return;
+        };
+        if self.target_session_index(&target).is_none() {
+            self.set_status("Command session is no longer available");
+            return;
+        }
+        // Same command/output source as block:copy_block/copy_output — the
+        // live record merged with the persisted sidebar record — so Markdown
+        // never renders an empty fence where a plain copy would succeed.
+        let Some((command, command_exact, output)) = self.captured_block_text(&target, true) else {
+            self.set_status("Command record is no longer available");
+            return;
+        };
+        let (exit_code, duration_ms, finished_secs, cwd) = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .and_then(|session| {
+                let terminal = session.terminal.lock();
+                terminal.command_record(&target.execution_id).map(|record| {
+                    (
+                        record.exit_code,
+                        record.duration_ms,
+                        record.finished_at.and_then(crate::block_mode::epoch_secs),
+                        record.cwd.clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                // Live record evicted: the persisted sidebar record carries
+                // the same metadata.
+                self.persisted_sidebar_execution(&target).map(|record| {
+                    (
+                        record.exit_code,
+                        record.duration_ms,
+                        record.ended_at_ms.map(|ms| ms / 1000),
+                        (!record.cwd.is_empty()).then(|| record.cwd.clone()),
+                    )
+                })
+            })
+            .unwrap_or((None, None, None, None));
+        let finished = finished_secs.map(|secs| {
+            crate::block_mode::format_local_datetime(
+                secs,
+                crate::block_mode::local_utc_offset_secs(secs),
+            )
+        });
+        let (output, output_truncated) = output.unwrap_or_default();
+        let markdown = crate::block_mode::block_markdown(&crate::block_mode::MarkdownBlock {
+            command: (!command.is_empty()).then_some(command.as_str()),
+            command_exact,
+            output: &output,
+            output_truncated,
+            exit_code,
+            duration_ms,
+            finished: finished.as_deref(),
+            cwd: cwd.as_deref(),
+        });
+        let char_count = markdown.chars().count();
+        let copy_result = self
+            .clipboard
+            .as_ref()
+            .map(|clipboard| clipboard.copy(&markdown));
+        match copy_result {
+            Some(Ok(())) => self.set_status(format!(
+                "Copied block as Markdown ({char_count} characters)"
+            )),
+            Some(Err(error)) => {
+                self.set_status_for(format!("Copy failed: {error}"), Duration::from_secs(4))
+            }
+            None => self.set_status("Clipboard is unavailable"),
         }
     }
 
@@ -986,6 +1221,10 @@ enum CopyKind {
     Output,
     Combined,
 }
+
+/// `(command, command_exact, output)` where output is `(text, truncated)` —
+/// see [`TerminalApp::captured_block_text`].
+type CapturedBlockText = (String, bool, Option<(String, bool)>);
 
 /// Persisted metadata may fill gaps in a command that already belongs to the
 /// active tab, but it must never create a sidebar row on its own. A slice

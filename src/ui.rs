@@ -454,6 +454,8 @@ struct BlockChromeEntry {
     span: crate::block_mode::VisibleBlockSpan,
     outcome: crate::block_mode::BlockOutcome,
     duration_ms: Option<u64>,
+    /// Finish time, appended to the badge while the block is selected.
+    finished_at: Option<std::time::SystemTime>,
 }
 
 pub struct TerminalRenderer {
@@ -994,6 +996,7 @@ impl TerminalRenderer {
                             span.record_index == newest,
                         ),
                         duration_ms: record.duration_ms,
+                        finished_at: record.finished_at,
                         span,
                     }
                 })
@@ -1103,27 +1106,20 @@ impl TerminalRenderer {
             let Some(text) = block_mode::badge_text(entry.outcome, entry.duration_ms) else {
                 continue;
             };
+            // 选中块的徽章附带完成时刻(本地时间)。带后缀的徽章放不下时,
+            // 先退回无后缀徽章再放弃,避免选中反而让徽章整个消失。
+            let mut candidates: Vec<String> = Vec::new();
+            if selected {
+                if let Some(secs) = entry.finished_at.and_then(block_mode::epoch_secs) {
+                    let clock = block_mode::format_local_time_of_day(
+                        secs,
+                        block_mode::local_utc_offset_secs(secs),
+                    );
+                    candidates.push(format!("{text} · {clock}"));
+                }
+            }
+            candidates.push(text);
             let color = self.block_outcome_color(entry.outcome);
-            let galley = painter.layout_no_wrap(text, badge_font.clone(), color);
-            let text_size = galley.size();
-            let bg_size = egui::vec2(
-                text_size.x + 2.0 * BADGE_PAD_X,
-                text_size.y + 2.0 * BADGE_PAD_Y,
-            );
-            if bg_size.y > line_height {
-                continue; // 小字号下徽章会溢出到下一行,整个跳过。
-            }
-            let bg_rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    content_rect.right() - BADGE_RIGHT_MARGIN - bg_size.x,
-                    top_y + ((line_height - bg_size.y).max(0.0)) / 2.0,
-                ),
-                bg_size,
-            );
-            if bg_rect.left() < content_rect.left() || char_width <= 0.0 {
-                continue; // 内容区太窄,放不下徽章。
-            }
-            let start_col = ((bg_rect.left() - content_rect.left()) / char_width).floor() as usize;
             // Map wide-char continuation cells to a non-blank marker so the
             // badge never paints over half a glyph.
             let row_chars: Vec<char> = grid
@@ -1140,15 +1136,87 @@ impl TerminalRenderer {
                         .collect()
                 })
                 .unwrap_or_default();
-            if block_mode::badge_covers_only_blank_cells(&row_chars, start_col) {
-                painter.rect_filled(bg_rect, 3.0, badge_bg);
-                painter.galley(
-                    bg_rect.min + egui::vec2(BADGE_PAD_X, BADGE_PAD_Y),
-                    galley,
-                    color,
+            for text in candidates {
+                let galley = painter.layout_no_wrap(text, badge_font.clone(), color);
+                let text_size = galley.size();
+                let bg_size = egui::vec2(
+                    text_size.x + 2.0 * BADGE_PAD_X,
+                    text_size.y + 2.0 * BADGE_PAD_Y,
                 );
+                if bg_size.y > line_height {
+                    break; // 小字号下徽章会溢出到下一行;高度与后缀无关,直接放弃。
+                }
+                let bg_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        content_rect.right() - BADGE_RIGHT_MARGIN - bg_size.x,
+                        top_y + ((line_height - bg_size.y).max(0.0)) / 2.0,
+                    ),
+                    bg_size,
+                );
+                if bg_rect.left() < content_rect.left() || char_width <= 0.0 {
+                    continue; // 内容区放不下这个候选,试更短的。
+                }
+                let start_col =
+                    ((bg_rect.left() - content_rect.left()) / char_width).floor() as usize;
+                if block_mode::badge_covers_only_blank_cells(&row_chars, start_col) {
+                    painter.rect_filled(bg_rect, 3.0, badge_bg);
+                    painter.galley(
+                        bg_rect.min + egui::vec2(BADGE_PAD_X, BADGE_PAD_Y),
+                        galley,
+                        color,
+                    );
+                    break;
+                }
             }
         }
+    }
+
+    /// Fractions (0 = track top/oldest retained line, 1 = bottom/newest grid
+    /// line) of every FAILED block's first row, for the scrollbar markers.
+    /// These are positional hints only: placement uses stable line ids over
+    /// the retained buffer and is deliberately NOT gated on
+    /// `viewport_buffer_mapping_is_exact` — approximate after reflow is fine.
+    /// The scan is bounded by MAX_COMMAND_MARKS (1024) records and only runs
+    /// while the scrollbar is actually drawn.
+    fn failed_block_marker_fractions(terminal: &TerminalState) -> Vec<f32> {
+        let records = terminal.command_records();
+        let Some(newest) = records.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        let cols = terminal.grid.row_len();
+        let oldest_line_id = terminal
+            .total_lines_scrolled
+            .saturating_sub(terminal.scrollback.len() as u64);
+        let newest_line_id = terminal
+            .total_lines_scrolled
+            .saturating_add(terminal.grid.rows().saturating_sub(1) as u64);
+        records
+            .iter()
+            .enumerate()
+            .filter(|(index, record)| {
+                matches!(
+                    crate::block_mode::classify_outcome(
+                        record.command.as_deref(),
+                        record.exit_code,
+                        record.state,
+                        record.complete,
+                        *index == newest,
+                    ),
+                    crate::block_mode::BlockOutcome::Failed(_)
+                )
+            })
+            .filter_map(|(_, record)| {
+                crate::block_mode::scrollbar_marker_fraction(
+                    crate::block_mode::prompt_row_line_id(
+                        record.prompt_start.line_id,
+                        record.prompt_start.column,
+                        cols,
+                    ),
+                    oldest_line_id,
+                    newest_line_id,
+                )
+            })
+            .collect()
     }
 
     fn scrollbar_thumb_height(visible_lines: usize, total_lines: usize, track_height: f32) -> f32 {
@@ -1917,6 +1985,28 @@ impl TerminalRenderer {
                     crate::theme::Theme::rgba_to_color32(sb.thumb_normal)
                 };
                 painter.rect_filled(thumb_rect.shrink2(egui::vec2(1.0, 0.0)), 6.0, thumb_color);
+            }
+
+            // Failed-block markers, painted AFTER the thumb so a large thumb
+            // never hides them (frost draws them over the thumb too). Same
+            // red as the Failed gutter stripe.
+            if self.block_mode && !terminal.is_alt_buffer_active() {
+                let marker_color =
+                    self.block_outcome_color(crate::block_mode::BlockOutcome::Failed(1));
+                // ~3 physical px tall regardless of DPI scale.
+                let marker_height = 3.0 / ui.ctx().pixels_per_point();
+                for fraction in Self::failed_block_marker_fractions(terminal) {
+                    let marker_y =
+                        scrollbar_rect.top() + fraction * (scrollbar_rect.height() - marker_height);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(scrollbar_x, marker_y),
+                            egui::vec2(scrollbar_width, marker_height),
+                        ),
+                        0.0,
+                        marker_color,
+                    );
+                }
             }
         }
 

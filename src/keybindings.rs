@@ -50,6 +50,13 @@ pub enum Command {
     /// 把选中/最近的命令放回提示符（只填入，绝不执行）。
     #[allow(clippy::enum_variant_names)]
     BlockRecallCommand,
+    /// 键盘选块：移到更旧/更新的可选块（与 gutter 点击同一集合）。
+    BlockSelectPrev,
+    BlockSelectNext,
+    /// 复制整个块的纯文本（命令 + 输出；背景块只复制输出）。
+    BlockCopyBlock,
+    /// 以 Markdown 文档形式复制块（与 frost 相同的固定格式）。
+    BlockCopyMarkdown,
 
     FontIncrease,
     FontDecrease,
@@ -129,6 +136,10 @@ impl std::fmt::Display for Command {
             Command::BlockCopyCommand => write!(f, "block:copy_command"),
             Command::BlockCopyOutput => write!(f, "block:copy_output"),
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
+            Command::BlockSelectPrev => write!(f, "block:select_prev"),
+            Command::BlockSelectNext => write!(f, "block:select_next"),
+            Command::BlockCopyBlock => write!(f, "block:copy_block"),
+            Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
@@ -195,6 +206,10 @@ impl std::str::FromStr for Command {
             "block:copy_command" => Ok(Command::BlockCopyCommand),
             "block:copy_output" => Ok(Command::BlockCopyOutput),
             "block:recall_command" => Ok(Command::BlockRecallCommand),
+            "block:select_prev" => Ok(Command::BlockSelectPrev),
+            "block:select_next" => Ok(Command::BlockSelectNext),
+            "block:copy_block" => Ok(Command::BlockCopyBlock),
+            "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
@@ -406,7 +421,9 @@ impl KeyBindings {
             "terminal:jump_next_command".to_string(),
         );
         // 跳到最早的失败命令块,与 anvil/forge 的 filter_failed_blocks
-        // 同键位。其余 block:* 命令默认不绑定,走命令面板。
+        // 同键位。其余 block:* 命令默认不绑定,走命令面板——包括
+        // block:select_prev/next:它们想要的 ctrl+alt+up/down 已被
+        // pane:focus_up/down 占用。
         bindings.bindings.insert(
             "ctrl+shift+x".to_string(),
             "block:jump_first_failed".to_string(),
@@ -574,6 +591,10 @@ mod tests {
             Command::BlockCopyCommand,
             Command::BlockCopyOutput,
             Command::BlockRecallCommand,
+            Command::BlockSelectPrev,
+            Command::BlockSelectNext,
+            Command::BlockCopyBlock,
+            Command::BlockCopyMarkdown,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }

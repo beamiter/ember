@@ -188,6 +188,14 @@ impl TerminalApp {
             self.terminal_mouse_capture = None;
             self.last_terminal_mouse_motion = None;
         }
+        if self
+            .block_selection
+            .as_ref()
+            .map(|(session_id, _)| session_id)
+            == removed_session_id.as_ref()
+        {
+            self.block_selection = None;
+        }
         self.tabs.on_session_removed(index);
         self.force_resize_session = true;
         if self.search_state.is_open {

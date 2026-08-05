@@ -473,6 +473,10 @@ impl TerminalApp {
             keybindings::Command::BlockCopyCommand => self.block_copy_command(),
             keybindings::Command::BlockCopyOutput => self.block_copy_output(),
             keybindings::Command::BlockRecallCommand => self.block_recall_command(),
+            keybindings::Command::BlockSelectPrev => self.block_select_prev(),
+            keybindings::Command::BlockSelectNext => self.block_select_next(),
+            keybindings::Command::BlockCopyBlock => self.block_copy_block(),
+            keybindings::Command::BlockCopyMarkdown => self.block_copy_markdown(),
             keybindings::Command::FontIncrease => {
                 self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")
             }
