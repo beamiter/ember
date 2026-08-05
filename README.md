@@ -329,10 +329,16 @@ docker = true
 deploy = "persist"
 ```
 
-The Remote tab of the Settings panel adds and removes these entries without
-editing the file by hand; the less common fields (`ssh_args`, `session`,
-`remote_shell`, `deploy_artifact`) stay config-file only and survive the panel
-untouched.
+These two are also what a config file with no `remote_hosts` key starts with:
+the two mistakes the grammar cannot forgive are invisible in an empty list —
+the port belongs in `ssh_args`, never as `host = "box:22"`, and the login
+belongs in `user`, never as `host = "root@box"`. An explicit list wins,
+`remote_hosts = []` included, so hosts deleted in the panel stay deleted.
+
+The Remote tab of the Settings panel adds, edits and removes these entries
+without editing the file by hand; the less common fields (`ssh_args`,
+`session`, `remote_shell`, `deploy_artifact`) stay config-file only and survive
+the panel untouched.
 
 `deploy = "off"` (the default) connects plainly and runs `remote_shell`
 (default `jsh`) as found on the destination. `"persist"` and `"incognito"`
