@@ -2,6 +2,19 @@ use super::*;
 
 const OUTPUT_TRUNCATION_MARKER: &str = "\n… output truncated …\n";
 
+/// Whether a cell is styled the way shells paint an inline suggestion.
+///
+/// There is no protocol for "this text is a preview", only a convention, and
+/// the convention is a muted grey: `jsh` prints its suggestion in ANSI colour 8
+/// (`ESC[38;5;8m`), zsh-autosuggestions defaults to the same colour, and `dim`
+/// (SGR 2) is the other spelling. Being wrong in the permissive direction
+/// accepts text the user never typed, so a cell that merely *might* be a
+/// suggestion is treated as one — the cost is that a click cannot place the
+/// cursor inside genuinely grey text, which is a click that does nothing.
+fn is_inline_suggestion_cell(cell: &TerminalCell) -> bool {
+    cell.flags.dim() || matches!(cell.foreground, Color::Indexed(8) | Color::BrightBlack)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Osc133DecodeError {
     MalformedPercentEncoding,
@@ -2832,18 +2845,51 @@ impl super::TerminalState {
             last += 1;
         }
 
-        let mut end = click_cursor::Cell::new(first as i64, 0);
-        'scan: for row in (first..=last).rev() {
-            for col in (0..cols).rev() {
-                let cell = self.grid.get(row, col);
-                // A wide character's continuation cell holds a blank but is
-                // still occupied, so trailing CJK must not be trimmed away.
-                if cell.flags.wide_continuation()
-                    || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
-                {
-                    end = click_cursor::Cell::new(row as i64, col as i64 + 1);
-                    break 'scan;
+        let occupied = |row: usize, col: usize| {
+            let cell = self.grid.get(row, col);
+            // A wide character's continuation cell holds a blank but is
+            // still occupied, so trailing CJK must not be trimmed away.
+            cell.flags.wide_continuation() || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
+        };
+        // One past the last occupied cell, looking only at columns before
+        // `col_bound` on `row_bound` itself.
+        let scan_back = |row_bound: usize, col_bound: usize| {
+            let mut end = click_cursor::Cell::new(first as i64, 0);
+            'scan: for row in (first..=row_bound).rev() {
+                let cols_here = if row == row_bound { col_bound } else { cols };
+                for col in (0..cols_here).rev() {
+                    if occupied(row, col) {
+                        end = click_cursor::Cell::new(row as i64, col as i64 + 1);
+                        break 'scan;
+                    }
                 }
+            }
+            end
+        };
+        let mut end = scan_back(last, cols);
+
+        // A right-aligned decoration — jsh and fish paint the previous
+        // command's duration flush with the right edge of the input row — is
+        // on the row but not in the buffer. Its shape gives it away: a
+        // trailing run that reaches the right edge, parted from everything
+        // before it by a wide blank gap, entirely right of the cursor. Clip
+        // it, or a click in the gap overshoots the buffer end — and past-end
+        // `Right`s are how jsh accepts an inline suggestion, even one that is
+        // not on screen at the moment.
+        if end.col + 1 >= cols as i64 && end.col > 0 {
+            let end_row = end.row as usize;
+            let mut run_start = end.col as usize;
+            while run_start > 0 && occupied(end_row, run_start - 1) {
+                run_start -= 1;
+            }
+            let mut gap_start = run_start;
+            while gap_start > 0 && !occupied(end_row, gap_start - 1) {
+                gap_start -= 1;
+            }
+            if run_start - gap_start >= 3
+                && (end_row as i64, run_start as i64) > (cursor_row as i64, self.cursor_col as i64)
+            {
+                end = scan_back(end_row, gap_start);
             }
         }
 
@@ -2855,10 +2901,49 @@ impl super::TerminalState {
             end = cursor;
         }
 
+        // A fish-style shell paints its inline suggestion past the cursor and
+        // then parks the cursor back at the end of what was typed. Those cells
+        // are a preview, not buffer — the backwards scan above cannot tell them
+        // from typed text, and every `Right` spent on them is the shell
+        // *accepting* the suggestion. Cut the span at the first one.
+        if let Some(ghost) = self.inline_suggestion_start(cursor, end) {
+            end = ghost;
+        }
+
         Some(click_cursor::InputSpan {
             start: click_cursor::Cell::new(first as i64, 0),
             end,
         })
+    }
+
+    /// Where inline-suggestion ("ghost") text begins between `from` and `end`,
+    /// if it begins at all.
+    ///
+    /// The scan runs forward from the cursor because that is where a suggestion
+    /// starts: shells only offer one when the caret is at the end of the
+    /// buffer, so the first suggestion-styled cell at or after the cursor is
+    /// where the real input stops.
+    fn inline_suggestion_start(
+        &self,
+        from: click_cursor::Cell,
+        end: click_cursor::Cell,
+    ) -> Option<click_cursor::Cell> {
+        let rows = self.grid.rows();
+        let cols = self.grid.cols();
+        let mut row = from.row.max(0) as usize;
+        let mut col = from.col.max(0) as usize;
+        while row < rows && (row as i64, col as i64) < (end.row, end.col) {
+            if col >= cols {
+                row += 1;
+                col = 0;
+                continue;
+            }
+            if is_inline_suggestion_cell(self.grid.get(row, col)) {
+                return Some(click_cursor::Cell::new(row as i64, col as i64));
+            }
+            col += 1;
+        }
+        None
     }
 
     /// Arrow-key bytes that walk the shell's line editor to a clicked cell, or

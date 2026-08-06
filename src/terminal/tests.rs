@@ -2102,6 +2102,105 @@ fn a_click_past_the_command_stops_at_its_end() {
     assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(3));
 }
 
+/// A prompt with `typed` at it and `ghost` painted past the cursor the way a
+/// fish-style shell previews a completion.
+///
+/// The byte shape is jsh's own, captured from the running shell: the
+/// suggestion in ANSI colour 8, then the cursor parked back at the end of the
+/// typed text with CHA.
+fn terminal_with_suggestion(cols: usize, rows: usize, typed: &str, ghost: &str) -> TerminalState {
+    let mut terminal = terminal_at_prompt(cols, rows, typed);
+    let (_, col) = terminal.get_cursor_pos();
+    terminal.process_input(format!("\x1b[38;5;8m{ghost}\x1b[0m\x1b[{}G", col + 1).as_bytes());
+    terminal
+}
+
+#[test]
+fn an_inline_suggestion_is_not_part_of_the_input() {
+    // The whole reason the span has to end where the *buffer* ends: those grey
+    // cells are a preview, and every `Right` spent on them is jsh accepting a
+    // command the user never typed.
+    let terminal = terminal_with_suggestion(32, 4, "echo he", "llo world");
+    assert_eq!(terminal.get_cursor_pos(), (0, 9));
+
+    assert!(
+        terminal.click_cursor_move(0, 30, true).is_empty(),
+        "clicking the empty space past the suggestion must not accept it"
+    );
+    assert!(
+        terminal.click_cursor_move(0, 12, true).is_empty(),
+        "nor may clicking the suggestion itself, which is not a place to edit"
+    );
+    assert_eq!(
+        terminal.click_cursor_move(0, 5, true),
+        b"\x1b[D".repeat(4),
+        "moving back into what was really typed still works"
+    );
+}
+
+/// A prompt with `typed` at it, a right-aligned decoration painted flush with
+/// the terminal's right edge (the way jsh and fish show the previous command's
+/// duration), and the cursor back at the end of the typed text.
+fn terminal_with_rprompt(cols: usize, rows: usize, typed: &str, rprompt: &str) -> TerminalState {
+    let mut terminal = terminal_at_prompt(cols, rows, typed);
+    let (_, col) = terminal.get_cursor_pos();
+    terminal.process_input(
+        format!(
+            "\x1b[{}G\x1b[33m{rprompt}\x1b[0m\x1b[{}G",
+            cols - rprompt.chars().count() + 1,
+            col + 1
+        )
+        .as_bytes(),
+    );
+    terminal
+}
+
+#[test]
+fn a_right_aligned_duration_is_not_part_of_the_input() {
+    // jsh keeps its last suggestion even while the cursor sits mid-buffer —
+    // it just stops drawing it. Arrows sent past the buffer end would accept
+    // that invisible text, so the span must stop at the typed command, not at
+    // the duration display parked against the right edge.
+    let mut terminal = terminal_with_rprompt(32, 4, "echo hello", "2.3s");
+    terminal.process_input(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
+    assert_eq!(terminal.get_cursor_pos(), (0, 7));
+
+    assert_eq!(
+        terminal.click_cursor_move(0, 30, true),
+        b"\x1b[C".repeat(5),
+        "a click on the duration walks to the end of the command and stops"
+    );
+    assert_eq!(
+        terminal.click_cursor_move(0, 20, true),
+        b"\x1b[C".repeat(5),
+        "so does a click in the gap before it"
+    );
+}
+
+#[test]
+fn an_interior_gap_away_from_the_edge_stays_reachable() {
+    // The decoration rule must not eat genuine input: a wide run of spaces
+    // inside a command whose tail stops short of the right edge is buffer.
+    let mut terminal = terminal_at_prompt(40, 4, "echo 'a          b'");
+    terminal.process_input(b"\x1b[D".repeat(15).as_slice());
+    assert_eq!(terminal.get_cursor_pos(), (0, 6));
+    assert_eq!(
+        terminal.click_cursor_move(0, 38, true),
+        b"\x1b[C".repeat(15),
+        "clicking past the command still reaches its real end"
+    );
+}
+
+#[test]
+fn ordinary_text_past_the_cursor_is_still_reachable() {
+    // The mirror image: text right of the cursor that is *not* suggestion-
+    // styled belongs to the buffer, so a click must still travel to it.
+    let mut terminal = terminal_at_prompt(32, 4, "echo hello");
+    terminal.process_input(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
+    assert_eq!(terminal.get_cursor_pos(), (0, 7));
+    assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(5));
+}
+
 #[test]
 fn a_click_on_the_prompt_goes_to_the_start_of_the_line() {
     let terminal = terminal_at_prompt(32, 4, "ls");
