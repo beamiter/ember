@@ -107,7 +107,7 @@ pub enum Command {
     JshInstall,
 
     // === 远程 ===
-    /// 打开远程主机选择器（[[remote_hosts]] 配置的 ssh/容器目标）。
+    /// 打开远程主机选择器（`[[remote_hosts]]` 配置的 ssh/容器目标）。
     RemotePicker,
 }
 

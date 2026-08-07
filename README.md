@@ -362,8 +362,8 @@ no configuration at all.
 
 ## Security notes
 
-- OSC 52 clipboard writes are enabled by default; clipboard reads are disabled
-  unless `osc52_clipboard_read = true` is set explicitly.
+- OSC 52 clipboard writes and reads are disabled by default; each direction
+  requires its corresponding option to be set to `true` explicitly.
 - MIME-aware OSC 5522 data reads are authorized only by a short-lived,
   single-use token created by an actual user paste action. The token is scoped
   to the MIME types announced for that paste.
