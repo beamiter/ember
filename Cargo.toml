@@ -34,7 +34,7 @@ uuid = { version = "1.24", features = ["v4", "serde"] }
 regex = "1.13"
 serde_json = { version = "1.0", features = ["raw_value"] }
 fuzzy-matcher = "0.3"
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png"] }
 toml = "1.1.3"
 dirs = "6.0.0"
@@ -44,7 +44,7 @@ once_cell = "1.21"
 
 # HarfRust is the maintained RustyBuzz successor. It is already shared with
 # egui's font stack, and uses read-fonts instead of adding another parser.
-harfrust = "0.7"
+harfrust = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
