@@ -288,6 +288,13 @@ canonical spelling so the file never needs escaping. Assigning `none`,
 Invalid entries are reported and skipped without discarding the other valid
 overrides.
 
+The file is capped at 256 KiB and opened through the same descriptor-based
+persistence boundary as Ember's snapshots. A missing file still selects the
+defaults; on Unix, a symlink, FIFO/device, multiply linked file, foreign-owned
+file, or group/world-writable file is rejected without following or blocking on
+the entry. Unsafe and oversized files produce a startup diagnostic and leave
+the built-in bindings active.
+
 The in-app help panel is generated from the active bindings, so it reflects
 customizations. Copy, paste and keyboard font zoom use this same command path;
 there are no separate hard-coded shortcuts that bypass user overrides.

@@ -10,6 +10,12 @@ fail closed.
 
 ## Completed since the previous handoff
 
+- `keybindings.toml` no longer has an `exists()`/path-reopen race. It is opened
+  once through Ember's no-follow, nonblocking descriptor boundary, checked as
+  an owned single-link regular file, and bounded to 256 KiB before allocation
+  or TOML parsing. Missing files still use defaults; unsafe, invalid UTF-8, and
+  oversized entries report a path-rich error and cannot stall startup.
+
 - Completed command records now map the pinned `jterm_core::block_contract`
   result into Ember's renderer-owned `BlockOutcome`; Prompt/Running lifecycle
   states remain local. The call happens only after OSC metadata and screen
@@ -49,9 +55,9 @@ fail closed.
 The local `fc-list`, `fc-match`, notification, and opener paths still need
 trusted helper resolution, process groups, deadlines, and concurrent bounded
 pipes. `link.rs` now resolves a trusted absolute opener and reaps it, but the
-font and notification helpers do not. Read font and keybinding files through
-regular-file, descriptor-based size limits. Test fake PATH entries, descendants
-holding pipes, huge output, FIFOs, and oversized files.
+font and notification helpers do not. Read font inputs through regular-file,
+descriptor-based size limits. Test fake PATH entries, descendants holding
+pipes, huge output, FIFOs, and oversized files.
 
 ## Release checks
 

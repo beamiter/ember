@@ -5,7 +5,12 @@
 /// 存储形式）。本文件只保留 ember 的命令词表和绑定表本身。
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// A hand-written binding table should remain tiny; this generous ceiling also
+/// bounds allocation and TOML parsing work for a planted configuration file.
+const MAX_KEYBINDINGS_BYTES: u64 = 256 * 1024;
 
 /// 所有可用的命令
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -503,15 +508,39 @@ impl KeyBindings {
 
     /// 加载配置文件，与默认配置合并
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut bindings = Self::default_bindings();
-
         let path = Self::config_path()?;
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            let user_bindings: KeyBindings = toml::from_str(&content)?;
-            for warning in bindings.merge_user_bindings(user_bindings) {
-                eprintln!("[Keybindings] WARNING: {warning}");
-            }
+        Self::load_path(&path)
+    }
+
+    /// Load one explicit path through ember's descriptor-based persistence
+    /// boundary. Keeping this separate from environment-based path discovery
+    /// makes the security contract directly testable without mutating HOME.
+    fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut bindings = Self::default_bindings();
+        let revision = crate::persistence_file::read_revision(path, MAX_KEYBINDINGS_BYTES)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot read keybindings file {}: {error}", path.display()),
+                )
+            })?;
+        let Some(bytes) = revision.bytes() else {
+            return Ok(bindings);
+        };
+        let content = std::str::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("keybindings file {} is not valid UTF-8", path.display()),
+            )
+        })?;
+        let user_bindings: KeyBindings = toml::from_str(content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cannot parse keybindings file {}: {error}", path.display()),
+            )
+        })?;
+        for warning in bindings.merge_user_bindings(user_bindings) {
+            eprintln!("[Keybindings] WARNING: {warning}");
         }
 
         Ok(bindings)
@@ -576,6 +605,181 @@ impl Default for KeyBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ember-keybindings-{label}-{}-{id}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_private(path: &Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn path_loader_defaults_when_missing_and_keeps_valid_forward_compatible_entries() {
+        let root = TestDir::new("missing-valid");
+        let path = root.join("keybindings.toml");
+
+        let missing = KeyBindings::load_path(&path).unwrap();
+        assert_eq!(
+            missing.get_command("ctrl+shift+t"),
+            Some(Command::SessionNew)
+        );
+
+        write_private(
+            &path,
+            concat!(
+                "\"ctrl+shift+t\" = \"session:close\"\n",
+                "\"ctrl+shift+y\" = \"future:command\"\n"
+            ),
+        );
+        let loaded = KeyBindings::load_path(&path).unwrap();
+        assert_eq!(
+            loaded.get_command("ctrl+shift+t"),
+            Some(Command::SessionClose)
+        );
+        assert_eq!(loaded.get_command("ctrl+shift+y"), None);
+    }
+
+    #[test]
+    fn keybindings_size_limit_is_inclusive_and_checked_before_toml_parse() {
+        let root = TestDir::new("size-limit");
+        let path = root.join("keybindings.toml");
+        let mut exact = b"\"ctrl+shift+t\" = \"session:close\"\n".to_vec();
+        exact.resize(MAX_KEYBINDINGS_BYTES as usize, b' ');
+        write_private(&path, &exact);
+
+        assert_eq!(
+            KeyBindings::load_path(&path)
+                .unwrap()
+                .get_command("ctrl+shift+t"),
+            Some(Command::SessionClose)
+        );
+
+        // The first byte beyond the cap is invalid UTF-8: size rejection must
+        // win before either text decoding or TOML parsing sees it.
+        exact.push(0xff);
+        write_private(&path, exact);
+        let error = KeyBindings::load_path(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::FileTooLarge)
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(message.contains("262144-byte limit"), "{message}");
+
+        write_private(&path, [0xff]);
+        let error = KeyBindings::load_path(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
+        );
+        assert!(
+            error.to_string().contains(path.to_string_lossy().as_ref()),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_keybinding_entries_are_rejected_and_fifo_open_is_bounded() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::time::Duration;
+
+        let root = TestDir::new("unsafe-entries");
+        let target = root.join("target.toml");
+        write_private(&target, b"\"ctrl+shift+t\" = \"session:close\"\n");
+
+        let linked = root.join("symlink.toml");
+        symlink(&target, &linked).unwrap();
+        let error = KeyBindings::load_path(&linked).unwrap_err().to_string();
+        assert!(error.contains(linked.to_string_lossy().as_ref()), "{error}");
+
+        let hard_linked = root.join("hard-link.toml");
+        std::fs::hard_link(&target, &hard_linked).unwrap();
+        let error = KeyBindings::load_path(&hard_linked).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        assert!(error.to_string().contains("hard link"), "{error}");
+
+        let writable = root.join("writable.toml");
+        std::fs::write(&writable, b"\"ctrl+shift+t\" = \"session:close\"\n").unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error = KeyBindings::load_path(&writable).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+
+        let fifo = root.join("fifo.toml");
+        let encoded = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: encoded is a live NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fifo_for_reader = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let outcome = KeyBindings::load_path(&fifo_for_reader)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            sender.send(outcome).unwrap();
+        });
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening a keybindings FIFO must never wait for a writer");
+        assert!(outcome.is_err());
+        reader.join().unwrap();
+
+        let device_error = KeyBindings::load_path(Path::new("/dev/null")).unwrap_err();
+        assert_eq!(
+            device_error
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"\"ctrl+shift+t\" = \"session:close\"\n"
+        );
+    }
 
     #[test]
     fn test_command_parse() {
