@@ -10,6 +10,13 @@
 //! anvil/forge).
 
 use crate::terminal::CommandState;
+use jterm_core::block_contract::{classify_completed, CompletedBlockOutcome};
+
+/// Presence marker used only when the semantic record knows a command existed
+/// but its bounded text was deliberately omitted. It is never rendered or
+/// persisted; it prevents `command_truncated` from masquerading as background
+/// output when the shared classifier receives the resolved frontend facts.
+const TRUNCATED_COMMAND_PRESENCE: &str = "[truncated command]";
 
 /// Width of the per-block gutter stripe, in pixels.
 pub const GUTTER_STRIPE_WIDTH: f32 = 3.0;
@@ -42,9 +49,12 @@ pub enum BlockOutcome {
 /// Classify one record. `is_newest` distinguishes the genuinely running
 /// command from an older record still marked `Running` (its D was lost);
 /// only the newest incomplete record can be running, mirroring
-/// `TerminalState::running_command`.
+/// `TerminalState::running_command`. `command` is the canonical semantic
+/// record after OSC metadata and screen fallback, never a raw metadata field;
+/// `command_truncated` preserves the fact that an omitted command did exist.
 pub fn classify_outcome(
     command: Option<&str>,
+    command_truncated: bool,
     exit_code: Option<i32>,
     state: CommandState,
     complete: bool,
@@ -55,14 +65,13 @@ pub fn classify_outcome(
         CommandState::Running if is_newest && !complete => BlockOutcome::Running,
         CommandState::Running => BlockOutcome::Unknown,
         CommandState::Complete => {
-            let has_command = command.is_some_and(|command| !command.trim().is_empty());
-            if !has_command {
-                return BlockOutcome::Background;
-            }
-            match exit_code {
-                Some(0) => BlockOutcome::Success,
-                Some(code) => BlockOutcome::Failed(code),
-                None => BlockOutcome::Unknown,
+            let resolved_command =
+                command.or_else(|| command_truncated.then_some(TRUNCATED_COMMAND_PRESENCE));
+            match classify_completed(resolved_command, exit_code) {
+                CompletedBlockOutcome::Background => BlockOutcome::Background,
+                CompletedBlockOutcome::Success => BlockOutcome::Success,
+                CompletedBlockOutcome::Failed(code) => BlockOutcome::Failed(code),
+                CompletedBlockOutcome::Unknown => BlockOutcome::Unknown,
             }
         }
     }
@@ -711,36 +720,72 @@ mod tests {
 
     #[test]
     fn exit_none_is_unknown_never_success_and_empty_command_is_background() {
-        let complete = |command: Option<&str>, exit: Option<i32>| {
-            classify_outcome(command, exit, CommandState::Complete, true, true)
+        let complete = |command: Option<&str>, command_truncated: bool, exit: Option<i32>| {
+            classify_outcome(
+                command,
+                command_truncated,
+                exit,
+                CommandState::Complete,
+                true,
+                true,
+            )
         };
-        assert_eq!(complete(Some("cargo test"), Some(0)), BlockOutcome::Success);
         assert_eq!(
-            complete(Some("cargo test"), Some(101)),
+            complete(Some("cargo test"), false, Some(0)),
+            BlockOutcome::Success
+        );
+        assert_eq!(
+            complete(Some("cargo test"), false, Some(101)),
             BlockOutcome::Failed(101)
         );
         // `None` must never be treated as 0.
-        assert_eq!(complete(Some("cargo test"), None), BlockOutcome::Unknown);
-        assert_ne!(complete(Some("cargo test"), None), BlockOutcome::Success);
+        assert_eq!(
+            complete(Some("cargo test"), false, None),
+            BlockOutcome::Unknown
+        );
+        assert_ne!(
+            complete(Some("cargo test"), false, None),
+            BlockOutcome::Success
+        );
         // No/empty command → background, even with a reported exit code.
-        assert_eq!(complete(None, Some(0)), BlockOutcome::Background);
-        assert_eq!(complete(Some("  \t"), Some(1)), BlockOutcome::Background);
+        assert_eq!(complete(None, false, Some(7)), BlockOutcome::Background);
+        assert_eq!(
+            complete(Some("  \t"), false, Some(1)),
+            BlockOutcome::Background
+        );
+        // A bounded semantic record can know a command existed even after its
+        // text was omitted; that is not background output.
+        assert_eq!(complete(None, true, Some(7)), BlockOutcome::Failed(7));
     }
 
     #[test]
     fn only_the_newest_incomplete_record_counts_as_running() {
         assert_eq!(
-            classify_outcome(Some("sleep 9"), None, CommandState::Running, false, true),
+            classify_outcome(
+                Some("sleep 9"),
+                false,
+                None,
+                CommandState::Running,
+                false,
+                true,
+            ),
             BlockOutcome::Running
         );
         // 老的 Running 记录意味着它的 D 丢了,按 Unknown 处理。
         assert_eq!(
-            classify_outcome(Some("sleep 9"), None, CommandState::Running, false, false),
+            classify_outcome(
+                Some("sleep 9"),
+                false,
+                None,
+                CommandState::Running,
+                false,
+                false,
+            ),
             BlockOutcome::Unknown
         );
         for state in [CommandState::Prompt, CommandState::Editing] {
             assert_eq!(
-                classify_outcome(None, None, state, false, true),
+                classify_outcome(None, false, None, state, false, true),
                 BlockOutcome::Prompt
             );
         }

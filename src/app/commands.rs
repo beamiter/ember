@@ -8,6 +8,7 @@ use super::state::TerminalApp;
 use crate::execution_journal::{self, HistoryLoad, HistoryRequestError, PersistedExecution};
 use crate::terminal::{CommandState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
 use eframe::egui;
+use jterm_core::block_contract::{classify_completed, CompletedBlockOutcome};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -151,11 +152,12 @@ impl TerminalApp {
                 .command_records()
                 .iter()
                 .filter_map(|record| {
-                    let command = record.command.as_deref().filter(|command| {
-                        !command
-                            .trim_matches(|character| matches!(character, ' ' | '\r' | '\n' | '\t'))
-                            .is_empty()
-                    });
+                    // Match the shared completed-block contract's Unicode
+                    // whitespace rule before constructing a command-only row.
+                    let command = record
+                        .command
+                        .as_deref()
+                        .filter(|command| !command.trim().is_empty());
                     let replayable_command = command.and_then(|command| {
                         crate::review_text::sanitize_history_replay(
                             command,
@@ -982,6 +984,7 @@ impl TerminalApp {
             .map(|(index, record)| {
                 crate::block_mode::classify_outcome(
                     record.command.as_deref(),
+                    record.command_truncated,
                     record.exit_code,
                     record.state,
                     record.complete,
@@ -1791,11 +1794,20 @@ fn replay_disabled_reason(
     }
 }
 
+/// Classify a completed sidebar row from its bounded, frontend-resolved display
+/// command. Rows are built only after `CommandRecord` has applied OSC metadata,
+/// screen fallback, and the explicit truncated-command placeholder, so this is
+/// intentionally not a raw `CommandMeta::command` field.
+fn completed_command_row_outcome(row: &CommandRowSnapshot) -> CompletedBlockOutcome {
+    debug_assert_eq!(row.state, CommandState::Complete);
+    classify_completed(Some(row.command_preview.as_str()), row.exit_code)
+}
+
 fn command_row_matches(row: &CommandRowSnapshot, query: &str, filter: CommandFilter) -> bool {
     let matches_filter = match filter {
         CommandFilter::All => true,
         CommandFilter::Failed => {
-            row.state == CommandState::Complete && row.exit_code.is_some_and(|code| code != 0)
+            row.state == CommandState::Complete && completed_command_row_outcome(row).is_failed()
         }
         CommandFilter::Running => row.state == CommandState::Running,
     };
@@ -1813,13 +1825,17 @@ fn command_status(row: &CommandRowSnapshot) -> (&'static str, egui::Color32, &'s
         CommandState::Prompt => ("○", egui::Color32::from_rgb(90, 160, 240), "Prompt"),
         CommandState::Editing => ("●", egui::Color32::from_rgb(90, 160, 240), "Editing"),
         CommandState::Running => ("●", egui::Color32::from_rgb(230, 175, 60), "Running"),
-        CommandState::Complete if row.exit_code == Some(0) => {
-            ("✓", egui::Color32::from_rgb(70, 190, 115), "Succeeded")
-        }
-        CommandState::Complete if row.exit_code.is_some() => {
-            ("✕", egui::Color32::from_rgb(225, 85, 85), "Failed")
-        }
-        CommandState::Complete => ("○", egui::Color32::GRAY, "Completed"),
+        CommandState::Complete => match completed_command_row_outcome(row) {
+            CompletedBlockOutcome::Success => {
+                ("✓", egui::Color32::from_rgb(70, 190, 115), "Succeeded")
+            }
+            CompletedBlockOutcome::Failed(_) => {
+                ("✕", egui::Color32::from_rgb(225, 85, 85), "Failed")
+            }
+            CompletedBlockOutcome::Background | CompletedBlockOutcome::Unknown => {
+                ("○", egui::Color32::GRAY, "Completed")
+            }
+        },
     }
 }
 
@@ -2207,6 +2223,28 @@ mod tests {
         row.exit_code = None;
         assert!(command_row_matches(&row, "", CommandFilter::Running));
         assert!(!command_row_matches(&row, "", CommandFilter::Failed));
+    }
+
+    #[test]
+    fn sidebar_failure_filter_and_status_share_the_completed_contract() {
+        let mut row = replay_test_row(true, false);
+        row.command_preview = "false".to_owned();
+        row.exit_code = Some(7);
+        assert!(command_row_matches(&row, "", CommandFilter::Failed));
+        assert_eq!(command_status(&row).2, "Failed");
+
+        // A legacy/synthetic commandless row is Background even when it carries
+        // a raw non-zero status; neither sidebar consumer may call it failed.
+        row.command_preview.clear();
+        assert!(!command_row_matches(&row, "", CommandFilter::Failed));
+        assert_eq!(command_status(&row).2, "Completed");
+
+        // Conversely, a resolved command with no reported status is Unknown,
+        // never Success or Failed.
+        row.command_preview = "command-without-status".to_owned();
+        row.exit_code = None;
+        assert!(!command_row_matches(&row, "", CommandFilter::Failed));
+        assert_eq!(command_status(&row).2, "Completed");
     }
 
     #[test]

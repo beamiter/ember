@@ -212,6 +212,13 @@ bottom_bar = true
 block_mode = true
 ```
 
+Completed records use `jterm_core::block_contract` only after Ember has merged
+OSC 133 metadata with its bounded screen reconstruction. Gutter badges,
+failure markers/navigation, and the Commands sidebar consequently agree that a
+blank/background record carrying a nonzero raw status is not a failed command,
+while a real command with no reported status remains unknown rather than
+success.
+
 The Settings panel exposes the same clipboard and paste-confirmation policies
 under **Advanced → Security**, including a way to re-enable confirmation after
 choosing “Don't ask again” in the paste preview.

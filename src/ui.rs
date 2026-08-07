@@ -989,6 +989,7 @@ impl TerminalRenderer {
                     let record = &records[span.record_index];
                     let outcome = crate::block_mode::classify_outcome(
                         record.command.as_deref(),
+                        record.command_truncated,
                         record.exit_code,
                         record.state,
                         record.complete,
@@ -1214,6 +1215,7 @@ impl TerminalRenderer {
                 matches!(
                     crate::block_mode::classify_outcome(
                         record.command.as_deref(),
+                        record.command_truncated,
                         record.exit_code,
                         record.state,
                         record.complete,

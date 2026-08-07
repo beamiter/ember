@@ -10,6 +10,15 @@ fail closed.
 
 ## Completed since the previous handoff
 
+- Completed command records now map the pinned `jterm_core::block_contract`
+  result into Ember's renderer-owned `BlockOutcome`; Prompt/Running lifecycle
+  states remain local. The call happens only after OSC metadata and screen
+  fallback have populated the canonical `CommandRecord`, and an explicit
+  truncated-command fact still counts as command presence without exposing its
+  omitted text. Failure markers/navigation and Commands-sidebar filtering/status
+  all classify the raw optional exit before any legacy scalar adapter, so
+  background+nonzero and command+unreported cases stay consistent.
+
 - `src/persistence_file.rs` gained `claim_exclusive`, a no-clobber
   hard-link/unlink claim, and `src/agent_panel.rs` restores through it. Exactly
   one opener ever observes the snapshot, so two windows opening at once cannot
