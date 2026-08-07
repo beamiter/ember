@@ -371,8 +371,9 @@ no configuration at all.
 - Carriage returns are normalized before that policy is evaluated, and UI
   commands place their submit key outside bracketed-paste markers.
 - Embedded bracketed-paste terminators are removed before forwarding data.
-- Session snapshots are size/count bounded before shells are restored. Invalid
-  snapshots are preserved as side-by-side backups instead of silently replaced.
+- Session snapshots enforce size, count, field, layout-depth, and cumulative
+  text budgets while decoding, before any shell is restored. Invalid snapshots
+  are preserved as side-by-side backups instead of silently replaced.
 - Instance locks and execution journals reject symbolic links, hard links and
   non-regular files before mutation.
 - Desktop notifications use a bounded worker and always reap or time out the

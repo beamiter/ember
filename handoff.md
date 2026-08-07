@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -20,6 +20,10 @@ fail closed.
   dropped instead of being applied to a transcript that no longer exists.
 - Execution generations use `checked_add`; exhaustion seals the session instead
   of reusing an identity a late completion could bind to.
+- Session restore now decodes through allocation-charging Serde seeds. Session,
+  tag, retained text, tab, layout-node, depth, and cumulative budgets are
+  enforced while parsing the 4 MiB-bounded input. Oversized layout branches are
+  pruned, and a malformed later tab no longer discards an earlier valid tab.
 - OSC 52 clipboard *write* now defaults to false. Missing configuration and new
   installs refuse terminal-driven clipboard writes; an explicit `true`
   round-trips unchanged.
@@ -31,14 +35,6 @@ fail closed.
 
 ## Remaining boundaries
 
-### Decode sessions while enforcing allocation budgets
-
-`src/session_persistence.rs` still constructs snapshots and intermediate layout
-`serde_json::Value`s before enforcing the 64-session, tag, tab, layout-depth,
-field, and cumulative budgets. Replace that path with bounded seeds/visitors —
-anvil's `src/session.rs` now has a worked example for the same shape — and add
-adversarial wide, deep, and cumulative tests.
-
 ### Bound the app-owned helpers and configuration files
 
 The local `fc-list`, `fc-match`, notification, and opener paths still need
@@ -47,13 +43,6 @@ pipes. `link.rs` now resolves a trusted absolute opener and reaps it, but the
 font and notification helpers do not. Read font and keybinding files through
 regular-file, descriptor-based size limits. Test fake PATH entries, descendants
 holding pipes, huge output, FIFOs, and oversized files.
-
-### Carry the epoch into execution effects
-
-`AgentEffect::RunCommand` still correlates on the checked execution generation
-alone. That is sufficient today because the panel owns exactly one session, but
-carrying `AgentSessionEpoch` alongside the generation would make a stale effect
-detectable at the boundary rather than by construction.
 
 ## Release checks
 
