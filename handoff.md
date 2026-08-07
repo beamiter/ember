@@ -4,7 +4,7 @@ Updated: 2026-08-08
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
-and rendering safety. Agent snapshots are now claimed atomically, execution
+and rendering safety. Agent snapshots are now claimed before restore, execution
 identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
@@ -26,10 +26,10 @@ fail closed.
   background+nonzero and command+unreported cases stay consistent.
 
 - `src/persistence_file.rs` gained `claim_exclusive`, a no-clobber
-  hard-link/unlink claim, and `src/agent_panel.rs` restores through it. Exactly
-  one opener ever observes the snapshot, so two windows opening at once cannot
-  both resume the same transcript, and evidence that cannot become a session is
-  left at the claim path rather than deleted.
+  hard-link/unlink claim, and `src/agent_panel.rs` restores through it. Evidence
+  that cannot become a session is left at the claim path rather than deleted.
+  An empty or rejected local session also leaves the public path alone, so one
+  process exiting cannot delete a newer checkpoint published by another.
 - The in-flight model request records the task generation it was started for; a
   reply that lands after New Task, a restore, or a session replacement is
   dropped instead of being applied to a transcript that no longer exists.

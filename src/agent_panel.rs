@@ -121,6 +121,30 @@ fn restore_snapshot_session(
     Ok(session)
 }
 
+fn persist_session_to_path(path: &Path, session: Option<&AgentSession>) {
+    if session.is_some_and(|session| {
+        session.transcript().iter().any(|turn| {
+            matches!(
+                turn,
+                Turn::AssistantProposed { command, .. }
+                    if crate::review_text::validate_single_line(
+                        command,
+                        crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                    )
+                    .is_err()
+            )
+        })
+    }) {
+        log::warn!("agent: refusing to persist an unsafe proposal command");
+        return;
+    }
+    if let Some(snapshot) = session.and_then(AgentSession::snapshot) {
+        if let Err(error) = write_snapshot_file(path, &snapshot) {
+            log::warn!("agent: could not persist session: {error}");
+        }
+    }
+}
+
 fn proposal_command(session: &AgentSession, proposal_id: ProposalId) -> Option<&str> {
     session.transcript().iter().find_map(|turn| match turn {
         Turn::AssistantProposed { id, command, .. } if *id == proposal_id => Some(command.as_str()),
@@ -320,31 +344,10 @@ impl AgentPanel {
         let Some(path) = snapshot_path() else {
             return;
         };
-        if self.session.as_ref().is_some_and(|session| {
-            session.transcript().iter().any(|turn| {
-                matches!(
-                    turn,
-                    Turn::AssistantProposed { command, .. }
-                        if crate::review_text::validate_single_line(
-                            command,
-                            crate::review_text::MAX_AGENT_COMMAND_BYTES,
-                        )
-                        .is_err()
-                )
-            })
-        }) {
-            log::warn!("agent: refusing to persist an unsafe proposal command");
-            jterm_core::agent::remove_snapshot_file(&path);
-            return;
-        }
-        match self.session.as_ref().and_then(|session| session.snapshot()) {
-            Some(snapshot) => {
-                if let Err(error) = write_snapshot_file(&path, &snapshot) {
-                    log::warn!("agent: could not persist session: {error}");
-                }
-            }
-            None => jterm_core::agent::remove_snapshot_file(&path),
-        }
+        // This path is shared by every Ember process. An empty or rejected
+        // local session owns no namespace entry, so deleting here could erase
+        // a checkpoint another window published after this one opened.
+        persist_session_to_path(&path, self.session.as_ref());
     }
 
     pub fn toggle(&mut self, config: &Config, session_id: String) {
@@ -1103,6 +1106,27 @@ mod tests {
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         root
+    }
+
+    #[test]
+    fn empty_local_session_preserves_a_concurrent_checkpoint() {
+        let root = private_test_dir("agent-persist-owner");
+        let path = root.join("agent_session.json");
+        write_private(&path, b"checkpoint from another process");
+
+        let empty = AgentSession::new(4);
+        persist_session_to_path(&path, Some(&empty));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"checkpoint from another process"
+        );
+        persist_session_to_path(&path, None);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"checkpoint from another process"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
