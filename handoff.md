@@ -25,11 +25,15 @@ fail closed.
   all classify the raw optional exit before any legacy scalar adapter, so
   background+nonzero and command+unreported cases stay consistent.
 
-- `src/persistence_file.rs` gained `claim_exclusive`, a no-clobber
-  hard-link/unlink claim, and `src/agent_panel.rs` restores through it. Evidence
-  that cannot become a session is left at the claim path rather than deleted.
-  An empty or rejected local session also leaves the public path alone, so one
-  process exiting cannot delete a newer checkpoint published by another.
+- Agent restore now consumes `jterm_core::agent::SessionClaim`, backed by one
+  atomic no-replace rename rather than the former local hard-link/unlink pair.
+  Exactly one concurrent opener restores a valid snapshot; malformed, future,
+  oversized, and semantically invalid evidence remains byte-identical at its
+  private claim path. An empty or rejected local session still leaves the
+  public path alone, so one process exiting cannot delete a newer checkpoint
+  published by another. `jterm_core` is pinned to
+  `fd25f905aadab9d8ca111a67b9b6422a22ef2d6c` (transitively jagent
+  `3aece307766ca8f3ca33ed0376d2a271cc2322b3`).
 - The in-flight model request records the task generation it was started for; a
   reply that lands after New Task, a restore, or a session replacement is
   dropped instead of being applied to a transcript that no longer exists.

@@ -52,73 +52,17 @@ fn read_snapshot_file(path: &Path) -> Option<AgentSessionSnapshot> {
 /// the claim path instead of being deleted, so a corrupt or hostile snapshot
 /// stays available for inspection and is never restored by a later opener.
 fn claim_snapshot_session(path: &Path) -> Option<AgentSession> {
-    let claimed = crate::persistence_file::claim_exclusive(path).ok()?;
-    let restored =
-        crate::persistence_file::read_bounded(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
-            .ok()
-            .and_then(|encoded| AgentSessionSnapshot::from_json(&encoded).ok())
-            .and_then(|snapshot| restore_snapshot_session(snapshot).ok());
-    match restored {
-        Some(session) => {
-            let _ = std::fs::remove_file(&claimed);
-            Some(session)
-        }
-        None => {
+    match jterm_core::agent::claim_session_file(path) {
+        jterm_core::agent::SessionClaim::Vacant => None,
+        jterm_core::agent::SessionClaim::Restored(session) => Some(session),
+        jterm_core::agent::SessionClaim::Quarantined { path, error } => {
             log::warn!(
-                "agent: quarantined an unusable session snapshot at {}",
-                claimed.display()
+                "agent: quarantined an unusable session snapshot at {}: {error}",
+                path.display()
             );
             None
         }
     }
-}
-
-fn restore_snapshot_session(
-    snapshot: AgentSessionSnapshot,
-) -> Result<AgentSession, AgentSnapshotError> {
-    let session = AgentSession::restore(snapshot)?;
-    let mut proposal_ids = std::collections::HashSet::new();
-    let mut pending = Vec::new();
-    for turn in session.transcript() {
-        if let Turn::AssistantProposed {
-            id,
-            command,
-            status,
-        } = turn
-        {
-            if crate::review_text::validate_single_line(
-                command,
-                crate::review_text::MAX_AGENT_COMMAND_BYTES,
-            )
-            .is_err()
-            {
-                return Err(AgentSnapshotError::Invalid(
-                    "proposal command is unsafe to display or execute",
-                ));
-            }
-            if !proposal_ids.insert(id.get()) {
-                return Err(AgentSnapshotError::Invalid("duplicate proposal id"));
-            }
-            if *status == ProposalStatus::Pending {
-                pending.push(*id);
-            }
-        }
-    }
-    match session.state() {
-        AgentState::AwaitingApproval { proposal_id } if pending.as_slice() == [proposal_id] => {}
-        AgentState::AwaitingApproval { .. } => {
-            return Err(AgentSnapshotError::Invalid(
-                "pending proposal state does not match transcript",
-            ));
-        }
-        _ if !pending.is_empty() => {
-            return Err(AgentSnapshotError::Invalid(
-                "pending proposal exists outside approval state",
-            ));
-        }
-        _ => {}
-    }
-    Ok(session)
 }
 
 fn persist_session_to_path(path: &Path, session: Option<&AgentSession>) {
@@ -172,7 +116,7 @@ fn accept_model_reply_compat(session: &mut AgentSession, raw: &str) -> Result<()
 
     let message = format!("model proposal rejected before display: {error}");
     if let Some(snapshot) = checkpoint {
-        match restore_snapshot_session(snapshot) {
+        match AgentSession::restore(snapshot) {
             Ok(mut restored) => {
                 let _ = restored.model_failed(message.clone());
                 *session = restored;
@@ -1097,6 +1041,66 @@ mod tests {
             .expect("non-empty session has a snapshot")
     }
 
+    fn invalid_snapshot_evidence() -> Vec<(&'static str, Vec<u8>)> {
+        let mut exhausted: serde_json::Value =
+            serde_json::from_str(&snapshot_fixture().to_json().unwrap()).unwrap();
+        exhausted["turns_used"] = serde_json::json!(u32::MAX);
+
+        let mut proposed = AgentSession::new(4);
+        proposed.submit_user("list files").unwrap();
+        proposed
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        let proposal: serde_json::Value = serde_json::from_str(
+            &proposed
+                .snapshot()
+                .expect("pending proposal has a snapshot")
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut duplicate = proposal.clone();
+        let transcript = duplicate["transcript"].as_array_mut().unwrap();
+        let duplicate_turn = transcript
+            .iter()
+            .find(|turn| turn.get("AssistantProposed").is_some())
+            .unwrap()
+            .clone();
+        transcript.push(duplicate_turn);
+
+        let mut spoofed = proposal;
+        let proposed = spoofed["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|turn| turn.get("AssistantProposed").is_some())
+            .unwrap();
+        proposed["AssistantProposed"]["command"] =
+            serde_json::Value::String("printf safe\u{202e}; rm -rf important".into());
+
+        vec![
+            ("malformed JSON", b"not json".to_vec()),
+            ("future schema", br#"{"version":99}"#.to_vec()),
+            (
+                "invalid turn budget",
+                serde_json::to_vec(&exhausted).unwrap(),
+            ),
+            (
+                "duplicate proposal id",
+                serde_json::to_vec(&duplicate).unwrap(),
+            ),
+            (
+                "visually spoofed proposal",
+                serde_json::to_vec(&spoofed).unwrap(),
+            ),
+            (
+                "oversized snapshot",
+                vec![b' '; MAX_AGENT_SNAPSHOT_JSON_BYTES + 1],
+            ),
+        ]
+    }
+
     fn private_test_dir(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("ember-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
@@ -1130,15 +1134,33 @@ mod tests {
     }
 
     #[test]
-    fn claiming_a_snapshot_has_exactly_one_winner() {
+    fn claiming_a_snapshot_has_exactly_one_concurrent_winner() {
         let root = private_test_dir("agent-claim");
         let path = root.join("agent_session.json");
         write_snapshot_file(&path, &snapshot_fixture()).unwrap();
 
-        let session = claim_snapshot_session(&path).expect("the first opener restores");
-        assert!(!session.transcript().is_empty());
-        // Consumed: a second opener finds nothing, and no leftover file in the
-        // directory can be restored later.
+        const WORKERS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS + 1));
+        let mut workers = Vec::new();
+        for _ in 0..WORKERS {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                claim_snapshot_session(&path).is_some_and(|session| {
+                    assert!(!session.transcript().is_empty());
+                    true
+                })
+            }));
+        }
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|won| *won)
+            .count();
+
+        assert_eq!(winners, 1);
         assert!(!path.exists());
         assert!(claim_snapshot_session(&path).is_none());
         assert!(std::fs::read_dir(&root).unwrap().next().is_none());
@@ -1150,19 +1172,35 @@ mod tests {
         let root = private_test_dir("agent-quarantine");
         let path = root.join("agent_session.json");
 
-        for evidence in ["not json", r#"{"version":99}"#] {
-            std::fs::write(&path, evidence).unwrap();
-            assert!(claim_snapshot_session(&path).is_none());
-            assert!(!path.exists(), "the original name is claimed");
+        for (label, evidence) in invalid_snapshot_evidence() {
+            write_private(&path, &evidence);
+            assert!(claim_snapshot_session(&path).is_none(), "{label}");
+            assert!(!path.exists(), "{label}: the original name is claimed");
             let preserved: Vec<_> = std::fs::read_dir(&root)
                 .unwrap()
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
                 .collect();
-            assert_eq!(preserved.len(), 1, "invalid evidence is kept");
-            assert_eq!(std::fs::read_to_string(&preserved[0]).unwrap(), evidence);
+            assert_eq!(preserved.len(), 1, "{label}: invalid evidence is kept");
+            assert!(
+                preserved[0]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("agent_session.json.claimed-"),
+                "{label}: evidence uses the private claim name"
+            );
+            assert_eq!(
+                std::fs::read(&preserved[0]).unwrap(),
+                evidence,
+                "{label}: quarantine preserves exact bytes"
+            );
             // A quarantined file is never restored by a later opener.
             assert!(claim_snapshot_session(&path).is_none());
+            assert!(
+                preserved[0].exists(),
+                "{label}: a loser cannot delete evidence"
+            );
             std::fs::remove_file(&preserved[0]).unwrap();
         }
         std::fs::remove_dir_all(&root).unwrap();
@@ -1189,57 +1227,6 @@ mod tests {
         write_private(&oversized, vec![b'x'; MAX_AGENT_SNAPSHOT_JSON_BYTES + 1]);
         assert!(read_snapshot_file(&oversized).is_none());
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn restored_snapshot_rejects_duplicate_proposal_id_confusion() {
-        let mut session = AgentSession::new(4);
-        session.submit_user("list files").unwrap();
-        session
-            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
-            .unwrap();
-        let snapshot = session.snapshot().unwrap();
-        let mut encoded: serde_json::Value =
-            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
-        let transcript = encoded["transcript"].as_array_mut().unwrap();
-        let duplicate = transcript
-            .iter()
-            .find(|turn| turn.get("AssistantProposed").is_some())
-            .unwrap()
-            .clone();
-        transcript.insert(1, duplicate);
-        let encoded = serde_json::to_string(&encoded).unwrap();
-        let snapshot = AgentSessionSnapshot::from_json(&encoded).unwrap();
-
-        assert!(matches!(
-            restore_snapshot_session(snapshot),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("proposal id")
-        ));
-    }
-
-    #[test]
-    fn restored_snapshot_rejects_visually_spoofed_proposals() {
-        let mut session = AgentSession::new(4);
-        session.submit_user("list files").unwrap();
-        session
-            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
-            .unwrap();
-        let snapshot = session.snapshot().unwrap();
-        let mut encoded: serde_json::Value =
-            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
-        let transcript = encoded["transcript"].as_array_mut().unwrap();
-        let proposed = transcript
-            .iter_mut()
-            .find(|turn| turn.get("AssistantProposed").is_some())
-            .unwrap();
-        proposed["AssistantProposed"]["command"] =
-            serde_json::Value::String("printf safe\u{202e}; rm -rf important".into());
-        let snapshot = AgentSessionSnapshot::from_json(&encoded.to_string()).unwrap();
-
-        assert!(matches!(
-            restore_snapshot_session(snapshot),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("proposal command")
-        ));
     }
 
     #[test]
