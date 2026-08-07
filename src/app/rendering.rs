@@ -866,10 +866,9 @@ impl TerminalApp {
                     });
                 }
                 crate::block_mode::BlockClick::Clear => {
-                    self.block_selection = None;
-                    // Full-duplex sync: deselecting the block also drops the
-                    // Commands-sidebar row highlight it mirrored.
-                    self.command_sidebar.selected = None;
+                    // Full-duplex sync: deselecting either view also drops
+                    // the Commands-sidebar row highlight it mirrored.
+                    self.clear_block_selection();
                 }
             }
         }

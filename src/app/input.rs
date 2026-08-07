@@ -287,7 +287,7 @@ impl TerminalApp {
                     &mut self.pending_paste_confirm,
                 ) {
                     // 粘贴也是用户字节:与键盘输入一样丢弃 block 选中。
-                    Ok(true) => self.block_selection = None,
+                    Ok(true) => self.clear_block_selection(),
                     Ok(false) => self.set_status("Clipboard contains no text"),
                     Err(error) => self.set_status_for(
                         format!("Paste failed: {error}"),
@@ -1072,7 +1072,10 @@ impl TerminalApp {
                         drop(terminal);
                         if !text.is_empty() {
                             // IME 提交同样是送往 PTY 的真实输入:清 block 选中。
-                            self.block_selection = None;
+                            super::commands::clear_block_selection_state(
+                                &mut self.block_selection,
+                                &mut self.command_sidebar.selected,
+                            );
                         }
                         if !text.is_empty() && !session.queue_input(text.as_bytes()) {
                             log::warn!("terminal input retry buffer full; IME commit retained by neither PTY nor UI");

@@ -206,8 +206,9 @@ show_repo_strip = true
 bottom_bar = true
 
 # Command-block chrome (Warp-style): a colored gutter stripe, separator and
-# outcome badge per OSC 133 command block. The block:* palette commands
-# (jump to first failure, copy, recall) keep working when this is off.
+# outcome badge per OSC 133 command block. Running blocks show a compact live
+# elapsed-time badge when it fits without covering terminal text. The block:*
+# palette commands (jump to first failure, copy, recall) work when this is off.
 block_mode = true
 ```
 

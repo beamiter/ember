@@ -27,7 +27,8 @@ pub enum BlockOutcome {
     /// The live prompt block (OSC 133 A/B without C yet): separator only,
     /// no gutter stripe.
     Prompt,
-    /// The newest record is between C and D: accent-colored stripe, no badge.
+    /// The newest record is between C and D: accent-colored stripe and live
+    /// elapsed-time badge when it fits.
     Running,
     /// Completed cycle with no/empty command (e.g. Enter on an empty prompt).
     Background,
@@ -94,9 +95,28 @@ pub fn format_block_duration(dur_ms: u64) -> String {
     }
 }
 
+/// Compact live badge for an OSC 133 command whose `C` arrived but whose `D`
+/// has not. The arrow is deliberately distinct from the final success/failure
+/// glyphs so an in-flight command can never look completed.
+pub fn running_badge_text(elapsed_ms: u64) -> String {
+    format!("▶ {}", format_block_duration(elapsed_ms))
+}
+
+/// Family refresh cadence for a visible running badge: keep feedback moving
+/// once per second, then slow to once per minute when the formatter drops its
+/// seconds component at one hour.
+pub fn running_badge_refresh_interval(elapsed_ms: u64) -> std::time::Duration {
+    if elapsed_ms < 3_600_000 {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(60)
+    }
+}
+
 /// Badge text for the block's first row, or `None` for outcomes that carry no
-/// badge (running, live prompt, background). `Unknown` is a bare `?` glyph:
-/// anvil/4 show no exit badge for an unreported status.
+/// badge (live prompt and background; running needs a live elapsed duration).
+/// `Unknown` is a bare `?` glyph: anvil/4 show no exit badge for an unreported
+/// status.
 pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<String> {
     match outcome {
         BlockOutcome::Success => Some(match duration_ms {
@@ -115,7 +135,8 @@ pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<Str
             Some(text)
         }
         BlockOutcome::Unknown => Some("?".to_string()),
-        BlockOutcome::Prompt | BlockOutcome::Running | BlockOutcome::Background => None,
+        BlockOutcome::Running => duration_ms.map(running_badge_text),
+        BlockOutcome::Prompt | BlockOutcome::Background => None,
     }
 }
 
@@ -770,9 +791,29 @@ mod tests {
             badge_text(BlockOutcome::Unknown, Some(2_300)),
             Some("?".to_string())
         );
-        assert_eq!(badge_text(BlockOutcome::Running, Some(10)), None);
+        assert_eq!(
+            badge_text(BlockOutcome::Running, Some(1_250)),
+            Some("▶ 1.2s".to_string())
+        );
+        assert_eq!(badge_text(BlockOutcome::Running, None), None);
         assert_eq!(badge_text(BlockOutcome::Prompt, None), None);
         assert_eq!(badge_text(BlockOutcome::Background, Some(10)), None);
+    }
+
+    #[test]
+    fn running_badge_is_compact_and_uses_bounded_refresh_cadence() {
+        assert_eq!(running_badge_text(0), "▶ 0ms");
+        assert_eq!(running_badge_text(92_000), "▶ 1m32s");
+        assert!(!running_badge_text(1_250).contains('✓'));
+        assert!(!running_badge_text(1_250).contains('✗'));
+        assert_eq!(
+            running_badge_refresh_interval(3_599_999),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            running_badge_refresh_interval(3_600_000),
+            std::time::Duration::from_secs(60)
+        );
     }
 
     #[test]

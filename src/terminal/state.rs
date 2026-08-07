@@ -1994,6 +1994,17 @@ impl super::TerminalState {
             .filter(|command| !command.is_empty())
     }
 
+    /// Elapsed wall time for the newest live OSC 133 command. This is
+    /// renderer-only state: completed records still prefer the shell-reported
+    /// duration at `D`, while the live block badge uses this monotonic clock.
+    pub fn running_duration_ms(&self) -> Option<u64> {
+        self.command_records
+            .back()
+            .filter(|record| !record.complete && record.state == CommandState::Running)
+            .and_then(|record| record.started_instant)
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// True after B and before C. This is the safe state for placing a
     /// command into the shell editor without racing a running foreground job.
     pub fn shell_is_prompt_ready(&self) -> bool {

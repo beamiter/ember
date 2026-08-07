@@ -21,6 +21,17 @@ pub struct CommandTarget {
     pub execution_id: String,
 }
 
+/// Retire the terminal and sidebar views of one logical block selection.
+/// Taking the fields separately lets input routing call this while it holds a
+/// disjoint mutable borrow of the active session.
+pub(crate) fn clear_block_selection_state(
+    block_selection: &mut Option<(String, String)>,
+    sidebar_selection: &mut Option<CommandTarget>,
+) {
+    *block_selection = None;
+    *sidebar_selection = None;
+}
+
 #[derive(Debug, Default)]
 pub struct CommandSidebarState {
     pub query: String,
@@ -498,7 +509,7 @@ impl TerminalApp {
             .is_some_and(|target| target.session_id == session_id)
             && selected_detail.is_none();
         if clear_selection || selected_missing {
-            self.command_sidebar.selected = None;
+            self.clear_block_selection();
         }
 
         // The containing Panel::show closure is still alive here. Stage the
@@ -1014,6 +1025,16 @@ impl TerminalApp {
     /// opening the sidebar on the Commands view later shows the highlight.
     pub(crate) fn sync_block_selection_to_sidebar(&mut self, target: &CommandTarget) {
         self.command_sidebar.selected = Some(target.clone());
+    }
+
+    /// Clear both views of the same block selection. Gutter/keyboard block
+    /// selection and the Commands-sidebar highlight are deliberately kept in
+    /// sync, so every dismissal path must retire both halves together.
+    pub(crate) fn clear_block_selection(&mut self) {
+        clear_block_selection_state(
+            &mut self.block_selection,
+            &mut self.command_sidebar.selected,
+        );
     }
 
     /// `block:search`: toggle the cross-block search picker. Like keyboard
@@ -2251,6 +2272,20 @@ mod tests {
             "echo hi\nhi\n"
         );
         assert_eq!(combine_command_and_output("true", ""), "true");
+    }
+
+    #[test]
+    fn clearing_a_block_selection_retires_terminal_and_sidebar_state_together() {
+        let mut block_selection = Some(("session".to_owned(), "execution".to_owned()));
+        let mut sidebar_selection = Some(CommandTarget {
+            session_id: "session".to_owned(),
+            execution_id: "execution".to_owned(),
+        });
+
+        clear_block_selection_state(&mut block_selection, &mut sidebar_selection);
+
+        assert_eq!(block_selection, None);
+        assert_eq!(sidebar_selection, None);
     }
 
     #[test]

@@ -3055,7 +3055,10 @@ impl eframe::App for TerminalApp {
         // 真实键盘输入送往 PTY 时丢弃 block 选中（anvil 先例：真实输入
         // 清除选中；不劫持 Escape）。
         if has_keyboard_input {
-            self.block_selection = None;
+            app::commands::clear_block_selection_state(
+                &mut self.block_selection,
+                &mut self.command_sidebar.selected,
+            );
         }
 
         // 有输入活动时更新最后活动时间

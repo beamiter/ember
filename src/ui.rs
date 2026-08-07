@@ -981,21 +981,27 @@ impl TerminalRenderer {
             rows,
         );
         let newest = records.len() - 1;
+        let running_duration_ms = terminal.running_duration_ms();
         Some(
             spans
                 .into_iter()
                 .map(|span| {
                     let record = &records[span.record_index];
+                    let outcome = crate::block_mode::classify_outcome(
+                        record.command.as_deref(),
+                        record.exit_code,
+                        record.state,
+                        record.complete,
+                        span.record_index == newest,
+                    );
                     BlockChromeEntry {
                         id: record.id.clone(),
-                        outcome: crate::block_mode::classify_outcome(
-                            record.command.as_deref(),
-                            record.exit_code,
-                            record.state,
-                            record.complete,
-                            span.record_index == newest,
-                        ),
-                        duration_ms: record.duration_ms,
+                        outcome,
+                        duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
+                            running_duration_ms
+                        } else {
+                            record.duration_ms
+                        },
                         finished_at: record.finished_at,
                         span,
                     }
@@ -1165,6 +1171,17 @@ impl TerminalRenderer {
                         galley,
                         color,
                     );
+                    // Register a timer only after the running badge actually
+                    // paints. Hidden panes are not rendered; alt-screen,
+                    // reflow, an offscreen prompt, overlap and insufficient
+                    // height/width all exit before this point.
+                    if entry.outcome == BlockOutcome::Running {
+                        if let Some(elapsed_ms) = entry.duration_ms {
+                            painter.ctx().request_repaint_after(
+                                block_mode::running_badge_refresh_interval(elapsed_ms),
+                            );
+                        }
+                    }
                     break;
                 }
             }

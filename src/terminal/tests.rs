@@ -1881,8 +1881,10 @@ fn prompt_ready_requires_b_and_ends_at_c() {
     assert!(terminal.shell_is_prompt_ready());
     terminal.process_input(b"cmd\r\n\x1b]133;C\x07");
     assert!(!terminal.shell_is_prompt_ready());
+    assert!(terminal.running_duration_ms().is_some());
     terminal.process_input(b"\x1b]133;D;0\x07");
     assert!(!terminal.shell_is_prompt_ready());
+    assert_eq!(terminal.running_duration_ms(), None);
 }
 
 #[test]

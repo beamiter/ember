@@ -1,5 +1,6 @@
 // Tab management module
 
+use super::commands::CommandTarget;
 use super::state::{TabDragOrigin, TerminalApp};
 use crate::tab_manager::TabFlags;
 use crate::theme::ThemeExt as _;
@@ -15,6 +16,18 @@ pub(crate) fn workspace_drag_pointer_pos(
     hover_pos: Option<egui::Pos2>,
 ) -> Option<egui::Pos2> {
     interact_pos.or(hover_pos)
+}
+
+/// Whether either UI representation of the logical block selection belongs
+/// to `session_id`. Normal selection paths update both fields together, but
+/// close must also clean up a pre-existing or otherwise divergent half.
+fn block_or_sidebar_selection_targets_session(
+    block_selection: Option<&(String, String)>,
+    sidebar_selection: Option<&CommandTarget>,
+    session_id: &str,
+) -> bool {
+    block_selection.is_some_and(|(selected_session, _)| selected_session == session_id)
+        || sidebar_selection.is_some_and(|target| target.session_id == session_id)
 }
 
 /// 侧边栏标签列表一行所需的全部信息,渲染前一次性算好。行渲染闭包内不能
@@ -348,13 +361,14 @@ impl TerminalApp {
             self.terminal_mouse_capture = None;
             self.last_terminal_mouse_motion = None;
         }
-        if self
-            .block_selection
-            .as_ref()
-            .map(|(session_id, _)| session_id)
-            == removed_session_id.as_ref()
-        {
-            self.block_selection = None;
+        if removed_session_id.as_deref().is_some_and(|session_id| {
+            block_or_sidebar_selection_targets_session(
+                self.block_selection.as_ref(),
+                self.command_sidebar.selected.as_ref(),
+                session_id,
+            )
+        }) {
+            self.clear_block_selection();
         }
         self.tabs.on_session_removed(index);
         self.force_resize_session = true;
@@ -2035,7 +2049,8 @@ impl TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_drag_pointer_pos;
+    use super::{block_or_sidebar_selection_targets_session, workspace_drag_pointer_pos};
+    use crate::app::commands::CommandTarget;
     use eframe::egui;
 
     #[test]
@@ -2055,5 +2070,24 @@ mod tests {
             workspace_drag_pointer_pos(Some(release_pos), Some(hover_pos)),
             Some(release_pos)
         );
+    }
+
+    #[test]
+    fn closing_a_session_detects_either_half_of_a_divergent_block_selection() {
+        let sidebar = CommandTarget {
+            session_id: "closed-session".to_owned(),
+            execution_id: "sidebar".to_owned(),
+        };
+
+        assert!(block_or_sidebar_selection_targets_session(
+            None,
+            Some(&sidebar),
+            "closed-session",
+        ));
+        assert!(!block_or_sidebar_selection_targets_session(
+            None,
+            Some(&sidebar),
+            "open-session",
+        ));
     }
 }
