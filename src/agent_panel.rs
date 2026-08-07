@@ -29,11 +29,7 @@ use std::sync::mpsc;
 const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join("ember")
-            .join("agent_session.json"),
-    )
+    Some(dirs::config_dir()?.join("ember").join("agent_session.json"))
 }
 
 /// Read an Agent snapshot through ember's hardened persistence boundary.
@@ -191,6 +187,7 @@ pub enum AgentEffect {
     RunCommand {
         session_id: String,
         command: String,
+        epoch: jterm_core::agent::AgentSessionEpoch,
         generation: u64,
     },
 }
@@ -200,6 +197,7 @@ struct PendingAgentExecution {
     proposal_id: ProposalId,
     command: String,
     generation: u64,
+    run_effect_claimed: bool,
 }
 
 fn client_from_config(config: &Config) -> Result<AiClient, String> {
@@ -943,6 +941,7 @@ impl AgentPanel {
     fn approve(&mut self, id: ProposalId, edited: Option<String>) -> Option<AgentEffect> {
         let session_id = self.bound_session_id.clone()?;
         let session = self.session.as_mut()?;
+        let epoch = session.epoch();
         let candidate = edited.as_deref().or_else(|| proposal_command(session, id));
         let Some(candidate) = candidate else {
             self.status = "proposal command is unavailable".to_string();
@@ -984,11 +983,13 @@ impl AgentPanel {
                     proposal_id: approved.proposal_id,
                     command: approved.command.clone(),
                     generation,
+                    run_effect_claimed: false,
                 });
                 self.status.clear();
                 Some(AgentEffect::RunCommand {
                     session_id,
                     command: approved.command,
+                    epoch,
                     generation,
                 })
             }
@@ -997,6 +998,39 @@ impl AgentPanel {
                 None
             }
         }
+    }
+
+    /// Atomically claim a deferred PTY side effect that still belongs to the
+    /// exact Agent task and approval that produced it. New tasks and restored
+    /// or replacement sessions receive a new epoch. Each approval can be
+    /// claimed only once, while its pending state remains until completion.
+    pub fn claim_run_effect(
+        &mut self,
+        session_id: &str,
+        command: &str,
+        epoch: jterm_core::agent::AgentSessionEpoch,
+        generation: u64,
+    ) -> bool {
+        if !self.is_open
+            || self.bound_session_id.as_deref() != Some(session_id)
+            || !self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_current_epoch(epoch))
+        {
+            return false;
+        }
+        let Some(pending) = self.awaiting.as_mut() else {
+            return false;
+        };
+        if pending.run_effect_claimed
+            || pending.generation != generation
+            || pending.command != command
+        {
+            return false;
+        }
+        pending.run_effect_claimed = true;
+        true
     }
 
     pub fn execution_start_failed(&mut self, generation: u64, message: impl Into<String>) {
@@ -1288,12 +1322,22 @@ mod tests {
         let AgentEffect::RunCommand {
             session_id,
             command,
+            epoch,
             generation,
         } = effect;
         assert_eq!(session_id, "session-three");
         assert_eq!(command, "ls -la");
         assert_ne!(generation, 0);
         assert!(panel.awaiting.is_some());
+        assert!(panel.claim_run_effect(&session_id, &command, epoch, generation));
+        // The PTY dispatch authorization is one-shot, while completion state
+        // remains live for the command that was already started.
+        assert!(!panel.claim_run_effect(&session_id, &command, epoch, generation));
+        assert!(panel.awaiting.is_some());
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::AwaitingObservation { proposal_id: id }
+        );
 
         // Completion from another session is ignored entirely.
         panel.handle_completed("session-one", &completed("ls -la", 0, "total 0"));
@@ -1323,6 +1367,31 @@ mod tests {
             panel.session.as_ref().unwrap().state(),
             AgentState::AwaitingModel
         );
+    }
+
+    #[test]
+    fn stale_run_effect_epoch_is_rejected_after_session_replacement() {
+        let mut panel = AgentPanel::new();
+        panel.open(&ai_config(), "session-three".into());
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("list files").unwrap();
+        let outcome = session
+            .accept_model_reply(r#"{"action":"run","command":"ls -la"}"#)
+            .unwrap();
+        let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
+            panic!("expected proposal");
+        };
+        let effect = panel.approve(id, None).expect("approval must yield effect");
+        let AgentEffect::RunCommand {
+            session_id,
+            command,
+            epoch,
+            generation,
+        } = effect;
+        panel.session = Some(AgentSession::new(ai_config().agent_max_turns));
+
+        assert!(!panel.claim_run_effect(&session_id, &command, epoch, generation));
+        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Ready);
     }
 
     #[test]

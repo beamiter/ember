@@ -1404,56 +1404,71 @@ impl TerminalApp {
                     crate::agent_panel::AgentEffect::RunCommand {
                         session_id,
                         command,
+                        epoch,
                         generation,
-                    } => match self.session_manager.index_of(&session_id) {
-                        Some(session_index) => {
-                            let Some(session) = self.session_manager.get_session_mut(session_index)
-                            else {
+                    } => {
+                        if !self.agent_panel.claim_run_effect(
+                            &session_id,
+                            &command,
+                            epoch,
+                            generation,
+                        ) {
+                            log::warn!(
+                                "agent: dropped a stale run effect for terminal session {session_id}"
+                            );
+                            continue;
+                        }
+                        match self.session_manager.index_of(&session_id) {
+                            Some(session_index) => {
+                                let Some(session) =
+                                    self.session_manager.get_session_mut(session_index)
+                                else {
+                                    self.agent_panel.execution_start_failed(
+                                        generation,
+                                        "Agent session's terminal no longer exists",
+                                    );
+                                    continue;
+                                };
+                                if !session.shell_owns_foreground_pty() {
+                                    self.agent_panel.execution_start_failed(
+                                    generation,
+                                    "Agent command was not started: the interactive shell does not own the foreground PTY",
+                                );
+                                    continue;
+                                }
+                                let bracketed = {
+                                    let mut terminal = session.terminal.lock();
+                                    if let Err(error) =
+                                        terminal.arm_agent_execution(generation, &command)
+                                    {
+                                        drop(terminal);
+                                        self.agent_panel.execution_start_failed(
+                                            generation,
+                                            format!("Agent command was not started: {error}"),
+                                        );
+                                        continue;
+                                    }
+                                    terminal.is_bracketed_paste_enabled()
+                                };
+                                let bytes = crate::encode_submitted_command(&command, bracketed);
+                                if !session.queue_agent_input(&bytes) {
+                                    session.terminal.lock().disarm_agent_execution(generation);
+                                    self.agent_panel.execution_start_failed(
+                                        generation,
+                                        "Agent command rejected: input queue is full",
+                                    );
+                                    self.set_status("Agent command rejected: input queue is full");
+                                }
+                            }
+                            None => {
                                 self.agent_panel.execution_start_failed(
                                     generation,
                                     "Agent session's terminal no longer exists",
                                 );
-                                continue;
-                            };
-                            if !session.shell_owns_foreground_pty() {
-                                self.agent_panel.execution_start_failed(
-                                    generation,
-                                    "Agent command was not started: the interactive shell does not own the foreground PTY",
-                                );
-                                continue;
-                            }
-                            let bracketed = {
-                                let mut terminal = session.terminal.lock();
-                                if let Err(error) =
-                                    terminal.arm_agent_execution(generation, &command)
-                                {
-                                    drop(terminal);
-                                    self.agent_panel.execution_start_failed(
-                                        generation,
-                                        format!("Agent command was not started: {error}"),
-                                    );
-                                    continue;
-                                }
-                                terminal.is_bracketed_paste_enabled()
-                            };
-                            let bytes = crate::encode_submitted_command(&command, bracketed);
-                            if !session.queue_agent_input(&bytes) {
-                                session.terminal.lock().disarm_agent_execution(generation);
-                                self.agent_panel.execution_start_failed(
-                                    generation,
-                                    "Agent command rejected: input queue is full",
-                                );
-                                self.set_status("Agent command rejected: input queue is full");
+                                self.set_status("Agent session's terminal no longer exists");
                             }
                         }
-                        None => {
-                            self.agent_panel.execution_start_failed(
-                                generation,
-                                "Agent session's terminal no longer exists",
-                            );
-                            self.set_status("Agent session's terminal no longer exists");
-                        }
-                    },
+                    }
                 }
             }
         }

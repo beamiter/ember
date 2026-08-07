@@ -93,10 +93,8 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "ember-history-test-{label}-{}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("ember-history-test-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             #[cfg(unix)]
