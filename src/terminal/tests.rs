@@ -2292,3 +2292,183 @@ fn a_terminal_inside_its_mutex_is_not_at_the_mutex_address() {
     let guard = terminal.lock();
     assert_eq!(&*guard as *const TerminalState as usize, payload_address);
 }
+
+/// What the grid renderer actually paints for a row: `build_row_instances`
+/// skips continuation cells, so they show as bare background regardless of
+/// what the cell holds.
+fn rendered_row(terminal: &TerminalState, row: usize) -> String {
+    terminal.grid[row]
+        .iter()
+        .map(|cell| {
+            if cell.flags.wide_continuation() {
+                ' '
+            } else {
+                cell.character
+            }
+        })
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// Every half of a double-width character must have its partner: the renderer
+/// skips continuation cells and paints `wide()` cells two columns wide, so a
+/// stranded half either hides the character in its cell or overpaints the
+/// neighbouring one — and the next write there blanks a good cell while
+/// repairing the pair.
+fn wide_pairing_violation(terminal: &TerminalState) -> Option<String> {
+    let (rows, cols) = (terminal.grid.rows(), terminal.grid.row_len());
+    for row in 0..rows {
+        for col in 0..cols {
+            let cell = terminal.grid[row][col];
+            if cell.flags.wide()
+                && (col + 1 >= cols || !terminal.grid[row][col + 1].flags.wide_continuation())
+            {
+                return Some(format!(
+                    "row {row} col {col}: wide {:?} alone",
+                    cell.character
+                ));
+            }
+            if cell.flags.wide_continuation()
+                && (col == 0 || !terminal.grid[row][col - 1].flags.wide())
+            {
+                return Some(format!(
+                    "row {row} col {col}: continuation alone, holding {:?}",
+                    cell.character
+                ));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn ascii_typed_over_a_wide_character_is_not_erased_by_the_next_write() {
+    // The reported bug: typing ASCII into a TUI line that already holds CJK
+    // made characters render as bare background. The fast ASCII path cleared
+    // the flags of the cells it wrote but not the continuation half it
+    // stranded one column further right, and the very next `put_char` there
+    // blanked its left neighbour while repairing that pair.
+    let mut terminal = TerminalState::new(8, 1);
+    terminal.process_input("好".as_bytes());
+    terminal.process_input("\x1b[1Ga好".as_bytes());
+
+    assert_eq!(rendered_row(&terminal, 0), "a好");
+    assert_eq!(wide_pairing_violation(&terminal), None);
+}
+
+#[test]
+fn ascii_typed_over_a_continuation_cell_clears_the_stranded_lead() {
+    // Overwriting the right half of a wide character used to leave its lead
+    // behind, still flagged `wide()`, painting a double-width glyph across the
+    // ASCII that replaced it.
+    let mut terminal = TerminalState::new(8, 1);
+    terminal.process_input("好".as_bytes());
+    terminal.process_input(b"\x1b[2Gab");
+
+    assert!(!terminal.grid[0][0].flags.wide());
+    assert_eq!(rendered_row(&terminal, 0), " ab");
+    assert_eq!(wide_pairing_violation(&terminal), None);
+}
+
+#[test]
+fn a_wide_character_landing_on_a_wide_lead_clears_the_stranded_continuation() {
+    // `put_char` repaired the cell it wrote but not the one it claims as its
+    // own continuation: landing that continuation on somebody else's lead
+    // stranded *their* continuation one column further right.
+    let mut terminal = TerminalState::new(8, 1);
+    terminal.process_input(b"\x1b[4G");
+    terminal.process_input("好".as_bytes());
+    terminal.process_input(b"\x1b[3G");
+    terminal.process_input("的".as_bytes());
+
+    assert!(!terminal.grid[0][4].flags.wide_continuation());
+    assert_eq!(wide_pairing_violation(&terminal), None);
+}
+
+#[test]
+fn deleting_half_a_wide_character_takes_the_other_half() {
+    // DCH shifted the surviving continuation half left into the deleted
+    // column, where the next write blanked the character before it.
+    let mut terminal = TerminalState::new(8, 1);
+    terminal.process_input("ab好cd".as_bytes());
+    terminal.process_input(b"\x1b[3G\x1b[1P");
+    assert_eq!(wide_pairing_violation(&terminal), None);
+
+    terminal.process_input("\x1b[3G好".as_bytes());
+    assert_eq!(rendered_row(&terminal, 0), "ab好 d");
+    assert_eq!(wide_pairing_violation(&terminal), None);
+}
+
+#[test]
+fn inserting_inside_a_wide_character_clears_both_halves() {
+    // ICH cannot keep a character whose halves the shift would separate.
+    let mut terminal = TerminalState::new(8, 1);
+    terminal.process_input("a好b".as_bytes());
+    terminal.process_input(b"\x1b[3G\x1b[1@");
+
+    assert!(!terminal.grid[0][1].flags.wide());
+    assert_eq!(rendered_row(&terminal, 0), "a   b");
+    assert_eq!(wide_pairing_violation(&terminal), None);
+}
+
+#[test]
+fn narrowing_past_a_wide_character_clears_its_lead_half() {
+    let mut terminal = TerminalState::new(6, 1);
+    terminal.process_input("a好".as_bytes());
+    assert!(terminal.grid[0][1].flags.wide());
+
+    terminal.on_resize(2, 1);
+
+    assert!(!terminal.grid[0][1].flags.wide());
+    assert_eq!(wide_pairing_violation(&terminal), None);
+}
+
+#[test]
+fn wide_pairing_survives_random_in_place_redraws() {
+    // TUIs redraw a line in place over whatever the row held before, so every
+    // combination of narrow and wide writes, erases, shifts and resizes has to
+    // leave the grid's double-width pairing intact. This sweep is what found
+    // the cases above; keeping it guards the paths that share the repair.
+    const COLS: usize = 10;
+    const ROWS: usize = 3;
+    let cjk = ['的', '好', '起'];
+    let ascii = ["a", "bc", "rep", "x"];
+
+    for seed in 1..3000u64 {
+        let mut rng = seed | 1;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut terminal = TerminalState::new(COLS, ROWS);
+        let mut log = Vec::new();
+        for _ in 0..14 {
+            let op = match next(12) {
+                0 | 1 => cjk[next(3) as usize].to_string(),
+                2 | 3 => ascii[next(4) as usize].to_string(),
+                4 => format!("\x1b[{}G", next(COLS as u64) + 1),
+                5 => format!("\x1b[{}K", next(3)),
+                6 => format!("\x1b[{}X", next(3) + 1),
+                7 => format!("\x1b[{}@", next(3) + 1),
+                8 => format!("\x1b[{}P", next(3) + 1),
+                9 => ["\x1b[4h", "\x1b[4l", "\r\n", "\x1b[H"][next(4) as usize].to_string(),
+                10 => format!("resize:{}x{}", next(6) + 4, next(3) + 1),
+                _ => format!("\x1b[{}C", next(3) + 1),
+            };
+            log.push(op.clone());
+            match op.strip_prefix("resize:") {
+                Some(dims) => {
+                    let (cols, rows) = dims.split_once('x').expect("resize op shape");
+                    terminal.on_resize(cols.parse().expect("cols"), rows.parse().expect("rows"));
+                }
+                None => terminal.process_input(op.as_bytes()),
+            }
+            if let Some(violation) = wide_pairing_violation(&terminal) {
+                panic!("{violation} after {log:?}");
+            }
+        }
+    }
+}

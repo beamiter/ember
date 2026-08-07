@@ -77,6 +77,22 @@ impl TerminalGrid {
         self.cells[start + self.cols - 1] = TerminalCell::default();
     }
 
+    /// Clear a double-width character left holding only its lead half at the
+    /// right edge. The renderer paints `wide()` cells two columns wide, and a
+    /// later shift would carry the half character back into the middle of the
+    /// row, where it hides or overpaints a neighbour. Callers use this after an
+    /// operation that can push a continuation cell off the row: an ICH/IRM
+    /// insert, or a resize that narrows the grid.
+    pub fn clear_dangling_wide_at_row_end(&mut self, row: usize, blank: TerminalCell) {
+        if row >= self.rows || self.cols == 0 {
+            return;
+        }
+        let last = row * self.cols + self.cols - 1;
+        if self.cells[last].flags.wide() {
+            self.cells[last] = blank;
+        }
+    }
+
     /// 是否为空
     #[inline]
     pub fn is_empty(&self) -> bool {

@@ -1166,10 +1166,23 @@ impl super::TerminalState {
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
                     let n = n.min(cols - self.cursor_col);
+                    // A double-width character split by the insertion point
+                    // cannot survive the shift — its halves would end up n
+                    // columns apart — so clear both of them first.
+                    if self
+                        .grid
+                        .get(self.cursor_row, self.cursor_col)
+                        .flags
+                        .wide_continuation()
+                    {
+                        self.clear_cell(self.cursor_row, self.cursor_col);
+                    }
                     for _ in 0..n {
                         self.grid
                             .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell);
                     }
+                    self.grid
+                        .clear_dangling_wide_at_row_end(self.cursor_row, blank_cell);
                     self.mark_row_dirty(self.cursor_row);
                 }
             }
@@ -1180,6 +1193,15 @@ impl super::TerminalState {
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
                     let n = n.min(cols - self.cursor_col);
+                    // Deleting one half of a double-width character has to take
+                    // the other half with it, at both edges of the window: the
+                    // lead left standing to the left, and the continuation that
+                    // the shift would pull in from the right.
+                    self.split_wide_pairs_around(
+                        self.cursor_row,
+                        self.cursor_col,
+                        self.cursor_col + n,
+                    );
                     for _ in 0..n {
                         self.grid
                             .remove_cell_from_row(self.cursor_row, self.cursor_col);

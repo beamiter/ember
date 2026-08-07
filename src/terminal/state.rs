@@ -825,25 +825,16 @@ impl super::TerminalState {
                         .insert_cell_in_row(self.cursor_row, self.cursor_col, blank_cell);
                 }
             }
+            self.grid
+                .clear_dangling_wide_at_row_end(self.cursor_row, blank_cell);
         }
 
-        // If current position has a continuation cell to its left, clear the wide character
-        if self.cursor_col > 0
-            && self
-                .grid
-                .get(self.cursor_row, self.cursor_col)
-                .flags
-                .wide_continuation()
-        {
-            *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell;
-        }
-
-        // If current position has a wide character, clear its continuation cell
-        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide()
-            && self.cursor_col + 1 < cols
-        {
-            *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell;
-        }
+        // Overwriting either half of a double-width character must clear the
+        // other half. `width` covers both the cell written and, for a wide
+        // character, the cell claimed as its own continuation below: landing
+        // that continuation on somebody else's lead orphans *its* continuation
+        // one column further right.
+        self.split_wide_pairs_around(self.cursor_row, self.cursor_col, self.cursor_col + width);
 
         // Write character
         let cell = self.grid.get_mut(self.cursor_row, self.cursor_col);
@@ -914,6 +905,13 @@ impl super::TerminalState {
             flags.set_wide(false);
             flags.set_wide_continuation(false);
             let col = self.cursor_col;
+            // This chunk overwrites a whole span at once, so — exactly as
+            // put_char does per cell — clear the double-width halves it leaves
+            // stranded on either side. Without this, ASCII typed over CJK left
+            // an orphaned continuation cell that the renderer skips (the
+            // character reads as empty background) and that the next write
+            // there blanks its left neighbour to repair.
+            self.split_wide_pairs_around(self.cursor_row, col, col + chunk_len);
             let row = &mut self.grid[self.cursor_row][col..col + chunk_len];
             for (cell, &byte) in row.iter_mut().zip(&bytes[pos..pos + chunk_len]) {
                 cell.character = byte as char;
@@ -1194,6 +1192,30 @@ impl super::TerminalState {
                 '~' => '·',
                 _ => ch,
             },
+        }
+    }
+
+    /// Blank the double-width halves that overwriting `start..end` orphans.
+    ///
+    /// Only the two edges of the span can have a partner outside it: a lead at
+    /// `start - 1` whose continuation is about to go, and a continuation at
+    /// `end` whose lead is about to go. A surviving half breaks what the
+    /// renderer assumes — it skips continuation cells entirely and paints
+    /// `wide()` cells two columns wide — so the orphan would either hide the
+    /// character written into it or overpaint its neighbour, and the next write
+    /// there would blank a good cell while repairing the pair.
+    pub(super) fn split_wide_pairs_around(&mut self, row: usize, start: usize, end: usize) {
+        let cols = self.grid.row_len();
+        if row >= self.grid.rows() || start >= end || start >= cols {
+            return;
+        }
+        let end = end.min(cols);
+        let blank_cell = self.create_blank_cell();
+        if start > 0 && self.grid.get(row, start - 1).flags.wide() {
+            *self.grid.get_mut(row, start - 1) = blank_cell;
+        }
+        if end < cols && self.grid.get(row, end).flags.wide_continuation() {
+            *self.grid.get_mut(row, end) = blank_cell;
         }
     }
 
@@ -3502,6 +3524,13 @@ impl super::TerminalState {
 
         self.grid.resize(rows, cols, blank_cell);
         self.alt_grid.resize(rows, cols, inactive_blank_cell);
+        // Narrowing can cut a double-width character in half at the new right
+        // edge; its lead half cannot stay behind on its own.
+        for row in 0..rows {
+            self.grid.clear_dangling_wide_at_row_end(row, blank_cell);
+            self.alt_grid
+                .clear_dangling_wide_at_row_end(row, inactive_blank_cell);
+        }
         self.kitty_graphics.resize(cols, rows);
 
         // CRITICAL: Sync row_versions size with grid size to prevent dirty mark loss
