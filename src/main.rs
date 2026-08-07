@@ -82,6 +82,14 @@ static NEXT_KITTY_PASTE_IMAGE_ID: AtomicU32 = AtomicU32::new(1);
 #[cfg(test)]
 const KITTY_BASE64_CHUNK_BYTES: usize = 4096;
 
+fn workspace_drag_pointer_cancelled(
+    primary_down: bool,
+    any_released: bool,
+    has_pointer: bool,
+) -> bool {
+    (!primary_down || !has_pointer) && !any_released
+}
+
 /// 设置信号处理器，确保收到SIGINT/SIGTERM时能正常退出
 /// 这允许Drop逻辑执行，从而清理所有jsh子进程
 #[cfg(unix)]
@@ -1907,6 +1915,11 @@ impl TerminalApp {
             last_window_title: String::new(),
             hovered_tab_index: None,
             dragging_tab: None,
+            dragging_tab_session_id: None,
+            tab_drag_pointer_origin: None,
+            tab_drag_hover_session_id: None,
+            tab_drag_hover_started_at: None,
+            tab_drag_origin_active_session_id: None,
             drag_start_pos: None,
             tab_drag_origin: None,
             current_mouse_x: 0.0,
@@ -1942,6 +1955,7 @@ impl TerminalApp {
             pane_status_cache: pane_header::PaneStatusCache::new(),
             git_strip_cache: pane_header::GitStripCache::new(),
             pane_drag: None,
+            tab_bar_drop_rects: Vec::new(),
             help_panel: help::HelpPanel::new(),
             remote_picker: Default::default(),
             config_panel: config_panel::ConfigPanel::new(),
@@ -2405,6 +2419,30 @@ impl TerminalApp {
         // 这里克隆一份作为局部 ctx 供下游使用(Arc 引用计数,几乎零成本)。
         let ctx_owned = root_ui.ctx().clone();
         let ctx = &ctx_owned;
+
+        // Bars register their pane-promotion targets before CentralPanel runs.
+        // They are frame-local geometry and must never survive a resize or a
+        // hidden sidebar. A release outside the viewport may not reach egui,
+        // so lost focus (and a no-button frame without a release edge) must
+        // cancel either gesture just like Escape does.
+        self.tab_bar_drop_rects.clear();
+        let workspace_drag_in_flight =
+            self.dragging_tab_session_id.is_some() || self.pane_drag.is_some();
+        let (escape_pressed, pointer_cancelled, window_focused) = ctx.input(|input| {
+            let released = input.pointer.any_released();
+            (
+                input.key_pressed(egui::Key::Escape),
+                workspace_drag_pointer_cancelled(
+                    input.pointer.primary_down(),
+                    released,
+                    input.pointer.has_pointer(),
+                ),
+                input.viewport().focused.unwrap_or(true),
+            )
+        });
+        if workspace_drag_in_flight && (escape_pressed || pointer_cancelled || !window_focused) {
+            self.clear_workspace_drag();
+        }
 
         let frame = egui::Frame::NONE.inner_margin(0.0);
 
@@ -4137,9 +4175,9 @@ mod tests {
         paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
-        ClipboardRequestGuard, DesktopNotification, PasteOrigin, PrimaryCopyRoute,
-        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
-        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
+        workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification, PasteOrigin,
+        PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES,
+        MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -4148,6 +4186,14 @@ mod tests {
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+
+    #[test]
+    fn pointer_gone_cancels_a_held_workspace_drag_but_release_gets_one_frame_to_commit() {
+        assert!(workspace_drag_pointer_cancelled(true, false, false));
+        assert!(workspace_drag_pointer_cancelled(false, false, true));
+        assert!(!workspace_drag_pointer_cancelled(true, false, true));
+        assert!(!workspace_drag_pointer_cancelled(false, true, false));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -153,7 +153,25 @@ pub struct TerminalApp {
 
     // Tab UI state
     pub hovered_tab_index: Option<usize>,
+    /// Presentation cache for the currently dragged tab. Structural drop
+    /// operations never trust this shifting index; `dragging_tab_session_id`
+    /// is the authoritative payload and is resolved again at drop time.
     pub dragging_tab: Option<usize>,
+    /// Stable identity carried by a tab drag. For a split tab this is its
+    /// focused session; an ordinary tab has exactly this one session.
+    pub dragging_tab_session_id: Option<String>,
+    /// Full pointer origin used for the cross-axis drag threshold. The legacy
+    /// scalar origin below is retained for the top-bar slide animation.
+    pub tab_drag_pointer_origin: Option<egui::Pos2>,
+    /// Stable identity and dwell start for delayed drag-hover tab activation.
+    /// This lets an active source tab expose another page before it is dropped
+    /// into that page, without turning a quick reorder gesture into a switch.
+    pub tab_drag_hover_session_id: Option<String>,
+    pub tab_drag_hover_started_at: Option<std::time::Instant>,
+    /// Stable identity of the tab that was active when a tab drag began.
+    /// Hover activation is only a preview: cancellation, an invalid drop, or
+    /// loss of window focus restores this tab even if indices moved meanwhile.
+    pub tab_drag_origin_active_session_id: Option<String>,
     /// 拖拽起点在拖拽方向上的坐标:顶部栏取 x,侧边栏取 y。两处列表现在可以
     /// 同帧显示,所以必须配合 [`Self::tab_drag_origin`] 才有意义。
     pub drag_start_pos: Option<f32>,
@@ -230,6 +248,11 @@ pub struct TerminalApp {
 
     /// In-flight header drag used to rearrange panes.
     pub pane_drag: Option<PaneDrag>,
+
+    /// Tab-bar regions registered earlier in the current frame. Central pane
+    /// rendering runs after top/sidebar bars and consumes these regions when a
+    /// split-pane header is released over a bar.
+    pub tab_bar_drop_rects: Vec<egui::Rect>,
 
     // Help panel
     pub help_panel: help::HelpPanel,

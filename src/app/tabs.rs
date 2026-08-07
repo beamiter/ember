@@ -5,6 +5,18 @@ use crate::tab_manager::TabFlags;
 use crate::theme::ThemeExt as _;
 use eframe::egui;
 
+const TAB_DRAG_HOVER_ACTIVATE_DELAY: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// Keep the final touch coordinate for the release frame: egui emits
+/// `PointerGone` after touch End, clearing hover/latest position while retaining
+/// `interact_pos` until the pass finishes.
+pub(crate) fn workspace_drag_pointer_pos(
+    interact_pos: Option<egui::Pos2>,
+    hover_pos: Option<egui::Pos2>,
+) -> Option<egui::Pos2> {
+    interact_pos.or(hover_pos)
+}
+
 /// 侧边栏标签列表一行所需的全部信息,渲染前一次性算好。行渲染闭包内不能
 /// 再读 self(它已经被可变借用),所以标题/未读/标记都先落到这里。
 struct SidebarTabInfo {
@@ -39,10 +51,151 @@ impl TerminalApp {
     /// sidebar ever sees the release.
     fn clear_tab_drag(&mut self, origin: TabDragOrigin) {
         if self.tab_drag_origin == Some(origin) {
-            self.dragging_tab = None;
-            self.drag_start_pos = None;
-            self.tab_drag_origin = None;
+            let restore_session_id = self.reset_tab_drag_state();
+            self.restore_tab_drag_origin(restore_session_id);
         }
+    }
+
+    /// Finish a tab-bar interaction that deliberately selected a new tab.
+    /// Unlike cancellation, this discards the hover-preview origin.
+    fn finish_tab_drag(&mut self, origin: TabDragOrigin) {
+        if self.tab_drag_origin == Some(origin) {
+            self.reset_tab_drag_state();
+        }
+    }
+
+    fn reset_tab_drag_state(&mut self) -> Option<String> {
+        let restore_session_id = self.tab_drag_origin_active_session_id.take();
+        self.dragging_tab = None;
+        self.dragging_tab_session_id = None;
+        self.tab_drag_pointer_origin = None;
+        self.tab_drag_hover_session_id = None;
+        self.tab_drag_hover_started_at = None;
+        self.drag_start_pos = None;
+        self.tab_drag_origin = None;
+        restore_session_id
+    }
+
+    fn restore_tab_drag_origin(&mut self, session_id: Option<String>) {
+        let restore_tab = session_id
+            .as_deref()
+            .and_then(|session_id| self.session_manager.index_of(session_id))
+            .and_then(|session_idx| self.tabs.tab_of_session(session_idx));
+        if let Some(tab_idx) = restore_tab {
+            self.activate_tab(tab_idx);
+        }
+    }
+
+    fn active_tab_session_id(&self) -> Option<String> {
+        self.tabs
+            .active_focused_session()
+            .and_then(|session_idx| self.session_manager.sessions().get(session_idx))
+            .map(|session| session.metadata.session_id.clone())
+    }
+
+    pub(crate) fn finish_workspace_drag(&mut self) {
+        self.reset_tab_drag_state();
+        self.pane_drag = None;
+        self.dragging_divider = None;
+    }
+
+    fn begin_tab_drag(&mut self, tab_idx: usize, origin: TabDragOrigin, pointer: egui::Pos2) {
+        let Some(session_id) = self
+            .tab_display_session(tab_idx)
+            .and_then(|session_idx| self.session_manager.sessions().get(session_idx))
+            .map(|session| session.metadata.session_id.clone())
+        else {
+            return;
+        };
+        self.dragging_tab = Some(tab_idx);
+        self.dragging_tab_session_id = Some(session_id);
+        self.tab_drag_pointer_origin = Some(pointer);
+        self.tab_drag_hover_session_id = None;
+        self.tab_drag_hover_started_at = None;
+        self.tab_drag_origin_active_session_id = self.active_tab_session_id();
+        self.drag_start_pos = Some(match origin {
+            TabDragOrigin::TopBar => pointer.x,
+            TabDragOrigin::Sidebar => pointer.y,
+        });
+        self.tab_drag_origin = Some(origin);
+    }
+
+    /// Resolve the authoritative stable drag payload back to the tab that owns
+    /// it now. A shell may exit and shift both vectors mid-drag, so callers must
+    /// never use the cached `dragging_tab` index for a structural operation.
+    pub(crate) fn resolved_dragging_tab(&self) -> Option<(usize, usize)> {
+        let session_idx = self
+            .dragging_tab_session_id
+            .as_deref()
+            .and_then(|session_id| self.session_manager.index_of(session_id))?;
+        let tab_idx = self.tabs.tab_of_session(session_idx)?;
+        Some((tab_idx, session_idx))
+    }
+
+    pub(crate) fn tab_drag_is_active(&self, ctx: &egui::Context) -> bool {
+        let Some(_origin) = self.tab_drag_origin else {
+            return false;
+        };
+        let Some(start) = self.tab_drag_pointer_origin else {
+            return false;
+        };
+        let Some(pos) = ctx.input(|input| {
+            workspace_drag_pointer_pos(input.pointer.interact_pos(), input.pointer.hover_pos())
+        }) else {
+            return false;
+        };
+        self.resolved_dragging_tab().is_some() && (pos - start).length() > 5.0
+    }
+
+    /// A deliberate dwell over another tab exposes that page while retaining
+    /// the source's stable payload. Quick horizontal/vertical passes keep the
+    /// existing reorder gesture and never switch pages.
+    fn update_tab_drag_hover_target(&mut self, target_tab_idx: Option<usize>, ctx: &egui::Context) {
+        let Some((source_tab_idx, _)) = self.resolved_dragging_tab() else {
+            self.tab_drag_hover_session_id = None;
+            self.tab_drag_hover_started_at = None;
+            return;
+        };
+        let eligible_target = target_tab_idx.filter(|target| {
+            *target != source_tab_idx
+                && *target != self.tabs.active_index()
+                && self.tabs.sessions_in(source_tab_idx).len() == 1
+        });
+        let target = eligible_target.and_then(|target_tab_idx| {
+            self.tab_display_session(target_tab_idx)
+                .and_then(|session_idx| self.session_manager.sessions().get(session_idx))
+                .map(|session| (target_tab_idx, session.metadata.session_id.clone()))
+        });
+        let Some((target_tab_idx, target_session_id)) = target else {
+            self.tab_drag_hover_session_id = None;
+            self.tab_drag_hover_started_at = None;
+            return;
+        };
+
+        if self.tab_drag_hover_session_id.as_deref() != Some(&target_session_id) {
+            self.tab_drag_hover_session_id = Some(target_session_id);
+            self.tab_drag_hover_started_at = Some(std::time::Instant::now());
+            ctx.request_repaint_after(TAB_DRAG_HOVER_ACTIVATE_DELAY);
+            return;
+        }
+        let Some(started_at) = self.tab_drag_hover_started_at else {
+            self.tab_drag_hover_started_at = Some(std::time::Instant::now());
+            ctx.request_repaint_after(TAB_DRAG_HOVER_ACTIVATE_DELAY);
+            return;
+        };
+        let elapsed = started_at.elapsed();
+        if elapsed >= TAB_DRAG_HOVER_ACTIVATE_DELAY {
+            self.activate_tab(target_tab_idx);
+        } else {
+            ctx.request_repaint_after(TAB_DRAG_HOVER_ACTIVATE_DELAY - elapsed);
+        }
+    }
+
+    pub(crate) fn clear_workspace_drag(&mut self) {
+        let restore_session_id = self.reset_tab_drag_state();
+        self.pane_drag = None;
+        self.dragging_divider = None;
+        self.restore_tab_drag_origin(restore_session_id);
     }
 
     /// 当前 tab 的窗格布局。所有分屏操作都作用在它上面,因此不会波及其他 tab。
@@ -110,6 +263,9 @@ impl TerminalApp {
         if tab_idx >= self.tabs.len() || self.tabs.len() <= 1 {
             return false;
         }
+        // Structural index changes invalidate every frame-local drag target.
+        // Cancellation also restores any hover-previewed active tab first.
+        self.clear_workspace_drag();
         self.renaming_tab = None;
         let mut owned = self.tabs.sessions_in(tab_idx);
         // 先摘掉 tab,后续每次删除会话就只剩纯粹的索引平移;从大到小删除,
@@ -162,11 +318,15 @@ impl TerminalApp {
     /// 只处理单个会话。若它是所属 tab 的最后一个窗格,请改用
     /// [`Self::close_tab_synced`],否则那个 tab 会留下指向已删除会话的窗格。
     pub fn close_session_synced(&mut self, index: usize) -> bool {
+        if index >= self.session_manager.len() || self.session_manager.len() <= 1 {
+            return false;
+        }
         let removed_session_id = self
             .session_manager
             .sessions()
             .get(index)
             .map(|session| session.metadata.session_id.clone());
+        self.clear_workspace_drag();
         if !self.session_manager.close_session(index) {
             return false;
         }
@@ -280,13 +440,19 @@ impl TerminalApp {
         // tab 栏与本列表同帧存在且共享拖拽字段,所以只认本列表发起的拖拽。
         let ctx = ui.ctx().clone();
         let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let drag_pointer_pos = ctx
+            .input(|i| workspace_drag_pointer_pos(i.pointer.interact_pos(), i.pointer.hover_pos()));
+        // The whole Sessions body is the vertical tab bar: a promoted pane may
+        // land on an existing row or on its blank area below the rows.
+        let sidebar_tab_bar_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         let owns_drag = self.tab_drag_origin == Some(TabDragOrigin::Sidebar);
-        let is_actually_dragging = match (owns_drag, self.dragging_tab, self.drag_start_pos) {
-            (true, Some(_), Some(start_y)) => pointer_pos
-                .map(|p| (p.y - start_y).abs() > 5.0)
-                .unwrap_or(false),
-            _ => false,
-        };
+        let resolved_dragging_tab = owns_drag
+            .then(|| self.resolved_dragging_tab().map(|(tab_idx, _)| tab_idx))
+            .flatten();
+        if owns_drag {
+            self.dragging_tab = resolved_dragging_tab;
+        }
+        let is_actually_dragging = owns_drag && self.tab_drag_is_active(&ctx);
 
         // 收集本帧每行的矩形,渲染后用于命中检测/插入指示线
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(infos.len());
@@ -386,10 +552,13 @@ impl TerminalApp {
 
                                 // 拖拽开始:仅在按下且尚未跟踪时记录起点
                                 if resp.drag_started() {
-                                    self.dragging_tab = Some(*i);
-                                    self.drag_start_pos =
-                                        resp.interact_pointer_pos().or(pointer_pos).map(|p| p.y);
-                                    self.tab_drag_origin = Some(TabDragOrigin::Sidebar);
+                                    if let Some(pointer) = ctx
+                                        .input(|input| input.pointer.press_origin())
+                                        .or_else(|| resp.interact_pointer_pos())
+                                        .or(drag_pointer_pos)
+                                    {
+                                        self.begin_tab_drag(*i, TabDragOrigin::Sidebar, pointer);
+                                    }
                                 }
                                 if resp.double_clicked() {
                                     begin_rename = Some(*i);
@@ -415,81 +584,103 @@ impl TerminalApp {
                 }
             });
 
+        let tab_list_rect = row_rects
+            .iter()
+            .map(|(_, rect)| *rect)
+            .reduce(|combined, rect| combined.union(rect))
+            .map(|rect| rect.intersect(ui.clip_rect()))
+            .filter(|rect| rect.is_positive());
+        if sidebar_tab_bar_rect.is_positive() {
+            self.tab_bar_drop_rects.push(sidebar_tab_bar_rect);
+            let promotable_pane_drag = self
+                .pane_drag
+                .as_ref()
+                .filter(|drag| drag.active)
+                .and_then(|drag| self.session_manager.index_of(&drag.session_id))
+                .and_then(|session_idx| self.tabs.tab_of_session(session_idx))
+                .is_some_and(|tab_idx| self.tabs.sessions_in(tab_idx).len() > 1);
+            if promotable_pane_drag
+                && drag_pointer_pos.is_some_and(|pos| sidebar_tab_bar_rect.contains(pos))
+            {
+                let accent =
+                    crate::theme::Theme::rgb_to_color32(self.renderer.theme.tabbar.active_border);
+                ui.painter().rect_stroke(
+                    sidebar_tab_bar_rect.shrink(1.0),
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(2.0, accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+
+        let hovered_tab_idx = drag_pointer_pos.and_then(|pos| {
+            row_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pos))
+                .map(|(tab_idx, _)| *tab_idx)
+        });
+        if is_actually_dragging {
+            // Hover activation follows the physical row: it is also how a tab
+            // exposes a cross-partition page as a tab-to-split target. Reorder
+            // preview and commit use the separately clamped destination below.
+            self.update_tab_drag_hover_target(hovered_tab_idx, &ctx);
+        }
+        let planned_reorder = is_actually_dragging
+            .then(|| {
+                self.resolved_dragging_tab().and_then(|(from_idx, _)| {
+                    hovered_tab_idx.and_then(|requested_idx| {
+                        self.tabs
+                            .planned_reorder_destination(from_idx, requested_idx)
+                            .map(|to_idx| (from_idx, to_idx))
+                    })
+                })
+            })
+            .flatten();
+
         // 拖拽结束:松开鼠标
         let any_released = ctx.input(|i| i.pointer.any_released());
         if any_released {
-            if is_actually_dragging {
-                if let (Some(from_idx), Some(p)) = (self.dragging_tab, pointer_pos) {
-                    // 找到光标所在行;否则若超出列表,夹到最后一行
-                    let mut target_idx = from_idx;
-                    let mut matched = false;
-                    for (idx, rect) in &row_rects {
-                        if p.y >= rect.top() && p.y < rect.bottom() {
-                            target_idx = *idx;
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if !matched {
-                        if let Some((idx, rect)) = row_rects.last() {
-                            if p.y >= rect.bottom() {
-                                target_idx = *idx;
-                            }
-                        }
-                        if let Some((idx, rect)) = row_rects.first() {
-                            if p.y < rect.top() {
-                                target_idx = *idx;
-                            }
-                        }
-                    }
+            let released_in_list = drag_pointer_pos
+                .zip(tab_list_rect)
+                .is_some_and(|(pos, rect)| rect.contains(pos));
+            if is_actually_dragging && released_in_list {
+                if let Some((from_idx, target_idx)) = planned_reorder {
                     if target_idx != from_idx {
                         reorder = Some((from_idx, target_idx));
                     }
                 }
+                self.clear_tab_drag(TabDragOrigin::Sidebar);
+            } else if !is_actually_dragging {
+                self.clear_tab_drag(TabDragOrigin::Sidebar);
             }
-            self.clear_tab_drag(TabDragOrigin::Sidebar);
         }
 
         // 拖拽过程中绘制插入指示线
         if is_actually_dragging {
-            if let (Some(from_idx), Some(p)) = (self.dragging_tab, pointer_pos) {
+            if let Some((from_idx, target_idx)) = planned_reorder {
                 let accent =
                     crate::theme::Theme::rgb_to_color32(self.renderer.theme.tabbar.active_border);
                 let painter = ui.painter();
-                let mut drawn = false;
-                for (idx, rect) in &row_rects {
-                    if p.y >= rect.top() && p.y < rect.bottom() {
-                        // 按光标在行内的上/下半决定插入到该行上沿还是下沿
-                        let line_y = if p.y - rect.center().y < 0.0 {
+                if target_idx != from_idx {
+                    if let Some((_, rect)) = row_rects.iter().find(|(idx, _)| *idx == target_idx) {
+                        // TabManager inserts at the planned index after removing
+                        // the source. Left/up moves therefore land before the
+                        // target row; right/down moves land after it.
+                        let line_y = if target_idx < from_idx {
                             rect.top()
                         } else {
                             rect.bottom()
                         };
-                        let _ = idx;
                         painter.hline(
                             rect.left()..=rect.right(),
                             line_y,
                             egui::Stroke::new(2.0, accent),
                         );
-                        drawn = true;
-                        break;
                     }
                 }
-                if !drawn {
-                    if let Some((_, rect)) = row_rects.last() {
-                        if p.y >= rect.bottom() {
-                            painter.hline(
-                                rect.left()..=rect.right(),
-                                rect.bottom(),
-                                egui::Stroke::new(2.0, accent),
-                            );
-                        }
-                    }
-                }
-                let _ = from_idx;
-                // 拖拽中持续重绘
-                ctx.request_repaint();
             }
+            // 拖拽中持续重绘
+            ctx.request_repaint();
         }
 
         ui.add_space(4.0);
@@ -797,7 +988,11 @@ impl TerminalApp {
         );
 
         let hover_pos = ctx.input(|i| i.pointer.hover_pos());
-        let mouse_released = ctx.input(|i| i.pointer.any_released());
+        // A release that originated from either workspace drag is consumed by
+        // central rendering; it must not also toggle chrome or close a window.
+        let workspace_drag_in_flight =
+            self.pane_drag.is_some() || self.dragging_tab_session_id.is_some();
+        let mouse_released = ctx.input(|i| i.pointer.any_released()) && !workspace_drag_in_flight;
 
         let toggle_btn_rect = egui::Rect::from_min_size(
             egui::pos2(tab_rect.left() + 5.0, tab_rect.top() + 5.0),
@@ -962,6 +1157,15 @@ impl TerminalApp {
         let ctrl_btn_w: f32 = 28.0;
         let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 4.0;
         let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
+        let tab_clip_rect = egui::Rect::from_min_max(
+            egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
+            egui::pos2(tab_rect.right() - reserved_right, tab_rect.bottom()),
+        );
+        if tab_clip_rect.is_positive() {
+            // Includes the blank strip after the last label, so pane promotion
+            // does not require pixel-perfect aim at an existing tab.
+            self.tab_bar_drop_rects.push(tab_clip_rect);
+        }
 
         let active_idx_for_layout = self.tabs.active_index();
 
@@ -1134,16 +1338,26 @@ impl TerminalApp {
 
         // 检测悬停位置（在绘制之前）
         let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+        let drag_pointer_pos = ctx
+            .input(|i| workspace_drag_pointer_pos(i.pointer.interact_pos(), i.pointer.hover_pos()));
         self.hovered_tab_index = None;
 
         // 更新当前鼠标x位置（用于拖拽动画）
-        if let Some(pos) = hover_pos {
+        if let Some(pos) = drag_pointer_pos {
             self.current_mouse_x = pos.x;
         }
 
         // 检测鼠标释放（点击完成或拖拽结束）
         let mouse_released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         let mouse_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        let owns_drag = self.tab_drag_origin == Some(TabDragOrigin::TopBar);
+        if owns_drag {
+            self.dragging_tab = self.resolved_dragging_tab().map(|(tab_idx, _)| tab_idx);
+        }
+        let any_tab_drag_in_flight = self.dragging_tab_session_id.is_some();
+        let had_top_tab_drag = owns_drag && self.dragging_tab_session_id.is_some();
+        let is_actually_dragging = owns_drag && self.tab_drag_is_active(ctx);
+        let pane_drag_in_flight = self.pane_drag.is_some();
         // 双击 tab 进入重命名:此处只检测,具体哪一个 tab 在循环里命中后处理。
         let mouse_double_clicked = ctx.input(|i| {
             i.pointer
@@ -1207,7 +1421,7 @@ impl TerminalApp {
 
             if sb_hovered {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                if mouse_released {
+                if mouse_released && !any_tab_drag_in_flight && !pane_drag_in_flight {
                     self.sidebar.visible = !self.sidebar.visible;
                     if self.sidebar.visible {
                         if let Some(error) = self.sidebar.refresh() {
@@ -1218,38 +1432,25 @@ impl TerminalApp {
             }
             if pos_hovered {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                if mouse_released {
+                if mouse_released && !any_tab_drag_in_flight && !pane_drag_in_flight {
                     self.toggle_tab_bar_position();
                 }
             }
         }
-
-        // 检查是否发生了实际的拖拽（超过阈值距离）。侧边栏 Sessions 列表
-        // 与本栏共享拖拽字段,所以只认本栏发起的拖拽。
-        let owns_drag = self.tab_drag_origin == Some(TabDragOrigin::TopBar);
-        let is_actually_dragging = match (owns_drag, self.dragging_tab, self.drag_start_pos) {
-            (true, Some(_), Some(start_x)) => {
-                if let Some(current_pos) = ctx.input(|i| i.pointer.latest_pos()) {
-                    let distance = (current_pos.x - start_x).abs();
-                    distance > 5.0 // 5px拖拽阈值
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
 
         // === 交互辅助：用 tab_widths 计算 tab 位置的宏 ===
         // scroll_base: 绝对坐标 x 基准（减去滚动偏移）
         let scroll_base = tab_rect.left() + left_margin - self.tab_scroll_offset;
 
         // 处理拖拽结束或点击
-        if mouse_released {
+        if mouse_released && !pane_drag_in_flight && (owns_drag || !any_tab_drag_in_flight) {
             if is_actually_dragging {
                 // 实际拖拽结束 - 计算drop目标并执行重排
-                if let Some(from_idx) = self.dragging_tab {
-                    if let Some(hover_pos) = hover_pos {
-                        if tab_rect.contains(hover_pos) {
+                let released_in_tab_bar =
+                    drag_pointer_pos.is_some_and(|pos| tab_clip_rect.contains(pos));
+                if released_in_tab_bar {
+                    if let Some((from_idx, _)) = self.resolved_dragging_tab() {
+                        if let Some(hover_pos) = drag_pointer_pos {
                             let mut x_off = scroll_base;
                             let mut target_idx = from_idx;
 
@@ -1261,52 +1462,63 @@ impl TerminalApp {
                                 x_off += tw + tab_spacing;
                             }
 
-                            // 执行重排
+                            // Preview and commit share the pinned-partition
+                            // planner, so release cannot jump to a different
+                            // destination than the insertion indicator.
+                            let target_idx = self
+                                .tabs
+                                .planned_reorder_destination(from_idx, target_idx)
+                                .unwrap_or(from_idx);
                             if target_idx != from_idx {
                                 self.reorder_tabs(from_idx, target_idx);
+                                self.schedule_session_save();
                             }
                         }
                     }
+                    self.clear_tab_drag(TabDragOrigin::TopBar);
                 }
-                self.clear_tab_drag(TabDragOrigin::TopBar);
             } else {
                 // 简单点击（没有发生实际拖拽）
-                if let Some(click_pos) = hover_pos.or_else(|| ctx.input(|i| i.pointer.latest_pos()))
-                {
-                    if tab_rect.contains(click_pos) {
-                        let mut x_off = scroll_base;
-                        for (i, &tw) in tab_widths.iter().enumerate() {
-                            let tab_rect_item = egui::Rect::from_min_size(
-                                egui::pos2(x_off, tab_rect.top() + 5.0),
-                                egui::vec2(tw, tab_height - 10.0),
-                            );
+                let payload_is_valid = !had_top_tab_drag || self.resolved_dragging_tab().is_some();
+                if payload_is_valid {
+                    if let Some(click_pos) =
+                        hover_pos.or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+                    {
+                        if tab_clip_rect.contains(click_pos) {
+                            let mut x_off = scroll_base;
+                            for (i, &tw) in tab_widths.iter().enumerate() {
+                                let tab_rect_item = egui::Rect::from_min_size(
+                                    egui::pos2(x_off, tab_rect.top() + 5.0),
+                                    egui::vec2(tw, tab_height - 10.0),
+                                );
 
-                            let close_btn_rect = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    tab_rect_item.right() - close_btn_size - 3.0,
-                                    tab_rect_item.center().y - close_btn_size / 2.0,
-                                ),
-                                egui::vec2(close_btn_size, close_btn_size),
-                            );
+                                let close_btn_rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        tab_rect_item.right() - close_btn_size - 3.0,
+                                        tab_rect_item.center().y - close_btn_size / 2.0,
+                                    ),
+                                    egui::vec2(close_btn_size, close_btn_size),
+                                );
 
-                            if close_btn_rect.contains(click_pos) {
-                                // 关闭 tab = 关闭它所有的分屏窗格。最后一个 tab
-                                // 没有可回退的目标,等同于关闭窗口。
-                                if self.close_tab_synced(i) {
-                                    self.schedule_session_save();
-                                } else {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                    return true;
+                                if close_btn_rect.contains(click_pos) {
+                                    // 关闭 tab = 关闭它所有的分屏窗格。最后一个 tab
+                                    // 没有可回退的目标,等同于关闭窗口。
+                                    if self.close_tab_synced(i) {
+                                        self.schedule_session_save();
+                                    } else {
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        return true;
+                                    }
+                                    self.finish_tab_drag(TabDragOrigin::TopBar);
+                                    break;
+                                } else if tab_rect_item.contains(click_pos) {
+                                    self.activate_tab(i);
+                                    self.finish_tab_drag(TabDragOrigin::TopBar);
+                                    break;
                                 }
-                                self.clear_tab_drag(TabDragOrigin::TopBar);
-                                break;
-                            } else if tab_rect_item.contains(click_pos) {
-                                self.activate_tab(i);
-                                self.clear_tab_drag(TabDragOrigin::TopBar);
-                                break;
-                            }
 
-                            x_off += tw + tab_spacing;
+                                x_off += tw + tab_spacing;
+                            }
                         }
                     }
                 }
@@ -1318,7 +1530,7 @@ impl TerminalApp {
         // 检测拖拽开始（鼠标按下且移动）
         if mouse_pressed {
             if let Some(press_pos) = ctx.input(|i| i.pointer.press_origin()) {
-                if self.dragging_tab.is_none() {
+                if self.dragging_tab_session_id.is_none() && self.pane_drag.is_none() {
                     let mut x_off = scroll_base;
                     for (i, &tw) in tab_widths.iter().enumerate() {
                         let tab_rect_item = egui::Rect::from_min_size(
@@ -1336,9 +1548,7 @@ impl TerminalApp {
 
                         if tab_rect_item.contains(press_pos) && !close_btn_rect.contains(press_pos)
                         {
-                            self.dragging_tab = Some(i);
-                            self.drag_start_pos = Some(press_pos.x);
-                            self.tab_drag_origin = Some(TabDragOrigin::TopBar);
+                            self.begin_tab_drag(i, TabDragOrigin::TopBar, press_pos);
                             break;
                         }
 
@@ -1349,29 +1559,35 @@ impl TerminalApp {
         }
 
         // 计算拖拽过程中的动画效果
-        let mut drag_target_idx: Option<usize> = None;
+        let mut hovered_tab_idx: Option<usize> = None;
         if is_actually_dragging {
-            if let Some(hover_pos) = hover_pos {
-                if let Some(_from_idx) = self.dragging_tab {
+            if let Some(hover_pos) = drag_pointer_pos {
+                if tab_clip_rect.contains(hover_pos) && self.dragging_tab.is_some() {
                     let mut x_off = scroll_base;
                     for (i, &tw) in tab_widths.iter().enumerate() {
                         if hover_pos.x >= x_off && hover_pos.x < x_off + tw {
-                            drag_target_idx = Some(i);
+                            hovered_tab_idx = Some(i);
                             break;
                         }
                         x_off += tw + tab_spacing;
                     }
                 }
             }
+            // Hover activation follows the physical tab so a cross-partition
+            // page can still become a split target. Only reorder feedback is
+            // clamped to the source's pinned partition.
+            self.update_tab_drag_hover_target(hovered_tab_idx, ctx);
             // 请求持续重绘以显示动画
             ctx.request_repaint();
         }
+        let drag_target_idx = self.dragging_tab.and_then(|from_idx| {
+            hovered_tab_idx.and_then(|requested_idx| {
+                self.tabs
+                    .planned_reorder_destination(from_idx, requested_idx)
+            })
+        });
 
         // === 渲染 Tab 栏（使用 clip rect 裁剪溢出内容）===
-        let tab_clip_rect = egui::Rect::from_min_max(
-            egui::pos2(tab_rect.left() + left_margin, tab_rect.top()),
-            egui::pos2(tab_rect.right() - reserved_right, tab_rect.bottom()),
-        );
         let clipped_painter = painter.with_clip_rect(tab_clip_rect);
 
         let mut x_offset = scroll_base;
@@ -1389,7 +1605,7 @@ impl TerminalApp {
 
             let is_active = i == active_idx;
             let is_dragging = self.dragging_tab == Some(i);
-            let is_drag_target = drag_target_idx == Some(i);
+            let is_drag_target = drag_target_idx == Some(i) && self.dragging_tab != Some(i);
 
             // 计算拖拽过程中的位移：被拖拽 tab 跟随鼠标；其余 tab 缓动让位
             let push_id = egui::Id::new(("tab_push", i));
@@ -1404,15 +1620,13 @@ impl TerminalApp {
                 // 计算让位目标偏移，再缓动到该位置
                 let mut push_target = 0.0;
                 if is_actually_dragging {
-                    if let Some(from_idx) = self.dragging_tab {
-                        let drag_to_left = is_drag_target
-                            && drag_target_idx.map(|t| t < from_idx).unwrap_or(false);
-                        let drag_to_right = is_drag_target
-                            && drag_target_idx.map(|t| t > from_idx).unwrap_or(false);
-                        if drag_to_left && i > from_idx {
-                            push_target = tab_width + tab_spacing;
-                        } else if drag_to_right && i < from_idx {
-                            push_target = -(tab_width + tab_spacing);
+                    if let (Some(from_idx), Some(target_idx)) = (self.dragging_tab, drag_target_idx)
+                    {
+                        let source_width = tab_widths.get(from_idx).copied().unwrap_or(0.0);
+                        if target_idx < from_idx && i >= target_idx && i < from_idx {
+                            push_target = source_width + tab_spacing;
+                        } else if target_idx > from_idx && i > from_idx && i <= target_idx {
+                            push_target = -(source_width + tab_spacing);
                         }
                     }
                 }
@@ -1479,7 +1693,10 @@ impl TerminalApp {
 
                 // 拖拽过程中，在目标Tab位置显示插入指示线
                 if is_drag_target && is_actually_dragging {
-                    let insert_line_x = if self.current_mouse_x - tab_rect_item.center().x < 0.0 {
+                    let insert_line_x = if drag_target_idx
+                        .zip(self.dragging_tab)
+                        .is_some_and(|(target_idx, from_idx)| target_idx < from_idx)
+                    {
                         tab_rect_item.left()
                     } else {
                         tab_rect_item.right()
@@ -1618,6 +1835,23 @@ impl TerminalApp {
             clipped_painter.rect_filled(indicator, 1.5, tb_accent);
         }
 
+        let promotable_pane_drag = self
+            .pane_drag
+            .as_ref()
+            .filter(|drag| drag.active)
+            .and_then(|drag| self.session_manager.index_of(&drag.session_id))
+            .and_then(|session_idx| self.tabs.tab_of_session(session_idx))
+            .is_some_and(|tab_idx| self.tabs.sessions_in(tab_idx).len() > 1);
+        if promotable_pane_drag && drag_pointer_pos.is_some_and(|pos| tab_clip_rect.contains(pos)) {
+            painter.rect_filled(tab_clip_rect, 0.0, tb_accent.gamma_multiply(0.08));
+            painter.rect_stroke(
+                tab_clip_rect.shrink(1.0),
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(2.0, tb_accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+
         // "+" 按钮 - 新建会话（紧跟最后一个 Tab，但不超过 clip 区域）
         let plus_btn_x = x_offset
             .max(tab_rect.left() + left_margin)
@@ -1657,7 +1891,11 @@ impl TerminalApp {
         );
 
         // 检测 "+" 按钮点击（在鼠标释放时）
-        if mouse_released {
+        if mouse_released
+            && !is_actually_dragging
+            && !any_tab_drag_in_flight
+            && !pane_drag_in_flight
+        {
             if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
                 if plus_btn_rect.contains(click_pos) {
                     self.new_tab();
@@ -1713,7 +1951,11 @@ impl TerminalApp {
         );
 
         // 检测关闭窗口按钮点击
-        if mouse_released {
+        if mouse_released
+            && !is_actually_dragging
+            && !any_tab_drag_in_flight
+            && !pane_drag_in_flight
+        {
             if let Some(click_pos) = ctx.input(|i| i.pointer.latest_pos()) {
                 if close_win_rect.contains(click_pos) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1788,5 +2030,30 @@ impl TerminalApp {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_drag_pointer_pos;
+    use eframe::egui;
+
+    #[test]
+    fn workspace_drag_keeps_the_touch_end_position_after_pointer_gone() {
+        let release_pos = egui::pos2(12.0, 34.0);
+        let hover_pos = egui::pos2(56.0, 78.0);
+
+        assert_eq!(
+            workspace_drag_pointer_pos(Some(release_pos), None),
+            Some(release_pos)
+        );
+        assert_eq!(
+            workspace_drag_pointer_pos(None, Some(hover_pos)),
+            Some(hover_pos)
+        );
+        assert_eq!(
+            workspace_drag_pointer_pos(Some(release_pos), Some(hover_pos)),
+            Some(release_pos)
+        );
     }
 }

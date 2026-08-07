@@ -252,15 +252,22 @@ impl TerminalApp {
                         ui.id().with(("pane-header", pane.session_idx)),
                         egui::Sense::click_and_drag(),
                     )
-                    .on_hover_text("Drag onto another pane to swap them");
+                    .on_hover_text(
+                        "Drag onto another pane to swap · drag to the tab bar to make a tab",
+                    );
                 Some((pane.session_idx, response))
             })
             .collect();
 
-        let pointer_pos = ctx.input(|input| input.pointer.latest_pos());
+        let pointer_pos = ctx.input(|input| {
+            super::tabs::workspace_drag_pointer_pos(
+                input.pointer.interact_pos(),
+                input.pointer.hover_pos(),
+            )
+        });
 
         if interaction_enabled {
-            if self.pane_drag.is_none() {
+            if self.pane_drag.is_none() && self.dragging_tab_session_id.is_none() {
                 if let Some((session_idx, origin)) = handles.iter().find_map(|(idx, response)| {
                     response
                         .drag_started()
@@ -297,6 +304,16 @@ impl TerminalApp {
             pointer_pos
                 .and_then(|pos| self.layout().session_at(pos))
                 .filter(|target| *target != source)
+        });
+        let tab_bar_drop_target = drag_source.filter(|source| {
+            self.tabs
+                .tab_of_session(*source)
+                .is_some_and(|tab_idx| self.tabs.sessions_in(tab_idx).len() > 1)
+                && pointer_pos.is_some_and(|pos| {
+                    self.tab_bar_drop_rects
+                        .iter()
+                        .any(|rect| rect.contains(pos))
+                })
         });
 
         if drag_source.is_some() {
@@ -342,7 +359,16 @@ impl TerminalApp {
         // Resolve the gesture only after painting, so the swap's new geometry
         // is drawn by the next frame rather than half-applied to this one.
         if self.pane_drag.is_some() && ctx.input(|input| input.pointer.any_released()) {
-            if let (Some(source), Some(target)) = (drag_source, drop_target) {
+            if let Some(source) = tab_bar_drop_target {
+                if self.tabs.promote_split_pane_to_tab(source) {
+                    self.renaming_tab = None;
+                    self.sync_active_session_to_focused_pane();
+                    self.force_resize_session = true;
+                    self.schedule_session_save();
+                    self.set_status("Moved pane to a new tab");
+                    ctx.request_repaint();
+                }
+            } else if let (Some(source), Some(target)) = (drag_source, drop_target) {
                 if self.layout_mut().swap_sessions(source, target) {
                     self.sync_active_session_to_focused_pane();
                     self.schedule_session_save();
@@ -354,9 +380,142 @@ impl TerminalApp {
         }
     }
 
+    /// Paint and consume the tab-to-pane half of workspace drag/drop. The
+    /// source is re-resolved from its stable session ID on every frame; target
+    /// indices come from the current active layout, so background session exits
+    /// cannot redirect a drop to a different PTY.
+    fn render_tab_to_pane_drop_zones(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_targets: &[(usize, egui::Rect)],
+        interaction_enabled: bool,
+    ) {
+        if self.dragging_tab_session_id.is_none() {
+            return;
+        }
+
+        let released = ctx.input(|input| input.pointer.any_released());
+        let active = interaction_enabled && self.tab_drag_is_active(ctx);
+        let source = active
+            .then(|| self.resolved_dragging_tab())
+            .flatten()
+            .filter(|(source_tab_idx, source_session_idx)| {
+                self.tabs.sessions_in(*source_tab_idx) == vec![*source_session_idx]
+                    && *source_tab_idx != self.tabs.active_index()
+            });
+        let pointer_pos = ctx.input(|input| {
+            super::tabs::workspace_drag_pointer_pos(
+                input.pointer.interact_pos(),
+                input.pointer.hover_pos(),
+            )
+        });
+        let hovered_target = source.and_then(|_| {
+            pointer_pos.and_then(|pos| {
+                pane_targets
+                    .iter()
+                    .find(|(_, rect)| rect.contains(pos))
+                    .copied()
+            })
+        });
+        let minimum_pane_size = self.renderer.minimum_split_pane_size();
+        let selected_drop = hovered_target.and_then(|(target_session_idx, target_rect)| {
+            let direction = pointer_pos.and_then(|pos| layout::pane_drop_zone(target_rect, pos))?;
+            self.layout()
+                .can_split_session_pane(
+                    target_session_idx,
+                    direction.horizontal(),
+                    minimum_pane_size,
+                )
+                .then_some((target_session_idx, direction))
+        });
+
+        if let Some((target_session_idx, target_rect)) = hovered_target {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            let accent =
+                crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border);
+            let painter = ui.painter();
+            for (direction, arrow) in [
+                (layout::PaneDropDirection::Left, "←"),
+                (layout::PaneDropDirection::Right, "→"),
+                (layout::PaneDropDirection::Top, "↑"),
+                (layout::PaneDropDirection::Bottom, "↓"),
+            ] {
+                let valid = self.layout().can_split_session_pane(
+                    target_session_idx,
+                    direction.horizontal(),
+                    minimum_pane_size,
+                );
+                let Some(zone) = layout::pane_drop_zone_rect(target_rect, direction) else {
+                    continue;
+                };
+                let selected = selected_drop == Some((target_session_idx, direction));
+                painter.rect_filled(
+                    zone.shrink(2.0),
+                    egui::CornerRadius::same(4),
+                    accent.gamma_multiply(if selected {
+                        0.32
+                    } else if valid {
+                        0.10
+                    } else {
+                        0.03
+                    }),
+                );
+                painter.rect_stroke(
+                    zone.shrink(2.0),
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(
+                        if selected { 2.0 } else { 1.0 },
+                        accent.gamma_multiply(if valid { 0.9 } else { 0.25 }),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    zone.center(),
+                    egui::Align2::CENTER_CENTER,
+                    arrow,
+                    egui::FontId::proportional(18.0),
+                    accent.gamma_multiply(if valid { 1.0 } else { 0.3 }),
+                );
+            }
+            ctx.request_repaint();
+        }
+
+        // CentralPanel is rendered after both tab bars, so it is the final
+        // consumer for a tab release outside the reorder strips. Success or
+        // failure, release is one-shot and an invalid/self drop is a no-op.
+        if released {
+            let mut moved = false;
+            if let (Some((_, source_session_idx)), Some((target_session_idx, direction))) =
+                (source, selected_drop)
+            {
+                if self.tabs.move_single_pane_tab_to_split(
+                    source_session_idx,
+                    target_session_idx,
+                    direction,
+                ) {
+                    self.renaming_tab = None;
+                    self.sync_active_session_to_focused_pane();
+                    self.force_resize_session = true;
+                    self.schedule_session_save();
+                    self.set_status("Moved tab into a split pane");
+                    ctx.request_repaint();
+                    moved = true;
+                }
+            }
+            if moved {
+                self.finish_workspace_drag();
+            } else {
+                self.clear_workspace_drag();
+            }
+        }
+    }
+
     pub fn render_terminal_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let interaction_enabled = !self.terminal_input_blocked(ctx);
-        if !interaction_enabled {
+        let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
+        let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
+        if !terminal_interaction_enabled {
             self.dragging_divider = None;
         }
         // 终端显示区域
@@ -366,6 +525,21 @@ impl TerminalApp {
         // so split commands can validate the resulting child sizes before
         // creating another shell session.
         self.layout_mut().compute_pane_rects(available_rect);
+        let pane_drop_targets: Vec<(usize, egui::Rect)> = {
+            let panes = self.layout().panes();
+            let multi_pane = panes.len() > 1;
+            panes
+                .iter()
+                .map(|pane| {
+                    let content_rect = if multi_pane {
+                        crate::pane_header::split_header(pane.rect).1
+                    } else {
+                        pane.rect
+                    };
+                    (pane.session_idx, content_rect)
+                })
+                .collect()
+        };
         self.ensure_pane_renderer_capacity(ctx);
         let (cols, rows) = self.renderer.grid_dimensions(ui.available_size());
         crate::debug_log!("[RESIZE] grid_dimensions => {}x{}", cols, rows);
@@ -476,8 +650,8 @@ impl TerminalApp {
                     renderer.render_in_rect(
                         ui,
                         &mut terminal_guard,
-                        interaction_enabled,
-                        interaction_enabled && pane.focused,
+                        terminal_interaction_enabled,
+                        terminal_interaction_enabled && pane.focused,
                         pane_cursor_visible,
                         pane_search,
                         &links,
@@ -582,7 +756,7 @@ impl TerminalApp {
 
             // 双击恢复 50/50；普通按下则锁定最深层分隔线，拖出命中区域后
             // 仍继续调整同一个 split。
-            let double_clicked_divider = interaction_enabled.then(|| {
+            let double_clicked_divider = terminal_interaction_enabled.then(|| {
                 divider_interactions
                     .iter()
                     .find(|(_, response)| response.double_clicked_by(egui::PointerButton::Primary))
@@ -595,14 +769,14 @@ impl TerminalApp {
                 self.dragging_divider = None;
                 self.set_status("Reset split to 50/50");
                 ctx.request_repaint();
-            } else if interaction_enabled && self.dragging_divider.is_none() {
+            } else if terminal_interaction_enabled && self.dragging_divider.is_none() {
                 self.dragging_divider = divider_interactions
                     .iter()
                     .find(|(_, response)| response.is_pointer_button_down_on())
                     .map(|(divider, _)| divider.id.clone());
             }
 
-            if interaction_enabled {
+            if terminal_interaction_enabled {
                 if let Some(split_id) = self.dragging_divider.clone() {
                     // The layout resolves the divider's own node rectangle and
                     // snaps near even pair splits.
@@ -619,7 +793,7 @@ impl TerminalApp {
 
             // 点击某个窗格 → 切换输入焦点到该窗格(忽略落在分隔线上的点击,
             // 那是用于拖拽调整比例的)。
-            if interaction_enabled
+            if terminal_interaction_enabled
                 && self.dragging_divider.is_none()
                 && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
             {
@@ -665,7 +839,7 @@ impl TerminalApp {
                 self.renderer.render(
                     ui,
                     &mut terminal_guard,
-                    interaction_enabled,
+                    terminal_interaction_enabled,
                     self.cursor_visible,
                     &self.search_state,
                     &self.cached_links,
@@ -677,6 +851,8 @@ impl TerminalApp {
                 }
             }
         }
+
+        self.render_tab_to_pane_drop_zones(ui, ctx, &pane_drop_targets, interaction_enabled);
 
         if let Some((session_id, click)) = pending_block_click {
             match click {

@@ -277,8 +277,37 @@ impl TabManager {
         true
     }
 
-    pub fn reorder(&mut self, from_idx: usize, to_idx: usize) {
-        if from_idx == to_idx || from_idx >= self.tabs.len() || to_idx >= self.tabs.len() {
+    /// Resolve a requested drag destination without mutating the tab list.
+    ///
+    /// `requested_idx` is the tab under the pointer in the current list; the
+    /// returned index is where the source will live after removal and insertion.
+    /// Pinned tabs form a leading partition. Both drag previews and commits use
+    /// this planner so the UI never advertises a destination that persistence
+    /// would normalize away on the next launch.
+    pub fn planned_reorder_destination(
+        &self,
+        from_idx: usize,
+        requested_idx: usize,
+    ) -> Option<usize> {
+        if from_idx >= self.tabs.len() || requested_idx >= self.tabs.len() {
+            return None;
+        }
+        // Pinned tabs form a leading partition. A drag may reorder within its
+        // own partition, but cannot persist an interleaved order that restore
+        // would immediately normalize on the next launch.
+        let pinned_count = self.tabs.iter().filter(|tab| tab.flags.pinned).count();
+        Some(if self.tabs[from_idx].flags.pinned {
+            requested_idx.min(pinned_count.saturating_sub(1))
+        } else {
+            requested_idx.max(pinned_count)
+        })
+    }
+
+    pub fn reorder(&mut self, from_idx: usize, requested_idx: usize) {
+        let Some(to_idx) = self.planned_reorder_destination(from_idx, requested_idx) else {
+            return;
+        };
+        if from_idx == to_idx {
             return;
         }
         let tab = self.tabs.remove(from_idx);
@@ -289,6 +318,103 @@ impl TabManager {
             a if to_idx < from_idx && a >= to_idx && a < from_idx => a + 1,
             a => a,
         };
+    }
+
+    /// Move a single-pane tab into a target pane as a directional split.
+    ///
+    /// Only layout leaves move: the `SessionManager` entry (and therefore the
+    /// live PTY) is neither removed nor cloned. Validation precedes mutation, so
+    /// self drops, split-tab sources, missing sessions, and duplicate ownership
+    /// are exact no-ops. The moved session receives focus in the target tab.
+    pub fn move_single_pane_tab_to_split(
+        &mut self,
+        source_session_idx: usize,
+        target_session_idx: usize,
+        direction: crate::layout::PaneDropDirection,
+    ) -> bool {
+        if source_session_idx == target_session_idx {
+            return false;
+        }
+        let source_claims = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.session_indices())
+            .filter(|session_idx| *session_idx == source_session_idx)
+            .count();
+        let target_claims = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.session_indices())
+            .filter(|session_idx| *session_idx == target_session_idx)
+            .count();
+        if source_claims != 1 || target_claims != 1 {
+            return false;
+        }
+        let Some(source_tab_idx) = self.tab_of_session(source_session_idx) else {
+            return false;
+        };
+        let Some(target_tab_idx) = self.tab_of_session(target_session_idx) else {
+            return false;
+        };
+        if source_tab_idx == target_tab_idx
+            || self.tabs[source_tab_idx].layout.pane_count() != 1
+            || self.tabs[source_tab_idx].layout.focused_session_idx() != Some(source_session_idx)
+        {
+            return false;
+        }
+        if self.tabs[target_tab_idx]
+            .layout
+            .split_session_at(target_session_idx, source_session_idx, direction)
+            .is_err()
+        {
+            return false;
+        }
+
+        // The source had exactly one leaf and the target has already adopted
+        // it, so removing the now-redundant tab cannot drop a session or PTY.
+        self.tabs.remove(source_tab_idx);
+        let target_tab_idx = if source_tab_idx < target_tab_idx {
+            target_tab_idx - 1
+        } else {
+            target_tab_idx
+        };
+        self.active = target_tab_idx;
+        true
+    }
+
+    /// Promote one pane from a split layout into its own ordinary tab. The
+    /// source layout must retain at least one sibling; a single-pane/self drop
+    /// is therefore a no-op. The promoted session becomes the active tab.
+    pub fn promote_split_pane_to_tab(&mut self, session_idx: usize) -> bool {
+        if self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.session_indices())
+            .filter(|candidate| *candidate == session_idx)
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let Some(source_tab_idx) = self.tab_of_session(session_idx) else {
+            return false;
+        };
+        if self.tabs[source_tab_idx].layout.pane_count() <= 1
+            || !self.tabs[source_tab_idx]
+                .layout
+                .remove_session_leaf(session_idx)
+        {
+            return false;
+        }
+
+        let inserted_at = (source_tab_idx + 1).min(self.tabs.len());
+        self.tabs
+            .insert(inserted_at, Tab::new(LayoutManager::new(session_idx)));
+        self.active = inserted_at;
+        // A promoted tab starts unpinned. Keep the existing invariant that all
+        // pinned tabs lead while preserving `active` by identity.
+        self.reorder_pinned_first();
+        true
     }
 
     /// 新会话插入全局列表后，所有 tab 里 >= 插入点的索引整体右移。
@@ -418,6 +544,79 @@ mod tests {
         // Session 4 was the only survivor above the closed tab, and it slid
         // down to index 1 as the three sessions below it went away.
         assert_eq!(tabs.sessions_in(1), vec![1]);
+    }
+
+    #[test]
+    fn a_single_pane_tab_moves_into_a_directional_split_without_losing_a_session() {
+        let mut tabs = TabManager::new(0); // source tab
+        tabs.insert_tab_after_active(1); // visible target tab
+
+        assert!(tabs.move_single_pane_tab_to_split(0, 1, crate::layout::PaneDropDirection::Left,));
+
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs.sessions_in(0), vec![0, 1]);
+        assert_eq!(tabs.active_index(), 0);
+        assert_eq!(tabs.active_focused_session(), Some(0));
+        assert_eq!(tabs.tab_of_session(0), Some(0));
+        assert_eq!(tabs.tab_of_session(1), Some(0));
+    }
+
+    #[test]
+    fn split_pane_promotion_preserves_every_leaf_and_focuses_the_new_tab() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        split_active(&mut tabs, 2); // tab 1: [1, 2]
+
+        assert!(tabs.promote_split_pane_to_tab(1));
+
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        assert_eq!(tabs.sessions_in(1), vec![2]);
+        assert_eq!(tabs.sessions_in(2), vec![1]);
+        assert_eq!(tabs.active_index(), 2);
+        assert_eq!(tabs.active_focused_session(), Some(1));
+        let mut all: Vec<_> = (0..tabs.len())
+            .flat_map(|tab_idx| tabs.sessions_in(tab_idx))
+            .collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn invalid_or_self_workspace_moves_are_no_ops() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        split_active(&mut tabs, 2);
+
+        assert!(!tabs.move_single_pane_tab_to_split(1, 0, crate::layout::PaneDropDirection::Right,));
+        assert!(!tabs.move_single_pane_tab_to_split(
+            0,
+            0,
+            crate::layout::PaneDropDirection::Bottom,
+        ));
+        assert!(!tabs.promote_split_pane_to_tab(0));
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        assert_eq!(tabs.sessions_in(1), vec![1, 2]);
+    }
+
+    #[test]
+    fn duplicate_session_ownership_fails_closed_before_workspace_mutation() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        // Build a deliberately hostile in-memory state that sanitized snapshots
+        // cannot produce: session 0 is claimed by both tabs.
+        split_active(&mut tabs, 0);
+        let before: Vec<_> = (0..tabs.len()).map(|idx| tabs.sessions_in(idx)).collect();
+
+        assert!(!tabs.move_single_pane_tab_to_split(0, 1, crate::layout::PaneDropDirection::Left,));
+        assert!(!tabs.promote_split_pane_to_tab(0));
+        assert_eq!(
+            (0..tabs.len())
+                .map(|idx| tabs.sessions_in(idx))
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     mod restore {
@@ -627,12 +826,89 @@ mod tests {
         tabs.insert_tab_after_active(1);
         tabs.insert_tab_after_active(2);
         assert_eq!(tabs.active_index(), 2);
+        assert_eq!(tabs.planned_reorder_destination(2, 0), Some(0));
+        assert_eq!(tabs.planned_reorder_destination(3, 0), None);
+        assert_eq!(tabs.planned_reorder_destination(0, 3), None);
 
         tabs.reorder(2, 0);
         assert_eq!(tabs.active_index(), 0);
         assert_eq!(tabs.sessions_in(0), vec![2]);
         assert_eq!(tabs.sessions_in(1), vec![0]);
         assert_eq!(tabs.sessions_in(2), vec![1]);
+    }
+
+    #[test]
+    fn pinned_reorder_preview_matches_the_clamped_commit() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        tabs.insert_tab_after_active(3);
+        assert!(tabs.toggle_pinned(1));
+        assert!(tabs.toggle_pinned(2));
+        assert_eq!(tabs.sessions_in(0), vec![1]);
+        assert_eq!(tabs.sessions_in(1), vec![2]);
+
+        let source_session = tabs.sessions_in(0)[0];
+        let preview_destination = tabs.planned_reorder_destination(0, 3);
+        assert_eq!(preview_destination, Some(1));
+        tabs.reorder(0, 3);
+
+        assert_eq!(tabs.tab_of_session(source_session), preview_destination);
+        assert_eq!(tabs.sessions_in(0), vec![2]);
+        assert_eq!(tabs.sessions_in(1), vec![1]);
+        assert!(tabs.flags(0).pinned);
+        assert!(tabs.flags(1).pinned);
+        assert!(!tabs.flags(2).pinned);
+        assert!(!tabs.flags(3).pinned);
+        assert_eq!(tabs.active_focused_session(), Some(3));
+        assert_eq!(tabs.planned_reorder_destination(1, 3), Some(1));
+    }
+
+    #[test]
+    fn unpinned_reorder_preview_matches_the_clamped_commit() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        tabs.insert_tab_after_active(3);
+        assert!(tabs.toggle_pinned(0));
+        assert!(tabs.toggle_pinned(1));
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        assert_eq!(tabs.sessions_in(1), vec![1]);
+
+        let source_session = tabs.sessions_in(3)[0];
+        let preview_destination = tabs.planned_reorder_destination(3, 0);
+        assert_eq!(preview_destination, Some(2));
+        tabs.reorder(3, 0);
+
+        assert_eq!(tabs.tab_of_session(source_session), preview_destination);
+        assert_eq!(tabs.sessions_in(0), vec![0]);
+        assert_eq!(tabs.sessions_in(1), vec![1]);
+        assert_eq!(tabs.sessions_in(2), vec![3]);
+        assert_eq!(tabs.sessions_in(3), vec![2]);
+        assert!(tabs.flags(0).pinned);
+        assert!(tabs.flags(1).pinned);
+        assert!(!tabs.flags(2).pinned);
+        assert!(!tabs.flags(3).pinned);
+        assert_eq!(tabs.active_focused_session(), Some(3));
+        assert_eq!(tabs.planned_reorder_destination(2, 0), Some(2));
+    }
+
+    #[test]
+    fn hover_preview_origin_can_be_restored_after_indices_move() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        tabs.set_active(0);
+        let origin_session_idx = tabs.active_focused_session().unwrap();
+
+        // Model a delayed hover preview, followed by an unrelated reorder.
+        tabs.set_active(2);
+        tabs.reorder(0, 2);
+        assert_eq!(tabs.active_focused_session(), Some(2));
+
+        let restored_tab = tabs.tab_of_session(origin_session_idx).unwrap();
+        tabs.set_active(restored_tab);
+        assert_eq!(tabs.active_focused_session(), Some(0));
     }
 
     #[test]

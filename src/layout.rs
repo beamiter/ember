@@ -21,6 +21,93 @@ pub use jterm_core::pane_layout::{Axis as SplitAxis, DividerId, PaneDirection as
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub usize);
 
+/// Directional edge of a target pane selected by a tab-to-content drop.
+/// Left/right create a side-by-side split; top/bottom create a stacked split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneDropDirection {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl PaneDropDirection {
+    fn axis(self) -> SplitAxis {
+        match self {
+            Self::Left | Self::Right => SplitAxis::Vertical,
+            Self::Top | Self::Bottom => SplitAxis::Horizontal,
+        }
+    }
+
+    fn inserts_before(self) -> bool {
+        matches!(self, Self::Left | Self::Top)
+    }
+
+    pub fn horizontal(self) -> bool {
+        self.axis() == SplitAxis::Horizontal
+    }
+}
+
+/// Resolve the directional drop zone at `pos`. The outer quarter of each pane
+/// is actionable; the center is deliberately inert so a cancelled or imprecise
+/// drag cannot restructure the layout. Corners belong to left/right, producing
+/// stable, non-overlapping hit regions.
+pub fn pane_drop_zone(rect: Rect, pos: egui::Pos2) -> Option<PaneDropDirection> {
+    if !rect.contains(pos)
+        || !rect.width().is_finite()
+        || !rect.height().is_finite()
+        || rect.width() <= 0.0
+        || rect.height() <= 0.0
+    {
+        return None;
+    }
+    let x_band = rect.width() * 0.25;
+    let y_band = rect.height() * 0.25;
+    if pos.x <= rect.left() + x_band {
+        Some(PaneDropDirection::Left)
+    } else if pos.x >= rect.right() - x_band {
+        Some(PaneDropDirection::Right)
+    } else if pos.y <= rect.top() + y_band {
+        Some(PaneDropDirection::Top)
+    } else if pos.y >= rect.bottom() - y_band {
+        Some(PaneDropDirection::Bottom)
+    } else {
+        None
+    }
+}
+
+/// Rectangle painted for one directional drop zone. This is kept beside the
+/// hit-test so visuals and behavior cannot drift apart.
+pub fn pane_drop_zone_rect(rect: Rect, direction: PaneDropDirection) -> Option<Rect> {
+    if !rect.width().is_finite()
+        || !rect.height().is_finite()
+        || rect.width() <= 0.0
+        || rect.height() <= 0.0
+    {
+        return None;
+    }
+    let x_band = rect.width() * 0.25;
+    let y_band = rect.height() * 0.25;
+    Some(match direction {
+        PaneDropDirection::Left => Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.left() + x_band, rect.bottom()),
+        ),
+        PaneDropDirection::Right => Rect::from_min_max(
+            egui::pos2(rect.right() - x_band, rect.top()),
+            rect.right_bottom(),
+        ),
+        PaneDropDirection::Top => Rect::from_min_max(
+            egui::pos2(rect.left() + x_band, rect.top()),
+            egui::pos2(rect.right() - x_band, rect.top() + y_band),
+        ),
+        PaneDropDirection::Bottom => Rect::from_min_max(
+            egui::pos2(rect.left() + x_band, rect.bottom() - y_band),
+            egui::pos2(rect.right() - x_band, rect.bottom()),
+        ),
+    })
+}
+
 /// 可交互分隔线及它所属的分割节点区域。`container_rect` 是分割节点自己
 /// 的矩形，拖动时把指针位置换算成该节点内的比例。
 #[derive(Debug, Clone, PartialEq)]
@@ -287,25 +374,51 @@ impl LayoutManager {
     /// tmux 语义：焦点窗格的父分割已经是同一轴向时，新窗格作为兄弟平级
     /// 加入，而不是再嵌套一层。
     pub fn split(&mut self, session_idx: usize, horizontal: bool) -> Result<(), String> {
-        if !self.can_split() {
-            return Err("No focused pane to split".to_string());
+        let direction = if horizontal {
+            PaneDropDirection::Bottom
+        } else {
+            PaneDropDirection::Right
+        };
+        self.split_session_at(self.focused_pane_id.0, session_idx, direction)
+    }
+
+    /// Insert an existing session beside a specific target leaf. This is the
+    /// topology-only half of tab-to-pane drag/drop: session/PTY ownership stays
+    /// in `SessionManager`, while this tree adopts exactly one leaf and focuses
+    /// it. Invalid/self/duplicate requests leave the layout unchanged.
+    pub fn split_session_at(
+        &mut self,
+        target_session_idx: usize,
+        new_session_idx: usize,
+        direction: PaneDropDirection,
+    ) -> Result<(), String> {
+        if target_session_idx == new_session_idx {
+            return Err("Cannot split a session onto itself".to_string());
         }
-        if self.tree.contains_session(session_idx) {
+        if !self.tree.contains_session(target_session_idx) {
+            return Err("Target pane is missing from the layout".to_string());
+        }
+        if self.tree.contains_session(new_session_idx) {
             return Err("Session is already visible in a pane".to_string());
         }
-
-        let axis = if horizontal {
-            SplitAxis::Horizontal
-        } else {
-            SplitAxis::Vertical
-        };
         if !self
             .tree
-            .split_leaf(self.focused_pane_id.0, axis, session_idx)
+            .split_leaf(target_session_idx, direction.axis(), new_session_idx)
         {
-            return Err("Focused pane is missing from the layout".to_string());
+            return Err("Target pane is missing from the layout".to_string());
         }
-        self.focused_pane_id = PaneId(session_idx);
+        if direction.inserts_before() {
+            self.tree.remap_sessions(&|session| {
+                if session == target_session_idx {
+                    new_session_idx
+                } else if session == new_session_idx {
+                    target_session_idx
+                } else {
+                    session
+                }
+            });
+        }
+        self.focused_pane_id = PaneId(new_session_idx);
         self.zoomed = false;
         self.rebuild_panes();
         Ok(())
@@ -321,7 +434,16 @@ impl LayoutManager {
     /// frame has supplied viewport geometry, retain the legacy permissive
     /// behaviour; the renderer itself still handles tiny restored panes.
     pub fn can_split_focused_pane(&self, horizontal: bool, minimum_pane_size: egui::Vec2) -> bool {
-        if !self.can_split() {
+        self.can_split_session_pane(self.focused_pane_id.0, horizontal, minimum_pane_size)
+    }
+
+    pub fn can_split_session_pane(
+        &self,
+        session_idx: usize,
+        horizontal: bool,
+        minimum_pane_size: egui::Vec2,
+    ) -> bool {
+        if !self.tree.contains_session(session_idx) {
             return false;
         }
         if self.last_container_rect.width() <= 0.0 || self.last_container_rect.height() <= 0.0 {
@@ -333,7 +455,7 @@ impl LayoutManager {
         let unzoomed_rect = self
             .tree_pane_rects()
             .into_iter()
-            .find(|pane| pane.session == self.focused_pane_id.0)
+            .find(|pane| pane.session == session_idx)
             .map(|pane| egui_rect(pane.rect))
             .unwrap_or(self.last_container_rect);
 
@@ -959,6 +1081,60 @@ mod tests {
         // silently remapping a session that is not on screen.
         assert!(!layout.swap_sessions(0, 0));
         assert!(!layout.swap_sessions(0, 9));
+    }
+
+    #[test]
+    fn pane_drop_zones_are_directional_and_leave_the_center_inert() {
+        let rect = Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(500.0, 350.0));
+        assert_eq!(
+            pane_drop_zone(rect, egui::pos2(110.0, 200.0)),
+            Some(PaneDropDirection::Left)
+        );
+        assert_eq!(
+            pane_drop_zone(rect, egui::pos2(490.0, 200.0)),
+            Some(PaneDropDirection::Right)
+        );
+        assert_eq!(
+            pane_drop_zone(rect, egui::pos2(300.0, 60.0)),
+            Some(PaneDropDirection::Top)
+        );
+        assert_eq!(
+            pane_drop_zone(rect, egui::pos2(300.0, 340.0)),
+            Some(PaneDropDirection::Bottom)
+        );
+        assert_eq!(pane_drop_zone(rect, rect.center()), None);
+        assert_eq!(pane_drop_zone(rect, egui::pos2(0.0, 0.0)), None);
+
+        for direction in [
+            PaneDropDirection::Left,
+            PaneDropDirection::Right,
+            PaneDropDirection::Top,
+            PaneDropDirection::Bottom,
+        ] {
+            let zone = pane_drop_zone_rect(rect, direction).expect("valid pane zone");
+            assert_eq!(pane_drop_zone(rect, zone.center()), Some(direction));
+        }
+    }
+
+    #[test]
+    fn directional_split_places_and_focuses_the_moved_session() {
+        let mut left = LayoutManager::new(10);
+        left.split_session_at(10, 20, PaneDropDirection::Left)
+            .unwrap();
+        assert_eq!(left.session_indices(), vec![20, 10]);
+        assert_eq!(left.focused_session_idx(), Some(20));
+
+        let mut top = LayoutManager::new(10);
+        top.split_session_at(10, 20, PaneDropDirection::Top)
+            .unwrap();
+        assert_eq!(top.session_indices(), vec![20, 10]);
+        assert_eq!(top.focused_session_idx(), Some(20));
+
+        let before = top.session_indices();
+        assert!(top
+            .split_session_at(10, 10, PaneDropDirection::Right)
+            .is_err());
+        assert_eq!(top.session_indices(), before);
     }
 
     #[test]

@@ -12,6 +12,9 @@ claimed.
 
 - WGPU terminal grid rendering with a CPU/Glow fallback
 - Tabs, drag-to-reorder, rename, activity indicators and split-layout restore
+- Drag a single-pane tab to a target pane edge to merge it as a split, or drag
+  a split-pane header back to the tab bar to make it a normal tab. A short tab
+  hover previews the destination; cancelled drops never restart or clone a PTY
 - Nested horizontal and vertical splits, focused-pane zoom and one-command
   divider equalization; every split starts an independent shell session
 - Per-pane status headers with working directory, git branch/dirty state and
