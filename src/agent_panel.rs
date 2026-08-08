@@ -52,12 +52,19 @@ fn read_snapshot_file(path: &Path) -> Option<AgentSessionSnapshot> {
 /// the claim path instead of being deleted, so a corrupt or hostile snapshot
 /// stays available for inspection and is never restored by a later opener.
 fn claim_snapshot_session(path: &Path) -> Option<AgentSession> {
-    match jterm_core::agent::claim_session_file(path) {
-        jterm_core::agent::SessionClaim::Vacant => None,
-        jterm_core::agent::SessionClaim::Restored(session) => Some(session),
-        jterm_core::agent::SessionClaim::Quarantined { path, error } => {
+    match jterm_core::agent::try_claim_session_file(path) {
+        Ok(jterm_core::agent::SessionClaim::Vacant) => None,
+        Ok(jterm_core::agent::SessionClaim::Restored(session)) => Some(session),
+        Ok(jterm_core::agent::SessionClaim::Quarantined { path, error }) => {
             log::warn!(
                 "agent: quarantined an unusable session snapshot at {}: {error}",
+                path.display()
+            );
+            None
+        }
+        Err(error) => {
+            log::warn!(
+                "agent: could not atomically claim session snapshot {}: {error}",
                 path.display()
             );
             None
@@ -1204,6 +1211,21 @@ mod tests {
             std::fs::remove_file(&preserved[0]).unwrap();
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_claim_error_keeps_the_public_path() {
+        let root = private_test_dir("agent-claim-error");
+        let path = root.join("agent_session.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(claim_snapshot_session(&path).is_none());
+        assert!(
+            path.is_dir(),
+            "claim errors must retain the public evidence"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -32,8 +32,10 @@ fail closed.
   private claim path. An empty or rejected local session still leaves the
   public path alone, so one process exiting cannot delete a newer checkpoint
   published by another. `jterm_core` is pinned to
-  `fd25f905aadab9d8ca111a67b9b6422a22ef2d6c` (transitively jagent
-  `3aece307766ca8f3ca33ed0376d2a271cc2322b3`).
+  `48d25f155b960417609ffc85a98b7c9ba44c5772` (transitively jagent
+  `a09fd1563b862f96bed7047834720aeb31c163e2`). Claim-acquisition errors are
+  logged with the public path and leave that path untouched; there is no
+  best-effort fallback read or delete.
 - The in-flight model request records the task generation it was started for; a
   reply that lands after New Task, a restore, or a session replacement is
   dropped instead of being applied to a transcript that no longer exists.
