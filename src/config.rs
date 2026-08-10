@@ -121,6 +121,12 @@ pub struct Config {
     #[serde(default = "default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// Show the provider-neutral Tasks dashboard. This is independent from
+    /// cloud-AI consent because local Agent CLIs and task bookkeeping do not
+    /// inherently send terminal context off-machine.
+    #[serde(default)]
+    pub experimental_task_sidebar: bool,
+
     /// Remote destinations for the host picker (Ctrl+Shift+S). Grammar,
     /// validation and the argv a tab runs are the family-shared
     /// `jterm_core::jsh_remote::RemoteHostConfig`. A file with no key at all
@@ -507,6 +513,7 @@ impl Default for Config {
             ai_share_command_context: false,
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
+            experimental_task_sidebar: false,
             remote_hosts: default_remote_hosts(),
             font_size: default_font_size(),
             font_family: default_font_family(),
@@ -1024,6 +1031,22 @@ mod tests {
         let serialized = toml::to_string_pretty(&opted_in).expect("config serializes");
         let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
         assert!(reparsed.ai_share_command_context);
+    }
+
+    #[test]
+    fn experimental_task_sidebar_defaults_off_and_round_trips() {
+        let defaults = Config::default();
+        assert!(!defaults.experimental_task_sidebar);
+
+        let omitted: Config = toml::from_str("").expect("empty config parses");
+        assert!(!omitted.experimental_task_sidebar);
+
+        let enabled: Config =
+            toml::from_str("experimental_task_sidebar = true\n").expect("task sidebar flag parses");
+        assert!(enabled.experimental_task_sidebar);
+        let serialized = toml::to_string_pretty(&enabled).expect("config serializes");
+        let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
+        assert!(reparsed.experimental_task_sidebar);
     }
 
     #[test]

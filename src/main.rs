@@ -1733,7 +1733,10 @@ impl TerminalApp {
                 .session_manager
                 .sessions_mut()
                 .iter_mut()
-                .find(|session| session.terminal.data_ptr() as usize == target);
+                .find(|session| {
+                    session.terminal.data_ptr() as usize == target
+                        && session.purpose != crate::session::SessionPurpose::RetainedCommand
+                });
             if let Some(session) = routed {
                 had_input = true;
                 overflow |= !session.queue_input(&bytes);
@@ -2010,10 +2013,11 @@ impl TerminalApp {
 
                 // 三个视图在两种 tab 栏布局下都可用：Top 模式下侧边栏的
                 // Sessions 列表与顶部 tab 栏并存(与 frost 一致)。
-                sb.view = cfg.sidebar_view;
+                sb.view = sidebar::effective_view(cfg.sidebar_view, cfg.experimental_task_sidebar);
                 sb
             },
             command_sidebar: Default::default(),
+            task_sidebar: Default::default(),
             block_selection: None,
             block_search: Default::default(),
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
@@ -2040,6 +2044,7 @@ impl TerminalApp {
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
             agent_diff: agent::AgentDiffPanel::new(),
+            task_manager: agent::TaskManager::new(),
             jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,
@@ -2072,6 +2077,8 @@ impl TerminalApp {
         if !self.config.block_mode {
             self.clear_block_selection();
         }
+        self.sidebar.view =
+            sidebar::effective_view(self.sidebar.view, self.config.experimental_task_sidebar);
         // Apply UI scale: use config value if provided, otherwise use native DPI
         let scale = self
             .config
@@ -2200,10 +2207,15 @@ impl TerminalApp {
         };
         if !matches!(self.config.tab_bar_position, config::TabBarPosition::Top) {
             // 标签移入侧边栏：恢复上次记住的视图并确保侧边栏可见，否则标签不可达
-            self.sidebar.view = self.config.sidebar_view;
+            self.sidebar.view = sidebar::effective_view(
+                self.config.sidebar_view,
+                self.config.experimental_task_sidebar,
+            );
             self.sidebar.visible = true;
-            if let Some(error) = self.sidebar.refresh() {
-                self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+            if self.sidebar.view == sidebar::SidebarView::Files {
+                if let Some(error) = self.sidebar.refresh() {
+                    self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                }
             }
         }
         self.config_panel.sync_from_config(&self.config);
@@ -2260,7 +2272,7 @@ impl TerminalApp {
             .default_size(self.sidebar.width)
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(root_ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     // Sessions 在两种 tab 栏布局下都可选：Top 模式下它是顶部
                     // tab 栏之外的一份纵向标签列表，而非替代品。
                     if ui
@@ -2293,6 +2305,24 @@ impl TerminalApp {
                         self.sidebar.view = sidebar::SidebarView::Commands;
                         view_changed = true;
                     }
+                    if self.config.experimental_task_sidebar {
+                        let attention = app::tasks::attention_count(self.task_manager.tasks());
+                        let label = if attention == 0 {
+                            "Tasks".to_string()
+                        } else {
+                            format!("Tasks {attention}")
+                        };
+                        if ui
+                            .selectable_label(
+                                self.sidebar.view == sidebar::SidebarView::Tasks,
+                                egui::RichText::new(label).strong(),
+                            )
+                            .clicked()
+                        {
+                            self.sidebar.view = sidebar::SidebarView::Tasks;
+                            view_changed = true;
+                        }
+                    }
                     if self.sidebar.view == sidebar::SidebarView::Files
                         && ui.button("⟳").on_hover_text("Refresh").clicked()
                     {
@@ -2304,6 +2334,7 @@ impl TerminalApp {
                 match self.sidebar.view {
                     sidebar::SidebarView::Sessions => self.render_sidebar_sessions(ui),
                     sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
+                    sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
                     sidebar::SidebarView::Files => {
                         if let Some(dir) = self
                             .sidebar
@@ -2362,6 +2393,7 @@ impl TerminalApp {
 
         // 闭包结束，安全 mutate
         self.execute_pending_command_sidebar_action();
+        self.execute_pending_task_sidebar_action();
         if let Some(p) = toggle_path {
             if let Some(error) = self.sidebar.toggle_node(&p) {
                 self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
@@ -2650,6 +2682,7 @@ impl eframe::App for TerminalApp {
         }
 
         self.debug_panel.record_frame();
+        self.poll_task_creation(ctx);
 
         // A stateful mouse edge admitted in an earlier frame is older than
         // every keyboard/IME event arriving now. Retry it before any session
@@ -2695,7 +2728,8 @@ impl eframe::App for TerminalApp {
         // terminal and staged now, before this frame's IME, Ctrl commands, or
         // keyboard bytes. A modal that already owned input when the frame
         // began discards the stale navigation instead.
-        let initially_blocked = self.terminal_input_blocked(ctx);
+        let initially_blocked =
+            self.terminal_input_blocked(ctx) || self.active_terminal_is_read_only();
         let (has_cursor_move_input, cursor_move_retry_overflow) =
             self.stage_prior_cursor_moves(initially_blocked);
 
@@ -2797,25 +2831,28 @@ impl eframe::App for TerminalApp {
                 body,
             );
         }
-        background_pump.exited_indices.sort_unstable();
-        background_pump.exited_indices.dedup();
         // 按稳定 ID 而不是索引关闭:关掉一个会话会让它之后的索引整体左移,
         // 而关掉一个只剩一个窗格的 tab 还会连带关掉该 tab 的其他会话,索引
         // 可能往任意方向漂移。ID 查不到就说明它已经被前一次关闭带走了。
-        let exited_ids: Vec<String> = background_pump
-            .exited_indices
-            .iter()
-            .filter_map(|&idx| {
-                self.session_manager
-                    .sessions()
-                    .get(idx)
-                    .map(|session| session.metadata.session_id.clone())
-            })
+        // 在关闭 tab 前先把真实 child wait status 交给 TaskManager，否则
+        // opaque Agent PTY 只能得到一个无意义的“消失了”状态。
+        let exited_sessions: Vec<(String, Option<i32>)> = background_pump
+            .exited_sessions
+            .drain(..)
+            .map(|exited| (exited.session_id, exited.exit_code))
             .collect();
-        for session_id in exited_ids {
+        for (session_id, exit_code) in exited_sessions {
+            let agent_task = self
+                .task_manager
+                .handle_session_exit(&session_id, exit_code)
+                .is_some();
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
                 continue;
             };
+            if agent_task {
+                self.session_manager.retain_exited_command(&session_id);
+                continue;
+            }
             if self.session_manager.len() > 1 && session_idx != self.session_manager.active_index()
             {
                 self.close_session_or_owning_tab(session_idx);
@@ -2834,7 +2871,10 @@ impl eframe::App for TerminalApp {
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
 
-        let mut terminal_input_blocked = self.terminal_input_blocked(ctx);
+        let mut ui_input_blocked = self.terminal_input_blocked(ctx);
+        let terminal_input_blocked_at_frame_start =
+            ui_input_blocked || self.active_terminal_is_read_only();
+        let mut terminal_input_blocked = terminal_input_blocked_at_frame_start;
         let has_preedit = if terminal_input_blocked {
             // UI text fields and modal dialogs own IME/keyboard input while open.
             // In particular, an IME commit must never be mirrored into the PTY.
@@ -2848,7 +2888,7 @@ impl eframe::App for TerminalApp {
             self.handle_ime_events(ctx)
         };
 
-        if !terminal_input_blocked {
+        if !ui_input_blocked {
             self.handle_font_zoom(ctx);
         }
 
@@ -2867,7 +2907,11 @@ impl eframe::App for TerminalApp {
         let overlay_owned_input = palette_owned_input || block_search_owned_input;
 
         let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
-            self.handle_keybindings(ctx, terminal_input_blocked || overlay_owned_input);
+            self.handle_keybindings(
+                ctx,
+                ui_input_blocked || overlay_owned_input,
+                terminal_input_blocked || overlay_owned_input,
+            );
         if keybinding_requested_close {
             return;
         }
@@ -2876,10 +2920,15 @@ impl eframe::App for TerminalApp {
         // newly opened surfaces, but never release a frame that a UI surface
         // owned at its start: later events in the same OS batch must not escape
         // into the PTY after the modal-closing shortcut.
-        terminal_input_blocked = app::input::terminal_input_blocked_after_commands(
-            terminal_input_blocked,
+        ui_input_blocked = app::input::terminal_input_blocked_after_commands(
+            ui_input_blocked,
             overlay_owned_input,
             self.terminal_input_blocked(ctx),
+        );
+        terminal_input_blocked = app::input::terminal_input_blocked_after_commands(
+            terminal_input_blocked_at_frame_start,
+            overlay_owned_input,
+            self.terminal_input_blocked(ctx) || self.active_terminal_is_read_only(),
         );
         if terminal_input_blocked {
             let mut terminal = self
@@ -2894,7 +2943,7 @@ impl eframe::App for TerminalApp {
         // active-session borrow below. The renderer used to switch focus only
         // at the end of the frame, which sent a click (and mouse protocol
         // coordinates) to the previously focused PTY.
-        let pointer_targets_terminal = !terminal_input_blocked
+        let pointer_targets_terminal = !ui_input_blocked
             && !app::input::semantic_paste_precedes_mouse_input(&self.frame_events)
             && ctx.input(|input| {
                 input.pointer.button_pressed(egui::PointerButton::Primary)
@@ -2939,6 +2988,9 @@ impl eframe::App for TerminalApp {
         // 获取当前活跃会话（在所有快捷键处理完后）
         let session_count_before = self.session_manager.len();
         let mut shell_exited = false;
+        let mut shell_exit_observed = false;
+        let mut shell_exit_code = None;
+        let mut retain_exited_agent_terminal = false;
         // A shell that dies before it could ever have shown a prompt is a
         // startup failure, not the user leaving. Closing the window on it
         // makes ember look like it "exits as soon as it runs", hiding the
@@ -2968,6 +3020,10 @@ impl eframe::App for TerminalApp {
         // the same tab if the user hasn't switched away.
         let session = self.session_manager.get_active_session_mut();
         let active_session_id = session.metadata.session_id.clone();
+        let active_agent_provider = self
+            .task_manager
+            .task_for_session(&active_session_id)
+            .map(|task| task.provider.display_name());
 
         // Step 3: semantic application paste events. Host copy/paste keyboard
         // shortcuts are dispatched above through configurable commands.
@@ -3196,9 +3252,17 @@ impl eframe::App for TerminalApp {
             terminal_input_blocked = true;
             app::input::clear_terminal_preedit_for_ui_owner(&mut session.terminal.lock(), true);
         }
-        let terminal_pointer_input_blocked = app::input::semantic_paste_pointer_input_blocked(
+        let mut terminal_pointer_input_blocked = app::input::semantic_paste_pointer_input_blocked(
             terminal_input_blocked,
             rejected_mouse_prefix_allows_pointer,
+            semantic_paste_blocks_pointer,
+        );
+        // An exited Agent terminal is read-only at the PTY boundary, but its
+        // local buffer must remain selectable and scrollable for review.
+        terminal_pointer_input_blocked = app::input::retained_terminal_pointer_input_blocked(
+            terminal_pointer_input_blocked,
+            session.purpose == crate::session::SessionPurpose::RetainedCommand,
+            ui_input_blocked,
             semantic_paste_blocks_pointer,
         );
 
@@ -3339,7 +3403,9 @@ impl eframe::App for TerminalApp {
         }
 
         // 从 channel 中收集数据，直到达到字节上限
-        if accumulated_data.len() < max_bytes_per_frame {
+        let shell_events_are_live =
+            session.purpose != crate::session::SessionPurpose::RetainedCommand;
+        if shell_events_are_live && accumulated_data.len() < max_bytes_per_frame {
             loop {
                 match session.shell.events().try_recv() {
                     Ok(ShellEvent::Output(data)) => {
@@ -3352,8 +3418,19 @@ impl eframe::App for TerminalApp {
                     }
                     Ok(ShellEvent::Exit(code)) => {
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
+                        shell_exit_observed = true;
+                        shell_exit_code = Some(code);
+                        retain_exited_agent_terminal = active_agent_provider.is_some();
                         let uptime = session.shell.uptime();
-                        if code != 0 && uptime < SHELL_STARTUP_GRACE {
+                        if let Some(provider) = active_agent_provider {
+                            self.status_message = if code == 0 {
+                                format!("{provider} task finished")
+                            } else {
+                                format!("{provider} task exited with code {code}")
+                            };
+                            self.status_expires_at =
+                                Some(std::time::Instant::now() + Duration::from_secs(6));
+                        } else if code != 0 && uptime < SHELL_STARTUP_GRACE {
                             shell_startup_failed = true;
                             self.status_message = format!(
                                 "Shell failed to start (exit code {code}). Check the `shell` setting in the config panel."
@@ -3377,12 +3454,14 @@ impl eframe::App for TerminalApp {
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        shell_exit_observed = true;
+                        retain_exited_agent_terminal = active_agent_provider.is_some();
                         shell_exited = true;
                         break;
                     }
                 }
             }
-        } else {
+        } else if accumulated_data.len() >= max_bytes_per_frame {
             has_more_data = true;
         }
 
@@ -3392,7 +3471,7 @@ impl eframe::App for TerminalApp {
             has_more_data = true;
         }
         // 也检查 channel 中是否还有数据
-        if !has_more_data && !session.shell.events().is_empty() {
+        if shell_events_are_live && !has_more_data && !session.shell.events().is_empty() {
             has_more_data = true;
         }
 
@@ -3572,7 +3651,7 @@ impl eframe::App for TerminalApp {
 
         // Step 9: 滚动处理
         // 优化：批量处理键盘滚动，只获取一次锁
-        let page_scroll_key = (!terminal_input_blocked)
+        let page_scroll_key = (!ui_input_blocked)
             .then(|| {
                 ctx.input(|i| {
                     if i.key_pressed(egui::Key::PageUp) {
@@ -3604,11 +3683,14 @@ impl eframe::App for TerminalApp {
         // 检查是否启用鼠标报告
         let mouse_enabled = {
             let terminal = session.terminal.lock();
-            terminal.is_mouse_enabled()
+            session.purpose != crate::session::SessionPurpose::RetainedCommand
+                && terminal.is_mouse_enabled()
         };
         let shift_mouse_bypass = ctx.input(|input| input.modifiers.shift);
 
-        let middle_paste_requested = !terminal_pointer_input_blocked
+        let middle_paste_requested = session.purpose
+            != crate::session::SessionPurpose::RetainedCommand
+            && !terminal_pointer_input_blocked
             && (!mouse_enabled || shift_mouse_bypass)
             && pointer_over_active_terminal
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
@@ -4276,6 +4358,15 @@ impl eframe::App for TerminalApp {
         #[allow(dropping_references)]
         drop(session);
 
+        if shell_exit_observed {
+            self.task_manager
+                .handle_session_exit(&active_session_id, shell_exit_code);
+            if retain_exited_agent_terminal {
+                self.session_manager
+                    .retain_exited_command(&active_session_id);
+            }
+        }
+
         // 渲染 UI
         self.render_ui(root_ui, terminal_pointer_input_blocked);
 
@@ -4308,7 +4399,8 @@ impl eframe::App for TerminalApp {
             // 二次检查：render_ui 期间 PTY 线程可能又发送了新数据
             let has_pending_data = if !has_new_output {
                 let session = self.session_manager.get_active_session_mut();
-                !session.shell.events().is_empty()
+                session.purpose != crate::session::SessionPurpose::RetainedCommand
+                    && !session.shell.events().is_empty()
             } else {
                 false
             };
@@ -4348,7 +4440,9 @@ impl eframe::App for TerminalApp {
                 "[SHELL EXIT] handling shell exit, session_count: {}",
                 session_count_before
             );
-            if session_count_before > 1 {
+            if retain_exited_agent_terminal {
+                crate::debug_log!("[SHELL EXIT] retaining Agent terminal for review");
+            } else if session_count_before > 1 {
                 // Close the current session if there are multiple sessions.
                 // If it was its tab's only pane, the tab goes with it.
                 self.close_session_or_owning_tab(active_session_idx);

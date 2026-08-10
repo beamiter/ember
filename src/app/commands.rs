@@ -979,7 +979,9 @@ impl TerminalApp {
     }
 
     fn start_agent_task_for_command(&mut self, target: &CommandTarget, intent: AgentTaskIntent) {
-        if !self.config.ai_enabled {
+        let create_is_local_worktree =
+            intent == AgentTaskIntent::Compose && self.config.experimental_task_sidebar;
+        if !create_is_local_worktree && !self.config.ai_enabled {
             self.set_status_for(
                 "Enable AI in Settings before creating an Agent task",
                 Duration::from_secs(5),
@@ -1036,6 +1038,16 @@ impl TerminalApp {
                 "The source terminal cwd is not independently verified; return a local shell to the command's recorded cwd before starting an Agent task",
                 Duration::from_secs(6),
             );
+            return;
+        }
+        if create_is_local_worktree {
+            match self.begin_command_worktree_task(semantic, crate::agent::AgentProvider::Codex) {
+                Ok(()) => {}
+                Err(error) => self.set_status_for(
+                    format!("Could not create Agent task: {error}"),
+                    Duration::from_secs(6),
+                ),
+            }
             return;
         }
         let prompt = match intent {
@@ -1971,6 +1983,17 @@ impl TerminalApp {
         };
         if self.session_manager.active_index() != index && !self.activate_session(index) {
             self.set_status("Command session is no longer available");
+            return;
+        }
+        if self
+            .session_manager
+            .sessions()
+            .get(index)
+            .is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::RetainedCommand
+            })
+        {
+            self.set_status("Exited Agent terminals are read-only");
             return;
         }
         let direct_input_blocked = self.direct_input_is_blocked_for_session(&target.session_id);

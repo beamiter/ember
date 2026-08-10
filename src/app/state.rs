@@ -207,6 +207,9 @@ pub struct TerminalApp {
     // Semantic command timeline sidebar
     pub command_sidebar: CommandSidebarState,
 
+    // Experimental provider-neutral task dashboard
+    pub task_sidebar: crate::app::tasks::TaskSidebarState,
+
     /// Block mode 当前选中的命令块范围。范围持有 session、固定 anchor、
     /// active edge 与 terminal-order ids；record 被淘汰或 session 关闭时一律
     /// 按“无选中”处理（绝不 panic）。真实键盘输入送往 PTY 时清空。
@@ -282,6 +285,9 @@ pub struct TerminalApp {
     /// Native, read-only Git review surface requested by a structured Agent
     /// task. Git probes run on its bounded background worker.
     pub agent_diff: crate::agent::AgentDiffPanel,
+    /// Provider-neutral task registry. Agent PTYs are associated by stable
+    /// session ID rather than by their mutable tab/pane indices.
+    pub task_manager: crate::agent::TaskManager,
     /// Background "is a newer jsh published?" check and the offer it produced.
     pub jsh_notice: crate::jsh_ui::JshNotice,
 

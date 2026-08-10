@@ -7,6 +7,17 @@
 
 pub mod context;
 pub mod diff;
+pub mod launcher;
+pub mod task;
+pub mod worktree;
 
 pub use context::{ContextError, SemanticCommandContext};
 pub use diff::{AgentDiffPanel, AgentDiffState, DiffRequestError};
+pub use launcher::{AgentLaunchError, AgentLaunchSpec};
+pub use task::{
+    AgentProvider, AgentTask, NewTask, TaskError, TaskId, TaskManager, TaskSource, TaskStatus,
+};
+pub use worktree::{
+    CreateWorktreeRequest, ManagedWorktree, RetireOutcome, RetirePolicy, WorktreeError,
+    WorktreeService,
+};

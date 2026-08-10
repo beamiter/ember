@@ -1,6 +1,7 @@
 //! Owned semantic command context passed from terminal history to agent tasks.
 
 use jterm_core::ai::BlockContext;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
 
@@ -22,7 +23,7 @@ pub const AGENT_BLOCK_CWD_PROMPT_BYTES: usize = 4 * 1024;
 /// metadata. A display-reconstructed command can still be useful as untrusted
 /// evidence, but must never authorize Retry. `command_truncated` means the
 /// producer explicitly omitted or shortened the command.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticCommandContext {
     pub source_session_id: String,
     pub source_execution_id: String,

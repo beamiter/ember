@@ -249,37 +249,6 @@ mod unix_pty {
                 // 都不安全 —— 若 fork 时另一线程恰好持有 malloc 锁,子进程会永久死锁。
                 // 因此这里预先构建 argv、envp、cwd 的 C 字符串,子进程分支只做 syscall。
 
-                // 选择 shell(读取 env/fs,必须在 fork 前)
-                let shell_path = choose_shell(configured_shell)?;
-                let shell_cstr = CString::new(shell_path.clone())
-                    .map_err(|_| anyhow!("Invalid shell path: {}", shell_path))?;
-                let shell_name = Path::new(&shell_path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("sh")
-                    .to_string();
-
-                // argv[0] 前缀 "-" 表示登录 shell
-                let dash_shell_cstr = CString::new(format!("-{}", shell_name))
-                    .map_err(|_| anyhow!("Invalid shell name"))?;
-                let login_arg = if shell_name == "bash" {
-                    Some(CString::new("-l").unwrap())
-                } else {
-                    None
-                };
-                let session_flag = CString::new("--session").unwrap();
-                let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
-
-                // `find_executable_in_path` is now exec-bit-checked and
-                // absolutizing in core, so the local re-check it used to need
-                // is gone.
-                let bash_path = if shell_name == "jsh" {
-                    jterm_core::host::find_executable_in_path("bash")
-                        .map(|p| p.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
-
                 // 一次性辅助进程(例如 jsh 安装脚本)按原样 exec 给定 argv:
                 // 不做登录 shell 包装,也不注入 --session。
                 let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
@@ -317,10 +286,33 @@ mod unix_pty {
                     None => None,
                 };
 
-                let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
-                    if let Some(command) = command_cstrings {
-                        command
-                    } else if let Some(bash_path) = bash_path {
+                let (exec_cstr, argv_cstrings): (CString, Vec<CString>) = if let Some(command) =
+                    command_cstrings
+                {
+                    command
+                } else {
+                    // Shell discovery is irrelevant for explicit command
+                    // sessions. Keeping it entirely inside this branch
+                    // means a broken interactive `shell =` setting cannot
+                    // prevent a valid Agent/helper executable from starting.
+                    let shell_path = choose_shell(configured_shell)?;
+                    let shell_cstr = CString::new(shell_path.clone())
+                        .map_err(|_| anyhow!("Invalid shell path: {}", shell_path))?;
+                    let shell_name = Path::new(&shell_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("sh")
+                        .to_string();
+                    let bash_path = if shell_name == "jsh" {
+                        // `find_executable_in_path` is exec-bit-checked and
+                        // returns an absolute path.
+                        jterm_core::host::find_executable_in_path("bash")
+                            .map(|path| path.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
+
+                    if let Some(bash_path) = bash_path {
                         let exec_cmd =
                             jterm_core::process::build_jsh_exec_command(&shell_path, session_id);
                         (
@@ -333,18 +325,23 @@ mod unix_pty {
                             ],
                         )
                     } else {
-                        let mut argv = vec![dash_shell_cstr.clone()];
-                        if let Some(ref arg) = login_arg {
-                            argv.push(arg.clone());
+                        // argv[0] prefixed with '-' requests login-shell
+                        // behavior for ordinary interactive sessions.
+                        let mut argv = vec![CString::new(format!("-{shell_name}"))
+                            .map_err(|_| anyhow!("Invalid shell name"))?];
+                        if shell_name == "bash" {
+                            argv.push(CString::new("-l").unwrap());
                         }
                         if shell_name == "jsh" {
-                            if let Some(ref sid) = session_id_cstr {
-                                argv.push(session_flag.clone());
-                                argv.push(sid.clone());
+                            if let Some(sid) = session_id.and_then(|value| CString::new(value).ok())
+                            {
+                                argv.push(CString::new("--session").unwrap());
+                                argv.push(sid);
                             }
                         }
-                        (shell_cstr.clone(), argv)
-                    };
+                        (shell_cstr, argv)
+                    }
+                };
 
                 let mut argv_ptrs: Vec<*const libc::c_char> =
                     argv_cstrings.iter().map(|arg| arg.as_ptr()).collect();
@@ -689,20 +686,71 @@ mod unix_pty {
             self.exit_code_cached = Some(code);
         }
 
-        pub fn is_alive(&mut self) -> bool {
-            // If we already have a cached exit code, the process is not alive
+        /// Observe the direct child without consuming its wait status. Keeping
+        /// the exited leader as a zombie preserves ownership of its numeric
+        /// PID/process-group identity until `finish_observed_exit` has killed
+        /// every same-group descendant. Reaping first would make a later
+        /// `kill(-pid, ...)` vulnerable to PID/PGID reuse.
+        fn child_exit_observed(&self, nonblocking: bool) -> std::io::Result<bool> {
             if self.exit_code_cached.is_some() {
-                return false;
+                return Ok(true);
+            }
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let options =
+                libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
+            retry_on_eintr(|| {
+                // `waitid` may leave siginfo unspecified after EINTR. Reset it
+                // on every attempt so WNOHANG's no-event result remains zero.
+                info = unsafe { std::mem::zeroed() };
+                // SAFETY: `info` is writable, P_PID scopes the observation to
+                // our forked child, and WNOWAIT explicitly preserves its wait
+                // status for the cleanup/reap step below.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        self.child_pid as libc::id_t,
+                        &mut info,
+                        options,
+                    )
+                };
+                if result < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })?;
+            // SAFETY: a successful waitid initializes siginfo. With WNOHANG,
+            // si_pid == 0 means the selected child has not changed state.
+            Ok(unsafe { info.si_pid() } == self.child_pid)
+        }
+
+        /// The direct child is known to be exited but deliberately unreaped.
+        /// Kill its still-owned private process group first, then consume the
+        /// original leader status exactly once. SIGKILL cannot change a status
+        /// that is already waitable, so a successful CLI exit remains exit 0.
+        fn finish_observed_exit(&mut self) -> std::io::Result<i32> {
+            if let Some(code) = self.exit_code_cached {
+                return Ok(code);
+            }
+            // SAFETY: WNOWAIT kept child_pid unreaped, so its process-group ID
+            // cannot be recycled between this signal and the waitpid below.
+            let killed = unsafe { libc::kill(-self.child_pid, libc::SIGKILL) };
+            if killed < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    // Preserve the zombie ownership anchor and retry rather
+                    // than publishing completion while a group we failed to
+                    // terminate may still be active.
+                    return Err(error);
+                }
             }
 
-            // SAFETY: waitpid 使用 WNOHANG 非阻塞检查子进程状态。
-            // status 是有效的栈变量，child_pid 是有效的进程 ID。
             let mut status = 0;
             let child_pid = self.child_pid;
             let result = retry_on_eintr(|| {
-                // SAFETY: WNOHANG is non-blocking; status is a valid mutable
-                // integer and child_pid belongs to this Pty instance.
-                let result = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                // SAFETY: the observed child is waitable and still owned by
+                // this Pty. No other Ember path can wait while its mutex is held.
+                let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -710,21 +758,47 @@ mod unix_pty {
                 }
             });
             match result {
-                Ok(0) => true,
-                Ok(_) => {
-                    // 子进程已退出且刚刚被本次调用回收 —— 必须缓存退出码,
-                    // 否则会留下"已 reap 但未标记"的窗口,导致后续 kill 误杀复用 PID。
+                Ok(result) if result == child_pid => {
                     self.cache_status(status);
-                    false
+                    Ok(self.exit_code_cached.unwrap_or(-1))
                 }
+                Ok(_) => Err(std::io::Error::other(
+                    "waitpid returned no status for an observed PTY exit",
+                )),
                 Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    self.exit_code_cached = Some(0);
+                    self.exit_code_cached = Some(-1);
+                    Ok(-1)
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        pub fn is_alive(&mut self) -> bool {
+            // If we already have a cached exit code, the process is not alive
+            if self.exit_code_cached.is_some() {
+                return false;
+            }
+
+            match self.child_exit_observed(true) {
+                Ok(false) => true,
+                Ok(true) => match self.finish_observed_exit() {
+                    Ok(_) => false,
+                    Err(error) => {
+                        log::warn!("could not finish observed PTY child exit: {error}");
+                        true
+                    }
+                },
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                    // Another wait path reaped the PID without leaving a
+                    // status. Unknown must fail closed, never masquerade as a
+                    // successful child process.
+                    self.exit_code_cached = Some(-1);
                     false
                 }
                 Err(error) => {
                     // Conservatively keep the process live: an unrelated
-                    // waitpid failure is not evidence that the PID was reaped.
-                    log::warn!("waitpid(WNOHANG) failed while checking PTY child: {error}");
+                    // waitid failure is not evidence that the PID was reaped.
+                    log::warn!("waitid(WNOWAIT) failed while checking PTY child: {error}");
                     true
                 }
             }
@@ -775,37 +849,29 @@ mod unix_pty {
             }
         }
 
-        /// 单次非阻塞 waitpid。已退出/ECHILD → Some(code); 仍在运行 → None。
+        /// 单次非阻塞退出观察。已退出时先清理仍归属该 PTY 进程组的后代，
+        /// 再 waitpid 回收 leader；ECHILD → unknown，仍在运行 → None。
         /// 调用方应在锁外做有界轮询,把 sleep 排除在 Pty 临界区之外,避免 UI
         /// 线程的 resize/write 在子进程退出窗口内被阻塞数十毫秒。
         pub fn try_reap(&mut self) -> Option<i32> {
             if let Some(code) = self.exit_code_cached {
                 return Some(code);
             }
-            // SAFETY: WNOHANG 非阻塞 waitpid;status 为有效栈变量,child_pid 来自 fork。
-            let mut status = 0;
-            let child_pid = self.child_pid;
-            let result = retry_on_eintr(|| {
-                // SAFETY: see is_alive above.
-                let result = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-                if result < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(result)
-                }
-            });
-            match result {
-                Ok(0) => None,
-                Ok(_) => {
-                    self.cache_status(status);
-                    Some(self.exit_code_cached.unwrap_or(-1))
-                }
+            match self.child_exit_observed(true) {
+                Ok(false) => None,
+                Ok(true) => match self.finish_observed_exit() {
+                    Ok(code) => Some(code),
+                    Err(error) => {
+                        log::warn!("could not finish observed PTY child exit: {error}");
+                        None
+                    }
+                },
                 Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    self.exit_code_cached = Some(0);
-                    Some(0)
+                    self.exit_code_cached = Some(-1);
+                    Some(-1)
                 }
                 Err(error) => {
-                    log::warn!("waitpid(WNOHANG) failed while reaping PTY child: {error}");
+                    log::warn!("waitid(WNOWAIT) failed while observing PTY child: {error}");
                     None
                 }
             }
@@ -817,31 +883,17 @@ mod unix_pty {
                 return Ok(code);
             }
 
-            // SAFETY: waitpid 阻塞等待子进程退出。status 是有效的栈变量，
-            // child_pid 是我们 fork 创建的有效进程 ID。
-            unsafe {
-                let mut status = 0;
-                loop {
-                    let result = libc::waitpid(self.child_pid, &mut status, 0);
-                    if result < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::Interrupted {
-                            continue; // EINTR:重试
-                        }
-                        // ECHILD 表示进程已被回收,返回默认退出码 0
-                        if err.raw_os_error() == Some(libc::ECHILD) {
-                            crate::debug_log!(
-                                "[PTY] waitpid returned ECHILD, process already reaped"
-                            );
-                            self.exit_code_cached = Some(0);
-                            return Ok(0);
-                        }
-                        return Err(anyhow!("waitpid failed: {}", err));
-                    } else {
-                        self.cache_status(status);
-                        return Ok(self.exit_code_cached.unwrap_or(-1));
-                    }
+            match self.child_exit_observed(false) {
+                Ok(true) => self
+                    .finish_observed_exit()
+                    .map_err(|error| anyhow!("waitpid failed: {error}")),
+                Ok(false) => Err(anyhow!("waitid returned without an exited PTY child")),
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                    crate::debug_log!("[PTY] waitid returned ECHILD, process already reaped");
+                    self.exit_code_cached = Some(-1);
+                    Ok(-1)
                 }
+                Err(error) => Err(anyhow!("waitid failed: {error}")),
             }
         }
 
@@ -1212,5 +1264,27 @@ mod tests {
             seen.contains("arg=payload"),
             "remaining arguments must reach the child: {seen:?}"
         );
+    }
+
+    /// A one-shot command is its own executable and must not depend on the
+    /// separately configured interactive shell being valid.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_argv_bypasses_invalid_interactive_shell_config() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let pty = super::Pty::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            None,
+            Some("/ember/definitely/missing/interactive-shell"),
+            Some(&argv),
+        );
+
+        assert!(pty.is_ok(), "explicit argv must not resolve the shell");
     }
 }

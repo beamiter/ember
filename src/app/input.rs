@@ -125,6 +125,22 @@ pub(crate) fn semantic_paste_pointer_input_blocked(
     (terminal_input_blocked && !rejected_mouse_prefix_allows_pointer) || accepted_or_confirmed_paste
 }
 
+/// A retained transcript has no live PTY input target, so local selection and
+/// scrolling may bypass that read-only boundary. It must never bypass a modal
+/// UI owner or the ordering claim made by semantic paste handling.
+pub(crate) fn retained_terminal_pointer_input_blocked(
+    base_blocked: bool,
+    retained_terminal: bool,
+    ui_input_blocked: bool,
+    semantic_paste_blocks_pointer: bool,
+) -> bool {
+    if retained_terminal && !ui_input_blocked && !semantic_paste_blocks_pointer {
+        false
+    } else {
+        base_blocked
+    }
+}
+
 pub(crate) fn osc_paste_route_is_clean(
     pending_input: bool,
     session_route_blocked: bool,
@@ -525,6 +541,15 @@ impl TerminalApp {
         )
     }
 
+    pub(crate) fn active_terminal_is_read_only(&self) -> bool {
+        self.session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::RetainedCommand
+            })
+    }
+
     fn copy_active_selection(&mut self) {
         let selected = {
             let session = self.session_manager.get_active_session_mut();
@@ -551,6 +576,10 @@ impl TerminalApp {
     }
 
     fn paste_active_clipboard(&mut self) {
+        if self.active_terminal_is_read_only() {
+            self.set_status("Exited Agent terminals are read-only");
+            return;
+        }
         let Some(clipboard) = &self.clipboard else {
             self.set_status("Clipboard is unavailable");
             return;
@@ -608,6 +637,10 @@ impl TerminalApp {
     }
 
     fn queue_terminal_control_input(&mut self, byte: u8) {
+        if self.active_terminal_is_read_only() {
+            self.set_status("Exited Agent terminals are read-only");
+            return;
+        }
         let (accepted, session_id) = {
             let session = self.session_manager.get_active_session_mut();
             (
@@ -890,7 +923,7 @@ impl TerminalApp {
             }
             keybindings::Command::SidebarToggle => {
                 self.sidebar.visible = !self.sidebar.visible;
-                if self.sidebar.visible {
+                if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {
                     if let Some(error) = self.sidebar.refresh() {
                         self.set_status(format!("文件树刷新失败：{error}"));
                     }
@@ -1345,6 +1378,7 @@ impl TerminalApp {
     pub fn handle_keybindings(
         &mut self,
         ctx: &egui::Context,
+        ui_input_blocked: bool,
         terminal_input_blocked: bool,
     ) -> (bool, bool, bool) {
         if !self.config.block_mode && self.block_selection.is_some() {
@@ -1379,7 +1413,7 @@ impl TerminalApp {
                     build_keybinding_string(press.key, press.modifiers).unwrap_or_default(),
                     command
                 );
-                if terminal_input_blocked && !self.command_belongs_to_open_modal(&command) {
+                if ui_input_blocked && !self.command_belongs_to_open_modal(&command) {
                     return OrderedPressOutcome::Ignored;
                 }
                 if terminal_input_seen {
@@ -1414,7 +1448,7 @@ impl TerminalApp {
                 // A modal opened by this exact press owns the rest of the
                 // batch immediately. Its input handler ran before the open, so
                 // later Enter/Escape/arrows are withheld until the next frame.
-                if terminal_input_blocked || self.terminal_input_blocked(ctx) {
+                if ui_input_blocked || self.terminal_input_blocked(ctx) {
                     OrderedPressOutcome::ClaimRest
                 } else {
                     OrderedPressOutcome::Consumed
@@ -2312,6 +2346,25 @@ mod tests {
         ]));
         assert!(semantic_paste_pointer_input_blocked(true, false, true));
         assert!(semantic_paste_pointer_input_blocked(false, false, true));
+    }
+
+    #[test]
+    fn retained_transcript_only_bypasses_its_own_read_only_pointer_boundary() {
+        assert!(!retained_terminal_pointer_input_blocked(
+            true, true, false, false
+        ));
+        assert!(retained_terminal_pointer_input_blocked(
+            true, true, true, false
+        ));
+        assert!(retained_terminal_pointer_input_blocked(
+            true, true, false, true
+        ));
+        assert!(retained_terminal_pointer_input_blocked(
+            true, false, false, false
+        ));
+        assert!(!retained_terminal_pointer_input_blocked(
+            false, false, false, false
+        ));
     }
 
     #[test]

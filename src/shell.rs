@@ -766,6 +766,17 @@ impl ShellSession {
         self.write_tx.clone()
     }
 
+    /// Stop every producer after the child exit event has been consumed while
+    /// keeping the already-rendered terminal transcript alive. Closing the
+    /// queue wakes an idle writer thread and makes every outstanding sender
+    /// fail closed; draining discards only events ordered after the observed
+    /// `Exit` (for example, a racing writer error).
+    pub(crate) fn freeze_after_exit(&self) {
+        self.write_tx.queue.close();
+        self.shutdown.store(true, Ordering::Relaxed);
+        while self.event_rx.try_recv().is_ok() {}
+    }
+
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
         let mut pty = self.pty.lock();
         pty.resize(cols, rows)
@@ -959,6 +970,102 @@ mod tests {
         let chunks = RAW_BYTES.div_ceil(CHUNK_BYTES);
         let conservative_response_bytes = base64_bytes + chunks * 256 + 1024;
         assert!(conservative_response_bytes <= WRITE_MESSAGE_BYTE_CAP);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freezing_an_exited_command_closes_every_writer() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let session = ShellSession::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            None,
+            None,
+            Some(&argv),
+            egui::Context::default(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for command exit");
+            match session.events().recv_timeout(remaining).unwrap() {
+                ShellEvent::Exit(0) => break,
+                ShellEvent::Output(_) => {}
+                ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
+                ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
+            }
+        }
+
+        let cloned_writer = session.write_sender();
+        session.freeze_after_exit();
+        assert!(matches!(
+            session.write(b"ignored"),
+            Err(ShellWriteError::Closed)
+        ));
+        assert!(matches!(
+            cloned_writer.try_send(b"ignored".to_vec()),
+            Err(ShellWriteError::Closed)
+        ));
+        assert!(session.events().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_leader_cannot_leave_same_group_descendants_running() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-pty-descendant-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let escaped_marker = root.join("descendant-escaped");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "(trap '' HUP TERM; sleep 0.6; printf escaped > \"$1\") & exit 0".to_string(),
+            "ember-descendant-test".to_string(),
+            escaped_marker.to_string_lossy().into_owned(),
+        ];
+        let session = ShellSession::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            None,
+            None,
+            Some(&argv),
+            egui::Context::default(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for command exit");
+            match session.events().recv_timeout(remaining).unwrap() {
+                ShellEvent::Exit(0) => break,
+                ShellEvent::Output(_) => {}
+                ShellEvent::Exit(code) => panic!("unexpected exit code {code}"),
+                ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
+            }
+        }
+
+        // The old reap-first path published Exit while the background child
+        // remained alive. Give that child enough time to prove it escaped;
+        // the cleaned private process group can never create this marker.
+        std::thread::sleep(Duration::from_millis(850));
+        assert!(!escaped_marker.exists());
+        drop(session);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

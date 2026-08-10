@@ -343,6 +343,9 @@ impl TerminalApp {
         if !self.session_manager.close_session(index) {
             return false;
         }
+        if let Some(session_id) = removed_session_id.as_deref() {
+            self.task_manager.handle_session_closed(session_id);
+        }
         if self
             .pending_paste_confirm
             .as_ref()
@@ -1036,7 +1039,7 @@ impl TerminalApp {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             if mouse_released {
                 self.sidebar.visible = !self.sidebar.visible;
-                if self.sidebar.visible {
+                if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {
                     if let Some(error) = self.sidebar.refresh() {
                         self.set_status(format!("文件树刷新失败：{error}"));
                     }
@@ -1437,7 +1440,9 @@ impl TerminalApp {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 if mouse_released && !any_tab_drag_in_flight && !pane_drag_in_flight {
                     self.sidebar.visible = !self.sidebar.visible;
-                    if self.sidebar.visible {
+                    if self.sidebar.visible
+                        && self.sidebar.view == crate::sidebar::SidebarView::Files
+                    {
                         if let Some(error) = self.sidebar.refresh() {
                             self.set_status(format!("文件树刷新失败：{error}"));
                         }

@@ -58,6 +58,7 @@ pub struct AgentDiffState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffRequestError {
     Busy,
+    InvalidBase,
     WorkerSpawn(String),
 }
 
@@ -65,6 +66,7 @@ impl fmt::Display for DiffRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => formatter.write_str("a Git diff request is already running"),
+            Self::InvalidBase => formatter.write_str("Git diff base is not a full object ID"),
             Self::WorkerSpawn(error) => {
                 write!(formatter, "could not start Git diff worker: {error}")
             }
@@ -105,6 +107,7 @@ pub struct AgentDiffPanel {
     pub is_open: bool,
     state: AgentDiffState,
     requested_cwd: Option<PathBuf>,
+    requested_base: Option<String>,
     pending: Option<Receiver<WorkerResult>>,
 }
 
@@ -127,12 +130,30 @@ impl AgentDiffPanel {
     /// built-in window; callers embedding [`Self::show_contents`] may set
     /// `is_open` back to false without affecting the worker.
     pub fn request(&mut self, cwd: impl Into<PathBuf>) -> Result<(), DiffRequestError> {
+        self.request_inner(cwd.into(), "HEAD".to_string())
+    }
+
+    /// Start a read-only diff against the immutable commit captured when a
+    /// task worktree was created. A full object ID avoids revision ambiguity
+    /// and option injection.
+    pub fn request_from(
+        &mut self,
+        cwd: impl Into<PathBuf>,
+        base_commit: impl Into<String>,
+    ) -> Result<(), DiffRequestError> {
+        let base_commit = base_commit.into();
+        if !valid_diff_base(&base_commit) || base_commit == "HEAD" {
+            return Err(DiffRequestError::InvalidBase);
+        }
+        self.request_inner(cwd.into(), base_commit)
+    }
+
+    fn request_inner(&mut self, cwd: PathBuf, base: String) -> Result<(), DiffRequestError> {
         self.poll();
         if self.pending.is_some() {
             return Err(DiffRequestError::Busy);
         }
 
-        let cwd = cwd.into();
         self.state = AgentDiffState {
             loading: true,
             error: None,
@@ -140,13 +161,14 @@ impl AgentDiffPanel {
             text: String::new(),
         };
         self.requested_cwd = Some(cwd.clone());
+        self.requested_base = Some(base.clone());
         self.is_open = true;
 
         let (sender, receiver) = mpsc::channel();
         let spawn = std::thread::Builder::new()
             .name("ember-agent-git-diff".to_string())
             .spawn(move || {
-                let _ = sender.send(run_git_diff(&cwd));
+                let _ = sender.send(run_git_diff(&cwd, &base));
             });
         match spawn {
             Ok(_worker) => {
@@ -215,18 +237,18 @@ impl AgentDiffPanel {
 
     fn render_contents(&self, ui: &mut egui::Ui) {
         if let Some(cwd) = &self.requested_cwd {
+            let base = self.requested_base.as_deref().unwrap_or("HEAD");
             ui.label(
-                RichText::new(format!("git diff HEAD · {}", visible_diff_cwd(cwd)))
+                RichText::new(format!("git diff {base} · {}", visible_diff_cwd(cwd)))
                     .small()
                     .weak(),
             );
-            ui.label(
-                RichText::new(
-                    "Current working tree; this view can include changes that predate the Agent task.",
-                )
-                .small()
-                .weak(),
-            );
+            let scope = if base == "HEAD" {
+                "Current working tree; this view can include changes that predate the Agent task."
+            } else {
+                "Compared with the immutable task baseline; includes Agent commits plus current working-tree changes."
+            };
+            ui.label(RichText::new(scope).small().weak());
             ui.label(
                 RichText::new(
                     "Repository-controlled paths and content are untrusted; control and bidirectional formatting characters are made visible or replaced.",
@@ -257,7 +279,8 @@ impl AgentDiffPanel {
         }
 
         if !self.state.loading && self.state.error.is_none() && self.state.text.is_empty() {
-            ui.label(RichText::new("No tracked changes relative to HEAD.").weak());
+            let base = self.requested_base.as_deref().unwrap_or("HEAD");
+            ui.label(RichText::new(format!("No tracked changes relative to {base}.")).weak());
             return;
         }
         if self.state.text.is_empty() {
@@ -314,15 +337,16 @@ impl AgentDiffPanel {
                     return;
                 };
                 let diff_text = bounded_lossy_text(diff.stdout.bytes, MAX_DIFF_STDOUT_BYTES);
+                let base = self.requested_base.as_deref().unwrap_or("HEAD");
                 let diff_body = if diff_text.is_empty() {
-                    "(no tracked changes relative to HEAD)"
+                    format!("(no tracked changes relative to {base})")
                 } else {
-                    diff_text.trim_end()
+                    diff_text.trim_end().to_string()
                 };
-                self.state.text.push_str(
-                    "\n\n$ git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD\n",
-                );
-                self.state.text.push_str(diff_body);
+                self.state.text.push_str(&format!(
+                    "\n\n$ git --no-pager diff --no-ext-diff --no-textconv --no-color {base} --\n"
+                ));
+                self.state.text.push_str(&diff_body);
 
                 self.state.error = (!diff.status.success())
                     .then(|| process_failure_message("git diff", diff.status, diff.stderr.bytes));
@@ -500,7 +524,13 @@ fn git_status_command(git: &Path, cwd: &Path) -> Command {
     command
 }
 
-fn git_diff_command(git: &Path, cwd: &Path) -> Command {
+fn valid_diff_base(base: &str) -> bool {
+    base == "HEAD"
+        || (matches!(base.len(), 40 | 64) && base.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn git_diff_command(git: &Path, cwd: &Path, base: &str) -> Command {
+    debug_assert!(valid_diff_base(base));
     debug_assert!(git.is_absolute());
     let mut command = Command::new(git);
     command
@@ -512,12 +542,13 @@ fn git_diff_command(git: &Path, cwd: &Path) -> Command {
         // A repository-controlled textconv driver is another external helper.
         .arg("--no-textconv")
         .arg("--no-color")
-        .arg("HEAD");
+        .arg(base)
+        .arg("--");
     configure_read_only_git(&mut command, cwd);
     command
 }
 
-fn run_git_diff(cwd: &Path) -> WorkerResult {
+fn run_git_diff(cwd: &Path, base: &str) -> WorkerResult {
     let git = trusted_git_path()?;
     let status_summary = run_git_command(
         git_status_command(&git, cwd),
@@ -532,7 +563,7 @@ fn run_git_diff(cwd: &Path) -> WorkerResult {
     }
 
     let tracked_diff = run_git_command(
-        git_diff_command(&git, cwd),
+        git_diff_command(&git, cwd, base),
         "git diff",
         MAX_DIFF_STDOUT_BYTES,
     )?;
@@ -570,6 +601,20 @@ fn run_command_with_timeout(
         // inspecting submodules). Give the command a private process group so
         // timeout cleanup also closes every inherited pipe writer.
         command.process_group(0);
+        #[cfg(target_os = "linux")]
+        // SAFETY: only async-signal-safe libc calls run between fork and exec.
+        // This read-only helper must not survive an abrupt Ember exit either.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() == 1 {
+                    return Err(io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = command
         .spawn()
@@ -596,57 +641,62 @@ fn run_command_with_timeout(
         }
     };
 
-    let (status, stdout, stderr) = std::thread::scope(|scope| {
-        // Both streams must be drained at the same time. Reading either one
-        // only after wait/output completion can deadlock when the other pipe
-        // fills, even though retained data itself is bounded.
-        let stdout_reader = scope.spawn(move || read_bounded(stdout, stdout_limit));
-        let stderr_reader = scope.spawn(move || read_bounded(stderr, stderr_limit));
-        let mut status = wait_for_child_deadline(&mut child, label, timeout, deadline);
-        if status.is_ok() {
-            // A repository-triggered descendant must not keep either pipe open
-            // after the direct Git process exits. Reader completion shares the
-            // command's original deadline; it does not receive a fresh budget.
-            while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
-                && Instant::now() < deadline
-            {
-                std::thread::sleep(
-                    CHILD_WAIT_POLL_INTERVAL
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
-                let cleanup_error = kill_process_group_id(child.id()).err();
-                let elapsed_ms = timeout.as_millis();
-                status = Err(match cleanup_error {
-                    Some(error) => format!(
-                        "{label} timed out after {elapsed_ms} ms while draining output; cleanup also failed: {error}"
-                    ),
-                    None => format!(
-                        "{label} timed out after {elapsed_ms} ms while draining output"
-                    ),
-                });
-            }
-        }
+    // Do not reap the leader until both readers see EOF. The unreaped child
+    // anchors its private PGID, preventing a drain-timeout cleanup from ever
+    // signalling a newly reused PID. Nonblocking readers share the command's
+    // original deadline, so inherited pipe writers cannot hang scoped joins.
+    let (stdout, stderr) = std::thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || {
+            read_bounded_until(stdout, stdout_limit, deadline)
+                .map_err(|error| format!("could not read git stdout: {error}"))
+        });
+        let stderr_reader = scope.spawn(move || {
+            read_bounded_until(stderr, stderr_limit, deadline)
+                .map_err(|error| format!("could not read git stderr: {error}"))
+        });
         let stdout = stdout_reader
             .join()
             .map_err(|_| "Git stdout reader panicked".to_string())
-            .and_then(|result| {
-                result.map_err(|error| format!("could not read git stdout: {error}"))
-            });
+            .and_then(|result| result);
         let stderr = stderr_reader
             .join()
             .map_err(|_| "Git stderr reader panicked".to_string())
-            .and_then(|result| {
-                result.map_err(|error| format!("could not read git stderr: {error}"))
-            });
-        (status, stdout, stderr)
+            .and_then(|result| result);
+        (stdout, stderr)
     });
 
+    let (stdout, stdout_closed) = match stdout {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            let _ = kill_process_group_and_wait(&mut child);
+            return Err(error);
+        }
+    };
+    let (stderr, stderr_closed) = match stderr {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            let _ = kill_process_group_and_wait(&mut child);
+            return Err(error);
+        }
+    };
+    if !stdout_closed || !stderr_closed {
+        let cleanup_error = kill_process_group_and_wait(&mut child).err();
+        let elapsed_ms = timeout.as_millis();
+        return Err(match cleanup_error {
+            Some(error) => format!(
+                "{label} timed out after {elapsed_ms} ms while draining output; cleanup also failed: {error}"
+            ),
+            None => {
+                format!("{label} timed out after {elapsed_ms} ms while draining output")
+            }
+        });
+    }
+    let status = wait_for_child_deadline(&mut child, label, timeout, deadline)?;
+
     Ok(ProcessOutput {
-        status: status?,
-        stdout: stdout?,
-        stderr: stderr?,
+        status,
+        stdout,
+        stderr,
     })
 }
 
@@ -660,14 +710,12 @@ fn wait_for_child_deadline(
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                let cleanup = kill_process_group_and_wait(child).err();
-                return Err(match cleanup {
-                    Some(cleanup) => format!(
-                        "could not wait for {label}: {error}; cleanup also failed: {cleanup}"
-                    ),
-                    None => format!("could not wait for {label}: {error}"),
-                });
+                // ECHILD (or another ambiguous wait error) can mean the
+                // leader was reaped elsewhere. Never signal its cached PID as
+                // a PGID after that point because the numeric ID may be reused.
+                return Err(format!("could not wait for {label}: {error}"));
             }
         }
 
@@ -761,6 +809,7 @@ fn process_failure_message(label: &str, status: ExitStatus, stderr_bytes: Vec<u8
     }
 }
 
+#[cfg(any(test, not(unix)))]
 fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<CapturedBytes> {
     let mut retained = Vec::with_capacity(limit.min(READ_CHUNK_BYTES));
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
@@ -779,6 +828,72 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<CapturedBytes
         bytes: retained,
         truncated,
     })
+}
+
+#[cfg(unix)]
+fn read_bounded_until(
+    mut reader: impl Read + std::os::fd::AsRawFd,
+    limit: usize,
+    deadline: Instant,
+) -> io::Result<(CapturedBytes, bool)> {
+    let descriptor = reader.as_raw_fd();
+    // SAFETY: fcntl only reads/updates flags on this live, owned pipe fd.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: same descriptor; preserve all existing status flags.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut retained = Vec::with_capacity(limit.min(READ_CHUNK_BYTES));
+    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    let mut truncated = false;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok((
+                CapturedBytes {
+                    bytes: retained,
+                    truncated,
+                },
+                false,
+            ));
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                return Ok((
+                    CapturedBytes {
+                        bytes: retained,
+                        truncated,
+                    },
+                    true,
+                ));
+            }
+            Ok(read) => {
+                let keep = read.min(limit.saturating_sub(retained.len()));
+                retained.extend_from_slice(&chunk[..keep]);
+                truncated |= keep < read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(
+                    CHILD_WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_bounded_until(
+    reader: impl Read,
+    limit: usize,
+    _deadline: Instant,
+) -> io::Result<(CapturedBytes, bool)> {
+    read_bounded(reader, limit).map(|captured| (captured, true))
 }
 
 /// Lossy decoding can expand one invalid input byte into a three-byte Unicode
@@ -873,7 +988,7 @@ mod tests {
 
     #[test]
     fn git_command_has_fixed_read_only_diff_arguments_and_no_shell() {
-        let command = git_diff_command(Path::new("/usr/bin/git"), Path::new("/tmp/repo"));
+        let command = git_diff_command(Path::new("/usr/bin/git"), Path::new("/tmp/repo"), "HEAD");
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -900,7 +1015,8 @@ mod tests {
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-color",
-                "HEAD"
+                "HEAD",
+                "--"
             ]
         );
         assert_eq!(env.get("GIT_PAGER").map(String::as_str), Some("cat"));
@@ -1057,8 +1173,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     // This helper must deliberately exit without waiting: the parent test is
-    // verifying that the outer process-group cleanup reaps an orphaned pipe
-    // holder after its direct child has already gone away.
+    // verifying that the outer process-group cleanup closes an orphaned pipe
+    // holder while the finished direct child remains deliberately unreaped as
+    // a stable PGID anchor.
     #[allow(clippy::zombie_processes)]
     fn pipe_holder_helper_process() {
         if std::env::var_os("EMBER_DIFF_PIPE_HOLDER_HELPER").is_none() {
@@ -1109,6 +1226,18 @@ mod tests {
         assert!(panel.pending.is_some());
     }
 
+    #[test]
+    fn task_diff_base_requires_a_full_object_id() {
+        let mut panel = AgentDiffPanel::new();
+        for invalid in ["", "HEAD", "--output=/tmp/owned", "deadbeef"] {
+            assert_eq!(
+                panel.request_from("/tmp/repo", invalid),
+                Err(DiffRequestError::InvalidBase)
+            );
+        }
+        assert!(valid_diff_base("0123456789abcdef0123456789abcdef01234567"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn completed_state_starts_with_status_including_untracked_then_shows_diff() {
@@ -1149,5 +1278,76 @@ mod tests {
         ));
         assert!(panel.state.text.contains("\n\n$ git --no-pager diff"));
         assert!(panel.state.text.contains("diff --git a/src/lib.rs"));
+    }
+
+    #[test]
+    fn immutable_task_base_keeps_committed_agent_changes_visible() {
+        struct TempRepo(PathBuf);
+        impl Drop for TempRepo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let repository = TempRepo(
+            std::env::temp_dir().join(format!("ember-task-diff-base-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&repository.0).expect("create repository");
+        let git = trusted_git_path().expect("trusted Git");
+        let checked = |args: &[&str]| {
+            let status = Command::new(&git)
+                .current_dir(&repository.0)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .status()
+                .expect("run fixture Git");
+            assert!(status.success(), "Git fixture command failed: {args:?}");
+        };
+        checked(&["init", "--quiet"]);
+        std::fs::write(repository.0.join("tracked.txt"), b"before\n").expect("write baseline");
+        checked(&["add", "--", "tracked.txt"]);
+        checked(&[
+            "-c",
+            "user.name=Ember Tests",
+            "-c",
+            "user.email=ember@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ]);
+        let base = Command::new(&git)
+            .current_dir(&repository.0)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read baseline");
+        assert!(base.status.success());
+        let base = String::from_utf8(base.stdout)
+            .expect("object id is UTF-8")
+            .trim()
+            .to_string();
+
+        std::fs::write(repository.0.join("tracked.txt"), b"after\n").expect("write Agent change");
+        checked(&["add", "--", "tracked.txt"]);
+        checked(&[
+            "-c",
+            "user.name=Ember Tests",
+            "-c",
+            "user.email=ember@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "agent change",
+        ]);
+
+        let output = run_git_diff(&repository.0, &base).expect("task diff runs");
+        assert!(output.status_summary.status.success());
+        assert!(output.status_summary.stdout.bytes.is_empty());
+        let diff = output.tracked_diff.expect("tracked diff result");
+        assert!(diff.status.success());
+        let text = String::from_utf8(diff.stdout.bytes).expect("diff is UTF-8");
+        assert!(text.contains("-before"), "{text}");
+        assert!(text.contains("+after"), "{text}");
     }
 }

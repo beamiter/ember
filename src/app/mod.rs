@@ -6,4 +6,5 @@ pub mod input;
 pub mod rendering;
 pub mod state;
 pub mod tabs;
+pub mod tasks;
 pub mod window;

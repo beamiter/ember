@@ -1,4 +1,4 @@
-use crate::session::Session;
+use crate::session::{Session, SessionPurpose};
 use crate::session_persistence;
 use crate::shell::{ShellEvent, ShellSession, ShellWriteError};
 use crate::terminal::{
@@ -8,6 +8,7 @@ use eframe::egui;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Protocol replies must survive transient PTY-writer backpressure. Keep a
@@ -319,7 +320,9 @@ pub struct BackgroundPumpResult {
     pub bytes_processed: usize,
     pub had_output: bool,
     pub has_more: bool,
-    pub exited_indices: Vec<usize>,
+    /// Child exits retain the real wait status when the PTY worker observed
+    /// one. `None` means the event channel disconnected without a status.
+    pub exited_sessions: Vec<ExitedSession>,
     pub errors: Vec<(usize, String)>,
     pub clipboard_requests: Vec<(usize, Vec<ClipboardReadRequest>)>,
     pub osc52_writes: Vec<(usize, String)>,
@@ -328,6 +331,21 @@ pub struct BackgroundPumpResult {
     /// Completed OSC 133 output snapshots. The caller forwards these to the
     /// asynchronous journal writer after all terminal locks have been dropped.
     pub completed_command_outputs: Vec<(usize, CompletedCommandOutput)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitedSession {
+    pub session_id: String,
+    pub exit_code: Option<i32>,
+}
+
+/// Successful result from creating a session. Callers that keep a long-lived
+/// association must store `session_id`; `session_index` is only the current UI
+/// insertion point and will drift when another tab closes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedSession {
+    pub session_index: usize,
+    pub session_id: String,
 }
 
 /// Retry one session's UI-accepted input as a single shell-writer message.
@@ -499,6 +517,9 @@ impl SessionManager {
             };
             remaining_sessions = remaining_sessions.saturating_sub(1);
             let session = &mut self.sessions[session_idx];
+            if session.purpose == SessionPurpose::RetainedCommand {
+                continue;
+            }
             let protocol_responses = self.protocol_responses[session_idx].clone();
             if let Err(error) = protocol_responses.flush(&session.shell) {
                 if !error.is_backpressure() {
@@ -540,6 +561,7 @@ impl SessionManager {
                 session.metadata.unseen_output = false;
             }
             let mut data = std::mem::take(&mut session.pending_output);
+            let mut exit_code = None;
             let mut exited = false;
 
             if share > 0 && data.len() < share {
@@ -551,7 +573,8 @@ impl SessionManager {
                                 break;
                             }
                         }
-                        Ok(ShellEvent::Exit(_code)) => {
+                        Ok(ShellEvent::Exit(code)) => {
+                            exit_code = Some(code);
                             exited = true;
                             break;
                         }
@@ -638,7 +661,10 @@ impl SessionManager {
             }
 
             if exited {
-                result.exited_indices.push(session_idx);
+                result.exited_sessions.push(ExitedSession {
+                    session_id: session.metadata.session_id.clone(),
+                    exit_code,
+                });
             }
             if protocol_responses.has_pending()
                 || !session.pending_output.is_empty()
@@ -676,6 +702,60 @@ impl SessionManager {
         self.insert_session(Some(name), None, cols, rows, scrollback_lines, Some(argv))
     }
 
+    /// Start a one-shot command in an explicit working directory and return
+    /// its stable identity. Unlike the legacy UI helpers this never falls back
+    /// to the active session on spawn failure, which prevents a task from being
+    /// silently bound to the wrong PTY.
+    pub fn new_command_session_in_cwd(
+        &mut self,
+        name: String,
+        argv: Vec<String>,
+        cwd: &Path,
+        cols: usize,
+        rows: usize,
+        scrollback_lines: usize,
+    ) -> Result<CreatedSession, String> {
+        if !cwd.is_absolute() {
+            return Err("command working directory must be absolute".to_string());
+        }
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| "command working directory is not valid UTF-8".to_string())?;
+        self.try_insert_session(
+            Some(name),
+            None,
+            cols,
+            rows,
+            scrollback_lines,
+            Some(argv),
+            Some(cwd),
+        )
+    }
+
+    /// Freeze an exited one-shot command in place so its terminal transcript
+    /// remains reviewable. Only an already-ephemeral session may transition;
+    /// ordinary shells can never be converted by a stale task binding.
+    pub fn retain_exited_command(&mut self, session_id: &str) -> bool {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.metadata.session_id == session_id)
+        else {
+            return false;
+        };
+        match self.sessions[index].purpose {
+            SessionPurpose::Interactive => return false,
+            SessionPurpose::EphemeralCommand => {
+                self.sessions[index].purpose = SessionPurpose::RetainedCommand;
+            }
+            SessionPurpose::RetainedCommand => {}
+        }
+        self.sessions[index].pending_input.clear();
+        self.sessions[index].shell.freeze_after_exit();
+        self.protocol_responses[index].close();
+        true
+    }
+
     fn insert_session(
         &mut self,
         name: Option<String>,
@@ -685,11 +765,6 @@ impl SessionManager {
         scrollback_lines: usize,
         command_argv: Option<Vec<String>>,
     ) -> usize {
-        let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-        let insert_index = self.active_index + 1;
-        let name = name.unwrap_or_else(|| format!("Session {}", self.sessions.len() + 1));
-        let tags = tags.unwrap_or_default();
-
         // 优先使用 shell 通过 OSC 7 报告的 cwd(SSH/tmux 等场景下 /proc 不能反
         // 映远端进程真实目录);否则退回 /proc/[pid]/cwd。
         let cwd = if !self.sessions.is_empty() {
@@ -700,36 +775,68 @@ impl SessionManager {
             None
         };
 
+        match self.try_insert_session(
+            name,
+            tags,
+            cols,
+            rows,
+            scrollback_lines,
+            command_argv,
+            cwd.as_deref(),
+        ) {
+            Ok(created) => created.session_index,
+            Err(error) => {
+                eprintln!("Failed to create new session: {error}");
+                self.active_index
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_insert_session(
+        &mut self,
+        name: Option<String>,
+        tags: Option<Vec<String>>,
+        cols: usize,
+        rows: usize,
+        scrollback_lines: usize,
+        command_argv: Option<Vec<String>>,
+        cwd: Option<&str>,
+    ) -> Result<CreatedSession, String> {
+        let (cols, rows) = clamp_terminal_dimensions(cols, rows);
+        let insert_index = self.active_index + 1;
+        let name = name.unwrap_or_else(|| format!("Session {}", self.sessions.len() + 1));
+        let tags = tags.unwrap_or_default();
+
         // 在启动 shell 前分配稳定 ID；jsh 的 --session、tab 路由和执行
         // journal 必须从第一条输出起使用同一个值。
         let session_id = crate::session::generate_session_id();
-        let cwd_ref = cwd.as_deref();
-        match ShellSession::new_with_cwd(
+        let shell = ShellSession::new_with_cwd(
             cols,
             rows,
-            cwd_ref,
+            cwd,
             Some(&session_id),
             self.configured_shell.as_deref(),
             command_argv.as_deref(),
             self.repaint_ctx.clone(),
-        ) {
-            Ok(shell) => {
-                let mut terminal = TerminalState::new(cols, rows);
-                terminal.set_max_scrollback(scrollback_lines);
-                let terminal = Arc::new(ParkingMutex::new(terminal));
-                let session = Session::new_with_session_id(name, tags, terminal, shell, session_id);
-                self.sessions.insert(insert_index, session);
-                self.protocol_responses.insert(
-                    insert_index,
-                    ProtocolResponseSender::new(self.repaint_ctx.clone()),
-                );
-                insert_index
-            }
-            Err(e) => {
-                eprintln!("Failed to create new session: {}", e);
-                self.active_index
-            }
+        )?;
+        let mut terminal = TerminalState::new(cols, rows);
+        terminal.set_max_scrollback(scrollback_lines);
+        let terminal = Arc::new(ParkingMutex::new(terminal));
+        let mut session =
+            Session::new_with_session_id(name, tags, terminal, shell, session_id.clone());
+        if command_argv.is_some() {
+            session.purpose = SessionPurpose::EphemeralCommand;
         }
+        self.sessions.insert(insert_index, session);
+        self.protocol_responses.insert(
+            insert_index,
+            ProtocolResponseSender::new(self.repaint_ctx.clone()),
+        );
+        Ok(CreatedSession {
+            session_index: insert_index,
+            session_id,
+        })
     }
 
     /// 关闭指定会话
@@ -839,6 +946,9 @@ impl SessionManager {
     pub fn flush_protocol_responses(&self, index: usize) -> Option<Result<usize, ShellWriteError>> {
         let sender = self.protocol_responses.get(index)?;
         let session = self.sessions.get(index)?;
+        if session.purpose == SessionPurpose::RetainedCommand {
+            return Some(Ok(0));
+        }
         Some(sender.flush(&session.shell))
     }
 
@@ -870,6 +980,7 @@ impl SessionManager {
     pub fn get_session_snapshots(&self) -> Vec<session_persistence::SessionSnapshot> {
         self.sessions
             .iter()
+            .filter(|session| session.purpose == SessionPurpose::Interactive)
             .map(|s| {
                 // OSC 7 is authoritative for remote shells and multiplexers;
                 // /proc only describes the local wrapper process in those
@@ -890,6 +1001,30 @@ impl SessionManager {
                 }
             })
             .collect()
+    }
+
+    /// Active index in the filtered, restorable snapshot. When an ephemeral
+    /// command owns focus, fall back to the first interactive shell rather
+    /// than persisting an index that would select a different restored tab.
+    pub fn restorable_active_index(&self) -> Option<usize> {
+        let active_id = self
+            .sessions
+            .get(self.active_index)
+            .filter(|session| session.purpose == SessionPurpose::Interactive)
+            .map(|session| session.metadata.session_id.as_str());
+        active_id
+            .and_then(|active_id| {
+                self.sessions
+                    .iter()
+                    .filter(|session| session.purpose == SessionPurpose::Interactive)
+                    .position(|session| session.metadata.session_id == active_id)
+            })
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .any(|session| session.purpose == SessionPurpose::Interactive)
+                    .then_some(0)
+            })
     }
 
     /// 从快照恢复额外的会话（第一个已经在外部创建好）
@@ -1033,11 +1168,16 @@ mod tests {
     use super::{
         background_pump_order, refreshed_unseen_output, restored_or_fresh_session_id,
         retry_pending_input, user_input_flush_block, user_input_is_blocked, ProtocolResponseLimits,
-        ProtocolResponseQueueError, ProtocolResponseSender, SessionInputBarriers,
+        ProtocolResponseQueueError, ProtocolResponseSender, SessionInputBarriers, SessionManager,
         UserInputFlushBlock,
     };
-    use crate::shell::ShellWriteError;
+    use crate::session::{Session, SessionPurpose};
+    use crate::shell::{ShellSession, ShellWriteError};
+    use crate::terminal::TerminalState;
+    use parking_lot::Mutex as ParkingMutex;
     use std::collections::HashSet;
+    use std::path::Path;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn tiny_protocol_limits() -> ProtocolResponseLimits {
@@ -1048,6 +1188,65 @@ mod tests {
             critical_reserve_bytes: 2,
             critical_reserve_messages: 1,
         }
+    }
+
+    #[test]
+    fn exact_argv_sessions_are_not_restored_as_interactive_shells() {
+        let repaint = egui::Context::default();
+        let first_id = format!("test-root-{}", uuid::Uuid::new_v4());
+        let first_shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            Some(&first_id),
+            Some("/bin/sh"),
+            None,
+            repaint.clone(),
+        )
+        .expect("interactive fixture shell starts");
+        let first = Session::new_with_session_id(
+            "interactive".to_string(),
+            Vec::new(),
+            Arc::new(ParkingMutex::new(TerminalState::new(80, 24))),
+            first_shell,
+            first_id.clone(),
+        );
+        let mut manager = SessionManager::new(first, repaint, Some("/bad/configured/shell".into()));
+
+        let created = manager
+            .new_command_session_in_cwd(
+                "Agent".to_string(),
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "exit 0".to_string(),
+                ],
+                Path::new("/tmp"),
+                80,
+                24,
+                100,
+            )
+            .expect("explicit argv bypasses configured interactive shell");
+        assert_eq!(
+            manager.sessions()[created.session_index].purpose,
+            SessionPurpose::EphemeralCommand
+        );
+        assert!(manager.retain_exited_command(&created.session_id));
+        assert_eq!(
+            manager.sessions()[created.session_index].purpose,
+            SessionPurpose::RetainedCommand
+        );
+        assert!(!manager.sessions_mut()[created.session_index].queue_input(b"ignored"));
+        assert!(manager.sessions()[created.session_index]
+            .pending_input
+            .is_empty());
+        assert!(!manager.retain_exited_command(&first_id));
+
+        manager.switch_session(created.session_index);
+        assert_eq!(manager.restorable_active_index(), Some(0));
+        let snapshots = manager.get_session_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].session_id.as_deref(), Some(first_id.as_str()));
     }
 
     #[test]

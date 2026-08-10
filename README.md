@@ -201,6 +201,9 @@ jsh_update_check = "daily"     # startup | daily | never
 ai_enabled = false
 ai_share_command_context = false
 
+# Experimental local task dashboard. Independent from cloud-context consent.
+experimental_task_sidebar = false
+
 # Host clipboard policy. Reading is more sensitive than writing.
 osc52_clipboard_write = true
 osc52_clipboard_read = false
@@ -245,6 +248,21 @@ Untracked paths are listed but their contents are not read into the diff view.
 Retry and Agent command execution currently require the recorded cwd to match
 an independently observed local shell-process cwd; SSH/tmux-style wrappers
 fail closed until Ember has an explicit remote execution backend.
+
+The experimental **Tasks** dashboard can be enabled under **Settings → AI &
+Agent** (or with `experimental_task_sidebar = true`). It tracks provider,
+normalized lifecycle state, source-command provenance, an isolated worktree,
+and an attached Agent PTY by stable session ID rather than tab position. The
+compatibility adapter can resolve Codex, Claude, and OpenCode CLIs; the current
+failed-command action creates a Codex task by default, while provider selection
+and native event transports remain later roadmap stages. The opaque CLI bridge
+does not inject the saved command/output into the provider; that context stays
+inside Ember unless a separately consented native flow sends it. Closing a running
+Agent tab marks its task cancelled; a successful child exit becomes **Ready
+for review**, keeps the exited terminal transcript available, and diffs against
+the commit captured when the worktree was created, so Agent commits stay
+visible. Task metadata is currently runtime-only; **Hide task** only hides that
+metadata and deliberately leaves the active worktree untouched.
 
 The Settings panel exposes the same clipboard and paste-confirmation policies
 under **Advanced → Security**, including a way to re-enable confirmation after

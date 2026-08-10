@@ -93,11 +93,24 @@ impl SessionMetadata {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPurpose {
+    /// Ordinary interactive shell; safe to restore from cwd metadata.
+    Interactive,
+    /// Exact-argv helper or Agent CLI. Its argv/lifecycle owner is not part of
+    /// the ordinary shell snapshot, so restoring it as a shell would be false.
+    EphemeralCommand,
+    /// An Agent CLI whose child has exited. Keep its terminal buffer available
+    /// for explicit human review, but never poll or restore it as a live shell.
+    RetainedCommand,
+}
+
 /// Session - 完整的会话，包含终端状态和 Shell 会话
 pub struct Session {
     pub metadata: SessionMetadata,
     pub terminal: Arc<ParkingMutex<TerminalState>>,
     pub shell: ShellSession,
+    pub purpose: SessionPurpose,
     /// User input accepted by the UI but not yet admitted to this session's
     /// bounded PTY write queue. Keeping the retry buffer on the session is a
     /// correctness boundary: switching tabs while the writer is backpressured
@@ -116,6 +129,9 @@ impl Session {
     /// Append bytes to this session's strict input FIFO without crossing its
     /// memory cap. `false` guarantees that no byte was appended.
     pub fn queue_input(&mut self, input: &[u8]) -> bool {
+        if self.purpose == SessionPurpose::RetainedCommand {
+            return false;
+        }
         let queued = append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP);
         if queued {
             self.terminal.lock().note_user_input(input);
@@ -126,6 +142,9 @@ impl Session {
     /// Queue an already-armed Agent command without marking it as unrelated
     /// local input. Callers must arm the terminal generation first.
     pub fn queue_agent_input(&mut self, input: &[u8]) -> bool {
+        if self.purpose == SessionPurpose::RetainedCommand {
+            return false;
+        }
         append_bounded_input(&mut self.pending_input, input, PENDING_INPUT_BYTE_CAP)
     }
 
@@ -162,6 +181,7 @@ impl Session {
             metadata: SessionMetadata::with_session_id(name, tags, session_id),
             terminal,
             shell,
+            purpose: SessionPurpose::Interactive,
             pending_input: Vec::new(),
             pending_output: Vec::new(),
         }

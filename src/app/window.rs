@@ -101,26 +101,32 @@ impl TerminalApp {
             .session_manager
             .sessions()
             .iter()
+            .filter(|session| session.purpose == crate::session::SessionPurpose::Interactive)
             .map(|session| session.metadata.session_id.clone())
             .collect();
         // 每个 tab 存一棵树。转换失败的 tab（其会话缺少稳定 ID）整个跳过，
         // 恢复时它的会话会各自落到单窗格 tab 上，而不是让整份布局作废。
-        let tabs: Vec<_> = self
-            .tabs
-            .layouts()
-            .filter_map(|(tab, flags)| {
-                tab.to_snapshot(&session_ids).map(|mut snapshot| {
-                    // 固定/标记是 tab 级别的状态，布局快照本身不知道它们。
-                    snapshot.pinned = flags.pinned;
-                    snapshot.marked = flags.marked;
-                    snapshot
-                })
-            })
-            .collect();
-        let active_tab = Some(self.tabs.active_index()).filter(|idx| *idx < tabs.len());
+        let original_active_tab = self.tabs.active_index();
+        let mut active_tab = None;
+        let mut tabs = Vec::new();
+        for (original_index, (tab, flags)) in self.tabs.layouts().enumerate() {
+            let Some(mut snapshot) = tab.to_snapshot(&session_ids) else {
+                continue;
+            };
+            // 固定/标记是 tab 级别的状态，布局快照本身不知道它们。
+            snapshot.pinned = flags.pinned;
+            snapshot.marked = flags.marked;
+            if original_index == original_active_tab {
+                active_tab = Some(tabs.len());
+            }
+            tabs.push(snapshot);
+        }
+        if active_tab.is_none() && !tabs.is_empty() {
+            active_tab = Some(0);
+        }
         session_persistence::SessionsSnapshot::from_snapshots(
             snapshots,
-            Some(self.session_manager.active_index()),
+            self.session_manager.restorable_active_index(),
             tabs,
             active_tab,
         )

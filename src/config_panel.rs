@@ -122,6 +122,7 @@ pub struct ConfigPanel {
     /// 最近一次存 key 的结果提示（成功路径或错误信息）。
     ai_key_store_status: Option<Result<String, String>>,
     edit_agent_max_turns: u32,
+    edit_experimental_task_sidebar: bool,
     edit_remote_hosts: Vec<RemoteHostDraft>,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
@@ -181,6 +182,7 @@ impl ConfigPanel {
             edit_ai_key_draft: String::new(),
             ai_key_store_status: None,
             edit_agent_max_turns: 20,
+            edit_experimental_task_sidebar: false,
             edit_remote_hosts: Vec::new(),
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
@@ -270,6 +272,7 @@ impl ConfigPanel {
         self.edit_ai_share_command_context = config.ai_share_command_context;
         self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
         self.edit_agent_max_turns = config.agent_max_turns;
+        self.edit_experimental_task_sidebar = config.experimental_task_sidebar;
         self.edit_remote_hosts = config
             .remote_hosts
             .iter()
@@ -321,6 +324,7 @@ impl ConfigPanel {
         config.ai_api_key_file =
             Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
+        config.experimental_task_sidebar = self.edit_experimental_task_sidebar;
         config.remote_hosts = self
             .edit_remote_hosts
             .iter()
@@ -1223,6 +1227,23 @@ impl ConfigPanel {
                 self.has_changes = true;
             }
         });
+        ui.separator();
+        if ui
+            .checkbox(
+                &mut self.edit_experimental_task_sidebar,
+                "Show experimental Tasks dashboard",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.label(
+            RichText::new(
+                "Enables local task/worktree and Agent-terminal status UI. This does not grant cloud context sharing.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
     }
 
     fn render_advanced_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ConfigAction>) {
@@ -1679,6 +1700,19 @@ mod tests {
         let serialized = toml::to_string_pretty(&applied).expect("serialize config");
         let reparsed: Config = toml::from_str(&serialized).expect("reparse config");
         assert!(reparsed.ai_share_command_context);
+    }
+
+    #[test]
+    fn experimental_task_sidebar_round_trips_through_panel() {
+        let source = Config::default();
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+        assert!(!panel.edit_experimental_task_sidebar);
+
+        panel.edit_experimental_task_sidebar = true;
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+        assert!(applied.experimental_task_sidebar);
     }
 
     #[test]

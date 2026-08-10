@@ -26,6 +26,18 @@ pub enum SidebarView {
     Files,
     Sessions,
     Commands,
+    Tasks,
+}
+
+/// Keep hand-edited or previously-saved experimental views loadable while
+/// ensuring the disabled feature never strands the sidebar on an unreachable
+/// tab.
+pub fn effective_view(configured: SidebarView, task_sidebar_enabled: bool) -> SidebarView {
+    if configured == SidebarView::Tasks && !task_sidebar_enabled {
+        SidebarView::Sessions
+    } else {
+        configured
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -501,6 +513,21 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tasks_view_round_trips_and_falls_back_when_feature_is_disabled() {
+        let serialized = serde_json::to_string(&SidebarView::Tasks).unwrap();
+        assert_eq!(serialized, "\"tasks\"");
+        assert_eq!(
+            serde_json::from_str::<SidebarView>(&serialized).unwrap(),
+            SidebarView::Tasks
+        );
+        assert_eq!(
+            effective_view(SidebarView::Tasks, false),
+            SidebarView::Sessions
+        );
+        assert_eq!(effective_view(SidebarView::Tasks, true), SidebarView::Tasks);
+    }
 
     fn entry(parent: &Path, name: impl Into<String>, is_dir: bool) -> FileEntry {
         let name = name.into();
