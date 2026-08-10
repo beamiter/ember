@@ -1554,7 +1554,7 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
     terminal.process_input(b"\x1b]133;C;jsh_id=exec-7;cmdline_url=echo%20hi;cwd=%2Ftmp\x07");
     assert!(!terminal.shell_is_prompt_ready());
     terminal.process_input(b"hello\r\n");
-    terminal.process_input(b"\x1b]133;D;0;jsh_id=exec-7;duration_ms=12\x07");
+    terminal.process_input(b"\x1b]133;D;0;jsh_id=exec-7;duration_ms=12;cwd=%2Ftmp%2Fafter\x07");
 
     let records = terminal.command_records();
     assert_eq!(records.len(), 1);
@@ -1564,10 +1564,12 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
     assert!(record.command_exact);
     assert!(!record.command_truncated);
     assert_eq!(record.cwd.as_deref(), Some("/tmp"));
+    assert_eq!(record.cwd_after.as_deref(), Some("/tmp/after"));
     assert_eq!(record.exit_code, Some(0));
     assert_eq!(record.duration_ms, Some(12));
     assert_eq!(record.state, CommandState::Complete);
     assert!(record.complete);
+    assert_eq!(terminal.current_working_dir.as_deref(), Some("/tmp/after"));
     assert_eq!(record.prompt_start.column, 0);
     assert_eq!(record.command_start.expect("B anchor").column, 2);
     assert!(record.output_start.is_some());

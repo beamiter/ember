@@ -6,7 +6,7 @@
 
 use super::state::TerminalApp;
 use crate::execution_journal::{self, HistoryLoad, HistoryRequestError, PersistedExecution};
-use crate::terminal::{CommandState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
+use crate::terminal::{CommandRecord, CommandState, MAX_COMPLETED_COMMAND_OUTPUT_BYTES};
 use eframe::egui;
 use jterm_core::block_contract::{classify_completed, CompletedBlockOutcome};
 use std::collections::HashMap;
@@ -84,13 +84,16 @@ struct CommandRowSnapshot {
     command_summary: String,
     command_preview: String,
     command_exact: bool,
+    command_context_fits: bool,
     command_multiline: bool,
     cwd: Option<String>,
+    cwd_context_fits: bool,
     state: CommandState,
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     started_at: Option<SystemTime>,
     output_copy_available: bool,
+    output_context_available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +132,9 @@ enum CommandActionKind {
     CopyCombined,
     Fill,
     RunAgain,
+    FixWithAgent,
+    ExplainWithAgent,
+    CreateAgentTask,
 }
 
 #[derive(Clone, Debug)]
@@ -148,11 +154,29 @@ enum ReplayOutcome {
     EmptyCommand,
     UnsafeCommand(String),
     MultilineRun,
+    WorkingDirectoryChanged,
     WriteFailed(crate::shell::ShellWriteError),
 }
 
 fn replay_outcome_accepted(outcome: &ReplayOutcome) -> bool {
     matches!(outcome, ReplayOutcome::Filled | ReplayOutcome::Ran)
+}
+
+/// An execution-authorizing action needs an independently observed local
+/// shell cwd. OSC 7/133 remains useful display/context data, but because any
+/// PTY program can emit it, it cannot validate itself. Requiring `/proc`'s
+/// shell cwd intentionally disables automatic Run/Fix on remote wrappers and
+/// multiplexers whose local process cwd does not describe the reported
+/// workspace; those need a future explicit remote backend.
+pub(crate) fn verified_local_command_cwd(
+    recorded: &str,
+    reported: Option<&str>,
+    process: Option<&str>,
+) -> bool {
+    let recorded = std::path::Path::new(recorded);
+    recorded.is_absolute()
+        && process.is_some_and(|process| std::path::Path::new(process) == recorded)
+        && reported.is_none_or(|reported| std::path::Path::new(reported) == recorded)
 }
 
 #[derive(Debug)]
@@ -284,6 +308,11 @@ impl TerminalApp {
                             .output_start
                             .zip(record.output_end)
                             .is_some_and(|(start, end)| end > start);
+                    // A completed Agent task needs the owned C..D snapshot,
+                    // including a genuinely empty one. Bare anchors can still
+                    // point at rows already evicted from scrollback, so they
+                    // must not advertise context availability on their own.
+                    let output_context_available = record.captured_output.is_some();
                     Some(CommandRowSnapshot {
                         target: CommandTarget {
                             session_id: session_id.clone(),
@@ -295,6 +324,9 @@ impl TerminalApp {
                         command_exact: record.command_exact
                             && !record.command_truncated
                             && replayable_command.is_some(),
+                        command_context_fits: command.is_some_and(|command| {
+                            command.len() <= crate::agent::context::AGENT_BLOCK_COMMAND_PROMPT_BYTES
+                        }),
                         command_multiline: replayable_command
                             .as_deref()
                             .is_some_and(replay_command_is_multiline),
@@ -302,11 +334,16 @@ impl TerminalApp {
                             .cwd
                             .as_deref()
                             .map(|cwd| single_line_command_preview(cwd, 256)),
+                        cwd_context_fits: record.cwd.as_ref().is_some_and(|cwd| {
+                            !cwd.trim().is_empty()
+                                && cwd.len() <= crate::agent::context::AGENT_BLOCK_CWD_PROMPT_BYTES
+                        }),
                         state: record.state,
                         exit_code: record.exit_code,
                         duration_ms: record.duration_ms,
                         started_at: record.started_at,
                         output_copy_available,
+                        output_context_available,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -374,18 +411,24 @@ impl TerminalApp {
         };
 
         self.sync_command_sidebar_history(&session_id, ui.ctx());
-        enrich_current_tab_rows_from_history(&mut rows, &self.command_sidebar.history);
-        let selected_detail = live_selected_detail.map(|mut detail| {
-            if let Some(record) = self
-                .command_sidebar
-                .history
-                .iter()
-                .find(|record| record.id == detail.target.execution_id)
-            {
-                enrich_live_detail_from_history(&mut detail, record);
+        let mut selected_detail = live_selected_detail;
+        if let Some(session) = self.session_manager.sessions().get(active_index) {
+            let terminal = session.terminal.lock();
+            enrich_current_tab_rows_from_history(
+                &mut rows,
+                terminal.command_records(),
+                &self.command_sidebar.history,
+            );
+            if let Some(detail) = selected_detail.as_mut() {
+                if let Some(record) = self.command_sidebar.history.iter().find(|persisted| {
+                    terminal
+                        .command_record(&detail.target.execution_id)
+                        .is_some_and(|live| persisted_execution_matches_live(live, persisted))
+                }) {
+                    enrich_live_detail_from_history(detail, record);
+                }
             }
-            detail
-        });
+        }
         rows.sort_by_key(|row| row.sequence);
 
         ui.add(
@@ -589,10 +632,41 @@ impl TerminalApp {
                                 ui,
                                 &mut action,
                                 row,
-                                "Run again",
+                                if completed_command_row_is_failed(row) {
+                                    "Retry"
+                                } else {
+                                    "Run again"
+                                },
                                 CommandActionKind::RunAgain,
                                 replay_disabled_reason(row, replay_guard, true),
                             );
+                            if completed_command_row_is_failed(row) {
+                                ui.separator();
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Fix with Agent",
+                                    CommandActionKind::FixWithAgent,
+                                    agent_task_disabled_reason(row),
+                                );
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Explain with Agent",
+                                    CommandActionKind::ExplainWithAgent,
+                                    agent_task_disabled_reason(row),
+                                );
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Create Agent Task",
+                                    CommandActionKind::CreateAgentTask,
+                                    agent_task_disabled_reason(row),
+                                );
+                            }
                         });
                         if selected {
                             if let Some(detail) = selected_detail
@@ -704,6 +778,15 @@ impl TerminalApp {
             }
             CommandActionKind::Fill => self.replay_sidebar_command(&action.target, false),
             CommandActionKind::RunAgain => self.replay_sidebar_command(&action.target, true),
+            CommandActionKind::FixWithAgent => {
+                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Fix)
+            }
+            CommandActionKind::ExplainWithAgent => {
+                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Explain)
+            }
+            CommandActionKind::CreateAgentTask => {
+                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Compose)
+            }
         }
     }
 
@@ -718,10 +801,20 @@ impl TerminalApp {
         if self.command_sidebar.history_session_id.as_deref() != Some(target.session_id.as_str()) {
             return None;
         }
-        self.command_sidebar
+        let session = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)?;
+        let terminal = session.terminal.lock();
+        let live = terminal.command_record(&target.execution_id)?;
+        let index = self
+            .command_sidebar
             .history
             .iter()
-            .find(|record| record.id == target.execution_id)
+            .position(|persisted| persisted_execution_matches_live(live, persisted))?;
+        drop(terminal);
+        self.command_sidebar.history.get(index)
     }
 
     fn jump_to_sidebar_command(&mut self, target: &CommandTarget) {
@@ -760,8 +853,9 @@ impl TerminalApp {
     }
 
     /// Command/output for one block target, exactly as the copy commands see
-    /// it: the live record first, merged with the persisted sidebar record
-    /// (exact command text, and output once the live anchors are gone).
+    /// it: command authority always comes from the live record; a journal
+    /// record whose full live identity was verified may fill output after the
+    /// captured buffer has been evicted.
     /// Returns `(command, command_exact, output)` where output is
     /// `(text, truncated)`; `None` when neither source knows the record.
     fn captured_block_text(
@@ -818,11 +912,7 @@ impl TerminalApp {
             )
         });
         match (live_captured, persisted_captured) {
-            (Some((mut command, mut command_exact, mut output)), Some(persisted)) => {
-                if !command_exact && persisted.1 {
-                    command = persisted.0;
-                    command_exact = true;
-                }
+            (Some((command, command_exact, mut output)), Some(persisted)) => {
                 if output.is_none() {
                     output = persisted.2;
                 }
@@ -830,6 +920,153 @@ impl TerminalApp {
             }
             (Some(captured), None) | (None, Some(captured)) => Some(captured),
             (None, None) => None,
+        }
+    }
+
+    /// Take an owned provenance snapshot for an Agent task while the semantic
+    /// record still exists. Live terminal state is authoritative; after full
+    /// command/cwd/exit/duration verification, the bounded jsh journal may
+    /// fill only an evicted output snapshot and non-authorizing timestamps.
+    fn semantic_context_for_command(
+        &self,
+        target: &CommandTarget,
+    ) -> Result<crate::agent::SemanticCommandContext, String> {
+        let live = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .ok_or_else(|| "Command session is no longer available".to_string())
+            .and_then(|session| {
+                let terminal = session.terminal.lock();
+                let record = terminal
+                    .command_record(&target.execution_id)
+                    .ok_or_else(|| "Command record is no longer available".to_string())?;
+                let output = terminal
+                    .command_output_text(&target.execution_id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES);
+                Ok(crate::agent::SemanticCommandContext {
+                    source_session_id: target.session_id.clone(),
+                    source_execution_id: target.execution_id.clone(),
+                    source_sequence: record.sequence,
+                    command: record.command.clone(),
+                    command_exact: record.command_exact,
+                    command_truncated: record.command_truncated,
+                    cwd: record.cwd.clone(),
+                    cwd_after: record.cwd_after.clone(),
+                    exit_code: record.exit_code,
+                    duration_ms: record.duration_ms,
+                    output_text: output
+                        .as_ref()
+                        .map(|output| output.text.clone())
+                        .unwrap_or_default(),
+                    output_available: output.is_some(),
+                    output_truncated: output.as_ref().is_some_and(|output| output.truncated),
+                    output_total_bytes: output
+                        .as_ref()
+                        .map(|output| output.total_bytes)
+                        .unwrap_or_default(),
+                    started_at: record.started_at,
+                    finished_at: record.finished_at,
+                })
+            })?;
+
+        let Some(persisted) = self.persisted_sidebar_execution(target) else {
+            return Ok(live);
+        };
+        let mut merged = live;
+        let _ = enrich_semantic_context_from_history(&mut merged, persisted);
+        Ok(merged)
+    }
+
+    fn start_agent_task_for_command(&mut self, target: &CommandTarget, intent: AgentTaskIntent) {
+        if !self.config.ai_enabled {
+            self.set_status_for(
+                "Enable AI in Settings before creating an Agent task",
+                Duration::from_secs(5),
+            );
+            return;
+        }
+        let semantic = match self.semantic_context_for_command(target) {
+            Ok(context) => context,
+            Err(error) => {
+                self.set_status_for(error, Duration::from_secs(5));
+                return;
+            }
+        };
+        let is_failed = semantic.exit_code.is_some_and(|exit_code| {
+            classify_completed(semantic.command.as_deref(), Some(exit_code)).is_failed()
+        });
+        if !is_failed {
+            self.set_status("Agent tasks are available for failed commands");
+            return;
+        }
+        if !semantic.command_exact {
+            self.set_status("Exact command metadata is required for an Agent task");
+            return;
+        }
+        let Some(recorded_cwd) = semantic.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty())
+        else {
+            self.set_status("Recorded command cwd is required for an Agent task");
+            return;
+        };
+        let current_cwds = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .map(|session| {
+                (
+                    session.terminal.lock().current_working_dir.clone(),
+                    jterm_core::process::process_cwd(session.get_shell_pid()),
+                )
+            });
+        let Some((reported_cwd, process_cwd)) = current_cwds else {
+            self.set_status_for(
+                "The source terminal working directory is unavailable; wait for shell integration before starting an Agent task",
+                Duration::from_secs(6),
+            );
+            return;
+        };
+        if !verified_local_command_cwd(
+            recorded_cwd,
+            reported_cwd.as_deref(),
+            process_cwd.as_deref(),
+        ) {
+            self.set_status_for(
+                "The source terminal cwd is not independently verified; return a local shell to the command's recorded cwd before starting an Agent task",
+                Duration::from_secs(6),
+            );
+            return;
+        }
+        let prompt = match intent {
+            // Command/output are untrusted PTY evidence and are already
+            // framed by BlockContext. Never interpolate either into the task
+            // instruction, where model-looking text could impersonate Ember.
+            AgentTaskIntent::Fix => Some(
+                "Fix the attached failed command. Diagnose the root cause, make only the necessary changes, and before completing rerun the exact validation command from the attached semantic context."
+                    .to_string(),
+            ),
+            AgentTaskIntent::Explain => Some(
+                "Explain the attached failed command: identify the root cause, cite the relevant evidence in its semantic output, and propose the smallest safe next step. Do not change files unless I ask."
+                    .to_string(),
+            ),
+            AgentTaskIntent::Compose => None,
+        };
+        match self
+            .agent_panel
+            .start_for_block(&self.config, semantic, prompt)
+        {
+            Ok(()) => self.set_status(match intent {
+                AgentTaskIntent::Fix => "Agent is working on the failed command",
+                AgentTaskIntent::Explain => "Agent is explaining the failed command",
+                AgentTaskIntent::Compose => {
+                    "Created a fresh Agent task with the failed command attached"
+                }
+            }),
+            Err(error) => self.set_status_for(
+                format!("Could not start Agent task: {error}"),
+                Duration::from_secs(5),
+            ),
         }
     }
 
@@ -1737,11 +1974,16 @@ impl TerminalApp {
             return;
         }
         let direct_input_blocked = self.direct_input_is_blocked_for_session(&target.session_id);
+        let process_cwd = self
+            .session_manager
+            .sessions()
+            .get(index)
+            .and_then(|session| jterm_core::process::process_cwd(session.get_shell_pid()));
 
-        let persisted_command = self
+        let persisted = self
             .persisted_sidebar_execution(target)
             .filter(|record| !record.command_truncated && !record.command.is_empty())
-            .map(|record| record.command.clone());
+            .map(|record| (record.command.clone(), record.cwd.clone()));
         let outcome = {
             let Some(session) = self.session_manager.get_session_mut(index) else {
                 return self.set_status("Command session is no longer available");
@@ -1749,16 +1991,22 @@ impl TerminalApp {
             let pending_input = direct_input_blocked || !session.pending_input.is_empty();
             let replay = {
                 let terminal = session.terminal.lock();
-                let command = terminal
-                    .command_record(&target.execution_id)
+                let live_record = terminal.command_record(&target.execution_id);
+                let command = live_record
                     .and_then(|record| {
                         (record.command_exact && !record.command_truncated)
                             .then(|| record.command.clone())
                             .flatten()
                     })
-                    .or(persisted_command);
+                    .or_else(|| persisted.as_ref().map(|(command, _cwd)| command.clone()));
+                let source_cwd = live_record
+                    .and_then(|record| record.cwd.clone())
+                    .or_else(|| persisted.as_ref().map(|(_command, cwd)| cwd.clone()));
                 (
                     command,
+                    source_cwd,
+                    terminal.current_working_dir.clone(),
+                    process_cwd,
                     terminal.shell_is_prompt_ready(),
                     terminal.is_alt_buffer(),
                     terminal.is_bracketed_paste_enabled(),
@@ -1776,11 +2024,16 @@ impl TerminalApp {
                     );
                 }
             };
-            if replay.2 {
+            let cwd_matches = replay.1.as_deref().is_some_and(|source| {
+                verified_local_command_cwd(source, replay.2.as_deref(), replay.3.as_deref())
+            });
+            if run && !cwd_matches {
+                ReplayOutcome::WorkingDirectoryChanged
+            } else if replay.5 {
                 ReplayOutcome::AlternateScreen
-            } else if !replay.1 {
+            } else if !replay.4 {
                 ReplayOutcome::NotPromptReady
-            } else if !replay.3 {
+            } else if !replay.6 {
                 ReplayOutcome::BracketedPasteDisabled
             } else if pending_input {
                 ReplayOutcome::PendingInput
@@ -1832,6 +2085,10 @@ impl TerminalApp {
             ReplayOutcome::MultilineRun => {
                 self.set_status("Run again is disabled for multiline commands; use Fill instead")
             }
+            ReplayOutcome::WorkingDirectoryChanged => self.set_status_for(
+                "Retry requires the current shell cwd to match the command's recorded cwd",
+                Duration::from_secs(5),
+            ),
             ReplayOutcome::WriteFailed(error) => self.set_status_for(
                 format!("Command replay failed: {error}"),
                 Duration::from_secs(4),
@@ -1850,6 +2107,13 @@ enum CopyKind {
     Combined,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentTaskIntent {
+    Fix,
+    Explain,
+    Compose,
+}
+
 /// One keyboard block-navigation snapshot — see
 /// [`TerminalApp::block_navigation`]. `had_selection`/`any_failed` let the
 /// callers distinguish a silent clamp from a "nothing to select" toast.
@@ -1863,15 +2127,112 @@ struct BlockNavigation {
 /// see [`TerminalApp::captured_block_text`].
 type CapturedBlockText = (String, bool, Option<(String, bool)>);
 
+fn enrich_semantic_context_from_history(
+    context: &mut crate::agent::SemanticCommandContext,
+    persisted: &PersistedExecution,
+) -> bool {
+    if !persisted_execution_matches_snapshot(
+        LiveExecutionIdentity {
+            id: &context.source_execution_id,
+            command: context.command.as_deref(),
+            command_exact: context.command_exact,
+            command_truncated: context.command_truncated,
+            cwd: context.cwd.as_deref(),
+            exit_code: context.exit_code,
+            duration_ms: context.duration_ms,
+        },
+        persisted,
+    ) {
+        return false;
+    }
+    // The journal is a secondary, bounded output cache. Never let it elevate
+    // reconstructed command text to exact or fill execution-authorizing cwd /
+    // exit metadata. Those fields remain live OSC evidence and had to match
+    // before this point.
+    if context.cwd_after.is_none() {
+        context.cwd_after = persisted.cwd_after.clone();
+    }
+    context.started_at = context
+        .started_at
+        .or_else(|| system_time_from_millis(persisted.started_at_ms));
+    context.finished_at = context
+        .finished_at
+        .or_else(|| persisted.ended_at_ms.and_then(system_time_from_millis));
+    if !context.output_available {
+        if let Some(output) = persisted.output.as_ref() {
+            context.output_text = output.text.clone();
+            context.output_available = true;
+            context.output_truncated = output.truncated;
+            context.output_total_bytes = usize::try_from(output.total_bytes).unwrap_or(usize::MAX);
+        }
+    }
+    true
+}
+
+/// jsh's journal `seq` counts accepted non-empty commands, while the
+/// terminal's `CommandRecord::sequence` counts prompt records (including a
+/// blank Enter). They are intentionally not compared. The process-unique
+/// execution id is instead cross-checked against every execution-authorizing
+/// live field before journal output may fill an evicted capture.
+#[derive(Clone, Copy)]
+struct LiveExecutionIdentity<'a> {
+    id: &'a str,
+    command: Option<&'a str>,
+    command_exact: bool,
+    command_truncated: bool,
+    cwd: Option<&'a str>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+}
+
+fn persisted_execution_matches_snapshot(
+    live: LiveExecutionIdentity<'_>,
+    persisted: &PersistedExecution,
+) -> bool {
+    live.id == persisted.id
+        && live.command_exact
+        && !live.command_truncated
+        && !persisted.command_truncated
+        && live.command == Some(persisted.command.as_str())
+        && live.cwd == Some(persisted.cwd.as_str())
+        && live.exit_code == persisted.exit_code
+        && live.duration_ms == persisted.duration_ms
+}
+
+fn persisted_execution_matches_live(live: &CommandRecord, persisted: &PersistedExecution) -> bool {
+    persisted_execution_matches_snapshot(
+        LiveExecutionIdentity {
+            id: &live.id,
+            command: live.command.as_deref(),
+            command_exact: live.command_exact,
+            command_truncated: live.command_truncated,
+            cwd: live.cwd.as_deref(),
+            exit_code: live.exit_code,
+            duration_ms: live.duration_ms,
+        },
+        persisted,
+    )
+}
+
 /// Persisted metadata may fill gaps in a command that already belongs to the
 /// active tab, but it must never create a sidebar row on its own. A slice
 /// makes that row-count invariant explicit.
 fn enrich_current_tab_rows_from_history(
     rows: &mut [CommandRowSnapshot],
+    live_records: &std::collections::VecDeque<CommandRecord>,
     history: &[PersistedExecution],
 ) {
+    let live_by_id = live_records
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect::<HashMap<_, _>>();
     let history_by_id = history
         .iter()
+        .filter(|persisted| {
+            live_by_id
+                .get(persisted.id.as_str())
+                .is_some_and(|live| persisted_execution_matches_live(live, persisted))
+        })
         .map(|record| (record.id.as_str(), record))
         .collect::<HashMap<_, _>>();
     for row in rows {
@@ -1882,55 +2243,17 @@ fn enrich_current_tab_rows_from_history(
 }
 
 fn enrich_live_row_from_history(row: &mut CommandRowSnapshot, record: &PersistedExecution) {
-    let exact_command = (!record.command_truncated)
-        .then(|| {
-            crate::review_text::sanitize_history_replay(
-                &record.command,
-                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
-            )
-            .ok()
-        })
-        .flatten();
-    if !row.command_exact {
-        if let Some(command) = exact_command.as_deref() {
-            row.command_summary = single_line_command_preview(command, 160);
-            row.command_preview = single_line_command_preview(command, 512);
-            row.command_exact = true;
-            row.command_multiline = replay_command_is_multiline(command);
-        }
-    }
     row.output_copy_available |= record
         .output
         .as_ref()
         .is_some_and(|output| !output.text.is_empty());
+    row.output_context_available |= record.output.is_some();
 }
 
 fn enrich_live_detail_from_history(
     detail: &mut CommandDetailSnapshot,
     record: &PersistedExecution,
 ) {
-    let replayable = (!record.command_truncated)
-        .then(|| {
-            crate::review_text::sanitize_history_replay(
-                &record.command,
-                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
-            )
-            .ok()
-        })
-        .flatten();
-    if !detail.command_exact {
-        if let Some(command) = replayable.as_deref() {
-            detail.command = Some(detail_text_snapshot(
-                &crate::review_text::visible_bounded(command, COMMAND_DETAIL_COMMAND_BYTES),
-                false,
-                command.len(),
-                COMMAND_DETAIL_COMMAND_BYTES,
-            ));
-            detail.command_exact = true;
-            detail.command_omitted = false;
-            detail.command_from_history = true;
-        }
-    }
     if detail.output.is_none() {
         if let Some(output) = record.output.as_ref() {
             detail.output = Some(detail_text_snapshot(
@@ -2014,6 +2337,7 @@ fn render_command_detail(
     action: &mut Option<CommandAction>,
     clear_selection: &mut bool,
 ) {
+    let failed = completed_command_row_is_failed(row);
     egui::Frame::group(ui.style())
         .corner_radius(egui::CornerRadius::same(5))
         .inner_margin(egui::Margin::same(6))
@@ -2127,11 +2451,47 @@ fn render_command_detail(
                     ui,
                     action,
                     row,
-                    "Run",
+                    if failed { "Retry" } else { "Run" },
                     CommandActionKind::RunAgain,
                     replay_disabled_reason(row, replay_guard, true),
                 );
             });
+
+            if failed {
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Agent task")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                    let disabled = agent_task_disabled_reason(row);
+                    command_detail_action_button(
+                        ui,
+                        action,
+                        row,
+                        "Fix",
+                        CommandActionKind::FixWithAgent,
+                        disabled,
+                    );
+                    command_detail_action_button(
+                        ui,
+                        action,
+                        row,
+                        "Explain",
+                        CommandActionKind::ExplainWithAgent,
+                        disabled,
+                    );
+                    command_detail_action_button(
+                        ui,
+                        action,
+                        row,
+                        "Create task",
+                        CommandActionKind::CreateAgentTask,
+                        disabled,
+                    );
+                });
+            }
 
             ui.separator();
             match (detail.state, detail.output.as_ref()) {
@@ -2237,6 +2597,31 @@ fn completed_command_row_outcome(row: &CommandRowSnapshot) -> CompletedBlockOutc
     classify_completed(Some(row.command_preview.as_str()), row.exit_code)
 }
 
+fn completed_command_row_is_failed(row: &CommandRowSnapshot) -> bool {
+    row.state == CommandState::Complete && completed_command_row_outcome(row).is_failed()
+}
+
+/// Agent actions promise the exact semantic command and its C..D output
+/// snapshot. Do not silently substitute display-derived text or an empty
+/// placeholder: the user should know when a task cannot be reproduced.
+fn agent_task_disabled_reason(row: &CommandRowSnapshot) -> Option<&'static str> {
+    if !completed_command_row_is_failed(row) {
+        Some("Agent tasks are available for failed commands")
+    } else if !row.command_exact {
+        Some("The shell did not provide exact command metadata")
+    } else if !row.command_context_fits {
+        Some("The exact command exceeds the Agent context limit")
+    } else if !row.cwd.as_deref().is_some_and(|cwd| !cwd.trim().is_empty()) {
+        Some("The shell did not provide the command working directory")
+    } else if !row.cwd_context_fits {
+        Some("The command working directory exceeds the Agent context limit")
+    } else if !row.output_context_available {
+        Some("The exact semantic output block is unavailable")
+    } else {
+        None
+    }
+}
+
 fn command_row_matches(row: &CommandRowSnapshot, query: &str, filter: CommandFilter) -> bool {
     let matches_filter = match filter {
         CommandFilter::All => true,
@@ -2314,6 +2699,10 @@ fn format_duration(duration_ms: u64) -> String {
         let seconds = duration_ms / 1_000;
         format!("{}m{:02}s", seconds / 60, seconds % 60)
     }
+}
+
+fn system_time_from_millis(milliseconds: u64) -> Option<SystemTime> {
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(milliseconds))
 }
 
 fn format_age(started_at: Option<SystemTime>) -> Option<String> {
@@ -2582,13 +2971,16 @@ mod tests {
             command_summary: "echo test".to_owned(),
             command_preview: "echo test".to_owned(),
             command_exact: exact,
+            command_context_fits: true,
             command_multiline: multiline,
             cwd: None,
+            cwd_context_fits: true,
             state: CommandState::Complete,
             exit_code: Some(0),
             duration_ms: None,
             started_at: None,
             output_copy_available: false,
+            output_context_available: false,
         }
     }
 
@@ -2598,6 +2990,131 @@ mod tests {
             alternate_screen: false,
             bracketed_paste: true,
             pending_input: false,
+        }
+    }
+
+    #[test]
+    fn agent_tasks_require_a_failed_exact_command_and_semantic_output() {
+        let mut row = replay_test_row(true, false);
+        row.exit_code = Some(101);
+        row.cwd = Some("/workspace/ember".to_string());
+        row.output_context_available = true;
+        assert_eq!(agent_task_disabled_reason(&row), None);
+
+        row.command_exact = false;
+        assert_eq!(
+            agent_task_disabled_reason(&row),
+            Some("The shell did not provide exact command metadata")
+        );
+
+        row.command_exact = true;
+        row.command_context_fits = false;
+        assert_eq!(
+            agent_task_disabled_reason(&row),
+            Some("The exact command exceeds the Agent context limit")
+        );
+
+        row.command_context_fits = true;
+        row.cwd = None;
+        assert_eq!(
+            agent_task_disabled_reason(&row),
+            Some("The shell did not provide the command working directory")
+        );
+
+        row.cwd = Some("/workspace/ember".to_string());
+        row.cwd_context_fits = false;
+        assert_eq!(
+            agent_task_disabled_reason(&row),
+            Some("The command working directory exceeds the Agent context limit")
+        );
+
+        row.cwd_context_fits = true;
+        row.output_context_available = false;
+        assert_eq!(
+            agent_task_disabled_reason(&row),
+            Some("The exact semantic output block is unavailable")
+        );
+
+        row.output_context_available = true;
+        row.exit_code = Some(0);
+        assert_eq!(
+            agent_task_disabled_reason(&row),
+            Some("Agent tasks are available for failed commands")
+        );
+    }
+
+    #[test]
+    fn persisted_evidence_enriches_only_the_same_semantic_execution() {
+        let mut context = crate::agent::SemanticCommandContext {
+            source_session_id: "stable-session".to_owned(),
+            source_execution_id: "persisted-execution".to_owned(),
+            // Terminal prompt sequence is deliberately unrelated to the
+            // journal's accepted-command sequence.
+            source_sequence: 42,
+            command: Some("printf hi".to_owned()),
+            command_exact: true,
+            command_truncated: false,
+            cwd: Some("/tmp".to_owned()),
+            cwd_after: None,
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            output_text: String::new(),
+            output_available: false,
+            output_truncated: false,
+            output_total_bytes: 0,
+            started_at: None,
+            finished_at: None,
+        };
+        let persisted = persisted_test_record();
+
+        assert!(enrich_semantic_context_from_history(
+            &mut context,
+            &persisted
+        ));
+        assert_eq!(context.source_session_id, "stable-session");
+        assert_eq!(context.command.as_deref(), Some("printf hi"));
+        assert!(context.command_exact);
+        assert!(!context.command_truncated);
+        assert_eq!(context.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(context.cwd_after.as_deref(), Some("/tmp"));
+        assert_eq!(context.exit_code, Some(0));
+        assert_eq!(context.duration_ms, Some(12));
+        assert_eq!(context.output_text, "hi");
+        assert!(context.output_available);
+        assert_eq!(context.output_total_bytes, 2);
+        assert!(context.started_at.is_some());
+        assert!(context.finished_at.is_some());
+
+        let before = context.clone();
+        context.source_execution_id = "different".to_owned();
+        assert!(!enrich_semantic_context_from_history(
+            &mut context,
+            &persisted
+        ));
+        assert_eq!(context.command, before.command);
+        assert_eq!(context.output_text, before.output_text);
+
+        context.source_execution_id = persisted.id.clone();
+        context.command = Some("stale command".to_owned());
+        assert!(!enrich_semantic_context_from_history(
+            &mut context,
+            &persisted
+        ));
+        assert_eq!(context.command.as_deref(), Some("stale command"));
+        assert_eq!(context.output_text, before.output_text);
+
+        for mismatch in ["cwd", "exit", "duration"] {
+            let mut candidate = before.clone();
+            match mismatch {
+                "cwd" => candidate.cwd = Some("/elsewhere".to_owned()),
+                "exit" => candidate.exit_code = Some(1),
+                "duration" => candidate.duration_ms = Some(99),
+                _ => unreachable!(),
+            }
+            assert!(
+                !enrich_semantic_context_from_history(&mut candidate, &persisted),
+                "{mismatch} conflict must reject journal enrichment"
+            );
         }
     }
 
@@ -2918,15 +3435,67 @@ mod tests {
     }
 
     #[test]
-    fn journal_only_records_never_create_current_tab_rows() {
+    fn execution_cwd_requires_an_independent_matching_local_process() {
+        assert!(verified_local_command_cwd(
+            "/workspace/ember",
+            Some("/workspace/ember"),
+            Some("/workspace/ember")
+        ));
+        assert!(verified_local_command_cwd(
+            "/workspace/ember",
+            None,
+            Some("/workspace/ember")
+        ));
+        assert!(!verified_local_command_cwd(
+            "/workspace/ember",
+            Some("/workspace/spoofed"),
+            Some("/workspace/ember")
+        ));
+        assert!(!verified_local_command_cwd(
+            "/workspace/ember",
+            Some("/workspace/ember"),
+            Some("/local/ssh-wrapper")
+        ));
+        assert!(!verified_local_command_cwd(
+            "/workspace/ember",
+            Some("/workspace/ember"),
+            None
+        ));
+        assert!(!verified_local_command_cwd(
+            "relative/workspace",
+            Some("relative/workspace"),
+            Some("relative/workspace")
+        ));
+    }
+
+    #[test]
+    fn journal_output_matches_exact_live_fields_not_the_unrelated_prompt_sequence() {
         let mut matching_record = persisted_test_record();
         matching_record.id = "execution".to_owned();
+        matching_record.seq = 1;
         let unmatched_record = persisted_test_record();
-        let mut rows = vec![replay_test_row(false, false)];
-        rows[0].command_summary = "(command omitted)".to_owned();
-        rows[0].command_preview = rows[0].command_summary.clone();
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        // The first blank prompt advances TerminalState's local sequence but
+        // is not an accepted jsh command and therefore does not advance the
+        // journal sequence.
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;id=execution;cmdline_url=printf%20hi;cwd_url=%2Ftmp\x07hi\x1b]133;D;0;id=execution;duration_ms=12;cwd_url=%2Ftmp\x07",
+        );
+        let live = terminal.command_record("execution").unwrap();
+        assert_ne!(live.sequence, matching_record.seq);
 
-        enrich_current_tab_rows_from_history(&mut rows, &[unmatched_record, matching_record]);
+        let mut rows = vec![replay_test_row(true, false)];
+        rows[0].command_summary = "printf hi".to_owned();
+        rows[0].command_preview = "printf hi".to_owned();
+        rows[0].cwd = Some("/tmp".to_owned());
+        rows[0].exit_code = Some(0);
+        rows[0].duration_ms = Some(12);
+
+        enrich_current_tab_rows_from_history(
+            &mut rows,
+            terminal.command_records(),
+            &[unmatched_record, matching_record],
+        );
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].command_exact);

@@ -24,6 +24,11 @@ claimed.
 - Full-scrollback search with auto-reveal navigation, bounded live refresh,
   selection-aware replace, and a continuous-grid
   [semantic command timeline](docs/jsh-semantic-executions.md) (OSC 133)
+- Failed semantic commands expose Fix, Explain, Retry, and Create Agent Task
+  actions. Agent tasks retain the selected command's stable source identity,
+  bounded C..D rendered-output snapshot and reported cwd, keep every proposed
+  command behind the existing approval/foreground-PTY gates, and can open a
+  bounded native Git diff review surface
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
@@ -188,6 +193,14 @@ tab_bar_position = "top"      # top | sidebar
 shell = "/bin/bash"            # optional; EMBER_SHELL has priority
 jsh_update_check = "daily"     # startup | daily | never
 
+# AI is off by default. Semantic command context includes the exact command,
+# working directory, and captured output. A direct loopback Ollama endpoint may
+# attach it locally (an inherited HTTP proxy disables that exemption).
+# Anthropic, OpenAI-compatible, and remote Ollama providers require this
+# explicit cloud-sharing opt-in before Ember sends it.
+ai_enabled = false
+ai_share_command_context = false
+
 # Host clipboard policy. Reading is more sensitive than writing.
 osc52_clipboard_write = true
 osc52_clipboard_read = false
@@ -219,6 +232,19 @@ failure markers/navigation, and the Commands sidebar consequently agree that a
 blank/background record carrying a nonzero raw status is not a failed command,
 while a real command with no reported status remains unknown rather than
 success.
+
+Select a failed row in the **Commands** sidebar (or use its context menu) to
+start a fresh Agent task with **Fix**, **Explain**, or **Create task**. The task
+never resumes an unrelated saved transcript, remains bound to the source
+terminal even when another tab is focused, and refuses to replace an Agent
+command that is still running. The failed row's **Retry** action continues to
+use the guarded semantic replay path. **Review Diff** opens an egui surface
+containing bounded `git status --short` and tracked `git diff HEAD`
+output for the current working tree; it may include pre-existing changes.
+Untracked paths are listed but their contents are not read into the diff view.
+Retry and Agent command execution currently require the recorded cwd to match
+an independently observed local shell-process cwd; SSH/tmux-style wrappers
+fail closed until Ember has an explicit remote execution backend.
 
 The Settings panel exposes the same clipboard and paste-confirmation policies
 under **Advanced → Security**, including a way to re-enable confirmation after

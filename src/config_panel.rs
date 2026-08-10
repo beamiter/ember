@@ -115,6 +115,7 @@ pub struct ConfigPanel {
     /// 温度草稿：空串 = 用 provider 默认。
     edit_ai_temperature: String,
     edit_ai_redact_secrets: bool,
+    edit_ai_share_command_context: bool,
     edit_ai_api_key_file: String,
     /// 待存储的 API key 明文；点击 Store 写成 0600 文件后立即清空，从不落盘。
     edit_ai_key_draft: String,
@@ -175,6 +176,7 @@ impl ConfigPanel {
             edit_ai_max_tokens: 1_024,
             edit_ai_temperature: String::new(),
             edit_ai_redact_secrets: true,
+            edit_ai_share_command_context: false,
             edit_ai_api_key_file: String::new(),
             edit_ai_key_draft: String::new(),
             ai_key_store_status: None,
@@ -265,6 +267,7 @@ impl ConfigPanel {
             .map(|t| format!("{t}"))
             .unwrap_or_default();
         self.edit_ai_redact_secrets = config.ai_redact_secrets;
+        self.edit_ai_share_command_context = config.ai_share_command_context;
         self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
         self.edit_agent_max_turns = config.agent_max_turns;
         self.edit_remote_hosts = config
@@ -314,6 +317,7 @@ impl ConfigPanel {
             .ok()
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
         config.ai_redact_secrets = self.edit_ai_redact_secrets;
+        config.ai_share_command_context = self.edit_ai_share_command_context;
         config.ai_api_key_file =
             Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
@@ -1190,6 +1194,26 @@ impl ConfigPanel {
             self.has_changes = true;
         }
 
+        if ui
+            .checkbox(
+                &mut self.edit_ai_share_command_context,
+                "Allow cloud AI to receive command context",
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.label(
+            RichText::new(
+                "A direct loopback Ollama endpoint can attach semantic context without this \
+                 opt-in; inherited HTTP proxy settings disable that exemption. Enable it before \
+                 Anthropic, OpenAI-compatible, or remote Ollama requests send the command, \
+                 working directory, and captured output.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+
         ui.horizontal(|ui| {
             ui.label("Agent turn budget:");
             if ui
@@ -1636,6 +1660,25 @@ mod tests {
         assert!(applied.notify_long_blocks);
         assert_eq!(applied.notify_long_block_threshold_ms, 5_000);
         assert!(applied.show_repo_strip);
+    }
+
+    #[test]
+    fn cloud_command_context_opt_in_round_trips_through_panel_and_config() {
+        let source = Config::default();
+        assert!(!source.ai_share_command_context);
+
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+        assert!(!panel.edit_ai_share_command_context);
+
+        panel.edit_ai_share_command_context = true;
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+        assert!(applied.ai_share_command_context);
+
+        let serialized = toml::to_string_pretty(&applied).expect("serialize config");
+        let reparsed: Config = toml::from_str(&serialized).expect("reparse config");
+        assert!(reparsed.ai_share_command_context);
     }
 
     #[test]

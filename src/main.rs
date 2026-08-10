@@ -1,3 +1,4 @@
+pub mod agent;
 mod agent_panel;
 mod app;
 mod block_mode;
@@ -2038,6 +2039,7 @@ impl TerminalApp {
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
+            agent_diff: agent::AgentDiffPanel::new(),
             jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,

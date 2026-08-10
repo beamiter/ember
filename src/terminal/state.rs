@@ -1601,6 +1601,7 @@ impl super::TerminalState {
             command_exact: false,
             command_truncated: false,
             cwd: self.current_working_dir.clone(),
+            cwd_after: None,
             prompt_start: anchor,
             command_start: None,
             output_start: None,
@@ -1902,7 +1903,16 @@ impl super::TerminalState {
         {
             return;
         }
-        self.apply_record_metadata(index, id, command, cwd);
+        // D's cwd is the post-command directory. It must not overwrite the
+        // cwd captured at C, which is the authority for Retry/task provenance.
+        self.apply_record_metadata(index, id, command, None);
+        if let Some(Ok(cwd_after)) = cwd.map(|value| Self::percent_decode_osc_133(value, 16 * 1024))
+        {
+            if let Some(record) = self.command_records.get_mut(index) {
+                record.cwd_after = Some(cwd_after.clone());
+            }
+            self.current_working_dir = Some(cwd_after);
+        }
         if command_truncated {
             if let Some(record) = self.command_records.get_mut(index) {
                 record.command = None;

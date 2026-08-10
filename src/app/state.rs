@@ -279,6 +279,9 @@ pub struct TerminalApp {
 
     // AI agent panel (per-command approval agent over jterm_core)
     pub agent_panel: crate::agent_panel::AgentPanel,
+    /// Native, read-only Git review surface requested by a structured Agent
+    /// task. Git probes run on its bounded background worker.
+    pub agent_diff: crate::agent::AgentDiffPanel,
     /// Background "is a newer jsh published?" check and the offer it produced.
     pub jsh_notice: crate::jsh_ui::JshNotice,
 

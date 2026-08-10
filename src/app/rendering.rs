@@ -1617,23 +1617,46 @@ impl TerminalApp {
         // AI agent panel: advance the session (harvest model replies, start
         // the next request), render, then apply approved-command effects.
         if self.agent_panel.is_open {
-            let cwd = {
-                let session = self.session_manager.get_active_session_mut();
-                let terminal = session.terminal.lock();
-                terminal.current_working_dir.clone()
-            };
+            // A task remains bound to its source terminal even if the user
+            // inspects another tab while the model is working. Feeding the
+            // active tab's cwd here would silently splice unrelated workspace
+            // context into the next Agent turn.
+            let bound_session_id = self.agent_panel.bound_session_id().map(str::to_owned);
+            let bound_session = bound_session_id.as_deref().and_then(|session_id| {
+                self.session_manager
+                    .sessions()
+                    .iter()
+                    .find(|session| session.metadata.session_id == session_id)
+            });
+            let (cwd, trusted_local_cwd) = bound_session.map_or((None, None), |session| {
+                let reported_cwd = session.terminal.lock().current_working_dir.clone();
+                let process_cwd = jterm_core::process::process_cwd(session.get_shell_pid());
+                let cwd = reported_cwd.or_else(|| process_cwd.clone());
+                let trusted_local_cwd = process_cwd.filter(|local| cwd.as_deref() == Some(local));
+                (cwd, trusted_local_cwd)
+            });
             let shell = self
                 .config
                 .shell
                 .clone()
                 .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()));
-            self.agent_panel.drive(&self.config, cwd.as_deref(), &shell);
+            if bound_session_id.is_some() && bound_session.is_none() {
+                self.agent_panel.binding_lost();
+            } else {
+                self.agent_panel.drive(
+                    &self.config,
+                    cwd.as_deref(),
+                    trusted_local_cwd.as_deref(),
+                    &shell,
+                );
+            }
             let effects = self.agent_panel.show(ctx);
             for effect in effects {
                 match effect {
                     crate::agent_panel::AgentEffect::RunCommand {
                         session_id,
                         command,
+                        required_cwd,
                         epoch,
                         generation,
                     } => {
@@ -1661,6 +1684,27 @@ impl TerminalApp {
                                     );
                                     continue;
                                 };
+                                if let Some(required_cwd) = required_cwd.as_deref() {
+                                    let reported_cwd =
+                                        session.terminal.lock().current_working_dir.clone();
+                                    let process_cwd =
+                                        jterm_core::process::process_cwd(session.get_shell_pid());
+                                    let matches = crate::app::commands::verified_local_command_cwd(
+                                        required_cwd,
+                                        reported_cwd.as_deref(),
+                                        process_cwd.as_deref(),
+                                    );
+                                    if !matches {
+                                        self.agent_panel.execution_start_failed(
+                                            generation,
+                                            "Agent command was not started: the recorded cwd is not independently verified by the local shell process",
+                                        );
+                                        self.set_status(
+                                            "Agent command was not started: return a local shell to the recorded working directory",
+                                        );
+                                        continue;
+                                    }
+                                }
                                 if !agent_input_route_is_clean(
                                     direct_input_blocked,
                                     !session.pending_input.is_empty(),
@@ -1716,9 +1760,54 @@ impl TerminalApp {
                             }
                         }
                     }
+                    crate::agent_panel::AgentEffect::ReviewDiff {
+                        session_id,
+                        recorded_cwd,
+                        epoch,
+                    } => {
+                        if !self.agent_panel.claim_context_effect(&session_id, epoch) {
+                            log::warn!(
+                                "agent: dropped a stale diff effect for terminal session {session_id}"
+                            );
+                            continue;
+                        }
+                        let trusted_cwd = self
+                            .session_manager
+                            .sessions()
+                            .iter()
+                            .find(|session| session.metadata.session_id == session_id)
+                            .and_then(|session| {
+                                jterm_core::process::process_cwd(session.get_shell_pid())
+                            });
+                        let Some(trusted_cwd) = trusted_cwd else {
+                            self.set_status_for(
+                                "Native diff is unavailable because the local source process cwd could not be verified",
+                                std::time::Duration::from_secs(6),
+                            );
+                            continue;
+                        };
+                        let trusted_path = std::path::Path::new(&trusted_cwd);
+                        let recorded_matches = recorded_cwd
+                            .as_deref()
+                            .is_some_and(|recorded| std::path::Path::new(recorded) == trusted_path);
+                        if !trusted_path.is_absolute() || !recorded_matches {
+                            self.set_status_for(
+                                "Native diff requires the recorded command cwd to match the verified local shell cwd",
+                                std::time::Duration::from_secs(6),
+                            );
+                            continue;
+                        }
+                        if let Err(error) = self.agent_diff.request(trusted_path.to_path_buf()) {
+                            self.set_status_for(
+                                format!("Could not open Agent diff: {error}"),
+                                std::time::Duration::from_secs(5),
+                            );
+                        }
+                    }
                 }
             }
         }
+        self.agent_diff.show(ctx);
     }
 
     /// 状态消息 toast。固定锚在屏幕右下角,过期后下一帧自动消失。

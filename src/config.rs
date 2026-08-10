@@ -105,6 +105,13 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub ai_redact_secrets: bool,
 
+    /// Explicit consent for sending semantic terminal context (command, cwd,
+    /// and captured output) to a non-local AI provider. Local Ollama requests
+    /// sent directly to a loopback Ollama endpoint do not require this
+    /// opt-in; an inherited HTTP proxy disables that exemption.
+    #[serde(default)]
+    pub ai_share_command_context: bool,
+
     /// Optional path to a 0600 file holding the provider API key, so the key
     /// never has to live in the process environment or this config file.
     #[serde(default)]
@@ -497,6 +504,7 @@ impl Default for Config {
             ai_max_tokens: default_ai_max_tokens(),
             ai_temperature: None,
             ai_redact_secrets: true,
+            ai_share_command_context: false,
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
             remote_hosts: default_remote_hosts(),
@@ -999,6 +1007,23 @@ mod tests {
 
         let config: Config = toml::from_str("block_mode = false\n").expect("override parses");
         assert!(!config.block_mode);
+    }
+
+    #[test]
+    fn cloud_command_context_sharing_requires_explicit_opt_in() {
+        let defaults = Config::default();
+        assert!(!defaults.ai_share_command_context);
+
+        let omitted: Config = toml::from_str("").expect("empty config parses");
+        assert!(!omitted.ai_share_command_context);
+
+        let opted_in: Config =
+            toml::from_str("ai_share_command_context = true\n").expect("explicit opt-in parses");
+        assert!(opted_in.ai_share_command_context);
+
+        let serialized = toml::to_string_pretty(&opted_in).expect("config serializes");
+        let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
+        assert!(reparsed.ai_share_command_context);
     }
 
     #[test]

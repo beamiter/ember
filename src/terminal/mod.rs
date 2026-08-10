@@ -141,7 +141,11 @@ pub struct CommandRecord {
     pub command_exact: bool,
     /// The producer explicitly omitted or shortened an oversized command.
     pub command_truncated: bool,
+    /// Working directory in which the command started (OSC 133 C).
     pub cwd: Option<String>,
+    /// Working directory reported after the command finished (OSC 133 D).
+    /// Kept separate so a stateful `cd` cannot rewrite execution provenance.
+    pub cwd_after: Option<String>,
     pub prompt_start: BufferAnchor,
     pub command_start: Option<BufferAnchor>,
     pub output_start: Option<BufferAnchor>,

@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
+const PRIVATE_MODEL_CWD_PLACEHOLDER: &str = "(working directory not shared)";
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
     Some(dirs::config_dir()?.join("ember").join("agent_session.json"))
@@ -70,6 +71,13 @@ fn claim_snapshot_session(path: &Path) -> Option<AgentSession> {
             None
         }
     }
+}
+
+fn seal_unbound_restored_session(mut session: AgentSession) -> AgentSession {
+    // Legacy snapshots contain no stable source terminal/cwd. Retain the
+    // transcript, but revoke every action token before showing it again.
+    session.cancel();
+    session
 }
 
 fn persist_session_to_path(path: &Path, session: Option<&AgentSession>) {
@@ -162,8 +170,18 @@ pub enum AgentEffect {
     RunCommand {
         session_id: String,
         command: String,
+        /// Structured tasks may execute only in the source command's cwd.
+        /// The app rechecks this immediately before arming the PTY write.
+        required_cwd: Option<String>,
         epoch: jterm_core::agent::AgentSessionEpoch,
         generation: u64,
+    },
+    /// Load the source worktree's current Git diff into Ember's native review
+    /// surface. The app performs the bounded background probe.
+    ReviewDiff {
+        session_id: String,
+        recorded_cwd: Option<String>,
+        epoch: jterm_core::agent::AgentSessionEpoch,
     },
 }
 
@@ -218,6 +236,97 @@ fn client_from_config(config: &Config) -> Result<AiClient, String> {
     .map_err(|error| error.to_string())
 }
 
+fn ensure_semantic_context_sharing_allowed(config: &Config) -> Result<(), String> {
+    semantic_context_sharing_allowed(config, ai_proxy_environment_present())
+}
+
+fn semantic_context_sharing_allowed(
+    config: &Config,
+    proxy_environment_present: bool,
+) -> Result<(), String> {
+    let provider = config
+        .ai_provider
+        .parse::<Provider>()
+        .map_err(|error| error.to_string())?;
+    if (provider == Provider::Ollama
+        && ollama_base_url_is_loopback(&config.ai_base_url)
+        && !proxy_environment_present)
+        || config.ai_share_command_context
+    {
+        Ok(())
+    } else {
+        Err(
+            "Cloud command context sharing is disabled; enable it in AI settings before sending command, cwd, and output to this provider"
+                .to_string(),
+        )
+    }
+}
+
+fn ai_proxy_environment_present() -> bool {
+    [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ]
+    .into_iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+fn model_prompt_cwd(sharing_allowed: bool, cwd: Option<&str>) -> &str {
+    if sharing_allowed {
+        cwd.unwrap_or(".")
+    } else {
+        PRIVATE_MODEL_CWD_PLACEHOLDER
+    }
+}
+
+/// Only an explicitly loopback Ollama endpoint is local by construction. A
+/// remote Ollama deployment can disclose the same context as any cloud API
+/// and therefore needs the same opt-in. The caller separately rejects a
+/// loopback exemption when curl could inherit a proxy environment.
+fn ollama_base_url_is_loopback(base_url: &str) -> bool {
+    let Some(rest) = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty()
+            && !suffix.strip_prefix(':').is_some_and(|port| {
+                !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return false;
+        }
+        host
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        if port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return false;
+        }
+        host
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 pub struct AgentPanel {
     pub is_open: bool,
     session: Option<AgentSession>,
@@ -228,6 +337,10 @@ pub struct AgentPanel {
     /// the panel was open. Attached to model requests as untrusted block
     /// context so "why did that fail?" has something to look at.
     last_manual_completed: Option<BlockContext>,
+    /// Full provider-neutral provenance for a task created from a semantic
+    /// command block. The compatibility BlockContext above intentionally
+    /// drops these stable ids, so retain the owned source snapshot here.
+    source_context: Option<crate::agent::SemanticCommandContext>,
     input: String,
     /// Proposal currently being edited inline: (id, buffer).
     edit: Option<(ProposalId, String)>,
@@ -251,6 +364,7 @@ impl AgentPanel {
             bound_session_id: None,
             awaiting: None,
             last_manual_completed: None,
+            source_context: None,
             input: String::new(),
             edit: None,
             loading: false,
@@ -275,8 +389,12 @@ impl AgentPanel {
         let restored = snapshot_path().and_then(|path| claim_snapshot_session(&path));
         match restored {
             Some(session) => {
-                self.session = Some(session);
-                self.status = "restored the previous agent session".to_string();
+                // The legacy snapshot schema has no stable terminal binding or
+                // structured source provenance. Preserve its transcript for
+                // review, but never let an old proposal execute in whichever
+                // tab happened to open the panel after restart.
+                self.session = Some(seal_unbound_restored_session(session));
+                self.status = "restored the previous Agent transcript for review only; start a new task to bind this terminal".to_string();
             }
             None => self.session = Some(AgentSession::new(config.agent_max_turns)),
         }
@@ -289,9 +407,119 @@ impl AgentPanel {
         }
     }
 
+    /// Start a new Agent task from one structured semantic command block.
+    ///
+    /// Unlike [`Self::open`], this path deliberately never claims or restores
+    /// the process-wide Agent snapshot: a failed command selected by the user
+    /// is the complete provenance for a new task and must not be appended to an
+    /// unrelated transcript from an earlier Ember run. The context remains
+    /// attached to subsequent model requests until the user detaches it or the
+    /// session is replaced.
+    ///
+    /// When `initial_prompt` is `Some`, it is submitted immediately so the
+    /// fresh session enters [`AgentState::AwaitingModel`]. `None` opens the
+    /// fresh task in [`AgentState::Ready`] and lets the user write the first
+    /// instruction in the panel.
+    pub fn start_for_block(
+        &mut self,
+        config: &Config,
+        context: crate::agent::SemanticCommandContext,
+        initial_prompt: Option<String>,
+    ) -> Result<(), String> {
+        if !config.ai_enabled {
+            return Err("AI features are disabled by configuration".to_string());
+        }
+        if let Some(session) = self.session.as_ref() {
+            let active = match session.state() {
+                AgentState::AwaitingObservation { .. } => Some(
+                    "An approved Agent command is still running; wait for its correlated completion before replacing this task",
+                ),
+                AgentState::AwaitingModel | AgentState::AwaitingApproval { .. } => {
+                    Some("Another Agent task is still active; stop or finish it before starting a new one")
+                }
+                AgentState::Ready if !session.transcript().is_empty() => {
+                    Some("Another Agent task is still open; finish it or choose New task first")
+                }
+                AgentState::Ready
+                | AgentState::Completed
+                | AgentState::Cancelled
+                | AgentState::TurnLimitReached => None,
+            };
+            if let Some(message) = active {
+                return Err(message.to_string());
+            }
+        }
+        // Validate and adapt before replacing a live task. A malformed or
+        // incomplete snapshot must not destroy the task the user is already
+        // supervising.
+        if !context.command_exact {
+            return Err("structured Agent tasks require exact command metadata".to_string());
+        }
+        if !context
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| !cwd.trim().is_empty())
+        {
+            return Err("structured Agent tasks require the source command cwd".to_string());
+        }
+        let block_context = context
+            .to_block_context()
+            .map_err(|error| error.to_string())?;
+        let session_id = context.source_session_id.clone();
+        let initial_prompt = initial_prompt.map(|prompt| prompt.trim().to_string());
+        if initial_prompt.as_deref().is_some_and(str::is_empty) {
+            return Err("initial Agent prompt is empty".to_string());
+        }
+        // A prompt-less Create Task is a local draft: validate the provider's
+        // identity, but defer consent, key, and transport validation until the
+        // user actually sends. Auto-starting Fix/Explain validates everything
+        // before replacing the current task.
+        let provider = config
+            .ai_provider
+            .parse::<Provider>()
+            .map_err(|error| error.to_string())?;
+        let provider_label = if initial_prompt.is_some() {
+            ensure_semantic_context_sharing_allowed(config)?;
+            client_from_config(config)?.display_name()
+        } else {
+            match provider {
+                Provider::Anthropic => "Anthropic",
+                Provider::OpenAiCompatible => "OpenAI-compatible",
+                Provider::Ollama => "Ollama",
+            }
+            .to_string()
+        };
+        let mut fresh_session = AgentSession::new(config.agent_max_turns);
+        if let Some(prompt) = initial_prompt.as_ref() {
+            fresh_session
+                .submit_user(prompt.clone())
+                .map_err(|error| error.to_string())?;
+        }
+
+        self.close_session();
+        self.is_open = true;
+        self.bound_session_id = Some(session_id);
+        self.session = Some(fresh_session);
+        self.last_manual_completed = Some(block_context);
+        self.source_context = Some(context);
+        self.input.clear();
+        self.request_epoch = None;
+        self.status.clear();
+
+        self.provider_label = provider_label;
+        Ok(())
+    }
+
     /// Persist the live session (if any) for the next run. Called on app
     /// exit, before the session is dropped.
     pub fn persist(&self) {
+        if self.source_context.is_some() {
+            // The legacy snapshot envelope cannot preserve source ids/cwd.
+            // Persisting only the transcript would allow a later opener to
+            // rebind a structured task to an unrelated terminal.
+            log::warn!("agent: structured task not written to legacy unbound snapshot format");
+            return;
+        }
         let Some(path) = snapshot_path() else {
             return;
         };
@@ -309,8 +537,52 @@ impl AgentPanel {
         }
     }
 
+    /// Stable terminal binding used for command execution and workspace
+    /// context. The active tab may change while an Agent task is running.
+    pub fn bound_session_id(&self) -> Option<&str> {
+        self.bound_session_id.as_deref()
+    }
+
+    /// Seal a task whose stable terminal binding disappeared. Keep the
+    /// transcript and source provenance visible for review, but stop model
+    /// work and reject every deferred PTY effect.
+    pub fn binding_lost(&mut self) {
+        if self.bound_session_id.take().is_none() {
+            return;
+        }
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.cancel();
+        }
+        self.awaiting = None;
+        self.result_rx = None;
+        self.request_epoch = None;
+        self.loading = false;
+        self.edit = None;
+        self.status =
+            "Agent task stopped because its source terminal session no longer exists".to_string();
+    }
+
+    fn detach_model_context(&mut self) {
+        // Source provenance drives binding/cwd/review and survives. This only
+        // controls whether command/output evidence is attached to later model
+        // requests, matching the UI label.
+        self.last_manual_completed = None;
+    }
+
     /// Close the panel and cancel the whole session.
     pub fn close(&mut self) {
+        if self.session.as_ref().is_some_and(|session| {
+            matches!(session.state(), AgentState::AwaitingObservation { .. })
+        }) {
+            // Closing cannot stop a process already running in the PTY. Keep
+            // the panel/correlation owner alive until OSC 133 D arrives.
+            self.is_open = true;
+            self.status = "Cannot close the Agent panel while its approved command is running; closing would not stop the terminal process".to_string();
+            return;
+        }
         self.close_session();
         self.is_open = false;
     }
@@ -326,6 +598,7 @@ impl AgentPanel {
         self.bound_session_id = None;
         self.awaiting = None;
         self.last_manual_completed = None;
+        self.source_context = None;
         self.result_rx = None;
         self.loading = false;
         self.edit = None;
@@ -334,9 +607,61 @@ impl AgentPanel {
     /// Advance the session: harvest a finished LLM reply and start the next
     /// request when the protocol is waiting on the model. Called every frame
     /// from the app loop; cheap when idle.
-    pub fn drive(&mut self, config: &Config, cwd: Option<&str>, shell: &str) {
+    pub fn drive(
+        &mut self,
+        config: &Config,
+        cwd: Option<&str>,
+        trusted_local_cwd: Option<&str>,
+        shell: &str,
+    ) {
         if !self.is_open {
             return;
+        }
+        if let Some(required_cwd) = self
+            .source_context
+            .as_ref()
+            .and_then(|context| context.cwd.as_deref())
+        {
+            let matches = cwd
+                .is_some_and(|cwd| std::path::Path::new(cwd) == std::path::Path::new(required_cwd))
+                && trusted_local_cwd.is_some_and(|trusted| {
+                    std::path::Path::new(trusted) == std::path::Path::new(required_cwd)
+                });
+            if !matches {
+                if self.session.as_ref().is_some_and(|session| {
+                    matches!(session.state(), AgentState::AwaitingObservation { .. })
+                }) {
+                    // An approved PTY command may itself publish a new OSC 7
+                    // cwd before its correlated OSC 133 D arrives. The
+                    // process is already running, so cancelling here would
+                    // only discard supervision while leaving the side effect
+                    // alive. Keep the correlation owner until completion;
+                    // the next frame can seal the task if the cwd remains
+                    // different.
+                    self.status = "The source terminal changed working directory while an approved Agent command is running; Ember will keep supervising it until completion"
+                        .to_string();
+                    return;
+                }
+                if !self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.state() == AgentState::Cancelled)
+                {
+                    if let Some(cancel) = self.cancel.take() {
+                        cancel.cancel();
+                    }
+                    if let Some(session) = self.session.as_mut() {
+                        session.cancel();
+                    }
+                    self.awaiting = None;
+                    self.result_rx = None;
+                    self.request_epoch = None;
+                    self.loading = false;
+                    self.edit = None;
+                    self.status = "Agent task stopped because the source terminal's recorded working directory no longer matches an independently verified local shell cwd".to_string();
+                }
+                return;
+            }
         }
         if let Some(rx) = &self.result_rx {
             match rx.try_recv() {
@@ -386,11 +711,64 @@ impl AgentPanel {
             .as_ref()
             .is_some_and(|session| session.state() == AgentState::AwaitingModel);
         if needs_model && !self.loading && self.result_rx.is_none() {
-            self.request_model(config, cwd, shell);
+            self.request_model(config, cwd, trusted_local_cwd, shell);
         }
     }
 
-    fn request_model(&mut self, config: &Config, cwd: Option<&str>, shell: &str) {
+    fn request_model(
+        &mut self,
+        config: &Config,
+        cwd: Option<&str>,
+        trusted_local_cwd: Option<&str>,
+        shell: &str,
+    ) {
+        if self.source_context.is_some() && cwd.is_none() {
+            let error =
+                "Agent task stopped because the bound terminal working directory is unavailable"
+                    .to_string();
+            self.status = error.clone();
+            if let Some(session) = self.session.as_mut() {
+                let _ = session.model_failed(error);
+            }
+            return;
+        }
+        // The consent covers the whole workspace envelope, not only the
+        // optional block attachment. Without it a legacy free-form panel may
+        // still send the user's own prompt, but Ember withholds cwd, Git
+        // metadata, and observed command output. A structured task cannot
+        // proceed without its source workspace, including after Detach.
+        let sharing_allowed = match ensure_semantic_context_sharing_allowed(config) {
+            Ok(()) => true,
+            Err(error) if self.source_context.is_some() => {
+                self.status = error.clone();
+                if let Some(session) = self.session.as_mut() {
+                    let _ = session.model_failed(error);
+                }
+                return;
+            }
+            Err(_) => false,
+        };
+        let shared_context = if sharing_allowed {
+            self.last_manual_completed.as_ref()
+        } else {
+            None
+        };
+        if !sharing_allowed
+            && self.session.as_ref().is_some_and(|session| {
+                session
+                    .transcript()
+                    .iter()
+                    .any(|turn| matches!(turn, Turn::Observation { .. }))
+            })
+        {
+            let error = "Cloud command context sharing is disabled; the Agent's terminal observation was kept local"
+                .to_string();
+            self.status = error.clone();
+            if let Some(session) = self.session.as_mut() {
+                let _ = session.model_failed(error);
+            }
+            return;
+        }
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -406,15 +784,24 @@ impl AgentPanel {
         };
         self.provider_label = client.display_name();
         let system = jterm_core::ai::build_agent_system_prompt();
-        // Cached repo probe with a bounded UI wait; None outside a repo.
-        let git = cwd.and_then(|cwd| jterm_core::git_meta::read(std::path::Path::new(cwd)));
+        // OSC cwd is valuable task evidence (and the only meaningful cwd for
+        // ssh/tmux), but it is PTY-controlled and must not authorize local
+        // filesystem reads. Repository metadata is read only when the app has
+        // independently matched it to the bound process's local cwd.
+        let git = sharing_allowed
+            .then(|| {
+                trusted_local_cwd
+                    .filter(|trusted| cwd == Some(*trusted))
+                    .and_then(|trusted| jterm_core::git_meta::read(std::path::Path::new(trusted)))
+            })
+            .flatten();
         let user = jterm_core::ai::agent_user_prompt(
             &session.build_user_prompt(),
-            cwd.unwrap_or("."),
+            model_prompt_cwd(sharing_allowed, cwd),
             shell,
             std::env::consts::OS,
             git.as_ref(),
-            self.last_manual_completed.as_ref(),
+            shared_context,
         );
         let token = AiCancellationToken::new();
         let worker_token = token.clone();
@@ -486,6 +873,18 @@ impl AgentPanel {
         if completed.agent_generation.is_some() {
             return;
         }
+        // A task created from an explicit command block keeps that immutable
+        // source snapshot. Unrelated manual commands in the same PTY must not
+        // silently replace the evidence the user chose to share.
+        if self.source_context.is_some() {
+            return;
+        }
+        let Some(exit_code) = completed.exit_code else {
+            // Unknown is real protocol state, not an implicit failure. The
+            // compatibility BlockContext cannot represent it, so fail closed
+            // instead of inventing exit 1.
+            return;
+        };
         let Some(command) = reported else {
             return;
         };
@@ -505,7 +904,7 @@ impl AgentPanel {
             cmd: command,
             output: output.to_string(),
             cwd: completed.cwd.clone(),
-            exit_code: completed.exit_code.unwrap_or(1),
+            exit_code,
             truncated: completed.truncated,
         });
     }
@@ -530,7 +929,9 @@ impl AgentPanel {
         let mut edit_rejected: Option<String> = None;
         let mut continue_task = false;
         let mut new_task = false;
+        let mut stop_task = false;
         let mut clear_context = false;
+        let mut review_diff = false;
 
         egui::Window::new("AI Agent")
             .open(&mut open)
@@ -764,14 +1165,42 @@ impl AgentPanel {
                 } else {
                     ui.colored_label(ui.visuals().warn_fg_color, self.status.as_str());
                 }
+                match session.state() {
+                    AgentState::AwaitingModel
+                    | AgentState::AwaitingApproval { .. }
+                    | AgentState::Ready
+                        if !session.transcript().is_empty() =>
+                    {
+                        if ui.button("Stop task").clicked() {
+                            stop_task = true;
+                        }
+                    }
+                    AgentState::AwaitingObservation { .. } => {
+                        ui.label(
+                            egui::RichText::new(
+                                "The approved terminal command must finish before this task can be stopped or closed.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    _ => {}
+                }
+                if self.source_context.is_some() && self.bound_session_id.is_some() {
+                    ui.horizontal(|ui| {
+                        if ui.button("Review Diff").clicked() {
+                            review_diff = true;
+                        }
+                    });
+                }
 
                 // A finished task can be followed up (same transcript, budget
                 // permitting) or replaced by a fresh one in the same binding.
                 let can_continue = session.can_continue_after_completion();
                 let can_restart = matches!(
                     session.state(),
-                    AgentState::Completed | AgentState::TurnLimitReached
-                );
+                    AgentState::Completed | AgentState::Cancelled | AgentState::TurnLimitReached
+                ) || (session.state() == AgentState::Ready && !session.transcript().is_empty());
                 if can_continue || can_restart {
                     ui.horizontal(|ui| {
                         if can_continue && ui.button("Continue task").clicked() {
@@ -783,11 +1212,29 @@ impl AgentPanel {
                     });
                 }
 
+                if let Some(source) = self.source_context.as_ref() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "source: @block:{} · cwd `{}`",
+                            crate::review_text::visible_bounded(
+                                &source.source_execution_id,
+                                160,
+                            ),
+                            crate::review_text::visible_bounded(
+                                source.cwd.as_deref().unwrap_or("unavailable"),
+                                crate::agent::context::AGENT_BLOCK_CWD_PROMPT_BYTES,
+                            )
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+
                 if let Some(context) = self.last_manual_completed.as_ref() {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!(
-                                "attached context: `{}` (exit {})",
+                                "attached to model: `{}` (exit {})",
                                 crate::review_text::visible_bounded(
                                     &context.cmd,
                                     crate::review_text::MAX_HISTORY_COMMAND_BYTES,
@@ -834,16 +1281,32 @@ impl AgentPanel {
         if let Some(error) = edit_rejected {
             self.status = error;
         }
+        if stop_task {
+            if let Some(cancel) = self.cancel.take() {
+                cancel.cancel();
+            }
+            if let Some(session) = self.session.as_mut() {
+                session.cancel();
+            }
+            self.awaiting = None;
+            self.result_rx = None;
+            self.request_epoch = None;
+            self.loading = false;
+            self.edit = None;
+            self.status = "Agent task stopped".to_string();
+        }
         if continue_task || new_task {
             self.edit = None;
             self.awaiting = None;
-            if let Some(session) = self.session.as_mut() {
-                let result = if continue_task {
-                    session.continue_after_completion()
-                } else {
-                    session.start_new_task()
-                };
-                match result {
+            if new_task {
+                self.last_manual_completed = None;
+                self.source_context = None;
+                if let Some(max_turns) = self.session.as_ref().map(AgentSession::max_turns) {
+                    self.session = Some(AgentSession::new(max_turns));
+                    self.status.clear();
+                }
+            } else if let Some(session) = self.session.as_mut() {
+                match session.continue_after_completion() {
                     Ok(()) => self.status.clear(),
                     Err(error) => self.status = error.to_string(),
                 }
@@ -853,7 +1316,7 @@ impl AgentPanel {
             self.edit = None;
         }
         if clear_context {
-            self.last_manual_completed = None;
+            self.detach_model_context();
         }
         if let Some((id, edited)) = approve {
             self.edit = None;
@@ -867,6 +1330,21 @@ impl AgentPanel {
                 if let Err(error) = session.reject(id) {
                     self.status = error.to_string();
                 }
+            }
+        }
+        if review_diff {
+            if let (Some(session_id), Some(epoch)) = (
+                self.bound_session_id.clone(),
+                self.session.as_ref().map(AgentSession::epoch),
+            ) {
+                effects.push(AgentEffect::ReviewDiff {
+                    session_id,
+                    recorded_cwd: self
+                        .source_context
+                        .as_ref()
+                        .and_then(|context| context.cwd.clone()),
+                    epoch,
+                });
             }
         }
         if !open {
@@ -894,6 +1372,10 @@ impl AgentPanel {
 
     fn approve(&mut self, id: ProposalId, edited: Option<String>) -> Option<AgentEffect> {
         let session_id = self.bound_session_id.clone()?;
+        let required_cwd = self
+            .source_context
+            .as_ref()
+            .and_then(|context| context.cwd.clone());
         let session = self.session.as_mut()?;
         let epoch = session.epoch();
         let candidate = edited.as_deref().or_else(|| proposal_command(session, id));
@@ -943,6 +1425,7 @@ impl AgentPanel {
                 Some(AgentEffect::RunCommand {
                     session_id,
                     command: approved.command,
+                    required_cwd,
                     epoch,
                     generation,
                 })
@@ -985,6 +1468,23 @@ impl AgentPanel {
         }
         pending.run_effect_claimed = true;
         true
+    }
+
+    /// Claim a synchronous provenance-bound UI effect. This prevents a
+    /// Review click from an old window frame from applying after task/session
+    /// replacement.
+    pub fn claim_context_effect(
+        &self,
+        session_id: &str,
+        epoch: jterm_core::agent::AgentSessionEpoch,
+    ) -> bool {
+        self.is_open
+            && self.bound_session_id.as_deref() == Some(session_id)
+            && self.source_context.is_some()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_current_epoch(epoch))
     }
 
     pub fn execution_start_failed(&mut self, generation: u64, message: impl Into<String>) {
@@ -1030,13 +1530,143 @@ mod tests {
         }
     }
 
+    fn failed_block_context() -> crate::agent::SemanticCommandContext {
+        crate::agent::SemanticCommandContext {
+            source_session_id: "source-session".into(),
+            source_execution_id: "exec-42".into(),
+            source_sequence: 42,
+            command: Some("cargo test".into()),
+            command_exact: true,
+            command_truncated: false,
+            cwd: Some("/workspace/ember".into()),
+            cwd_after: Some("/workspace/ember".into()),
+            exit_code: Some(101),
+            duration_ms: Some(100),
+            output_text: "error: test failed\n".into(),
+            output_available: true,
+            output_truncated: false,
+            output_total_bytes: 19,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
     fn ai_config() -> Config {
         Config {
             ai_enabled: true,
             ai_provider: "ollama".into(),
             ai_base_url: "http://localhost:11434".into(),
             ai_model: "codellama:7b".into(),
+            // Most tests exercise state transitions rather than environment
+            // proxy policy; make their consent independent of the test host.
+            ai_share_command_context: true,
             ..Config::default()
+        }
+    }
+
+    #[test]
+    fn cloud_semantic_context_requires_explicit_sharing_consent() {
+        let mut cloud = ai_config();
+        cloud.ai_provider = "anthropic".into();
+        cloud.ai_share_command_context = false;
+        assert!(ensure_semantic_context_sharing_allowed(&cloud)
+            .unwrap_err()
+            .contains("disabled"));
+
+        cloud.ai_share_command_context = true;
+        assert!(ensure_semantic_context_sharing_allowed(&cloud).is_ok());
+
+        let mut local = ai_config();
+        local.ai_share_command_context = false;
+        assert!(semantic_context_sharing_allowed(&local, false).is_ok());
+        assert!(semantic_context_sharing_allowed(&local, true)
+            .unwrap_err()
+            .contains("disabled"));
+
+        let mut remote_ollama = ai_config();
+        remote_ollama.ai_base_url = "http://models.example.test:11434".into();
+        remote_ollama.ai_share_command_context = false;
+        assert!(ensure_semantic_context_sharing_allowed(&remote_ollama)
+            .unwrap_err()
+            .contains("disabled"));
+        remote_ollama.ai_share_command_context = true;
+        assert!(ensure_semantic_context_sharing_allowed(&remote_ollama).is_ok());
+    }
+
+    #[test]
+    fn legacy_cloud_prompt_hides_workspace_without_context_consent() {
+        assert_eq!(
+            model_prompt_cwd(false, Some("/workspace/private-project")),
+            PRIVATE_MODEL_CWD_PLACEHOLDER
+        );
+        assert_eq!(
+            model_prompt_cwd(true, Some("/workspace/private-project")),
+            "/workspace/private-project"
+        );
+        assert_eq!(model_prompt_cwd(true, None), ".");
+    }
+
+    #[test]
+    fn legacy_cloud_agent_keeps_terminal_observations_local_without_consent() {
+        let mut panel = AgentPanel::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some("legacy-session".into());
+        panel.session = Some(AgentSession::new(4));
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let AgentEffect::RunCommand { generation, .. } =
+            panel.approve(id, None).expect("approval effect")
+        else {
+            panic!("expected run effect");
+        };
+        let mut observation = completed("pwd", 0, "/workspace/private-project");
+        observation.agent_generation = Some(generation);
+        panel.handle_completed("legacy-session", &observation);
+
+        let mut cloud = ai_config();
+        cloud.ai_provider = "anthropic".into();
+        cloud.ai_base_url = "https://api.anthropic.com".into();
+        cloud.ai_share_command_context = false;
+        panel.drive(
+            &cloud,
+            Some("/workspace/private-project"),
+            Some("/workspace/private-project"),
+            "sh",
+        );
+
+        assert!(panel.status.contains("observation was kept local"));
+        assert!(panel.result_rx.is_none());
+        assert!(!panel.loading);
+    }
+
+    #[test]
+    fn only_unambiguous_loopback_ollama_urls_bypass_cloud_consent() {
+        for local in [
+            "http://localhost:11434",
+            "https://127.0.0.1/v1",
+            "http://127.42.0.9:11434",
+            "http://[::1]:11434/api",
+        ] {
+            assert!(ollama_base_url_is_loopback(local), "{local}");
+        }
+        for remote_or_ambiguous in [
+            "http://models.example.test:11434",
+            "http://localhost.example.test",
+            "http://localhost@models.example.test",
+            "http://[::1.example.test]:11434",
+            "file://localhost/tmp/socket",
+            "localhost:11434",
+        ] {
+            assert!(
+                !ollama_base_url_is_loopback(remote_or_ambiguous),
+                "{remote_or_ambiguous}"
+            );
         }
     }
 
@@ -1292,6 +1922,268 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn structured_block_start_is_fresh_bound_and_keeps_exact_context() {
+        let config = ai_config();
+        let mut previous = AgentSession::new(2);
+        previous.submit_user("unrelated old task").unwrap();
+        previous.cancel();
+        let previous_epoch = previous.epoch();
+        let old_context = BlockContext {
+            cmd: "old command".into(),
+            output: "old output".into(),
+            cwd: Some("/old/workspace".into()),
+            exit_code: 1,
+            truncated: true,
+        };
+        let context = failed_block_context();
+        let mut panel = AgentPanel::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some("old-session".into());
+        panel.session = Some(previous);
+        panel.last_manual_completed = Some(old_context);
+        panel.input = "stale draft".into();
+        panel.request_epoch = Some(previous_epoch);
+
+        panel
+            .start_for_block(&config, context.clone(), None)
+            .unwrap();
+
+        let session = panel.session.as_ref().expect("fresh session");
+        assert!(panel.is_open);
+        assert_eq!(panel.bound_session_id.as_deref(), Some("source-session"));
+        assert_ne!(session.epoch(), previous_epoch);
+        assert_eq!(session.max_turns(), config.agent_max_turns);
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(session.transcript().is_empty());
+        assert_eq!(panel.source_context.as_ref(), Some(&context));
+        assert_eq!(
+            panel.last_manual_completed.as_ref(),
+            Some(&context.to_block_context().unwrap())
+        );
+        assert!(panel.input.is_empty());
+        assert_eq!(panel.request_epoch, None);
+    }
+
+    #[test]
+    fn structured_block_start_can_submit_the_first_prompt_immediately() {
+        let context = failed_block_context();
+        let mut panel = AgentPanel::new();
+
+        panel
+            .start_for_block(
+                &ai_config(),
+                context.clone(),
+                Some("  Fix this failed command  ".into()),
+            )
+            .unwrap();
+
+        let session = panel.session.as_ref().expect("fresh session");
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+        assert_eq!(
+            session.transcript(),
+            &[Turn::User("Fix this failed command".into())]
+        );
+        assert_eq!(panel.bound_session_id.as_deref(), Some("source-session"));
+        assert_eq!(panel.source_context.as_ref(), Some(&context));
+        assert_eq!(
+            panel.last_manual_completed.as_ref(),
+            Some(&context.to_block_context().unwrap())
+        );
+    }
+
+    #[test]
+    fn promptless_cloud_task_is_a_local_draft_until_the_user_sends() {
+        let mut cloud = ai_config();
+        cloud.ai_provider = "anthropic".into();
+        cloud.ai_base_url = "https://api.anthropic.com".into();
+        cloud.ai_share_command_context = false;
+
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&cloud, failed_block_context(), None)
+            .expect("creating a local draft sends no context");
+
+        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Ready);
+        assert_eq!(panel.provider_label, "Anthropic");
+    }
+
+    #[test]
+    fn detaching_block_evidence_cannot_bypass_structured_cloud_consent() {
+        let mut cloud = ai_config();
+        cloud.ai_provider = "anthropic".into();
+        cloud.ai_base_url = "https://api.anthropic.com".into();
+        cloud.ai_share_command_context = false;
+
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&cloud, failed_block_context(), None)
+            .expect("creating the local draft sends nothing");
+        panel.detach_model_context();
+        panel
+            .session
+            .as_mut()
+            .unwrap()
+            .submit_user("continue")
+            .unwrap();
+
+        panel.drive(
+            &cloud,
+            Some("/workspace/ember"),
+            Some("/workspace/ember"),
+            "sh",
+        );
+
+        assert!(panel.status.contains("sharing is disabled"));
+        assert!(panel.result_rx.is_none());
+        assert!(!panel.loading);
+        assert!(panel.source_context.is_some());
+        assert!(panel.last_manual_completed.is_none());
+    }
+
+    #[test]
+    fn structured_task_stops_when_the_bound_terminal_leaves_source_cwd() {
+        let source = failed_block_context();
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), source.clone(), None)
+            .unwrap();
+
+        panel.drive(
+            &ai_config(),
+            Some("/workspace/another"),
+            Some("/workspace/another"),
+            "sh",
+        );
+
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+        assert_eq!(panel.source_context.as_ref(), Some(&source));
+        assert!(panel.status.contains("recorded working directory"));
+    }
+
+    #[test]
+    fn detaching_model_evidence_preserves_source_provenance() {
+        let source = failed_block_context();
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), source.clone(), None)
+            .unwrap();
+
+        panel.detach_model_context();
+
+        assert!(panel.last_manual_completed.is_none());
+        assert_eq!(panel.source_context.as_ref(), Some(&source));
+        let epoch = panel.session.as_ref().unwrap().epoch();
+        assert!(panel.claim_context_effect("source-session", epoch));
+    }
+
+    #[test]
+    fn legacy_snapshot_restore_is_review_only_without_binding_provenance() {
+        let mut pending = AgentSession::new(4);
+        pending.submit_user("list files").unwrap();
+        pending
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        assert!(matches!(
+            pending.state(),
+            AgentState::AwaitingApproval { .. }
+        ));
+
+        let restored = seal_unbound_restored_session(pending);
+
+        assert_eq!(restored.state(), AgentState::Cancelled);
+        assert!(!restored.transcript().is_empty());
+    }
+
+    #[test]
+    fn incomplete_block_context_does_not_replace_the_live_task() {
+        let mut panel = AgentPanel::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some("live-session".into());
+        panel.session = Some(AgentSession::new(4));
+        let live_epoch = panel.session.as_ref().unwrap().epoch();
+        let mut incomplete = failed_block_context();
+        incomplete.output_available = false;
+
+        let error = panel
+            .start_for_block(&ai_config(), incomplete, Some("Fix it".into()))
+            .unwrap_err();
+
+        assert!(error.contains("output"));
+        assert!(panel.is_open);
+        assert_eq!(panel.bound_session_id.as_deref(), Some("live-session"));
+        assert_eq!(panel.session.as_ref().unwrap().epoch(), live_epoch);
+    }
+
+    #[test]
+    fn active_task_must_finish_before_a_semantic_task_can_replace_it() {
+        let mut active = AgentSession::new(4);
+        active.submit_user("keep working").unwrap();
+        let active_epoch = active.epoch();
+        let mut panel = AgentPanel::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some("live-session".into());
+        panel.session = Some(active);
+
+        let error = panel
+            .start_for_block(&ai_config(), failed_block_context(), Some("Fix it".into()))
+            .unwrap_err();
+
+        assert!(error.contains("still active"));
+        assert_eq!(panel.bound_session_id.as_deref(), Some("live-session"));
+        assert_eq!(panel.session.as_ref().unwrap().epoch(), active_epoch);
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::AwaitingModel
+        );
+    }
+
+    #[test]
+    fn unrelated_manual_completion_cannot_replace_explicit_task_provenance() {
+        let source = failed_block_context();
+        let expected = source.to_block_context().unwrap();
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), source.clone(), None)
+            .unwrap();
+
+        panel.handle_completed(
+            "source-session",
+            &completed("printf unrelated", 0, "unrelated output"),
+        );
+
+        assert_eq!(panel.source_context.as_ref(), Some(&source));
+        assert_eq!(panel.last_manual_completed.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn losing_the_bound_terminal_seals_work_but_keeps_review_provenance() {
+        let source = failed_block_context();
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), source.clone(), Some("Fix the failure".into()))
+            .unwrap();
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::AwaitingModel
+        );
+
+        panel.binding_lost();
+
+        assert_eq!(panel.bound_session_id, None);
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+        assert_eq!(panel.source_context.as_ref(), Some(&source));
+        assert!(panel.status.contains("no longer exists"));
+        assert!(!panel.loading);
+        assert!(panel.result_rx.is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_snapshot_io_rejects_unsafe_entries_and_never_uses_the_legacy_stage() {
@@ -1355,11 +2247,16 @@ mod tests {
         let AgentEffect::RunCommand {
             session_id,
             command,
+            required_cwd,
             epoch,
             generation,
-        } = effect;
+        } = effect
+        else {
+            panic!("expected command effect");
+        };
         assert_eq!(session_id, "session-three");
         assert_eq!(command, "ls -la");
+        assert_eq!(required_cwd, None);
         assert_ne!(generation, 0);
         assert!(panel.awaiting.is_some());
         assert!(panel.claim_run_effect(&session_id, &command, epoch, generation));
@@ -1403,6 +2300,131 @@ mod tests {
     }
 
     #[test]
+    fn running_approved_command_keeps_panel_open_until_correlated_completion() {
+        let mut panel = AgentPanel::new();
+        panel.open(&ai_config(), "session-three".into());
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("list files").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let AgentEffect::RunCommand { generation, .. } =
+            panel.approve(id, None).expect("approval effect")
+        else {
+            panic!("expected command effect");
+        };
+
+        panel.close();
+        assert!(panel.is_open);
+        assert!(panel.session.is_some());
+        assert!(panel.awaiting.is_some());
+        assert!(panel.status.contains("would not stop"));
+
+        let mut completion = completed("ls", 0, "ok");
+        completion.agent_generation = Some(generation);
+        panel.handle_completed("session-three", &completion);
+        panel.close();
+        assert!(!panel.is_open);
+        assert!(panel.session.is_none());
+    }
+
+    #[test]
+    fn cwd_drift_during_an_approved_command_keeps_correlation_until_completion() {
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), failed_block_context(), None)
+            .unwrap();
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("change directory").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"cd subdir"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let AgentEffect::RunCommand {
+            session_id,
+            command,
+            epoch,
+            generation,
+            ..
+        } = panel.approve(id, None).expect("approval effect")
+        else {
+            panic!("expected command effect");
+        };
+        assert!(panel.claim_run_effect(&session_id, &command, epoch, generation));
+
+        panel.drive(
+            &ai_config(),
+            Some("/workspace/ember/subdir"),
+            Some("/workspace/ember/subdir"),
+            "sh",
+        );
+
+        assert!(matches!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::AwaitingObservation { .. }
+        ));
+        assert!(panel.awaiting.is_some());
+        panel.close();
+        assert!(panel.is_open);
+
+        let mut completion = completed("cd subdir", 0, "");
+        completion.agent_generation = Some(generation);
+        panel.handle_completed("source-session", &completion);
+        assert!(panel.awaiting.is_none());
+
+        panel.drive(
+            &ai_config(),
+            Some("/workspace/ember/subdir"),
+            Some("/workspace/ember/subdir"),
+            "sh",
+        );
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+    }
+
+    #[test]
+    fn structured_approval_carries_the_source_cwd_to_the_final_write_gate() {
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), failed_block_context(), None)
+            .unwrap();
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+
+        let AgentEffect::RunCommand { required_cwd, .. } =
+            panel.approve(id, None).expect("approval effect")
+        else {
+            panic!("expected command effect");
+        };
+        assert_eq!(required_cwd.as_deref(), Some("/workspace/ember"));
+    }
+
+    #[test]
+    fn manual_completion_without_exit_status_is_not_attached_as_fake_failure() {
+        let mut panel = AgentPanel::new();
+        panel.open(&ai_config(), "session-three".into());
+        let mut unknown = completed("mystery", 0, "output");
+        unknown.exit_code = None;
+
+        panel.handle_completed("session-three", &unknown);
+
+        assert!(panel.last_manual_completed.is_none());
+    }
+
+    #[test]
     fn stale_run_effect_epoch_is_rejected_after_session_replacement() {
         let mut panel = AgentPanel::new();
         panel.open(&ai_config(), "session-three".into());
@@ -1418,9 +2440,13 @@ mod tests {
         let AgentEffect::RunCommand {
             session_id,
             command,
+            required_cwd: _,
             epoch,
             generation,
-        } = effect;
+        } = effect
+        else {
+            panic!("expected command effect");
+        };
         panel.session = Some(AgentSession::new(ai_config().agent_max_turns));
 
         assert!(!panel.claim_run_effect(&session_id, &command, epoch, generation));
@@ -1440,7 +2466,10 @@ mod tests {
             panic!("expected proposal");
         };
         let AgentEffect::RunCommand { generation, .. } =
-            panel.approve(id, None).expect("approval must yield effect");
+            panel.approve(id, None).expect("approval must yield effect")
+        else {
+            panic!("expected command effect");
+        };
         let mut completion = completed("ls -la", 0, "total 0");
         completion.exit_code = None;
         completion.agent_generation = Some(generation);
