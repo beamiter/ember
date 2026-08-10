@@ -58,6 +58,10 @@ pub enum Command {
     /// 键盘选块：移到更旧/更新的可选块（与 gutter 点击同一集合）。
     BlockSelectPrev,
     BlockSelectNext,
+    /// 选择当前 pane 中的所有已完成块（oldest anchor, newest active）。
+    BlockSelectAll,
+    /// 按终端顺序把多选范围内的命令回填到提示符，绝不执行。
+    BlockReinputSelectedCommands,
     /// 复制整个块的纯文本（命令 + 输出；背景块只复制输出）。
     BlockCopyBlock,
     /// 以 Markdown 文档形式复制块（与 frost 相同的固定格式）。
@@ -148,6 +152,10 @@ impl std::fmt::Display for Command {
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
             Command::BlockSelectPrev => write!(f, "block:select_prev"),
             Command::BlockSelectNext => write!(f, "block:select_next"),
+            Command::BlockSelectAll => write!(f, "block:select_all"),
+            Command::BlockReinputSelectedCommands => {
+                write!(f, "block:reinput_selected_commands")
+            }
             Command::BlockCopyBlock => write!(f, "block:copy_block"),
             Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
             Command::BlockJumpPrevFailed => write!(f, "block:jump_prev_failed"),
@@ -221,6 +229,8 @@ impl std::str::FromStr for Command {
             "block:recall_command" => Ok(Command::BlockRecallCommand),
             "block:select_prev" => Ok(Command::BlockSelectPrev),
             "block:select_next" => Ok(Command::BlockSelectNext),
+            "block:select_all" => Ok(Command::BlockSelectAll),
+            "block:reinput_selected_commands" => Ok(Command::BlockReinputSelectedCommands),
             "block:copy_block" => Ok(Command::BlockCopyBlock),
             "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
             "block:jump_prev_failed" => Ok(Command::BlockJumpPrevFailed),
@@ -371,7 +381,7 @@ impl KeyBindings {
         // AI agent 面板
         bindings
             .bindings
-            .insert("ctrl+shift+a".to_string(), "agent:toggle".to_string());
+            .insert("ctrl+shift+alt+a".to_string(), "agent:toggle".to_string());
         bindings
             .bindings
             .insert("ctrl+shift+s".to_string(), "remote:picker".to_string());
@@ -450,6 +460,15 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+g".to_string(), "block:search".to_string());
+        // Warp/anvil/forge 的批量 block 工作流。Agent 移到
+        // Ctrl+Shift+Alt+A，为 Select all blocks 让出家族统一键位。
+        bindings
+            .bindings
+            .insert("ctrl+shift+a".to_string(), "block:select_all".to_string());
+        bindings.bindings.insert(
+            "ctrl+shift+i".to_string(),
+            "block:reinput_selected_commands".to_string(),
+        );
         // Keep font zoom in the same configurable command path as every other
         // keyboard shortcut. Different keyboard layouts can report `+` either
         // with or without Shift, while `Ctrl+=` is the conventional spelling.
@@ -814,6 +833,8 @@ mod tests {
             Command::BlockRecallCommand,
             Command::BlockSelectPrev,
             Command::BlockSelectNext,
+            Command::BlockSelectAll,
+            Command::BlockReinputSelectedCommands,
             Command::BlockCopyBlock,
             Command::BlockCopyMarkdown,
             Command::BlockJumpPrevFailed,
@@ -841,7 +862,9 @@ mod tests {
             ("ctrl+pageup", Command::SessionPrev),
             ("ctrl+shift+o", Command::ConfigToggle),
             ("ctrl+backslash", Command::SidebarToggle),
-            ("ctrl+shift+a", Command::AgentToggle),
+            ("ctrl+shift+alt+a", Command::AgentToggle),
+            ("ctrl+shift+a", Command::BlockSelectAll),
+            ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
             ("ctrl+shift+return", Command::PaneZoomToggle),

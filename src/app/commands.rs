@@ -26,11 +26,34 @@ pub struct CommandTarget {
 /// Taking the fields separately lets input routing call this while it holds a
 /// disjoint mutable borrow of the active session.
 pub(crate) fn clear_block_selection_state(
-    block_selection: &mut Option<(String, String)>,
+    block_selection: &mut Option<crate::block_mode::BlockSelection>,
     sidebar_selection: &mut Option<CommandTarget>,
 ) {
     *block_selection = None;
     *sidebar_selection = None;
+}
+
+pub(crate) fn block_selection_state_targets_session(
+    block_selection: Option<&crate::block_mode::BlockSelection>,
+    sidebar_selection: Option<&CommandTarget>,
+    session_id: &str,
+) -> bool {
+    block_selection.is_some_and(|selection| selection.session_id == session_id)
+        || sidebar_selection.is_some_and(|target| target.session_id == session_id)
+}
+
+pub(crate) fn clear_block_selection_state_for_session(
+    block_selection: &mut Option<crate::block_mode::BlockSelection>,
+    sidebar_selection: &mut Option<CommandTarget>,
+    session_id: &str,
+) {
+    if block_selection_state_targets_session(
+        block_selection.as_ref(),
+        sidebar_selection.as_ref(),
+        session_id,
+    ) {
+        clear_block_selection_state(block_selection, sidebar_selection);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -128,7 +151,90 @@ enum ReplayOutcome {
     WriteFailed(crate::shell::ShellWriteError),
 }
 
+fn replay_outcome_accepted(outcome: &ReplayOutcome) -> bool {
+    matches!(outcome, ReplayOutcome::Filled | ReplayOutcome::Ran)
+}
+
+#[derive(Debug)]
+enum SelectedReplayError {
+    NoSelection,
+    MissingRecord,
+    ExactCommandUnavailable,
+    NoCommands,
+    NotPromptReady,
+    AlternateScreen,
+    BracketedPasteDisabled,
+    PendingInput,
+    UnsafeCommand(crate::review_text::ReviewTextError),
+    TooLarge { limit: usize },
+    WriteFailed(crate::shell::ShellWriteError),
+}
+
+#[derive(Clone, Copy)]
+struct SelectedReplayRecord<'a> {
+    id: &'a str,
+    command: Option<&'a str>,
+    exact: bool,
+    truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SelectedReplayGuard {
+    alternate_screen: bool,
+    prompt_ready: bool,
+    bracketed_paste: bool,
+    pending_input: bool,
+}
+
+/// Gate ownership before replay mechanics. A foreground/alt-screen program
+/// always owns Enter. At an idle prompt, determine whether the selection has a
+/// real command before requiring bracketed paste or an empty pending queue, so
+/// a background-only range still lets Enter pass through.
+fn prepare_selected_replay<T>(
+    guard: SelectedReplayGuard,
+    prepare: impl FnOnce() -> Result<T, SelectedReplayError>,
+) -> Result<T, SelectedReplayError> {
+    if guard.alternate_screen {
+        return Err(SelectedReplayError::AlternateScreen);
+    }
+    if !guard.prompt_ready {
+        return Err(SelectedReplayError::NotPromptReady);
+    }
+    let prepared = prepare()?;
+    if !guard.bracketed_paste {
+        return Err(SelectedReplayError::BracketedPasteDisabled);
+    }
+    if guard.pending_input {
+        return Err(SelectedReplayError::PendingInput);
+    }
+    Ok(prepared)
+}
+
 impl TerminalApp {
+    /// Whether a direct, atomic UI write would overtake an older mouse edge or
+    /// protocol reply for `session_id`. Callers still check the session's
+    /// `pending_input`: this gate covers the independent producer FIFOs.
+    pub(crate) fn direct_input_is_blocked_for_session(&self, session_id: &str) -> bool {
+        let mouse_barrier_session_id = self
+            .terminal_mouse_capture
+            .as_ref()
+            .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
+            .map(|capture| capture.session_id.as_str());
+        let Some(index) = self.session_manager.index_of(session_id) else {
+            return true;
+        };
+        let Some(protocol_responses) = self.session_manager.protocol_response_sender(index) else {
+            return true;
+        };
+        crate::session_manager::user_input_flush_block(
+            session_id,
+            mouse_barrier_session_id,
+            &self.osc_paste_input_barriers,
+            &protocol_responses,
+        )
+        .is_some()
+    }
+
     /// Render commands for the currently focused tab in chronological order.
     pub(crate) fn render_sidebar_commands(&mut self, ui: &mut egui::Ui) {
         let active_index = self.session_manager.active_index();
@@ -432,10 +538,12 @@ impl TerminalApp {
                             // selection (id-based, same session): a sidebar
                             // click selects the block, just as selecting a
                             // block highlights the sidebar row.
-                            self.block_selection = Some((
-                                row.target.session_id.clone(),
-                                row.target.execution_id.clone(),
-                            ));
+                            self.block_selection = self.config.block_mode.then(|| {
+                                crate::block_mode::BlockSelection::single(
+                                    row.target.session_id.clone(),
+                                    row.target.execution_id.clone(),
+                                )
+                            });
                             action = Some(CommandAction {
                                 target: row.target.clone(),
                                 kind: CommandActionKind::Jump,
@@ -787,7 +895,9 @@ impl TerminalApp {
     /// The current block selection as a sidebar-style target, or `None` when
     /// it dangles (session closed or record evicted) — never a panic.
     fn live_block_target(&self) -> Option<CommandTarget> {
-        let (session_id, record_id) = self.block_selection.as_ref()?;
+        let selection = self.block_selection.as_ref()?;
+        let session_id = &selection.session_id;
+        let record_id = &selection.active_id;
         let session = self
             .session_manager
             .sessions()
@@ -909,6 +1019,296 @@ impl TerminalApp {
         self.block_select_step(crate::block_mode::SelectStep::Newer);
     }
 
+    /// `block:select_all`: select every completed block in the active pane.
+    /// The oldest id is the fixed range anchor and the newest id is the active
+    /// edge, so the first Shift+Up contracts the range exactly like anvil.
+    pub(crate) fn block_select_all(&mut self) {
+        let Some((session_id, ids)) = self.selectable_block_ids(true) else {
+            return;
+        };
+        let count = ids.len();
+        let Some(selection) = crate::block_mode::BlockSelection::all(session_id.clone(), ids)
+        else {
+            self.set_status("No completed command blocks to select");
+            return;
+        };
+        let target = CommandTarget {
+            session_id,
+            execution_id: selection.active_id.clone(),
+        };
+        self.block_selection = Some(selection);
+        self.sync_block_selection_to_sidebar(&target);
+        self.jump_to_sidebar_command(&target);
+        self.set_status(format!("Selected {count} command blocks"));
+    }
+
+    /// `block:reinput_selected_commands`: put every selected real command back
+    /// into the live editor, in terminal order, as one bracketed-paste frame.
+    /// Background blocks contribute no empty line. The operation is atomic:
+    /// one stale/inexact/unsafe record rejects the whole selection.
+    pub(crate) fn block_reinput_selected_commands(&mut self) {
+        match self.try_reinput_selected_commands() {
+            Ok(count) => self.set_status(format!(
+                "Filled {count} selected command{} at prompt",
+                if count == 1 { "" } else { "s" }
+            )),
+            Err(error) => self.report_selected_replay_error(error),
+        }
+    }
+
+    /// Enter is context-sensitive: only consume it after bytes were safely
+    /// written at an idle prompt. A running program (including `read`) and a
+    /// selection containing only background output must receive Enter normally.
+    pub(crate) fn block_reinput_selected_commands_from_enter(&mut self) -> bool {
+        match self.try_reinput_selected_commands() {
+            Ok(count) => {
+                self.set_status(format!(
+                    "Filled {count} selected command{} at prompt",
+                    if count == 1 { "" } else { "s" }
+                ));
+                true
+            }
+            // These states genuinely belong to the child: a foreground/read
+            // program needs Enter, and background-only selection has nothing
+            // to insert. Every other idle-prompt failure is consumed and
+            // surfaced; forwarding it could submit text the user did not mean
+            // to run after the reviewed selection failed validation.
+            Err(
+                SelectedReplayError::NoSelection
+                | SelectedReplayError::NoCommands
+                | SelectedReplayError::NotPromptReady
+                | SelectedReplayError::AlternateScreen,
+            ) => false,
+            Err(error) => {
+                self.report_selected_replay_error(error);
+                true
+            }
+        }
+    }
+
+    fn try_reinput_selected_commands(&mut self) -> Result<usize, SelectedReplayError> {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return Err(SelectedReplayError::NoSelection);
+        }
+        let active_index = self.session_manager.active_index();
+        let active_session_id = self
+            .session_manager
+            .sessions()
+            .get(active_index)
+            .map(|session| session.metadata.session_id.clone())
+            .ok_or(SelectedReplayError::NoSelection)?;
+        let selection = self
+            .block_selection
+            .clone()
+            .filter(|selection| selection.session_id == active_session_id)
+            .ok_or(SelectedReplayError::NoSelection)?;
+        let direct_input_blocked = self.direct_input_is_blocked_for_session(&active_session_id);
+
+        let result = {
+            let session = self
+                .session_manager
+                .get_session_mut(active_index)
+                .ok_or(SelectedReplayError::NoSelection)?;
+            let (command, count) = {
+                let terminal = session.terminal.lock();
+                let guard = SelectedReplayGuard {
+                    alternate_screen: terminal.is_alt_buffer_active(),
+                    prompt_ready: terminal.shell_is_prompt_ready(),
+                    bracketed_paste: terminal.is_bracketed_paste_enabled(),
+                    pending_input: direct_input_blocked || !session.pending_input.is_empty(),
+                };
+                prepare_selected_replay(guard, || {
+                    selected_commands_in_terminal_order(
+                        terminal
+                            .command_records()
+                            .iter()
+                            .map(|record| SelectedReplayRecord {
+                                id: &record.id,
+                                command: record.command.as_deref(),
+                                exact: record.command_exact,
+                                truncated: record.command_truncated,
+                            }),
+                        &selection.selected_ids,
+                        crate::review_text::MAX_PROMPT_INSERT_BYTES,
+                    )
+                })?
+            };
+            // Every constituent command was already sanitized above; do not
+            // run the single-record 64-KiB validator over the combined buffer
+            // and accidentally undercut MAX_PROMPT_INSERT_BYTES.
+            let payload = replay_prepared_payload(&command, false);
+            session
+                .shell
+                .write(&payload)
+                .map_err(SelectedReplayError::WriteFailed)?;
+            let mut terminal = session.terminal.lock();
+            terminal.note_user_input(&payload);
+            terminal.scroll_to_bottom();
+            Ok(count)
+        };
+
+        if result.is_ok() {
+            self.clear_block_selection();
+        }
+        result
+    }
+
+    fn report_selected_replay_error(&mut self, error: SelectedReplayError) {
+        let message = match error {
+            SelectedReplayError::NoSelection => "No command blocks are selected".to_string(),
+            SelectedReplayError::MissingRecord => {
+                "A selected command block is no longer available".to_string()
+            }
+            SelectedReplayError::ExactCommandUnavailable => {
+                "Exact command text is unavailable for part of the selection".to_string()
+            }
+            SelectedReplayError::NoCommands => {
+                "The selected blocks contain no commands to reinput".to_string()
+            }
+            SelectedReplayError::NotPromptReady => {
+                "Wait for the shell prompt before reinputting commands".to_string()
+            }
+            SelectedReplayError::AlternateScreen => {
+                "Cannot reinput commands while an alternate-screen app is open".to_string()
+            }
+            SelectedReplayError::BracketedPasteDisabled => {
+                "Safe multi-command replay requires bracketed-paste mode".to_string()
+            }
+            SelectedReplayError::PendingInput => {
+                "Wait for pending terminal input to be delivered".to_string()
+            }
+            SelectedReplayError::UnsafeCommand(error) => {
+                format!("Command replay rejected: {error}")
+            }
+            SelectedReplayError::TooLarge { limit } => {
+                format!("Selected commands exceed the {limit}-byte replay limit")
+            }
+            SelectedReplayError::WriteFailed(error) => {
+                format!("Command replay failed: {error}")
+            }
+        };
+        self.set_status_for(message, Duration::from_secs(5));
+    }
+
+    /// Context-sensitive Ctrl+Up/Down behavior shared with anvil/forge.
+    /// Ctrl+Up starts at the newest block when no range exists; Ctrl+Down with
+    /// no range keeps its legacy small-scroll behavior. Once selected, either
+    /// direction moves/collapses the active edge, and moving newer past the
+    /// newest block exits selection so a subsequent Ctrl+Down can scroll.
+    pub(crate) fn block_context_scroll(&mut self, step: crate::block_mode::SelectStep) -> bool {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return false;
+        }
+        if self.block_move_selection(step, false) {
+            return true;
+        }
+        if step == crate::block_mode::SelectStep::Newer {
+            return false;
+        }
+        let Some(navigation) = self.block_navigation(|outcomes, current| {
+            crate::block_mode::next_selected_index(outcomes, current, step)
+        }) else {
+            return false;
+        };
+        let Some(target) = navigation.target else {
+            return false;
+        };
+        self.apply_block_selection(target);
+        true
+    }
+
+    /// Move an existing active edge by one block. Plain movement collapses a
+    /// range to the target; Shift movement keeps the anchor and rebuilds the
+    /// inclusive range. Returns false when no visible/live selection owns the
+    /// key, allowing the arrow/Enter to continue to the PTY.
+    pub(crate) fn block_move_selection(
+        &mut self,
+        step: crate::block_mode::SelectStep,
+        extend: bool,
+    ) -> bool {
+        let Some((session_id, ordered_ids)) = self.selectable_block_ids(false) else {
+            return false;
+        };
+        let Some(mut selection) = self
+            .block_selection
+            .clone()
+            .filter(|selection| selection.session_id == session_id)
+        else {
+            return false;
+        };
+        let Some(current) = ordered_ids.iter().position(|id| id == &selection.active_id) else {
+            // An evicted id must not strand arrow keys in application state.
+            self.clear_block_selection();
+            return false;
+        };
+
+        let target_index = match step {
+            crate::block_mode::SelectStep::Older => current.saturating_sub(1),
+            crate::block_mode::SelectStep::Newer if current + 1 < ordered_ids.len() => current + 1,
+            crate::block_mode::SelectStep::Newer => {
+                if extend {
+                    current
+                } else {
+                    self.clear_block_selection();
+                    return true;
+                }
+            }
+        };
+        let target_id = ordered_ids[target_index].clone();
+        if extend {
+            selection.extend_to(&ordered_ids, &target_id);
+        } else {
+            selection =
+                crate::block_mode::BlockSelection::single(session_id.clone(), target_id.clone());
+        }
+        let target = CommandTarget {
+            session_id,
+            execution_id: target_id,
+        };
+        self.block_selection = Some(selection);
+        self.sync_block_selection_to_sidebar(&target);
+        self.jump_to_sidebar_command(&target);
+        true
+    }
+
+    /// Snapshot the current pane's selectable block ids in terminal order.
+    /// `completed_only` excludes the running command for Select all, while
+    /// gutter/arrow navigation retains ember's existing ability to select it.
+    /// Alternate-screen applications expose no block canvas and return None.
+    fn selectable_block_ids(&mut self, completed_only: bool) -> Option<(String, Vec<String>)> {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return None;
+        }
+        let session = self.session_manager.get_active_session_mut();
+        let session_id = session.metadata.session_id.clone();
+        let terminal = session.terminal.lock();
+        if terminal.is_alt_buffer_active() {
+            return None;
+        }
+        let records = terminal.command_records();
+        let newest = records.len().checked_sub(1);
+        let ids = records
+            .iter()
+            .enumerate()
+            .filter(|(index, record)| {
+                (!completed_only || record.complete)
+                    && crate::block_mode::classify_outcome(
+                        record.command.as_deref(),
+                        record.command_truncated,
+                        record.exit_code,
+                        record.state,
+                        record.complete,
+                        Some(*index) == newest,
+                    ) != crate::block_mode::BlockOutcome::Prompt
+            })
+            .map(|(_, record)| record.id.clone())
+            .collect();
+        Some((session_id, ids))
+    }
+
     /// Keyboard navigation over the same selectable set as gutter clicks
     /// (`outcome != Prompt`, Running included). Clamped at either end the
     /// selection is kept silently; a dangling selected id counts as no
@@ -969,6 +1369,10 @@ impl TerminalApp {
         &mut self,
         pick: impl FnOnce(&[crate::block_mode::BlockOutcome], Option<usize>) -> Option<usize>,
     ) -> Option<BlockNavigation> {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return None;
+        }
         let session = self.session_manager.get_active_session_mut();
         let session_id = session.metadata.session_id.clone();
         let terminal = session.terminal.lock();
@@ -995,8 +1399,12 @@ impl TerminalApp {
         let current = self
             .block_selection
             .as_ref()
-            .filter(|(selected_session, _)| selected_session == &session_id)
-            .and_then(|(_, record_id)| records.iter().position(|record| &record.id == record_id));
+            .filter(|selection| selection.session_id == session_id)
+            .and_then(|selection| {
+                records
+                    .iter()
+                    .position(|record| record.id == selection.active_id)
+            });
         let target = pick(&outcomes, current)
             .and_then(|index| records.get(index))
             .map(|record| CommandTarget {
@@ -1016,7 +1424,14 @@ impl TerminalApp {
     /// Commands-sidebar row, and scroll to the block (the same jump path as
     /// `block:jump_first_failed`).
     fn apply_block_selection(&mut self, target: CommandTarget) {
-        self.block_selection = Some((target.session_id.clone(), target.execution_id.clone()));
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return;
+        }
+        self.block_selection = Some(crate::block_mode::BlockSelection::single(
+            target.session_id.clone(),
+            target.execution_id.clone(),
+        ));
         self.sync_block_selection_to_sidebar(&target);
         self.jump_to_sidebar_command(&target);
     }
@@ -1040,6 +1455,14 @@ impl TerminalApp {
         );
     }
 
+    pub(crate) fn clear_block_selection_for_session(&mut self, session_id: &str) {
+        clear_block_selection_state_for_session(
+            &mut self.block_selection,
+            &mut self.command_sidebar.selected,
+            session_id,
+        );
+    }
+
     /// `block:search`: toggle the cross-block search picker. Like keyboard
     /// block navigation, it never OPENS over a fullscreen (alt-buffer) app —
     /// blocks are invisible there and Enter's jump could only toast — but
@@ -1047,6 +1470,10 @@ impl TerminalApp {
     pub(crate) fn block_search_toggle(&mut self) {
         if self.block_search.is_open {
             self.block_search.close();
+            return;
+        }
+        if !self.config.block_mode {
+            self.clear_block_selection();
             return;
         }
         let alt_buffer_active = {
@@ -1166,7 +1593,7 @@ impl TerminalApp {
         let selection_in_active_session = self
             .block_selection
             .as_ref()
-            .is_some_and(|(session_id, _)| session_id == &active_session_id);
+            .is_some_and(|selection| selection.session_id == active_session_id);
         if selection_in_active_session {
             let target = self.live_block_target();
             if target.is_none() {
@@ -1309,6 +1736,7 @@ impl TerminalApp {
             self.set_status("Command session is no longer available");
             return;
         }
+        let direct_input_blocked = self.direct_input_is_blocked_for_session(&target.session_id);
 
         let persisted_command = self
             .persisted_sidebar_execution(target)
@@ -1318,7 +1746,7 @@ impl TerminalApp {
             let Some(session) = self.session_manager.get_session_mut(index) else {
                 return self.set_status("Command session is no longer available");
             };
-            let pending_input = !session.pending_input.is_empty();
+            let pending_input = direct_input_blocked || !session.pending_input.is_empty();
             let replay = {
                 let terminal = session.terminal.lock();
                 let command = terminal
@@ -1365,7 +1793,9 @@ impl TerminalApp {
                     Err(error) => ReplayOutcome::UnsafeCommand(error.to_string()),
                     Ok(payload) => match session.shell.write(&payload) {
                         Ok(()) => {
-                            session.terminal.lock().scroll_to_bottom();
+                            let mut terminal = session.terminal.lock();
+                            terminal.note_user_input(&payload);
+                            terminal.scroll_to_bottom();
                             if run {
                                 ReplayOutcome::Ran
                             } else {
@@ -1378,6 +1808,7 @@ impl TerminalApp {
             }
         };
 
+        let replay_accepted = replay_outcome_accepted(&outcome);
         match outcome {
             ReplayOutcome::Filled => self.set_status("Command filled at prompt"),
             ReplayOutcome::Ran => self.set_status("Command queued to run"),
@@ -1405,6 +1836,9 @@ impl TerminalApp {
                 format!("Command replay failed: {error}"),
                 Duration::from_secs(4),
             ),
+        }
+        if replay_accepted {
+            self.clear_block_selection_for_session(&target.session_id);
         }
     }
 }
@@ -1949,6 +2383,62 @@ fn format_byte_count(bytes: usize) -> String {
     }
 }
 
+/// Collect a selection in record/terminal order. Background records are seen
+/// (so eviction is still detected) but omitted from the command buffer.
+fn selected_commands_in_terminal_order<'a>(
+    records: impl IntoIterator<Item = SelectedReplayRecord<'a>>,
+    selected_ids: &[String],
+    max_bytes: usize,
+) -> Result<(String, usize), SelectedReplayError> {
+    if selected_ids.is_empty() {
+        return Err(SelectedReplayError::NoSelection);
+    }
+
+    let mut text = String::new();
+    let mut command_count = 0usize;
+    let mut seen_records = 0usize;
+    for record in records {
+        if !selected_ids.iter().any(|selected| selected == record.id) {
+            continue;
+        }
+        seen_records += 1;
+        let Some(raw_command) = record.command.filter(|command| !command.trim().is_empty()) else {
+            // A background block is part of the visual range but contributes
+            // neither an empty command nor an extra separator.
+            continue;
+        };
+        if !record.exact || record.truncated {
+            return Err(SelectedReplayError::ExactCommandUnavailable);
+        }
+        let command =
+            prepare_replay_command(raw_command).map_err(SelectedReplayError::UnsafeCommand)?;
+        let separator = usize::from(!text.is_empty());
+        let Some(next_len) = text
+            .len()
+            .checked_add(separator)
+            .and_then(|len| len.checked_add(command.len()))
+        else {
+            return Err(SelectedReplayError::TooLarge { limit: max_bytes });
+        };
+        if next_len > max_bytes {
+            return Err(SelectedReplayError::TooLarge { limit: max_bytes });
+        }
+        if separator != 0 {
+            text.push('\n');
+        }
+        text.push_str(&command);
+        command_count += 1;
+    }
+
+    if seen_records != selected_ids.len() {
+        return Err(SelectedReplayError::MissingRecord);
+    }
+    if command_count == 0 {
+        return Err(SelectedReplayError::NoCommands);
+    }
+    Ok((text, command_count))
+}
+
 /// Bytes that put a recalled command back on the child's prompt.
 ///
 /// Only ever reached when the child advertised DECSET 2004 (see
@@ -1968,6 +2458,14 @@ fn replay_payload(
     command: &str,
     run: bool,
 ) -> Result<Vec<u8>, crate::review_text::ReviewTextError> {
+    let command = prepare_replay_command(command)?;
+    Ok(replay_prepared_payload(&command, run))
+}
+
+/// Frame text already accepted by [`prepare_replay_command`]. Multi-selection
+/// sanitizes each record independently before joining it and calls this helper
+/// so the aggregate can use the separate prompt-insert budget.
+fn replay_prepared_payload(command: &str, run: bool) -> Vec<u8> {
     use jterm_core::pty_input::{
         encode_prompt_insert, PasteModes, PastePolicy, UnbracketedMultiline,
     };
@@ -1981,14 +2479,13 @@ fn replay_payload(
     // included. `defanged_paste_body` therefore runs to a fixed point before the
     // framing — one de-fanging pass can splice a *new* terminator out of a
     // nested one and hand it straight to the frame.
-    let command = prepare_replay_command(command)?;
-    Ok(encode_prompt_insert(
-        &crate::defanged_paste_body(&command, policy),
+    encode_prompt_insert(
+        &crate::defanged_paste_body(command, policy),
         PasteModes { bracketed: true },
         policy,
         true,
     )
-    .bytes)
+    .bytes
 }
 
 fn prepare_replay_command(command: &str) -> Result<String, crate::review_text::ReviewTextError> {
@@ -2111,6 +2608,140 @@ mod tests {
             "printf 'a\\nb'"
         );
         assert_eq!(prepare_replay_command(" echo hi  ").unwrap(), " echo hi  ");
+    }
+
+    #[test]
+    fn selected_replay_uses_terminal_order_and_skips_background_blocks() {
+        let records = [
+            SelectedReplayRecord {
+                id: "old",
+                command: Some("printf old"),
+                exact: true,
+                truncated: false,
+            },
+            SelectedReplayRecord {
+                id: "background",
+                command: None,
+                exact: false,
+                truncated: false,
+            },
+            SelectedReplayRecord {
+                id: "new",
+                command: Some("printf new\n"),
+                exact: true,
+                truncated: false,
+            },
+        ];
+        // Selection storage order is irrelevant; record order is canonical.
+        let selected = ["new", "background", "old"].map(str::to_string).to_vec();
+        assert_eq!(
+            selected_commands_in_terminal_order(records, &selected, 1024).unwrap(),
+            ("printf old\nprintf new".to_string(), 2)
+        );
+    }
+
+    #[test]
+    fn selected_replay_is_atomic_for_stale_inexact_and_oversized_ranges() {
+        let exact = SelectedReplayRecord {
+            id: "exact",
+            command: Some("echo exact"),
+            exact: true,
+            truncated: false,
+        };
+        assert!(matches!(
+            selected_commands_in_terminal_order(
+                [exact],
+                &["exact".to_string(), "evicted".to_string()],
+                1024,
+            ),
+            Err(SelectedReplayError::MissingRecord)
+        ));
+
+        let inexact = SelectedReplayRecord {
+            id: "inexact",
+            command: Some("echo reconstructed"),
+            exact: false,
+            truncated: false,
+        };
+        assert!(matches!(
+            selected_commands_in_terminal_order(
+                [exact, inexact],
+                &["exact".to_string(), "inexact".to_string()],
+                1024,
+            ),
+            Err(SelectedReplayError::ExactCommandUnavailable)
+        ));
+
+        assert!(matches!(
+            selected_commands_in_terminal_order([exact], &["exact".to_string()], 4),
+            Err(SelectedReplayError::TooLarge { limit: 4 })
+        ));
+    }
+
+    #[test]
+    fn selected_replay_gives_running_and_background_enter_back_to_the_child() {
+        let pending_running = SelectedReplayGuard {
+            alternate_screen: false,
+            prompt_ready: false,
+            bracketed_paste: true,
+            pending_input: true,
+        };
+        assert!(matches!(
+            prepare_selected_replay::<()>(pending_running, || {
+                panic!("running ownership must be decided before aggregation")
+            }),
+            Err(SelectedReplayError::NotPromptReady)
+        ));
+
+        for guard in [
+            SelectedReplayGuard {
+                alternate_screen: false,
+                prompt_ready: true,
+                bracketed_paste: true,
+                pending_input: true,
+            },
+            SelectedReplayGuard {
+                alternate_screen: false,
+                prompt_ready: true,
+                bracketed_paste: false,
+                pending_input: false,
+            },
+        ] {
+            assert!(matches!(
+                prepare_selected_replay::<()>(guard, || Err(SelectedReplayError::NoCommands)),
+                Err(SelectedReplayError::NoCommands)
+            ));
+        }
+    }
+
+    #[test]
+    fn selected_replay_rejects_an_idle_direct_write_while_its_route_is_barriered() {
+        let barriered_idle_prompt = SelectedReplayGuard {
+            alternate_screen: false,
+            prompt_ready: true,
+            bracketed_paste: true,
+            // `try_reinput_selected_commands` folds both pending_input and
+            // the session-scoped mouse/protocol gate into this field.
+            pending_input: true,
+        };
+        assert!(matches!(
+            prepare_selected_replay(barriered_idle_prompt, || Ok("echo safe")),
+            Err(SelectedReplayError::PendingInput)
+        ));
+    }
+
+    #[test]
+    fn accepted_replay_taints_agent_prompt_before_pty_echo() {
+        let mut terminal = crate::terminal::TerminalState::new(40, 5);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let payload = replay_payload("printf safe", false).expect("safe replay");
+
+        // Replay now routes through Session::queue_input, whose acceptance
+        // contract records these bytes before any PTY echo can arrive.
+        terminal.note_user_input(&payload);
+        terminal.scroll_to_bottom();
+
+        assert!(terminal.arm_agent_execution(1, "echo agent").is_err());
     }
 
     #[test]
@@ -2314,7 +2945,10 @@ mod tests {
 
     #[test]
     fn clearing_a_block_selection_retires_terminal_and_sidebar_state_together() {
-        let mut block_selection = Some(("session".to_owned(), "execution".to_owned()));
+        let mut block_selection = Some(crate::block_mode::BlockSelection::single(
+            "session".to_owned(),
+            "execution".to_owned(),
+        ));
         let mut sidebar_selection = Some(CommandTarget {
             session_id: "session".to_owned(),
             execution_id: "execution".to_owned(),
@@ -2324,6 +2958,53 @@ mod tests {
 
         assert_eq!(block_selection, None);
         assert_eq!(sidebar_selection, None);
+    }
+
+    #[test]
+    fn session_scoped_selection_cleanup_does_not_touch_another_terminal() {
+        let block_selection = crate::block_mode::BlockSelection::single(
+            "selected-session".to_owned(),
+            "execution".to_owned(),
+        );
+        let sidebar_selection = CommandTarget {
+            session_id: "selected-session".to_owned(),
+            execution_id: "execution".to_owned(),
+        };
+        assert!(block_selection_state_targets_session(
+            Some(&block_selection),
+            Some(&sidebar_selection),
+            "selected-session"
+        ));
+        assert!(!block_selection_state_targets_session(
+            Some(&block_selection),
+            Some(&sidebar_selection),
+            "other-session"
+        ));
+
+        let mut block_selection = Some(block_selection);
+        let mut sidebar_selection = Some(sidebar_selection);
+        clear_block_selection_state_for_session(
+            &mut block_selection,
+            &mut sidebar_selection,
+            "other-session",
+        );
+        assert!(block_selection.is_some());
+        assert!(sidebar_selection.is_some());
+        clear_block_selection_state_for_session(
+            &mut block_selection,
+            &mut sidebar_selection,
+            "selected-session",
+        );
+        assert!(block_selection.is_none());
+        assert!(sidebar_selection.is_none());
+    }
+
+    #[test]
+    fn only_accepted_sidebar_replays_retire_block_key_ownership() {
+        assert!(replay_outcome_accepted(&ReplayOutcome::Filled));
+        assert!(replay_outcome_accepted(&ReplayOutcome::Ran));
+        assert!(!replay_outcome_accepted(&ReplayOutcome::PendingInput));
+        assert!(!replay_outcome_accepted(&ReplayOutcome::NotPromptReady));
     }
 
     #[test]

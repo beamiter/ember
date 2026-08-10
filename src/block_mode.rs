@@ -232,6 +232,77 @@ pub enum SelectStep {
     Newer,
 }
 
+/// One pane-local Warp-style block selection. `selected_ids` is always kept
+/// in terminal order; `anchor_id` stays fixed while Shift+Up/Down moves the
+/// `active_id` edge and rebuilds the inclusive range between them.
+///
+/// Keeping the session identity in the value makes a renderer reused by a
+/// different tab fail closed instead of painting stale ids from the previous
+/// pane. The app mirrors only `active_id` into the single-row Commands sidebar
+/// selection; every block in `selected_ids` is still outlined in the terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSelection {
+    pub session_id: String,
+    pub selected_ids: Vec<String>,
+    pub active_id: String,
+    pub anchor_id: String,
+}
+
+impl BlockSelection {
+    /// Replace any previous range with one active block.
+    pub fn single(session_id: String, record_id: String) -> Self {
+        Self {
+            session_id,
+            selected_ids: vec![record_id.clone()],
+            active_id: record_id.clone(),
+            anchor_id: record_id,
+        }
+    }
+
+    /// Select every supplied id. The ids must be in terminal order; the oldest
+    /// becomes the fixed anchor and the newest the active edge, matching
+    /// anvil/forge's Select-all contract. Empty input has no selection.
+    pub fn all(session_id: String, selected_ids: Vec<String>) -> Option<Self> {
+        let anchor_id = selected_ids.first()?.clone();
+        let active_id = selected_ids.last()?.clone();
+        Some(Self {
+            session_id,
+            selected_ids,
+            active_id,
+            anchor_id,
+        })
+    }
+
+    /// Move the active edge to `target` and select the inclusive range from
+    /// the fixed anchor. A stale anchor degrades to a single target rather than
+    /// manufacturing a discontinuous or cross-session selection.
+    pub fn extend_to(&mut self, ordered_ids: &[String], target: &str) {
+        self.selected_ids = selected_id_range(ordered_ids, &self.anchor_id, target);
+        self.active_id = target.to_string();
+        if !ordered_ids.iter().any(|id| id == &self.anchor_id) {
+            self.anchor_id = target.to_string();
+        }
+    }
+}
+
+/// Inclusive terminal-order range used by Shift+Up/Down. Missing endpoints
+/// fail closed to the target only; callers can therefore use a snapshot of the
+/// current record list even while old records are being evicted.
+pub fn selected_id_range(ordered_ids: &[String], anchor: &str, target: &str) -> Vec<String> {
+    let Some(anchor_index) = ordered_ids.iter().position(|id| id == anchor) else {
+        return vec![target.to_string()];
+    };
+    let Some(target_index) = ordered_ids.iter().position(|id| id == target) else {
+        return vec![target.to_string()];
+    };
+    let (start, end) = if anchor_index <= target_index {
+        (anchor_index, target_index)
+    } else {
+        (target_index, anchor_index)
+    };
+    ordered_ids[start..=end].to_vec()
+}
+
 /// Keyboard block navigation over the same selectable set as gutter clicks
 /// (`outcome != Prompt`; `Running` included). `current` is the resolved index
 /// of the currently selected record, or `None` when nothing is selected or
@@ -1033,6 +1104,47 @@ mod tests {
             next_selected_index(&with_gap, Some(0), SelectStep::Newer),
             Some(2)
         );
+    }
+
+    #[test]
+    fn block_selection_tracks_anchor_active_edge_and_terminal_order() {
+        let ids = ["oldest", "middle", "newest"].map(str::to_string).to_vec();
+        let mut selection =
+            BlockSelection::all("session".to_string(), ids.clone()).expect("non-empty range");
+
+        assert_eq!(selection.anchor_id, "oldest");
+        assert_eq!(selection.active_id, "newest");
+        assert_eq!(selection.selected_ids, ids);
+        assert!(selection.selected_ids.iter().any(|id| id == "middle"));
+
+        // Select-all followed by Shift+Up contracts at the newest edge.
+        selection.extend_to(&ids, "middle");
+        assert_eq!(selection.anchor_id, "oldest");
+        assert_eq!(selection.active_id, "middle");
+        assert_eq!(selection.selected_ids, ids[..=1]);
+
+        // Moving back across the anchor remains an inclusive ordered range.
+        let reverse_ids = ["zero", "oldest", "middle", "newest"]
+            .map(str::to_string)
+            .to_vec();
+        selection.extend_to(&reverse_ids, "zero");
+        assert_eq!(selection.selected_ids, reverse_ids[..=1]);
+        assert_eq!(selection.active_id, "zero");
+        assert_eq!(selection.anchor_id, "oldest");
+    }
+
+    #[test]
+    fn stale_selection_endpoints_fail_closed_to_one_target() {
+        let ids = ["a", "b", "c"].map(str::to_string).to_vec();
+        assert_eq!(selected_id_range(&ids, "missing", "b"), vec!["b"]);
+        assert_eq!(selected_id_range(&ids, "a", "missing"), vec!["missing"]);
+
+        let mut selection = BlockSelection::single("session".into(), "evicted".into());
+        selection.extend_to(&ids, "c");
+        assert_eq!(selection.selected_ids, vec!["c"]);
+        assert_eq!(selection.anchor_id, "c");
+        assert_eq!(selection.active_id, "c");
+        assert!(BlockSelection::all("session".into(), Vec::new()).is_none());
     }
 
     #[test]

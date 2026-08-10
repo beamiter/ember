@@ -278,6 +278,18 @@ impl CommandPalette {
                 crate::keybindings::Command::BlockSelectNext,
             ),
             CommandInfo::new(
+                "Select All Blocks",
+                CommandCategory::Terminal,
+                "Select every completed command block in the active pane",
+                crate::keybindings::Command::BlockSelectAll,
+            ),
+            CommandInfo::new(
+                "Reinput Selected Commands",
+                CommandCategory::Terminal,
+                "Insert selected block commands at the prompt in terminal order without running them",
+                crate::keybindings::Command::BlockReinputSelectedCommands,
+            ),
+            CommandInfo::new(
                 "Copy Block",
                 CommandCategory::Terminal,
                 "Copy the selected (or most recent) block's command and output as plain text",
@@ -716,6 +728,8 @@ mod tests {
             Command::BlockRecallCommand,
             Command::BlockSelectPrev,
             Command::BlockSelectNext,
+            Command::BlockSelectAll,
+            Command::BlockReinputSelectedCommands,
             Command::BlockCopyBlock,
             Command::BlockCopyMarkdown,
             Command::BlockJumpPrevFailed,

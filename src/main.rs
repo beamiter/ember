@@ -745,7 +745,40 @@ enum PasteOrigin {
 #[derive(Debug)]
 enum PasteRequestError {
     Unsafe(crate::review_text::ReviewTextError),
+    Write(PasteWriteError),
+}
+
+#[derive(Debug)]
+enum PasteWriteError {
+    /// An older session-scoped input edge/reply still owns delivery order.
+    Busy,
     Write(crate::shell::ShellWriteError),
+}
+
+impl PasteWriteError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Busy) || matches!(self, Self::Write(error) if error.is_backpressure())
+    }
+}
+
+impl std::fmt::Display for PasteWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("older terminal input is still pending"),
+            Self::Write(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn ensure_direct_paste_route_available(
+    direct_input_blocked: bool,
+    pending_input: bool,
+) -> Result<(), PasteWriteError> {
+    if direct_input_blocked || pending_input {
+        Err(PasteWriteError::Busy)
+    } else {
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for PasteRequestError {
@@ -852,8 +885,9 @@ fn encode_submitted_command(command: &str, bracketed: bool) -> Vec<u8> {
     .bytes
 }
 
-/// Encode `text` for the child's *current* bracketed-paste mode and hand it to
-/// the shell writer.
+/// Encode `text` for the child's *current* bracketed-paste mode and atomically
+/// admit it to the shell writer. A caller-provided session ordering gate keeps
+/// this direct delivery behind older mouse/protocol traffic.
 ///
 /// DECSET 2004 is read here, at delivery time, and nowhere else. The
 /// confirmation modal can stay open for arbitrarily many frames, and a shell
@@ -866,7 +900,13 @@ fn write_paste_to_session(
     session: &mut Session,
     text: &str,
     submit_after_paste: bool,
-) -> Result<bool, crate::shell::ShellWriteError> {
+    direct_input_blocked: bool,
+) -> Result<bool, PasteWriteError> {
+    // Do not pre-encode into pending_input: DECSET 2004 can change while an
+    // OSC paste worker or an older user-input retry owns the route. Keeping
+    // normalized source in the confirmation flow lets retry encode against
+    // the mode that is actually live at delivery time.
+    ensure_direct_paste_route_available(direct_input_blocked, !session.pending_input.is_empty())?;
     let bracketed = {
         let terminal = session.terminal.lock();
         terminal.is_bracketed_paste_enabled()
@@ -884,7 +924,13 @@ fn write_paste_to_session(
     if paste.is_empty() {
         return Ok(false);
     }
-    session.shell.write(&paste.bytes)?;
+    session
+        .shell
+        .write(&paste.bytes)
+        .map_err(PasteWriteError::Write)?;
+    let mut terminal = session.terminal.lock();
+    terminal.note_user_input(&paste.bytes);
+    terminal.scroll_to_bottom();
     Ok(true)
 }
 
@@ -894,6 +940,7 @@ fn paste_text_into_session(
     paste_confirm: bool,
     origin: PasteOrigin,
     submit_after_paste: bool,
+    direct_input_blocked: bool,
     pending_paste_confirm: &mut Option<crate::app::state::PendingPasteConfirm>,
 ) -> Result<bool, PasteRequestError> {
     // Classify the clipboard as it arrived: `should_confirm` also trips on an
@@ -920,6 +967,7 @@ fn paste_text_into_session(
 
     if paste_requires_confirmation(origin, paste_confirm, &risk, sanitized.had_visual_spoofing) {
         *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
+            decision_armed: false,
             text: body,
             session_id,
             risk,
@@ -932,11 +980,12 @@ fn paste_text_into_session(
     // Retain the normalized source until the all-or-nothing shell enqueue
     // succeeds. On transient backpressure the confirmation flow becomes a
     // durable retry surface even when confirmations were otherwise off.
-    match write_paste_to_session(session, &body, submit_after_paste) {
+    match write_paste_to_session(session, &body, submit_after_paste, direct_input_blocked) {
         Ok(delivered) => Ok(delivered),
         Err(error) => {
-            if error.is_backpressure() {
+            if error.is_retryable() {
                 *pending_paste_confirm = Some(crate::app::state::PendingPasteConfirm {
+                    decision_armed: false,
                     text: body,
                     session_id,
                     risk,
@@ -1373,13 +1422,40 @@ fn flush_pending_mouse_controls<E>(
 
 fn flush_mouse_controls(
     capture: &mut crate::app::state::TerminalMouseCapture,
-) -> Result<(), crate::shell::ShellWriteError> {
+    protocol_input_barriers: &crate::session_manager::SessionInputBarriers,
+) -> Result<bool, crate::shell::ShellWriteError> {
+    if mouse_protocol_input_is_blocked(
+        &capture.session_id,
+        protocol_input_barriers,
+        &capture.protocol_responses,
+    ) {
+        return Ok(false);
+    }
     let write_tx = capture.write_tx.clone();
     flush_pending_mouse_controls(
         &mut capture.pending_controls,
         &mut capture.press_accepted,
         |bytes| write_tx.try_send(bytes.to_vec()),
+    )?;
+    Ok(true)
+}
+
+fn mouse_protocol_input_is_blocked(
+    session_id: &str,
+    protocol_input_barriers: &crate::session_manager::SessionInputBarriers,
+    protocol_responses: &crate::session_manager::ProtocolResponseSender,
+) -> bool {
+    crate::session_manager::user_input_flush_block(
+        session_id,
+        None,
+        protocol_input_barriers,
+        protocol_responses,
     )
+    .is_some()
+}
+
+fn mouse_lossy_reports_allowed(protocol_input_blocked: bool, sequence_allows: bool) -> bool {
+    !protocol_input_blocked && sequence_allows
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1900,6 +1976,7 @@ impl TerminalApp {
             renderer,
             clipboard,
             clipboard_request_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            osc_paste_input_barriers: crate::session_manager::SessionInputBarriers::default(),
             osc52_clipboard_write_tx,
             osc52_write_window_started: std::time::Instant::now(),
             osc52_writes_in_window: 0,
@@ -1990,6 +2067,9 @@ impl TerminalApp {
     }
 
     fn apply_runtime_config(&mut self, ctx: &egui::Context) {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+        }
         // Apply UI scale: use config value if provided, otherwise use native DPI
         let scale = self
             .config
@@ -2294,6 +2374,14 @@ impl TerminalApp {
         if let Some(p) = cd_path {
             let quoted = jterm_core::process::shell_quote_path(&p.to_string_lossy());
             let cmd = format!("cd {}\n", quoted);
+            let active_session_id = self
+                .session_manager
+                .sessions()
+                .get(self.session_manager.active_index())
+                .map(|session| session.metadata.session_id.clone());
+            let direct_input_blocked = active_session_id
+                .as_deref()
+                .is_none_or(|session_id| self.direct_input_is_blocked_for_session(session_id));
             let paste_result = {
                 let session = self.session_manager.get_active_session_mut();
                 paste_text_into_session(
@@ -2302,6 +2390,7 @@ impl TerminalApp {
                     self.config.paste_confirm,
                     PasteOrigin::PromptInsert,
                     true,
+                    direct_input_blocked,
                     &mut self.pending_paste_confirm,
                 )
             };
@@ -2313,6 +2402,9 @@ impl TerminalApp {
                         Some(std::time::Instant::now() + Duration::from_secs(4));
                 }
                 Ok(true) => {
+                    if let Some(session_id) = active_session_id {
+                        self.clear_block_selection_for_session(&session_id);
+                    }
                     self.status_message =
                         "目录切换命令已发送；文件树将跟随 shell 工作目录".to_string();
                     self.status_expires_at =
@@ -2413,7 +2505,7 @@ impl TerminalApp {
     }
 
     #[allow(deprecated)]
-    fn render_ui(&mut self, root_ui: &mut egui::Ui) {
+    fn render_ui(&mut self, root_ui: &mut egui::Ui, frame_pointer_input_blocked: bool) {
         // egui 0.35 起 Panel/CentralPanel 都改成在 Ui 上 .show(ui, ...) 调用;
         // 但仍有部分代码(浮窗 Window、各种 input/viewport 操作)需要 &Context,
         // 这里克隆一份作为局部 ctx 供下游使用(Arc 引用计数,几乎零成本)。
@@ -2487,7 +2579,7 @@ impl TerminalApp {
             .frame(frame)
             .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                self.render_terminal_content(ui, ctx);
+                self.render_terminal_content(ui, ctx, frame_pointer_input_blocked);
             });
 
         self.render_floating_panels(ctx);
@@ -2564,11 +2656,12 @@ impl eframe::App for TerminalApp {
         // and hold a one-frame admission barrier for the captured writer.
         let mut retire_mouse_capture = false;
         let mut prior_mouse_write_error = None;
+        let protocol_input_barriers = self.osc_paste_input_barriers.clone();
         let prior_mouse_control_result = self
             .terminal_mouse_capture
             .as_mut()
             .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
-            .map(flush_mouse_controls);
+            .map(|capture| flush_mouse_controls(capture, &protocol_input_barriers));
         if let Some(Err(error)) = prior_mouse_control_result {
             retire_mouse_capture = !error.is_backpressure();
             prior_mouse_write_error = Some(error);
@@ -2584,7 +2677,7 @@ impl eframe::App for TerminalApp {
             self.terminal_mouse_capture = None;
             self.last_terminal_mouse_motion = None;
         }
-        let user_input_barrier_session_id = self
+        let mouse_input_barrier_session_id = self
             .terminal_mouse_capture
             .as_ref()
             .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
@@ -2618,7 +2711,8 @@ impl eframe::App for TerminalApp {
         let mut background_pump = self.session_manager.pump_inactive_sessions(
             background_budget,
             &visible_sessions,
-            user_input_barrier_session_id.as_deref(),
+            mouse_input_barrier_session_id.as_deref(),
+            &self.osc_paste_input_barriers,
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
         let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
@@ -2770,7 +2864,9 @@ impl eframe::App for TerminalApp {
         let block_search_owned_input = self.handle_block_search_input();
         let overlay_owned_input = palette_owned_input || block_search_owned_input;
 
-        if self.handle_keybindings(ctx, terminal_input_blocked || overlay_owned_input) {
+        let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
+            self.handle_keybindings(ctx, terminal_input_blocked || overlay_owned_input);
+        if keybinding_requested_close {
             return;
         }
 
@@ -2783,12 +2879,21 @@ impl eframe::App for TerminalApp {
             overlay_owned_input,
             self.terminal_input_blocked(ctx),
         );
+        if terminal_input_blocked {
+            let mut terminal = self
+                .session_manager
+                .get_active_session_mut()
+                .terminal
+                .lock();
+            app::input::clear_terminal_preedit_for_ui_owner(&mut terminal, true);
+        }
 
         // Route pointer input to the pane under the pointer before taking the
         // active-session borrow below. The renderer used to switch focus only
         // at the end of the frame, which sent a click (and mouse protocol
         // coordinates) to the previously focused PTY.
         let pointer_targets_terminal = !terminal_input_blocked
+            && !app::input::semantic_paste_precedes_mouse_input(&self.frame_events)
             && ctx.input(|input| {
                 input.pointer.button_pressed(egui::PointerButton::Primary)
                     || input.pointer.button_pressed(egui::PointerButton::Secondary)
@@ -2868,6 +2973,10 @@ impl eframe::App for TerminalApp {
             app::input::routed_terminal_events(&self.frame_events, terminal_input_blocked);
         let mut consumed_keys = std::collections::HashSet::new();
 
+        let mut accepted_paste_input = false;
+        let paste_confirmation_was_open = self.pending_paste_confirm.is_some();
+        let mut semantic_paste_claims_rest = false;
+        let mut rejected_mouse_prefix_allows_pointer = false;
         let saw_semantic_paste = events_copy.iter().any(|event| {
             if let egui::Event::Paste(_content) = event {
                 crate::debug_log!(
@@ -2886,131 +2995,216 @@ impl eframe::App for TerminalApp {
 
         if saw_semantic_paste {
             crate::debug_log!("[PASTE] ===== Semantic Paste triggered =====");
-            let paste_events_enabled = {
-                let terminal = session.terminal.lock();
-                let paste_events_enabled = terminal.is_paste_events_enabled();
-                crate::debug_log!(
-                    "[PASTE] terminal paste_events_enabled (mode 5522): {}",
-                    paste_events_enabled
-                );
-                paste_events_enabled
-            };
-
-            if paste_events_enabled && self.clipboard.is_some() {
-                // MIME discovery is host clipboard I/O and build_paste_event
-                // replaces the terminal's single-use grant. Serialize it with
-                // OSC reads so concurrent Paste events cannot race tokens or
-                // create an unbounded helper/thread population.
-                if self
-                    .clipboard_request_in_flight
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    crate::debug_log!("[PASTE] app supports paste events, building paste event");
-                    let terminal = Arc::clone(&session.terminal);
-                    let response_tx = active_protocol_responses.clone();
-                    let in_flight = Arc::clone(&self.clipboard_request_in_flight);
-                    let spawn_result = std::thread::Builder::new()
-                        .name("paste-event-sender".to_string())
-                        .spawn(move || {
-                            let _guard = ClipboardRequestGuard(in_flight);
-                            let mime_types = ClipboardManager::new()
-                                .and_then(|clipboard| clipboard.available_mime_types())
-                                .unwrap_or_default();
-                            crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
-                            let bytes = terminal.lock().build_paste_event(&mime_types);
-                            crate::debug_log!(
-                                "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
-                                bytes.len()
-                            );
-                            if let Err(error) = response_tx.enqueue_blocking(bytes) {
-                                log::debug!("OSC 5522 unsolicited paste event cancelled: {error}");
-                            }
-                        });
-                    if let Err(error) = spawn_result {
-                        self.clipboard_request_in_flight
-                            .store(false, Ordering::Release);
-                        log::warn!("failed to spawn OSC 5522 paste event worker: {error}");
-                        self.status_message = "剪贴板正忙，请重试粘贴".to_string();
-                        self.status_expires_at =
-                            Some(std::time::Instant::now() + Duration::from_secs(3));
-                    }
-                } else {
-                    self.status_message = "剪贴板正忙，请稍后重试粘贴".to_string();
-                    self.status_expires_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(3));
-                }
+            if app::input::semantic_paste_has_mouse_prefix(&events_copy) {
+                // Pointer input is dispatched later in the frame and cannot be
+                // staged ahead of an asynchronous OSC 5522 notification. Keep
+                // that older pointer input intact and reject this Paste. The
+                // Paste and its keyboard/IME suffix remain claimed so retrying
+                // cannot accidentally duplicate or submit them.
+                semantic_paste_claims_rest = true;
+                rejected_mouse_prefix_allows_pointer = true;
+                self.status_message = "本帧已有更早的鼠标输入；请重试粘贴".to_string();
+                self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(3));
                 consumed_keys.insert("PasteEvent".to_string());
             } else {
-                if self.clipboard.is_none() {
-                    crate::debug_log!("[PASTE] clipboard not available");
-                } else {
-                    crate::debug_log!("[PASTE] app does NOT support paste events");
-                }
-                // 应用不支持粘贴事件协议，需要特殊处理不同类型的内容
-                crate::debug_log!(
-                    "[PASTE] fallback: app doesn't support paste events, handling content directly"
-                );
-                if let Some(clipboard) = &self.clipboard {
-                    if let Ok(content) = clipboard.paste_contents() {
-                        match content {
-                            ClipboardContent::Text(text) => {
+                let paste_events_enabled = {
+                    let terminal = session.terminal.lock();
+                    let paste_events_enabled = terminal.is_paste_events_enabled();
+                    crate::debug_log!(
+                        "[PASTE] terminal paste_events_enabled (mode 5522): {}",
+                        paste_events_enabled
+                    );
+                    paste_events_enabled
+                };
+
+                if paste_events_enabled && self.clipboard.is_some() {
+                    // An asynchronous paste notification may only establish its
+                    // protocol barrier at a clean FIFO boundary. Otherwise an
+                    // older Text/IME/key prefix (or pending input from a prior
+                    // frame) would be forced behind the notification.
+                    semantic_paste_claims_rest = true;
+                    let route_blocked = crate::session_manager::user_input_flush_block(
+                        &session.metadata.session_id,
+                        mouse_input_barrier_session_id.as_deref(),
+                        &self.osc_paste_input_barriers,
+                        &active_protocol_responses,
+                    )
+                    .is_some();
+                    let clean_route = app::input::osc_paste_route_is_clean(
+                        !session.pending_input.is_empty(),
+                        route_blocked,
+                        &events_copy,
+                    );
+                    // MIME discovery is host clipboard I/O and build_paste_event
+                    // replaces the terminal's single-use grant. Serialize it with
+                    // OSC reads so concurrent Paste events cannot race tokens or
+                    // create an unbounded helper/thread population.
+                    if !clean_route {
+                        self.status_message =
+                            "终端仍有更早的输入；请在输入送达后重试粘贴".to_string();
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(3));
+                    } else if self
+                        .clipboard_request_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        crate::debug_log!(
+                            "[PASTE] app supports paste events, building paste event"
+                        );
+                        let terminal = Arc::clone(&session.terminal);
+                        let response_tx = active_protocol_responses.clone();
+                        let in_flight = Arc::clone(&self.clipboard_request_in_flight);
+                        let paste_input_barrier = self
+                            .osc_paste_input_barriers
+                            .acquire(active_session_id.clone());
+                        let spawn_result = std::thread::Builder::new()
+                            .name("paste-event-sender".to_string())
+                            .spawn(move || {
+                                let _guard = ClipboardRequestGuard(in_flight);
+                                // Release only after enqueue_blocking returns. Until
+                                // then this stable session's pending_input cannot
+                                // overtake the asynchronous paste notification.
+                                let _paste_input_barrier = paste_input_barrier;
+                                let mime_types = ClipboardManager::new()
+                                    .and_then(|clipboard| clipboard.available_mime_types())
+                                    .unwrap_or_default();
+                                crate::debug_log!("[PASTE] available MIME types: {:?}", mime_types);
+                                let bytes = terminal.lock().build_paste_event(&mime_types);
                                 crate::debug_log!(
-                                    "[PASTE] fallback: TEXT content ({} chars)",
-                                    text.len()
+                                    "[OSC5522] sending unsolicited paste MIME list ({} bytes)",
+                                    bytes.len()
                                 );
-                                match paste_text_into_session(
-                                    session,
-                                    text,
-                                    self.config.paste_confirm,
-                                    PasteOrigin::Clipboard,
-                                    false,
-                                    &mut self.pending_paste_confirm,
-                                ) {
-                                    Ok(true) => {
-                                        consumed_keys.insert("PasteEvent".to_string());
-                                    }
-                                    Ok(false) => {
-                                        crate::debug_log!("[PASTE] fallback: text is empty");
-                                    }
-                                    Err(error) => {
-                                        self.status_message = format!("粘贴失败：{error}");
-                                        self.status_expires_at = Some(
-                                            std::time::Instant::now() + Duration::from_secs(4),
-                                        );
-                                    }
+                                if let Err(error) = response_tx.enqueue_blocking(bytes) {
+                                    log::debug!(
+                                        "OSC 5522 unsolicited paste event cancelled: {error}"
+                                    );
                                 }
+                            });
+                        match spawn_result {
+                            Ok(_) => {
+                                accepted_paste_input = true;
                             }
-                            ClipboardContent::Binary(_bytes) => {
-                                crate::debug_log!(
-                                    "[PASTE] fallback: BINARY content ({} bytes)",
-                                    _bytes.len()
-                                );
-                                crate::debug_log!(
-                                    "[PASTE] refusing to send {} binary bytes as PTY input; app did not negotiate OSC 5522",
-                                    _bytes.len()
-                                );
-                                self.status_message = "图像粘贴需要应用支持 OSC 5522".to_string();
+                            Err(error) => {
+                                self.clipboard_request_in_flight
+                                    .store(false, Ordering::Release);
+                                log::warn!("failed to spawn OSC 5522 paste event worker: {error}");
+                                self.status_message = "剪贴板正忙，请重试粘贴".to_string();
                                 self.status_expires_at =
-                                    Some(std::time::Instant::now() + Duration::from_secs(4));
-                                consumed_keys.insert("PasteEvent".to_string());
+                                    Some(std::time::Instant::now() + Duration::from_secs(3));
                             }
                         }
                     } else {
-                        crate::debug_log!("[PASTE] fallback: failed to get clipboard content");
+                        self.status_message = "剪贴板正忙，请稍后重试粘贴".to_string();
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(3));
                     }
+                    consumed_keys.insert("PasteEvent".to_string());
                 } else {
-                    crate::debug_log!("[PASTE] fallback: clipboard not available");
+                    if self.clipboard.is_none() {
+                        crate::debug_log!("[PASTE] clipboard not available");
+                    } else {
+                        crate::debug_log!("[PASTE] app does NOT support paste events");
+                    }
+                    // 应用不支持粘贴事件协议，需要特殊处理不同类型的内容
+                    crate::debug_log!(
+                        "[PASTE] fallback: app doesn't support paste events, handling content directly"
+                    );
+                    if let Some(clipboard) = &self.clipboard {
+                        if let Ok(content) = clipboard.paste_contents() {
+                            match content {
+                                ClipboardContent::Text(text) => {
+                                    crate::debug_log!(
+                                        "[PASTE] fallback: TEXT content ({} chars)",
+                                        text.len()
+                                    );
+                                    match paste_text_into_session(
+                                        session,
+                                        text,
+                                        self.config.paste_confirm,
+                                        PasteOrigin::Clipboard,
+                                        false,
+                                        app::input::semantic_paste_direct_input_blocked(
+                                            crate::session_manager::user_input_flush_block(
+                                                &session.metadata.session_id,
+                                                mouse_input_barrier_session_id.as_deref(),
+                                                &self.osc_paste_input_barriers,
+                                                &active_protocol_responses,
+                                            )
+                                            .is_some(),
+                                            &events_copy,
+                                        ),
+                                        &mut self.pending_paste_confirm,
+                                    ) {
+                                        Ok(true) => {
+                                            accepted_paste_input =
+                                                self.pending_paste_confirm.is_none();
+                                            consumed_keys.insert("PasteEvent".to_string());
+                                        }
+                                        Ok(false) => {
+                                            crate::debug_log!("[PASTE] fallback: text is empty");
+                                        }
+                                        Err(error) => {
+                                            self.status_message = format!("粘贴失败：{error}");
+                                            self.status_expires_at = Some(
+                                                std::time::Instant::now() + Duration::from_secs(4),
+                                            );
+                                        }
+                                    }
+                                }
+                                ClipboardContent::Binary(_bytes) => {
+                                    crate::debug_log!(
+                                        "[PASTE] fallback: BINARY content ({} bytes)",
+                                        _bytes.len()
+                                    );
+                                    crate::debug_log!(
+                                        "[PASTE] refusing to send {} binary bytes as PTY input; app did not negotiate OSC 5522",
+                                        _bytes.len()
+                                    );
+                                    self.status_message =
+                                        "图像粘贴需要应用支持 OSC 5522".to_string();
+                                    self.status_expires_at =
+                                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                                    consumed_keys.insert("PasteEvent".to_string());
+                                }
+                            }
+                        } else {
+                            crate::debug_log!("[PASTE] fallback: failed to get clipboard content");
+                        }
+                    } else {
+                        crate::debug_log!("[PASTE] fallback: clipboard not available");
+                    }
                 }
             }
             crate::debug_log!("[PASTE] ===== Semantic Paste finished =====");
         }
 
+        if !paste_confirmation_was_open && self.pending_paste_confirm.is_some() {
+            // Confirmation owns every event after the Paste that opened it,
+            // including Enter and IME lifecycle/commit events.
+            semantic_paste_claims_rest = true;
+        }
+        let semantic_paste_blocks_pointer = accepted_paste_input
+            || (!paste_confirmation_was_open && self.pending_paste_confirm.is_some());
+        let terminal_keyboard_events = app::input::terminal_events_before_semantic_paste_claim(
+            &events_copy,
+            semantic_paste_claims_rest,
+        );
+        if semantic_paste_claims_rest {
+            terminal_input_blocked = true;
+            app::input::clear_terminal_preedit_for_ui_owner(&mut session.terminal.lock(), true);
+        }
+        let terminal_pointer_input_blocked = app::input::semantic_paste_pointer_input_blocked(
+            terminal_input_blocked,
+            rejected_mouse_prefix_allows_pointer,
+            semantic_paste_blocks_pointer,
+        );
+
         // Step 4: 处理普通键盘输入
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
         // 复用缓冲区减少内存分配
         self.keyboard_input_buffer.clear();
-        if !terminal_input_blocked {
+        if !terminal_input_blocked || semantic_paste_claims_rest {
             let (
                 keyboard_enhancement_flags,
                 report_all_keys_mode,
@@ -3046,40 +3240,30 @@ impl eframe::App for TerminalApp {
                 xterm_format_other_keys,
                 application_cursor_keys,
                 alt_screen,
-                &self.frame_events,
+                &terminal_keyboard_events,
             );
         }
 
         let has_keyboard_input = !self.keyboard_input_buffer.is_empty();
-
-        // 真实键盘输入送往 PTY 时丢弃 block 选中（anvil 先例：真实输入
-        // 清除选中；不劫持 Escape）。
-        if has_keyboard_input {
-            app::commands::clear_block_selection_state(
-                &mut self.block_selection,
-                &mut self.command_sidebar.selected,
-            );
-        }
-
-        // 有输入活动时更新最后活动时间
-        if has_keyboard_input || has_cursor_move_input {
-            self.last_activity_time = std::time::Instant::now();
-        }
 
         // The retry buffer is per-session and sent as one FIFO message. Do not
         // split arbitrary bytes into frame-sized chunks: terminal replies could
         // otherwise interleave inside a UTF-8/key escape/paste sequence.
         let mut terminal_write_error = None;
         let mut input_retry_overflow = cursor_move_retry_overflow;
+        let mut keyboard_input_accepted = false;
         {
             if has_keyboard_input {
-                input_retry_overflow |= !session.queue_input(&self.keyboard_input_buffer);
+                keyboard_input_accepted = session.queue_input(&self.keyboard_input_buffer);
+                input_retry_overflow |= !keyboard_input_accepted;
             }
-            let user_input_flush_blocked =
-                crate::session_manager::user_input_is_blocked_by_mouse_edge(
-                    &session.metadata.session_id,
-                    user_input_barrier_session_id.as_deref(),
-                );
+            let user_input_flush_blocked = crate::session_manager::user_input_flush_block(
+                &session.metadata.session_id,
+                mouse_input_barrier_session_id.as_deref(),
+                &self.osc_paste_input_barriers,
+                &active_protocol_responses,
+            )
+            .is_some();
             if !user_input_flush_blocked && !session.pending_input.is_empty() {
                 session.terminal.lock().scroll_to_bottom();
                 match session.shell.write(&session.pending_input) {
@@ -3092,6 +3276,26 @@ impl eframe::App for TerminalApp {
                     }
                 }
             }
+        }
+        let accepted_terminal_input =
+            keyboard_input_accepted || accepted_ime_input || accepted_paste_input;
+
+        // 本帧真正接受的终端输入（键盘、IME 或 paste）都遵循同一时序：
+        // 只有输入之后又显式建立的新选区才能保留。Retry-buffer cap 拒绝
+        // 是全-or-nothing，不得因为仅生成了 bytes 就误清 selection。
+        if app::input::accepted_terminal_input_clears_block_selection(
+            accepted_terminal_input,
+            selection_postdates_terminal_input,
+        ) {
+            app::commands::clear_block_selection_state(
+                &mut self.block_selection,
+                &mut self.command_sidebar.selected,
+            );
+        }
+
+        // 有输入活动时更新最后活动时间
+        if accepted_terminal_input || has_cursor_move_input {
+            self.last_activity_time = std::time::Instant::now();
         }
         if let Some(error) = terminal_write_error {
             if error.is_backpressure() {
@@ -3111,7 +3315,7 @@ impl eframe::App for TerminalApp {
         }
 
         // Force repaint if we have any keyboard/cursor input - ensures input renders immediately
-        if has_keyboard_input || has_cursor_move_input {
+        if accepted_terminal_input || has_cursor_move_input {
             ctx.request_repaint();
         }
 
@@ -3402,7 +3606,7 @@ impl eframe::App for TerminalApp {
         };
         let shift_mouse_bypass = ctx.input(|input| input.modifiers.shift);
 
-        let middle_paste_requested = !terminal_input_blocked
+        let middle_paste_requested = !terminal_pointer_input_blocked
             && (!mouse_enabled || shift_mouse_bypass)
             && pointer_over_active_terminal
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
@@ -3415,17 +3619,35 @@ impl eframe::App for TerminalApp {
                 } else {
                     primary_text
                 };
-                if let Err(error) = paste_text_into_session(
+                let paste_result = paste_text_into_session(
                     session,
                     text,
                     self.config.paste_confirm,
                     PasteOrigin::Clipboard,
                     false,
+                    crate::session_manager::user_input_flush_block(
+                        &session.metadata.session_id,
+                        mouse_input_barrier_session_id.as_deref(),
+                        &self.osc_paste_input_barriers,
+                        &active_protocol_responses,
+                    )
+                    .is_some(),
                     &mut self.pending_paste_confirm,
-                ) {
-                    self.status_message = format!("粘贴失败：{error}");
-                    self.status_expires_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(4));
+                );
+                match paste_result {
+                    Ok(true) if self.pending_paste_confirm.is_none() => {
+                        app::commands::clear_block_selection_state_for_session(
+                            &mut self.block_selection,
+                            &mut self.command_sidebar.selected,
+                            &active_session_id,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.status_message = format!("粘贴失败：{error}");
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(4));
+                    }
                 }
             }
         }
@@ -3433,7 +3655,7 @@ impl eframe::App for TerminalApp {
         // 鼠标滚轮处理：
         // 1. 如果应用启用了鼠标报告（如 vim），滚轮会在下面的鼠标处理部分发送给应用
         // 2. 如果应用未启用鼠标，或在普通终端，滚轮用于查看历史
-        if !terminal_input_blocked
+        if !terminal_pointer_input_blocked
             && pointer_over_active_terminal
             && scroll_delta != 0.0
             && !ctrl_scroll_this_frame
@@ -3544,7 +3766,7 @@ impl eframe::App for TerminalApp {
         if let Some(button) = terminal_button_pressed.filter(|button| {
             self.terminal_mouse_capture.is_none()
                 && (mouse_enabled || *button == 0)
-                && !terminal_input_blocked
+                && !terminal_pointer_input_blocked
                 && pointer_over_active_terminal
         }) {
             let pointer_renderer = active_pane_renderer_idx
@@ -3568,6 +3790,7 @@ impl eframe::App for TerminalApp {
                 button,
                 terminal: Arc::clone(&session.terminal),
                 write_tx: session.shell.write_sender(),
+                protocol_responses: active_protocol_responses.clone(),
                 content_rect,
                 char_width: pointer_renderer.char_width,
                 line_height: pointer_renderer.line_height,
@@ -3624,11 +3847,12 @@ impl eframe::App for TerminalApp {
             &terminal_buttons_released,
             pointer_any_down,
         );
-        let only_release = terminal_input_blocked;
+        let only_release = terminal_pointer_input_blocked;
 
         let (
             mouse_terminal,
             mouse_write_tx,
+            mouse_protocol_responses,
             mouse_session_id,
             content_rect,
             char_width,
@@ -3638,6 +3862,7 @@ impl eframe::App for TerminalApp {
             (
                 Arc::clone(&capture.terminal),
                 capture.write_tx.clone(),
+                capture.protocol_responses.clone(),
                 capture.session_id.clone(),
                 capture.content_rect,
                 capture.char_width,
@@ -3651,6 +3876,7 @@ impl eframe::App for TerminalApp {
             (
                 Arc::clone(&session.terminal),
                 session.shell.write_sender(),
+                active_protocol_responses.clone(),
                 active_session_id.clone(),
                 pointer_renderer
                     .last_content_rect
@@ -3663,7 +3889,7 @@ impl eframe::App for TerminalApp {
         let mut mouse_route_closed = false;
         let lossy_mouse_reports: Vec<Vec<u8>> = if (!sequence_reports_to_app
             || !pointer_routes_to_terminal
-            || (terminal_input_blocked && reported_capture_release.is_none()))
+            || (terminal_pointer_input_blocked && reported_capture_release.is_none()))
             || (pointer_pos.is_none() && fallback_cell.is_none())
         {
             self.mouse_scroll_accumulator = 0.0;
@@ -3854,11 +4080,18 @@ impl eframe::App for TerminalApp {
                 .terminal_mouse_capture
                 .as_ref()
                 .is_some_and(|capture| !capture.pending_controls.is_empty());
+        let mouse_protocol_input_blocked = mouse_protocol_input_is_blocked(
+            &mouse_session_id,
+            &self.osc_paste_input_barriers,
+            &mouse_protocol_responses,
+        );
         let mut mouse_write_error = None;
         if !mouse_route_closed {
             if let Some(capture) = self.terminal_mouse_capture.as_mut() {
                 if capture.reported_to_app {
-                    if let Err(error) = flush_mouse_controls(capture) {
+                    if let Err(error) =
+                        flush_mouse_controls(capture, &self.osc_paste_input_barriers)
+                    {
                         if !error.is_backpressure() {
                             mouse_route_closed = true;
                         }
@@ -3870,7 +4103,10 @@ impl eframe::App for TerminalApp {
 
         if !mouse_route_closed
             && mouse_write_error.is_none()
-            && mouse_capture_allows_lossy(self.terminal_mouse_capture.as_ref())
+            && mouse_lossy_reports_allowed(
+                mouse_protocol_input_blocked,
+                mouse_capture_allows_lossy(self.terminal_mouse_capture.as_ref()),
+            )
         {
             for report in lossy_mouse_reports {
                 if let Err(error) = mouse_write_tx.try_send(report) {
@@ -3901,7 +4137,7 @@ impl eframe::App for TerminalApp {
         }
 
         // Step 12: 链接检测和交互
-        if terminal_input_blocked {
+        if terminal_pointer_input_blocked {
             self.hovered_link = None;
         } else {
             let terminal_ptr = Arc::as_ptr(&session.terminal) as usize;
@@ -4039,9 +4275,9 @@ impl eframe::App for TerminalApp {
         drop(session);
 
         // 渲染 UI
-        self.render_ui(root_ui);
+        self.render_ui(root_ui, terminal_pointer_input_blocked);
 
-        if !self.terminal_input_blocked(ctx) {
+        if !terminal_pointer_input_blocked && !self.terminal_input_blocked(ctx) {
             let selection_for_primary = match primary_copy_route {
                 PrimaryCopyRoute::CapturedLocal => local_primary_selection_terminal
                     .and_then(|terminal| terminal.lock().copy_selection()),
@@ -4172,15 +4408,17 @@ mod tests {
     use super::{
         bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
-        encode_submitted_command, flush_pending_mouse_controls, kitty_graphics_payload,
-        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
-        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
-        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
+        encode_submitted_command, ensure_direct_paste_route_available,
+        flush_pending_mouse_controls, kitty_graphics_payload, mouse_lossy_reports_allowed,
+        mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
+        normalized_paste_body, osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows,
+        paste_policy, paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
         workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification, PasteOrigin,
-        PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES,
-        MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
+        PasteWriteError, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
+        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
+        OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -4553,11 +4791,23 @@ mod tests {
     /// so a backpressure retry sends the same bytes rather than a doubly
     /// processed payload.
     #[test]
-    fn a_pending_body_re_encodes_for_either_mode_without_drifting() {
+    fn barrier_retry_reencodes_pending_paste_for_the_delivery_time_mode() {
         use jterm_core::pty_input::{encode_paste, PasteModes};
         let body = normalized_paste_body("echo one\r\necho \x1b[201~two", false);
         assert_eq!(body, "echo one\necho two");
 
+        assert!(matches!(
+            ensure_direct_paste_route_available(true, false),
+            Err(PasteWriteError::Busy)
+        ));
+        assert!(matches!(
+            ensure_direct_paste_route_available(false, true),
+            Err(PasteWriteError::Busy)
+        ));
+        ensure_direct_paste_route_available(false, false).unwrap();
+
+        // No framed bytes were staged while the route was blocked. A retry
+        // after DECSET 2004 changes therefore uses the mode live *now*.
         let framed = encode_paste(&body, PasteModes { bracketed: true }, paste_policy(false));
         assert_eq!(framed.bytes, b"\x1b[200~echo one\necho two\x1b[201~");
         let unframed = encode_paste(&body, PasteModes { bracketed: false }, paste_policy(false));
@@ -4712,6 +4962,61 @@ mod tests {
         assert_eq!(admitted, b"pressrelease");
         assert!(press_accepted);
         assert!(controls.is_empty());
+    }
+
+    #[test]
+    fn slow_osc_paste_holds_click_edges_and_drops_wheel_until_its_reply_is_ahead() {
+        use crate::app::state::PendingMouseControlKind::{Press, Release};
+
+        let barriers = crate::session_manager::SessionInputBarriers::default();
+        let responses =
+            crate::session_manager::ProtocolResponseSender::new(egui::Context::default());
+        let guard = barriers.acquire("mouse-session".to_owned());
+        let mut controls = std::collections::VecDeque::new();
+        queue_mouse_control(&mut controls, Press, b"click".to_vec());
+        queue_mouse_control(&mut controls, Release, b"release".to_vec());
+        let mut press_accepted = false;
+        let mut admitted = Vec::new();
+
+        let producer_blocked =
+            mouse_protocol_input_is_blocked("mouse-session", &barriers, &responses);
+        if !producer_blocked {
+            flush_pending_mouse_controls(&mut controls, &mut press_accepted, |bytes| {
+                admitted.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+        assert!(admitted.is_empty());
+        assert_eq!(controls.len(), 2, "click/release are durable edges");
+        assert!(!mouse_lossy_reports_allowed(producer_blocked, true));
+
+        // Publication happens before the producer guard is released. Even
+        // after release, a backpressured protocol response remains the gate.
+        responses.try_enqueue(b"paste reply".to_vec()).unwrap();
+        drop(guard);
+        assert!(mouse_protocol_input_is_blocked(
+            "mouse-session",
+            &barriers,
+            &responses
+        ));
+        assert!(!mouse_lossy_reports_allowed(true, true));
+
+        // Once that route has no producer or pending response, the original
+        // stateful sequence is admitted in order; lossy wheel becomes eligible.
+        let drained_responses =
+            crate::session_manager::ProtocolResponseSender::new(egui::Context::default());
+        let blocked =
+            mouse_protocol_input_is_blocked("mouse-session", &barriers, &drained_responses);
+        assert!(!blocked);
+        flush_pending_mouse_controls(&mut controls, &mut press_accepted, |bytes| {
+            admitted.extend_from_slice(bytes);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(admitted, b"clickrelease");
+        assert!(press_accepted);
+        assert!(mouse_lossy_reports_allowed(blocked, true));
     }
 
     #[test]

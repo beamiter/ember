@@ -6,7 +6,7 @@ use crate::terminal::{
 };
 use eframe::egui;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -93,7 +93,7 @@ pub struct ProtocolResponseSender {
 }
 
 impl ProtocolResponseSender {
-    fn new(repaint_ctx: egui::Context) -> Self {
+    pub(crate) fn new(repaint_ctx: egui::Context) -> Self {
         Self::new_with_limits(repaint_ctx, ProtocolResponseLimits::PRODUCTION)
     }
 
@@ -354,11 +354,77 @@ fn retry_pending_input(
     }
 }
 
-pub(crate) fn user_input_is_blocked_by_mouse_edge(
+/// Session-scoped barriers held by asynchronous protocol producers. Counts,
+/// rather than a set, make overlapping guards for one session composable.
+#[derive(Clone, Default)]
+pub struct SessionInputBarriers {
+    counts: Arc<ParkingMutex<HashMap<String, usize>>>,
+}
+
+impl SessionInputBarriers {
+    pub fn acquire(&self, session_id: String) -> SessionInputBarrierGuard {
+        *self.counts.lock().entry(session_id.clone()).or_default() += 1;
+        SessionInputBarrierGuard {
+            barriers: self.clone(),
+            session_id,
+        }
+    }
+
+    pub fn blocks(&self, session_id: &str) -> bool {
+        self.counts.lock().contains_key(session_id)
+    }
+}
+
+#[must_use = "dropping the guard releases its session's input barrier"]
+pub struct SessionInputBarrierGuard {
+    barriers: SessionInputBarriers,
+    session_id: String,
+}
+
+impl Drop for SessionInputBarrierGuard {
+    fn drop(&mut self) {
+        let mut counts = self.barriers.counts.lock();
+        let Some(count) = counts.get_mut(&self.session_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&self.session_id);
+        }
+    }
+}
+
+pub(crate) fn user_input_is_blocked(
     session_id: &str,
-    barrier_session_id: Option<&str>,
+    mouse_barrier_session_id: Option<&str>,
+    protocol_barriers: &SessionInputBarriers,
 ) -> bool {
-    barrier_session_id == Some(session_id)
+    mouse_barrier_session_id == Some(session_id) || protocol_barriers.blocks(session_id)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserInputFlushBlock {
+    ProducerBarrier,
+    ProtocolResponse,
+}
+
+/// Shared active/background ordering gate. Producer barriers are checked
+/// first because a worker publishes its response and only then drops the
+/// barrier; once the barrier is absent, the following FIFO read must observe
+/// that response before user input may flush.
+pub(crate) fn user_input_flush_block(
+    session_id: &str,
+    mouse_barrier_session_id: Option<&str>,
+    protocol_barriers: &SessionInputBarriers,
+    protocol_responses: &ProtocolResponseSender,
+) -> Option<UserInputFlushBlock> {
+    if user_input_is_blocked(session_id, mouse_barrier_session_id, protocol_barriers) {
+        Some(UserInputFlushBlock::ProducerBarrier)
+    } else if protocol_responses.has_pending() {
+        Some(UserInputFlushBlock::ProtocolResponse)
+    } else {
+        None
+    }
 }
 
 fn restored_or_fresh_session_id(
@@ -405,7 +471,8 @@ impl SessionManager {
         &mut self,
         total_budget: usize,
         visible_session_indices: &[usize],
-        user_input_barrier_session_id: Option<&str>,
+        mouse_barrier_session_id: Option<&str>,
+        protocol_input_barriers: &SessionInputBarriers,
     ) -> BackgroundPumpResult {
         let order = background_pump_order(
             self.active_index,
@@ -438,28 +505,35 @@ impl SessionManager {
                     result.errors.push((session_idx, error.to_string()));
                 }
             }
-            // Do not accept more PTY protocol requests while an older reply is
-            // waiting for shell-writer capacity. This propagates bounded
-            // backpressure to the PTY and protects the critical reply reserve.
-            if protocol_responses.has_pending() {
-                share = 0;
-                result.has_more = true;
-            } else if user_input_is_blocked_by_mouse_edge(
+            match user_input_flush_block(
                 &session.metadata.session_id,
-                user_input_barrier_session_id,
+                mouse_barrier_session_id,
+                protocol_input_barriers,
+                &protocol_responses,
             ) {
-                // A press/release transition from an earlier frame still owns
-                // this session's user-input ordering barrier. Continue
-                // draining PTY output, but do not let newer keyboard/IME bytes
-                // overtake that edge in its writer. Independent PTYs remain
-                // usable while this route is backpressured.
-                result.has_more |= !session.pending_input.is_empty();
-            } else {
-                let shell = &session.shell;
-                match retry_pending_input(&mut session.pending_input, |bytes| shell.write(bytes)) {
-                    Ok(_) => {}
-                    Err(error) if error.is_backpressure() => result.has_more = true,
-                    Err(error) => result.errors.push((session_idx, error.to_string())),
+                Some(UserInputFlushBlock::ProducerBarrier) => {
+                    // An asynchronous protocol producer or a stateful mouse
+                    // edge still owns this session's ordering boundary. Keep
+                    // draining PTY output, but hold newer user bytes; unrelated
+                    // sessions continue independently.
+                    result.has_more |= !session.pending_input.is_empty();
+                }
+                // Do not accept more PTY protocol requests while an older
+                // reply is waiting for shell-writer capacity. This propagates
+                // bounded backpressure and protects the critical reserve.
+                Some(UserInputFlushBlock::ProtocolResponse) => {
+                    share = 0;
+                    result.has_more = true;
+                }
+                None => {
+                    let shell = &session.shell;
+                    match retry_pending_input(&mut session.pending_input, |bytes| {
+                        shell.write(bytes)
+                    }) {
+                        Ok(_) => {}
+                        Err(error) if error.is_backpressure() => result.has_more = true,
+                        Err(error) => result.errors.push((session_idx, error.to_string())),
+                    }
                 }
             }
             if visible_session_indices.contains(&session_idx) {
@@ -958,8 +1032,9 @@ fn refreshed_unseen_output(
 mod tests {
     use super::{
         background_pump_order, refreshed_unseen_output, restored_or_fresh_session_id,
-        retry_pending_input, user_input_is_blocked_by_mouse_edge, ProtocolResponseLimits,
-        ProtocolResponseQueueError, ProtocolResponseSender,
+        retry_pending_input, user_input_flush_block, user_input_is_blocked, ProtocolResponseLimits,
+        ProtocolResponseQueueError, ProtocolResponseSender, SessionInputBarriers,
+        UserInputFlushBlock,
     };
     use crate::shell::ShellWriteError;
     use std::collections::HashSet;
@@ -1031,19 +1106,132 @@ mod tests {
     }
 
     #[test]
-    fn mouse_edge_barrier_blocks_only_its_stable_session_route() {
-        assert!(user_input_is_blocked_by_mouse_edge(
-            "captured-session",
-            Some("captured-session")
+    fn mouse_and_protocol_barriers_can_block_different_sessions() {
+        let protocol_barriers = SessionInputBarriers::default();
+        let protocol_guard = protocol_barriers.acquire("paste-session".to_owned());
+
+        assert!(user_input_is_blocked(
+            "mouse-session",
+            Some("mouse-session"),
+            &protocol_barriers
         ));
-        assert!(!user_input_is_blocked_by_mouse_edge(
+        assert!(user_input_is_blocked(
+            "paste-session",
+            Some("mouse-session"),
+            &protocol_barriers
+        ));
+        assert!(!user_input_is_blocked(
             "independent-session",
-            Some("captured-session")
+            Some("mouse-session"),
+            &protocol_barriers
         ));
-        assert!(!user_input_is_blocked_by_mouse_edge(
-            "captured-session",
-            None
+
+        drop(protocol_guard);
+        assert!(!user_input_is_blocked(
+            "paste-session",
+            Some("mouse-session"),
+            &protocol_barriers
         ));
+        assert!(user_input_is_blocked(
+            "mouse-session",
+            Some("mouse-session"),
+            &protocol_barriers
+        ));
+    }
+
+    #[test]
+    fn overlapping_protocol_guards_release_only_after_the_last_drop() {
+        let barriers = SessionInputBarriers::default();
+        let first = barriers.acquire("same-session".to_owned());
+        let second = barriers.acquire("same-session".to_owned());
+
+        assert!(barriers.blocks("same-session"));
+        drop(first);
+        assert!(
+            barriers.blocks("same-session"),
+            "one drop must not release an overlapping producer's guard"
+        );
+        drop(second);
+        assert!(!barriers.blocks("same-session"));
+    }
+
+    #[test]
+    fn published_protocol_response_remains_a_fifo_gate_after_guard_drop() {
+        let barriers = SessionInputBarriers::default();
+        let responses = ProtocolResponseSender::new_with_limits(
+            egui::Context::default(),
+            tiny_protocol_limits(),
+        );
+        let guard = barriers.acquire("paste-session".to_owned());
+
+        assert_eq!(
+            user_input_flush_block("paste-session", None, &barriers, &responses),
+            Some(UserInputFlushBlock::ProducerBarrier)
+        );
+        responses
+            .try_enqueue_critical(b"paste-notification"[..8].to_vec())
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            user_input_flush_block("paste-session", None, &barriers, &responses),
+            Some(UserInputFlushBlock::ProtocolResponse),
+            "the response FIFO must remain ahead of newer user input"
+        );
+    }
+
+    #[test]
+    fn protocol_barrier_holds_pending_input_across_frames_until_worker_finishes() {
+        let barriers = SessionInputBarriers::default();
+        let responses = ProtocolResponseSender::new_with_limits(
+            egui::Context::default(),
+            tiny_protocol_limits(),
+        );
+        let guard = barriers.acquire("slow-paste".to_owned());
+        let mut pending = b"later-enter\r".to_vec();
+        let mut writes = Vec::new();
+
+        // Two UI/background pump passes while the worker is slow: neither may
+        // admit the newer input to the shell writer.
+        for _ in 0..2 {
+            if user_input_flush_block("slow-paste", None, &barriers, &responses).is_none() {
+                retry_pending_input(&mut pending, |bytes| {
+                    writes.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+        assert!(writes.is_empty());
+        assert_eq!(pending, b"later-enter\r");
+
+        responses
+            .try_enqueue_critical(b"paste-ok".to_vec())
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            user_input_flush_block("slow-paste", None, &barriers, &responses),
+            Some(UserInputFlushBlock::ProtocolResponse)
+        );
+        assert!(writes.is_empty());
+
+        // Model the pump admitting the protocol FIFO head, then verify the
+        // already-buffered Enter follows it rather than overtaking it.
+        let response = responses
+            .queue
+            .state
+            .lock()
+            .pending
+            .pop_front()
+            .expect("published paste response");
+        writes.extend_from_slice(&response);
+        assert!(user_input_flush_block("slow-paste", None, &barriers, &responses).is_none());
+        retry_pending_input(&mut pending, |bytes| {
+            writes.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writes, b"paste-oklater-enter\r");
+        assert!(pending.is_empty());
     }
 
     #[test]

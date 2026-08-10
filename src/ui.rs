@@ -487,10 +487,13 @@ pub struct TerminalRenderer {
     /// Whether to draw command-block chrome (`block_mode`): gutter stripes,
     /// separators and outcome badges derived from OSC 133 records.
     pub block_mode: bool,
-    /// Record id of the app-selected block for the terminal this renderer is
-    /// about to draw. Set by the app each frame; an id that matches no record
-    /// simply draws nothing (selection must never dangle).
-    pub selected_block_id: Option<String>,
+    /// Record ids in the app-selected Warp-style range for the terminal this
+    /// renderer is about to draw. Set by the app each frame; ids that match no
+    /// record simply draw nothing (selection must never dangle).
+    pub selected_block_ids: Vec<String>,
+    /// Strongly outlined active edge within `selected_block_ids`. The other
+    /// selected blocks keep a lighter outline.
+    pub active_block_id: Option<String>,
     /// Block-mode hit-test outcome of this frame's click, drained by the app
     /// the way `cursor_move_input` is.
     pub block_click: Option<crate::block_mode::BlockClick>,
@@ -583,7 +586,8 @@ impl TerminalRenderer {
             font_ligatures: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
-            selected_block_id: None,
+            selected_block_ids: Vec::new(),
+            active_block_id: None,
             block_click: None,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
@@ -1057,7 +1061,11 @@ impl TerminalRenderer {
         let badge_font = FontId::proportional(11.0);
 
         for entry in entries {
-            let selected = self.selected_block_id.as_deref() == Some(entry.id.as_str());
+            let selected = self
+                .selected_block_ids
+                .iter()
+                .any(|record_id| record_id == &entry.id);
+            let active = self.active_block_id.as_deref() == Some(entry.id.as_str());
             let (top_y, _) = snapped_span(content_rect.top(), entry.span.first_row, line_height);
             let (last_y, last_height) =
                 snapped_span(content_rect.top(), entry.span.last_row, line_height);
@@ -1077,8 +1085,10 @@ impl TerminalRenderer {
             // block gets no stripe (separator only).
             if entry.outcome != BlockOutcome::Prompt {
                 let color = self.block_outcome_color(entry.outcome);
-                let (width, alpha) = if selected {
+                let (width, alpha) = if active {
                     (block_mode::GUTTER_STRIPE_SELECTED_WIDTH, 255)
+                } else if selected {
+                    (block_mode::GUTTER_STRIPE_SELECTED_WIDTH, 210)
                 } else {
                     (block_mode::GUTTER_STRIPE_WIDTH, 170)
                 };
@@ -1092,15 +1102,24 @@ impl TerminalRenderer {
                 );
             }
 
-            // Selected block: 1px outline around its visible row span.
+            // Every selected block receives an outline; the active edge is
+            // stronger so a range still communicates where Up/Down will move.
             if selected {
+                let color = self.block_outcome_color(entry.outcome);
                 painter.rect_stroke(
                     egui::Rect::from_min_max(
                         egui::pos2(content_rect.left(), top_y),
                         egui::pos2(content_rect.right(), bottom_y),
                     ),
                     egui::CornerRadius::ZERO,
-                    egui::Stroke::new(1.0, self.block_outcome_color(entry.outcome)),
+                    egui::Stroke::new(
+                        if active { 1.5 } else { 1.0 },
+                        if active {
+                            color
+                        } else {
+                            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 130)
+                        },
+                    ),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -1116,7 +1135,7 @@ impl TerminalRenderer {
             // 选中块的徽章附带完成时刻(本地时间)。带后缀的徽章放不下时,
             // 先退回无后缀徽章再放弃,避免选中反而让徽章整个消失。
             let mut candidates: Vec<String> = Vec::new();
-            if selected {
+            if active {
                 if let Some(secs) = entry.finished_at.and_then(block_mode::epoch_secs) {
                     let clock = block_mode::format_local_time_of_day(
                         secs,
@@ -3056,6 +3075,13 @@ impl TerminalRenderer {
                     // Always send them - they handle Shift, Caps Lock, etc. correctly.
                     input.extend(text.as_bytes());
                 }
+                // Most IME commits are queued in app/input at their exact
+                // ordered position and removed from this event slice. A commit
+                // left here follows older deferred Text/key input, so encode it
+                // inline to preserve byte order instead of overtaking that FIFO.
+                egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
+                    input.extend(text.as_bytes());
+                }
                 egui::Event::Key {
                     key,
                     pressed: true,
@@ -3162,6 +3188,106 @@ impl TerminalRenderer {
 mod tests {
     use super::*;
 
+    fn render_semantic_paste_pointer_suffix(
+        interaction_enabled: bool,
+    ) -> (TerminalRenderer, egui::Context, egui::Id) {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut terminal = crate::terminal::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
+        let click = egui::pos2(32.0, 10.0);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
+        // Register the widget's clickable hit-test geometry. egui resolves a
+        // press against the previous pass; focus is explicitly surrendered
+        // before the accepted-Paste release below.
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = renderer.render(
+                    ui,
+                    &mut terminal,
+                    true,
+                    true,
+                    &crate::search::SearchState::default(),
+                    &[],
+                    &None,
+                );
+            },
+        );
+        let mut pressed_response_id = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(click),
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let response = renderer.render(
+                    ui,
+                    &mut terminal,
+                    true,
+                    true,
+                    &crate::search::SearchState::default(),
+                    &[],
+                    &None,
+                );
+                pressed_response_id = Some(response.id);
+            },
+        );
+        // The assertion is about the release after an accepted Paste, not a
+        // focus retained from the press that established egui's click route.
+        ctx.memory_mut(|memory| {
+            memory.surrender_focus(pressed_response_id.expect("terminal press was rendered"));
+        });
+        renderer.block_click = None;
+        renderer.cursor_move_input.clear();
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                egui::Event::Paste("accepted".to_owned()),
+                egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut response_id = None;
+        let _ = ctx.run_ui(raw_input, |ui| {
+            let response = renderer.render(
+                ui,
+                &mut terminal,
+                interaction_enabled,
+                true,
+                &crate::search::SearchState::default(),
+                &[],
+                &None,
+            );
+            response_id = Some(response.id);
+        });
+        (renderer, ctx, response_id.expect("terminal was rendered"))
+    }
+
     #[test]
     fn grid_position_uses_content_origin() {
         let content_rect =
@@ -3177,6 +3303,25 @@ mod tests {
         );
 
         assert_eq!((row, col), (2, 4));
+    }
+
+    #[test]
+    fn accepted_semantic_paste_suppresses_renderer_pointer_suffix() {
+        // Prove the synthetic click is actionable without the frame gate, so
+        // the negative assertions below exercise renderer integration rather
+        // than an inert egui event fixture.
+        let (active, active_ctx, active_id) = render_semantic_paste_pointer_suffix(true);
+        assert_eq!(
+            active.block_click,
+            Some(crate::block_mode::BlockClick::Clear)
+        );
+        assert!(!active.cursor_move_input.is_empty());
+        assert!(active_ctx.memory(|memory| memory.has_focus(active_id)));
+
+        let (blocked, blocked_ctx, blocked_id) = render_semantic_paste_pointer_suffix(false);
+        assert_eq!(blocked.block_click, None);
+        assert!(blocked.cursor_move_input.is_empty());
+        assert!(!blocked_ctx.memory(|memory| memory.has_focus(blocked_id)));
     }
 
     #[test]
@@ -3484,6 +3629,43 @@ mod tests {
             &[ctrl_d],
         );
         assert_eq!(encoded, [0x04]);
+    }
+
+    #[test]
+    fn deferred_ime_commit_keeps_its_position_in_terminal_input() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let events = [
+            egui::Event::Text("a".to_owned()),
+            egui::Event::Ime(egui::ImeEvent::Commit("你".to_owned())),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let mut encoded = Vec::new();
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0,
+            false,
+            0,
+            0,
+            false,
+            false,
+            &events,
+        );
+        assert_eq!(encoded, "a你\r".as_bytes());
     }
 
     #[test]

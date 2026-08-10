@@ -22,11 +22,11 @@ pub(crate) fn workspace_drag_pointer_pos(
 /// to `session_id`. Normal selection paths update both fields together, but
 /// close must also clean up a pre-existing or otherwise divergent half.
 fn block_or_sidebar_selection_targets_session(
-    block_selection: Option<&(String, String)>,
+    block_selection: Option<&crate::block_mode::BlockSelection>,
     sidebar_selection: Option<&CommandTarget>,
     session_id: &str,
 ) -> bool {
-    block_selection.is_some_and(|(selected_session, _)| selected_session == session_id)
+    block_selection.is_some_and(|selection| selection.session_id == session_id)
         || sidebar_selection.is_some_and(|target| target.session_id == session_id)
 }
 
@@ -2078,6 +2078,10 @@ mod tests {
             session_id: "closed-session".to_owned(),
             execution_id: "sidebar".to_owned(),
         };
+        let block = crate::block_mode::BlockSelection::single(
+            "closed-session".to_owned(),
+            "block".to_owned(),
+        );
 
         assert!(block_or_sidebar_selection_targets_session(
             None,
@@ -2088,6 +2092,11 @@ mod tests {
             None,
             Some(&sidebar),
             "open-session",
+        ));
+        assert!(block_or_sidebar_selection_targets_session(
+            Some(&block),
+            None,
+            "closed-session",
         ));
     }
 }

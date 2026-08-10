@@ -10,6 +10,25 @@ const MAX_FRAME_BUDGET: usize = 256 * 1024;
 const TARGET_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
 const MIN_ADAPTIVE_SAMPLE_BYTES: usize = 4 * 1024;
 
+fn paste_confirmation_decision(
+    armed: bool,
+    requested: Option<bool>,
+    modal_should_close: bool,
+) -> Option<bool> {
+    armed.then(|| requested.or_else(|| modal_should_close.then_some(false)))?
+}
+
+fn agent_input_route_is_clean(direct_input_blocked: bool, pending_input: bool) -> bool {
+    !direct_input_blocked && !pending_input
+}
+
+fn terminal_frame_interaction_enabled(
+    terminal_input_blocked: bool,
+    frame_pointer_input_blocked: bool,
+) -> bool {
+    !terminal_input_blocked && !frame_pointer_input_blocked
+}
+
 /// Adjust the next PTY parsing budget from measured parser work, not from the
 /// interval between UI frames. The latter includes time spent completely idle
 /// and used to collapse the budget after a cursor-blink repaint.
@@ -511,8 +530,16 @@ impl TerminalApp {
         }
     }
 
-    pub fn render_terminal_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let interaction_enabled = !self.terminal_input_blocked(ctx);
+    pub fn render_terminal_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        frame_pointer_input_blocked: bool,
+    ) {
+        let interaction_enabled = terminal_frame_interaction_enabled(
+            self.terminal_input_blocked(ctx),
+            frame_pointer_input_blocked,
+        );
         let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
         if !terminal_interaction_enabled {
@@ -640,11 +667,15 @@ impl TerminalApp {
                     };
 
                     // 本 pane 的会话若持有 block 选中,让 renderer 高亮它。
-                    renderer.selected_block_id = self
+                    let pane_block_selection = self
                         .block_selection
                         .as_ref()
-                        .filter(|(session_id, _)| session_id == &session.metadata.session_id)
-                        .map(|(_, record_id)| record_id.clone());
+                        .filter(|selection| selection.session_id == session.metadata.session_id);
+                    renderer.selected_block_ids = pane_block_selection
+                        .map(|selection| selection.selected_ids.clone())
+                        .unwrap_or_default();
+                    renderer.active_block_id =
+                        pane_block_selection.map(|selection| selection.active_id.clone());
 
                     // 在指定矩形内渲染（多窗格模式专用方法）
                     renderer.render_in_rect(
@@ -811,11 +842,15 @@ impl TerminalApp {
             {
                 let session = self.session_manager.get_active_session_mut();
                 let session_id = session.metadata.session_id.clone();
-                self.renderer.selected_block_id = self
+                let block_selection = self
                     .block_selection
                     .as_ref()
-                    .filter(|(selected_session, _)| selected_session == &session_id)
-                    .map(|(_, record_id)| record_id.clone());
+                    .filter(|selection| selection.session_id == session_id);
+                self.renderer.selected_block_ids = block_selection
+                    .map(|selection| selection.selected_ids.clone())
+                    .unwrap_or_default();
+                self.renderer.active_block_id =
+                    block_selection.map(|selection| selection.active_id.clone());
                 let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                 let mut terminal_guard = session.terminal.lock();
 
@@ -857,7 +892,14 @@ impl TerminalApp {
         if let Some((session_id, click)) = pending_block_click {
             match click {
                 crate::block_mode::BlockClick::Select(record_id) => {
-                    self.block_selection = Some((session_id.clone(), record_id.clone()));
+                    if !self.config.block_mode {
+                        self.clear_block_selection();
+                        return;
+                    }
+                    self.block_selection = Some(crate::block_mode::BlockSelection::single(
+                        session_id.clone(),
+                        record_id.clone(),
+                    ));
                     // A gutter click highlights the matching Commands-sidebar
                     // row, like keyboard selection and jump_first_failed do.
                     self.sync_block_selection_to_sidebar(&super::commands::CommandTarget {
@@ -1480,6 +1522,15 @@ impl TerminalApp {
                                 }
                             }
                             search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
+                                let active_session_id = self
+                                    .session_manager
+                                    .sessions()
+                                    .get(self.session_manager.active_index())
+                                    .map(|session| session.metadata.session_id.clone());
+                                let direct_input_blocked =
+                                    active_session_id.as_deref().is_none_or(|session_id| {
+                                        self.direct_input_is_blocked_for_session(session_id)
+                                    });
                                 let paste_result = {
                                     let session = self.session_manager.get_active_session_mut();
                                     crate::paste_text_into_session(
@@ -1488,6 +1539,7 @@ impl TerminalApp {
                                         self.config.paste_confirm,
                                         crate::PasteOrigin::PromptInsert,
                                         false,
+                                        direct_input_blocked,
                                         &mut self.pending_paste_confirm,
                                     )
                                 };
@@ -1497,6 +1549,9 @@ impl TerminalApp {
                                             "Awaiting paste confirmation".to_string();
                                     }
                                     Ok(true) => {
+                                        if let Some(session_id) = active_session_id {
+                                            self.clear_block_selection_for_session(&session_id);
+                                        }
                                         self.search_replace_panel.status =
                                             "Typed into terminal".to_string();
                                     }
@@ -1595,6 +1650,8 @@ impl TerminalApp {
                         }
                         match self.session_manager.index_of(&session_id) {
                             Some(session_index) => {
+                                let direct_input_blocked =
+                                    self.direct_input_is_blocked_for_session(&session_id);
                                 let Some(session) =
                                     self.session_manager.get_session_mut(session_index)
                                 else {
@@ -1604,6 +1661,19 @@ impl TerminalApp {
                                     );
                                     continue;
                                 };
+                                if !agent_input_route_is_clean(
+                                    direct_input_blocked,
+                                    !session.pending_input.is_empty(),
+                                ) {
+                                    self.agent_panel.execution_start_failed(
+                                        generation,
+                                        "Agent command was not started: older terminal input is still pending",
+                                    );
+                                    self.set_status(
+                                        "Agent command was not started: older terminal input is still pending",
+                                    );
+                                    continue;
+                                }
                                 if !session.shell_owns_foreground_pty() {
                                     self.agent_panel.execution_start_failed(
                                     generation,
@@ -1633,6 +1703,8 @@ impl TerminalApp {
                                         "Agent command rejected: input queue is full",
                                     );
                                     self.set_status("Agent command rejected: input queue is full");
+                                } else {
+                                    self.clear_block_selection_for_session(&session_id);
                                 }
                             }
                             None => {
@@ -1708,6 +1780,7 @@ impl TerminalApp {
         let Some(pending) = self.pending_paste_confirm.as_ref() else {
             return;
         };
+        let decision_armed = pending.decision_armed;
 
         let panel_bg = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
         let text_color = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.text);
@@ -1809,30 +1882,46 @@ impl TerminalApp {
                     });
                 ui.add_space(8.0);
                 if !had_visual_spoofing {
-                    ui.checkbox(&mut dont_ask_again, "不再询问(可在配置里重新开启)");
+                    ui.add_enabled(
+                        decision_armed,
+                        egui::Checkbox::new(&mut dont_ask_again, "不再询问(可在配置里重新开启)"),
+                    );
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
+                    if ui
+                        .add_enabled(decision_armed, egui::Button::new("取消"))
+                        .clicked()
+                    {
                         decision = Some(false);
                     }
-                    if ui.button("粘贴").clicked() {
+                    if ui
+                        .add_enabled(decision_armed, egui::Button::new("粘贴"))
+                        .clicked()
+                    {
                         decision = Some(true);
                     }
                 });
                 // Esc / Enter shortcuts.
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if decision_armed && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     decision = Some(false);
                 }
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if decision_armed && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     decision = Some(true);
                 }
             });
-        if modal_response.should_close() {
-            decision = Some(false);
-        }
+        decision =
+            paste_confirmation_decision(decision_armed, decision, modal_response.should_close());
 
         self.paste_dont_ask_again = dont_ask_again;
+
+        if !decision_armed {
+            if let Some(pending) = self.pending_paste_confirm.as_mut() {
+                pending.decision_armed = true;
+            }
+            ctx.request_repaint();
+            return;
+        }
 
         let Some(confirmed) = decision else {
             return;
@@ -1873,20 +1962,30 @@ impl TerminalApp {
         // Encoded here rather than when the dialog opened: the shell may have
         // entered or left bracketed-paste mode while the modal was up, and the
         // framing has to match the mode that is live at delivery time.
+        let direct_input_blocked = self.direct_input_is_blocked_for_session(&pending.session_id);
         let write_result = {
             let session = self.session_manager.get_active_session_mut();
-            crate::write_paste_to_session(session, &pending.text, pending.submit_after_paste)
+            crate::write_paste_to_session(
+                session,
+                &pending.text,
+                pending.submit_after_paste,
+                direct_input_blocked,
+            )
         };
-        if let Err(error) = write_result {
-            let retryable = error.is_backpressure();
-            self.set_status_for(
-                format!("Paste failed: {error}"),
-                std::time::Duration::from_secs(4),
-            );
-            if retryable {
-                // The bounded writer guarantees Full enqueued zero
-                // bytes, so reopening the confirmation is a safe exact retry.
-                self.pending_paste_confirm = Some(pending);
+        match write_result {
+            Ok(true) => self.clear_block_selection_for_session(&pending.session_id),
+            Ok(false) => {}
+            Err(error) => {
+                let retryable = error.is_retryable();
+                self.set_status_for(
+                    format!("Paste failed: {error}"),
+                    std::time::Duration::from_secs(4),
+                );
+                if retryable {
+                    // Busy/Full admitted zero bytes, so reopening with the
+                    // normalized source is a safe delivery-time-mode retry.
+                    self.pending_paste_confirm = Some(pending);
+                }
             }
         }
     }
@@ -1952,5 +2051,32 @@ mod tests {
             );
         }
         assert_eq!(low, MIN_FRAME_BUDGET);
+    }
+
+    #[test]
+    fn risky_paste_opening_batch_cannot_confirm_or_cancel_its_first_render() {
+        assert_eq!(paste_confirmation_decision(false, Some(true), false), None);
+        assert_eq!(paste_confirmation_decision(false, Some(false), true), None);
+        assert_eq!(
+            paste_confirmation_decision(true, Some(true), false),
+            Some(true)
+        );
+        assert_eq!(paste_confirmation_decision(true, None, true), Some(false));
+    }
+
+    #[test]
+    fn agent_command_rejects_barriers_and_pending_input_before_arming() {
+        assert!(agent_input_route_is_clean(false, false));
+        assert!(!agent_input_route_is_clean(true, false));
+        assert!(!agent_input_route_is_clean(false, true));
+        assert!(!agent_input_route_is_clean(true, true));
+    }
+
+    #[test]
+    fn accepted_paste_frame_disables_all_terminal_render_interaction() {
+        assert!(terminal_frame_interaction_enabled(false, false));
+        assert!(!terminal_frame_interaction_enabled(false, true));
+        assert!(!terminal_frame_interaction_enabled(true, false));
+        assert!(!terminal_frame_interaction_enabled(true, true));
     }
 }

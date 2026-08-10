@@ -207,8 +207,9 @@ bottom_bar = true
 
 # Command-block chrome (Warp-style): a colored gutter stripe, separator and
 # outcome badge per OSC 133 command block. Running blocks show a compact live
-# elapsed-time badge when it fits without covering terminal text. The block:*
-# palette commands (jump to first failure, copy, recall) work when this is off.
+# elapsed-time badge when it fits without covering terminal text. Turning this
+# off also clears/disables whole-block selection, so arrows and Enter retain
+# their ordinary terminal meaning.
 block_mode = true
 ```
 
@@ -264,8 +265,19 @@ Defaults include:
 | Equalize all pane dividers | Command palette: “Equalize Panes” |
 | Font size increase / decrease / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | Window opacity increase / decrease | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
+| Select all completed command blocks | `Ctrl+Shift+A` |
+| Reinput selected block commands (without running) | `Ctrl+Shift+I` |
+| Toggle Agent panel | `Ctrl+Shift+Alt+A` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
+
+Block selection is context-sensitive. `Ctrl+Up` starts at the newest block;
+once a block is selected, plain `Up` / `Down` collapses and moves the active
+edge, while `Shift+Up` / `Shift+Down` expands or contracts the anchored range.
+`Enter` reinputs every selected real command in terminal order as editable
+bracketed-paste text, background-output blocks are skipped, and `Escape` clears
+the range. Enter continues to the child unchanged while a command or
+alternate-screen program owns the PTY.
 
 Bindings in `~/.config/ember/keybindings.toml` override defaults. The file is
 a flat TOML table:

@@ -24,6 +24,10 @@ use std::sync::{atomic::AtomicBool, Arc};
 /// exceeds [`PASTE_CONFIRM_THRESHOLD_BYTES`], carries an embedded frame marker,
 /// or contains visual-spoof Unicode that requires an explicit one-shot review.
 pub struct PendingPasteConfirm {
+    /// A dialog created during this OS input batch must not consume the same
+    /// batch's trailing Enter/Escape/click as approval. Its first render only
+    /// presents the preview and arms decisions for the following frame.
+    pub decision_armed: bool,
     /// The payload as the child will receive it: line endings folded and any
     /// embedded paste marker already removed, so the preview cannot show
     /// something other than what gets written. Re-encoding it on accept is a
@@ -101,6 +105,10 @@ pub struct TerminalMouseCapture {
     /// changes so release can never land in a different PTY.
     pub terminal: Arc<ParkingMutex<crate::terminal::TerminalState>>,
     pub write_tx: crate::shell::ShellWriteSender,
+    /// Stable protocol FIFO paired with `write_tx`. Tab indices can change
+    /// during a drag, but a paste response for this PTY must remain ahead of
+    /// its mouse reports.
+    pub protocol_responses: crate::session_manager::ProtocolResponseSender,
     /// Press-time pane geometry plus the most recent cell. Some window
     /// systems deliver an outside-window release without a pointer position.
     pub content_rect: egui::Rect,
@@ -128,6 +136,11 @@ pub struct TerminalApp {
     /// processes, so allowing the PTY to spawn overlapping reads would turn a
     /// harmless MIME-list query into an unbounded thread/process DoS.
     pub clipboard_request_in_flight: Arc<AtomicBool>,
+    /// Holds user input for the originating session until an asynchronous OSC
+    /// 5522 paste notification has entered that session's protocol-response
+    /// FIFO. Stable IDs keep tab switches and background pumping correctly
+    /// routed; mouse-edge barriers remain independent.
+    pub(crate) osc_paste_input_barriers: crate::session_manager::SessionInputBarriers,
     /// Bounded background writer for OSC 52. PTY output is untrusted and must
     /// never synchronously wait for external clipboard-owner processes on the
     /// UI thread.
@@ -194,10 +207,10 @@ pub struct TerminalApp {
     // Semantic command timeline sidebar
     pub command_sidebar: CommandSidebarState,
 
-    /// Block mode 当前选中的命令块：(session_id, record id)。record 被淘汰
-    /// 或 session 关闭时一律按“无选中”处理（绝不 panic）；真实键盘输入
-    /// 送往 PTY 时清空（anvil 先例）。
-    pub block_selection: Option<(String, String)>,
+    /// Block mode 当前选中的命令块范围。范围持有 session、固定 anchor、
+    /// active edge 与 terminal-order ids；record 被淘汰或 session 关闭时一律
+    /// 按“无选中”处理（绝不 panic）。真实键盘输入送往 PTY 时清空。
+    pub block_selection: Option<crate::block_mode::BlockSelection>,
 
     /// `block:search` 跨块搜索选择器（palette 式浮层）。打开期间拥有键盘
     /// 输入,终端事件被拦截,因此不会顺带清掉 block_selection。
