@@ -7,15 +7,29 @@
 
 pub mod context;
 pub mod diff;
+pub mod driver;
+pub mod drivers;
+pub mod event;
 pub mod launcher;
 pub mod task;
 pub mod worktree;
 
 pub use context::{ContextError, SemanticCommandContext};
 pub use diff::{AgentDiffPanel, AgentDiffState, DiffRequestError};
+pub use driver::{
+    AgentCancellation, AgentCommand, AgentDriver, AgentDriverError, AgentEventQueueLimits,
+    AgentEventQueueStats, AgentEventReceiveError, AgentEventReceiver, AgentEventSendError,
+    AgentEventSender, AgentEventSink, AgentPrompt, AgentStartRequest, ApprovalDecision,
+};
+pub use event::{
+    AgentEvent, AgentEventEpoch, AgentEventError, AgentEventKind, AgentEventStream,
+    AgentSessionOutcome, AgentTurnId, ApprovalId, InvalidNativeAgentSessionId,
+    InvalidProviderSessionId, NativeAgentSessionId, ProviderSessionId,
+};
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
 pub use task::{
-    AgentProvider, AgentTask, NewTask, TaskError, TaskId, TaskManager, TaskSource, TaskStatus,
+    AgentProvider, AgentTask, NewTask, TaskError, TaskId, TaskManager, TaskRuntimeKind, TaskSource,
+    TaskStatus,
 };
 pub use worktree::{
     CreateWorktreeRequest, ManagedWorktree, RetireOutcome, RetirePolicy, WorktreeError,

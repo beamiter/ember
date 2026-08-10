@@ -344,7 +344,7 @@ impl TerminalApp {
             return false;
         }
         if let Some(session_id) = removed_session_id.as_deref() {
-            self.task_manager.handle_session_closed(session_id);
+            self.task_manager.handle_terminal_session_closed(session_id);
         }
         if self
             .pending_paste_confirm

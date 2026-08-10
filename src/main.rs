@@ -2844,7 +2844,7 @@ impl eframe::App for TerminalApp {
         for (session_id, exit_code) in exited_sessions {
             let agent_task = self
                 .task_manager
-                .handle_session_exit(&session_id, exit_code)
+                .handle_terminal_session_exit(&session_id, exit_code)
                 .is_some();
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
                 continue;
@@ -3022,7 +3022,7 @@ impl eframe::App for TerminalApp {
         let active_session_id = session.metadata.session_id.clone();
         let active_agent_provider = self
             .task_manager
-            .task_for_session(&active_session_id)
+            .task_for_terminal_session(&active_session_id)
             .map(|task| task.provider.display_name());
 
         // Step 3: semantic application paste events. Host copy/paste keyboard
@@ -4360,7 +4360,7 @@ impl eframe::App for TerminalApp {
 
         if shell_exit_observed {
             self.task_manager
-                .handle_session_exit(&active_session_id, shell_exit_code);
+                .handle_terminal_session_exit(&active_session_id, shell_exit_code);
             if retain_exited_agent_terminal {
                 self.session_manager
                     .retain_exited_command(&active_session_id);

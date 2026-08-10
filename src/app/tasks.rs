@@ -234,27 +234,28 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_sidebar_tasks(&mut self, ui: &mut egui::Ui) {
-        let mut rows: Vec<_> =
-            self.task_manager
-                .tasks()
-                .iter()
-                .filter(|task| task.status != TaskStatus::Archived)
-                .map(|task| TaskRowSnapshot {
-                    id: task.id,
-                    title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
-                    provider: task.provider,
-                    status: task.status,
-                    branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
-                    updated_at_ms: task.updated_at_ms,
-                    has_terminal: task.agent_session_id.as_deref().is_some_and(|session_id| {
-                        self.session_manager.index_of(session_id).is_some()
-                    }),
-                    status_detail: task
-                        .status_detail
-                        .as_deref()
-                        .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
-                })
-                .collect();
+        let mut rows: Vec<_> = self
+            .task_manager
+            .tasks()
+            .iter()
+            .filter(|task| task.status != TaskStatus::Archived)
+            .map(|task| TaskRowSnapshot {
+                id: task.id,
+                title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
+                provider: task.provider,
+                status: task.status,
+                branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
+                updated_at_ms: task.updated_at_ms,
+                has_terminal: task
+                    .terminal_session_id
+                    .as_deref()
+                    .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
+                status_detail: task
+                    .status_detail
+                    .as_deref()
+                    .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
+            })
+            .collect();
         sort_rows(&mut rows);
 
         if rows.is_empty() {
@@ -382,7 +383,7 @@ impl TerminalApp {
                 let session_id = self
                     .task_manager
                     .get(task_id)
-                    .and_then(|task| task.agent_session_id.clone());
+                    .and_then(|task| task.terminal_session_id.clone());
                 let Some(session_id) = session_id else {
                     self.set_status("Agent terminal is no longer available");
                     return;
@@ -425,7 +426,7 @@ impl TerminalApp {
 
     fn start_task_agent_terminal(&mut self, task_id: TaskId) {
         let launch = self.task_manager.get(task_id).and_then(|task| {
-            (task.status == TaskStatus::Created && task.agent_session_id.is_none()).then(|| {
+            (task.status == TaskStatus::Created && task.terminal_session_id.is_none()).then(|| {
                 (
                     task.provider,
                     task.title.clone(),
@@ -486,7 +487,7 @@ impl TerminalApp {
 
         if let Err(error) = self
             .task_manager
-            .bind_agent_session(task_id, created.session_id.clone())
+            .bind_terminal_session(task_id, created.session_id.clone())
         {
             // The session was inserted but has not entered TabManager yet;
             // removing it immediately restores the original index layout.

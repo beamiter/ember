@@ -12,6 +12,13 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub use super::event::{
+    AgentEvent, AgentEventEpoch, AgentEventError, AgentEventKind, AgentEventStream,
+    AgentSessionOutcome, AgentTurnId, ApprovalId, InvalidNativeAgentSessionId,
+    NativeAgentSessionId, ProviderSessionId, MAX_AGENT_EVENT_DETAIL_BYTES,
+    MAX_NATIVE_AGENT_SESSION_ID_BYTES,
+};
+
 const MAX_TASK_TITLE_BYTES: usize = 256;
 const MAX_BRANCH_BYTES: usize = 512;
 
@@ -73,6 +80,17 @@ pub enum TaskStatus {
     Archived,
 }
 
+/// Runtime family selected for a task. This choice survives an individual
+/// stream/process ending so a task cannot silently switch authority models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRuntimeKind {
+    #[default]
+    Unassigned,
+    Terminal,
+    Native,
+}
+
 impl TaskStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -101,6 +119,15 @@ impl TaskStatus {
         matches!(
             self,
             Self::WaitingForApproval | Self::WaitingForHuman | Self::ReadyForReview | Self::Failed
+        )
+    }
+
+    /// States that native driver events may never leave. Ready-for-review is
+    /// intentionally not terminal: review feedback may start another turn.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Archived
         )
     }
 }
@@ -141,7 +168,14 @@ pub struct AgentTask {
     pub base_commit: String,
     pub source: Option<TaskSource>,
     pub source_context: Option<super::SemanticCommandContext>,
-    pub agent_session_id: Option<String>,
+    #[serde(default)]
+    pub runtime_kind: TaskRuntimeKind,
+    /// Stable jsh/PTY session ID for the opaque terminal fallback.
+    ///
+    /// This is intentionally separate from native run epochs and opaque
+    /// provider session identities.
+    #[serde(alias = "agent_session_id")]
+    pub terminal_session_id: Option<String>,
     pub exit_code: Option<i32>,
     pub status_detail: Option<String>,
     pub created_at_ms: u64,
@@ -163,10 +197,27 @@ pub enum TaskError {
     WorktreePathMustBeAbsolute,
     WorktreeMatchesRepoRoot,
     InvalidSourceContext,
-    InvalidSessionId,
+    InvalidTerminalSessionId,
+    NativeRuntimeAlreadySelected(TaskId),
+    NativeEventStreamActive(TaskId),
+    CannotBindTerminalInState {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    CannotLeaveTerminalState {
+        task_id: TaskId,
+        current: TaskStatus,
+        requested: TaskStatus,
+    },
     UnknownTask(TaskId),
-    SessionAlreadyBound { session_id: String, task_id: TaskId },
-    TaskAlreadyBound { task_id: TaskId, session_id: String },
+    TerminalSessionAlreadyBound {
+        session_id: String,
+        task_id: TaskId,
+    },
+    TaskAlreadyBoundToTerminal {
+        task_id: TaskId,
+        session_id: String,
+    },
     CannotArchiveRunning(TaskId),
 }
 
@@ -191,9 +242,34 @@ impl fmt::Display for TaskError {
             Self::InvalidSourceContext => {
                 formatter.write_str("task source context has invalid stable identifiers")
             }
-            Self::InvalidSessionId => formatter.write_str("agent session ID is invalid"),
+            Self::InvalidTerminalSessionId => {
+                formatter.write_str("Agent terminal session ID is invalid")
+            }
+            Self::NativeRuntimeAlreadySelected(task_id) => write!(
+                formatter,
+                "task {task_id} has selected the native Agent runtime"
+            ),
+            Self::NativeEventStreamActive(task_id) => write!(
+                formatter,
+                "task {task_id} still has an active native Agent event stream"
+            ),
+            Self::CannotBindTerminalInState { task_id, status } => write!(
+                formatter,
+                "cannot bind an Agent terminal to task {task_id} in state {}",
+                status.label()
+            ),
+            Self::CannotLeaveTerminalState {
+                task_id,
+                current,
+                requested,
+            } => write!(
+                formatter,
+                "cannot move task {task_id} from terminal state {} to {}",
+                current.label(),
+                requested.label()
+            ),
             Self::UnknownTask(task_id) => write!(formatter, "unknown task {task_id}"),
-            Self::SessionAlreadyBound {
+            Self::TerminalSessionAlreadyBound {
                 session_id,
                 task_id,
             } => {
@@ -202,7 +278,7 @@ impl fmt::Display for TaskError {
                     "session {session_id} is already bound to task {task_id}"
                 )
             }
-            Self::TaskAlreadyBound {
+            Self::TaskAlreadyBoundToTerminal {
                 task_id,
                 session_id,
             } => {
@@ -225,7 +301,16 @@ impl std::error::Error for TaskError {}
 pub struct TaskManager {
     tasks: Vec<AgentTask>,
     task_indices: HashMap<TaskId, usize>,
-    tasks_by_session: HashMap<String, TaskId>,
+    tasks_by_terminal_session: HashMap<String, TaskId>,
+    native_event_streams: HashMap<TaskId, NativeEventStreamState>,
+}
+
+#[derive(Debug)]
+struct NativeEventStreamState {
+    stream: AgentEventStream,
+    next_sequence: u64,
+    session_started: bool,
+    active_turn: Option<AgentTurnId>,
 }
 
 impl TaskManager {
@@ -251,7 +336,8 @@ impl TaskManager {
                 execution_id: context.source_execution_id.clone(),
             }),
             source_context: new_task.source_context,
-            agent_session_id: None,
+            runtime_kind: TaskRuntimeKind::Unassigned,
+            terminal_session_id: None,
             exit_code: None,
             status_detail: None,
             created_at_ms: now,
@@ -272,47 +358,335 @@ impl TaskManager {
             .and_then(|index| self.tasks.get(*index))
     }
 
-    pub fn task_for_session(&self, session_id: &str) -> Option<&AgentTask> {
-        self.tasks_by_session
+    pub fn task_for_terminal_session(&self, session_id: &str) -> Option<&AgentTask> {
+        self.tasks_by_terminal_session
             .get(session_id)
             .and_then(|task_id| self.get(*task_id))
+    }
+
+    /// Start a correlated event stream and atomically select the native
+    /// runtime for an unassigned task. An already-active stream must be
+    /// stopped through the runtime before it can be explicitly replaced.
+    pub fn start_agent_event_stream(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<AgentEventStream, AgentEventError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(AgentEventError::StreamAlreadyActive(task_id));
+        }
+        self.install_agent_event_stream(task_id, NativeAgentSessionId::new(), false)
+    }
+
+    /// Rotate event correlation after the runtime has cancelled and reaped the
+    /// old adapter. The status is preserved across transport reconnection.
+    pub fn replace_agent_event_stream_after_stop(
+        &mut self,
+        expected: &AgentEventStream,
+    ) -> Result<AgentEventStream, AgentEventError> {
+        let task_id = self.verify_agent_event_stream(expected)?;
+        self.install_agent_event_stream(task_id, expected.session_id().clone(), true)
+    }
+
+    /// Converge a stream after its runtime has stopped but could not enqueue a
+    /// final event (for example, a worker/channel failure). This is an
+    /// out-of-band compare-and-swap operation: a stale runtime cannot finish a
+    /// replacement stream.
+    pub fn finish_agent_event_stream_after_stop(
+        &mut self,
+        expected: &AgentEventStream,
+        outcome: AgentSessionOutcome,
+        detail: Option<String>,
+    ) -> Result<TaskStatus, AgentEventError> {
+        let task_id = self.verify_agent_event_stream(expected)?;
+        let current = self
+            .get(task_id)
+            .ok_or(AgentEventError::UnknownTask(task_id))?
+            .status;
+        if current.is_terminal() {
+            return Err(AgentEventError::TerminalState {
+                task_id,
+                status: current,
+            });
+        }
+        let event = AgentEventKind::SessionEnded { outcome };
+        let (next, _) = super::event::status_after_event(current, &event).ok_or(
+            AgentEventError::InvalidTransition {
+                task_id,
+                status: current,
+                event,
+            },
+        )?;
+        let detail = super::event::bounded_event_detail(detail);
+        let task = self
+            .task_mut(task_id)
+            .map_err(|_| AgentEventError::UnknownTask(task_id))?;
+        task.status = next;
+        if next != current || detail.is_some() {
+            task.status_detail = detail;
+        }
+        task.updated_at_ms = unix_time_ms();
+        self.native_event_streams.remove(&task_id);
+        Ok(next)
+    }
+
+    fn verify_agent_event_stream(
+        &self,
+        expected: &AgentEventStream,
+    ) -> Result<TaskId, AgentEventError> {
+        let task_id = expected.task_id();
+        let Some(active) = self.native_event_streams.get(&task_id) else {
+            return Err(AgentEventError::NoActiveStream(task_id));
+        };
+        if active.stream.epoch() != expected.epoch() {
+            return Err(AgentEventError::EpochMismatch {
+                task_id,
+                expected: active.stream.epoch(),
+                received: expected.epoch(),
+            });
+        }
+        if active.stream.session_id() != expected.session_id() {
+            return Err(AgentEventError::SessionMismatch(task_id));
+        }
+        Ok(task_id)
+    }
+
+    fn install_agent_event_stream(
+        &mut self,
+        task_id: TaskId,
+        session_id: NativeAgentSessionId,
+        replacing: bool,
+    ) -> Result<AgentEventStream, AgentEventError> {
+        let (status, runtime_kind, terminal_bound) = self
+            .get(task_id)
+            .map(|task| {
+                (
+                    task.status,
+                    task.runtime_kind,
+                    task.terminal_session_id.is_some(),
+                )
+            })
+            .ok_or(AgentEventError::UnknownTask(task_id))?;
+        if status.is_terminal() {
+            return Err(AgentEventError::TerminalState { task_id, status });
+        }
+        if terminal_bound || runtime_kind == TaskRuntimeKind::Terminal {
+            return Err(AgentEventError::TerminalSessionBound(task_id));
+        }
+        let epoch = super::event::next_agent_event_epoch()?;
+        let stream = AgentEventStream::new(task_id, session_id, epoch);
+        if !replacing && runtime_kind == TaskRuntimeKind::Unassigned {
+            let task = self
+                .task_mut(task_id)
+                .map_err(|_| AgentEventError::UnknownTask(task_id))?;
+            task.runtime_kind = TaskRuntimeKind::Native;
+            task.status = TaskStatus::Starting;
+            task.status_detail = None;
+            task.updated_at_ms = unix_time_ms();
+        }
+        let active_turn = if replacing {
+            self.native_event_streams
+                .get(&task_id)
+                .and_then(|active| active.active_turn)
+        } else {
+            None
+        };
+        self.native_event_streams.insert(
+            task_id,
+            NativeEventStreamState {
+                stream: stream.clone(),
+                next_sequence: 1,
+                session_started: false,
+                active_turn,
+            },
+        );
+        Ok(stream)
+    }
+
+    /// Apply one lifecycle event only when all correlation fields and the
+    /// contiguous sequence match the current stream. Any rejection leaves the
+    /// task and stream cursor unchanged.
+    pub fn apply_agent_event(
+        &mut self,
+        agent_event: AgentEvent,
+    ) -> Result<TaskStatus, AgentEventError> {
+        let (stream, sequence, kind, detail) = agent_event.into_parts();
+        let task_id = stream.task_id();
+        let (current, expected_provider) = self
+            .get(task_id)
+            .map(|task| (task.status, task.provider))
+            .ok_or(AgentEventError::UnknownTask(task_id))?;
+        if current.is_terminal() {
+            return Err(AgentEventError::TerminalState {
+                task_id,
+                status: current,
+            });
+        }
+
+        let active = self
+            .native_event_streams
+            .get(&task_id)
+            .ok_or(AgentEventError::NoActiveStream(task_id))?;
+        if active.stream.epoch() != stream.epoch() {
+            return Err(AgentEventError::EpochMismatch {
+                task_id,
+                expected: active.stream.epoch(),
+                received: stream.epoch(),
+            });
+        }
+        if active.stream.session_id() != stream.session_id() {
+            return Err(AgentEventError::SessionMismatch(task_id));
+        }
+        if active.next_sequence != sequence {
+            return Err(AgentEventError::InvalidSequence {
+                task_id,
+                expected: active.next_sequence,
+                received: sequence,
+            });
+        }
+        if let AgentEventKind::SessionStarted {
+            provider_session_id,
+            resumed,
+        } = &kind
+        {
+            if *resumed && provider_session_id.is_none() {
+                return Err(AgentEventError::MissingResumeSession(task_id));
+            }
+            if let Some(provider_session_id) = provider_session_id {
+                let received = provider_session_id.provider();
+                if received != expected_provider {
+                    return Err(AgentEventError::ProviderMismatch {
+                        task_id,
+                        expected: expected_provider,
+                        received,
+                    });
+                }
+            }
+        }
+        let is_session_started = matches!(&kind, AgentEventKind::SessionStarted { .. });
+        let may_end_before_start = matches!(
+            &kind,
+            AgentEventKind::Cancelled
+                | AgentEventKind::SessionEnded { .. }
+                | AgentEventKind::Error { fatal: true }
+        );
+        if !active.session_started && !is_session_started && !may_end_before_start {
+            return Err(AgentEventError::SessionNotStarted(task_id));
+        }
+        if active.session_started && is_session_started {
+            return Err(AgentEventError::InvalidTransition {
+                task_id,
+                status: current,
+                event: kind,
+            });
+        }
+        match &kind {
+            AgentEventKind::TurnStarted { turn_id } => {
+                if let Some(active_turn) = active.active_turn {
+                    return Err(AgentEventError::TurnAlreadyActive {
+                        task_id,
+                        turn_id: active_turn,
+                    });
+                }
+                let _ = turn_id;
+            }
+            AgentEventKind::ApprovalRequested { turn_id, .. }
+            | AgentEventKind::PermissionRequested { turn_id, .. }
+            | AgentEventKind::InputRequested { turn_id }
+            | AgentEventKind::WorkResumed { turn_id }
+            | AgentEventKind::TurnCompleted { turn_id } => match active.active_turn {
+                Some(active_turn) if active_turn != *turn_id => {
+                    return Err(AgentEventError::TurnMismatch {
+                        task_id,
+                        expected: active_turn,
+                        received: *turn_id,
+                    });
+                }
+                None => return Err(AgentEventError::NoActiveTurn(task_id)),
+                Some(_) => {}
+            },
+            _ => {}
+        }
+        let (next, updates_task) = super::event::status_after_event(current, &kind).ok_or(
+            AgentEventError::InvalidTransition {
+                task_id,
+                status: current,
+                event: kind.clone(),
+            },
+        )?;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(AgentEventError::SequenceExhausted(task_id))?;
+
+        if updates_task {
+            let task = self
+                .task_mut(task_id)
+                .map_err(|_| AgentEventError::UnknownTask(task_id))?;
+            task.status = next;
+            if next != current || detail.is_some() {
+                task.status_detail = detail;
+            }
+            task.updated_at_ms = unix_time_ms();
+        }
+
+        if next.is_terminal() || super::event::event_ends_stream(&kind) {
+            self.native_event_streams.remove(&task_id);
+        } else if let Some(active) = self.native_event_streams.get_mut(&task_id) {
+            active.next_sequence = next_sequence;
+            active.session_started |= is_session_started;
+            match &kind {
+                AgentEventKind::TurnStarted { turn_id } => active.active_turn = Some(*turn_id),
+                AgentEventKind::TurnCompleted { .. } => active.active_turn = None,
+                _ => {}
+            }
+        }
+        Ok(next)
     }
 
     /// Bind a freshly spawned PTY to a task. Existing bindings are immutable:
     /// replacement must be an explicit future lifecycle operation, never a
     /// side effect of a tab/index change.
-    pub fn bind_agent_session(
+    pub fn bind_terminal_session(
         &mut self,
         task_id: TaskId,
         session_id: String,
     ) -> Result<(), TaskError> {
         if !crate::session::is_valid_jsh_session_id(&session_id) {
-            return Err(TaskError::InvalidSessionId);
+            return Err(TaskError::InvalidTerminalSessionId);
         }
-        if let Some(existing_task_id) = self.tasks_by_session.get(&session_id).copied() {
+        if let Some(existing_task_id) = self.tasks_by_terminal_session.get(&session_id).copied() {
             if existing_task_id == task_id {
                 return Ok(());
             }
-            return Err(TaskError::SessionAlreadyBound {
+            return Err(TaskError::TerminalSessionAlreadyBound {
                 session_id,
                 task_id: existing_task_id,
             });
         }
 
         let task = self.task_mut(task_id)?;
-        if let Some(existing_session_id) = &task.agent_session_id {
-            return Err(TaskError::TaskAlreadyBound {
+        if task.runtime_kind == TaskRuntimeKind::Native {
+            return Err(TaskError::NativeRuntimeAlreadySelected(task_id));
+        }
+        if !matches!(task.status, TaskStatus::Created | TaskStatus::Starting) {
+            return Err(TaskError::CannotBindTerminalInState {
+                task_id,
+                status: task.status,
+            });
+        }
+        if let Some(existing_session_id) = &task.terminal_session_id {
+            return Err(TaskError::TaskAlreadyBoundToTerminal {
                 task_id,
                 session_id: existing_session_id.clone(),
             });
         }
-        task.agent_session_id = Some(session_id.clone());
+        task.runtime_kind = TaskRuntimeKind::Terminal;
+        task.terminal_session_id = Some(session_id.clone());
         // PTY creation returns only after chdir + exec crossed the startup
         // pipe, so a successful binding is already a reliable Working signal.
         task.status = TaskStatus::Working;
         task.status_detail = None;
         task.updated_at_ms = unix_time_ms();
-        self.tasks_by_session.insert(session_id, task_id);
+        self.tasks_by_terminal_session.insert(session_id, task_id);
         Ok(())
     }
 
@@ -322,25 +696,37 @@ impl TaskManager {
         status: TaskStatus,
         detail: Option<String>,
     ) -> Result<(), TaskError> {
-        let task = self.task_mut(task_id)?;
-        if task.status == TaskStatus::Archived {
-            return Ok(());
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActive(task_id));
         }
-        task.status = status;
-        task.status_detail = detail.filter(|value| !value.trim().is_empty());
-        task.updated_at_ms = unix_time_ms();
+        {
+            let task = self.task_mut(task_id)?;
+            if task.status.is_terminal() && task.status != status {
+                return Err(TaskError::CannotLeaveTerminalState {
+                    task_id,
+                    current: task.status,
+                    requested: status,
+                });
+            }
+            task.status = status;
+            task.status_detail = super::event::bounded_event_detail(detail);
+            task.updated_at_ms = unix_time_ms();
+        }
+        if status.is_terminal() {
+            self.native_event_streams.remove(&task_id);
+        }
         Ok(())
     }
 
     /// Apply the authoritative child-process result before its tab disappears.
     /// A zero exit only means the opaque Agent process finished; its worktree
     /// still requires human review and is never treated as accepted/merged.
-    pub fn handle_session_exit(
+    pub fn handle_terminal_session_exit(
         &mut self,
         session_id: &str,
         exit_code: Option<i32>,
     ) -> Option<TaskId> {
-        let task_id = self.tasks_by_session.get(session_id).copied()?;
+        let task_id = self.tasks_by_terminal_session.get(session_id).copied()?;
         let task = self.task_mut(task_id).ok()?;
         if matches!(
             task.status,
@@ -375,8 +761,8 @@ impl TaskManager {
     /// Record an explicit UI/session close when no child wait status was
     /// observed. This is not a process failure and must not leave the task
     /// looking perpetually active in the dashboard.
-    pub fn handle_session_closed(&mut self, session_id: &str) -> Option<TaskId> {
-        let task_id = self.tasks_by_session.get(session_id).copied()?;
+    pub fn handle_terminal_session_closed(&mut self, session_id: &str) -> Option<TaskId> {
+        let task_id = self.tasks_by_terminal_session.get(session_id).copied()?;
         let task = self.task_mut(task_id).ok()?;
         if matches!(
             task.status,
@@ -396,6 +782,9 @@ impl TaskManager {
     }
 
     pub fn archive(&mut self, task_id: TaskId) -> Result<(), TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::CannotArchiveRunning(task_id));
+        }
         let task = self.task_mut(task_id)?;
         if task.status.is_running() {
             return Err(TaskError::CannotArchiveRunning(task_id));
@@ -501,6 +890,36 @@ mod tests {
         }
     }
 
+    fn session_started() -> AgentEventKind {
+        AgentEventKind::SessionStarted {
+            provider_session_id: None,
+            resumed: false,
+        }
+    }
+
+    fn turn_started(turn_id: AgentTurnId) -> AgentEventKind {
+        AgentEventKind::TurnStarted { turn_id }
+    }
+
+    fn approval_requested(turn_id: AgentTurnId) -> AgentEventKind {
+        AgentEventKind::ApprovalRequested {
+            turn_id,
+            approval_id: ApprovalId::new(),
+        }
+    }
+
+    fn turn_completed(turn_id: AgentTurnId) -> AgentEventKind {
+        AgentEventKind::TurnCompleted { turn_id }
+    }
+
+    fn input_requested(turn_id: AgentTurnId) -> AgentEventKind {
+        AgentEventKind::InputRequested { turn_id }
+    }
+
+    fn work_resumed(turn_id: AgentTurnId) -> AgentEventKind {
+        AgentEventKind::WorkResumed { turn_id }
+    }
+
     #[test]
     fn creates_owned_task_with_stable_identity() {
         let mut manager = TaskManager::new();
@@ -560,16 +979,16 @@ mod tests {
         let mut manager = TaskManager::new();
         let id = manager.create(new_task("task")).unwrap();
         manager
-            .bind_agent_session(id, "stable-session-42".to_string())
+            .bind_terminal_session(id, "stable-session-42".to_string())
             .unwrap();
 
         assert_eq!(
             manager
-                .task_for_session("stable-session-42")
+                .task_for_terminal_session("stable-session-42")
                 .map(|task| task.id),
             Some(id)
         );
-        assert!(manager.task_for_session("pane-index-0").is_none());
+        assert!(manager.task_for_terminal_session("pane-index-0").is_none());
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
     }
 
@@ -583,11 +1002,11 @@ mod tests {
         let second = manager.create(second_task).unwrap();
 
         manager
-            .bind_agent_session(first, "agent-session".to_string())
+            .bind_terminal_session(first, "agent-session".to_string())
             .unwrap();
         assert_eq!(
-            manager.bind_agent_session(second, "agent-session".to_string()),
-            Err(TaskError::SessionAlreadyBound {
+            manager.bind_terminal_session(second, "agent-session".to_string()),
+            Err(TaskError::TerminalSessionAlreadyBound {
                 session_id: "agent-session".to_string(),
                 task_id: first,
             })
@@ -599,10 +1018,10 @@ mod tests {
         let mut manager = TaskManager::new();
         let success = manager.create(new_task("success")).unwrap();
         manager
-            .bind_agent_session(success, "success-session".to_string())
+            .bind_terminal_session(success, "success-session".to_string())
             .unwrap();
         assert_eq!(
-            manager.handle_session_exit("success-session", Some(0)),
+            manager.handle_terminal_session_exit("success-session", Some(0)),
             Some(success)
         );
         let task = manager.get(success).unwrap();
@@ -615,9 +1034,9 @@ mod tests {
         failed_task.branch = "ember/failed".to_string();
         let failed = manager.create(failed_task).unwrap();
         manager
-            .bind_agent_session(failed, "failed-session".to_string())
+            .bind_terminal_session(failed, "failed-session".to_string())
             .unwrap();
-        manager.handle_session_exit("failed-session", Some(17));
+        manager.handle_terminal_session_exit("failed-session", Some(17));
         let task = manager.get(failed).unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.exit_code, Some(17));
@@ -629,9 +1048,9 @@ mod tests {
         let mut manager = TaskManager::new();
         let id = manager.create(new_task("disconnected")).unwrap();
         manager
-            .bind_agent_session(id, "disconnected-session".to_string())
+            .bind_terminal_session(id, "disconnected-session".to_string())
             .unwrap();
-        manager.handle_session_exit("disconnected-session", None);
+        manager.handle_terminal_session_exit("disconnected-session", None);
 
         let task = manager.get(id).unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
@@ -644,14 +1063,14 @@ mod tests {
         let mut manager = TaskManager::new();
         let id = manager.create(new_task("active")).unwrap();
         manager
-            .bind_agent_session(id, "active-session".to_string())
+            .bind_terminal_session(id, "active-session".to_string())
             .unwrap();
 
         assert_eq!(
             manager.archive(id),
             Err(TaskError::CannotArchiveRunning(id))
         );
-        manager.handle_session_exit("active-session", Some(0));
+        manager.handle_terminal_session_exit("active-session", Some(0));
         manager.archive(id).unwrap();
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::Archived);
     }
@@ -661,16 +1080,722 @@ mod tests {
         let mut manager = TaskManager::new();
         let id = manager.create(new_task("cancelled")).unwrap();
         manager
-            .bind_agent_session(id, "cancelled-session".to_string())
+            .bind_terminal_session(id, "cancelled-session".to_string())
             .unwrap();
 
-        assert_eq!(manager.handle_session_closed("cancelled-session"), Some(id));
+        assert_eq!(
+            manager.handle_terminal_session_closed("cancelled-session"),
+            Some(id)
+        );
         let task = manager.get(id).unwrap();
         assert_eq!(task.status, TaskStatus::Cancelled);
         assert_eq!(task.exit_code, None);
 
         // A later channel disconnect must not overwrite the explicit reason.
-        manager.handle_session_exit("cancelled-session", None);
+        manager.handle_terminal_session_exit("cancelled-session", None);
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn native_session_ids_are_generated_locally_bounded_and_diagnostic_safe() {
+        let first = NativeAgentSessionId::new();
+        let second = NativeAgentSessionId::new();
+        assert_ne!(first, second);
+        assert!(!first.as_str().is_empty());
+        assert!(first.as_str().len() <= MAX_NATIVE_AGENT_SESSION_ID_BYTES);
+        for invalid in ["", "has space", "line\nbreak", "spoof\u{202e}id"] {
+            assert!(NativeAgentSessionId::parse(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(
+            NativeAgentSessionId::parse("x".repeat(MAX_NATIVE_AGENT_SESSION_ID_BYTES + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn normalized_events_reduce_lifecycle_without_retaining_content_payloads() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("native lifecycle")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn_id = AgentTurnId::new();
+
+        assert_eq!(
+            manager
+                .apply_agent_event(stream.event(1, session_started(), Some("connecting".into()),))
+                .unwrap(),
+            TaskStatus::Starting
+        );
+        assert_eq!(
+            manager
+                .apply_agent_event(stream.event(2, turn_started(turn_id), Some("thinking".into()),))
+                .unwrap(),
+            TaskStatus::Working
+        );
+        manager
+            .apply_agent_event(stream.event(
+                3,
+                AgentEventKind::TextDelta,
+                Some("untrusted transcript chunk".into()),
+            ))
+            .unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().status_detail.as_deref(),
+            Some("thinking")
+        );
+
+        manager
+            .apply_agent_event(stream.event(
+                4,
+                approval_requested(turn_id),
+                Some("run tests?".into()),
+            ))
+            .unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().status,
+            TaskStatus::WaitingForApproval
+        );
+        // Incidental output is ordered and consumed, but cannot hide an
+        // outstanding request for attention.
+        manager
+            .apply_agent_event(stream.event(
+                5,
+                AgentEventKind::CommandOutput,
+                Some("still draining".into()),
+            ))
+            .unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().status,
+            TaskStatus::WaitingForApproval
+        );
+        manager
+            .apply_agent_event(stream.event(6, work_resumed(turn_id), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                7,
+                input_requested(turn_id),
+                Some("choose a target".into()),
+            ))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::WaitingForHuman);
+        manager
+            .apply_agent_event(stream.event(8, work_resumed(turn_id), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                9,
+                turn_completed(turn_id),
+                Some("review changes".into()),
+            ))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+    }
+
+    #[test]
+    fn event_sequence_is_contiguous_and_rejections_do_not_consume_it() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("ordered events")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn_id = AgentTurnId::new();
+
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(2, session_started(), None)),
+            Err(AgentEventError::InvalidSequence {
+                expected: 1,
+                received: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(1, turn_started(turn_id), None)),
+            Err(AgentEventError::SessionNotStarted(task_id)) if task_id == id
+        ));
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(1, session_started(), None)),
+            Err(AgentEventError::InvalidSequence {
+                expected: 2,
+                received: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(3, turn_started(turn_id), None)),
+            Err(AgentEventError::InvalidSequence {
+                expected: 2,
+                received: 3,
+                ..
+            })
+        ));
+        assert_eq!(
+            manager
+                .apply_agent_event(stream.event(2, turn_started(turn_id), None))
+                .unwrap(),
+            TaskStatus::Working
+        );
+    }
+
+    #[test]
+    fn session_start_validates_provider_namespace_and_resume_identity() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("provider identity")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let claude = ProviderSessionId::new(AgentProvider::Claude, "claude-thread").unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(
+                1,
+                AgentEventKind::SessionStarted {
+                    provider_session_id: Some(claude),
+                    resumed: false,
+                },
+                None,
+            )),
+            Err(AgentEventError::ProviderMismatch {
+                task_id,
+                expected: AgentProvider::Codex,
+                received: AgentProvider::Claude,
+            }) if task_id == id
+        ));
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(
+                1,
+                AgentEventKind::SessionStarted {
+                    provider_session_id: None,
+                    resumed: true,
+                },
+                None,
+            )),
+            Err(AgentEventError::MissingResumeSession(task_id)) if task_id == id
+        ));
+
+        let codex = ProviderSessionId::new(AgentProvider::Codex, "codex-thread").unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                1,
+                AgentEventKind::SessionStarted {
+                    provider_session_id: Some(codex),
+                    resumed: true,
+                },
+                None,
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn turn_and_approval_events_must_match_the_active_turn() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("turn correlation")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let active_turn = AgentTurnId::new();
+        let stale_turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(active_turn), None))
+            .unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(3, approval_requested(stale_turn), None)),
+            Err(AgentEventError::TurnMismatch {
+                task_id,
+                expected,
+                received,
+            }) if task_id == id && expected == active_turn && received == stale_turn
+        ));
+        manager
+            .apply_agent_event(stream.event(3, approval_requested(active_turn), None))
+            .unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(4, turn_completed(stale_turn), None)),
+            Err(AgentEventError::TurnMismatch { .. })
+        ));
+        manager
+            .apply_agent_event(stream.event(4, work_resumed(active_turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(5, turn_completed(active_turn), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+
+        let next_turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(6, turn_started(next_turn), None))
+            .unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(7, turn_started(AgentTurnId::new()), None)),
+            Err(AgentEventError::TurnAlreadyActive { task_id, turn_id })
+                if task_id == id && turn_id == next_turn
+        ));
+    }
+
+    #[test]
+    fn replacement_stream_uses_fresh_identity_and_rejects_stale_callers() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("correlated events")).unwrap();
+        let old = manager.start_agent_event_stream(id).unwrap();
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::StreamAlreadyActive(task_id)) if task_id == id
+        ));
+        let replacement = manager.replace_agent_event_stream_after_stop(&old).unwrap();
+        assert_ne!(old.epoch(), replacement.epoch());
+        assert_eq!(old.session_id(), replacement.session_id());
+        assert!(matches!(
+            manager.apply_agent_event(old.event(1, session_started(), None)),
+            Err(AgentEventError::EpochMismatch { .. })
+        ));
+        assert!(matches!(
+            manager.replace_agent_event_stream_after_stop(&old),
+            Err(AgentEventError::EpochMismatch { .. })
+        ));
+        manager
+            .apply_agent_event(replacement.event(1, session_started(), None))
+            .unwrap();
+
+        let different_session = manager
+            .replace_agent_event_stream_after_stop(&replacement)
+            .unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(replacement.event(
+                2,
+                turn_started(AgentTurnId::new()),
+                None,
+            )),
+            Err(AgentEventError::EpochMismatch { task_id, .. }) if task_id == id
+        ));
+        manager
+            .apply_agent_event(different_session.event(1, session_started(), None))
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_and_native_runtime_bindings_are_mutually_exclusive() {
+        let mut terminal_manager = TaskManager::new();
+        let terminal_task = terminal_manager.create(new_task("terminal mode")).unwrap();
+        terminal_manager
+            .bind_terminal_session(terminal_task, "terminal-mode".to_string())
+            .unwrap();
+        assert!(matches!(
+            terminal_manager.start_agent_event_stream(terminal_task),
+            Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == terminal_task
+        ));
+
+        let mut native_manager = TaskManager::new();
+        let native_task = native_manager.create(new_task("native mode")).unwrap();
+        native_manager
+            .start_agent_event_stream(native_task)
+            .unwrap();
+        assert_eq!(
+            native_manager.get(native_task).unwrap().runtime_kind,
+            TaskRuntimeKind::Native
+        );
+        assert_eq!(
+            native_manager.get(native_task).unwrap().status,
+            TaskStatus::Starting
+        );
+        assert_eq!(
+            native_manager.update_status(
+                native_task,
+                TaskStatus::Working,
+                Some("bypass reducer".into()),
+            ),
+            Err(TaskError::NativeEventStreamActive(native_task))
+        );
+        assert_eq!(
+            native_manager.bind_terminal_session(native_task, "terminal-after-native".to_string()),
+            Err(TaskError::NativeRuntimeAlreadySelected(native_task))
+        );
+    }
+
+    #[test]
+    fn runtime_selection_survives_stream_end_and_terminal_states_cannot_be_revived() {
+        let mut manager = TaskManager::new();
+        let native_task = manager.create(new_task("native remains native")).unwrap();
+        let stream = manager.start_agent_event_stream(native_task).unwrap();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                2,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Clean,
+                },
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            manager.get(native_task).unwrap().status,
+            TaskStatus::ReadyForReview
+        );
+        assert_eq!(
+            manager.bind_terminal_session(native_task, "late-terminal".to_string()),
+            Err(TaskError::NativeRuntimeAlreadySelected(native_task))
+        );
+
+        let mut failed_task = new_task("failed stays failed");
+        failed_task.worktree_path = PathBuf::from("/tasks/failed-terminal-bind");
+        failed_task.branch = "ember/failed-terminal-bind".to_string();
+        let failed_task = manager.create(failed_task).unwrap();
+        manager
+            .update_status(failed_task, TaskStatus::Failed, Some("failed".into()))
+            .unwrap();
+        assert_eq!(
+            manager.bind_terminal_session(failed_task, "revive-failed".to_string()),
+            Err(TaskError::CannotBindTerminalInState {
+                task_id: failed_task,
+                status: TaskStatus::Failed,
+            })
+        );
+    }
+
+    #[test]
+    fn active_native_stream_cannot_be_archived_from_ready_for_review() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("active review")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn_id = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn_id), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(turn_id), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert_eq!(
+            manager.archive(id),
+            Err(TaskError::CannotArchiveRunning(id))
+        );
+        assert_eq!(
+            manager
+                .apply_agent_event(stream.event(
+                    4,
+                    AgentEventKind::Cancelled,
+                    Some("stopped after turn".into()),
+                ))
+                .unwrap(),
+            TaskStatus::ReadyForReview
+        );
+        manager.archive(id).unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Archived);
+    }
+
+    #[test]
+    fn explicit_reconnect_preserves_working_and_waiting_state() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("native reconnect")).unwrap();
+        let first = manager.start_agent_event_stream(id).unwrap();
+        let turn_id = AgentTurnId::new();
+        manager
+            .apply_agent_event(first.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(first.event(2, turn_started(turn_id), None))
+            .unwrap();
+
+        let working = manager
+            .replace_agent_event_stream_after_stop(&first)
+            .unwrap();
+        assert_eq!(
+            manager
+                .apply_agent_event(working.event(1, session_started(), None))
+                .unwrap(),
+            TaskStatus::Working
+        );
+        manager
+            .apply_agent_event(working.event(
+                2,
+                approval_requested(turn_id),
+                Some("approve".into()),
+            ))
+            .unwrap();
+
+        let waiting = manager
+            .replace_agent_event_stream_after_stop(&working)
+            .unwrap();
+        assert_eq!(
+            manager
+                .apply_agent_event(waiting.event(1, session_started(), None))
+                .unwrap(),
+            TaskStatus::WaitingForApproval
+        );
+        assert_eq!(
+            manager.get(id).unwrap().status_detail.as_deref(),
+            Some("approve")
+        );
+    }
+
+    #[test]
+    fn clean_session_end_converges_from_each_waiting_state() {
+        for (label, expected_waiting) in [
+            ("approval", TaskStatus::WaitingForApproval),
+            ("human", TaskStatus::WaitingForHuman),
+        ] {
+            let mut manager = TaskManager::new();
+            let id = manager.create(new_task(label)).unwrap();
+            let stream = manager.start_agent_event_stream(id).unwrap();
+            let turn_id = AgentTurnId::new();
+            let waiting_event = if label == "approval" {
+                approval_requested(turn_id)
+            } else {
+                input_requested(turn_id)
+            };
+            manager
+                .apply_agent_event(stream.event(1, session_started(), None))
+                .unwrap();
+            manager
+                .apply_agent_event(stream.event(2, turn_started(turn_id), None))
+                .unwrap();
+            manager
+                .apply_agent_event(stream.event(3, waiting_event, None))
+                .unwrap();
+            assert_eq!(manager.get(id).unwrap().status, expected_waiting);
+            assert_eq!(
+                manager
+                    .apply_agent_event(stream.event(
+                        4,
+                        AgentEventKind::SessionEnded {
+                            outcome: AgentSessionOutcome::Clean,
+                        },
+                        Some("transport closed".into()),
+                    ))
+                    .unwrap(),
+                TaskStatus::ReadyForReview
+            );
+            assert!(matches!(
+                manager.apply_agent_event(stream.event(5, AgentEventKind::UsageUpdated, None)),
+                Err(AgentEventError::NoActiveStream(task_id)) if task_id == id
+            ));
+        }
+    }
+
+    #[test]
+    fn cancellation_before_provider_start_closes_the_stream() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("cancel during startup")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        assert_eq!(
+            manager
+                .apply_agent_event(stream.event(
+                    1,
+                    AgentEventKind::Cancelled,
+                    Some("cancelled before handshake".into()),
+                ))
+                .unwrap(),
+            TaskStatus::Cancelled
+        );
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(2, session_started(), None)),
+            Err(AgentEventError::TerminalState {
+                status: TaskStatus::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stopped_runtime_can_finish_out_of_band_with_stream_cas() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("worker failure")).unwrap();
+        let stale = manager.start_agent_event_stream(id).unwrap();
+        let current = manager
+            .replace_agent_event_stream_after_stop(&stale)
+            .unwrap();
+        assert!(matches!(
+            manager.finish_agent_event_stream_after_stop(
+                &stale,
+                AgentSessionOutcome::Failed,
+                Some("stale worker".into()),
+            ),
+            Err(AgentEventError::EpochMismatch { task_id, .. }) if task_id == id
+        ));
+
+        assert_eq!(
+            manager
+                .finish_agent_event_stream_after_stop(
+                    &current,
+                    AgentSessionOutcome::Failed,
+                    Some("channel closed\n\u{202e}".into()),
+                )
+                .unwrap(),
+            TaskStatus::Failed
+        );
+        let detail = manager.get(id).unwrap().status_detail.as_deref().unwrap();
+        assert_eq!(detail, "channel closed??");
+        assert!(matches!(
+            manager.finish_agent_event_stream_after_stop(
+                &current,
+                AgentSessionOutcome::Failed,
+                None,
+            ),
+            Err(AgentEventError::NoActiveStream(task_id)) if task_id == id
+        ));
+    }
+
+    #[test]
+    fn generic_status_updates_cannot_revive_terminal_tasks() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("sticky failure")).unwrap();
+        manager
+            .update_status(id, TaskStatus::Failed, Some("failed".into()))
+            .unwrap();
+        assert_eq!(
+            manager.update_status(id, TaskStatus::Working, Some("revived".into())),
+            Err(TaskError::CannotLeaveTerminalState {
+                task_id: id,
+                current: TaskStatus::Failed,
+                requested: TaskStatus::Working,
+            })
+        );
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Failed);
+        manager
+            .update_status(id, TaskStatus::Failed, Some("updated detail".into()))
+            .unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().status_detail.as_deref(),
+            Some("updated detail")
+        );
+    }
+
+    #[test]
+    fn event_detail_is_bounded_and_neutralizes_display_spoofing() {
+        let mut hostile = String::from("  safe\n\t\u{202e}");
+        hostile.push_str(&"界".repeat(MAX_AGENT_EVENT_DETAIL_BYTES));
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("bounded event")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let event = stream.event(1, session_started(), Some(hostile));
+        let detail = event.detail().unwrap().to_string();
+        assert!(detail.len() <= MAX_AGENT_EVENT_DETAIL_BYTES);
+        assert!(detail.contains('?'));
+        assert!(!detail.chars().any(|character| {
+            character.is_control() || crate::review_text::is_visual_spoof(character)
+        }));
+
+        manager.apply_agent_event(event).unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().status_detail.as_deref(),
+            Some(detail.as_str())
+        );
+    }
+
+    #[test]
+    fn ready_for_review_can_restart_but_sticky_terminal_state_fails_closed() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("terminal event")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let first_turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(first_turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                3,
+                turn_completed(first_turn),
+                Some("authoritative result".into()),
+            ))
+            .unwrap();
+
+        let review_turn = AgentTurnId::new();
+        assert_eq!(
+            manager
+                .apply_agent_event(stream.event(
+                    4,
+                    turn_started(review_turn),
+                    Some("addressing review".into()),
+                ))
+                .unwrap(),
+            TaskStatus::Working
+        );
+        assert_eq!(
+            manager.update_status(id, TaskStatus::Completed, Some("too early".into())),
+            Err(TaskError::NativeEventStreamActive(id))
+        );
+        manager
+            .apply_agent_event(stream.event(
+                5,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Clean,
+                },
+                None,
+            ))
+            .unwrap();
+        manager
+            .update_status(id, TaskStatus::Completed, Some("accepted".into()))
+            .unwrap();
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(
+                6,
+                AgentEventKind::Error { fatal: true },
+                Some("late transport error".into()),
+            )),
+            Err(AgentEventError::TerminalState {
+                status: TaskStatus::Completed,
+                ..
+            })
+        ));
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.status_detail.as_deref(), Some("accepted"));
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::TerminalState { .. })
+        ));
+    }
+
+    #[test]
+    fn session_end_outcome_and_error_fatality_are_explicit() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("session outcome")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn_id = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn_id), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                3,
+                AgentEventKind::Error { fatal: false },
+                Some("recoverable provider warning".into()),
+            ))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
+        assert_eq!(manager.get(id).unwrap().status_detail, None);
+        manager
+            .apply_agent_event(stream.event(
+                4,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Clean,
+                },
+                Some("clean shutdown".into()),
+            ))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(5, AgentEventKind::UsageUpdated, None)),
+            Err(AgentEventError::NoActiveStream(task_id)) if task_id == id
+        ));
+
+        let resumed = manager.start_agent_event_stream(id).unwrap();
+        let resumed_turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(resumed.event(1, session_started(), None))
+            .unwrap();
+        assert_eq!(
+            manager
+                .apply_agent_event(resumed.event(2, turn_started(resumed_turn), None))
+                .unwrap(),
+            TaskStatus::Working
+        );
     }
 }
