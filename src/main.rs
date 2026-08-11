@@ -1929,6 +1929,7 @@ impl TerminalApp {
         renderer.font_ligatures = cfg.font_ligatures;
         renderer.click_moves_cursor = cfg.click_moves_cursor;
         renderer.block_mode = cfg.block_mode;
+        renderer.block_compact = cfg.block_compact;
         renderer.gpu_rendering = cfg.gpu_rendering;
         renderer.wgpu_render_state = wgpu_render_state.clone();
 
@@ -2113,6 +2114,7 @@ impl TerminalApp {
         self.renderer.font_ligatures = self.config.font_ligatures;
         self.renderer.click_moves_cursor = self.config.click_moves_cursor;
         self.renderer.block_mode = self.config.block_mode;
+        self.renderer.block_compact = self.config.block_compact;
         self.renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
         self.renderer.sync_font_metrics(ctx);
         self.renderer.invalidate_font_cache();
@@ -2127,6 +2129,7 @@ impl TerminalApp {
             renderer.font_ligatures = self.config.font_ligatures;
             renderer.click_moves_cursor = self.config.click_moves_cursor;
             renderer.block_mode = self.config.block_mode;
+            renderer.block_compact = self.config.block_compact;
             renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
             renderer.sync_font_metrics(ctx);
             renderer.invalidate_font_cache();

@@ -453,9 +453,155 @@ struct BlockChromeEntry {
     id: String,
     span: crate::block_mode::VisibleBlockSpan,
     outcome: crate::block_mode::BlockOutcome,
+    /// The newest incomplete semantic record owns the live input/running
+    /// surface. It receives the accent card independently of block selection.
+    live: bool,
+    selected: bool,
+    active: bool,
+    hovered: bool,
     duration_ms: Option<u64>,
     /// Finish time, appended to the badge while the block is selected.
     finished_at: Option<std::time::SystemTime>,
+}
+
+/// Layout-owned space before terminal column zero while Block Mode is on.
+/// The outcome stripe and card border live here and cannot cover glyphs.
+const BLOCK_GUTTER_WIDTH: f32 = 8.0;
+const BLOCK_CARD_NORMAL_GAP: f32 = 2.0;
+const BLOCK_CARD_COMPACT_GAP: f32 = 0.5;
+const BLOCK_CARD_NORMAL_RADIUS: u8 = 10;
+const BLOCK_CARD_COMPACT_RADIUS: u8 = 6;
+
+/// Pure geometry for one card's visible intersection. Open viewport edges
+/// deliberately have square corners and no cap stroke; only semantic starts,
+/// semantic ends and bounded live visual ends may close a card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockCardGeometry {
+    rect: egui::Rect,
+    rounding: egui::CornerRadius,
+    top_closed: bool,
+    bottom_closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockCardEmphasis {
+    ActiveSelection,
+    Selected,
+    Hovered,
+    Live,
+    Failed,
+    Background,
+    Neutral,
+}
+
+fn block_card_emphasis(
+    active: bool,
+    selected: bool,
+    hovered: bool,
+    live: bool,
+    outcome: crate::block_mode::BlockOutcome,
+) -> BlockCardEmphasis {
+    use crate::block_mode::BlockOutcome;
+    if active {
+        BlockCardEmphasis::ActiveSelection
+    } else if selected {
+        BlockCardEmphasis::Selected
+    } else if hovered {
+        BlockCardEmphasis::Hovered
+    } else if live {
+        BlockCardEmphasis::Live
+    } else {
+        match outcome {
+            BlockOutcome::Failed(_) => BlockCardEmphasis::Failed,
+            BlockOutcome::Background => BlockCardEmphasis::Background,
+            _ => BlockCardEmphasis::Neutral,
+        }
+    }
+}
+
+fn block_card_geometry(
+    content_rect: egui::Rect,
+    span: crate::block_mode::VisibleBlockSpan,
+    line_height: f32,
+    compact: bool,
+    visual_bottom: bool,
+) -> Option<BlockCardGeometry> {
+    if !line_height.is_finite()
+        || line_height <= 0.0
+        || content_rect.width() <= 1.0
+        || content_rect.height() <= 0.0
+        || span.last_row < span.first_row
+    {
+        return None;
+    }
+
+    // `content_rect` is already inset by the layout-owned block gutter. Keep
+    // the body aligned with column zero so every glyph remains inside it; the
+    // status stripe is painted immediately to its left, inside the gutter.
+    let left = content_rect.left();
+    let right = content_rect.right();
+    if right <= left {
+        return None;
+    }
+
+    let (row_top, _) = snapped_span(content_rect.top(), span.first_row, line_height);
+    let (last_top, last_height) = snapped_span(content_rect.top(), span.last_row, line_height);
+    let raw_top = row_top.max(content_rect.top());
+    let raw_bottom = (last_top + last_height).min(content_rect.bottom());
+    if raw_bottom <= raw_top {
+        return None;
+    }
+    let requested_gap = if compact {
+        BLOCK_CARD_COMPACT_GAP
+    } else {
+        BLOCK_CARD_NORMAL_GAP
+    };
+    // A tiny pane/line must never invert the card. Each closed edge may use at
+    // most one quarter of this visible intersection.
+    let gap = requested_gap.min((raw_bottom - raw_top) * 0.25);
+    let top = raw_top + if span.starts_in_viewport { gap } else { 0.0 };
+    let bottom = raw_bottom - if visual_bottom { gap } else { 0.0 };
+    if bottom <= top {
+        return None;
+    }
+
+    let requested_radius = if compact {
+        BLOCK_CARD_COMPACT_RADIUS
+    } else {
+        BLOCK_CARD_NORMAL_RADIUS
+    };
+    let radius = requested_radius.min(((bottom - top) * 0.5).floor().max(0.0) as u8);
+    Some(BlockCardGeometry {
+        rect: egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom)),
+        rounding: egui::CornerRadius {
+            nw: if span.starts_in_viewport { radius } else { 0 },
+            ne: if span.starts_in_viewport { radius } else { 0 },
+            sw: if visual_bottom { radius } else { 0 },
+            se: if visual_bottom { radius } else { 0 },
+        },
+        top_closed: span.starts_in_viewport,
+        bottom_closed: visual_bottom,
+    })
+}
+
+fn composite_over_opaque(base: Color32, overlay: Color32) -> Color32 {
+    let alpha = u16::from(overlay.a());
+    let blend = |base: u8, tint: u8| -> u8 {
+        ((u16::from(tint) * alpha + u16::from(base) * (255 - alpha) + 127) / 255) as u8
+    };
+    Color32::from_rgb(
+        blend(base.r(), overlay.r()),
+        blend(base.g(), overlay.g()),
+        blend(base.b(), overlay.b()),
+    )
+}
+
+fn block_stripe_rect(card_rect: egui::Rect, requested_width: f32) -> egui::Rect {
+    let width = requested_width.clamp(0.0, crate::block_mode::GUTTER_CLICK_BAND_PX);
+    egui::Rect::from_min_max(
+        egui::pos2(card_rect.left() - width, card_rect.top()),
+        egui::pos2(card_rect.left(), card_rect.bottom()),
+    )
 }
 
 pub struct TerminalRenderer {
@@ -487,13 +633,17 @@ pub struct TerminalRenderer {
     /// Whether to draw command-block chrome (`block_mode`): gutter stripes,
     /// separators and outcome badges derived from OSC 133 records.
     pub block_mode: bool,
+    /// Tighten card-only spacing/radius without changing the terminal grid or
+    /// PTY geometry.
+    pub block_compact: bool,
     /// Record ids in the app-selected Warp-style range for the terminal this
     /// renderer is about to draw. Set by the app each frame; ids that match no
     /// record simply draw nothing (selection must never dangle).
-    pub selected_block_ids: Vec<String>,
+    selected_block_ids: Vec<String>,
+    selected_block_id_set: std::collections::HashSet<String>,
     /// Strongly outlined active edge within `selected_block_ids`. The other
     /// selected blocks keep a lighter outline.
-    pub active_block_id: Option<String>,
+    active_block_id: Option<String>,
     /// Block-mode hit-test outcome of this frame's click, drained by the app
     /// the way `cursor_move_input` is.
     pub block_click: Option<crate::block_mode::BlockClick>,
@@ -535,6 +685,9 @@ pub struct TerminalRenderer {
     last_rendered_cols: usize,
     last_rendered_rows: usize,
     last_rendered_terminal_ptr: usize,
+    /// Hash of the visible per-row card backdrops used to weight-correct GPU
+    /// glyph antialiasing. Card changes dirty rows without rebuilding history.
+    last_rendered_block_backdrop_hash: u64,
     dirty_rows: std::sync::Arc<Vec<bool>>,
     changed_rows_buffer: Vec<usize>,
     row_instances_scratch: Vec<gpu::instance::CellInstance>,
@@ -586,7 +739,9 @@ impl TerminalRenderer {
             font_ligatures: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
+            block_compact: false,
             selected_block_ids: Vec::new(),
+            selected_block_id_set: std::collections::HashSet::new(),
             active_block_id: None,
             block_click: None,
             gpu_rendering: true,
@@ -615,6 +770,7 @@ impl TerminalRenderer {
             last_rendered_cols: 0,
             last_rendered_rows: 0,
             last_rendered_terminal_ptr: 0,
+            last_rendered_block_backdrop_hash: 0,
             dirty_rows: std::sync::Arc::new(Vec::new()),
             changed_rows_buffer: Vec::new(),
             row_instances_scratch: Vec::new(),
@@ -632,6 +788,30 @@ impl TerminalRenderer {
 
     pub fn cancel_local_selection_capture(&mut self) {
         self.local_selection_terminal = None;
+    }
+
+    /// Mirror app-level block selection without cloning up to 1024 record ids
+    /// on every idle frame. Selection changes are comparatively rare; the
+    /// renderer retains and reuses its existing string allocations otherwise.
+    pub fn set_block_selection(&mut self, selection: Option<&crate::block_mode::BlockSelection>) {
+        match selection {
+            Some(selection) => {
+                if self.selected_block_ids.as_slice() != selection.selected_ids.as_slice() {
+                    self.selected_block_ids.clone_from(&selection.selected_ids);
+                    self.selected_block_id_set.clear();
+                    self.selected_block_id_set
+                        .extend(selection.selected_ids.iter().cloned());
+                }
+                if self.active_block_id.as_deref() != Some(selection.active_id.as_str()) {
+                    self.active_block_id = Some(selection.active_id.clone());
+                }
+            }
+            None => {
+                self.selected_block_ids.clear();
+                self.selected_block_id_set.clear();
+                self.active_block_id = None;
+            }
+        }
     }
 
     pub fn invalidate_font_cache(&mut self) {
@@ -886,14 +1066,25 @@ impl TerminalRenderer {
         }
     }
 
+    fn block_gutter_width(&self) -> f32 {
+        if self.block_mode {
+            BLOCK_GUTTER_WIDTH
+        } else {
+            0.0
+        }
+    }
+
     fn content_size(&self, available: Vec2) -> Vec2 {
         let outer_width = (available.x - self.padding * 2.0).max(self.char_width);
         let outer_height = (available.y - self.padding * 2.0).max(self.line_height);
         let reserved_scrollbar_width = (Self::SCROLLBAR_WIDTH + Self::SCROLLBAR_GAP)
             .min((outer_width - self.char_width).max(0.0));
+        let reserved_block_gutter = self
+            .block_gutter_width()
+            .min((outer_width - reserved_scrollbar_width - self.char_width).max(0.0));
 
         Vec2::new(
-            (outer_width - reserved_scrollbar_width).max(self.char_width),
+            (outer_width - reserved_scrollbar_width - reserved_block_gutter).max(self.char_width),
             outer_height,
         )
     }
@@ -906,7 +1097,8 @@ impl TerminalRenderer {
             self.char_width * Self::MIN_SPLIT_COLS
                 + self.padding * 2.0
                 + Self::SCROLLBAR_WIDTH
-                + Self::SCROLLBAR_GAP,
+                + Self::SCROLLBAR_GAP
+                + self.block_gutter_width(),
             self.line_height * Self::MIN_SPLIT_ROWS + self.padding * 2.0,
         )
     }
@@ -929,8 +1121,11 @@ impl TerminalRenderer {
 
         let reserved_scrollbar_width = (Self::SCROLLBAR_WIDTH + Self::SCROLLBAR_GAP)
             .min((outer_rect.width() - self.char_width).max(0.0));
+        let reserved_block_gutter = self
+            .block_gutter_width()
+            .min((outer_rect.width() - reserved_scrollbar_width - self.char_width).max(0.0));
         let content_rect = egui::Rect::from_min_max(
-            outer_rect.min,
+            egui::pos2(outer_rect.left() + reserved_block_gutter, outer_rect.top()),
             egui::pos2(
                 (outer_rect.right() - reserved_scrollbar_width).max(outer_rect.left()),
                 outer_rect.bottom(),
@@ -966,58 +1161,100 @@ impl TerminalRenderer {
         if records.is_empty() {
             return None;
         }
-        // Normalize pending-wrap anchors (`column == cols`): the prompt
-        // renders on the row after the one the anchor names.
         let cols = terminal.grid.row_len();
-        let prompt_line_ids: Vec<u64> = records
-            .iter()
-            .map(|record| {
-                crate::block_mode::prompt_row_line_id(
-                    record.prompt_start.line_id,
-                    record.prompt_start.column,
-                    cols,
-                )
-            })
-            .collect();
-        let spans = crate::block_mode::visible_block_spans(
-            &prompt_line_ids,
-            terminal.viewport_top_line_id(),
-            rows,
-        );
+        let viewport_top = terminal.viewport_top_line_id();
+        let viewport_bottom = viewport_top.saturating_add(rows.saturating_sub(1) as u64);
+        // Record anchors are monotonic. Binary-search to the one block that can
+        // cross the viewport top, then stop as soon as prompt starts pass the
+        // bottom. This avoids allocating/scanning all retained history on each
+        // frame while preserving the pure span contract in `block_mode`.
+        let first_after_top = records.partition_point(|record| {
+            crate::block_mode::prompt_row_line_id(
+                record.prompt_start.line_id,
+                record.prompt_start.column,
+                cols,
+            ) <= viewport_top
+        });
+        let first_candidate = first_after_top.saturating_sub(1);
         let newest = records.len() - 1;
         let running_duration_ms = terminal.running_duration_ms();
-        Some(
-            spans
-                .into_iter()
-                .map(|span| {
-                    let record = &records[span.record_index];
-                    let outcome = crate::block_mode::classify_outcome(
-                        record.command.as_deref(),
-                        record.command_truncated,
-                        record.exit_code,
-                        record.state,
-                        record.complete,
-                        span.record_index == newest,
-                    );
-                    BlockChromeEntry {
-                        id: record.id.clone(),
-                        outcome,
-                        duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
-                            running_duration_ms
-                        } else {
-                            record.duration_ms
-                        },
-                        finished_at: record.finished_at,
-                        span,
-                    }
-                })
-                .collect(),
-        )
+        let cursor_line_id = terminal
+            .total_lines_scrolled
+            .saturating_add(terminal.get_cursor_pos().0 as u64);
+        let mut entries = Vec::new();
+        for record_index in first_candidate..records.len() {
+            let record = &records[record_index];
+            let start = crate::block_mode::prompt_row_line_id(
+                record.prompt_start.line_id,
+                record.prompt_start.column,
+                cols,
+            );
+            if start > viewport_bottom {
+                break;
+            }
+            let next_start = records.get(record_index + 1).map(|next| {
+                crate::block_mode::prompt_row_line_id(
+                    next.prompt_start.line_id,
+                    next.prompt_start.column,
+                    cols,
+                )
+            });
+            let live = record_index == newest && !record.complete;
+            let span = if live {
+                crate::block_mode::visible_live_block_span(
+                    record_index,
+                    start,
+                    cursor_line_id,
+                    viewport_top,
+                    rows,
+                )
+            } else {
+                crate::block_mode::visible_block_span(
+                    record_index,
+                    start,
+                    next_start,
+                    viewport_top,
+                    rows,
+                )
+            };
+            let Some(span) = span else {
+                continue;
+            };
+            let outcome = crate::block_mode::classify_outcome(
+                record.command.as_deref(),
+                record.command_truncated,
+                record.exit_code,
+                record.state,
+                record.complete,
+                record_index == newest,
+            );
+            entries.push(BlockChromeEntry {
+                selected: self.selected_block_id_set.contains(record.id.as_str()),
+                active: self.active_block_id.as_deref() == Some(record.id.as_str()),
+                live,
+                hovered: false,
+                id: record.id.clone(),
+                outcome,
+                duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
+                    running_duration_ms
+                } else {
+                    record.duration_ms
+                },
+                finished_at: record.finished_at,
+                span,
+            });
+        }
+        Some(entries)
     }
 
-    /// Outcome → theme color, using the same sources the bottom bar maps
-    /// `Tone::Positive`/`Negative` to (ANSI green/red), the cursor accent for
-    /// the running block, and disabled text for background/unknown.
+    fn block_accent_color(&self) -> Color32 {
+        crate::theme::Theme::rgb_to_color32(self.theme.tabbar.active_border)
+    }
+
+    /// Outcome → semantic theme color. Navigation/live state uses the theme
+    /// accent rather than success green; background output shares that accent,
+    /// while an unreported status uses warning yellow instead of pretending it
+    /// succeeded or failed.
     fn block_outcome_color(&self, outcome: crate::block_mode::BlockOutcome) -> Color32 {
         use crate::block_mode::BlockOutcome;
         match outcome {
@@ -1027,15 +1264,249 @@ impl TerminalRenderer {
             BlockOutcome::Failed(_) => {
                 crate::theme::Theme::rgb_to_color32(self.theme.terminal.ansi_colors[1])
             }
-            BlockOutcome::Running => self.theme.cursor_color(),
-            BlockOutcome::Prompt | BlockOutcome::Background | BlockOutcome::Unknown => {
-                crate::theme::Theme::rgb_to_color32(self.theme.ui.text_disabled)
+            BlockOutcome::Unknown => {
+                crate::theme::Theme::rgb_to_color32(self.theme.terminal.ansi_colors[3])
+            }
+            BlockOutcome::Prompt | BlockOutcome::Running | BlockOutcome::Background => {
+                self.block_accent_color()
             }
         }
     }
 
-    /// Paint all block chrome for one pane with plain painter calls, the way
-    /// the pane header and bottom bar draw. Never touches the grid instances.
+    fn block_card_overlay(&self, entry: &BlockChromeEntry) -> Color32 {
+        let accent = self.block_accent_color();
+        let foreground = self.theme.terminal_foreground();
+        let (color, alpha): (Color32, u8) = match block_card_emphasis(
+            entry.active,
+            entry.selected,
+            entry.hovered,
+            entry.live,
+            entry.outcome,
+        ) {
+            BlockCardEmphasis::ActiveSelection => (accent, 36), // 0.14
+            BlockCardEmphasis::Selected => (accent, 20),        // 0.08
+            BlockCardEmphasis::Hovered => (foreground, 13),     // 0.05
+            BlockCardEmphasis::Live => (accent, 9),             // 0.035
+            BlockCardEmphasis::Failed => (self.block_outcome_color(entry.outcome), 28), // 0.11
+            BlockCardEmphasis::Background => (accent, 18),      // 0.07
+            BlockCardEmphasis::Neutral => (foreground, 8),      // 0.03
+        };
+        let alpha = (f32::from(alpha) * self.opacity.clamp(0.0, 1.0)).round() as u8;
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    }
+
+    fn block_card_border(&self, entry: &BlockChromeEntry) -> (f32, Color32) {
+        let accent = self.block_accent_color();
+        let foreground = self.theme.terminal_foreground();
+        let (width, color, alpha) = match block_card_emphasis(
+            entry.active,
+            entry.selected,
+            entry.hovered,
+            entry.live,
+            entry.outcome,
+        ) {
+            BlockCardEmphasis::ActiveSelection => (2.0, accent, 235), // 0.92
+            BlockCardEmphasis::Selected => (1.0, accent, 122),        // 0.48
+            BlockCardEmphasis::Hovered => (1.0, foreground, 41),      // 0.16
+            BlockCardEmphasis::Live => (1.0, accent, 82),             // 0.32
+            BlockCardEmphasis::Background => (1.0, accent, 61),       // 0.24
+            BlockCardEmphasis::Failed | BlockCardEmphasis::Neutral => {
+                (1.0, foreground, 20) // 0.08
+            }
+        };
+        (
+            width,
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+        )
+    }
+
+    fn block_visual_bottom(entry: &BlockChromeEntry, _viewport_rows: usize) -> bool {
+        entry.span.ends_in_viewport
+    }
+
+    fn card_geometry(
+        &self,
+        entry: &BlockChromeEntry,
+        content_rect: egui::Rect,
+        line_height: f32,
+        viewport_rows: usize,
+    ) -> Option<BlockCardGeometry> {
+        block_card_geometry(
+            content_rect,
+            entry.span,
+            line_height,
+            self.block_compact,
+            Self::block_visual_bottom(entry, viewport_rows),
+        )
+    }
+
+    fn update_block_hover(
+        &self,
+        entries: &mut [BlockChromeEntry],
+        hover_pos: Option<egui::Pos2>,
+        content_rect: egui::Rect,
+        line_height: f32,
+        viewport_rows: usize,
+    ) {
+        let Some(pos) = hover_pos.filter(|pos| {
+            line_height.is_finite()
+                && line_height > 0.0
+                && pos.y >= content_rect.top()
+                && pos.y < content_rect.bottom()
+        }) else {
+            return;
+        };
+        let row = (((pos.y - content_rect.top()) / line_height)
+            .floor()
+            .max(0.0) as usize)
+            .min(viewport_rows.saturating_sub(1));
+        let Some(entry) = entries.iter_mut().find(|entry| {
+            entry.span.first_row <= row
+                && row <= entry.span.last_row
+                && !entry.live
+                && entry.outcome != crate::block_mode::BlockOutcome::Prompt
+        }) else {
+            return;
+        };
+        let Some(geometry) = self.card_geometry(entry, content_rect, line_height, viewport_rows)
+        else {
+            return;
+        };
+        let hover_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                geometry.rect.left() - crate::block_mode::GUTTER_CLICK_BAND_PX,
+                geometry.rect.top(),
+            ),
+            geometry.rect.right_bottom(),
+        );
+        entry.hovered = hover_rect.contains(pos);
+    }
+
+    /// The card painter runs once per visible span before terminal cell
+    /// backgrounds, glyphs, and Kitty layers. It never lays a translucent veil
+    /// over terminal content; default cells remain transparent and reveal this
+    /// backdrop, while explicit ANSI cell backgrounds stay authoritative.
+    fn draw_block_card_backgrounds(
+        &self,
+        painter: &egui::Painter,
+        entries: &[BlockChromeEntry],
+        content_rect: egui::Rect,
+        line_height: f32,
+        viewport_rows: usize,
+    ) {
+        for entry in entries {
+            let Some(geometry) =
+                self.card_geometry(entry, content_rect, line_height, viewport_rows)
+            else {
+                continue;
+            };
+            if !self.block_compact && geometry.top_closed && geometry.bottom_closed {
+                let shadow = if entry.live {
+                    Some(egui::Shadow {
+                        offset: [0, 2],
+                        blur: 8,
+                        spread: 0,
+                        color: Color32::from_black_alpha(
+                            (46.0 * self.opacity.clamp(0.0, 1.0)).round() as u8,
+                        ),
+                    })
+                } else if entry.hovered {
+                    Some(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 14,
+                        spread: 0,
+                        color: Color32::from_black_alpha(
+                            (56.0 * self.opacity.clamp(0.0, 1.0)).round() as u8,
+                        ),
+                    })
+                } else {
+                    None
+                };
+                if let Some(shadow) = shadow {
+                    painter.add(shadow.as_shape(geometry.rect, geometry.rounding));
+                }
+            }
+            painter.rect_filled(
+                geometry.rect,
+                geometry.rounding,
+                self.block_card_overlay(entry),
+            );
+        }
+    }
+
+    /// Per-row opaque approximation of the already-painted card composite,
+    /// used only as the GPU glyph antialiasing backdrop. Painting remains one
+    /// shape per visible block; this linear row pass merely keeps transparent
+    /// default-cell glyph edges color-correct when selection/live tint changes.
+    fn block_row_backdrops(
+        &self,
+        entries: &[BlockChromeEntry],
+        viewport_rows: usize,
+        base_bg: Color32,
+    ) -> Vec<Option<Color32>> {
+        let mut rows = vec![None; viewport_rows];
+        for entry in entries {
+            let backdrop = composite_over_opaque(base_bg, self.block_card_overlay(entry));
+            let end = entry.span.last_row.min(viewport_rows.saturating_sub(1));
+            for row in rows
+                .iter_mut()
+                .take(end.saturating_add(1))
+                .skip(entry.span.first_row)
+            {
+                *row = Some(backdrop);
+            }
+        }
+        rows
+    }
+
+    fn draw_card_outline(
+        painter: &egui::Painter,
+        geometry: BlockCardGeometry,
+        stroke: egui::Stroke,
+    ) {
+        if geometry.top_closed && geometry.bottom_closed {
+            painter.rect_stroke(
+                geometry.rect,
+                geometry.rounding,
+                stroke,
+                egui::StrokeKind::Outside,
+            );
+            return;
+        }
+
+        // A clipped block has no semantic cap at that viewport edge. Draw its
+        // continuing sides and only the real cap(s), never a false horizontal
+        // border at the top/bottom of the window.
+        let inset = stroke.width * 0.5;
+        let left = geometry.rect.left() - inset;
+        let right = geometry.rect.right() + inset;
+        let top = geometry.rect.top() - inset;
+        let bottom = geometry.rect.bottom() + inset;
+        painter.line_segment([egui::pos2(left, top), egui::pos2(left, bottom)], stroke);
+        painter.line_segment([egui::pos2(right, top), egui::pos2(right, bottom)], stroke);
+        if geometry.top_closed {
+            painter.line_segment(
+                [
+                    egui::pos2(left, top + inset),
+                    egui::pos2(right, top + inset),
+                ],
+                stroke,
+            );
+        }
+        if geometry.bottom_closed {
+            painter.line_segment(
+                [
+                    egui::pos2(left, bottom - inset),
+                    egui::pos2(right, bottom - inset),
+                ],
+                stroke,
+            );
+        }
+    }
+
+    /// Paint foreground-only card chrome: thin border, 3px outcome stripe and
+    /// a blank-cell-safe badge. The translucent card fill is intentionally a
+    /// separate pre-grid pass above.
     fn draw_block_chrome(
         &self,
         painter: &egui::Painter,
@@ -1048,81 +1519,53 @@ impl TerminalRenderer {
         use crate::block_mode::{self, BlockOutcome};
         const BADGE_PAD_X: f32 = 4.0;
         const BADGE_PAD_Y: f32 = 1.0;
-        const BADGE_RIGHT_MARGIN: f32 = 4.0;
+        const BADGE_RIGHT_MARGIN: f32 = 8.0;
 
-        let separator_color = {
-            let [r, g, b] = self.theme.ui.text_disabled;
-            Color32::from_rgba_unmultiplied(r, g, b, 56)
-        };
         let badge_bg = {
-            let [r, g, b] = self.theme.tabbar.bg;
-            Color32::from_rgba_unmultiplied(r, g, b, 220)
+            let [r, g, b] = self.theme.ui.panel_bg;
+            Color32::from_rgba_unmultiplied(r, g, b, 235)
         };
-        let badge_font = FontId::proportional(11.0);
+        let badge_font = FontId::proportional(if self.block_compact { 10.0 } else { 11.0 });
+        let viewport_rows = grid.len();
 
         for entry in entries {
-            let selected = self
-                .selected_block_ids
-                .iter()
-                .any(|record_id| record_id == &entry.id);
-            let active = self.active_block_id.as_deref() == Some(entry.id.as_str());
+            let Some(geometry) =
+                self.card_geometry(entry, content_rect, line_height, viewport_rows)
+            else {
+                continue;
+            };
             let (top_y, _) = snapped_span(content_rect.top(), entry.span.first_row, line_height);
-            let (last_y, last_height) =
-                snapped_span(content_rect.top(), entry.span.last_row, line_height);
-            let bottom_y = last_y + last_height;
+            let status = self.block_outcome_color(entry.outcome);
+            let stripe_alpha = if entry.active || entry.live {
+                255
+            } else if entry.selected {
+                225
+            } else {
+                190
+            };
+            let stripe_width = if entry.active || entry.selected {
+                block_mode::GUTTER_STRIPE_SELECTED_WIDTH
+            } else {
+                block_mode::GUTTER_STRIPE_WIDTH
+            };
+            let stripe_radius = geometry.rounding.nw.min(2);
+            painter.rect_filled(
+                block_stripe_rect(geometry.rect, stripe_width),
+                egui::CornerRadius {
+                    nw: stripe_radius,
+                    ne: 0,
+                    sw: geometry.rounding.sw.min(2),
+                    se: 0,
+                },
+                Color32::from_rgba_unmultiplied(status.r(), status.g(), status.b(), stripe_alpha),
+            );
 
-            // 1px separator on the block's first row — only when that row
-            // really is the prompt row, not a clipped continuation.
-            if entry.span.starts_in_viewport {
-                painter.hline(
-                    content_rect.left()..=content_rect.right(),
-                    top_y + 0.5,
-                    egui::Stroke::new(1.0, separator_color),
-                );
-            }
-
-            // Gutter stripe over the block's visible rows. The live prompt
-            // block gets no stripe (separator only).
-            if entry.outcome != BlockOutcome::Prompt {
-                let color = self.block_outcome_color(entry.outcome);
-                let (width, alpha) = if active {
-                    (block_mode::GUTTER_STRIPE_SELECTED_WIDTH, 255)
-                } else if selected {
-                    (block_mode::GUTTER_STRIPE_SELECTED_WIDTH, 210)
-                } else {
-                    (block_mode::GUTTER_STRIPE_WIDTH, 170)
-                };
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(content_rect.left(), top_y),
-                        egui::pos2(content_rect.left() + width, bottom_y),
-                    ),
-                    egui::CornerRadius::ZERO,
-                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
-                );
-            }
-
-            // Every selected block receives an outline; the active edge is
-            // stronger so a range still communicates where Up/Down will move.
-            if selected {
-                let color = self.block_outcome_color(entry.outcome);
-                painter.rect_stroke(
-                    egui::Rect::from_min_max(
-                        egui::pos2(content_rect.left(), top_y),
-                        egui::pos2(content_rect.right(), bottom_y),
-                    ),
-                    egui::CornerRadius::ZERO,
-                    egui::Stroke::new(
-                        if active { 1.5 } else { 1.0 },
-                        if active {
-                            color
-                        } else {
-                            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 130)
-                        },
-                    ),
-                    egui::StrokeKind::Inside,
-                );
-            }
+            let (border_width, border_color) = self.block_card_border(entry);
+            Self::draw_card_outline(
+                painter,
+                geometry,
+                egui::Stroke::new(border_width, border_color),
+            );
 
             // Right-aligned outcome badge on the first row, drawn only when
             // every cell it would cover is blank — never over prompt text.
@@ -1135,7 +1578,7 @@ impl TerminalRenderer {
             // 选中块的徽章附带完成时刻(本地时间)。带后缀的徽章放不下时,
             // 先退回无后缀徽章再放弃,避免选中反而让徽章整个消失。
             let mut candidates: Vec<String> = Vec::new();
-            if active {
+            if entry.active {
                 if let Some(secs) = entry.finished_at.and_then(block_mode::epoch_secs) {
                     let clock = block_mode::format_local_time_of_day(
                         secs,
@@ -1145,7 +1588,7 @@ impl TerminalRenderer {
                 }
             }
             candidates.push(text);
-            let color = self.block_outcome_color(entry.outcome);
+            let color = status;
             // Map wide-char continuation cells to a non-blank marker so the
             // badge never paints over half a glyph.
             let row_chars: Vec<char> = grid
@@ -1179,7 +1622,11 @@ impl TerminalRenderer {
                     ),
                     bg_size,
                 );
-                if bg_rect.left() < content_rect.left() || char_width <= 0.0 {
+                let bg_rect = bg_rect.translate(egui::vec2(
+                    geometry.rect.right() - content_rect.right(),
+                    0.0,
+                ));
+                if bg_rect.left() < geometry.rect.left() || char_width <= 0.0 {
                     continue; // 内容区放不下这个候选,试更短的。
                 }
                 let start_col =
@@ -1425,7 +1872,22 @@ impl TerminalRenderer {
         // Owned per-frame snapshot of visible command blocks, shared by the
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
-        let block_chrome = self.compute_block_chrome(terminal, rows);
+        let mut block_chrome = self.compute_block_chrome(terminal, rows);
+        if let Some(entries) = block_chrome.as_deref_mut() {
+            self.update_block_hover(
+                entries,
+                ui.ctx().input(|input| input.pointer.hover_pos()),
+                content_rect,
+                line_height,
+                rows,
+            );
+        }
+        let block_row_backdrops = if let Some(entries) = block_chrome.as_deref() {
+            self.draw_block_card_backgrounds(&painter, entries, content_rect, line_height, rows);
+            self.block_row_backdrops(entries, rows, bg)
+        } else {
+            Vec::new()
+        };
         let cursor_pos = terminal.get_cursor_pos();
         let ime_rect = cursor_rect(
             content_rect,
@@ -1627,27 +2089,25 @@ impl TerminalRenderer {
         // where click-to-place-cursor matters) the click falls through to
         // normal handling.
         let gutter_selected_block = if plain_content_click {
-            click_pos
-                .filter(|pos| {
-                    pos.x >= content_rect.left()
-                        && pos.x < content_rect.left() + crate::block_mode::GUTTER_CLICK_BAND_PX
-                })
-                .and_then(|pos| {
-                    let entries = block_chrome.as_ref()?;
-                    let (row, _) = grid_position_from_content(
-                        pos,
-                        content_rect,
-                        char_width,
-                        line_height,
-                        cols,
-                        rows,
-                    );
-                    entries
-                        .iter()
-                        .find(|entry| entry.span.first_row <= row && row <= entry.span.last_row)
-                        .filter(|entry| entry.outcome != crate::block_mode::BlockOutcome::Prompt)
-                        .map(|entry| entry.id.clone())
-                })
+            click_pos.and_then(|pos| {
+                let entries = block_chrome.as_ref()?;
+                let (row, _) = grid_position_from_content(
+                    pos,
+                    content_rect,
+                    char_width,
+                    line_height,
+                    cols,
+                    rows,
+                );
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.span.first_row <= row && row <= entry.span.last_row)
+                    .filter(|entry| entry.outcome != crate::block_mode::BlockOutcome::Prompt)?;
+                let geometry = self.card_geometry(entry, content_rect, line_height, rows)?;
+                (pos.x >= geometry.rect.left() - crate::block_mode::GUTTER_CLICK_BAND_PX
+                    && pos.x < geometry.rect.left())
+                .then(|| entry.id.clone())
+            })
         } else {
             None
         };
@@ -1836,6 +2296,7 @@ impl TerminalRenderer {
                 content_rect,
                 char_width,
                 line_height,
+                &block_row_backdrops,
             )
         } else {
             false
@@ -1870,21 +2331,9 @@ impl TerminalRenderer {
             );
         }
 
-        // Zero/positive z-index images are above terminal text. Keep the
-        // cursor as the final UI affordance so it remains locatable.
-        self.paint_kitty_image_layer(
-            ui.ctx(),
-            &painter,
-            terminal,
-            content_rect,
-            char_width,
-            line_height,
-            KittyImageLayer::AboveText,
-        );
-
-        // Command-block chrome (gutter stripes, separators, outcome badges).
-        // Painter overlays recomputed every frame, drawn after the grid so
-        // they never interact with the GPU path's dirty tracking.
+        // Foreground card chrome follows terminal text. Badge placement was
+        // verified against blank cells; the stripe lives wholly in the
+        // layout-owned gutter, so neither path covers a glyph.
         if let Some(entries) = &block_chrome {
             self.draw_block_chrome(
                 &painter,
@@ -1895,6 +2344,19 @@ impl TerminalRenderer {
                 line_height,
             );
         }
+
+        // Zero/positive z-index images are above terminal text and UI chrome;
+        // a terminal graphic must not be washed by a later translucent card
+        // fill. Keep the cursor as the final UI affordance so it stays visible.
+        self.paint_kitty_image_layer(
+            ui.ctx(),
+            &painter,
+            terminal,
+            content_rect,
+            char_width,
+            line_height,
+            KittyImageLayer::AboveText,
+        );
 
         // Render cursor - direct O(1) positioning instead of full grid scan
         if cursor_visible && cursor_pos.0 < rows && cursor_pos.1 < cols {
@@ -2071,6 +2533,7 @@ impl TerminalRenderer {
         content_rect: egui::Rect,
         char_width: f32,
         line_height: f32,
+        block_row_backdrops: &[Option<Color32>],
     ) -> bool {
         let render_state = match &self.wgpu_render_state {
             Some(rs) => rs,
@@ -2113,6 +2576,12 @@ impl TerminalRenderer {
             search_state.query.hash(&mut h);
             search_state.matches.hash(&mut h);
             search_state.current_match_index.hash(&mut h);
+            h.finish()
+        };
+        let block_backdrop_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            block_row_backdrops.hash(&mut h);
             h.finish()
         };
 
@@ -2191,6 +2660,14 @@ impl TerminalRenderer {
                     }
                 }
             }
+
+            // Default-background cells are transparent over the pre-grid card
+            // painter, but their RGB still drives glyph edge correction in the
+            // shader. Refresh visible rows when that backdrop changes (block
+            // selection/live/outcome), without rebuilding offscreen history.
+            if self.last_rendered_block_backdrop_hash != block_backdrop_hash {
+                dirty_rows.fill(true);
+            }
         }
 
         let any_dirty = dirty_rows.iter().any(|&d| d);
@@ -2267,6 +2744,7 @@ impl TerminalRenderer {
                             hovered_link,
                             &self.theme,
                             default_bg,
+                            block_row_backdrops,
                             has_search,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
@@ -2301,6 +2779,7 @@ impl TerminalRenderer {
                             hovered_link,
                             &self.theme,
                             default_bg,
+                            block_row_backdrops,
                             has_search,
                             glyph_offset_x_adjust,
                             glyph_offset_y_adjust,
@@ -2349,6 +2828,7 @@ impl TerminalRenderer {
                                 hovered_link,
                                 &self.theme,
                                 default_bg,
+                                block_row_backdrops,
                                 has_search,
                                 glyph_offset_x_adjust,
                                 glyph_offset_y_adjust,
@@ -2382,6 +2862,7 @@ impl TerminalRenderer {
         self.last_rendered_scroll_offset = current_scroll_offset;
         self.last_rendered_selection = current_selection;
         self.last_rendered_search_hash = search_hash;
+        self.last_rendered_block_backdrop_hash = block_backdrop_hash;
         // Update last_search_match_lines for next frame's dirty tracking
         self.last_search_match_lines.clear();
         for m in &search_state.matches {
@@ -2478,6 +2959,7 @@ impl TerminalRenderer {
         hovered_link: &Option<crate::link::Link>,
         theme: &crate::theme::Theme,
         default_bg: Color32,
+        block_row_backdrops: &[Option<Color32>],
         has_search: bool,
         glyph_offset_x_adjust: f32,
         glyph_offset_y_adjust: f32,
@@ -2486,6 +2968,11 @@ impl TerminalRenderer {
         cols: usize,
     ) {
         let sel_cols = terminal.row_selection_cols(row_idx);
+        let row_default_bg = block_row_backdrops
+            .get(row_idx)
+            .copied()
+            .flatten()
+            .unwrap_or(default_bg);
 
         // Ligature pass: shape contiguous printable-ASCII runs of the same weight.
         // Only override glyphs when shaping actually merges cells (a ligature
@@ -2620,7 +3107,7 @@ impl TerminalRenderer {
                 && cell.background == crate::terminal::Color::Default
                 && !is_search_match;
             if is_default_background {
-                bg_color = default_bg;
+                bg_color = row_default_bg;
             }
 
             let mut fg_color = if is_selected {
@@ -3731,6 +4218,141 @@ mod tests {
             assert!(rect.right() <= pane.right());
             assert!(rect.bottom() <= pane.bottom());
         }
+    }
+
+    #[test]
+    fn block_gutter_moves_column_zero_and_grid_size_together() {
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            2.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.char_width = 8.0;
+        renderer.line_height = 20.0;
+        let available = egui::vec2(102.0, 104.0);
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, available);
+
+        renderer.block_mode = true;
+        let (with_content, _) = renderer.layout_rects(pane);
+        assert_eq!(renderer.grid_dimensions(available), (10, 5));
+        assert_eq!(with_content.left(), 2.0 + BLOCK_GUTTER_WIDTH);
+        assert_eq!(with_content.width(), 80.0);
+
+        // Compact is paint density only: toggling it cannot resize the PTY.
+        renderer.block_compact = true;
+        assert_eq!(renderer.grid_dimensions(available), (10, 5));
+        assert_eq!(renderer.layout_rects(pane).0, with_content);
+
+        // Disabling Block Mode removes the layout-owned gutter and recovers
+        // exactly one eight-pixel column. Mouse/cursor/Kitty all consume this
+        // same content rect, so there is no independent coordinate offset.
+        renderer.block_mode = false;
+        let (without_content, _) = renderer.layout_rects(pane);
+        assert_eq!(renderer.grid_dimensions(available), (11, 5));
+        assert_eq!(without_content.left(), 2.0);
+        assert_eq!(without_content.right(), with_content.right());
+    }
+
+    #[test]
+    fn card_geometry_preserves_real_edges_and_seals_only_visible_live_targets() {
+        let content = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 200.0));
+        let open_tail = crate::block_mode::VisibleBlockSpan {
+            record_index: 4,
+            first_row: 0,
+            last_row: 2,
+            starts_in_viewport: true,
+            ends_in_viewport: false,
+        };
+        let geometry =
+            block_card_geometry(content, open_tail, 20.0, false, false).expect("card geometry");
+        assert_eq!(geometry.rect.left(), content.left());
+        assert_eq!(geometry.rect.right(), content.right());
+        assert_eq!(geometry.rect.top(), 22.0);
+        assert_eq!(geometry.rect.bottom(), 80.0);
+        assert_eq!(geometry.rounding.nw, BLOCK_CARD_NORMAL_RADIUS);
+        assert_eq!(geometry.rounding.se, 0, "clipping is not a real bottom");
+        assert!(!geometry.bottom_closed);
+
+        let idle_span = crate::block_mode::visible_live_block_span(4, 100, 100, 100, 10)
+            .expect("idle live span");
+        let live = block_card_geometry(content, idle_span, 20.0, false, idle_span.ends_in_viewport)
+            .expect("live card geometry");
+        assert_eq!(live.rect.bottom(), 138.0);
+        assert_eq!(live.rounding.se, BLOCK_CARD_NORMAL_RADIUS);
+        assert!(live.bottom_closed);
+
+        let clipped_live_span = crate::block_mode::visible_live_block_span(4, 100, 108, 104, 4)
+            .expect("clipped live span");
+        let clipped_live = block_card_geometry(
+            content,
+            clipped_live_span,
+            20.0,
+            false,
+            clipped_live_span.ends_in_viewport,
+        )
+        .expect("clipped live geometry");
+        assert_eq!(clipped_live.rect.bottom(), 100.0);
+        assert_eq!(clipped_live.rounding.se, 0);
+        assert!(!clipped_live.bottom_closed);
+
+        let clipped_top = crate::block_mode::VisibleBlockSpan {
+            record_index: 3,
+            first_row: 0,
+            last_row: 1,
+            starts_in_viewport: false,
+            ends_in_viewport: true,
+        };
+        let compact = block_card_geometry(content, clipped_top, 20.0, true, true)
+            .expect("compact clipped card");
+        assert_eq!(compact.rect.top(), content.top());
+        assert_eq!(compact.rect.bottom(), 59.5);
+        assert_eq!(compact.rounding.nw, 0);
+        assert_eq!(compact.rounding.se, BLOCK_CARD_COMPACT_RADIUS);
+    }
+
+    #[test]
+    fn selected_stripe_stays_inside_the_layout_owned_gutter() {
+        let card = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 40.0));
+        let normal = block_stripe_rect(card, crate::block_mode::GUTTER_STRIPE_WIDTH);
+        let selected = block_stripe_rect(card, crate::block_mode::GUTTER_STRIPE_SELECTED_WIDTH);
+        assert_eq!(normal.width(), 3.0);
+        assert_eq!(selected.width(), 4.0);
+        for stripe in [normal, selected] {
+            assert_eq!(stripe.right(), card.left());
+            assert!(stripe.left() >= card.left() - BLOCK_GUTTER_WIDTH);
+            assert!(stripe.right() <= card.left());
+        }
+        // With the default 2px pane padding, the strong stripe starts beyond
+        // a conventional 5px window-resize grip and remains fully clickable.
+        assert_eq!(selected.left(), 6.0);
+        assert!(selected.left() > 5.0);
+    }
+
+    #[test]
+    fn card_state_priority_matches_the_family_contract() {
+        use crate::block_mode::BlockOutcome;
+        assert_eq!(
+            block_card_emphasis(true, true, true, true, BlockOutcome::Failed(1)),
+            BlockCardEmphasis::ActiveSelection
+        );
+        assert_eq!(
+            block_card_emphasis(false, true, true, false, BlockOutcome::Failed(1)),
+            BlockCardEmphasis::Selected
+        );
+        assert_eq!(
+            block_card_emphasis(false, false, true, false, BlockOutcome::Failed(1)),
+            BlockCardEmphasis::Hovered
+        );
+        assert_eq!(
+            block_card_emphasis(false, false, false, true, BlockOutcome::Running),
+            BlockCardEmphasis::Live
+        );
+        assert_eq!(
+            block_card_emphasis(false, false, false, false, BlockOutcome::Failed(1)),
+            BlockCardEmphasis::Failed
+        );
     }
 
     #[test]

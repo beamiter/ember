@@ -272,6 +272,12 @@ pub struct Config {
     #[serde(default = "default_block_mode")]
     pub block_mode: bool,
 
+    /// Denser visual treatment for command cards. Ember keeps its native
+    /// continuous terminal grid (and therefore the exact PTY cell geometry)
+    /// in both modes; this setting only tightens the card radius/gaps/chrome.
+    #[serde(default)]
+    pub block_compact: bool,
+
     /// Why this run could not use the on-disk config, if it exists but could
     /// not be read or parsed. Never serialized: it describes the load attempt,
     /// not a user setting.
@@ -550,6 +556,7 @@ impl Default for Config {
             bottom_bar: default_bottom_bar(),
             click_moves_cursor: default_click_moves_cursor(),
             block_mode: default_block_mode(),
+            block_compact: false,
             load_error: None,
             revision: None,
         }
@@ -1011,9 +1018,12 @@ mod tests {
     fn block_mode_defaults_on_and_can_be_disabled() {
         let config: Config = toml::from_str("").expect("empty config parses");
         assert!(config.block_mode);
+        assert!(!config.block_compact);
 
-        let config: Config = toml::from_str("block_mode = false\n").expect("override parses");
+        let config: Config =
+            toml::from_str("block_mode = false\nblock_compact = true\n").expect("overrides parse");
         assert!(!config.block_mode);
+        assert!(config.block_compact);
     }
 
     #[test]

@@ -221,16 +221,20 @@ show_repo_strip = true
 # status/duration, grid size and tab position. Same key in every jterm.
 bottom_bar = true
 
-# Command-block chrome (Warp-style): a colored gutter stripe, separator and
-# outcome badge per OSC 133 command block. Running blocks show a compact live
-# elapsed-time badge when it fits without covering terminal text. Turning this
-# off also clears/disables whole-block selection, so arrows and Enter retain
-# their ordinary terminal meaning.
+# Command-card chrome (Warp-style): theme-relative cards, a colored outcome
+# stripe and a status badge per OSC 133 command block. Running blocks show a
+# compact live elapsed-time badge when it fits without covering terminal text.
+# Block Mode reserves an 8px card gutter before column zero (which can reduce
+# a pane by one column). Compact only tightens visual chrome and never changes
+# the PTY/cell geometry relative to non-compact Block Mode.
+# Turning block mode off also clears/disables whole-block selection, so arrows
+# and Enter retain their ordinary terminal meaning.
 block_mode = true
+block_compact = false
 ```
 
 Completed records use `jterm_core::block_contract` only after Ember has merged
-OSC 133 metadata with its bounded screen reconstruction. Gutter badges,
+OSC 133 metadata with its bounded screen reconstruction. Card badges,
 failure markers/navigation, and the Commands sidebar consequently agree that a
 blank/background record carrying a nonzero raw status is not a failed command,
 while a real command with no reported status remains unknown rather than

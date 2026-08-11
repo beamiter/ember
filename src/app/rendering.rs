@@ -84,6 +84,7 @@ impl TerminalApp {
             renderer.font_ligatures = self.renderer.font_ligatures;
             renderer.click_moves_cursor = self.renderer.click_moves_cursor;
             renderer.block_mode = self.renderer.block_mode;
+            renderer.block_compact = self.renderer.block_compact;
             renderer.gpu_rendering = self.renderer.gpu_rendering;
             renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
             renderer.sync_font_metrics(ctx);
@@ -671,11 +672,7 @@ impl TerminalApp {
                         .block_selection
                         .as_ref()
                         .filter(|selection| selection.session_id == session.metadata.session_id);
-                    renderer.selected_block_ids = pane_block_selection
-                        .map(|selection| selection.selected_ids.clone())
-                        .unwrap_or_default();
-                    renderer.active_block_id =
-                        pane_block_selection.map(|selection| selection.active_id.clone());
+                    renderer.set_block_selection(pane_block_selection);
 
                     // 在指定矩形内渲染（多窗格模式专用方法）
                     renderer.render_in_rect(
@@ -846,11 +843,7 @@ impl TerminalApp {
                     .block_selection
                     .as_ref()
                     .filter(|selection| selection.session_id == session_id);
-                self.renderer.selected_block_ids = block_selection
-                    .map(|selection| selection.selected_ids.clone())
-                    .unwrap_or_default();
-                self.renderer.active_block_id =
-                    block_selection.map(|selection| selection.active_id.clone());
+                self.renderer.set_block_selection(block_selection);
                 let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                 let mut terminal_guard = session.terminal.lock();
 

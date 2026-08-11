@@ -107,6 +107,7 @@ pub struct ConfigPanel {
     edit_show_repo_strip: bool,
     edit_bottom_bar: bool,
     edit_block_mode: bool,
+    edit_block_compact: bool,
     edit_ai_enabled: bool,
     edit_ai_provider: String,
     edit_ai_model: String,
@@ -170,6 +171,7 @@ impl ConfigPanel {
             edit_show_repo_strip: true,
             edit_bottom_bar: jterm_core::bottom_bar::ENABLED_BY_DEFAULT,
             edit_block_mode: true,
+            edit_block_compact: false,
             edit_ai_enabled: false,
             edit_ai_provider: "anthropic".to_string(),
             edit_ai_model: String::new(),
@@ -259,6 +261,7 @@ impl ConfigPanel {
         self.edit_show_repo_strip = config.show_repo_strip;
         self.edit_bottom_bar = config.bottom_bar;
         self.edit_block_mode = config.block_mode;
+        self.edit_block_compact = config.block_compact;
         self.edit_ai_enabled = config.ai_enabled;
         self.edit_ai_provider = config.ai_provider.clone();
         self.edit_ai_model = config.ai_model.clone();
@@ -308,6 +311,7 @@ impl ConfigPanel {
         config.show_repo_strip = self.edit_show_repo_strip;
         config.bottom_bar = self.edit_bottom_bar;
         config.block_mode = self.edit_block_mode;
+        config.block_compact = self.edit_block_compact;
         config.ai_enabled = self.edit_ai_enabled;
         config.ai_provider = self.edit_ai_provider.clone();
         config.ai_model = self.edit_ai_model.trim().to_string();
@@ -1338,8 +1342,18 @@ impl ConfigPanel {
         if ui
             .checkbox(
                 &mut self.edit_block_mode,
-                "Show command-block chrome (gutter stripes, outcome badges)",
+                "Show command cards (status stripe, border, outcome badge)",
             )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        if ui
+            .add_enabled(
+                self.edit_block_mode,
+                egui::Checkbox::new(&mut self.edit_block_compact, "Compact Block Spacing"),
+            )
+            .on_disabled_hover_text("Enable command cards first")
             .changed()
         {
             self.has_changes = true;
@@ -1681,6 +1695,22 @@ mod tests {
         assert!(applied.notify_long_blocks);
         assert_eq!(applied.notify_long_block_threshold_ms, 5_000);
         assert!(applied.show_repo_strip);
+    }
+
+    #[test]
+    fn compact_block_spacing_round_trips_through_panel_buffer() {
+        let source = Config {
+            block_compact: true,
+            ..Config::default()
+        };
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+        assert!(panel.edit_block_compact);
+
+        panel.edit_block_compact = false;
+        let mut applied = source;
+        panel.apply_to_config(&mut applied);
+        assert!(!applied.block_compact);
     }
 
     #[test]

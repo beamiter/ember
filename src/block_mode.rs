@@ -22,17 +22,21 @@ const TRUNCATED_COMMAND_PRESENCE: &str = "[truncated command]";
 pub const GUTTER_STRIPE_WIDTH: f32 = 3.0;
 /// Wider stripe for the selected block.
 pub const GUTTER_STRIPE_SELECTED_WIDTH: f32 = 4.0;
-/// Horizontal band at `content_rect.left()` where a click selects a block
-/// instead of moving the cursor or clearing the text selection.
-pub const GUTTER_CLICK_BAND_PX: f32 = 6.0;
+/// Layout-owned horizontal band immediately before `content_rect.left()` where
+/// a click selects a block instead of moving the cursor or clearing the text
+/// selection.
+pub const GUTTER_CLICK_BAND_PX: f32 = 8.0;
+/// Minimum visual height of the newest editable/running command card. This is
+/// paint metadata only: the terminal grid and PTY keep their viewport size.
+pub const MIN_INPUT_ROWS: usize = 6;
 
 /// What a block's gutter/badge should communicate. `Unknown` (the shell never
 /// reported an exit code) must never render as success: `exit_code == None`
 /// is not `Some(0)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockOutcome {
-    /// The live prompt block (OSC 133 A/B without C yet): separator only,
-    /// no gutter stripe.
+    /// The live prompt block (OSC 133 A/B without C yet): accent card and
+    /// stripe, but no badge so input remains unobscured.
     Prompt,
     /// The newest record is between C and D: accent-colored stripe and live
     /// elapsed-time badge when it fits.
@@ -122,10 +126,10 @@ pub fn running_badge_refresh_interval(elapsed_ms: u64) -> std::time::Duration {
     }
 }
 
-/// Badge text for the block's first row, or `None` for outcomes that carry no
-/// badge (live prompt and background; running needs a live elapsed duration).
-/// `Unknown` is a bare `?` glyph: anvil/4 show no exit badge for an unreported
-/// status.
+/// Badge text for the block's first row, or `None` for the editable prompt
+/// (running needs a live elapsed duration). Background output and an
+/// unreported command status stay explicit and use the same compact wording as
+/// the other native frontends.
 pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<String> {
     match outcome {
         BlockOutcome::Success => Some(match duration_ms {
@@ -143,9 +147,10 @@ pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<Str
             }
             Some(text)
         }
-        BlockOutcome::Unknown => Some("?".to_string()),
+        BlockOutcome::Unknown => Some("? exit:?".to_string()),
         BlockOutcome::Running => duration_ms.map(running_badge_text),
-        BlockOutcome::Prompt | BlockOutcome::Background => None,
+        BlockOutcome::Background => Some("↻ Background".to_string()),
+        BlockOutcome::Prompt => None,
     }
 }
 
@@ -176,12 +181,76 @@ pub struct VisibleBlockSpan {
     /// Whether the block's own first row (the prompt row) is inside the
     /// viewport. Separator and badge are only drawn when it is.
     pub starts_in_viewport: bool,
+    /// Whether the block's target end is in the viewport. For finished blocks
+    /// this is the row before the next prompt; for the newest live block it is
+    /// the bounded visual growth edge. Renderers use this to avoid a fake
+    /// rounded/bordered bottom edge when a block is clipped by the window.
+    pub ends_in_viewport: bool,
+}
+
+/// Exclusive visual end of the newest editable/running card. Idle input keeps
+/// a six-row surface; multiline input or command output grows it through the
+/// cursor row. This does not resize the terminal grid or PTY.
+pub fn live_block_end_exclusive(prompt_start: u64, cursor_line_id: u64) -> u64 {
+    prompt_start
+        .saturating_add(MIN_INPUT_ROWS as u64)
+        .max(cursor_line_id.saturating_add(1))
+}
+
+/// Intersect the newest live card's bounded visual extent with a viewport.
+/// `ends_in_viewport` describes the real target end, not merely the viewport
+/// clip, so scrolling cannot manufacture a bottom border.
+pub fn visible_live_block_span(
+    record_index: usize,
+    prompt_start: u64,
+    cursor_line_id: u64,
+    top_line_id: u64,
+    viewport_rows: usize,
+) -> Option<VisibleBlockSpan> {
+    visible_block_span(
+        record_index,
+        prompt_start,
+        Some(live_block_end_exclusive(prompt_start, cursor_line_id)),
+        top_line_id,
+        viewport_rows,
+    )
+}
+
+/// Intersect one block boundary pair with a viewport. Kept separate from the
+/// collection walk so frontends can binary-search their native record store
+/// and remain `O(visible blocks)` without first allocating every prompt id.
+pub fn visible_block_span(
+    record_index: usize,
+    start: u64,
+    next_start: Option<u64>,
+    top_line_id: u64,
+    viewport_rows: usize,
+) -> Option<VisibleBlockSpan> {
+    if viewport_rows == 0 {
+        return None;
+    }
+    let bottom_line_id = top_line_id.saturating_add(viewport_rows as u64 - 1);
+    let (end, has_semantic_end) = match next_start {
+        Some(next_start) => (next_start.checked_sub(1).filter(|end| *end >= start)?, true),
+        None => (bottom_line_id.max(start), false),
+    };
+    if end < top_line_id || start > bottom_line_id {
+        return None;
+    }
+    Some(VisibleBlockSpan {
+        record_index,
+        first_row: (start.max(top_line_id) - top_line_id) as usize,
+        last_row: (end.min(bottom_line_id) - top_line_id) as usize,
+        starts_in_viewport: start >= top_line_id,
+        ends_in_viewport: has_semantic_end && end <= bottom_line_id,
+    })
 }
 
 /// Compute the viewport intersection of every block. `prompt_line_ids` are
 /// the records' `prompt_start.line_id` values in record order; block *i* ends
 /// on the line before block *i+1* starts, and the last block extends to the
 /// viewport bottom (the live tail).
+#[cfg(test)]
 pub fn visible_block_spans(
     prompt_line_ids: &[u64],
     top_line_id: u64,
@@ -191,26 +260,26 @@ pub fn visible_block_spans(
     if viewport_rows == 0 {
         return spans;
     }
-    let bottom_line_id = top_line_id + viewport_rows as u64 - 1;
-    for (record_index, &start) in prompt_line_ids.iter().enumerate() {
-        let end = match prompt_line_ids.get(record_index + 1) {
-            Some(next_start) => {
-                let Some(end) = next_start.checked_sub(1).filter(|end| *end >= start) else {
-                    continue; // 相邻 prompt 落在同一行:该块没有可见行。
-                };
-                end
-            }
-            None => bottom_line_id.max(start),
-        };
-        if end < top_line_id || start > bottom_line_id {
-            continue;
+    let bottom_line_id = top_line_id.saturating_add(viewport_rows as u64 - 1);
+    // At most the last block that starts at/before the viewport can intersect
+    // its top. Skip older retained history in logarithmic time, then stop once
+    // prompt starts pass the bottom.
+    let first_after_top = prompt_line_ids.partition_point(|start| *start <= top_line_id);
+    let first_candidate = first_after_top.saturating_sub(1);
+    for record_index in first_candidate..prompt_line_ids.len() {
+        let start = prompt_line_ids[record_index];
+        if start > bottom_line_id {
+            break;
         }
-        spans.push(VisibleBlockSpan {
+        if let Some(span) = visible_block_span(
             record_index,
-            first_row: (start.max(top_line_id) - top_line_id) as usize,
-            last_row: (end.min(bottom_line_id) - top_line_id) as usize,
-            starts_in_viewport: start >= top_line_id,
-        });
+            start,
+            prompt_line_ids.get(record_index + 1).copied(),
+            top_line_id,
+            viewport_rows,
+        ) {
+            spans.push(span);
+        }
     }
     spans
 }
@@ -902,10 +971,10 @@ mod tests {
             badge_text(BlockOutcome::Failed(130), Some(2_300)),
             Some("✗ exit:130 SIGINT · 2.3s".to_string())
         );
-        // Unreported exit: bare `?`, no exit badge.
+        // Unreported exit and commandless background output remain explicit.
         assert_eq!(
             badge_text(BlockOutcome::Unknown, Some(2_300)),
-            Some("?".to_string())
+            Some("? exit:?".to_string())
         );
         assert_eq!(
             badge_text(BlockOutcome::Running, Some(1_250)),
@@ -913,7 +982,10 @@ mod tests {
         );
         assert_eq!(badge_text(BlockOutcome::Running, None), None);
         assert_eq!(badge_text(BlockOutcome::Prompt, None), None);
-        assert_eq!(badge_text(BlockOutcome::Background, Some(10)), None);
+        assert_eq!(
+            badge_text(BlockOutcome::Background, Some(10)),
+            Some("↻ Background".to_string())
+        );
     }
 
     #[test]
@@ -944,12 +1016,14 @@ mod tests {
                     first_row: 0,
                     last_row: 2,
                     starts_in_viewport: true,
+                    ends_in_viewport: true,
                 },
                 VisibleBlockSpan {
                     record_index: 1,
                     first_row: 3,
                     last_row: 6,
                     starts_in_viewport: true,
+                    ends_in_viewport: true,
                 },
                 // 最后一个块一直延伸到 viewport 底部(live tail)。
                 VisibleBlockSpan {
@@ -957,6 +1031,7 @@ mod tests {
                     first_row: 7,
                     last_row: 9,
                     starts_in_viewport: true,
+                    ends_in_viewport: false,
                 },
             ]
         );
@@ -974,12 +1049,14 @@ mod tests {
                     first_row: 0,
                     last_row: 4,
                     starts_in_viewport: false,
+                    ends_in_viewport: true,
                 },
                 VisibleBlockSpan {
                     record_index: 1,
                     first_row: 5,
                     last_row: 9,
                     starts_in_viewport: true,
+                    ends_in_viewport: false,
                 },
                 // record 2 (line 120) 完全在 viewport 之下:跳过。
             ]
@@ -993,9 +1070,50 @@ mod tests {
                 first_row: 0,
                 last_row: 9,
                 starts_in_viewport: false,
+                ends_in_viewport: false,
             }]
         );
         assert!(visible_block_spans(&[10], 100, 0).is_empty());
+    }
+
+    #[test]
+    fn live_span_keeps_six_rows_grows_to_cursor_and_preserves_clip_state() {
+        assert_eq!(live_block_end_exclusive(100, 100), 106);
+        assert_eq!(live_block_end_exclusive(100, 108), 109);
+
+        // Idle input owns exactly the six-row visual floor when it fits.
+        assert_eq!(
+            visible_live_block_span(3, 100, 100, 100, 10),
+            Some(VisibleBlockSpan {
+                record_index: 3,
+                first_row: 0,
+                last_row: 5,
+                starts_in_viewport: true,
+                ends_in_viewport: true,
+            })
+        );
+        // Running output grows through the cursor row.
+        assert_eq!(
+            visible_live_block_span(3, 100, 108, 100, 12),
+            Some(VisibleBlockSpan {
+                record_index: 3,
+                first_row: 0,
+                last_row: 8,
+                starts_in_viewport: true,
+                ends_in_viewport: true,
+            })
+        );
+        // A scrolled/clipped intersection must not claim the real target end.
+        assert_eq!(
+            visible_live_block_span(3, 100, 108, 104, 4),
+            Some(VisibleBlockSpan {
+                record_index: 3,
+                first_row: 0,
+                last_row: 3,
+                starts_in_viewport: false,
+                ends_in_viewport: false,
+            })
+        );
     }
 
     #[test]
@@ -1020,12 +1138,14 @@ mod tests {
                     first_row: 0,
                     last_row: 1,
                     starts_in_viewport: true,
+                    ends_in_viewport: true,
                 },
                 VisibleBlockSpan {
                     record_index: 1,
                     first_row: 2,
                     last_row: 4,
                     starts_in_viewport: true,
+                    ends_in_viewport: false,
                 },
             ]
         );
