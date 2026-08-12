@@ -194,6 +194,51 @@ impl WorktreeService {
         &self.archive_root
     }
 
+    /// Revalidate an existing task worktree before executing trusted task
+    /// automation in it. Path containment alone is insufficient: an attacker
+    /// could replace a removed worktree with an ordinary directory at the same
+    /// canonical path. This proves Git still recognizes the exact top-level,
+    /// that it shares the source repository's common directory, and that the
+    /// task's branch identity has not changed.
+    pub fn verify_active_task_worktree(
+        &self,
+        repository: impl AsRef<Path>,
+        worktree: impl AsRef<Path>,
+        expected_branch: &str,
+    ) -> Result<(), WorktreeError> {
+        self.verify_active_task_worktree_through(
+            repository,
+            worktree.as_ref(),
+            worktree.as_ref(),
+            expected_branch,
+        )
+    }
+
+    /// Descriptor-anchored form used by validation. `access_path` may be a
+    /// Linux `/proc/self/fd/N` directory kept open by the caller; Git then
+    /// inspects the same directory inode that the validation child will enter,
+    /// not a pathname that can be swapped between preflight and spawn.
+    pub fn verify_active_task_worktree_through(
+        &self,
+        repository: impl AsRef<Path>,
+        worktree: impl AsRef<Path>,
+        access_path: impl AsRef<Path>,
+        expected_branch: &str,
+    ) -> Result<(), WorktreeError> {
+        validate_branch_text(expected_branch)?;
+        let repository = self.validate_repository(repository.as_ref())?;
+        let worktree =
+            self.validate_managed_existing(worktree.as_ref(), ManagedLocation::Active)?;
+        self.verify_registered_worktree_through(&repository, &worktree, access_path.as_ref())?;
+        let branch = self.symbolic_branch(access_path.as_ref())?;
+        if branch != expected_branch {
+            return Err(WorktreeError::UnsafePath(format!(
+                "managed worktree branch {branch:?} does not match task branch {expected_branch:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Resolve a source-command cwd (including a repository subdirectory) to
     /// its canonical Git top-level without consulting PATH or inherited Git
     /// configuration. Mutating lifecycle methods still require this exact root
@@ -494,23 +539,32 @@ impl WorktreeService {
         repository: &Path,
         worktree: &Path,
     ) -> Result<(), WorktreeError> {
+        self.verify_registered_worktree_through(repository, worktree, worktree)
+    }
+
+    fn verify_registered_worktree_through(
+        &self,
+        repository: &Path,
+        expected_worktree: &Path,
+        access_path: &Path,
+    ) -> Result<(), WorktreeError> {
         let top = self.git_text(
-            git_command(&self.git, worktree, ["rev-parse", "--show-toplevel"]),
+            git_command(&self.git, access_path, ["rev-parse", "--show-toplevel"]),
             "git rev-parse managed worktree",
         )?;
         let top = canonical_exact(Path::new(&top), "managed worktree top-level")?;
-        if top != worktree {
+        if top != expected_worktree {
             return Err(WorktreeError::UnsafePath(format!(
                 "{} is not an exact worktree top-level",
-                worktree.display()
+                expected_worktree.display()
             )));
         }
         let repository_common = self.git_common_directory(repository)?;
-        let worktree_common = self.git_common_directory(worktree)?;
+        let worktree_common = self.git_common_directory(access_path)?;
         if repository_common != worktree_common {
             return Err(WorktreeError::UnsafeRepository(format!(
                 "managed path {} belongs to a different Git repository",
-                worktree.display()
+                expected_worktree.display()
             )));
         }
         Ok(())

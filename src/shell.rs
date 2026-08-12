@@ -296,6 +296,9 @@ pub struct ShellSession {
     /// point never reached an interactive prompt, so the app must report the
     /// failure instead of treating it as the user typing `exit`.
     started_at: std::time::Instant,
+    /// Absolute shell executable resolved when an interactive session was
+    /// created. One-shot command sessions have no source-shell identity.
+    shell_program: Option<String>,
 }
 
 impl ShellSession {
@@ -322,8 +325,45 @@ impl ShellSession {
         command_argv: Option<&[String]>,
         repaint_ctx: egui::Context,
     ) -> std::result::Result<Self, String> {
+        Self::new_with_pinned_cwd(
+            cols,
+            rows,
+            cwd,
+            session_id,
+            configured_shell,
+            command_argv,
+            None,
+            repaint_ctx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_pinned_cwd(
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+        configured_shell: Option<&str>,
+        command_argv: Option<&[String]>,
+        pinned_cwd: Option<crate::pty::PinnedDirectory>,
+        repaint_ctx: egui::Context,
+    ) -> std::result::Result<Self, String> {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-        match Pty::new_with_cwd(cols, rows, cwd, session_id, configured_shell, command_argv) {
+        let shell_program = if command_argv.is_none() {
+            Some(crate::pty::resolved_shell(configured_shell).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        let spawn_shell = shell_program.as_deref().or(configured_shell);
+        match Pty::new_with_pinned_cwd(
+            cols,
+            rows,
+            cwd,
+            session_id,
+            spawn_shell,
+            command_argv,
+            pinned_cwd,
+        ) {
             Ok(pty) => {
                 // 在把 pty 放入 Arc<Mutex> 前获取 child_pid
                 let child_pid = pty.get_child_pid();
@@ -402,6 +442,7 @@ impl ShellSession {
                     shutdown,
                     write_tx,
                     started_at: std::time::Instant::now(),
+                    shell_program,
                 })
             }
             Err(e) => Err(format!("Failed to create shell session: {}", e)),
@@ -416,6 +457,10 @@ impl ShellSession {
     /// 子进程启动至今的时长。用于区分"用户主动 exit"与"shell 根本没起来"。
     pub fn uptime(&self) -> std::time::Duration {
         self.started_at.elapsed()
+    }
+
+    pub fn shell_program(&self) -> Option<&str> {
+        self.shell_program.as_deref()
     }
 
     fn send_event(

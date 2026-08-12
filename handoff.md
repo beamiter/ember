@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-12
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,23 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- Agent tasks that are ready for review can now re-run their originating
+  semantic command as a separate validation terminal inside the isolated
+  worktree. Validation requires exact, untruncated, single-line command
+  metadata; maps a canonical source-repository subdirectory to the matching
+  canonical worktree directory; and rejects missing directories, control or
+  bidi-spoofing text, and symlink escapes before spawn. Agent and validation
+  PTYs have distinct stable roles and exit reducers, so failed, inconclusive,
+  or manually cancelled validation never turns into an Agent runtime failure.
+  The Tasks card retains attempt/result state and exposes validation output,
+  rerun, diff review, and an explicit pass-gated Mark complete action. Spawn is
+  gated before PTY creation while a native event stream is active; resuming
+  Agent work invalidates an older result; and validation uses non-login shell
+  command mode plus no-rc/scrubbed startup hooks. The actual source-session
+  shell identity is captured before config hot reloads, Git registration and
+  branch identity are rechecked, and a descriptor-pinned cwd is carried from
+  preflight to child `fchdir` to close pathname replacement races.
 
 - `keybindings.toml` no longer has an `exists()`/path-reopen race. It is opened
   once through Ember's no-follow, nonblocking descriptor boundary, checked as

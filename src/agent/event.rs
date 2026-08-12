@@ -372,6 +372,7 @@ pub enum AgentEventError {
     },
     NoActiveStream(TaskId),
     StreamAlreadyActive(TaskId),
+    ValidationActive(TaskId),
     TerminalSessionBound(TaskId),
     SessionMismatch(TaskId),
     ProviderMismatch {
@@ -425,6 +426,10 @@ impl fmt::Display for AgentEventError {
             Self::StreamAlreadyActive(task_id) => write!(
                 formatter,
                 "task {task_id} already has an active native Agent event stream"
+            ),
+            Self::ValidationActive(task_id) => write!(
+                formatter,
+                "task {task_id} cannot resume Agent work while validation is running"
             ),
             Self::TerminalSessionBound(task_id) => write!(
                 formatter,

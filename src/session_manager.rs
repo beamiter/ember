@@ -729,7 +729,54 @@ impl SessionManager {
             scrollback_lines,
             Some(argv),
             Some(cwd),
+            None,
         )
+    }
+
+    /// Validation-only spawn path. The directory descriptor was opened and
+    /// Git-verified during preflight, then moved intact to the child for
+    /// `fchdir`; no mutable pathname is re-resolved at process start.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub(crate) fn new_validation_session_in_cwd(
+        &mut self,
+        name: String,
+        argv: Vec<String>,
+        cwd: &Path,
+        pinned_cwd: crate::pty::PinnedDirectory,
+        cols: usize,
+        rows: usize,
+        scrollback_lines: usize,
+    ) -> Result<CreatedSession, String> {
+        if !cwd.is_absolute() {
+            return Err("validation working directory must be absolute".to_string());
+        }
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| "validation working directory is not valid UTF-8".to_string())?;
+        self.try_insert_session(
+            Some(name),
+            None,
+            cols,
+            rows,
+            scrollback_lines,
+            Some(argv),
+            Some(cwd),
+            Some(pinned_cwd),
+        )
+    }
+
+    /// Resolve an argv for re-running a task's exact validation command with
+    /// the absolute shell identity captured from its source session.
+    /// Resolution happens before a session is inserted, so a missing or
+    /// invalid shell cannot leave behind a misleading empty validation tab.
+    pub fn validation_command_argv(
+        &self,
+        source_shell: &str,
+        command: &str,
+    ) -> Result<Vec<String>, String> {
+        crate::pty::validation_command_argv(Some(source_shell), command)
+            .map_err(|error| error.to_string())
     }
 
     /// Freeze an exited one-shot command in place so its terminal transcript
@@ -783,6 +830,7 @@ impl SessionManager {
             scrollback_lines,
             command_argv,
             cwd.as_deref(),
+            None,
         ) {
             Ok(created) => created.session_index,
             Err(error) => {
@@ -802,6 +850,7 @@ impl SessionManager {
         scrollback_lines: usize,
         command_argv: Option<Vec<String>>,
         cwd: Option<&str>,
+        pinned_cwd: Option<crate::pty::PinnedDirectory>,
     ) -> Result<CreatedSession, String> {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
         let insert_index = self.active_index + 1;
@@ -811,13 +860,14 @@ impl SessionManager {
         // 在启动 shell 前分配稳定 ID；jsh 的 --session、tab 路由和执行
         // journal 必须从第一条输出起使用同一个值。
         let session_id = crate::session::generate_session_id();
-        let shell = ShellSession::new_with_cwd(
+        let shell = ShellSession::new_with_pinned_cwd(
             cols,
             rows,
             cwd,
             Some(&session_id),
             self.configured_shell.as_deref(),
             command_argv.as_deref(),
+            pinned_cwd,
             self.repaint_ctx.clone(),
         )?;
         let mut terminal = TerminalState::new(cols, rows);
@@ -1204,6 +1254,10 @@ mod tests {
             repaint.clone(),
         )
         .expect("interactive fixture shell starts");
+        assert_eq!(
+            std::fs::canonicalize(first_shell.shell_program().unwrap()).unwrap(),
+            std::fs::canonicalize("/bin/sh").unwrap()
+        );
         let first = Session::new_with_session_id(
             "interactive".to_string(),
             Vec::new(),
@@ -1212,6 +1266,18 @@ mod tests {
             first_id.clone(),
         );
         let mut manager = SessionManager::new(first, repaint, Some("/bad/configured/shell".into()));
+        let source_shell = manager.sessions()[0]
+            .shell
+            .shell_program()
+            .unwrap()
+            .to_string();
+        let validation_argv = manager
+            .validation_command_argv(&source_shell, "exit 0")
+            .expect("validation uses the captured source shell, not the hot configuration");
+        assert_eq!(
+            std::fs::canonicalize(&validation_argv[0]).unwrap(),
+            std::fs::canonicalize("/bin/sh").unwrap()
+        );
 
         let created = manager
             .new_command_session_in_cwd(

@@ -12,6 +12,7 @@ pub mod drivers;
 pub mod event;
 pub mod launcher;
 pub mod task;
+pub mod validation;
 pub mod worktree;
 
 pub use context::{ContextError, SemanticCommandContext};
@@ -29,7 +30,10 @@ pub use event::{
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
 pub use task::{
     AgentProvider, AgentTask, NewTask, TaskError, TaskId, TaskManager, TaskRuntimeKind, TaskSource,
-    TaskStatus,
+    TaskStatus, TaskTerminalRole, TaskValidationState, TaskValidationStatus,
+};
+pub use validation::{
+    prepare_task_validation, PreparedTaskValidation, TaskValidationError, TaskValidationPath,
 };
 pub use worktree::{
     CreateWorktreeRequest, ManagedWorktree, RetireOutcome, RetirePolicy, WorktreeError,

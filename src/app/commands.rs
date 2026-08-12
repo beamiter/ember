@@ -1016,6 +1016,7 @@ impl TerminalApp {
                     source_session_id: target.session_id.clone(),
                     source_execution_id: target.execution_id.clone(),
                     source_sequence: record.sequence,
+                    source_shell: session.shell.shell_program().map(str::to_string),
                     command: record.command.clone(),
                     command_exact: record.command_exact,
                     command_truncated: record.command_truncated,
@@ -2816,7 +2817,7 @@ impl TerminalApp {
                 session.purpose == crate::session::SessionPurpose::RetainedCommand
             })
         {
-            self.set_status("Exited Agent terminals are read-only");
+            self.set_status("Exited task terminals are read-only");
             return;
         }
         let direct_input_blocked = self.direct_input_is_blocked_for_session(&target.session_id);
@@ -3952,6 +3953,7 @@ mod tests {
             // Terminal prompt sequence is deliberately unrelated to the
             // journal's accepted-command sequence.
             source_sequence: 42,
+            source_shell: Some("/bin/bash".to_owned()),
             command: Some("printf hi".to_owned()),
             command_exact: true,
             command_truncated: false,

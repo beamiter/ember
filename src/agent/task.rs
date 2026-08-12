@@ -80,6 +80,64 @@ pub enum TaskStatus {
     Archived,
 }
 
+/// Result of the most recent task-validation attempt.
+///
+/// Validation is deliberately orthogonal to [`TaskStatus`]: a successful
+/// validation makes a task safer to accept, but never accepts it on the
+/// user's behalf.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskValidationStatus {
+    #[default]
+    NotRun,
+    Running,
+    Passed,
+    Failed,
+    Inconclusive,
+    Cancelled,
+}
+
+impl TaskValidationStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotRun => "Not run",
+            Self::Running => "Running",
+            Self::Passed => "Passed",
+            Self::Failed => "Failed",
+            Self::Inconclusive => "Needs review",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Whether a finished validation attempt needs a human decision.
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::Failed | Self::Inconclusive | Self::Cancelled)
+    }
+}
+
+/// Serializable summary of the most recent validation attempt.
+///
+/// The terminal session is a stable jsh ID, not a tab or pane index. Keeping
+/// the attempt counter with task state lets later execution records
+/// correlate results even after a validation terminal has disappeared.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskValidationState {
+    pub status: TaskValidationStatus,
+    pub attempt: u64,
+    pub terminal_session_id: Option<String>,
+    pub exit_code: Option<i32>,
+    pub status_detail: Option<String>,
+}
+
+/// Why a terminal session belongs to a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTerminalRole {
+    Agent,
+    Validation,
+}
+
 /// Runtime family selected for a task. This choice survives an individual
 /// stream/process ending so a task cannot silently switch authority models.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +234,10 @@ pub struct AgentTask {
     /// provider session identities.
     #[serde(alias = "agent_session_id")]
     pub terminal_session_id: Option<String>,
+    /// The latest validation attempt, if any. Older serialized tasks restore
+    /// as [`TaskValidationStatus::NotRun`].
+    #[serde(default)]
+    pub validation: TaskValidationState,
     pub exit_code: Option<i32>,
     pub status_detail: Option<String>,
     pub created_at_ms: u64,
@@ -184,7 +246,12 @@ pub struct AgentTask {
 
 impl AgentTask {
     pub fn needs_attention(&self) -> bool {
-        self.status.needs_attention()
+        // While validation is running, ReadyForReview is only an internal
+        // prerequisite and should not pull the task to the user prematurely.
+        if self.validation.status == TaskValidationStatus::Running {
+            return false;
+        }
+        self.status.needs_attention() || self.validation.status.needs_attention()
     }
 }
 
@@ -203,6 +270,22 @@ pub enum TaskError {
     CannotBindTerminalInState {
         task_id: TaskId,
         status: TaskStatus,
+    },
+    CannotBindValidationInState {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    ValidationAlreadyRunning {
+        task_id: TaskId,
+        session_id: String,
+    },
+    ValidationAttemptExhausted(TaskId),
+    NativeEventStreamActiveDuringValidation(TaskId),
+    CompletionRequiresValidation(TaskId),
+    CannotCompleteAfterValidation {
+        task_id: TaskId,
+        status: TaskStatus,
+        validation_status: TaskValidationStatus,
     },
     CannotLeaveTerminalState {
         task_id: TaskId,
@@ -258,6 +341,40 @@ impl fmt::Display for TaskError {
                 "cannot bind an Agent terminal to task {task_id} in state {}",
                 status.label()
             ),
+            Self::CannotBindValidationInState { task_id, status } => write!(
+                formatter,
+                "cannot bind a validation terminal to task {task_id} in state {}",
+                status.label()
+            ),
+            Self::ValidationAlreadyRunning {
+                task_id,
+                session_id,
+            } => write!(
+                formatter,
+                "task {task_id} validation is already running in session {session_id}"
+            ),
+            Self::ValidationAttemptExhausted(task_id) => write!(
+                formatter,
+                "task {task_id} validation attempt counter is exhausted"
+            ),
+            Self::NativeEventStreamActiveDuringValidation(task_id) => write!(
+                formatter,
+                "task {task_id} still has an active native Agent event stream"
+            ),
+            Self::CompletionRequiresValidation(task_id) => write!(
+                formatter,
+                "task {task_id} can only be completed through its latest passing validation"
+            ),
+            Self::CannotCompleteAfterValidation {
+                task_id,
+                status,
+                validation_status,
+            } => write!(
+                formatter,
+                "cannot complete task {task_id} in state {} after validation {}",
+                status.label(),
+                validation_status.label()
+            ),
             Self::CannotLeaveTerminalState {
                 task_id,
                 current,
@@ -302,6 +419,7 @@ pub struct TaskManager {
     tasks: Vec<AgentTask>,
     task_indices: HashMap<TaskId, usize>,
     tasks_by_terminal_session: HashMap<String, TaskId>,
+    tasks_by_validation_session: HashMap<String, TaskId>,
     native_event_streams: HashMap<TaskId, NativeEventStreamState>,
 }
 
@@ -338,6 +456,7 @@ impl TaskManager {
             source_context: new_task.source_context,
             runtime_kind: TaskRuntimeKind::Unassigned,
             terminal_session_id: None,
+            validation: TaskValidationState::default(),
             exit_code: None,
             status_detail: None,
             created_at_ms: now,
@@ -359,9 +478,46 @@ impl TaskManager {
     }
 
     pub fn task_for_terminal_session(&self, session_id: &str) -> Option<&AgentTask> {
+        self.task_and_role_for_terminal_session(session_id)
+            .map(|(task, _)| task)
+    }
+
+    /// Resolve both stable task identity and the terminal's purpose. This is
+    /// the role-aware form UI/session-close paths should prefer when their
+    /// copy or behavior differs for Agent and validation terminals.
+    pub fn task_and_role_for_terminal_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(&AgentTask, TaskTerminalRole)> {
+        if let Some(task_id) = self.tasks_by_validation_session.get(session_id) {
+            return self
+                .get(*task_id)
+                .map(|task| (task, TaskTerminalRole::Validation));
+        }
         self.tasks_by_terminal_session
             .get(session_id)
             .and_then(|task_id| self.get(*task_id))
+            .map(|task| (task, TaskTerminalRole::Agent))
+    }
+
+    pub fn terminal_role_for_session(&self, session_id: &str) -> Option<TaskTerminalRole> {
+        self.task_and_role_for_terminal_session(session_id)
+            .map(|(_, role)| role)
+    }
+
+    pub fn has_active_agent_event_stream(&self, task_id: TaskId) -> bool {
+        self.native_event_streams.contains_key(&task_id)
+    }
+
+    pub fn attention_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.status != TaskStatus::Archived
+                    && task.needs_attention()
+                    && !self.has_active_agent_event_stream(task.id)
+            })
+            .count()
     }
 
     /// Start a correlated event stream and atomically select the native
@@ -456,13 +612,15 @@ impl TaskManager {
         session_id: NativeAgentSessionId,
         replacing: bool,
     ) -> Result<AgentEventStream, AgentEventError> {
-        let (status, runtime_kind, terminal_bound) = self
+        let (status, runtime_kind, terminal_bound, validation_status, validation_session) = self
             .get(task_id)
             .map(|task| {
                 (
                     task.status,
                     task.runtime_kind,
                     task.terminal_session_id.is_some(),
+                    task.validation.status,
+                    task.validation.terminal_session_id.clone(),
                 )
             })
             .ok_or(AgentEventError::UnknownTask(task_id))?;
@@ -472,15 +630,33 @@ impl TaskManager {
         if terminal_bound || runtime_kind == TaskRuntimeKind::Terminal {
             return Err(AgentEventError::TerminalSessionBound(task_id));
         }
+        if validation_status == TaskValidationStatus::Running {
+            return Err(AgentEventError::ValidationActive(task_id));
+        }
         let epoch = super::event::next_agent_event_epoch()?;
         let stream = AgentEventStream::new(task_id, session_id, epoch);
-        if !replacing && runtime_kind == TaskRuntimeKind::Unassigned {
+        if !replacing {
+            if let Some(validation_session) = validation_session.as_deref() {
+                self.tasks_by_validation_session.remove(validation_session);
+            }
             let task = self
                 .task_mut(task_id)
                 .map_err(|_| AgentEventError::UnknownTask(task_id))?;
-            task.runtime_kind = TaskRuntimeKind::Native;
-            task.status = TaskStatus::Starting;
-            task.status_detail = None;
+            if runtime_kind == TaskRuntimeKind::Unassigned {
+                task.runtime_kind = TaskRuntimeKind::Native;
+                task.status = TaskStatus::Starting;
+                task.status_detail = None;
+            }
+            if task.validation != TaskValidationState::default() {
+                let attempt = task.validation.attempt;
+                task.validation = TaskValidationState {
+                    attempt,
+                    status_detail: Some(
+                        "Agent work resumed; the previous validation result is stale".to_string(),
+                    ),
+                    ..TaskValidationState::default()
+                };
+            }
             task.updated_at_ms = unix_time_ms();
         }
         let active_turn = if replacing {
@@ -653,6 +829,12 @@ impl TaskManager {
         if !crate::session::is_valid_jsh_session_id(&session_id) {
             return Err(TaskError::InvalidTerminalSessionId);
         }
+        if let Some(existing_task_id) = self.tasks_by_validation_session.get(&session_id).copied() {
+            return Err(TaskError::TerminalSessionAlreadyBound {
+                session_id,
+                task_id: existing_task_id,
+            });
+        }
         if let Some(existing_task_id) = self.tasks_by_terminal_session.get(&session_id).copied() {
             if existing_task_id == task_id {
                 return Ok(());
@@ -690,6 +872,86 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Bind a freshly spawned validation PTY to a task awaiting review.
+    ///
+    /// A completed attempt may be replaced explicitly. The old session lookup
+    /// is removed only after every check for the new binding succeeds, so a
+    /// rejected re-run leaves the previous result and correlation intact.
+    pub fn bind_validation_session(
+        &mut self,
+        task_id: TaskId,
+        session_id: String,
+    ) -> Result<(), TaskError> {
+        if !crate::session::is_valid_jsh_session_id(&session_id) {
+            return Err(TaskError::InvalidTerminalSessionId);
+        }
+        let next_attempt = self.next_validation_attempt(task_id)?;
+        let old_session_id = self
+            .get(task_id)
+            .ok_or(TaskError::UnknownTask(task_id))?
+            .validation
+            .terminal_session_id
+            .clone();
+
+        if let Some(existing_task_id) = self.tasks_by_terminal_session.get(&session_id).copied() {
+            return Err(TaskError::TerminalSessionAlreadyBound {
+                session_id,
+                task_id: existing_task_id,
+            });
+        }
+        if let Some(existing_task_id) = self.tasks_by_validation_session.get(&session_id).copied() {
+            return Err(TaskError::TerminalSessionAlreadyBound {
+                session_id,
+                task_id: existing_task_id,
+            });
+        }
+
+        if let Some(old_session_id) = old_session_id.as_deref() {
+            self.tasks_by_validation_session.remove(old_session_id);
+        }
+        let task = self.task_mut(task_id)?;
+        task.validation = TaskValidationState {
+            status: TaskValidationStatus::Running,
+            attempt: next_attempt,
+            terminal_session_id: Some(session_id.clone()),
+            exit_code: None,
+            status_detail: None,
+        };
+        task.updated_at_ms = unix_time_ms();
+        self.tasks_by_validation_session.insert(session_id, task_id);
+        Ok(())
+    }
+
+    /// Read-only eligibility check used before resolving a shell or spawning
+    /// a PTY. Binding repeats every check after spawn so future concurrent
+    /// callers cannot turn this advisory result into authority.
+    pub fn next_validation_attempt(&self, task_id: TaskId) -> Result<u64, TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActiveDuringValidation(task_id));
+        }
+        let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
+        if task.status != TaskStatus::ReadyForReview {
+            return Err(TaskError::CannotBindValidationInState {
+                task_id,
+                status: task.status,
+            });
+        }
+        if task.validation.status == TaskValidationStatus::Running {
+            return Err(TaskError::ValidationAlreadyRunning {
+                task_id,
+                session_id: task
+                    .validation
+                    .terminal_session_id
+                    .clone()
+                    .unwrap_or_default(),
+            });
+        }
+        task.validation
+            .attempt
+            .checked_add(1)
+            .ok_or(TaskError::ValidationAttemptExhausted(task_id))
+    }
+
     pub fn update_status(
         &mut self,
         task_id: TaskId,
@@ -699,14 +961,53 @@ impl TaskManager {
         if self.native_event_streams.contains_key(&task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
+        if status == TaskStatus::Completed {
+            return Err(TaskError::CompletionRequiresValidation(task_id));
+        }
+        let (current, validation_status, validation_session_id) = self
+            .get(task_id)
+            .map(|task| {
+                (
+                    task.status,
+                    task.validation.status,
+                    task.validation.terminal_session_id.clone(),
+                )
+            })
+            .ok_or(TaskError::UnknownTask(task_id))?;
+        if current.is_terminal() && current != status {
+            return Err(TaskError::CannotLeaveTerminalState {
+                task_id,
+                current,
+                requested: status,
+            });
+        }
+        if validation_status == TaskValidationStatus::Running && status != current {
+            return Err(TaskError::ValidationAlreadyRunning {
+                task_id,
+                session_id: validation_session_id.unwrap_or_default(),
+            });
+        }
+        let invalidate_validation = status.is_running()
+            && !matches!(
+                validation_status,
+                TaskValidationStatus::NotRun | TaskValidationStatus::Running
+            );
+        if invalidate_validation {
+            if let Some(session_id) = validation_session_id.as_deref() {
+                self.tasks_by_validation_session.remove(session_id);
+            }
+        }
         {
             let task = self.task_mut(task_id)?;
-            if task.status.is_terminal() && task.status != status {
-                return Err(TaskError::CannotLeaveTerminalState {
-                    task_id,
-                    current: task.status,
-                    requested: status,
-                });
+            if invalidate_validation {
+                let attempt = task.validation.attempt;
+                task.validation = TaskValidationState {
+                    attempt,
+                    status_detail: Some(
+                        "Task work resumed; the previous validation result is stale".to_string(),
+                    ),
+                    ..TaskValidationState::default()
+                };
             }
             task.status = status;
             task.status_detail = super::event::bounded_event_detail(detail);
@@ -726,6 +1027,31 @@ impl TaskManager {
         session_id: &str,
         exit_code: Option<i32>,
     ) -> Option<TaskId> {
+        if let Some(task_id) = self.tasks_by_validation_session.get(session_id).copied() {
+            let task = self.task_mut(task_id).ok()?;
+            if task.validation.status != TaskValidationStatus::Running {
+                return Some(task_id);
+            }
+            task.validation.exit_code = exit_code;
+            match exit_code {
+                Some(0) => {
+                    task.validation.status = TaskValidationStatus::Passed;
+                    task.validation.status_detail = Some("Validation passed".to_string());
+                }
+                Some(code) => {
+                    task.validation.status = TaskValidationStatus::Failed;
+                    task.validation.status_detail =
+                        Some(format!("Validation process exited with code {code}"));
+                }
+                None => {
+                    task.validation.status = TaskValidationStatus::Inconclusive;
+                    task.validation.status_detail =
+                        Some("Validation ended without an authoritative exit status".to_string());
+                }
+            }
+            task.updated_at_ms = unix_time_ms();
+            return Some(task_id);
+        }
         let task_id = self.tasks_by_terminal_session.get(session_id).copied()?;
         let task = self.task_mut(task_id).ok()?;
         if matches!(
@@ -762,6 +1088,17 @@ impl TaskManager {
     /// observed. This is not a process failure and must not leave the task
     /// looking perpetually active in the dashboard.
     pub fn handle_terminal_session_closed(&mut self, session_id: &str) -> Option<TaskId> {
+        if let Some(task_id) = self.tasks_by_validation_session.get(session_id).copied() {
+            let task = self.task_mut(task_id).ok()?;
+            if task.validation.status != TaskValidationStatus::Running {
+                return Some(task_id);
+            }
+            task.validation.status = TaskValidationStatus::Cancelled;
+            task.validation.exit_code = None;
+            task.validation.status_detail = Some("Validation terminal was closed".to_string());
+            task.updated_at_ms = unix_time_ms();
+            return Some(task_id);
+        }
         let task_id = self.tasks_by_terminal_session.get(session_id).copied()?;
         let task = self.task_mut(task_id).ok()?;
         if matches!(
@@ -786,10 +1123,31 @@ impl TaskManager {
             return Err(TaskError::CannotArchiveRunning(task_id));
         }
         let task = self.task_mut(task_id)?;
-        if task.status.is_running() {
+        if task.status.is_running() || task.validation.status == TaskValidationStatus::Running {
             return Err(TaskError::CannotArchiveRunning(task_id));
         }
         task.status = TaskStatus::Archived;
+        task.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
+    /// Accept a reviewed task only after its latest validation passed.
+    pub fn complete_after_validation(&mut self, task_id: TaskId) -> Result<(), TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActive(task_id));
+        }
+        let task = self.task_mut(task_id)?;
+        if task.status != TaskStatus::ReadyForReview
+            || task.validation.status != TaskValidationStatus::Passed
+        {
+            return Err(TaskError::CannotCompleteAfterValidation {
+                task_id,
+                status: task.status,
+                validation_status: task.validation.status,
+            });
+        }
+        task.status = TaskStatus::Completed;
+        task.status_detail = Some("Validation passed; task accepted".to_string());
         task.updated_at_ms = unix_time_ms();
         Ok(())
     }
@@ -873,6 +1231,7 @@ mod tests {
                 source_session_id: "source-session".to_string(),
                 source_execution_id: "execution-7".to_string(),
                 source_sequence: 7,
+                source_shell: Some("/bin/bash".to_string()),
                 command: Some("cargo test".to_string()),
                 command_exact: true,
                 command_truncated: false,
@@ -1011,6 +1370,384 @@ mod tests {
                 task_id: first,
             })
         );
+    }
+
+    #[test]
+    fn validation_state_defaults_and_serializes_compatibly() {
+        assert_eq!(
+            TaskValidationState::default().status,
+            TaskValidationStatus::NotRun
+        );
+        assert_eq!(TaskValidationStatus::Running.label(), "Running");
+        assert!(!TaskValidationStatus::Passed.needs_attention());
+        assert!(TaskValidationStatus::Failed.needs_attention());
+        assert_eq!(TaskValidationStatus::Inconclusive.label(), "Needs review");
+        assert!(TaskValidationStatus::Inconclusive.needs_attention());
+
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("legacy validation state")).unwrap();
+        let serialized = serde_json::to_value(manager.get(id).unwrap()).unwrap();
+        let mut object = serialized.as_object().unwrap().clone();
+        object.remove("validation");
+        let restored: AgentTask = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(restored.validation, TaskValidationState::default());
+    }
+
+    #[test]
+    fn validation_passes_without_accepting_task_and_can_then_complete() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("validate success")).unwrap();
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-success".to_string())
+            .unwrap();
+
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.validation.status, TaskValidationStatus::Running);
+        assert_eq!(task.validation.attempt, 1);
+        assert!(!task.needs_attention());
+        assert_eq!(
+            manager.terminal_role_for_session("validation-success"),
+            Some(TaskTerminalRole::Validation)
+        );
+        assert_eq!(
+            manager
+                .task_for_terminal_session("validation-success")
+                .map(|task| task.id),
+            Some(id)
+        );
+
+        assert_eq!(
+            manager.handle_terminal_session_exit("validation-success", Some(0)),
+            Some(id)
+        );
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::ReadyForReview);
+        assert_eq!(task.validation.status, TaskValidationStatus::Passed);
+        assert_eq!(task.validation.exit_code, Some(0));
+        assert!(task.needs_attention());
+
+        manager.complete_after_validation(id).unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn validation_failure_and_close_are_recorded_without_changing_task_status() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("validate failure")).unwrap();
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-failure".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-failure", Some(9));
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::ReadyForReview);
+        assert_eq!(task.validation.status, TaskValidationStatus::Failed);
+        assert_eq!(task.validation.exit_code, Some(9));
+        assert!(task
+            .validation
+            .status_detail
+            .as_deref()
+            .unwrap()
+            .contains('9'));
+
+        manager
+            .bind_validation_session(id, "validation-inconclusive".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-inconclusive", None);
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::ReadyForReview);
+        assert_eq!(task.validation.status, TaskValidationStatus::Inconclusive);
+        assert_eq!(task.validation.exit_code, None);
+
+        manager
+            .bind_validation_session(id, "validation-cancelled".to_string())
+            .unwrap();
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-cancelled"),
+            Some(id)
+        );
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::ReadyForReview);
+        assert_eq!(task.validation.status, TaskValidationStatus::Cancelled);
+        assert_eq!(task.validation.exit_code, None);
+
+        // A later child notification cannot overwrite the explicit close.
+        manager.handle_terminal_session_exit("validation-cancelled", Some(0));
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn validation_rerun_replaces_only_its_previous_stable_mapping() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("rerun validation")).unwrap();
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-one".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-one", Some(1));
+        assert_eq!(
+            manager.bind_validation_session(id, "validation-one".to_string()),
+            Err(TaskError::TerminalSessionAlreadyBound {
+                session_id: "validation-one".to_string(),
+                task_id: id,
+            })
+        );
+        manager
+            .bind_validation_session(id, "validation-two".to_string())
+            .unwrap();
+
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.validation.attempt, 2);
+        assert_eq!(
+            task.validation.terminal_session_id.as_deref(),
+            Some("validation-two")
+        );
+        assert!(manager
+            .task_for_terminal_session("validation-one")
+            .is_none());
+        assert_eq!(
+            manager
+                .task_for_terminal_session("validation-two")
+                .map(|task| task.id),
+            Some(id)
+        );
+        assert_eq!(
+            manager.handle_terminal_session_exit("validation-one", Some(0)),
+            None
+        );
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::Running
+        );
+    }
+
+    #[test]
+    fn validation_binding_checks_state_running_collisions_and_attempt_overflow() {
+        let mut manager = TaskManager::new();
+        let first = manager.create(new_task("validation gates")).unwrap();
+        assert_eq!(
+            manager.bind_validation_session(first, "too-early".to_string()),
+            Err(TaskError::CannotBindValidationInState {
+                task_id: first,
+                status: TaskStatus::Created,
+            })
+        );
+
+        manager
+            .update_status(first, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(first, "validation-running".to_string())
+            .unwrap();
+        assert_eq!(
+            manager.bind_validation_session(first, "validation-other".to_string()),
+            Err(TaskError::ValidationAlreadyRunning {
+                task_id: first,
+                session_id: "validation-running".to_string(),
+            })
+        );
+        assert_eq!(
+            manager.archive(first),
+            Err(TaskError::CannotArchiveRunning(first))
+        );
+
+        let mut second_task = new_task("validation collision");
+        second_task.worktree_path = PathBuf::from("/tasks/validation-collision");
+        second_task.branch = "ember/validation-collision".to_string();
+        let second = manager.create(second_task).unwrap();
+        assert_eq!(
+            manager.bind_terminal_session(second, "validation-running".to_string()),
+            Err(TaskError::TerminalSessionAlreadyBound {
+                session_id: "validation-running".to_string(),
+                task_id: first,
+            })
+        );
+        manager
+            .update_status(second, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        assert_eq!(
+            manager.bind_validation_session(second, "validation-running".to_string()),
+            Err(TaskError::TerminalSessionAlreadyBound {
+                session_id: "validation-running".to_string(),
+                task_id: first,
+            })
+        );
+
+        let mut agent_task = new_task("Agent session collision");
+        agent_task.worktree_path = PathBuf::from("/tasks/agent-session-collision");
+        agent_task.branch = "ember/agent-session-collision".to_string();
+        let agent_task = manager.create(agent_task).unwrap();
+        manager
+            .bind_terminal_session(agent_task, "agent-owned".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("agent-owned", Some(0));
+        assert_eq!(
+            manager.bind_validation_session(agent_task, "agent-owned".to_string()),
+            Err(TaskError::TerminalSessionAlreadyBound {
+                session_id: "agent-owned".to_string(),
+                task_id: agent_task,
+            })
+        );
+
+        manager.handle_terminal_session_exit("validation-running", Some(0));
+        manager.task_mut(first).unwrap().validation.attempt = u64::MAX;
+        assert_eq!(
+            manager.bind_validation_session(first, "attempt-overflow".to_string()),
+            Err(TaskError::ValidationAttemptExhausted(first))
+        );
+        assert_eq!(
+            manager
+                .task_for_terminal_session("validation-running")
+                .map(|task| task.id),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn validation_waits_until_a_native_event_stream_has_ended() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("native validation gate")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(turn), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert_eq!(manager.attention_count(), 0);
+        assert_eq!(
+            manager.next_validation_attempt(id),
+            Err(TaskError::NativeEventStreamActiveDuringValidation(id))
+        );
+        assert_eq!(
+            manager.bind_validation_session(id, "validation-too-soon".to_string()),
+            Err(TaskError::NativeEventStreamActiveDuringValidation(id))
+        );
+
+        manager
+            .apply_agent_event(stream.event(
+                4,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Clean,
+                },
+                None,
+            ))
+            .unwrap();
+        assert_eq!(manager.attention_count(), 1);
+        manager
+            .bind_validation_session(id, "validation-after-stop".to_string())
+            .unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::Running
+        );
+        assert_eq!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::ValidationActive(id))
+        );
+    }
+
+    #[test]
+    fn resuming_native_work_invalidates_the_previous_validation_result() {
+        let mut manager = TaskManager::new();
+        let id = manager
+            .create(new_task("invalidate stale validation"))
+            .unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                4,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Clean,
+                },
+                None,
+            ))
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-before-resume".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-before-resume", Some(0));
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::Passed
+        );
+
+        manager.start_agent_event_stream(id).unwrap();
+
+        let validation = &manager.get(id).unwrap().validation;
+        assert_eq!(validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(validation.attempt, 1);
+        assert!(validation.terminal_session_id.is_none());
+        assert!(validation
+            .status_detail
+            .as_deref()
+            .unwrap()
+            .contains("stale"));
+        assert!(manager
+            .task_for_terminal_session("validation-before-resume")
+            .is_none());
+        assert_eq!(
+            manager.complete_after_validation(id),
+            Err(TaskError::NativeEventStreamActive(id))
+        );
+    }
+
+    #[test]
+    fn generic_work_resume_invalidates_validation_and_cannot_bypass_completion() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("generic validation gate")).unwrap();
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-generic".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-generic", Some(0));
+
+        assert_eq!(
+            manager.update_status(id, TaskStatus::Completed, None),
+            Err(TaskError::CompletionRequiresValidation(id))
+        );
+        manager
+            .update_status(id, TaskStatus::Working, Some("more work".to_string()))
+            .unwrap();
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(task.validation.attempt, 1);
+        assert!(task
+            .validation
+            .status_detail
+            .as_deref()
+            .unwrap()
+            .contains("stale"));
+        assert!(manager
+            .task_for_terminal_session("validation-generic")
+            .is_none());
     }
 
     #[test]
@@ -1727,9 +2464,15 @@ mod tests {
                 None,
             ))
             .unwrap();
+        assert_eq!(
+            manager.update_status(id, TaskStatus::Completed, Some("accepted".into())),
+            Err(TaskError::CompletionRequiresValidation(id))
+        );
         manager
-            .update_status(id, TaskStatus::Completed, Some("accepted".into()))
+            .bind_validation_session(id, "validation-accepted".to_string())
             .unwrap();
+        manager.handle_terminal_session_exit("validation-accepted", Some(0));
+        manager.complete_after_validation(id).unwrap();
         assert!(matches!(
             manager.apply_agent_event(stream.event(
                 6,
@@ -1743,7 +2486,10 @@ mod tests {
         ));
         let task = manager.get(id).unwrap();
         assert_eq!(task.status, TaskStatus::Completed);
-        assert_eq!(task.status_detail.as_deref(), Some("accepted"));
+        assert_eq!(
+            task.status_detail.as_deref(),
+            Some("Validation passed; task accepted")
+        );
         assert!(matches!(
             manager.start_agent_event_stream(id),
             Err(AgentEventError::TerminalState { .. })

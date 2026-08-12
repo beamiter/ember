@@ -28,7 +28,9 @@ claimed.
   actions. Agent tasks retain the selected command's stable source identity,
   bounded C..D rendered-output snapshot and reported cwd, keep every proposed
   command behind the existing approval/foreground-PTY gates, and can open a
-  bounded native Git diff review surface
+  bounded native Git diff review surface. A finished isolated task can rerun
+  its exact source command as a separate validation terminal and retain the
+  passed / failed / needs-review result on the task card
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
@@ -281,6 +283,23 @@ for review**, keeps the exited terminal transcript available, and diffs against
 the commit captured when the worktree was created, so Agent commits stay
 visible. Task metadata is currently runtime-only; **Hide task** only hides that
 metadata and deliberately leaves the active worktree untouched.
+
+When an Agent process finishes successfully, **Run validation** executes the
+same exact, non-truncated single-line command that created the task. Ember maps
+the source repository subdirectory into the isolated worktree, canonicalizes
+the target, and rejects missing paths or symbolic-link escapes before starting
+a separate read-only-after-exit validation terminal. The task card records each
+attempt as running, passed, failed, needs review (no authoritative exit
+status), or cancelled. A failed validation does not masquerade as an Agent
+runtime failure, and a passing validation still requires the explicit **Mark
+complete** action after diff review. Validation cannot start until a native
+Agent event stream has fully ended; resuming Agent work invalidates the prior
+result. The validation shell uses non-login command mode so a login profile
+cannot silently move execution out of the checked worktree directory. Ember
+reuses the source terminal's captured shell identity, disables supported-shell
+startup files, verifies that Git still registers the exact task worktree and
+branch, then carries the verified cwd into the child through an open directory
+descriptor and `fchdir` rather than resolving the path again.
 
 The Settings panel exposes the same clipboard and paste-confirmation policies
 under **Advanced → Security**, including a way to re-enable confirmation after

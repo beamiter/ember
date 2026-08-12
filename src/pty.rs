@@ -2,6 +2,64 @@ use anyhow::{anyhow, Result};
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 
+#[cfg(unix)]
+pub(crate) struct PinnedDirectory(std::fs::File);
+
+#[cfg(unix)]
+impl std::fmt::Debug for PinnedDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::os::fd::AsRawFd;
+        formatter
+            .debug_tuple("PinnedDirectory")
+            .field(&self.0.as_raw_fd())
+            .finish()
+    }
+}
+
+#[cfg(unix)]
+impl PinnedDirectory {
+    pub(crate) fn open(path: &std::path::Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                anyhow!(
+                    "cannot pin validation directory {}: {error}",
+                    path.display()
+                )
+            })?;
+        if !directory
+            .metadata()
+            .map_err(|error| {
+                anyhow!(
+                    "cannot inspect pinned validation directory {}: {error}",
+                    path.display()
+                )
+            })?
+            .is_dir()
+        {
+            return Err(anyhow!(
+                "validation working directory is not a directory: {}",
+                path.display()
+            ));
+        }
+        Ok(Self(directory))
+    }
+
+    pub(crate) fn proc_path(&self) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        self.0.as_raw_fd()
+    }
+}
+
 /// PTY 读取结果。流关闭与子进程退出必须分开判断：Linux 的 EIO/Hangup
 /// 只说明当前没有 slave fd，子进程仍可能存活；只有 waitpid 才能确认退出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,9 +246,72 @@ mod unix_pty {
         ))
     }
 
-    fn choose_shell(configured_shell: Option<&str>) -> Result<String> {
+    pub(super) fn choose_shell(configured_shell: Option<&str>) -> Result<String> {
         let path_var = std::env::var_os("PATH");
         choose_shell_with_path(configured_shell, path_var.as_deref(), Path::new("/bin/sh"))
+    }
+
+    /// Resolve the shell captured by the source Ember pane and return an
+    /// explicit argv for a single user-approved validation command.
+    ///
+    /// Validation runs in a fresh process inside the task worktree.  Passing
+    /// the command as one argv element (rather than interpolating it into a
+    /// wrapper script) preserves its exact shell syntax and avoids a second
+    /// quoting language. Command mode deliberately is not login mode: a login
+    /// profile may change directory after the PTY has entered the validated
+    /// worktree, causing the command to run against unrelated files. Supported
+    /// shells also receive their no-rc flag; unknown shell families fail
+    /// closed because their non-interactive startup contract is not known.
+    pub(super) fn validation_command_argv(
+        source_shell: Option<&str>,
+        command: &str,
+    ) -> Result<Vec<String>> {
+        let source_shell = source_shell
+            .filter(|shell| !shell.is_empty())
+            .ok_or_else(|| anyhow!("Validation source shell identity is missing"))?;
+        let shell = jterm_core::host::resolve_configured_program(source_shell, None)
+            .ok_or_else(|| {
+                anyhow!("Validation source shell is no longer executable: {source_shell}")
+            })?
+            .to_string_lossy()
+            .into_owned();
+        if is_interactive_jsh(Path::new(&shell)) {
+            return Ok(vec![
+                shell,
+                "--norc".to_string(),
+                "-c".to_string(),
+                command.to_string(),
+            ]);
+        }
+        let resolved = std::fs::canonicalize(&shell).unwrap_or_else(|_| Path::new(&shell).into());
+        let family = resolved
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut argv = vec![shell];
+        match family.as_str() {
+            "bash" => argv.extend(["--noprofile".to_string(), "--norc".to_string()]),
+            "zsh" => argv.push("-f".to_string()),
+            "fish" => argv.push("--no-config".to_string()),
+            "sh" | "dash" | "ksh" | "ksh93" | "mksh" => {}
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported source shell for isolated validation: {}",
+                    resolved.display()
+                ));
+            }
+        }
+        argv.extend(["-c".to_string(), command.to_string()]);
+        Ok(argv)
+    }
+
+    pub(super) fn validation_command_environment() -> [(&'static str, &'static str); 3] {
+        [
+            ("BASH_ENV", "/dev/null"),
+            ("ENV", "/dev/null"),
+            ("ZDOTDIR", "/dev/null"),
+        ]
     }
 
     /// ember's child-environment policy.
@@ -220,6 +341,7 @@ mod unix_pty {
     }
 
     impl Pty {
+        #[allow(dead_code)]
         pub fn new_with_cwd(
             cols: usize,
             rows: usize,
@@ -227,6 +349,26 @@ mod unix_pty {
             session_id: Option<&str>,
             configured_shell: Option<&str>,
             command_argv: Option<&[String]>,
+        ) -> Result<Self> {
+            Self::new_with_pinned_cwd(
+                cols,
+                rows,
+                cwd,
+                session_id,
+                configured_shell,
+                command_argv,
+                None,
+            )
+        }
+
+        pub(crate) fn new_with_pinned_cwd(
+            cols: usize,
+            rows: usize,
+            cwd: Option<&str>,
+            session_id: Option<&str>,
+            configured_shell: Option<&str>,
+            command_argv: Option<&[String]>,
+            pinned_cwd: Option<PinnedDirectory>,
         ) -> Result<Self> {
             // SAFETY: 这个 unsafe 块包含多个 libc 系统调用用于 PTY 创建和进程 fork。
             // 所有的 libc 调用都检查了返回值并正确处理错误。
@@ -354,13 +496,27 @@ mod unix_pty {
                     }
                     None => None,
                 };
+                let cwd_directory = match (cwd, pinned_cwd) {
+                    (Some(_), directory @ Some(_)) => directory,
+                    (None, Some(_)) => {
+                        return Err(anyhow!(
+                            "pinned working directory requires an explicit display path"
+                        ));
+                    }
+                    (Some(_), None) | (None, None) => None,
+                };
 
                 // 构建子进程环境:继承父进程环境,覆盖终端相关变量(避免在子进程调用
                 // 非异步信号安全的 setenv)。直接把构建好的 envp 传给 execve。
                 // 策略与变量集合由 jterm_core::child_env 持有,四个终端共用;这里
                 // 只声明 ember 的选择 —— LESS=FR、UTF-8 locale 修正、不接管 ls 颜色。
-                let env_cstrings = jterm_core::child_env::envp(&child_environment(), &[])
-                    .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
+                let command_environment =
+                    cwd_directory.is_some().then(validation_command_environment);
+                let env_cstrings = jterm_core::child_env::envp(
+                    &child_environment(),
+                    command_environment.as_ref().map_or(&[], |extra| extra),
+                )
+                .map_err(|error| anyhow!("Invalid child environment: {error}"))?;
                 let mut envp: Vec<*const libc::c_char> =
                     env_cstrings.iter().map(|c| c.as_ptr()).collect();
                 envp.push(std::ptr::null());
@@ -474,7 +630,13 @@ mod unix_pty {
                     libc::setsid();
 
                     // 切换工作目录(使用 fork 前构建好的指针)
-                    if let Some(ref dir_cstr) = cwd_cstr {
+                    if let Some(ref directory) = cwd_directory {
+                        if libc::fchdir(directory.as_raw_fd()) != 0 {
+                            report_startup_failure(startup_pipe[1], b'C');
+                            libc::_exit(127);
+                        }
+                        libc::close(directory.as_raw_fd());
+                    } else if let Some(ref dir_cstr) = cwd_cstr {
                         if libc::chdir(dir_cstr.as_ptr()) != 0 {
                             report_startup_failure(startup_pipe[1], b'C');
                             libc::_exit(127);
@@ -969,6 +1131,20 @@ mod windows_pty {
 #[cfg(unix)]
 pub use unix_pty::Pty;
 
+/// Build the explicit shell argv used by task validation terminals.
+#[cfg(unix)]
+pub(crate) fn validation_command_argv(
+    configured_shell: Option<&str>,
+    command: &str,
+) -> Result<Vec<String>> {
+    unix_pty::validation_command_argv(configured_shell, command)
+}
+
+#[cfg(unix)]
+pub(crate) fn resolved_shell(configured_shell: Option<&str>) -> Result<String> {
+    unix_pty::choose_shell(configured_shell)
+}
+
 #[cfg(windows)]
 pub use windows_pty::Pty;
 
@@ -1057,6 +1233,181 @@ mod tests {
 
         assert_eq!(std::path::Path::new(&selected), executable);
         assert!(std::path::Path::new(&selected).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_argv_keeps_command_as_one_argument() {
+        let root = ShellTestDir::new("validation-argv");
+        let shell = root.executable("bash");
+        let command = "printf '%s' \"$HOME && literal\"";
+
+        let argv = super::unix_pty::validation_command_argv(shell.to_str(), command).unwrap();
+
+        assert_eq!(
+            argv,
+            vec![
+                shell.to_string_lossy(),
+                "--noprofile".into(),
+                "--norc".into(),
+                "-c".into(),
+                command.into()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_argv_does_not_load_a_login_profile_that_changes_cwd() {
+        let root = ShellTestDir::new("validation-login-cwd");
+        let home = root.0.join("home");
+        let expected_cwd = root.0.join("worktree");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&expected_cwd).unwrap();
+        std::fs::write(home.join(".bash_profile"), b"cd /\n").unwrap();
+        let argv = super::unix_pty::validation_command_argv(Some("/bin/bash"), "pwd").unwrap();
+
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&expected_cwd)
+            .env("HOME", &home)
+            .env_remove("BASH_ENV")
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            std::path::Path::new(String::from_utf8(output.stdout).unwrap().trim()),
+            expected_cwd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_command_scrubs_noninteractive_shell_startup_hooks() {
+        let root = ShellTestDir::new("validation-startup-hook-cwd");
+        let expected_cwd = root.0.join("worktree");
+        let outside = root.0.join("outside");
+        let bash_env = root.0.join("bash-env");
+        std::fs::create_dir(&expected_cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(&bash_env, format!("cd {}\n", outside.display())).unwrap();
+        let escaped = std::process::Command::new("/bin/bash")
+            .args(["-c", "pwd"])
+            .current_dir(&expected_cwd)
+            .env("BASH_ENV", &bash_env)
+            .output()
+            .unwrap();
+        assert_eq!(
+            std::path::Path::new(String::from_utf8(escaped.stdout).unwrap().trim()),
+            outside
+        );
+
+        let validation_environment = super::unix_pty::validation_command_environment();
+        assert!(validation_environment.contains(&("BASH_ENV", "/dev/null")));
+        let mut safe = std::process::Command::new("/bin/bash");
+        safe.args(["-c", "pwd"]).current_dir(&expected_cwd);
+        for (name, value) in validation_environment {
+            safe.env(name, value);
+        }
+        let safe = safe.output().unwrap();
+        assert!(safe.status.success());
+        assert_eq!(
+            std::path::Path::new(String::from_utf8(safe.stdout).unwrap().trim()),
+            expected_cwd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_validation_cwd_cannot_be_redirected_by_path_replacement() {
+        let root = ShellTestDir::new("validation-pinned-cwd");
+        let original_path = root.0.join("worktree");
+        let moved_path = root.0.join("worktree-moved");
+        std::fs::create_dir(&original_path).unwrap();
+        let pinned = super::PinnedDirectory::open(&original_path).unwrap();
+        std::fs::rename(&original_path, &moved_path).unwrap();
+        std::fs::create_dir(&original_path).unwrap();
+        let argv = vec!["/bin/pwd".to_string()];
+
+        let mut pty = super::Pty::new_with_pinned_cwd(
+            80,
+            24,
+            original_path.to_str(),
+            None,
+            None,
+            Some(&argv),
+            Some(pinned),
+        )
+        .unwrap();
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut buf = [0u8; 1024];
+        while std::time::Instant::now() < deadline
+            && !seen.contains(moved_path.to_string_lossy().as_ref())
+        {
+            match pty.read(&mut buf) {
+                Ok(super::ReadOutcome::Data(n)) => {
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                Ok(super::ReadOutcome::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+
+        let reported = seen.trim().trim_end_matches('\r');
+        assert_eq!(
+            std::path::Path::new(reported),
+            moved_path,
+            "child did not enter the pinned directory: {seen:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_argv_uses_jsh_command_contract() {
+        let root = ShellTestDir::new("validation-jsh");
+        let shell = root.executable("jsh");
+
+        let argv = super::unix_pty::validation_command_argv(shell.to_str(), "cargo test").unwrap();
+
+        assert_eq!(argv[0], shell.to_string_lossy());
+        assert_eq!(&argv[1..], ["--norc", "-c", "cargo test"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_argv_recognizes_a_configured_symlink_to_jsh() {
+        let root = ShellTestDir::new("validation-jsh-symlink");
+        let jsh = root.executable("jsh-0.4.0");
+        let configured = root.0.join("team-shell");
+        std::os::unix::fs::symlink(jsh, &configured).unwrap();
+
+        let argv =
+            super::unix_pty::validation_command_argv(configured.to_str(), "cargo test").unwrap();
+
+        assert_eq!(&argv[1..], ["--norc", "-c", "cargo test"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_argv_disables_supported_shell_rc_files_and_rejects_unknown_families() {
+        let root = ShellTestDir::new("validation-shell-families");
+        let zsh = root.executable("zsh");
+        let fish = root.executable("fish");
+        let custom = root.executable("custom-shell");
+
+        assert_eq!(
+            &super::unix_pty::validation_command_argv(zsh.to_str(), "pwd").unwrap()[1..],
+            ["-f", "-c", "pwd"]
+        );
+        assert_eq!(
+            &super::unix_pty::validation_command_argv(fish.to_str(), "pwd").unwrap()[1..],
+            ["--no-config", "-c", "pwd"]
+        );
+        assert!(super::unix_pty::validation_command_argv(custom.to_str(), "pwd").is_err());
     }
 
     #[cfg(unix)]

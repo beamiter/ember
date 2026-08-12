@@ -72,6 +72,12 @@ pub struct SemanticCommandContext {
     pub source_execution_id: String,
     pub source_sequence: u64,
 
+    /// Absolute shell executable selected for the source terminal. Validation
+    /// refuses legacy snapshots without this identity rather than interpreting
+    /// exact command text through a later hot-reloaded shell configuration.
+    #[serde(default)]
+    pub source_shell: Option<String>,
+
     pub command: Option<String>,
     pub command_exact: bool,
     pub command_truncated: bool,
@@ -253,6 +259,7 @@ mod tests {
             // Sequence zero is the first valid local record and must not be
             // mistaken for a missing identity.
             source_sequence: 0,
+            source_shell: Some("/bin/bash".to_string()),
             command: Some("cargo test".to_string()),
             command_exact: true,
             command_truncated: false,
@@ -284,6 +291,16 @@ mod tests {
         assert_eq!(semantic.output_total_bytes, 300_000);
         assert!(semantic.command_exact);
         assert_eq!(semantic.cwd_after.as_deref(), Some("/workspace/ember"));
+    }
+
+    #[test]
+    fn legacy_context_without_source_shell_deserializes_fail_closed() {
+        let mut serialized = serde_json::to_value(context()).unwrap();
+        serialized.as_object_mut().unwrap().remove("source_shell");
+
+        let restored: SemanticCommandContext = serde_json::from_value(serialized).unwrap();
+
+        assert!(restored.source_shell.is_none());
     }
 
     #[test]

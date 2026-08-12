@@ -5,7 +5,7 @@
 //! egui closure, so a concurrent PTY exit or tab removal cannot redirect an
 //! action to an unrelated index.
 
-use crate::agent::{AgentProvider, TaskId, TaskStatus};
+use crate::agent::{AgentProvider, TaskId, TaskStatus, TaskValidationStatus};
 use crate::app::state::TerminalApp;
 use crate::review_text::visible_bounded;
 use eframe::egui;
@@ -25,6 +25,9 @@ const MAX_TASK_DETAIL_DISPLAY_BYTES: usize = 320;
 pub enum TaskSidebarAction {
     StartAgent(TaskId),
     FocusTerminal(TaskId),
+    FocusValidation(TaskId),
+    RunValidation(TaskId),
+    Complete(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
 }
@@ -69,15 +72,27 @@ struct TaskRowSnapshot {
     status: TaskStatus,
     branch: String,
     updated_at_ms: u64,
-    has_terminal: bool,
+    has_agent_terminal: bool,
+    has_validation_terminal: bool,
+    has_active_agent_stream: bool,
+    validation_status: TaskValidationStatus,
+    validation_attempt: u64,
+    validation_detail: Option<String>,
+    needs_attention: bool,
     status_detail: Option<String>,
 }
 
 impl TaskRowSnapshot {
+    fn is_running(&self) -> bool {
+        self.status.is_running()
+            || self.validation_status == TaskValidationStatus::Running
+            || self.has_active_agent_stream
+    }
+
     fn group_rank(&self) -> u8 {
-        if self.status.needs_attention() {
+        if self.needs_attention {
             0
-        } else if self.status.is_running() {
+        } else if self.is_running() {
             1
         } else {
             2
@@ -93,13 +108,6 @@ fn sort_rows(rows: &mut [TaskRowSnapshot]) {
             row.id.to_string(),
         )
     });
-}
-
-pub fn attention_count(tasks: &[crate::agent::AgentTask]) -> usize {
-    tasks
-        .iter()
-        .filter(|task| task.status != TaskStatus::Archived && task.needs_attention())
-        .count()
 }
 
 impl TerminalApp {
@@ -246,10 +254,25 @@ impl TerminalApp {
                 status: task.status,
                 branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
                 updated_at_ms: task.updated_at_ms,
-                has_terminal: task
+                has_agent_terminal: task
                     .terminal_session_id
                     .as_deref()
                     .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
+                has_validation_terminal: task
+                    .validation
+                    .terminal_session_id
+                    .as_deref()
+                    .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
+                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(task.id),
+                validation_status: task.validation.status,
+                validation_attempt: task.validation.attempt,
+                validation_detail: task
+                    .validation
+                    .status_detail
+                    .as_deref()
+                    .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
+                needs_attention: task.needs_attention()
+                    && !self.task_manager.has_active_agent_event_stream(task.id),
                 status_detail: task
                     .status_detail
                     .as_deref()
@@ -285,17 +308,23 @@ impl TerminalApp {
             .show(ui, |ui| {
                 for row in &rows {
                     let selected = self.task_sidebar.selected == Some(row.id);
-                    let attention = row.status.needs_attention();
+                    let attention = row.needs_attention;
                     let marker = if attention {
                         "!"
-                    } else if row.status.is_running() {
+                    } else if row.is_running() {
                         "●"
-                    } else if row.status == TaskStatus::Completed {
+                    } else if row.status == TaskStatus::Completed
+                        || row.validation_status == TaskValidationStatus::Passed
+                    {
                         "✓"
                     } else {
                         "·"
                     };
-                    let color = task_status_color(ui, row.status);
+                    let color = if row.validation_status == TaskValidationStatus::NotRun {
+                        task_status_color(ui, row.status)
+                    } else {
+                        task_validation_color(ui, row.validation_status)
+                    };
                     let response = ui
                         .horizontal(|ui| {
                             ui.colored_label(color, marker);
@@ -312,15 +341,17 @@ impl TerminalApp {
 
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {}",
+                        let activity = if row.validation_attempt == 0 {
+                            format!("{} · {}", row.provider.display_name(), row.status.label())
+                        } else {
+                            format!(
+                                "{} · Validation #{} {}",
                                 row.provider.display_name(),
-                                row.status.label()
-                            ))
-                            .small()
-                            .color(color),
-                        );
+                                row.validation_attempt,
+                                row.validation_status.label().to_lowercase()
+                            )
+                        };
+                        ui.label(egui::RichText::new(activity).small().color(color));
                     });
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
@@ -338,18 +369,64 @@ impl TerminalApp {
                                 pending = Some(TaskSidebarAction::StartAgent(row.id));
                             }
                             if ui
-                                .add_enabled(row.has_terminal, egui::Button::new("Open terminal"))
+                                .add_enabled(
+                                    row.has_agent_terminal,
+                                    egui::Button::new("Agent terminal"),
+                                )
                                 .on_disabled_hover_text("Agent terminal is no longer available")
                                 .clicked()
                             {
                                 pending = Some(TaskSidebarAction::FocusTerminal(row.id));
                             }
-                            if ui.button("Review diff").clicked() {
-                                pending = Some(TaskSidebarAction::ReviewDiff(row.id));
+                            if row.status == TaskStatus::ReadyForReview
+                                && ui
+                                    .add_enabled(
+                                        row.validation_status != TaskValidationStatus::Running
+                                            && !row.has_active_agent_stream,
+                                        egui::Button::new(
+                                            if row.validation_attempt == 0 {
+                                                "Run validation"
+                                            } else {
+                                                "Run again"
+                                            },
+                                        ),
+                                    )
+                                    .on_disabled_hover_text(if row.has_active_agent_stream {
+                                        "Wait for the native Agent session to end"
+                                    } else {
+                                        "Validation is already running"
+                                    })
+                                    .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::RunValidation(row.id));
                             }
                             if ui
                                 .add_enabled(
-                                    !row.status.is_running(),
+                                    row.has_validation_terminal,
+                                    egui::Button::new("Validation output"),
+                                )
+                                .on_disabled_hover_text("No validation output is available")
+                                .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::FocusValidation(row.id));
+                            }
+                            if ui.button("Review diff").clicked() {
+                                pending = Some(TaskSidebarAction::ReviewDiff(row.id));
+                            }
+                            if row.status == TaskStatus::ReadyForReview
+                                && row.validation_status == TaskValidationStatus::Passed
+                                && ui
+                                    .button("Mark complete")
+                                    .on_hover_text(
+                                        "Accept the reviewed task after its latest validation passed",
+                                    )
+                                    .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::Complete(row.id));
+                            }
+                            if ui
+                                .add_enabled(
+                                    !row.is_running(),
                                     egui::Button::new("Hide task"),
                                 )
                                 .on_hover_text("Hide task metadata; leave its worktree in place")
@@ -363,6 +440,31 @@ impl TerminalApp {
                                 ui.add_space(18.0);
                                 ui.label(egui::RichText::new(detail).small().weak());
                             });
+                        }
+                        if row.validation_attempt > 0 {
+                            let validation_color =
+                                task_validation_color(ui, row.validation_status);
+                            ui.horizontal(|ui| {
+                                ui.add_space(18.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Validation #{} · {}",
+                                        row.validation_attempt,
+                                        row.validation_status.label()
+                                    ))
+                                    .small()
+                                    .color(validation_color),
+                                );
+                                if row.validation_status == TaskValidationStatus::Running {
+                                    ui.spinner();
+                                }
+                            });
+                            if let Some(detail) = &row.validation_detail {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    ui.label(egui::RichText::new(detail).small().weak());
+                                });
+                            }
                         }
                     }
                     ui.separator();
@@ -394,6 +496,30 @@ impl TerminalApp {
                 };
                 if !self.activate_session(index) {
                     self.set_status("Agent terminal is no longer available");
+                }
+            }
+            TaskSidebarAction::FocusValidation(task_id) => {
+                let session_id = self
+                    .task_manager
+                    .get(task_id)
+                    .and_then(|task| task.validation.terminal_session_id.clone());
+                let Some(session_id) = session_id else {
+                    self.set_status("Validation output is no longer available");
+                    return;
+                };
+                let Some(index) = self.session_manager.index_of(&session_id) else {
+                    self.set_status("Validation output is no longer available");
+                    return;
+                };
+                if !self.activate_session(index) {
+                    self.set_status("Validation output is no longer available");
+                }
+            }
+            TaskSidebarAction::RunValidation(task_id) => self.start_task_validation(task_id),
+            TaskSidebarAction::Complete(task_id) => {
+                match self.task_manager.complete_after_validation(task_id) {
+                    Ok(()) => self.set_status("Task marked complete after passing validation"),
+                    Err(error) => self.set_status_for(error.to_string(), Duration::from_secs(5)),
                 }
             }
             TaskSidebarAction::ReviewDiff(task_id) => {
@@ -510,6 +636,94 @@ impl TerminalApp {
             provider.display_name()
         ));
     }
+
+    fn start_task_validation(&mut self, task_id: TaskId) {
+        let next_attempt = match self.task_manager.next_validation_attempt(task_id) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.set_status_for(error.to_string(), Duration::from_secs(6));
+                return;
+            }
+        };
+        let prepared = {
+            let Some(task) = self.task_manager.get(task_id) else {
+                self.set_status("Task is no longer available");
+                return;
+            };
+            match crate::agent::prepare_task_validation(task) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.set_status_for(
+                        format!("Could not prepare validation: {error}"),
+                        Duration::from_secs(7),
+                    );
+                    return;
+                }
+            }
+        };
+        let argv = match self
+            .session_manager
+            .validation_command_argv(&prepared.source_shell, &prepared.command)
+        {
+            Ok(argv) => argv,
+            Err(error) => {
+                self.set_status_for(
+                    format!("Could not resolve validation shell: {error}"),
+                    Duration::from_secs(6),
+                );
+                return;
+            }
+        };
+        let task_title = match self.task_manager.get(task_id) {
+            Some(task) => task.title.clone(),
+            None => {
+                self.set_status("Task is no longer available");
+                return;
+            }
+        };
+        let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
+        let session_name = format!(
+            "Validate #{} · {}",
+            next_attempt,
+            visible_bounded(&task_title, 88)
+        );
+        let created = match self.session_manager.new_validation_session_in_cwd(
+            session_name,
+            argv,
+            &prepared.cwd,
+            prepared.pinned_cwd,
+            cols,
+            rows,
+            self.config.scrollback_lines,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                self.set_status_for(
+                    format!("Could not start validation: {error}"),
+                    Duration::from_secs(6),
+                );
+                return;
+            }
+        };
+
+        if let Err(error) = self
+            .task_manager
+            .bind_validation_session(task_id, created.session_id.clone())
+        {
+            let _ = self.session_manager.close_session(created.session_index);
+            self.set_status_for(error.to_string(), Duration::from_secs(6));
+            return;
+        }
+
+        self.tabs.on_session_inserted(created.session_index);
+        self.tabs.insert_tab_after_active(created.session_index);
+        self.activate_session(created.session_index);
+        self.schedule_session_save();
+        self.set_status(format!(
+            "Validation #{} is running in the isolated task worktree",
+            next_attempt
+        ));
+    }
 }
 
 fn task_status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
@@ -521,6 +735,18 @@ fn task_status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
         TaskStatus::Created | TaskStatus::Cancelled | TaskStatus::Archived => {
             ui.visuals().weak_text_color()
         }
+    }
+}
+
+fn task_validation_color(ui: &egui::Ui, status: TaskValidationStatus) -> egui::Color32 {
+    match status {
+        TaskValidationStatus::Running => egui::Color32::from_rgb(90, 150, 230),
+        TaskValidationStatus::Passed => egui::Color32::from_rgb(90, 190, 120),
+        TaskValidationStatus::Failed => ui.visuals().error_fg_color,
+        TaskValidationStatus::Inconclusive | TaskValidationStatus::Cancelled => {
+            ui.visuals().warn_fg_color
+        }
+        TaskValidationStatus::NotRun => ui.visuals().weak_text_color(),
     }
 }
 
@@ -536,7 +762,13 @@ mod tests {
             status,
             branch: "ember/task".to_string(),
             updated_at_ms,
-            has_terminal: true,
+            has_agent_terminal: true,
+            has_validation_terminal: false,
+            has_active_agent_stream: false,
+            validation_status: TaskValidationStatus::NotRun,
+            validation_attempt: 0,
+            validation_detail: None,
+            needs_attention: status.needs_attention(),
             status_detail: None,
         }
     }

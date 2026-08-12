@@ -2443,7 +2443,7 @@ impl TerminalApp {
                         view_changed = true;
                     }
                     if self.config.experimental_task_sidebar {
-                        let attention = app::tasks::attention_count(self.task_manager.tasks());
+                        let attention = self.task_manager.attention_count();
                         let label = if attention == 0 {
                             "Tasks".to_string()
                         } else {
@@ -2979,15 +2979,19 @@ impl eframe::App for TerminalApp {
             .map(|exited| (exited.session_id, exited.exit_code))
             .collect();
         for (session_id, exit_code) in exited_sessions {
-            let agent_task = self
+            let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
+            let task_terminal = self
                 .task_manager
                 .handle_terminal_session_exit(&session_id, exit_code)
                 .is_some();
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
                 continue;
             };
-            if agent_task {
+            if terminal_role == Some(crate::agent::TaskTerminalRole::Agent) {
                 self.session_manager.retain_exited_command(&session_id);
+                continue;
+            }
+            if task_terminal && self.session_manager.retain_exited_command(&session_id) {
                 continue;
             }
             if self.session_manager.len() > 1 && session_idx != self.session_manager.active_index()
@@ -3127,7 +3131,7 @@ impl eframe::App for TerminalApp {
         let mut shell_exited = false;
         let mut shell_exit_observed = false;
         let mut shell_exit_code = None;
-        let mut retain_exited_agent_terminal = false;
+        let mut retain_exited_task_terminal = false;
         // A shell that dies before it could ever have shown a prompt is a
         // startup failure, not the user leaving. Closing the window on it
         // makes ember look like it "exits as soon as it runs", hiding the
@@ -3157,10 +3161,10 @@ impl eframe::App for TerminalApp {
         // the same tab if the user hasn't switched away.
         let session = self.session_manager.get_active_session_mut();
         let active_session_id = session.metadata.session_id.clone();
-        let active_agent_provider = self
+        let active_task_terminal = self
             .task_manager
-            .task_for_terminal_session(&active_session_id)
-            .map(|task| task.provider.display_name());
+            .task_and_role_for_terminal_session(&active_session_id)
+            .map(|(task, role)| (task.provider.display_name(), role));
 
         // Step 3: semantic application paste events. Host copy/paste keyboard
         // shortcuts are dispatched above through configurable commands.
@@ -3394,7 +3398,7 @@ impl eframe::App for TerminalApp {
             rejected_mouse_prefix_allows_pointer,
             semantic_paste_blocks_pointer,
         );
-        // An exited Agent terminal is read-only at the PTY boundary, but its
+        // An exited task terminal is read-only at the PTY boundary, but its
         // local buffer must remain selectable and scrollable for review.
         terminal_pointer_input_blocked = app::input::retained_terminal_pointer_input_blocked(
             terminal_pointer_input_blocked,
@@ -3558,13 +3562,22 @@ impl eframe::App for TerminalApp {
                         crate::debug_log!("[SHELL EXIT] shell exited with code: {}", code);
                         shell_exit_observed = true;
                         shell_exit_code = Some(code);
-                        retain_exited_agent_terminal = active_agent_provider.is_some();
+                        retain_exited_task_terminal = active_task_terminal.is_some();
                         let uptime = session.shell.uptime();
-                        if let Some(provider) = active_agent_provider {
-                            self.status_message = if code == 0 {
-                                format!("{provider} task finished")
-                            } else {
-                                format!("{provider} task exited with code {code}")
+                        if let Some((provider, role)) = active_task_terminal {
+                            self.status_message = match (role, code) {
+                                (crate::agent::TaskTerminalRole::Agent, 0) => {
+                                    format!("{provider} task finished")
+                                }
+                                (crate::agent::TaskTerminalRole::Agent, code) => {
+                                    format!("{provider} task exited with code {code}")
+                                }
+                                (crate::agent::TaskTerminalRole::Validation, 0) => {
+                                    "Task validation passed".to_string()
+                                }
+                                (crate::agent::TaskTerminalRole::Validation, code) => {
+                                    format!("Task validation failed with code {code}")
+                                }
                             };
                             self.status_expires_at =
                                 Some(std::time::Instant::now() + Duration::from_secs(6));
@@ -3593,7 +3606,7 @@ impl eframe::App for TerminalApp {
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         shell_exit_observed = true;
-                        retain_exited_agent_terminal = active_agent_provider.is_some();
+                        retain_exited_task_terminal = active_task_terminal.is_some();
                         shell_exited = true;
                         break;
                     }
@@ -4751,7 +4764,7 @@ impl eframe::App for TerminalApp {
         if shell_exit_observed {
             self.task_manager
                 .handle_terminal_session_exit(&active_session_id, shell_exit_code);
-            if retain_exited_agent_terminal {
+            if retain_exited_task_terminal {
                 self.session_manager
                     .retain_exited_command(&active_session_id);
             }
@@ -4836,8 +4849,8 @@ impl eframe::App for TerminalApp {
                 "[SHELL EXIT] handling shell exit, session_count: {}",
                 session_count_before
             );
-            if retain_exited_agent_terminal {
-                crate::debug_log!("[SHELL EXIT] retaining Agent terminal for review");
+            if retain_exited_task_terminal {
+                crate::debug_log!("[SHELL EXIT] retaining task terminal for review");
             } else if session_count_before > 1 {
                 // Close the current session if there are multiple sessions.
                 // If it was its tab's only pane, the tab goes with it.
