@@ -5,7 +5,11 @@
 //! egui closure, so a concurrent PTY exit or tab removal cannot redirect an
 //! action to an unrelated index.
 
-use crate::agent::{AgentProvider, TaskId, TaskStatus, TaskValidationStatus};
+use crate::agent::{
+    AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
+    CodexAppServerViewSnapshot, NativePromptPolicy, TaskId, TaskRuntimeKind, TaskStatus,
+    TaskValidationStatus,
+};
 use crate::app::state::TerminalApp;
 use crate::review_text::visible_bounded;
 use eframe::egui;
@@ -20,10 +24,16 @@ use std::time::Duration;
 const MAX_TASK_TITLE_DISPLAY_BYTES: usize = 160;
 const MAX_TASK_BRANCH_DISPLAY_BYTES: usize = 120;
 const MAX_TASK_DETAIL_DISPLAY_BYTES: usize = 320;
+const MAX_NATIVE_AGENT_TEXT_DISPLAY_BYTES: usize = 64 * 1024;
+const MAX_NATIVE_ITEM_DISPLAY_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskSidebarAction {
-    StartAgent(TaskId),
+    StartCodex(TaskId),
+    StartTerminal(TaskId),
+    StopCodex(TaskId),
+    Approve(TaskId, ApprovalId),
+    Deny(TaskId, ApprovalId),
     FocusTerminal(TaskId),
     FocusValidation(TaskId),
     RunValidation(TaskId),
@@ -70,6 +80,7 @@ struct TaskRowSnapshot {
     title: String,
     provider: AgentProvider,
     status: TaskStatus,
+    runtime_kind: TaskRuntimeKind,
     branch: String,
     updated_at_ms: u64,
     has_agent_terminal: bool,
@@ -108,6 +119,207 @@ fn sort_rows(rows: &mut [TaskRowSnapshot]) {
             row.id.to_string(),
         )
     });
+}
+
+fn render_native_codex_view(
+    ui: &mut egui::Ui,
+    task_id: TaskId,
+    view: &CodexAppServerViewSnapshot,
+    approvals_enabled: bool,
+    pending: &mut Option<TaskSidebarAction>,
+) {
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Native Codex").small().strong());
+            ui.label(
+                egui::RichText::new(format!("{:?}", view.phase))
+                    .small()
+                    .weak(),
+            );
+            if view.dropped_updates > 0 {
+                ui.label(
+                    egui::RichText::new(format!("· {} updates compacted", view.dropped_updates))
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+
+        for approval in &view.pending_approvals {
+            ui.separator();
+            let kind = match approval.kind {
+                CodexAppServerApprovalKind::Command => "Command approval",
+                CodexAppServerApprovalKind::FileChange => "File-change approval",
+            };
+            ui.label(
+                egui::RichText::new(kind)
+                    .small()
+                    .strong()
+                    .color(ui.visuals().warn_fg_color),
+            );
+            if let Some(command) = approval.command.as_deref() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(visible_bounded(command, MAX_NATIVE_ITEM_DISPLAY_BYTES))
+                        .small()
+                        .monospace(),
+                    )
+                    .wrap(),
+                );
+            }
+            if let Some(cwd) = approval.cwd.as_deref() {
+                ui.label(
+                    egui::RichText::new(format!("cwd · {cwd}"))
+                    .small()
+                    .monospace()
+                    .weak(),
+                );
+            }
+            if let Some(reason) = approval.reason.as_deref() {
+                ui.label(
+                    egui::RichText::new(visible_bounded(
+                        reason,
+                        MAX_NATIVE_ITEM_DISPLAY_BYTES,
+                    ))
+                    .small(),
+                );
+            }
+            if approval.kind == CodexAppServerApprovalKind::FileChange {
+                ui.label(
+                    egui::RichText::new("Exact patch requested by Codex")
+                        .small()
+                        .strong(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt(("native-file-approval", approval.id))
+                    .max_height(280.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for change in &approval.file_changes {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    change.kind, change.path
+                                ))
+                                .small()
+                                .strong()
+                                .monospace(),
+                            );
+                            if let Some(move_path) = change.move_path.as_deref() {
+                                ui.label(
+                                    egui::RichText::new(format!("moves to · {move_path}"))
+                                        .small()
+                                        .monospace(),
+                                );
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&change.diff).small().monospace(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    });
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Allow is disabled: accepted provider actions cannot yet be bound to Ember's pinned workspace capability. Deny keeps the fixed workspace sandbox in force.",
+                )
+                .small()
+                .color(ui.visuals().warn_fg_color),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        native_approval_can_allow(approval, approvals_enabled),
+                        egui::Button::new("Allow once"),
+                    )
+                    .on_hover_text("Approve only the exact patch displayed above")
+                    .on_disabled_hover_text(
+                        "Native approvals are display-and-deny only in this one-shot runtime",
+                    )
+                    .clicked()
+                {
+                    *pending = Some(TaskSidebarAction::Approve(task_id, approval.id));
+                }
+                if ui
+                    .add_enabled(approvals_enabled, egui::Button::new("Deny"))
+                    .clicked()
+                {
+                    *pending = Some(TaskSidebarAction::Deny(task_id, approval.id));
+                }
+            });
+        }
+
+        if !view.agent_text.is_empty() {
+            ui.separator();
+            egui::CollapsingHeader::new("Agent response")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(visible_bounded(
+                                &view.agent_text,
+                                MAX_NATIVE_AGENT_TEXT_DISPLAY_BYTES,
+                            ))
+                            .small(),
+                        )
+                        .wrap(),
+                    );
+                    if view.agent_text_truncated {
+                        ui.label(egui::RichText::new("Earlier text was compacted").small().weak());
+                    }
+                });
+        }
+
+        if !view.commands.is_empty() {
+            egui::CollapsingHeader::new(format!("Commands ({})", view.commands.len())).show(
+                ui,
+                |ui| {
+                    let first = view.commands.len().saturating_sub(4);
+                    for command in &view.commands[first..] {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                command.status,
+                                visible_bounded(&command.command, MAX_NATIVE_ITEM_DISPLAY_BYTES)
+                            ))
+                            .small()
+                            .monospace(),
+                        );
+                    }
+                },
+            );
+        }
+
+        if !view.file_changes.is_empty() {
+            let change_count = view
+                .file_changes
+                .iter()
+                .map(|item| item.changes.len())
+                .sum::<usize>();
+            ui.label(
+                egui::RichText::new(format!("{} file changes reported", change_count))
+                    .small()
+                    .weak(),
+            );
+        }
+        if let Some(error) = view.last_error.as_deref() {
+            ui.label(
+                egui::RichText::new(visible_bounded(error, MAX_NATIVE_ITEM_DISPLAY_BYTES))
+                    .small()
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
+    });
+}
+
+fn native_approval_can_allow(
+    _approval: &crate::agent::CodexAppServerApproval,
+    _runtime_accepts_decisions: bool,
+) -> bool {
+    false
 }
 
 impl TerminalApp {
@@ -225,7 +437,7 @@ impl TerminalApp {
                             Ok(task_id) => {
                                 self.task_sidebar.selected = Some(task_id);
                                 self.set_status(format!(
-                                    "Created an isolated {provider_name} task; choose Open agent"
+                                    "Created an isolated {provider_name} task; choose Start Codex"
                                 ));
                             }
                             Err(error) => self.set_status_for(
@@ -252,6 +464,7 @@ impl TerminalApp {
                 title: visible_bounded(&task.title, MAX_TASK_TITLE_DISPLAY_BYTES),
                 provider: task.provider,
                 status: task.status,
+                runtime_kind: task.runtime_kind,
                 branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
                 updated_at_ms: task.updated_at_ms,
                 has_agent_terminal: task
@@ -271,8 +484,7 @@ impl TerminalApp {
                     .status_detail
                     .as_deref()
                     .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
-                needs_attention: task.needs_attention()
-                    && !self.task_manager.has_active_agent_event_stream(task.id),
+                needs_attention: self.task_manager.task_needs_attention(task.id),
                 status_detail: task
                     .status_detail
                     .as_deref()
@@ -303,6 +515,7 @@ impl TerminalApp {
         }
 
         let mut pending = None;
+        let native_ai_enabled = self.config.ai_enabled && self.config.ai_share_command_context;
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
@@ -362,11 +575,80 @@ impl TerminalApp {
                     });
 
                     if selected {
+                        let native_view = self.agent_runtime.snapshot(row.id);
                         ui.horizontal_wrapped(|ui| {
                             if row.status == TaskStatus::Created
-                                && ui.button("Open agent").clicked()
+                                && row.runtime_kind == TaskRuntimeKind::Unassigned
                             {
-                                pending = Some(TaskSidebarAction::StartAgent(row.id));
+                                if ui
+                                    .add_enabled(
+                                        native_ai_enabled,
+                                        egui::Button::new("Start Codex"),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Enable AI features and cloud command-context sharing in Settings → AI first",
+                                    )
+                                    .on_hover_text(
+                                        "Start a one-shot native Codex app-server turn. Agent tool writes are restricted to this worktree; the current Codex sandbox may read other host files.",
+                                    )
+                                    .clicked()
+                                {
+                                    pending = Some(TaskSidebarAction::StartCodex(row.id));
+                                }
+                                if ui
+                                    .button("Terminal fallback")
+                                    .on_hover_text(
+                                        "Open the provider CLI in a PTY without Ember-native events or approval cards; the provider TUI owns its prompts",
+                                    )
+                                    .clicked()
+                                {
+                                    pending = Some(TaskSidebarAction::StartTerminal(row.id));
+                                }
+                            }
+                            if row.status == TaskStatus::Created
+                                && row.runtime_kind == TaskRuntimeKind::TerminalFallback
+                                && ui
+                                    .button("Retry terminal fallback")
+                                    .on_hover_text(
+                                        "Retry only the provider CLI compatibility path; native one-shot authority remains consumed",
+                                    )
+                                    .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::StartTerminal(row.id));
+                            }
+                            if row.status == TaskStatus::Failed
+                                && row.runtime_kind == TaskRuntimeKind::Native
+                                && !row.has_active_agent_stream
+                                && self.agent_runtime.exit_report(row.id).is_some()
+                                && ui
+                                    .button("Continue in terminal")
+                                    .on_hover_text(
+                                        "Keep the isolated worktree and continue through the provider CLI compatibility path",
+                                    )
+                                    .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::StartTerminal(row.id));
+                            }
+                            if row.status == TaskStatus::Failed
+                                && row.runtime_kind == TaskRuntimeKind::TerminalFallback
+                                && ui
+                                    .button("Retry terminal fallback")
+                                    .on_hover_text(
+                                        "Start another provider CLI compatibility PTY; native one-shot authority remains consumed",
+                                    )
+                                    .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::StartTerminal(row.id));
+                            }
+                            if row.has_active_agent_stream
+                                && ui
+                                    .button("Stop Codex")
+                                    .on_hover_text(
+                                        "Interrupt the turn, stop its process group, and wait for reap",
+                                    )
+                                    .clicked()
+                            {
+                                pending = Some(TaskSidebarAction::StopCodex(row.id));
                             }
                             if ui
                                 .add_enabled(
@@ -441,6 +723,16 @@ impl TerminalApp {
                                 ui.label(egui::RichText::new(detail).small().weak());
                             });
                         }
+                        if let Some(view) = native_view.as_ref() {
+                            render_native_codex_view(
+                                ui,
+                                row.id,
+                                view,
+                                self.agent_runtime.has_running(row.id)
+                                    && row.has_active_agent_stream,
+                                &mut pending,
+                            );
+                        }
                         if row.validation_attempt > 0 {
                             let validation_color =
                                 task_validation_color(ui, row.validation_status);
@@ -480,7 +772,22 @@ impl TerminalApp {
             return;
         };
         match action {
-            TaskSidebarAction::StartAgent(task_id) => self.start_task_agent_terminal(task_id),
+            TaskSidebarAction::StartCodex(task_id) => self.start_task_native_codex(task_id),
+            TaskSidebarAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
+            TaskSidebarAction::StopCodex(task_id) => match self.agent_runtime.cancel(task_id) {
+                Ok(()) => self.set_status("Stopping Codex and waiting for process cleanup…"),
+                Err(error) => {
+                    self.set_status_for(error.to_string(), Duration::from_secs(6));
+                }
+            },
+            TaskSidebarAction::Approve(task_id, approval_id) => {
+                self.decide_native_approval(task_id, approval_id, ApprovalDecision::Approve)
+            }
+            TaskSidebarAction::Deny(task_id, approval_id) => self.decide_native_approval(
+                task_id,
+                approval_id,
+                ApprovalDecision::Deny { reason: None },
+            ),
             TaskSidebarAction::FocusTerminal(task_id) => {
                 let session_id = self
                     .task_manager
@@ -540,6 +847,7 @@ impl TerminalApp {
             }
             TaskSidebarAction::Archive(task_id) => match self.task_manager.archive(task_id) {
                 Ok(()) => {
+                    self.agent_runtime.clear_retained(task_id);
                     if self.task_sidebar.selected == Some(task_id) {
                         self.task_sidebar.selected = None;
                     }
@@ -550,7 +858,112 @@ impl TerminalApp {
         }
     }
 
+    fn start_task_native_codex(&mut self, task_id: TaskId) {
+        let policy = NativePromptPolicy {
+            share_command_context: self.config.ai_enabled && self.config.ai_share_command_context,
+            redact_secrets: self.config.ai_redact_secrets,
+        };
+        match self
+            .agent_runtime
+            .start_codex(&mut self.task_manager, task_id, policy)
+        {
+            Ok(()) => self.set_status(
+                "Started native Codex in the isolated worktree; waiting for app-server events…",
+            ),
+            Err(error) => self.set_status_for(
+                format!("Could not start native Codex: {error}"),
+                Duration::from_secs(8),
+            ),
+        }
+    }
+
+    fn decide_native_approval(
+        &mut self,
+        task_id: TaskId,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) {
+        let label = if matches!(&decision, ApprovalDecision::Approve) {
+            "Approval sent to Codex"
+        } else {
+            "Denial sent to Codex"
+        };
+        match self
+            .agent_runtime
+            .decide_approval(task_id, approval_id, decision)
+        {
+            Ok(()) => self.set_status(label),
+            Err(error) => self.set_status_for(error.to_string(), Duration::from_secs(6)),
+        }
+    }
+
+    /// Drain only already-buffered native events. The runtime applies its own
+    /// global/per-task frame budgets and never waits for provider I/O here.
+    pub(crate) fn poll_native_agent_runtime(&mut self, ctx: &egui::Context) {
+        let report = self.agent_runtime.poll(&mut self.task_manager);
+        if let Some(issue) = report.issues.last() {
+            self.set_status_for(
+                format!("Native Agent issue: {}", issue.detail),
+                Duration::from_secs(7),
+            );
+        } else if let Some(completion) = report.completions.last() {
+            let message = if report.completions.len() > 1 {
+                format!(
+                    "{} native Codex sessions stopped; open Tasks for individual results",
+                    report.completions.len()
+                )
+            } else {
+                match completion.outcome {
+                    AgentSessionOutcome::Clean => {
+                        "Native Codex stopped cleanly; review its diff, then run validation"
+                            .to_string()
+                    }
+                    AgentSessionOutcome::Cancelled => {
+                        "Native Codex was cancelled and fully stopped".to_string()
+                    }
+                    AgentSessionOutcome::Failed => format!(
+                        "Native Codex failed: {}",
+                        completion
+                            .detail
+                            .as_deref()
+                            .unwrap_or("provider session did not complete")
+                    ),
+                }
+            };
+            self.set_status_for(message, Duration::from_secs(8));
+        }
+        if self.agent_runtime.has_any_running() || report.budget_exhausted {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if report.made_progress() {
+            ctx.request_repaint();
+        }
+    }
+
     fn start_task_agent_terminal(&mut self, task_id: TaskId) {
+        let needs_failed_terminal_retry = self.task_manager.get(task_id).is_some_and(|task| {
+            task.status == TaskStatus::Failed
+                && task.runtime_kind == TaskRuntimeKind::TerminalFallback
+        });
+        let needs_failed_native_recovery = self.task_manager.get(task_id).is_some_and(|task| {
+            task.status == TaskStatus::Failed
+                && task.runtime_kind == TaskRuntimeKind::Native
+                && self.agent_runtime.exit_report(task_id).is_some()
+        });
+        if needs_failed_terminal_retry {
+            if let Err(error) = self.task_manager.prepare_terminal_fallback_retry(task_id) {
+                self.set_status_for(error.to_string(), Duration::from_secs(6));
+                return;
+            }
+        } else if needs_failed_native_recovery {
+            if let Err(error) = self
+                .task_manager
+                .prepare_terminal_fallback_after_native_failure(task_id)
+            {
+                self.set_status_for(error.to_string(), Duration::from_secs(6));
+                return;
+            }
+            self.agent_runtime.clear_retained(task_id);
+        }
         let launch = self.task_manager.get(task_id).and_then(|task| {
             (task.status == TaskStatus::Created && task.terminal_session_id.is_none()).then(|| {
                 (
@@ -569,6 +982,8 @@ impl TerminalApp {
         {
             Ok(launch) => launch,
             Err(error) => {
+                // update_status preserves TerminalFallback provenance, so a
+                // failed compatibility launch remains terminal-only.
                 let _ = self.task_manager.update_status(
                     task_id,
                     TaskStatus::Created,
@@ -620,7 +1035,11 @@ impl TerminalApp {
             let _ = self.session_manager.close_session(created.session_index);
             let _ = self.task_manager.update_status(
                 task_id,
-                TaskStatus::Failed,
+                // The PTY was closed before it gained task authority. Keep
+                // the selected runtime family retryable; in particular a
+                // consumed native one-shot remains TerminalFallback and can
+                // never expose Start Codex again.
+                TaskStatus::Created,
                 Some(error.to_string()),
             );
             self.set_status_for(error.to_string(), Duration::from_secs(6));
@@ -760,6 +1179,7 @@ mod tests {
             title: title.to_string(),
             provider: AgentProvider::Codex,
             status,
+            runtime_kind: TaskRuntimeKind::Unassigned,
             branch: "ember/task".to_string(),
             updated_at_ms,
             has_agent_terminal: true,
@@ -784,6 +1204,35 @@ mod tests {
         sort_rows(&mut rows);
         let titles: Vec<_> = rows.iter().map(|row| row.title.as_str()).collect();
         assert_eq!(titles, vec!["waiting-new", "failed-old", "working", "done"]);
+    }
+
+    #[test]
+    fn native_approvals_remain_deny_only_even_for_a_frozen_patch() {
+        let base = crate::agent::CodexAppServerApproval {
+            id: ApprovalId::new(),
+            kind: CodexAppServerApprovalKind::Command,
+            item_id: "item-1".into(),
+            command: Some("cargo test".into()),
+            cwd: Some("/worktree".into()),
+            reason: None,
+            file_paths: Vec::new(),
+            file_changes: Vec::new(),
+        };
+        assert!(!native_approval_can_allow(&base, true));
+
+        let file = crate::agent::CodexAppServerApproval {
+            kind: CodexAppServerApprovalKind::FileChange,
+            file_paths: vec!["src/main.rs".into()],
+            file_changes: vec![crate::agent::CodexAppServerApprovalFileChange {
+                path: "src/main.rs".into(),
+                kind: "{\"type\":\"update\"}".into(),
+                diff: "@@ -1 +1 @@\n-old\n+new".into(),
+                move_path: None,
+            }],
+            ..base
+        };
+        assert!(!native_approval_can_allow(&file, true));
+        assert!(!native_approval_can_allow(&file, false));
     }
 
     #[test]

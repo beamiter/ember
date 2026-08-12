@@ -1056,13 +1056,27 @@ impl ConfigPanel {
         ui.label(
             RichText::new(
                 "Off by default. Nothing leaves this machine until you enable AI \
-                 and explicitly submit a request; agent commands always require \
-                 per-command approval.",
+                 and explicitly submit a request. Native Codex runs in a pinned \
+                 workspace sandbox; accepting command and file-change approvals \
+                 is disabled in the current one-shot flow.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
         );
         ui.separator();
+
+        ui.label(
+            RichText::new("Inline AI provider (does not configure native Codex)")
+                .small()
+                .strong(),
+        );
+        ui.label(
+            RichText::new(
+                "Native tasks use the installed, ChatGPT-authenticated Codex CLI in an isolated empty config; inline provider/model settings and user Codex extensions do not carry into that one-shot runtime.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
 
         ui.horizontal(|ui| {
             ui.label("Provider:");
@@ -1195,7 +1209,7 @@ impl ConfigPanel {
         if ui
             .checkbox(
                 &mut self.edit_ai_redact_secrets,
-                "Redact secrets in AI-bound text",
+                "Redact secrets in attached command context",
             )
             .changed()
         {
@@ -1216,14 +1230,15 @@ impl ConfigPanel {
                 "A direct loopback Ollama endpoint can attach semantic context without this \
                  opt-in; inherited HTTP proxy settings disable that exemption. Enable it before \
                  Anthropic, OpenAI-compatible, or remote Ollama requests send the command, \
-                 working directory, and captured output.",
+                 working directory, and captured output. Native Codex redaction applies to this \
+                 initial attachment; Codex may separately send worktree files and tool output.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
         );
 
         ui.horizontal(|ui| {
-            ui.label("Agent turn budget:");
+            ui.label("Inline Agent turn budget:");
             if ui
                 .add(egui::Slider::new(&mut self.edit_agent_max_turns, 1..=100).show_value(true))
                 .changed()
@@ -1243,10 +1258,17 @@ impl ConfigPanel {
         }
         ui.label(
             RichText::new(
-                "Enables local task/worktree and Agent-terminal status UI. This does not grant cloud context sharing.",
+                "Enables isolated task worktrees and the one-shot native Codex app-server dashboard. This does not grant cloud command-context sharing.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
+        );
+        ui.label(
+            RichText::new(
+                "Native Codex writes are confined to the task worktree, but its current workspace-write sandbox may read other host files. Start it only when that provider access is acceptable.",
+            )
+            .size(11.0)
+            .color(ui.visuals().warn_fg_color),
         );
     }
 

@@ -1048,8 +1048,12 @@ impl TerminalApp {
     }
 
     fn start_agent_task_for_command(&mut self, target: &CommandTarget, intent: AgentTaskIntent) {
+        // With the Tasks dashboard enabled, fixing a failed command takes the
+        // provider-native path: first create the isolated worktree, then let
+        // the user explicitly start Codex with the configured sharing policy.
+        // Explain remains a read-only request in the legacy inline panel.
         let create_is_local_worktree =
-            intent == AgentTaskIntent::Compose && self.config.experimental_task_sidebar;
+            self.config.experimental_task_sidebar && intent == AgentTaskIntent::Fix;
         if !create_is_local_worktree && !self.config.ai_enabled {
             self.set_status_for(
                 "Enable AI in Settings before creating an Agent task",

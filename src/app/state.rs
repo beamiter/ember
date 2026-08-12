@@ -306,6 +306,10 @@ pub struct TerminalApp {
     /// Provider-neutral task registry. Agent PTYs are associated by stable
     /// session ID rather than by their mutable tab/pane indices.
     pub task_manager: crate::agent::TaskManager,
+    /// Owns live provider-native app-server workers and their bounded views.
+    /// This state is process-local and is never included in session
+    /// persistence; every child is cancelled and reaped during shutdown.
+    pub agent_runtime: crate::agent::AgentRuntimeManager,
     /// Background "is a newer jsh published?" check and the offer it produced.
     pub jsh_notice: crate::jsh_ui::JshNotice,
 

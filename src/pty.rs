@@ -54,7 +54,67 @@ impl PinnedDirectory {
         std::path::PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
     }
 
-    fn as_raw_fd(&self) -> RawFd {
+    /// Open a descendant directory without ever resolving a pathname from the
+    /// process root. Each component is resolved relative to an already-open
+    /// parent descriptor and rejects symlinks, `..`, and absolute paths.
+    ///
+    /// This closes the canonicalize-then-open race for nested task working
+    /// directories: replacing an ancestor with a symlink can no longer move
+    /// the returned capability outside `self`.
+    pub(crate) fn open_beneath(&self, relative: &std::path::Path) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Component;
+
+        if relative.is_absolute() {
+            return Err(anyhow!(
+                "cannot pin absolute descendant directory {}",
+                relative.display()
+            ));
+        }
+
+        let mut directory = self
+            .0
+            .try_clone()
+            .map_err(|error| anyhow!("cannot clone pinned directory: {error}"))?;
+        for component in relative.components() {
+            let name = match component {
+                Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!(
+                        "descendant directory contains an unsafe component: {}",
+                        relative.display()
+                    ));
+                }
+            };
+            let name = CString::new(name.as_bytes()).map_err(|_| {
+                anyhow!(
+                    "descendant directory contains a NUL byte: {}",
+                    relative.display()
+                )
+            })?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(anyhow!(
+                    "cannot pin descendant directory {}: {}",
+                    relative.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: `openat` returned a new owned descriptor on success.
+            directory = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        Ok(Self(directory))
+    }
+
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
         use std::os::fd::AsRawFd;
         self.0.as_raw_fd()
     }
@@ -1215,6 +1275,43 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
         assert_eq!(attempts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_descendant_rejects_symlinked_ancestors_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = ShellTestDir::new("pinned-beneath");
+        let outside = ShellTestDir::new("pinned-outside");
+        std::fs::create_dir_all(root.0.join("safe/nested")).unwrap();
+        std::fs::create_dir_all(outside.0.join("nested")).unwrap();
+        symlink(&outside.0, root.0.join("safe/redirect")).unwrap();
+
+        let pinned = super::PinnedDirectory::open(&root.0).unwrap();
+        let cloned_root = pinned.open_beneath(std::path::Path::new(".")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(cloned_root.proc_path()).unwrap(),
+            std::fs::canonicalize(&root.0).unwrap()
+        );
+        let nested = pinned.open_beneath(std::path::Path::new("safe/nested"));
+        assert!(nested.is_ok(), "ordinary descendants remain available");
+        assert!(pinned
+            .open_beneath(std::path::Path::new("safe/redirect/nested"))
+            .is_err());
+        assert!(pinned
+            .open_beneath(std::path::Path::new("../pinned-outside"))
+            .is_err());
+        assert!(pinned.open_beneath(&outside.0).is_err());
+
+        let moved = root.0.with_extension("moved");
+        std::fs::rename(&root.0, &moved).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(pinned.proc_path()).unwrap(),
+            std::fs::canonicalize(&moved).unwrap(),
+            "the descriptor remains anchored to the original inode after rename"
+        );
+        std::fs::rename(&moved, &root.0).unwrap();
     }
 
     #[cfg(unix)]

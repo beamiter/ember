@@ -267,8 +267,13 @@ pub fn prepare_task_validation(
             "task worktree has no managed-root parent".to_string(),
         )
     })?;
-    let mapped_path = worktree.join(relative_cwd);
-    let cwd = canonical_path(&mapped_path, TaskValidationPath::WorktreeCwd)?;
+    let pinned_root = crate::pty::PinnedDirectory::open(&worktree)
+        .map_err(|error| TaskValidationError::WorktreeIdentity(error.to_string()))?;
+    let pinned_cwd = pinned_root
+        .open_beneath(relative_cwd)
+        .map_err(|error| TaskValidationError::WorktreeIdentity(error.to_string()))?;
+    let pinned_path = pinned_cwd.proc_path();
+    let cwd = canonical_path(&pinned_path, TaskValidationPath::WorktreeCwd)?;
     if cwd != worktree && !cwd.starts_with(&worktree) {
         return Err(TaskValidationError::WorktreeCwdEscapesWorktree { cwd, worktree });
     }
@@ -278,9 +283,6 @@ pub fn prepare_task_validation(
             path: cwd,
         });
     }
-    let pinned_cwd = crate::pty::PinnedDirectory::open(&cwd)
-        .map_err(|error| TaskValidationError::WorktreeIdentity(error.to_string()))?;
-    let pinned_path = pinned_cwd.proc_path();
     super::worktree::WorktreeService::new(managed_root)
         .and_then(|service| {
             service.verify_active_task_worktree_through(
@@ -585,7 +587,7 @@ mod tests {
 
         assert!(matches!(
             prepare_task_validation(&task),
-            Err(TaskValidationError::WorktreeCwdEscapesWorktree { .. })
+            Err(TaskValidationError::WorktreeIdentity(_))
         ));
     }
 

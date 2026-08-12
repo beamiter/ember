@@ -2180,6 +2180,7 @@ impl TerminalApp {
             agent_panel: agent_panel::AgentPanel::new(),
             agent_diff: agent::AgentDiffPanel::new(),
             task_manager: agent::TaskManager::new(),
+            agent_runtime: agent::AgentRuntimeManager::new(),
             jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,
@@ -2820,6 +2821,7 @@ impl eframe::App for TerminalApp {
 
         self.debug_panel.record_frame();
         self.poll_task_creation(ctx);
+        self.poll_native_agent_runtime(ctx);
 
         // A stateful mouse edge admitted in an earlier frame is older than
         // every keyboard/IME event arriving now. Retry it before any session

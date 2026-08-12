@@ -147,6 +147,9 @@ pub enum TaskRuntimeKind {
     Unassigned,
     Terminal,
     Native,
+    /// A native attempt already consumed this task's one-shot authority; only
+    /// the opaque PTY compatibility path may be retried from here.
+    TerminalFallback,
 }
 
 impl TaskStatus {
@@ -301,6 +304,10 @@ pub enum TaskError {
         task_id: TaskId,
         session_id: String,
     },
+    TerminalFallbackUnavailable {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
     CannotArchiveRunning(TaskId),
 }
 
@@ -404,6 +411,11 @@ impl fmt::Display for TaskError {
                     "task {task_id} is already bound to session {session_id}"
                 )
             }
+            Self::TerminalFallbackUnavailable { task_id, status } => write!(
+                formatter,
+                "terminal fallback is unavailable for task {task_id} in state {}",
+                status.label()
+            ),
             Self::CannotArchiveRunning(task_id) => {
                 write!(formatter, "cannot archive running task {task_id}")
             }
@@ -509,20 +521,32 @@ impl TaskManager {
         self.native_event_streams.contains_key(&task_id)
     }
 
+    /// Return the product-level attention state for one task.
+    ///
+    /// A completed native turn briefly remains attached to its live provider
+    /// process while the runtime stops and reaps it. That is the only active
+    /// stream state we suppress: approval and human-input requests are
+    /// actionable precisely while their stream is active.
+    pub fn task_needs_attention(&self, task_id: TaskId) -> bool {
+        self.get(task_id).is_some_and(|task| {
+            task.status != TaskStatus::Archived
+                && task.needs_attention()
+                && !(task.status == TaskStatus::ReadyForReview
+                    && self.has_active_agent_event_stream(task.id))
+        })
+    }
+
     pub fn attention_count(&self) -> usize {
         self.tasks
             .iter()
-            .filter(|task| {
-                task.status != TaskStatus::Archived
-                    && task.needs_attention()
-                    && !self.has_active_agent_event_stream(task.id)
-            })
+            .filter(|task| self.task_needs_attention(task.id))
             .count()
     }
 
     /// Start a correlated event stream and atomically select the native
-    /// runtime for an unassigned task. An already-active stream must be
-    /// stopped through the runtime before it can be explicitly replaced.
+    /// runtime for an unassigned task. The product path is one-shot; an
+    /// already-active or previously finished native stream cannot be started
+    /// again through this entry point.
     pub fn start_agent_event_stream(
         &mut self,
         task_id: TaskId,
@@ -530,12 +554,47 @@ impl TaskManager {
         if self.native_event_streams.contains_key(&task_id) {
             return Err(AgentEventError::StreamAlreadyActive(task_id));
         }
+        let status = self
+            .get(task_id)
+            .ok_or(AgentEventError::UnknownTask(task_id))?
+            .status;
+        if status.is_terminal() {
+            return Err(AgentEventError::TerminalState { task_id, status });
+        }
+        // Install performs the higher-priority ownership gates first
+        // (terminal binding and active validation). Only then apply this
+        // product's one-shot lifecycle policy.
+        let (runtime_kind, terminal_bound, validation_running) = self
+            .get(task_id)
+            .map(|task| {
+                (
+                    task.runtime_kind,
+                    task.terminal_session_id.is_some(),
+                    task.validation.status == TaskValidationStatus::Running,
+                )
+            })
+            .ok_or(AgentEventError::UnknownTask(task_id))?;
+        if terminal_bound
+            || matches!(
+                runtime_kind,
+                TaskRuntimeKind::Terminal | TaskRuntimeKind::TerminalFallback
+            )
+        {
+            return Err(AgentEventError::TerminalSessionBound(task_id));
+        }
+        if validation_running {
+            return Err(AgentEventError::ValidationActive(task_id));
+        }
+        if status != TaskStatus::Created {
+            return Err(AgentEventError::NativeStartRequiresCreated { task_id, status });
+        }
         self.install_agent_event_stream(task_id, NativeAgentSessionId::new(), false)
     }
 
-    /// Rotate event correlation after the runtime has cancelled and reaped the
-    /// old adapter. The status is preserved across transport reconnection.
-    pub fn replace_agent_event_stream_after_stop(
+    /// Test-only transport-incarnation hook. The product's native Codex path
+    /// is deliberately one-shot and has no production restart authority.
+    #[cfg(test)]
+    fn replace_agent_event_stream_after_stop(
         &mut self,
         expected: &AgentEventStream,
     ) -> Result<AgentEventStream, AgentEventError> {
@@ -585,6 +644,36 @@ impl TaskManager {
         Ok(next)
     }
 
+    /// Undo native-runtime selection only when adapter startup returned before
+    /// creating a worker or provider process. The caller owns that pre-spawn
+    /// proof; this method contributes the stream-incarnation CAS so a stale
+    /// startup attempt cannot reset a replacement task.
+    pub(crate) fn rollback_agent_event_stream_before_spawn(
+        &mut self,
+        expected: &AgentEventStream,
+        detail: String,
+    ) -> Result<(), AgentEventError> {
+        let task_id = self.verify_agent_event_stream(expected)?;
+        let task = self
+            .task_mut(task_id)
+            .map_err(|_| AgentEventError::UnknownTask(task_id))?;
+        if task.status != TaskStatus::Starting || task.runtime_kind != TaskRuntimeKind::Native {
+            return Err(AgentEventError::InvalidTransition {
+                task_id,
+                status: task.status,
+                event: AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Failed,
+                },
+            });
+        }
+        task.runtime_kind = TaskRuntimeKind::Unassigned;
+        task.status = TaskStatus::Created;
+        task.status_detail = super::event::bounded_event_detail(Some(detail));
+        task.updated_at_ms = unix_time_ms();
+        self.native_event_streams.remove(&task_id);
+        Ok(())
+    }
+
     fn verify_agent_event_stream(
         &self,
         expected: &AgentEventStream,
@@ -627,7 +716,12 @@ impl TaskManager {
         if status.is_terminal() {
             return Err(AgentEventError::TerminalState { task_id, status });
         }
-        if terminal_bound || runtime_kind == TaskRuntimeKind::Terminal {
+        if terminal_bound
+            || matches!(
+                runtime_kind,
+                TaskRuntimeKind::Terminal | TaskRuntimeKind::TerminalFallback
+            )
+        {
             return Err(AgentEventError::TerminalSessionBound(task_id));
         }
         if validation_status == TaskValidationStatus::Running {
@@ -861,7 +955,9 @@ impl TaskManager {
                 session_id: existing_session_id.clone(),
             });
         }
-        task.runtime_kind = TaskRuntimeKind::Terminal;
+        if task.runtime_kind != TaskRuntimeKind::TerminalFallback {
+            task.runtime_kind = TaskRuntimeKind::Terminal;
+        }
         task.terminal_session_id = Some(session_id.clone());
         // PTY creation returns only after chdir + exec crossed the startup
         // pipe, so a successful binding is already a reliable Working signal.
@@ -869,6 +965,70 @@ impl TaskManager {
         task.status_detail = None;
         task.updated_at_ms = unix_time_ms();
         self.tasks_by_terminal_session.insert(session_id, task_id);
+        Ok(())
+    }
+
+    /// Explicitly continue a fully stopped failed native attempt through the
+    /// compatibility PTY. This is the sole deliberate recovery from the
+    /// otherwise sticky Failed state: it never runs while a native stream or
+    /// validation owns the task, and it preserves the isolated worktree and
+    /// any partial provider changes already made there.
+    pub fn prepare_terminal_fallback_after_native_failure(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<(), TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActive(task_id));
+        }
+        let task = self.task_mut(task_id)?;
+        if task.status != TaskStatus::Failed
+            || task.runtime_kind != TaskRuntimeKind::Native
+            || task.terminal_session_id.is_some()
+            || task.validation.status == TaskValidationStatus::Running
+        {
+            return Err(TaskError::TerminalFallbackUnavailable {
+                task_id,
+                status: task.status,
+            });
+        }
+        task.runtime_kind = TaskRuntimeKind::TerminalFallback;
+        task.status = TaskStatus::Created;
+        task.status_detail =
+            Some("Native Codex stopped; continuing in the terminal compatibility path".to_string());
+        task.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
+    /// Retry only a fully exited compatibility PTY after its non-zero or
+    /// status-less exit. The original native one-shot remains consumed.
+    pub fn prepare_terminal_fallback_retry(&mut self, task_id: TaskId) -> Result<(), TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActive(task_id));
+        }
+        let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
+        if task.status != TaskStatus::Failed
+            || task.runtime_kind != TaskRuntimeKind::TerminalFallback
+            || task.validation.status == TaskValidationStatus::Running
+        {
+            return Err(TaskError::TerminalFallbackUnavailable {
+                task_id,
+                status: task.status,
+            });
+        }
+        let old_session =
+            task.terminal_session_id
+                .clone()
+                .ok_or(TaskError::TerminalFallbackUnavailable {
+                    task_id,
+                    status: task.status,
+                })?;
+        self.tasks_by_terminal_session.remove(&old_session);
+        let task = self.task_mut(task_id)?;
+        task.terminal_session_id = None;
+        task.exit_code = None;
+        task.status = TaskStatus::Created;
+        task.status_detail = Some("Retrying the terminal compatibility path".to_string());
+        task.updated_at_ms = unix_time_ms();
         Ok(())
     }
 
@@ -1626,9 +1786,20 @@ mod tests {
             .apply_agent_event(stream.event(2, turn_started(turn), None))
             .unwrap();
         manager
-            .apply_agent_event(stream.event(3, turn_completed(turn), None))
+            .apply_agent_event(stream.event(3, approval_requested(turn), None))
+            .unwrap();
+        assert!(manager.task_needs_attention(id));
+        assert_eq!(manager.attention_count(), 1);
+        manager
+            .apply_agent_event(stream.event(4, work_resumed(turn), None))
+            .unwrap();
+        assert!(!manager.task_needs_attention(id));
+        assert_eq!(manager.attention_count(), 0);
+        manager
+            .apply_agent_event(stream.event(5, turn_completed(turn), None))
             .unwrap();
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert!(!manager.task_needs_attention(id));
         assert_eq!(manager.attention_count(), 0);
         assert_eq!(
             manager.next_validation_attempt(id),
@@ -1641,13 +1812,14 @@ mod tests {
 
         manager
             .apply_agent_event(stream.event(
-                4,
+                6,
                 AgentEventKind::SessionEnded {
                     outcome: AgentSessionOutcome::Clean,
                 },
                 None,
             ))
             .unwrap();
+        assert!(manager.task_needs_attention(id));
         assert_eq!(manager.attention_count(), 1);
         manager
             .bind_validation_session(id, "validation-after-stop".to_string())
@@ -1663,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn resuming_native_work_invalidates_the_previous_validation_result() {
+    fn one_shot_native_task_cannot_resume_after_validation() {
         let mut manager = TaskManager::new();
         let id = manager
             .create(new_task("invalidate stale validation"))
@@ -1697,24 +1869,24 @@ mod tests {
             TaskValidationStatus::Passed
         );
 
-        manager.start_agent_event_stream(id).unwrap();
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::NativeStartRequiresCreated {
+                task_id,
+                status: TaskStatus::ReadyForReview,
+            }) if task_id == id
+        ));
 
         let validation = &manager.get(id).unwrap().validation;
-        assert_eq!(validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(validation.status, TaskValidationStatus::Passed);
         assert_eq!(validation.attempt, 1);
-        assert!(validation.terminal_session_id.is_none());
-        assert!(validation
-            .status_detail
-            .as_deref()
-            .unwrap()
-            .contains("stale"));
+        assert_eq!(
+            validation.terminal_session_id.as_deref(),
+            Some("validation-before-resume")
+        );
         assert!(manager
             .task_for_terminal_session("validation-before-resume")
-            .is_none());
-        assert_eq!(
-            manager.complete_after_validation(id),
-            Err(TaskError::NativeEventStreamActive(id))
-        );
+            .is_some());
     }
 
     #[test]
@@ -2107,6 +2279,35 @@ mod tests {
     }
 
     #[test]
+    fn pre_spawn_native_rollback_restores_retryable_created_task() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("pre-spawn rollback")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+
+        manager
+            .rollback_agent_event_stream_before_spawn(
+                &stream,
+                "could not create worker thread".into(),
+            )
+            .unwrap();
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::Created);
+        assert_eq!(task.runtime_kind, TaskRuntimeKind::Unassigned);
+        assert!(!manager.has_active_agent_event_stream(id));
+        assert_eq!(
+            task.status_detail.as_deref(),
+            Some("could not create worker thread")
+        );
+
+        let replacement = manager.start_agent_event_stream(id).unwrap();
+        assert_ne!(stream.epoch(), replacement.epoch());
+        assert!(matches!(
+            manager.rollback_agent_event_stream_before_spawn(&stream, "stale".into()),
+            Err(AgentEventError::EpochMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn terminal_and_native_runtime_bindings_are_mutually_exclusive() {
         let mut terminal_manager = TaskManager::new();
         let terminal_task = terminal_manager.create(new_task("terminal mode")).unwrap();
@@ -2185,6 +2386,75 @@ mod tests {
                 status: TaskStatus::Failed,
             })
         );
+    }
+
+    #[test]
+    fn stopped_failed_native_task_can_explicitly_continue_in_terminal() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("native fallback")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                1,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Failed,
+                },
+                Some("app-server startup failed".into()),
+            ))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Failed);
+        assert_eq!(
+            manager.get(id).unwrap().runtime_kind,
+            TaskRuntimeKind::Native
+        );
+
+        manager
+            .prepare_terminal_fallback_after_native_failure(id)
+            .unwrap();
+        let recovered = manager.get(id).unwrap();
+        assert_eq!(recovered.status, TaskStatus::Created);
+        assert_eq!(recovered.runtime_kind, TaskRuntimeKind::TerminalFallback);
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == id
+        ));
+        manager
+            .update_status(
+                id,
+                TaskStatus::Created,
+                Some("first PTY launch failed".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get(id).unwrap().runtime_kind,
+            TaskRuntimeKind::TerminalFallback
+        );
+        manager
+            .bind_terminal_session(id, "native-fallback-terminal".to_string())
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
+        assert_eq!(
+            manager.get(id).unwrap().runtime_kind,
+            TaskRuntimeKind::TerminalFallback
+        );
+        manager.handle_terminal_session_exit("native-fallback-terminal", Some(7));
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Failed);
+        manager.prepare_terminal_fallback_retry(id).unwrap();
+        let retry = manager.get(id).unwrap();
+        assert_eq!(retry.status, TaskStatus::Created);
+        assert_eq!(retry.runtime_kind, TaskRuntimeKind::TerminalFallback);
+        assert!(retry.terminal_session_id.is_none());
+        assert!(manager
+            .task_for_terminal_session("native-fallback-terminal")
+            .is_none());
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == id
+        ));
+        manager
+            .bind_terminal_session(id, "native-fallback-terminal-2".to_string())
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
     }
 
     #[test]
@@ -2532,16 +2802,12 @@ mod tests {
             Err(AgentEventError::NoActiveStream(task_id)) if task_id == id
         ));
 
-        let resumed = manager.start_agent_event_stream(id).unwrap();
-        let resumed_turn = AgentTurnId::new();
-        manager
-            .apply_agent_event(resumed.event(1, session_started(), None))
-            .unwrap();
-        assert_eq!(
-            manager
-                .apply_agent_event(resumed.event(2, turn_started(resumed_turn), None))
-                .unwrap(),
-            TaskStatus::Working
-        );
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::NativeStartRequiresCreated {
+                task_id,
+                status: TaskStatus::ReadyForReview,
+            }) if task_id == id
+        ));
     }
 }

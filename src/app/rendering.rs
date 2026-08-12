@@ -1562,8 +1562,16 @@ impl TerminalApp {
                 }
                 config_panel::ConfigAction::SaveRequested => {
                     let bottom_bar_was = self.config.bottom_bar;
+                    let keep_tasks_visible = self.agent_runtime.has_any_running();
                     // Apply all buffered edit values to config
                     self.config_panel.apply_to_config(&mut self.config);
+                    if keep_tasks_visible && !self.config.experimental_task_sidebar {
+                        self.config.experimental_task_sidebar = true;
+                        self.set_status_for(
+                            "Tasks stays visible until the native Agent has fully stopped",
+                            std::time::Duration::from_secs(5),
+                        );
+                    }
                     // The bottom bar takes/returns a strip of window height;
                     // re-grid the PTY at once instead of waiting for the next
                     // natural resize.
@@ -1589,14 +1597,19 @@ impl TerminalApp {
                             );
                         }
                     }
+                    self.config_panel.sync_from_config(&self.config);
                 }
                 config_panel::ConfigAction::ResetToDefaults => {
                     let bottom_bar_was = self.config.bottom_bar;
+                    let keep_tasks_visible = self.agent_runtime.has_any_running();
                     // Replacing the whole struct (never field-by-field) is what
                     // makes Reset the escape hatch out of `Config::load_error`:
                     // an explicit reset is the one time overwriting a broken
                     // config file is what the user asked for.
                     self.config = config::Config::default();
+                    if keep_tasks_visible {
+                        self.config.experimental_task_sidebar = true;
+                    }
                     if self.config.bottom_bar != bottom_bar_was {
                         self.force_resize_session = true;
                     }

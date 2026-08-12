@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-12
+Updated: 2026-08-13
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,24 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- The experimental Tasks dashboard now has a real one-shot Codex app-server
+  runtime. It sends explicitly shared, bounded failed-command evidence over
+  Codex's structured JSONL protocol, reduces correlated lifecycle events into
+  task state, and retains bounded agent/command/file views. The provider runs
+  in a descriptor-pinned isolated worktree and transient user-systemd cgroup;
+  Ember publishes its terminal event only after the cgroup is empty and the
+  leader is reaped. File-change requests require an immutable, completely
+  displayable patch snapshot. Approval policy is fixed to `never`; any managed
+  request is display-and-deny only because accepted command or file actions are
+  not yet bound to Ember's descriptor capability. The provider gets a private
+  empty `CODEX_HOME`, an access-token-only external login, and a pre-thread
+  effective-config proof that rejects inherited MCP, hooks, plugins, apps,
+  project trust, and managed authority. Hosted search and tool network access
+  are disabled; the audited 0.147.0 protocol is version-gated, and tool
+  subprocesses get a separate no-login, proxy-free environment with a vetted
+  absolute PATH. Native failure keeps the worktree available for an explicit
+  PTY compatibility continuation; native session resume remains future work.
 
 - Agent tasks that are ready for review can now re-run their originating
   semantic command as a separate validation terminal inside the isolated
@@ -20,8 +38,8 @@ fail closed.
   or manually cancelled validation never turns into an Agent runtime failure.
   The Tasks card retains attempt/result state and exposes validation output,
   rerun, diff review, and an explicit pass-gated Mark complete action. Spawn is
-  gated before PTY creation while a native event stream is active; resuming
-  Agent work invalidates an older result; and validation uses non-login shell
+  gated before PTY creation while a native event stream is active; the current
+  native Codex path is one-shot; and validation uses non-login shell
   command mode plus no-rc/scrubbed startup hooks. The actual source-session
   shell identity is captured before config hot reloads, Git registration and
   branch identity are rechecked, and a descriptor-pinned cwd is carried from

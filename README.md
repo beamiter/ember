@@ -26,9 +26,11 @@ claimed.
   [semantic command timeline](docs/jsh-semantic-executions.md) (OSC 133)
 - Failed semantic commands expose Fix, Explain, Retry, and Create Agent Task
   actions. Agent tasks retain the selected command's stable source identity,
-  bounded C..D rendered-output snapshot and reported cwd, keep every proposed
-  command behind the existing approval/foreground-PTY gates, and can open a
-  bounded native Git diff review surface. A finished isolated task can rerun
+  bounded C..D rendered-output snapshot and reported cwd. Experimental Codex
+  tasks can run through the structured app-server protocol in a descriptor-
+  pinned isolated worktree, show agent output and exact display-and-deny
+  approval snapshots,
+  and open a bounded native Git diff review surface. A finished task can rerun
   its exact source command as a separate validation terminal and retain the
   passed / failed / needs-review result on the task card
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
@@ -95,6 +97,12 @@ Clipboard integration uses the first available backend:
 
 The application still starts if none is installed, but host clipboard actions
 will be unavailable.
+
+The experimental native Codex task path additionally requires the currently
+audited `codex-cli 0.147.0`, a ChatGPT login from `codex login`, a running
+per-user systemd manager, and unified cgroup v2 with `cgroup.kill`.
+If native startup fails and its containment is fully stopped, the task card
+offers an explicit continuation through the ordinary terminal CLI fallback.
 
 ## Build and run
 
@@ -272,17 +280,60 @@ fail closed until Ember has an explicit remote execution backend.
 The experimental **Tasks** dashboard can be enabled under **Settings → AI &
 Agent** (or with `experimental_task_sidebar = true`). It tracks provider,
 normalized lifecycle state, source-command provenance, an isolated worktree,
-and an attached Agent PTY by stable session ID rather than tab position. The
-compatibility adapter can resolve Codex, Claude, and OpenCode CLIs; the current
-failed-command action creates a Codex task by default, while provider selection
-and native event transports remain later roadmap stages. The opaque CLI bridge
-does not inject the saved command/output into the provider; that context stays
-inside Ember unless a separately consented native flow sends it. Closing a running
-Agent tab marks its task cancelled; a successful child exit becomes **Ready
-for review**, keeps the exited terminal transcript available, and diffs against
-the commit captured when the worktree was created, so Agent commits stay
-visible. Task metadata is currently runtime-only; **Hide task** only hides that
-metadata and deliberately leaves the active worktree untouched.
+and either an attached Agent PTY or native provider stream by stable identity
+rather than tab position. **Start Codex** is an explicit, one-shot native path:
+after both AI and command-context sharing are enabled, Ember sends a bounded,
+optionally redacted user prompt over Codex app-server's newline-delimited
+protocol and consumes structured turn, command, diff, approval, and completion
+events. The source cwd is mapped to the same repository-relative directory in
+the worktree. Both the root and nested cwd are opened as directory capabilities,
+not re-resolved pathname strings.
+
+Native Codex runs with approval policy `never`, hosted web search and tool
+network access disabled, and `/tmp` excluded from tool writable roots. Its
+tool-write capability is the descriptor-pinned worktree; the app-server keeps
+its own transient state in a separate Ember-owned private directory. Account
+default and remote execution environments are explicitly disabled for both
+the thread and turn. Provider
+transport to the configured Codex service still requires network access. If a
+managed Codex policy raises an approval request, Ember retains and shows the
+complete exact request but only allows **Deny**. Accepting either command or
+file-change approval is deliberately disabled in this first native slice,
+because an accepted action cannot yet be bound to Ember's pinned worktree and
+process containment. **Open terminal Agent** remains the opaque compatibility fallback
+and does not receive saved command/output context. Closing that PTY marks its
+task cancelled; a successful child exit becomes **Ready for review** and keeps
+the transcript available. Both paths diff against the commit captured when the
+worktree was created, so Agent commits stay visible.
+
+Ember stops the complete native cgroup, verifies it is empty, and reaps the
+provider before publishing the terminal event that unlocks validation. An
+out-of-scope guardian triggers `cgroup.kill` if Ember exits without its normal
+shutdown path. Initial redaction covers only the attached command, relative
+cwd, and captured terminal output; Codex may separately send worktree content
+and tool output according to its provider behavior. Task metadata is currently
+runtime-only; **Hide task** only hides that metadata and deliberately leaves the
+active worktree untouched.
+
+The native path does not load the user's Codex configuration, trust database,
+MCP servers, hooks, plugins, apps, or refresh token. Ember creates a private
+0700 `CODEX_HOME` with an empty config, passes only the current in-memory
+ChatGPT access grant through app-server's login RPC, and attests the effective
+config and its source layers before starting a thread. Project or managed
+configuration that cannot satisfy that proof fails closed and leaves the
+terminal compatibility continuation available. Tool subprocesses receive a
+separate no-login environment: only a vetted absolute PATH (including safe
+user-owned toolchain directories), the user's HOME, and basic locale/identity
+variables; proxy credentials and the provider's private state are not exposed.
+Because this relies on experimental app-server APIs, Ember currently gates the
+native path to the audited `codex-cli 0.147.0` protocol identity.
+
+The current Codex `workspaceWrite` policy confines writes but does not provide
+a general host-file read boundary. Starting native Codex therefore also trusts
+the installed Codex sandbox to read files available to it and potentially send
+their contents to the configured provider. Ember removes shell-startup hooks,
+user D-Bus access, and API-key environment variables from the provider child,
+but this is not a substitute for a filesystem-read sandbox.
 
 When an Agent process finishes successfully, **Run validation** executes the
 same exact, non-truncated single-line command that created the task. Ember maps
@@ -293,8 +344,9 @@ attempt as running, passed, failed, needs review (no authoritative exit
 status), or cancelled. A failed validation does not masquerade as an Agent
 runtime failure, and a passing validation still requires the explicit **Mark
 complete** action after diff review. Validation cannot start until a native
-Agent event stream has fully ended; resuming Agent work invalidates the prior
-result. The validation shell uses non-login command mode so a login profile
+Agent event stream has fully ended. The current native Codex path is one-shot;
+the terminal compatibility path is the explicit continuation after a failed
+native attempt. The validation shell uses non-login command mode so a login profile
 cannot silently move execution out of the checked worktree directory. Ember
 reuses the source terminal's captured shell identity, disables supported-shell
 startup files, verifies that Git still registers the exact task worktree and

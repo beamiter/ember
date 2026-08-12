@@ -372,6 +372,10 @@ pub enum AgentEventError {
     },
     NoActiveStream(TaskId),
     StreamAlreadyActive(TaskId),
+    NativeStartRequiresCreated {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
     ValidationActive(TaskId),
     TerminalSessionBound(TaskId),
     SessionMismatch(TaskId),
@@ -426,6 +430,11 @@ impl fmt::Display for AgentEventError {
             Self::StreamAlreadyActive(task_id) => write!(
                 formatter,
                 "task {task_id} already has an active native Agent event stream"
+            ),
+            Self::NativeStartRequiresCreated { task_id, status } => write!(
+                formatter,
+                "native Agent task {task_id} can start only from Created, not {}",
+                status.label()
             ),
             Self::ValidationActive(task_id) => write!(
                 formatter,

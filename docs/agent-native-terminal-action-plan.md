@@ -805,17 +805,19 @@ Goal: stop treating agents as opaque PTY applications.
 
 Deliverables:
 
-1. `AgentDriver` abstraction;
-2. `AgentEvent` normalization;
-3. Codex app-server driver;
+1. `AgentDriver` abstraction — implemented for the first Codex vertical slice;
+2. `AgentEvent` normalization — implemented with stream/turn correlation;
+3. Codex app-server driver — one-shot MVP implemented;
 4. Claude stream-json driver;
-5. native Agent Pane;
-6. **Fix this command**;
+5. native Agent Pane — initial Tasks-dashboard projection implemented;
+6. **Fix this command** — implemented for exact failed-command evidence;
 7. **Explain this command**;
 8. context references: `@last-error`, `@block`, `@pane`, `@selection`, `@git-diff`;
 9. `ember-mcp` read/context tools;
-10. ActionGate and native approval cards;
-11. provider session resume after Ember restart.
+10. ActionGate and native approval cards — exact display-and-deny cards implemented;
+    all native approvals remain non-accepting until granted actions can be
+    bound to the pinned worktree and containment boundary;
+11. provider session resume after Ember restart — not yet implemented.
 
 Exit condition:
 

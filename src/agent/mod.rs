@@ -11,6 +11,8 @@ pub mod driver;
 pub mod drivers;
 pub mod event;
 pub mod launcher;
+pub mod native;
+pub mod runtime;
 pub mod task;
 pub mod validation;
 pub mod worktree;
@@ -22,12 +24,25 @@ pub use driver::{
     AgentEventQueueStats, AgentEventReceiveError, AgentEventReceiver, AgentEventSendError,
     AgentEventSender, AgentEventSink, AgentPrompt, AgentStartRequest, ApprovalDecision,
 };
+pub use drivers::{
+    CodexAppServerApproval, CodexAppServerApprovalFileChange, CodexAppServerApprovalKind,
+    CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,
+    CodexAppServerFileChange, CodexAppServerFileChangeView, CodexAppServerPhase,
+    CodexAppServerProcessExit, CodexAppServerViewSnapshot,
+};
 pub use event::{
     AgentEvent, AgentEventEpoch, AgentEventError, AgentEventKind, AgentEventStream,
     AgentSessionOutcome, AgentTurnId, ApprovalId, InvalidNativeAgentSessionId,
     InvalidProviderSessionId, NativeAgentSessionId, ProviderSessionId,
 };
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
+pub use native::{
+    NativeCodexHomeError, NativePromptError, NativePromptPolicy, NativeWorkspaceError,
+};
+pub use runtime::{
+    AgentRuntimeCompletion, AgentRuntimeError, AgentRuntimeIssue, AgentRuntimeManager,
+    AgentRuntimePollReport,
+};
 pub use task::{
     AgentProvider, AgentTask, NewTask, TaskError, TaskId, TaskManager, TaskRuntimeKind, TaskSource,
     TaskStatus, TaskTerminalRole, TaskValidationState, TaskValidationStatus,
