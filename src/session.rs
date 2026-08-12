@@ -1,5 +1,5 @@
 use crate::shell::ShellSession;
-use crate::terminal::TerminalState;
+use crate::terminal::{ProjectionPolicy, ProjectionViewState, TerminalState};
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -123,6 +123,16 @@ pub struct Session {
     /// stream into the newly active terminal corrupts both its screen and its
     /// terminal modes.
     pub pending_output: Vec<u8>,
+    /// Session-owned view policy. Renderers are reused across tabs/panes and
+    /// must never carry collapse state or projected scroll between sessions.
+    pub projection_policy: ProjectionPolicy,
+    pub projection_view_state: ProjectionViewState,
+    /// Last policy/provenance generations whose requested collapses were
+    /// checked for permanent eviction. Rendering can then keep the P1
+    /// fail-closed cleanup off the steady-state frame path.
+    #[allow(dead_code)]
+    // Used by the binary app; the library Session type is built separately.
+    pub(crate) collapse_availability_cache: Option<(u64, u64)>,
 }
 
 impl Session {
@@ -184,6 +194,9 @@ impl Session {
             purpose: SessionPurpose::Interactive,
             pending_input: Vec::new(),
             pending_output: Vec::new(),
+            projection_policy: ProjectionPolicy::new(),
+            projection_view_state: ProjectionViewState::new(),
+            collapse_availability_cache: None,
         }
     }
 

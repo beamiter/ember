@@ -932,6 +932,8 @@ fn write_paste_to_session(
     let mut terminal = session.terminal.lock();
     terminal.note_user_input(&paste.bytes);
     terminal.scroll_to_bottom();
+    drop(terminal);
+    session.projection_view_state.scroll_to_bottom();
     Ok(true)
 }
 
@@ -1203,14 +1205,82 @@ fn link_at_pointer(
     if !content_rect.contains(pointer) || cols == 0 || rows == 0 {
         return None;
     }
-    let display =
-        grid_position_from_content(pointer, content_rect, char_width, line_height, cols, rows);
     let (row, col) =
-        viewport.application_cell(terminal::DisplayPoint::new(display.0, display.1))?;
+        grid_position_from_content(pointer, content_rect, char_width, line_height, cols, rows);
+    if viewport.is_transformed()
+        && viewport
+            .raw_anchor_at(terminal::DisplayPoint::new(row, col))
+            .is_none()
+    {
+        return None;
+    }
     links
         .iter()
         .find(|link| link.line == row && col >= link.col_start && col < link.col_end)
         .cloned()
+}
+
+fn projected_viewport_for_session(
+    session: &mut Session,
+    renderer: &TerminalRenderer,
+) -> terminal::ProjectedViewport {
+    let terminal = Arc::clone(&session.terminal);
+    let policy = &session.projection_policy;
+    let view_state = &mut session.projection_view_state;
+    let mut terminal = terminal.lock();
+    renderer.projected_viewport_with_state(&mut terminal, policy, view_state)
+}
+
+fn application_cell_at_pointer(
+    pointer: egui::Pos2,
+    content_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    viewport: &terminal::ProjectedViewport,
+) -> Option<(usize, usize)> {
+    let cols = viewport.columns();
+    let rows = viewport.rows();
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let (row, col) =
+        grid_position_from_content(pointer, content_rect, char_width, line_height, cols, rows);
+    viewport.application_cell(terminal::DisplayPoint::new(row, col))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AppMouseFrameRoute {
+    /// A pointer cell that may produce press, motion or wheel reports.
+    lossy_cell: Option<(usize, usize)>,
+    /// The last real raw cell is retained solely to pair an accepted press with
+    /// its release when the pointer leaves the app surface or its session.
+    release_cell: Option<(usize, usize)>,
+}
+
+fn app_mouse_press_reports_from_snapshot(
+    route_requested: bool,
+    application_cell: Option<(usize, usize)>,
+) -> bool {
+    route_requested && application_cell.is_some()
+}
+
+fn app_mouse_frame_route(
+    uses_active_projection: bool,
+    projected_pointer_cell: Option<Option<(usize, usize)>>,
+    captured_last_cell: Option<(usize, usize)>,
+) -> AppMouseFrameRoute {
+    if !uses_active_projection {
+        return AppMouseFrameRoute {
+            lossy_cell: None,
+            release_cell: captured_last_cell,
+        };
+    }
+
+    let lossy_cell = projected_pointer_cell.flatten();
+    AppMouseFrameRoute {
+        lossy_cell,
+        release_cell: lossy_cell.or(captured_last_cell),
+    }
 }
 
 const LINK_ACTIVATION_DRAG_THRESHOLD: f32 = 4.0;
@@ -3399,6 +3469,7 @@ impl eframe::App for TerminalApp {
             .is_some();
             if !user_input_flush_blocked && !session.pending_input.is_empty() {
                 session.terminal.lock().scroll_to_bottom();
+                session.projection_view_state.scroll_to_bottom();
                 match session.shell.write(&session.pending_input) {
                     Ok(()) => session.pending_input.clear(),
                     Err(error) => {
@@ -3738,8 +3809,15 @@ impl eframe::App for TerminalApp {
         });
 
         if let Some(amount) = scroll_amount {
-            let mut terminal = session.terminal.lock();
-            terminal.scroll(amount);
+            let renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            let viewport = projected_viewport_for_session(session, renderer);
+            if viewport.is_transformed() {
+                session.projection_view_state.scroll(amount, &viewport);
+            } else {
+                session.terminal.lock().scroll(amount);
+            }
         }
 
         let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
@@ -3756,146 +3834,18 @@ impl eframe::App for TerminalApp {
         let shift_mouse_bypass = ctx.input(|input| input.modifiers.shift);
         let pointer_pos =
             ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
-        let pointer_app_mouse_eligible = pointer_over_active_terminal
-            && pointer_pos.is_some_and(|pos| {
-                let renderer = active_pane_renderer_idx
-                    .and_then(|index| self.pane_renderers.get(index))
-                    .unwrap_or(&self.renderer);
-                let mut terminal = session.terminal.lock();
-                let viewport = renderer.projected_viewport(&mut terminal);
-                renderer.pointer_app_mouse_eligible_projected(&terminal, &viewport, pos)
-            });
+        let mut mouse_projection_viewport = {
+            let renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            projected_viewport_for_session(session, renderer)
+        };
 
-        // Resolve Ctrl-only link ownership before creating a PTY mouse
-        // capture. Host link activation owns this press on any real grid cell
-        // except a finished command header, so a mouse-reporting foreground
-        // application must never receive the same press as the host opener.
-        let link_press = ctx.input(|input| {
-            input
-                .pointer
-                .button_pressed(egui::PointerButton::Primary)
-                .then_some((
-                    input.modifiers.ctrl
-                        && !input.modifiers.shift
-                        && !input.modifiers.alt
-                        && !input.modifiers.command,
-                    input
-                        .pointer
-                        .button_double_clicked(egui::PointerButton::Primary)
-                        || input
-                            .pointer
-                            .button_triple_clicked(egui::PointerButton::Primary),
-                    input.pointer.interact_pos().or(input.pointer.hover_pos()),
-                ))
-        });
-        let mut link_press_override = false;
-        if let Some((ctrl_only, multiple_click, press_pos)) = link_press {
-            self.pending_link_activation = None;
-            if !terminal_pointer_input_blocked && ctrl_only && !multiple_click {
-                if let Some(origin) = press_pos {
-                    let renderer = active_pane_renderer_idx
-                        .and_then(|index| self.pane_renderers.get(index))
-                        .unwrap_or(&self.renderer);
-                    let mut terminal = session.terminal.lock();
-                    let viewport = renderer.projected_viewport(&mut terminal);
-                    if renderer.pointer_link_eligible_projected(&terminal, &viewport, origin) {
-                        let links = self
-                            .link_detector
-                            .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-                                viewport.cells(),
-                                viewport.row_wrapped(),
-                                |id| terminal.hyperlink_uri(id).map(str::to_owned),
-                            );
-                        let content_rect = renderer
-                            .last_content_rect
-                            .unwrap_or_else(|| ctx.viewport_rect());
-                        if let Some(link) = link_at_pointer(
-                            &links,
-                            origin,
-                            content_rect,
-                            renderer.char_width,
-                            renderer.line_height,
-                            &viewport,
-                        ) {
-                            self.pending_link_activation =
-                                Some(crate::app::state::PendingLinkActivation {
-                                    session_id: active_session_id.clone(),
-                                    link,
-                                    origin,
-                                    cancelled: false,
-                                    released_at: None,
-                                });
-                            link_press_override = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        let middle_paste_requested = session.purpose
-            != crate::session::SessionPurpose::RetainedCommand
-            && !terminal_pointer_input_blocked
-            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
-            && pointer_over_active_terminal
-            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
-
-        if middle_paste_requested {
-            if let Some(clipboard) = &self.clipboard {
-                let primary_text = clipboard.paste_primary().unwrap_or_default();
-                let text = if primary_text.is_empty() {
-                    clipboard.paste().unwrap_or_default()
-                } else {
-                    primary_text
-                };
-                let paste_result = paste_text_into_session(
-                    session,
-                    text,
-                    self.config.paste_confirm,
-                    PasteOrigin::Clipboard,
-                    false,
-                    crate::session_manager::user_input_flush_block(
-                        &session.metadata.session_id,
-                        mouse_input_barrier_session_id.as_deref(),
-                        &self.osc_paste_input_barriers,
-                        &active_protocol_responses,
-                    )
-                    .is_some(),
-                    &mut self.pending_paste_confirm,
-                );
-                match paste_result {
-                    Ok(true) if self.pending_paste_confirm.is_none() => {
-                        app::commands::clear_block_selection_state_for_session(
-                            &mut self.block_selection,
-                            &mut self.command_sidebar.selected,
-                            &active_session_id,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.status_message = format!("粘贴失败：{error}");
-                        self.status_expires_at =
-                            Some(std::time::Instant::now() + Duration::from_secs(4));
-                    }
-                }
-            }
-        }
-
-        // 鼠标滚轮处理：
-        // 1. 如果应用启用了鼠标报告（如 vim），滚轮会在下面的鼠标处理部分发送给应用
-        // 2. 如果应用未启用鼠标，或在普通终端，滚轮用于查看历史
-        if !terminal_pointer_input_blocked
-            && pointer_over_active_terminal
-            && scroll_delta != 0.0
-            && !ctrl_scroll_this_frame
-            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
-        {
-            // 0.35 阻尼系数：原始的 scroll_speed 直接乘 delta 会让单次滚轮累积约 7 倍位移，滑得太快
-            const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
-            self.smooth_scroll_velocity +=
-                scroll_delta * self.config.scroll_speed as f32 * SCROLL_VELOCITY_DAMPING;
-        }
-
-        // Smooth scroll physics
+        // Apply velocity already admitted by an earlier frame before taking
+        // ownership decisions for this frame. A wheel event admitted below is
+        // intentionally applied on the next frame, so no viewport mutation can
+        // split one pointer batch across two projection snapshots.
+        let mut viewport_changed_by_smooth_scroll = false;
         if self.smooth_scroll_velocity.abs() > 0.1 {
             self.smooth_scroll_velocity *= 0.88;
 
@@ -3907,7 +3857,14 @@ impl eframe::App for TerminalApp {
 
             // 抵达边界检测：在累积偏移前先看当前是否已到顶/到底(或处于备用屏幕)。
             // 若惯性继续往边界外推，会出现"跨行 → scroll 被钳制 → 偏移回弹"的逐帧抖动。
-            let mut hit_boundary = {
+            let transformed_scroll = mouse_projection_viewport.is_transformed();
+            let mut hit_boundary = if transformed_scroll {
+                let offset = session.projection_view_state.offset_from_bottom();
+                let at_top = offset >= mouse_projection_viewport.max_scroll_offset();
+                let at_bottom = offset == 0;
+                (self.smooth_scroll_velocity > 0.0 && at_top)
+                    || (self.smooth_scroll_velocity < 0.0 && at_bottom)
+            } else {
                 let terminal = session.terminal.lock();
                 let at_top = terminal.scroll_offset >= terminal.scrollback_len();
                 let at_bottom = terminal.scroll_offset == 0;
@@ -3921,12 +3878,31 @@ impl eframe::App for TerminalApp {
                 let lines = (self.smooth_scroll_pixel_offset / line_h) as isize;
                 if lines != 0 {
                     self.smooth_scroll_pixel_offset -= lines as f32 * line_h;
-                    let mut terminal = session.terminal.lock();
-                    let before = terminal.scroll_offset as isize;
-                    terminal.scroll(lines);
-                    // 实际移动行数不等于请求行数 => 在本帧触及边界，立即停下惯性。
-                    if terminal.scroll_offset as isize - before != lines {
-                        hit_boundary = true;
+                    if transformed_scroll {
+                        let before = session.projection_view_state.offset_from_bottom();
+                        session
+                            .projection_view_state
+                            .scroll(lines, &mouse_projection_viewport);
+                        let after = session.projection_view_state.offset_from_bottom();
+                        viewport_changed_by_smooth_scroll = after != before;
+                        let moved_fully = if lines > 0 {
+                            after.saturating_sub(before) == lines as usize
+                        } else {
+                            before.saturating_sub(after) == lines.unsigned_abs()
+                        };
+                        if !moved_fully {
+                            hit_boundary = true;
+                        }
+                    } else {
+                        let mut terminal = session.terminal.lock();
+                        let before = terminal.scroll_offset as isize;
+                        terminal.scroll(lines);
+                        viewport_changed_by_smooth_scroll =
+                            terminal.scroll_offset as isize != before;
+                        // 实际移动行数不等于请求行数 => 在本帧触及边界，立即停下惯性。
+                        if terminal.scroll_offset as isize - before != lines {
+                            hit_boundary = true;
+                        }
                     }
                 }
             }
@@ -3960,6 +3936,120 @@ impl eframe::App for TerminalApp {
                 self.renderer.scroll_pixel_offset = 0.0;
             }
         }
+
+        if viewport_changed_by_smooth_scroll {
+            let renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            mouse_projection_viewport = projected_viewport_for_session(session, renderer);
+        }
+
+        // Mouse ownership, coordinate mapping and link hit-testing below all
+        // consume this one post-scroll snapshot. Nothing below may mutate the
+        // raw or projected viewport until the pointer batch has been routed.
+        let pointer_app_mouse_eligible = pointer_over_active_terminal
+            && pointer_pos.is_some_and(|pos| {
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                let terminal = session.terminal.lock();
+                renderer.pointer_app_mouse_eligible_projected(
+                    &terminal,
+                    &mouse_projection_viewport,
+                    pos,
+                )
+            });
+
+        // Resolve Ctrl-only link ownership before creating a PTY mouse
+        // capture. Host link activation owns this press on any real grid cell
+        // except a finished command header, so a mouse-reporting foreground
+        // application must never receive the same press as the host opener.
+        let link_press = ctx.input(|input| {
+            input
+                .pointer
+                .button_pressed(egui::PointerButton::Primary)
+                .then_some((
+                    input.modifiers.ctrl
+                        && !input.modifiers.shift
+                        && !input.modifiers.alt
+                        && !input.modifiers.command,
+                    input
+                        .pointer
+                        .button_double_clicked(egui::PointerButton::Primary)
+                        || input
+                            .pointer
+                            .button_triple_clicked(egui::PointerButton::Primary),
+                    input.pointer.interact_pos().or(input.pointer.hover_pos()),
+                ))
+        });
+        let mut link_press_override = false;
+        if let Some((ctrl_only, multiple_click, press_pos)) = link_press {
+            self.pending_link_activation = None;
+            if !terminal_pointer_input_blocked && ctrl_only && !multiple_click {
+                if let Some(origin) = press_pos {
+                    let renderer = active_pane_renderer_idx
+                        .and_then(|index| self.pane_renderers.get(index))
+                        .unwrap_or(&self.renderer);
+                    let terminal = session.terminal.lock();
+                    if renderer.pointer_link_eligible_projected(
+                        &terminal,
+                        &mouse_projection_viewport,
+                        origin,
+                    ) {
+                        let links = self
+                            .link_detector
+                            .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+                                mouse_projection_viewport.cells(),
+                                mouse_projection_viewport.row_wrapped(),
+                                |id| terminal.hyperlink_uri(id).map(str::to_owned),
+                            );
+                        let content_rect = renderer
+                            .last_content_rect
+                            .unwrap_or_else(|| ctx.viewport_rect());
+                        if let Some(link) = link_at_pointer(
+                            &links,
+                            origin,
+                            content_rect,
+                            renderer.char_width,
+                            renderer.line_height,
+                            &mouse_projection_viewport,
+                        ) {
+                            self.pending_link_activation =
+                                Some(crate::app::state::PendingLinkActivation {
+                                    session_id: active_session_id.clone(),
+                                    link,
+                                    origin,
+                                    cancelled: false,
+                                    released_at: None,
+                                });
+                            link_press_override = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Host-owned wheel input is admitted only after the post-scroll
+        // snapshot has decided surface ownership. Its velocity starts next
+        // frame; applying it now could invalidate this same pointer batch.
+        if !terminal_pointer_input_blocked
+            && pointer_over_active_terminal
+            && scroll_delta != 0.0
+            && !ctrl_scroll_this_frame
+            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
+        {
+            const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
+            self.smooth_scroll_velocity +=
+                scroll_delta * self.config.scroll_speed as f32 * SCROLL_VELOCITY_DAMPING;
+            ctx.request_repaint();
+        }
+
+        let middle_paste_requested = session.purpose
+            != crate::session::SessionPurpose::RetainedCommand
+            && !terminal_pointer_input_blocked
+            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
+            && pointer_over_active_terminal
+            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
 
         // Step 11: 鼠标处理（包括滚轮）
         let terminal_button_pressed = ctx.input(|input| {
@@ -4002,7 +4092,7 @@ impl eframe::App for TerminalApp {
                 .last_content_rect
                 .unwrap_or_else(|| ctx.viewport_rect());
             let (mouse_cols, mouse_rows) = session.terminal.lock().get_dimensions();
-            let (last_row, last_col) = mouse_cell_for_current_dimensions(
+            let display_cell = mouse_cell_for_current_dimensions(
                 pointer_pos.or(Some(content_rect.center())),
                 None,
                 content_rect,
@@ -4011,12 +4101,29 @@ impl eframe::App for TerminalApp {
                 mouse_cols,
                 mouse_rows,
             );
-            let reported_to_app = mouse_press_reports_to_app(
-                mouse_enabled,
-                shift_mouse_bypass,
-                pointer_app_mouse_eligible,
-                link_press_override,
+            let application_cell = pointer_pos.and_then(|pointer| {
+                application_cell_at_pointer(
+                    pointer,
+                    content_rect,
+                    pointer_renderer.char_width,
+                    pointer_renderer.line_height,
+                    &mouse_projection_viewport,
+                )
+            });
+            let reported_to_app = app_mouse_press_reports_from_snapshot(
+                mouse_press_reports_to_app(
+                    mouse_enabled,
+                    shift_mouse_bypass,
+                    pointer_app_mouse_eligible,
+                    link_press_override,
+                ),
+                application_cell,
             );
+            let (last_row, last_col) = if reported_to_app {
+                application_cell.unwrap_or(display_cell)
+            } else {
+                display_cell
+            };
             self.terminal_mouse_capture = Some(crate::app::state::TerminalMouseCapture {
                 session_id: active_session_id.clone(),
                 reported_to_app,
@@ -4123,6 +4230,8 @@ impl eframe::App for TerminalApp {
                 None,
             )
         };
+        let mouse_uses_active_projection = mouse_session_id == active_session_id
+            && Arc::ptr_eq(&mouse_terminal, &session.terminal);
         let mut mouse_route_closed = false;
         let lossy_mouse_reports: Vec<Vec<u8>> = if (!sequence_reports_to_app
             || !pointer_routes_to_terminal
@@ -4149,17 +4258,24 @@ impl eframe::App for TerminalApp {
                 Vec::new()
             } else {
                 let mut reports = Vec::new();
-                let (mouse_cols, mouse_rows) = terminal.get_dimensions();
-                let (row, col) = mouse_cell_for_current_dimensions(
-                    pointer_pos,
+                let (_, mouse_rows) = terminal.get_dimensions();
+                let projected_pointer_cell = mouse_uses_active_projection.then(|| {
+                    pointer_pos.and_then(|pointer| {
+                        application_cell_at_pointer(
+                            pointer,
+                            content_rect,
+                            char_width,
+                            line_height,
+                            &mouse_projection_viewport,
+                        )
+                    })
+                });
+                let frame_route = app_mouse_frame_route(
+                    mouse_uses_active_projection,
+                    projected_pointer_cell,
                     fallback_cell,
-                    content_rect,
-                    char_width,
-                    line_height,
-                    mouse_cols,
-                    mouse_rows,
                 );
-                if pointer_pos.is_some() {
+                if let Some((row, col)) = frame_route.lossy_cell {
                     if let Some(capture) = self.terminal_mouse_capture.as_mut() {
                         if capture.session_id == mouse_session_id {
                             capture.last_col = col;
@@ -4168,7 +4284,9 @@ impl eframe::App for TerminalApp {
                     }
                 }
 
-                if !only_release {
+                if let Some((row, col)) =
+                    (!only_release).then_some(frame_route.lossy_cell).flatten()
+                {
                     // 处理鼠标滚轮（当启用鼠标报告时）
                     let line_h = line_height.max(1.0);
                     let mut discrete_scroll_steps: isize = 0;
@@ -4286,12 +4404,21 @@ impl eframe::App for TerminalApp {
                                 Some((mouse_session_id.clone(), col, row));
                         }
                     }
+                } else {
+                    // Synthetic summary/padding rows never become an app
+                    // surface. A capture whose terminal is no longer active is
+                    // release-only as well: never reinterpret the new pane's
+                    // display coordinates as the old PTY's raw grid. Do not
+                    // retain wheel fractions that could fire on re-entry.
+                    self.mouse_scroll_accumulator = 0.0;
                 }
 
                 // A release is emitted exactly once and only for a press
                 // captured by this terminal. Mode 1002 therefore cannot
                 // see an orphan release after a drag began elsewhere.
-                if let Some(button) = reported_capture_release {
+                if let (Some(button), Some((row, col))) =
+                    (reported_capture_release, frame_route.release_cell)
+                {
                     if let Some(report) = terminal.get_mouse_release_report(button, col, row) {
                         if let Some(capture) = self.terminal_mouse_capture.as_mut() {
                             queue_mouse_control(
@@ -4375,12 +4502,11 @@ impl eframe::App for TerminalApp {
             self.pending_link_activation = None;
         } else {
             let terminal_ptr = Arc::as_ptr(&session.terminal) as usize;
-            let mut terminal = session.terminal.lock();
+            let terminal = session.terminal.lock();
             let pointer = ctx.input(|input| input.pointer.hover_pos());
 
             self.hovered_link = if let Some(renderer_idx) = active_pane_renderer_idx {
-                let viewport = self.pane_renderers[renderer_idx].projected_viewport(&mut terminal);
-                let projection_key = viewport.key();
+                let projection_key = mouse_projection_viewport.key();
                 let needs_refresh = self
                     .pane_renderers
                     .get(renderer_idx)
@@ -4392,8 +4518,8 @@ impl eframe::App for TerminalApp {
                     let links = self
                         .link_detector
                         .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-                            viewport.cells(),
-                            viewport.row_wrapped(),
+                            mouse_projection_viewport.cells(),
+                            mouse_projection_viewport.row_wrapped(),
                             |id| terminal.hyperlink_uri(id).map(str::to_owned),
                         );
                     if let Some(renderer) = self.pane_renderers.get_mut(renderer_idx) {
@@ -4412,20 +4538,19 @@ impl eframe::App for TerminalApp {
                             rect,
                             renderer.char_width,
                             renderer.line_height,
-                            &viewport,
+                            &mouse_projection_viewport,
                         )
                     })
             } else {
-                let viewport = self.renderer.projected_viewport(&mut terminal);
-                let projection_key = viewport.key();
+                let projection_key = mouse_projection_viewport.key();
                 if self.cached_links_projection_key != Some(projection_key)
                     || terminal_ptr != self.cached_links_terminal_ptr
                 {
                     self.cached_links = self
                         .link_detector
                         .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-                            viewport.cells(),
-                            viewport.row_wrapped(),
+                            mouse_projection_viewport.cells(),
+                            mouse_projection_viewport.row_wrapped(),
                             |id| terminal.hyperlink_uri(id).map(str::to_owned),
                         );
                     self.cached_links_projection_key = Some(projection_key);
@@ -4440,7 +4565,7 @@ impl eframe::App for TerminalApp {
                             rect,
                             self.renderer.char_width,
                             self.renderer.line_height,
-                            &viewport,
+                            &mouse_projection_viewport,
                         )
                     })
             };
@@ -4448,8 +4573,7 @@ impl eframe::App for TerminalApp {
                 let renderer = active_pane_renderer_idx
                     .and_then(|index| self.pane_renderers.get(index))
                     .unwrap_or(&self.renderer);
-                let viewport = renderer.projected_viewport(&mut terminal);
-                renderer.pointer_link_eligible_projected(&terminal, &viewport, pos)
+                renderer.pointer_link_eligible_projected(&terminal, &mouse_projection_viewport, pos)
             });
             drop(terminal);
             if self.hovered_link.is_some() && hovered_link_eligible {
@@ -4567,6 +4691,50 @@ impl eframe::App for TerminalApp {
                 };
                 self.status_message = msg;
                 self.status_expires_at = Some(std::time::Instant::now() + dur);
+            }
+        }
+
+        // A host-owned middle click may scroll both raw and projected views to
+        // the bottom. Run it only after every consumer of the immutable mouse
+        // snapshot above has finished, so it cannot retarget this pointer batch.
+        if middle_paste_requested {
+            if let Some(clipboard) = &self.clipboard {
+                let primary_text = clipboard.paste_primary().unwrap_or_default();
+                let text = if primary_text.is_empty() {
+                    clipboard.paste().unwrap_or_default()
+                } else {
+                    primary_text
+                };
+                let paste_result = paste_text_into_session(
+                    session,
+                    text,
+                    self.config.paste_confirm,
+                    PasteOrigin::Clipboard,
+                    false,
+                    crate::session_manager::user_input_flush_block(
+                        &session.metadata.session_id,
+                        mouse_input_barrier_session_id.as_deref(),
+                        &self.osc_paste_input_barriers,
+                        &active_protocol_responses,
+                    )
+                    .is_some(),
+                    &mut self.pending_paste_confirm,
+                );
+                match paste_result {
+                    Ok(true) if self.pending_paste_confirm.is_none() => {
+                        app::commands::clear_block_selection_state_for_session(
+                            &mut self.block_selection,
+                            &mut self.command_sidebar.selected,
+                            &active_session_id,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.status_message = format!("粘贴失败：{error}");
+                        self.status_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(4));
+                    }
+                }
             }
         }
 
@@ -4730,15 +4898,17 @@ impl Drop for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::{
+        app_mouse_frame_route, app_mouse_press_reports_from_snapshot, application_cell_at_pointer,
         bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, kitty_graphics_payload, link_activation_dragged,
-        link_activation_ready, link_activation_release_allowed, mouse_capture_accepts_new_press,
-        mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
-        mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
-        normalized_paste_body, osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows,
-        paste_policy, paste_requires_confirmation, primary_copy_route, queue_mouse_control,
+        link_activation_ready, link_activation_release_allowed, link_at_pointer,
+        mouse_capture_accepts_new_press, mouse_cell_for_current_dimensions,
+        mouse_lossy_reports_allowed, mouse_press_reports_to_app, mouse_protocol_input_is_blocked,
+        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
+        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
+        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
         workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification, PasteOrigin,
@@ -4753,6 +4923,151 @@ mod tests {
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+
+    #[test]
+    fn transformed_pointer_mapping_rejects_summary_and_reports_raw_grid_coordinates() {
+        let mut terminal = crate::terminal::TerminalState::new(12, 6);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;C;id=fold\x07OUT\r\nMORE\x1b]133;D;0;id=fold\x07",
+        );
+        let zone_id = terminal.command_records().back().unwrap().sequence;
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let mut view_state = crate::terminal::ProjectionViewState::new();
+        let bottom = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut view_state,
+        );
+        view_state.set_offset(bottom.max_scroll_offset(), &bottom);
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut view_state,
+        );
+        let summary_row = viewport
+            .row_kinds()
+            .iter()
+            .position(|kind| {
+                matches!(
+                    kind,
+                    crate::terminal::ProjectedRowKind::CollapsedSummary { .. }
+                )
+            })
+            .expect("collapsed output should have a visible summary");
+        let (live_row, raw_cell) = (0..viewport.rows())
+            .find_map(|row| {
+                viewport
+                    .application_cell(crate::terminal::DisplayPoint::new(row, 0))
+                    .map(|raw| (row, raw))
+            })
+            .expect("the transformed viewport should retain a live grid row");
+        let char_width = 10.0;
+        let line_height = 10.0;
+        let rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                viewport.columns() as f32 * char_width,
+                viewport.rows() as f32 * line_height,
+            ),
+        );
+        let pointer = |row| egui::pos2(5.0, row as f32 * line_height + 5.0);
+
+        assert_eq!(
+            application_cell_at_pointer(
+                pointer(summary_row),
+                rect,
+                char_width,
+                line_height,
+                &viewport,
+            ),
+            None
+        );
+        assert_eq!(
+            application_cell_at_pointer(
+                pointer(live_row),
+                rect,
+                char_width,
+                line_height,
+                &viewport,
+            ),
+            Some(raw_cell)
+        );
+
+        let link = crate::link::Link {
+            line: summary_row,
+            col_start: 0,
+            col_end: 1,
+            link_type: crate::link::LinkType::Url,
+            text: "https://example.test".to_owned(),
+        };
+        assert_eq!(
+            link_at_pointer(
+                &[link],
+                pointer(summary_row),
+                rect,
+                char_width,
+                line_height,
+                &viewport,
+            ),
+            None
+        );
+
+        let live_link = crate::link::Link {
+            line: live_row,
+            col_start: 0,
+            col_end: 1,
+            link_type: crate::link::LinkType::Url,
+            text: "https://visible.example.test".to_owned(),
+        };
+        assert_eq!(
+            link_at_pointer(
+                std::slice::from_ref(&live_link),
+                pointer(live_row),
+                rect,
+                char_width,
+                line_height,
+                &viewport,
+            ),
+            Some(live_link)
+        );
+
+        assert!(!app_mouse_press_reports_from_snapshot(
+            true,
+            application_cell_at_pointer(
+                pointer(summary_row),
+                rect,
+                char_width,
+                line_height,
+                &viewport,
+            )
+        ));
+        assert!(app_mouse_press_reports_from_snapshot(
+            true,
+            application_cell_at_pointer(
+                pointer(live_row),
+                rect,
+                char_width,
+                line_height,
+                &viewport,
+            )
+        ));
+
+        let summary_route = app_mouse_frame_route(true, Some(None), Some(raw_cell));
+        assert_eq!(summary_route.lossy_cell, None);
+        assert_eq!(summary_route.release_cell, Some(raw_cell));
+    }
+
+    #[test]
+    fn inactive_mouse_capture_uses_only_its_last_raw_cell_for_release() {
+        let last_raw_cell = (2, 7);
+        let route = app_mouse_frame_route(false, Some(Some((99, 101))), Some(last_raw_cell));
+
+        assert_eq!(route.lossy_cell, None);
+        assert_eq!(route.release_cell, Some(last_raw_cell));
+    }
 
     #[test]
     fn pointer_gone_cancels_a_held_workspace_drag_but_release_gets_one_frame_to_commit() {

@@ -1,11 +1,1333 @@
 use super::hyperlink::{MAX_OSC8_PARAMS_BYTES, MAX_OSC8_URI_BYTES};
+use super::state::{
+    PROJECTION_PLAN_BUILD_COUNT, PROJECTION_PLAN_HISTORY_LAYOUT_VISITS,
+    PROJECTION_PLAN_ORACLE_HISTORY_DECOMPRESSES, PROJECTION_VIEW_HISTORY_DECOMPRESSES,
+    VISIBLE_CELLS_RECYCLE_COUNT,
+};
 use super::{
     ClipboardReadKind, ClipboardReadRequest, Color, CommandState, DisplayPoint, ExtractedText,
-    HistoryProjection, HyperlinkId, RawCellAnchor, RawRowId, ScrollbackLine, TerminalCell,
-    TerminalState, UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES,
-    MAX_COMPLETED_COMMAND_OUTPUT_BYTES, MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES,
-    MAX_PENDING_ESCAPE,
+    HistoryProjection, HyperlinkId, ProjectedBufferAnchorLocation, ProjectedRowKind,
+    ProjectionPolicy, ProjectionViewState, RawCellAnchor, RawRowId, ScrollbackLine, TerminalCell,
+    TerminalState, UnderlineStyle, FINISHED_OUTPUT_EVICTION_ROW_CHECKS,
+    MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMMAND_MARKS, MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
+    MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE,
 };
+
+fn emit_completed_block(terminal: &mut TerminalState, index: usize) -> u64 {
+    terminal.process_input(
+        format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07cmd-{index}\r\n\x1b]133;C\x07out-{index}\r\n\x1b]133;D;0\x07"
+        )
+        .as_bytes(),
+    );
+    terminal.command_records().back().unwrap().sequence
+}
+
+#[test]
+fn collapsed_projection_changes_document_without_mutating_raw_terminal() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal
+        .process_input(b"\x1b]133;A\x07\x1b]133;C;id=fold\x07OUT\r\nMORE\x1b]133;D;0;id=fold\x07");
+    let record = terminal.command_records().back().unwrap();
+    let zone_id = record.sequence;
+    let range = terminal.finished_output_range(zone_id).unwrap();
+    let raw_grid: Vec<_> = terminal.grid.iter().map(|row| row.to_vec()).collect();
+    let raw_grid_ids = terminal.grid.row_ids.clone();
+    let raw_scrollback_ids: Vec<_> = terminal
+        .scrollback
+        .iter()
+        .map(ScrollbackLine::raw_row_id)
+        .collect();
+    let raw_scrollback: Vec<_> = terminal
+        .scrollback
+        .iter()
+        .map(ScrollbackLine::decompress)
+        .collect();
+    let raw_version = terminal.grid_version;
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut view_state = ProjectionViewState::new();
+
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut view_state,
+    );
+
+    assert!(viewport.is_transformed());
+    assert!(viewport.effective_collapsed().contains(&zone_id));
+    assert_eq!(
+        viewport
+            .row_kinds()
+            .iter()
+            .filter(|kind| matches!(kind, ProjectedRowKind::CollapsedSummary { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: range.start.row,
+            column: range.start.col,
+        }),
+        None
+    );
+    let current_grid: Vec<_> = terminal.grid.iter().map(|row| row.to_vec()).collect();
+    assert_cell_grids_equal(&current_grid, &raw_grid, "collapse raw grid");
+    assert_eq!(terminal.grid.row_ids, raw_grid_ids);
+    let current_scrollback: Vec<_> = terminal
+        .scrollback
+        .iter()
+        .map(ScrollbackLine::decompress)
+        .collect();
+    assert_cell_grids_equal(
+        &current_scrollback,
+        &raw_scrollback,
+        "collapse raw scrollback",
+    );
+    assert_eq!(
+        terminal
+            .scrollback
+            .iter()
+            .map(ScrollbackLine::raw_row_id)
+            .collect::<Vec<_>>(),
+        raw_scrollback_ids
+    );
+    assert_eq!(terminal.grid_version, raw_version);
+
+    assert!(policy.expand(zone_id));
+    let identity = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut view_state,
+    );
+    let legacy = terminal.get_visible_cells();
+    assert!(!identity.is_transformed());
+    assert!(std::sync::Arc::ptr_eq(&identity.cells_arc(), &legacy));
+}
+
+#[test]
+fn same_row_output_suffix_keeps_columns_around_a_hard_summary() {
+    let mut terminal = TerminalState::new(12, 4);
+    terminal
+        .process_input(b"\x1b]133;A\x07P>\x1b]133;C;id=same\x07OUT\x1b]133;D;0;id=same\x07TAIL");
+    let zone_id = terminal.command_records().back().unwrap().sequence;
+    let range = terminal.finished_output_range(zone_id).unwrap();
+    assert_eq!((range.start.col, range.end.col), (2, 5));
+    let mut policy = ProjectionPolicy::new();
+    policy.collapse(zone_id);
+    let mut state = ProjectionViewState::new();
+    let bottom = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    state.set_offset(bottom.max_scroll_offset(), &bottom);
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let summary = viewport
+        .row_kinds()
+        .iter()
+        .position(|kind| matches!(kind, ProjectedRowKind::CollapsedSummary { .. }))
+        .unwrap();
+    assert!(summary > 0 && summary + 1 < viewport.rows());
+    assert_eq!(viewport.cells()[summary - 1][0].character, 'P');
+    assert_eq!(viewport.cells()[summary - 1][1].character, '>');
+    assert_eq!(viewport.cells()[summary + 1][5].character, 'T');
+    assert!(!viewport.row_wrapped()[summary]);
+    assert_eq!(viewport.raw_anchor_at(DisplayPoint::new(summary, 0)), None);
+}
+
+#[test]
+fn transformed_selection_copies_only_visible_fragments_across_one_hard_barrier() {
+    let mut terminal = TerminalState::new(12, 4);
+    terminal
+        .process_input(b"\x1b]133;A\x07P>\x1b]133;C;id=same\x07OUT\x1b]133;D;0;id=same\x07TAIL");
+    let zone_id = terminal.command_records().back().unwrap().sequence;
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    let bottom = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    state.set_offset(bottom.max_scroll_offset(), &bottom);
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let summary = viewport
+        .row_kinds()
+        .iter()
+        .position(|kind| matches!(kind, ProjectedRowKind::CollapsedSummary { .. }))
+        .unwrap();
+
+    terminal.start_selection_projected(&viewport, (summary - 1, 0));
+    terminal.update_selection_projected(&viewport, (summary + 1, 8));
+
+    assert_eq!(terminal.copy_selection().as_deref(), Some("P>\nTAIL"));
+    assert_eq!(
+        terminal.row_selection_cols_projected(&viewport, summary - 1),
+        Some((0, 1))
+    );
+    assert_eq!(
+        terminal.row_selection_cols_projected(&viewport, summary),
+        None
+    );
+    assert_eq!(
+        terminal.row_selection_cols_projected(&viewport, summary + 1),
+        Some((5, 8))
+    );
+    assert!(!terminal.copy_selection().unwrap().contains("OUT"));
+
+    // Column two is structural space left by the same-row prefix splice.
+    terminal.start_selection_projected(&viewport, (summary - 1, 2));
+    assert!(!terminal.has_text_selection());
+    terminal.start_selection_projected(&viewport, (summary, 0));
+    assert!(!terminal.has_text_selection());
+}
+
+#[test]
+fn transformed_empty_raw_row_selects_but_padding_and_summary_do_not() {
+    let mut terminal = TerminalState::new(12, 8);
+    terminal.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07",
+    );
+    terminal.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07hide\r\nmore\r\n\x1b]133;D;0\x07",
+    );
+    let first_id = terminal.command_records()[0].sequence;
+    let blank_id = terminal
+        .finished_output_range(first_id)
+        .expect("blank output range")
+        .start
+        .row;
+    let hidden_id = terminal.command_records()[1].sequence;
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(hidden_id));
+    let mut state = ProjectionViewState::new();
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let blank_row = viewport
+        .raw_row_view_bounds(blank_id)
+        .expect("empty raw row stays addressable")
+        .0;
+    terminal.start_selection_projected(&viewport, (blank_row, 0));
+    terminal.update_selection_projected(&viewport, (blank_row, 5));
+    assert_eq!(terminal.copy_selection().as_deref(), Some("      "));
+
+    let summary = viewport
+        .row_kinds()
+        .iter()
+        .position(|kind| matches!(kind, ProjectedRowKind::CollapsedSummary { .. }))
+        .unwrap();
+    terminal.start_selection_projected(&viewport, (summary, 0));
+    assert!(!terminal.has_text_selection());
+    if let Some(padding) = viewport
+        .row_kinds()
+        .iter()
+        .position(|kind| matches!(kind, ProjectedRowKind::Padding))
+    {
+        terminal.start_selection_projected(&viewport, (padding, 0));
+        assert!(!terminal.has_text_selection());
+    }
+}
+
+#[test]
+fn transformed_wide_selection_normalizes_continuation_and_highlights_whole_glyph() {
+    let mut terminal = TerminalState::new(12, 6);
+    terminal.process_input(
+        "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07中\r\n\x1b]133;D;0\x07".as_bytes(),
+    );
+    terminal.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07hide\r\n\x1b]133;D;0\x07",
+    );
+    let hidden_id = terminal.command_records()[1].sequence;
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(hidden_id));
+    let mut state = ProjectionViewState::new();
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let (row, body) = viewport
+        .cells()
+        .iter()
+        .enumerate()
+        .find_map(|(row, cells)| {
+            cells
+                .iter()
+                .position(|cell| cell.character == '中')
+                .map(|col| (row, col))
+        })
+        .unwrap();
+    assert!(viewport.cells()[row][body + 1].flags.wide_continuation());
+
+    terminal.start_selection_projected(&viewport, (row, body + 1));
+
+    assert_eq!(terminal.copy_selection().as_deref(), Some("中"));
+    assert_eq!(
+        terminal.row_selection_cols_projected(&viewport, row),
+        Some((body, body + 1))
+    );
+}
+
+#[test]
+fn transformed_block_selection_expands_a_middle_row_wide_continuation() {
+    let mut terminal = TerminalState::new(12, 10);
+    terminal.process_input(
+        "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07ab\r\n中x\r\ncd\x1b]133;D;0\x07"
+            .as_bytes(),
+    );
+    terminal.process_input(
+        b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07hide\x1b]133;D;0\x07",
+    );
+    let hidden_id = terminal.command_records()[1].sequence;
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(hidden_id));
+    let mut state = ProjectionViewState::new();
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let (middle_row, body) = viewport
+        .cells()
+        .iter()
+        .enumerate()
+        .find_map(|(row, cells)| {
+            cells
+                .iter()
+                .position(|cell| cell.character == '中')
+                .map(|column| (row, column))
+        })
+        .unwrap();
+    let continuation = body + 1;
+    assert!(middle_row > 0 && middle_row + 1 < viewport.rows());
+    assert_eq!(
+        viewport.cells()[middle_row - 1][continuation].character,
+        'b'
+    );
+    assert!(viewport.cells()[middle_row][continuation]
+        .flags
+        .wide_continuation());
+    assert_eq!(
+        viewport.cells()[middle_row + 1][continuation].character,
+        'd'
+    );
+
+    terminal.start_block_selection_projected(&viewport, (middle_row - 1, continuation));
+    terminal.update_selection_projected(&viewport, (middle_row + 1, continuation));
+
+    assert_eq!(terminal.copy_selection().as_deref(), Some("b\n中\nd"));
+    assert_eq!(
+        terminal.row_selection_cols_projected(&viewport, middle_row),
+        Some((body, continuation))
+    );
+}
+
+#[test]
+fn transformed_selection_is_plan_stable_and_fails_closed_after_rebuild() {
+    let mut terminal = TerminalState::new(20, 8);
+    let ids: Vec<_> = (0..3)
+        .map(|index| emit_completed_block(&mut terminal, index))
+        .collect();
+    let mut first_policy = ProjectionPolicy::new();
+    assert!(first_policy.collapse(ids[0]));
+    let mut first_state = ProjectionViewState::new();
+    let first = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &first_policy,
+        &mut first_state,
+    );
+    let visible = first
+        .cells()
+        .iter()
+        .enumerate()
+        .find_map(|(row, cells)| {
+            cells
+                .iter()
+                .position(|cell| cell.character == 'o')
+                .map(|col| (row, col))
+        })
+        .unwrap();
+    terminal.start_selection_projected(&first, visible);
+    let selection_revision = terminal.selection_revision();
+    let same = terminal.projected_viewport_with_state(
+        HistoryProjection::identity_at_revision(99),
+        true,
+        &first_policy,
+        &mut first_state,
+    );
+    assert_eq!(same.plan_revision(), first.plan_revision());
+    assert_eq!(terminal.selection_revision(), selection_revision);
+    assert!(terminal.copy_selection().is_some());
+
+    // A different exact policy can carry the same public policy revision.
+    let mut second_policy = ProjectionPolicy::new();
+    assert!(second_policy.collapse(ids[1]));
+    assert_eq!(second_policy.revision(), first_policy.revision());
+    let mut second_state = ProjectionViewState::new();
+    let second = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &second_policy,
+        &mut second_state,
+    );
+    assert_ne!(second.plan_revision(), first.plan_revision());
+    assert!(!terminal.has_text_selection());
+    assert_eq!(terminal.copy_selection(), None);
+
+    terminal.start_selection_projected(
+        &second,
+        second
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .position(|cell| cell.character == '$')
+                    .map(|col| (row, col))
+            })
+            .unwrap(),
+    );
+    terminal.on_resize(20, 7);
+    assert_eq!(terminal.copy_selection(), None);
+    assert_eq!(
+        terminal.row_selection_cols_projected(&second, visible.0),
+        None
+    );
+}
+
+#[test]
+fn transformed_and_bypass_selection_spaces_are_mutually_exclusive() {
+    let mut terminal = TerminalState::new(16, 6);
+    let hidden_id = emit_completed_block(&mut terminal, 0);
+    emit_completed_block(&mut terminal, 1);
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(hidden_id));
+    let mut state = ProjectionViewState::new();
+    let transformed = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let real = transformed
+        .row_kinds()
+        .iter()
+        .position(|kind| matches!(kind, ProjectedRowKind::Raw))
+        .unwrap();
+    terminal.start_selection_projected(&transformed, (real, 0));
+    assert!(terminal.has_text_selection());
+
+    let bypass = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        false,
+        &policy,
+        &mut state,
+    );
+    assert!(!bypass.is_transformed());
+    assert!(!terminal.has_text_selection());
+    terminal.start_selection_projected(&bypass, (0, 0));
+    assert!(terminal.selection.is_some());
+
+    let _transformed_again = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(terminal.selection.is_none());
+    assert!(!terminal.has_text_selection());
+}
+
+#[test]
+fn projected_buffer_anchor_reveal_classifies_visible_hidden_and_identity_exactly() {
+    let mut terminal = TerminalState::new(16, 4);
+    let mut ids = Vec::new();
+    let mut anchors = Vec::new();
+    for index in 0..8 {
+        ids.push(emit_completed_block(&mut terminal, index));
+        anchors.push(
+            terminal
+                .command_records()
+                .back()
+                .and_then(|record| record.output_start)
+                .unwrap(),
+        );
+    }
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(ids[5]));
+    let mut state = ProjectionViewState::new();
+    let initial = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    state.set_offset(1, &initial);
+    let before_hidden = state.offset_from_bottom();
+
+    assert_eq!(
+        terminal.reveal_buffer_anchor_in_projection(&policy, &mut state, anchors[5]),
+        ProjectedBufferAnchorLocation::Hidden { zone_id: ids[5] }
+    );
+    assert_eq!(state.offset_from_bottom(), before_hidden);
+
+    assert!(terminal.reveal_collapsed_summary(&policy, &mut state, ids[5]));
+    let summary_view = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(summary_view.row_kinds().iter().any(|kind| {
+        matches!(kind, ProjectedRowKind::CollapsedSummary { key, .. } if key.zone_id == ids[5])
+    }));
+
+    let raw_scroll_offset = terminal.scroll_offset;
+    let ProjectedBufferAnchorLocation::Visible { document_row } =
+        terminal.reveal_buffer_anchor_in_projection(&policy, &mut state, anchors[1])
+    else {
+        panic!("visible raw output should survive the transform");
+    };
+    assert_eq!(terminal.scroll_offset, raw_scroll_offset);
+    let revealed = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert_eq!(
+        revealed.document_start(),
+        document_row.min(revealed.max_scroll_offset())
+    );
+    assert!(terminal
+        .buffer_anchor_to_projected(&revealed, anchors[1])
+        .is_some());
+
+    let mut identity_state = ProjectionViewState::new();
+    let identity_policy = ProjectionPolicy::new();
+    assert_eq!(
+        terminal.reveal_buffer_anchor_in_projection(
+            &identity_policy,
+            &mut identity_state,
+            anchors[1]
+        ),
+        ProjectedBufferAnchorLocation::Identity
+    );
+}
+
+#[test]
+fn projected_buffer_anchor_reveal_fails_closed_for_a_stale_policy() {
+    let mut terminal = TerminalState::new(16, 6);
+    let hidden_id = emit_completed_block(&mut terminal, 0);
+    let anchor = terminal
+        .command_records()
+        .back()
+        .unwrap()
+        .output_start
+        .unwrap();
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(hidden_id));
+    let mut state = ProjectionViewState::new();
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    state.set_offset(1, &viewport);
+    let before = state.offset_from_bottom();
+
+    terminal.on_resize(16, 5);
+
+    assert_eq!(
+        terminal.reveal_buffer_anchor_in_projection(&policy, &mut state, anchor),
+        ProjectedBufferAnchorLocation::Unmapped
+    );
+    assert_eq!(state.offset_from_bottom(), before);
+}
+
+#[test]
+fn stale_collapse_policy_returns_the_exact_identity_fast_path() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.process_input(b"visible");
+    let identity = terminal.projected_viewport(HistoryProjection::identity(), true);
+    let mut policy = ProjectionPolicy::new();
+    policy.collapse(u64::MAX - 1);
+    let mut state = ProjectionViewState::new();
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    let stale = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(!stale.is_transformed());
+    assert_eq!(stale.key(), identity.key());
+    assert!(std::sync::Arc::ptr_eq(
+        &stale.cells_arc(),
+        &identity.cells_arc()
+    ));
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 0);
+    assert_eq!(
+        PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(std::cell::Cell::get),
+        0,
+        "stale policies resolve before the full history plan"
+    );
+}
+
+#[test]
+fn live_collapse_after_csi_3j_uses_the_monotonic_grid_source_base() {
+    let mut terminal = TerminalState::new(12, 6);
+    for index in 0..12 {
+        terminal.process_input(format!("old-{index}\r\n").as_bytes());
+    }
+    assert!(terminal.total_lines_scrolled > 0);
+    terminal.process_input(b"\x1b[3J\x1b[1;1H");
+    assert!(terminal.scrollback.is_empty());
+
+    let zone_id = emit_completed_block(&mut terminal, 0);
+    assert!(terminal.scrollback.is_empty());
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut ProjectionViewState::new(),
+    );
+
+    assert!(viewport.is_transformed());
+    assert!(viewport.effective_collapsed().contains(&zone_id));
+}
+
+#[test]
+fn streamed_ineffective_collapse_stays_on_the_identity_fast_path() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.process_input(
+        b"xx\x1b[5G\x1b]133;A\x07\x1b]133;C;id=trimmed\x07  \x1b]133;D;0;id=trimmed\x07",
+    );
+    let zone_id = terminal.command_record("trimmed").unwrap().sequence;
+    terminal.process_input(b"\r\none\r\ntwo\r\nthree\r\n");
+    assert!(terminal.finished_output_range(zone_id).is_some());
+
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    let before = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(!before.is_transformed());
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 1);
+
+    terminal.process_input(b"four\r\n");
+    let after = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(!after.is_transformed());
+    assert_eq!(
+        PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get),
+        1,
+        "an incrementally advanced ineffective plan must remain identity"
+    );
+}
+
+#[test]
+fn transformed_plan_and_viewport_caches_have_independent_exact_keys() {
+    let mut terminal = TerminalState::new(12, 4);
+    let zone_ids: Vec<_> = (0..6)
+        .map(|index| emit_completed_block(&mut terminal, index))
+        .collect();
+    let mut first_policy = ProjectionPolicy::new();
+    assert!(first_policy.collapse(zone_ids[1]));
+    let mut first_state = ProjectionViewState::new();
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+
+    let first = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &first_policy,
+        &mut first_state,
+    );
+    let cached = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &first_policy,
+        &mut first_state,
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &first.cells_arc(),
+        &cached.cells_arc()
+    ));
+
+    first_state.scroll(1, &cached);
+    let scrolled = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &first_policy,
+        &mut first_state,
+    );
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 1);
+    assert!(!std::sync::Arc::ptr_eq(
+        &cached.cells_arc(),
+        &scrolled.cells_arc()
+    ));
+
+    terminal.process_batch(b"!");
+    let repainted = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &first_policy,
+        &mut first_state,
+    );
+    assert_eq!(
+        PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get),
+        1,
+        "ordinary cell paint invalidates only the viewport slice"
+    );
+    assert!(!std::sync::Arc::ptr_eq(
+        &scrolled.cells_arc(),
+        &repainted.cells_arc()
+    ));
+
+    // Both policies are at revision two. Exact id vectors, rather than a
+    // digest or revision alone, must keep their plans distinct.
+    let mut second_policy = ProjectionPolicy::new();
+    assert!(second_policy.collapse(zone_ids[3]));
+    assert_eq!(second_policy.revision(), first_policy.revision());
+    let mut second_state = ProjectionViewState::new();
+    let second = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &second_policy,
+        &mut second_state,
+    );
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 2);
+    assert_eq!(
+        second.effective_collapsed(),
+        &std::collections::BTreeSet::from([zone_ids[3]])
+    );
+
+    let last = terminal.grid.rows() - 1;
+    terminal.grid.row_wrapped[last] = !terminal.grid.row_wrapped[last];
+    let _rewrapped = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &second_policy,
+        &mut second_state,
+    );
+    assert_eq!(
+        PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get),
+        3,
+        "the exact live wrap vector is part of plan topology"
+    );
+}
+
+#[test]
+fn collapsed_plan_advances_streaming_history_without_rescanning_it() {
+    let mut terminal = TerminalState::new(16, 4);
+    terminal.set_max_scrollback(20_000);
+    let zone_id = emit_completed_block(&mut terminal, 0);
+    for index in 0..10_000 {
+        terminal.process_input(format!("history-{index}\r\n").as_bytes());
+    }
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    let before = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(before.is_transformed());
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 1);
+
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    terminal.process_input(b"next\r\n");
+    let after = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(after.is_transformed());
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 1);
+    assert!(
+        PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(std::cell::Cell::get) <= 1,
+        "one streamed row must not revisit 10k retained layouts"
+    );
+    assert_eq!(after.cells().len(), before.cells().len());
+
+    let incremental_cells = after.cells().to_vec();
+    let mut incremental_origins = Vec::new();
+    for row in 0..after.rows() {
+        for column in 0..after.columns() {
+            incremental_origins.push(after.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert!(policy.expand(zone_id));
+    assert!(policy.collapse(zone_id));
+    let rebuilt = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut ProjectionViewState::new(),
+    );
+    assert_cell_grids_equal(
+        rebuilt.cells(),
+        incremental_cells.as_slice(),
+        "incremental append matches forced rebuild",
+    );
+    let mut rebuilt_origins = Vec::new();
+    for row in 0..rebuilt.rows() {
+        for column in 0..rebuilt.columns() {
+            rebuilt_origins.push(rebuilt.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert_eq!(rebuilt_origins, incremental_origins);
+}
+
+#[test]
+fn collapsed_plan_advances_more_than_one_viewport_per_input_batch() {
+    let mut terminal = TerminalState::new(16, 4);
+    terminal.set_max_scrollback(20_000);
+    let zone_id = emit_completed_block(&mut terminal, 0);
+    for index in 0..1_000 {
+        terminal.process_input(format!("history-{index}\r\n").as_bytes());
+    }
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    let _ = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    terminal.process_batch(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\n");
+    let incremental = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 1);
+    assert!(PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(std::cell::Cell::get) <= 8);
+
+    let incremental_cells = incremental.cells().to_vec();
+    let mut incremental_origins = Vec::new();
+    for row in 0..incremental.rows() {
+        for column in 0..incremental.columns() {
+            incremental_origins.push(incremental.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert!(policy.expand(zone_id));
+    assert!(policy.collapse(zone_id));
+    let rebuilt = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut ProjectionViewState::new(),
+    );
+    assert_cell_grids_equal(
+        rebuilt.cells(),
+        incremental_cells.as_slice(),
+        "multi-viewport incremental append matches forced rebuild",
+    );
+    let mut rebuilt_origins = Vec::new();
+    for row in 0..rebuilt.rows() {
+        for column in 0..rebuilt.columns() {
+            rebuilt_origins.push(rebuilt.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert_eq!(rebuilt_origins, incremental_origins);
+}
+
+#[test]
+fn collapsed_plan_rebuilds_when_batch_eviction_exceeds_old_history() {
+    let mut terminal = TerminalState::new(12, 12);
+    terminal.set_max_scrollback(3);
+    terminal
+        .process_input(b"\x1b[9;1H\x1b]133;A\x07\x1b]133;C;id=kept\x07OUT\x1b]133;D;0;id=kept\x07");
+    let zone_id = terminal.command_record("kept").unwrap().sequence;
+    assert_eq!(terminal.scrollback_len(), 0);
+
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    let before = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(before.is_transformed());
+    drop(before);
+
+    let total_before = terminal.total_lines_scrolled;
+    terminal.process_batch(b"\r\n0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n");
+    let appended = terminal.total_lines_scrolled - total_before;
+    assert!(appended as usize > terminal.max_scrollback());
+    assert_eq!(terminal.scrollback_len(), terminal.max_scrollback());
+    assert!(terminal.finished_output_range(zone_id).is_some());
+
+    let after = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(after.is_transformed());
+    assert_eq!(
+        PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get),
+        2,
+        "evicting newly transferred grid rows must fall back to a full plan"
+    );
+    let fallback_cells = after.cells().to_vec();
+    let fallback_kinds = after.row_kinds().to_vec();
+    let fallback_document_rows = after.document_rows();
+    let mut fallback_origins = Vec::new();
+    for row in 0..after.rows() {
+        for column in 0..after.columns() {
+            fallback_origins.push(after.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+
+    terminal.projection_plan_cache = None;
+    terminal.transformed_viewport_cache = None;
+    let rebuilt = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut ProjectionViewState::new(),
+    );
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 3);
+    assert_cell_grids_equal(
+        rebuilt.cells(),
+        fallback_cells.as_slice(),
+        "small-capacity fallback matches an independent full rebuild",
+    );
+    assert_eq!(rebuilt.row_kinds(), fallback_kinds.as_slice());
+    assert_eq!(rebuilt.document_rows(), fallback_document_rows);
+    let mut rebuilt_origins = Vec::new();
+    for row in 0..rebuilt.rows() {
+        for column in 0..rebuilt.columns() {
+            rebuilt_origins.push(rebuilt.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert_eq!(rebuilt_origins, fallback_origins);
+}
+
+#[test]
+fn collapsed_plan_advances_across_capped_front_trim_with_exact_origins() {
+    let mut terminal = TerminalState::new(12, 3);
+    terminal.set_max_scrollback(64);
+    for index in 0..40 {
+        terminal.process_input(format!("prefix-{index}\r\n").as_bytes());
+    }
+    let zone_id = emit_completed_block(&mut terminal, 0);
+    for index in 0..30 {
+        terminal.process_input(format!("suffix-{index}\r\n").as_bytes());
+    }
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    let _before = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let retained_before: Vec<_> = terminal
+        .scrollback
+        .iter()
+        .map(ScrollbackLine::raw_row_id)
+        .collect();
+
+    terminal.process_input(b"trimmed-tail\r\n");
+    let after = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 1);
+    assert_ne!(
+        terminal.scrollback.front().map(ScrollbackLine::raw_row_id),
+        retained_before.first().copied()
+    );
+    for row in 0..after.rows() {
+        if let Some(raw) = after.raw_anchor_at(DisplayPoint::new(row, 0)) {
+            assert!(
+                terminal
+                    .scrollback
+                    .iter()
+                    .any(|line| line.raw_row_id() == raw.row_id)
+                    || terminal.grid.row_ids.contains(&raw.row_id)
+            );
+        }
+    }
+    let incremental_cells = after.cells().to_vec();
+    let mut incremental_origins = Vec::new();
+    for row in 0..after.rows() {
+        for column in 0..after.columns() {
+            incremental_origins.push(after.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert!(policy.expand(zone_id));
+    assert!(policy.collapse(zone_id));
+    let rebuilt = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut ProjectionViewState::new(),
+    );
+    assert_cell_grids_equal(
+        rebuilt.cells(),
+        incremental_cells.as_slice(),
+        "capped incremental append matches forced rebuild",
+    );
+    let mut rebuilt_origins = Vec::new();
+    for row in 0..rebuilt.rows() {
+        for column in 0..rebuilt.columns() {
+            rebuilt_origins.push(rebuilt.raw_anchor_at(DisplayPoint::new(row, column)));
+        }
+    }
+    assert_eq!(rebuilt_origins, incremental_origins);
+}
+
+#[test]
+fn transformed_materializer_decodes_each_visible_history_source_once() {
+    let mut terminal = TerminalState::new(12, 3);
+    terminal
+        .process_input(b"\x1b]133;A\x07P>\x1b]133;C;id=same\x07OUT\x1b]133;D;0;id=same\x07TAIL");
+    let zone_id = terminal.command_records().back().unwrap().sequence;
+    terminal.process_input(b"\r\n\r\n\r\n");
+    assert_eq!(terminal.scrollback.len(), 1);
+
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(zone_id));
+    let mut state = ProjectionViewState::new();
+    let bottom = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    state.set_offset(bottom.max_scroll_offset(), &bottom);
+    PROJECTION_VIEW_HISTORY_DECOMPRESSES.with(|count| count.set(0));
+    let top = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+
+    assert!(matches!(
+        top.row_kinds()[1],
+        ProjectedRowKind::CollapsedSummary { .. }
+    ));
+    assert_eq!(top.cells()[0][0].character, 'P');
+    assert_eq!(top.cells()[2][5].character, 'T');
+    assert_eq!(
+        PROJECTION_VIEW_HISTORY_DECOMPRESSES.with(std::cell::Cell::get),
+        1,
+        "prefix and suffix slices share one decoded history source"
+    );
+}
+
+#[test]
+fn projection_view_state_preserves_bottom_and_summary_anchor_across_rebuilds() {
+    let mut terminal = TerminalState::new(12, 4);
+    let zone_ids: Vec<_> = (0..8)
+        .map(|index| emit_completed_block(&mut terminal, index))
+        .collect();
+    let target = zone_ids[3];
+    let range = terminal.finished_output_range(target).unwrap();
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(target));
+    let mut state = ProjectionViewState::new();
+
+    let bottom = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert_eq!(bottom.scroll_offset(), 0);
+    emit_completed_block(&mut terminal, 99);
+    let appended = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert_eq!(
+        appended.scroll_offset(),
+        0,
+        "bottom follows appended output"
+    );
+
+    let mut summary_top = None;
+    let mut viewport = appended;
+    for offset in 0..=viewport.max_scroll_offset() {
+        state.set_offset(offset, &viewport);
+        viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut state,
+        );
+        if matches!(
+            viewport.row_kinds()[viewport.top_padding()],
+            ProjectedRowKind::CollapsedSummary { key, .. } if key.zone_id == target
+        ) {
+            summary_top = Some(viewport.clone());
+            break;
+        }
+    }
+    let summary_top = summary_top.expect("summary can be placed at the viewport top");
+    let parked_offset = state.offset_from_bottom();
+    let bypass = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        false,
+        &policy,
+        &mut state,
+    );
+    assert!(bypass.key().is_bypass());
+    assert_eq!(state.offset_from_bottom(), parked_offset);
+    let resumed = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(matches!(
+        resumed.row_kinds()[resumed.top_padding()],
+        ProjectedRowKind::CollapsedSummary { key, .. } if key.zone_id == target
+    ));
+    assert_eq!(resumed.document_start(), summary_top.document_start());
+
+    assert!(policy.expand(target));
+    let expanded = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(!expanded.is_transformed());
+    assert_eq!(
+        expanded
+            .display_point_for(RawCellAnchor {
+                row_id: range.start.row,
+                column: range.start.col,
+            })
+            .map(|point| point.row),
+        Some(0),
+        "expanding a top summary restores its first raw output row"
+    );
+}
+
+#[test]
+fn identity_full_document_plan_matches_legacy_bytes_for_non_wide_reflow() {
+    let mut terminal = TerminalState::new(8, 3);
+    let mut linked_blank = vec![TerminalCell::default(); 8];
+    linked_blank[0].character = 'a';
+    linked_blank[1].character = 'b';
+    let hyperlink = HyperlinkId::from_raw(1);
+    linked_blank[4].hyperlink_id = hyperlink;
+    terminal.push_scrollback_compressed(ScrollbackLine::compress(&linked_blank, true));
+    let mut tail = vec![TerminalCell::default(); 8];
+    tail[0].character = 'c';
+    tail[1].background = Color::Blue;
+    terminal.push_scrollback_compressed(ScrollbackLine::compress(&tail, false));
+    terminal.process_input(b"GRID");
+
+    let plan = terminal.identity_projection_plan(8);
+    let (materialized, wrapped) = terminal.materialize_identity_projection_plan(&plan);
+
+    // The oracle covers the complete document, while legacy visible cells are
+    // its viewport suffix. Grid rows remain a hard, full-width tail.
+    assert_eq!(materialized.len(), plan.rows.len());
+    assert_eq!(wrapped.len(), materialized.len());
+    assert_eq!(materialized.last().unwrap()[0].character, ' ');
+    assert!(materialized
+        .iter()
+        .flatten()
+        .any(|cell| cell.hyperlink_id == hyperlink));
+    assert!(materialized
+        .iter()
+        .flatten()
+        .any(|cell| cell.background == Color::Blue));
+}
+
+#[test]
+fn identity_full_document_plan_is_linear_and_does_not_decode_deep_history() {
+    let mut terminal = TerminalState::new(80, 2);
+    terminal.set_max_scrollback(10_001);
+    let mut cells = vec![TerminalCell::default(); 80];
+    cells[0].character = 'x';
+    cells[0].foreground = Color::Red;
+    for _ in 0..10_000 {
+        terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+    }
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    PROJECTION_PLAN_ORACLE_HISTORY_DECOMPRESSES.with(|count| count.set(0));
+
+    let plan = terminal.identity_projection_plan(80);
+
+    assert_eq!(
+        PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(std::cell::Cell::get),
+        10_000
+    );
+    assert_eq!(
+        PROJECTION_PLAN_ORACLE_HISTORY_DECOMPRESSES.with(std::cell::Cell::get),
+        0,
+        "planning must not invoke even the test oracle decompressor"
+    );
+    assert!(plan.metadata_units() <= 30_010);
+}
+
+#[test]
+fn identity_full_document_plan_matches_eager_history_and_grid_across_widths() {
+    for cols in [3, 4, 5, 8] {
+        let mut terminal = TerminalState::new(cols, 2);
+
+        let mut first = vec![TerminalCell::default(); 8];
+        first[0].character = 'A';
+        first[1].character = '界';
+        first[1].flags.set_wide(true);
+        first[2].flags.set_wide_continuation(true);
+        first[5].hyperlink_id = HyperlinkId::from_raw(1);
+
+        let mut second = vec![TerminalCell::default(); 8];
+        second[0].character = 'B';
+        second[1].character = 'C';
+        second[4].background = Color::Blue;
+        // Compression retains this styled cell, but projection's cached P0
+        // active length must still trim it after the painted background.
+        second[7].foreground = Color::Red;
+
+        let mut untracked = vec![TerminalCell::default(); 8];
+        untracked[0].character = 'U';
+        let history = vec![
+            ScrollbackLine::compress(&first, true),
+            ScrollbackLine::compress(&second, false),
+            ScrollbackLine::compress(&[TerminalCell::default(); 8], false),
+            // A trailing wrapped history row must end at the history/grid
+            // boundary rather than consuming the first live-grid row.
+            ScrollbackLine::compress(&untracked, true),
+        ];
+        for line in history.iter().cloned() {
+            terminal.push_scrollback_compressed(line);
+        }
+        terminal.scrollback[3].set_raw_row_id(RawRowId::UNTRACKED);
+        terminal.grid.get_mut(0, 0).character = 'G';
+        terminal.grid.get_mut(1, 0).character = 'H';
+        terminal.grid.row_wrapped[0] = true;
+        terminal.grid.row_ids[1] = RawRowId::UNTRACKED;
+
+        let plan = terminal.identity_projection_plan(cols);
+        let (actual, actual_wrapped) = terminal.materialize_identity_projection_plan(&plan);
+
+        let eager_history = TerminalState::reflow_lines(&history, cols, &TerminalCell::default());
+        let mut expected: Vec<_> = eager_history
+            .iter()
+            .map(ScrollbackLine::decompress)
+            .collect();
+        let mut expected_wrapped: Vec<_> =
+            eager_history.iter().map(|line| line.is_wrapped).collect();
+        let grid_start = expected.len();
+        expected.extend(terminal.grid.iter().map(|row| row.to_vec()));
+        expected_wrapped.extend(terminal.grid.row_wrapped.iter().copied());
+
+        assert_cell_grids_equal(&actual, &expected, &format!("identity plan width {cols}"));
+        assert_eq!(actual_wrapped, expected_wrapped, "wrapped width {cols}");
+        assert_eq!(actual[grid_start][0].character, 'G');
+        assert_eq!(actual[grid_start + 1][0].character, 'H');
+
+        for absolute_row in [3, terminal.scrollback.len() + 1] {
+            let slices: Vec<_> = plan
+                .rows
+                .iter()
+                .flat_map(|row| &row.raw_slices)
+                .filter(|slice| slice.source.absolute_row == absolute_row)
+                .collect();
+            assert!(!slices.is_empty(), "UNTRACKED source {absolute_row}");
+            assert!(slices.iter().all(|slice| slice.origin.is_none()));
+        }
+    }
+}
+
+#[test]
+fn identity_full_document_plan_materializes_a_narrow_wide_body() {
+    let mut terminal = TerminalState::new(1, 1);
+    let mut history = vec![TerminalCell::default(); 4];
+    history[0].character = '界';
+    history[0].flags.set_wide(true);
+    history[1].flags.set_wide_continuation(true);
+    history[2].character = 'Z';
+    history[3].hyperlink_id = HyperlinkId::from_raw(1);
+    terminal.push_scrollback_compressed(ScrollbackLine::compress(&history, false));
+    terminal.scrollback[0].set_raw_row_id(RawRowId::UNTRACKED);
+    terminal.grid.get_mut(0, 0).character = 'G';
+
+    let plan = terminal.identity_projection_plan(1);
+    let (actual, wrapped) = terminal.materialize_identity_projection_plan(&plan);
+
+    assert_eq!(actual.len(), 4);
+    assert_eq!(actual[0][0].character, '界');
+    assert!(!actual[0][0].flags.wide());
+    assert!(!actual[0][0].flags.wide_continuation());
+    assert_eq!(actual[1][0].character, 'Z');
+    assert_eq!(actual[2][0].hyperlink_id, HyperlinkId::from_raw(1));
+    assert_eq!(actual[3][0].character, 'G');
+    assert_eq!(wrapped, vec![true, true, false, false]);
+    assert!(plan
+        .rows
+        .iter()
+        .take(3)
+        .flat_map(|row| &row.raw_slices)
+        .all(|slice| slice.origin.is_none()));
+}
 
 // `a=t` is the protocol default. Omitting it also guards against regressing to
 // heuristic routing based on searching the body for an `a=` substring.
@@ -784,6 +2106,24 @@ fn identity_projection_reuses_visible_cells_and_versions_only_its_metadata() {
     let bypass = terminal.projected_viewport(HistoryProjection::identity(), false);
     assert!(bypass.key().is_bypass());
     assert_cell_grids_equal(bypass.cells(), legacy.as_ref(), "block-off bypass");
+}
+
+#[test]
+fn stale_identity_projection_cache_releases_cells_before_visible_rebuild() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"hello");
+    let first = terminal.projected_viewport(HistoryProjection::identity(), true);
+    let first_cells = first.cells_arc();
+    assert_eq!(std::sync::Arc::strong_count(&first_cells), 4);
+    drop(first_cells);
+    drop(first);
+
+    VISIBLE_CELLS_RECYCLE_COUNT.with(|count| count.set(0));
+    terminal.process_batch(b"!");
+    let rebuilt = terminal.projected_viewport(HistoryProjection::identity(), true);
+
+    assert_eq!(rebuilt.cells()[0][5].character, '!');
+    assert_eq!(VISIBLE_CELLS_RECYCLE_COUNT.with(std::cell::Cell::get), 1);
 }
 
 #[test]
@@ -2079,6 +3419,489 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
 }
 
 #[test]
+fn finished_output_range_is_exact_on_a_shared_raw_row() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07pre\x1b]133;B\x07\x1b]133;C;id=exact\x07OUT\x1b]133;D;0;id=exact\x07suffix",
+    );
+
+    let record = terminal.command_record("exact").expect("completed record");
+    let range = terminal
+        .finished_output_range(record.sequence)
+        .expect("exact retained output range");
+    assert_eq!(range.start.row, range.end.row);
+    assert_eq!((range.start.col, range.end.col), (3, 6));
+    assert_eq!(terminal.grid[0][range.start.col].character, 'O');
+    assert_eq!(terminal.grid[0][range.end.col].character, 's');
+}
+
+#[test]
+fn finished_output_range_survives_suffix_filling_and_wrapping_outside_it() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07\x1b]133;C;id=suffix-wrap\x07OUT\x1b]133;D;0;id=suffix-wrap\x07",
+    );
+    let sequence = terminal.command_record("suffix-wrap").unwrap().sequence;
+    let exact = terminal.finished_output_range(sequence).unwrap();
+
+    // Fill every remaining cell on the shared row. This sets DEC pending-wrap
+    // but does not touch the protected [0, 3) output interval.
+    terminal.process_input(b"abcde");
+    assert!(terminal.pending_wrap);
+    assert_eq!(terminal.finished_output_range(sequence), Some(exact));
+
+    // Resolving that pending wrap changes topology and writes on the next raw
+    // row; neither operation changes the already-finished output cells.
+    terminal.process_input(b"Z");
+    assert_eq!(terminal.finished_output_range(sequence), Some(exact));
+}
+
+#[test]
+fn finished_output_content_mutations_fail_closed_without_stale_owners() {
+    for (label, mutation) in [
+        ("overwrite", "\rZ"),
+        ("ech", "\r\x1b[X"),
+        ("el", "\r\x1b[K"),
+        ("ed", "\x1b[2J"),
+    ] {
+        let mut terminal = TerminalState::new(12, 4);
+        let lifecycle =
+            format!("\x1b]133;A\x07\x1b]133;C;id={label}\x07OUT\x1b]133;D;0;id={label}\x07");
+        terminal.process_input(lifecycle.as_bytes());
+        let sequence = terminal.command_record(label).unwrap().sequence;
+        assert!(
+            terminal.finished_output_range(sequence).is_some(),
+            "{label}"
+        );
+
+        terminal.process_input(mutation.as_bytes());
+        assert_eq!(terminal.finished_output_range(sequence), None, "{label}");
+        assert!(
+            terminal
+                .finished_output_owners
+                .values()
+                .flatten()
+                .all(|owner| owner.zone_id != sequence),
+            "{label} left a stale reverse-index owner"
+        );
+    }
+}
+
+#[test]
+fn finished_output_shift_and_wide_mutations_fail_closed() {
+    for (label, mutation) in [
+        ("ich", "\r\x1b[@"),
+        ("dch", "\r\x1b[P"),
+        ("irm", "\r\x1b[4hZ"),
+    ] {
+        let mut terminal = TerminalState::new(12, 4);
+        let lifecycle =
+            format!("\x1b]133;A\x07\x1b]133;C;id={label}\x07OUT\x1b]133;D;0;id={label}\x07");
+        terminal.process_input(lifecycle.as_bytes());
+        let sequence = terminal.command_record(label).unwrap().sequence;
+        terminal.process_input(mutation.as_bytes());
+        assert_eq!(terminal.finished_output_range(sequence), None, "{label}");
+    }
+
+    let mut wide = TerminalState::new(8, 3);
+    wide.process_input("\x1b]133;A\x07\x1b]133;C;id=wide\x07界\x1b]133;D;0;id=wide\x07".as_bytes());
+    let sequence = wide.command_record("wide").unwrap().sequence;
+    wide.process_input(b"\x1b[1;2HX");
+    assert_eq!(
+        wide.finished_output_range(sequence),
+        None,
+        "overwriting a wide continuation must invalidate the whole glyph owner"
+    );
+
+    let mut combining = TerminalState::new(8, 3);
+    combining
+        .process_input(b"\x1b]133;A\x07\x1b]133;C;id=combining\x07e\x1b]133;D;0;id=combining\x07");
+    let sequence = combining.command_record("combining").unwrap().sequence;
+    combining.process_input("\u{301}".as_bytes());
+    assert_eq!(combining.grid[0][0].character, 'é');
+    assert_eq!(combining.finished_output_range(sequence), None);
+}
+
+#[test]
+fn finished_output_reverse_index_invalidates_only_the_intersecting_same_row_zone() {
+    let mut terminal = TerminalState::new(12, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07\x1b]133;C;id=one\x07aa\x1b]133;D;0;id=one\x07\
+          \x1b]133;A\x07\x1b]133;C;id=two\x07bb\x1b]133;D;0;id=two\x07",
+    );
+    let one = terminal.command_record("one").unwrap().sequence;
+    let two = terminal.command_record("two").unwrap().sequence;
+    let second_range = terminal.finished_output_range(two).unwrap();
+    assert!(terminal.finished_output_range(one).is_some());
+
+    terminal.process_input(b"\rZ");
+    assert_eq!(terminal.finished_output_range(one), None);
+    assert_eq!(terminal.finished_output_range(two), Some(second_range));
+}
+
+#[test]
+fn partial_region_scroll_drops_only_discarded_raw_row_provenance() {
+    let mut down = TerminalState::new(8, 4);
+    down.process_input(b"\x1b[3;1H\x1b]133;A\x07\x1b]133;C;id=down\x07x\x1b]133;D;0;id=down\x07");
+    let sequence = down.command_record("down").unwrap().sequence;
+    let dropped = down.grid.row_id(2);
+    assert!(down.finished_output_owners.contains_key(&dropped));
+    down.scroll_region_down(1, 2);
+    assert_eq!(down.finished_output_range(sequence), None);
+    assert!(!down.finished_output_owners.contains_key(&dropped));
+
+    let mut up = TerminalState::new(8, 4);
+    up.process_input(b"\x1b[2;1H\x1b]133;A\x07\x1b]133;C;id=up\x07x\x1b]133;D;0;id=up\x07");
+    let sequence = up.command_record("up").unwrap().sequence;
+    let dropped = up.grid.row_id(1);
+    assert!(up.finished_output_owners.contains_key(&dropped));
+    up.scroll_region_up(1, 2);
+    assert_eq!(up.finished_output_range(sequence), None);
+    assert!(!up.finished_output_owners.contains_key(&dropped));
+}
+
+#[test]
+fn finished_output_range_follows_identity_preserving_partial_line_moves() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal.process_input(
+        b"\x1b[2;1H\x1b]133;A\x07\x1b]133;C;id=moved\x07OUT\x1b]133;D;0;id=moved\x07",
+    );
+    let sequence = terminal.command_record("moved").unwrap().sequence;
+    let exact = terminal.finished_output_range(sequence).unwrap();
+
+    terminal.process_input(b"\x1b[1;1H\x1b[L");
+
+    assert_eq!(terminal.finished_output_range(sequence), Some(exact));
+    assert_eq!(terminal.grid[2][0].character, 'O');
+}
+
+#[test]
+fn zero_count_delete_lines_keeps_finished_output_provenance() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal
+        .process_input(b"\x1b]133;A\x07\x1b]133;C;id=zero-dl\x07OUT\x1b]133;D;0;id=zero-dl\x07");
+    let sequence = terminal.command_record("zero-dl").unwrap().sequence;
+    let exact = terminal.finished_output_range(sequence).unwrap();
+
+    terminal.process_input(b"\x1b[1;1H\x1b[0M");
+
+    assert_eq!(terminal.finished_output_range(sequence), Some(exact));
+}
+
+#[test]
+fn zero_count_character_shifts_keep_finished_output_provenance() {
+    for (label, control) in [("zero-ich", "\x1b[0@"), ("zero-dch", "\x1b[0P")] {
+        let mut terminal = TerminalState::new(8, 4);
+        let lifecycle =
+            format!("\x1b]133;A\x07\x1b]133;C;id={label}\x07OUT\x1b]133;D;0;id={label}\x07");
+        terminal.process_input(lifecycle.as_bytes());
+        let sequence = terminal.command_record(label).unwrap().sequence;
+        let exact = terminal.finished_output_range(sequence).unwrap();
+
+        terminal.process_input(b"\r");
+        terminal.process_input(control.as_bytes());
+
+        assert_eq!(
+            terminal.finished_output_range(sequence),
+            Some(exact),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn cursor_positioning_without_output_never_invents_structural_rows() {
+    for (label, control) in [
+        ("cup-down", "\x1b[3;1H"),
+        ("cud-down", "\x1b[2B"),
+        ("vpa-down", "\x1b[3d"),
+    ] {
+        let mut terminal = TerminalState::new(8, 4);
+        let lifecycle =
+            format!("\x1b]133;A\x07\x1b]133;C;id={label}\x07{control}\x1b]133;D;0;id={label}\x07");
+        terminal.process_input(lifecycle.as_bytes());
+        let sequence = terminal.command_record(label).unwrap().sequence;
+        assert_eq!(terminal.finished_output_range(sequence), None, "{label}");
+    }
+}
+
+#[test]
+fn repeated_output_start_keeps_one_canonical_range_and_capture() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07\x1b]133;C;id=repeat-c\x07first\x1b]133;C;id=repeat-c\x07second\x1b]133;D;0;id=repeat-c\x07",
+    );
+
+    let record = terminal.command_record("repeat-c").unwrap();
+    let range = terminal.finished_output_range(record.sequence).unwrap();
+    assert_eq!((range.start.col, range.end.col), (0, 11));
+    assert_eq!(
+        terminal.command_output_text("repeat-c", 1024).unwrap().text,
+        "firstsecond"
+    );
+}
+
+#[test]
+fn pending_wrap_at_output_start_rebases_to_the_first_real_output_row() {
+    let mut terminal = TerminalState::new(4, 4);
+    terminal.process_input(
+        b"HEAD\x1b]133;A\x07\x1b]133;C;id=start-wrap\x07X\x1b]133;D;0;id=start-wrap\x07",
+    );
+
+    let record = terminal.command_record("start-wrap").unwrap();
+    let range = terminal.finished_output_range(record.sequence).unwrap();
+    assert_ne!(range.start.row, terminal.grid.row_id(0));
+    assert_eq!((range.start.col, range.end.col), (0, 1));
+    assert_eq!(
+        terminal
+            .command_output_text("start-wrap", 1024)
+            .unwrap()
+            .text,
+        "X"
+    );
+}
+
+#[test]
+fn output_write_above_c_fails_closed_without_owning_the_header() {
+    let mut terminal = TerminalState::new(16, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07HEADER\r\n\x1b]133;C;id=cup-up\x07out\x1b[1;1HZ\x1b[2;4H\x1b]133;D;0;id=cup-up\x07",
+    );
+    let sequence = terminal.command_record("cup-up").unwrap().sequence;
+    assert_eq!(terminal.finished_output_range(sequence), None);
+}
+
+#[test]
+fn implicit_next_prompt_finalizes_the_exact_output_range() {
+    let mut terminal = TerminalState::new(16, 4);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=implicit\x07hello");
+    let sequence = terminal.command_record("implicit").unwrap().sequence;
+    terminal.process_input(b"\x1b]133;A\x07");
+
+    assert!(terminal.command_record("implicit").unwrap().complete);
+    let range = terminal
+        .finished_output_range(sequence)
+        .expect("implicit A binds retained output");
+    assert_eq!((range.start.col, range.end.col), (0, 5));
+}
+
+#[test]
+fn finished_output_range_fails_closed_after_cursor_back() {
+    for (id, cursor_move) in [("cr", "\r"), ("backspace", "\x08"), ("cup", "\x1b[1;2H")] {
+        let mut terminal = TerminalState::new(16, 4);
+        let lifecycle = format!(
+            "\x1b]133;A\x07\x1b]133;C;id={id}\x07abcdef{cursor_move}\x1b]133;D;0;id={id}\x07"
+        );
+        terminal.process_input(lifecycle.as_bytes());
+        let sequence = terminal.command_record(id).unwrap().sequence;
+        assert_eq!(terminal.finished_output_range(sequence), None, "{id}");
+    }
+}
+
+#[test]
+fn finished_output_range_shrinks_start_after_a_real_leftward_write() {
+    let mut terminal = TerminalState::new(16, 4);
+    terminal.process_input(
+        b"pre\x1b]133;A\x07\x1b]133;C;id=left-write\x07abc\rZ\x1b]133;D;0;id=left-write\x07",
+    );
+    let record = terminal.command_record("left-write").unwrap();
+    let range = terminal
+        .finished_output_range(record.sequence)
+        .expect("a real write after CR expands output ownership leftward");
+
+    assert_eq!((range.start.col, range.end.col), (0, 6));
+    assert_eq!(terminal.grid[0][0].character, 'Z');
+    assert_eq!(
+        terminal
+            .command_output_text("left-write", 1024)
+            .expect("capture uses the same effective boundaries")
+            .text,
+        "Zreabc"
+    );
+}
+
+#[test]
+fn finished_output_range_expands_wide_boundaries_atomically() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.process_input("界".as_bytes());
+    let provenance = terminal
+        .bind_finished_output_provenance(7, 0, 1, 0, 1)
+        .expect("wide continuation boundaries expand to the complete glyph");
+    assert_eq!(
+        (provenance.range.start.col, provenance.range.end.col),
+        (0, 2)
+    );
+}
+
+#[test]
+fn finished_output_range_keeps_pending_wrap_and_blank_rows() {
+    let mut wrapped = TerminalState::new(4, 4);
+    wrapped.process_input(b"\x1b]133;A\x07\x1b]133;C;id=wrap\x07abcd\x1b]133;D;0;id=wrap\x07");
+    let record = wrapped.command_record("wrap").unwrap();
+    let range = wrapped.finished_output_range(record.sequence).unwrap();
+    assert_eq!((range.start.col, range.end.col), (0, 4));
+
+    let mut blank = TerminalState::new(8, 4);
+    blank.process_input(b"\x1b]133;A\x07\x1b]133;C;id=blank\x07x\r\n\r\n\x1b]133;D;0;id=blank\x07");
+    let record = blank.command_record("blank").unwrap();
+    let provenance = blank
+        .finished_output_provenance
+        .get(&record.sequence)
+        .expect("blank structural row remains provenance");
+    assert_eq!(provenance.rows.len(), 2);
+    assert_eq!(provenance.range.end.col, 8);
+}
+
+#[test]
+fn finished_output_sidecar_is_cleaned_on_row_and_record_eviction() {
+    let mut row_eviction = TerminalState::new(8, 2);
+    row_eviction.set_max_scrollback(1);
+    row_eviction.process_input(b"\x1b]133;A\x07\x1b]133;C;id=old\x07x\x1b]133;D;0;id=old\x07");
+    let old_sequence = row_eviction.command_record("old").unwrap().sequence;
+    assert!(row_eviction.finished_output_range(old_sequence).is_some());
+    row_eviction.process_input(b"\r\none\r\ntwo\r\nthree\r\n");
+    assert_eq!(row_eviction.finished_output_range(old_sequence), None);
+    assert!(!row_eviction
+        .finished_output_provenance
+        .contains_key(&old_sequence));
+
+    let mut record_eviction = TerminalState::new(1024, 4);
+    record_eviction
+        .process_input(b"\x1b]133;A\x07\x1b]133;C;id=first\x07x\x1b]133;D;0;id=first\x07");
+    let first_sequence = record_eviction.command_record("first").unwrap().sequence;
+    assert!(record_eviction
+        .finished_output_provenance
+        .contains_key(&first_sequence));
+    for index in 0..MAX_COMMAND_MARKS {
+        let lifecycle = format!(
+            "\x1b]133;A\x07\x1b]133;C;id=later-{index}\x07x\x1b]133;D;0;id=later-{index}\x07"
+        );
+        record_eviction.process_input(lifecycle.as_bytes());
+    }
+    assert!(!record_eviction
+        .finished_output_provenance
+        .contains_key(&first_sequence));
+}
+
+#[test]
+fn finished_output_provenance_survives_only_same_size_resize_noops() {
+    let mut completed = TerminalState::new(12, 4);
+    completed.process_input(b"\x1b]133;A\x07\x1b]133;C;id=resize\x07ok\x1b]133;D;0;id=resize\x07");
+    let sequence = completed.command_record("resize").unwrap().sequence;
+    let exact = completed.finished_output_range(sequence).unwrap();
+
+    completed.on_resize(12, 4);
+    assert_eq!(completed.finished_output_range(sequence), Some(exact));
+    completed.on_resize(13, 4);
+    assert_eq!(completed.finished_output_range(sequence), None);
+
+    let mut active = TerminalState::new(12, 4);
+    active.process_input(b"\x1b]133;A\x07\x1b]133;C;id=active-resize\x07before");
+    let sequence = active.command_record("active-resize").unwrap().sequence;
+    active.on_resize(12, 5);
+    active.process_input(b"after\x1b]133;D;0;id=active-resize\x07");
+    assert_eq!(active.finished_output_range(sequence), None);
+}
+
+#[test]
+fn alternate_screen_writes_do_not_contaminate_primary_output_provenance() {
+    let mut terminal = TerminalState::new(12, 4);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=alt-safe\x07P");
+    terminal.process_input(b"\x1b[?1049hALT\x1b[?1049lQ\x1b]133;D;0;id=alt-safe\x07");
+
+    let record = terminal.command_record("alt-safe").unwrap();
+    let range = terminal.finished_output_range(record.sequence).unwrap();
+    assert_eq!((range.start.col, range.end.col), (0, 2));
+    assert_eq!(terminal.grid[0][0].character, 'P');
+    assert_eq!(terminal.grid[0][1].character, 'Q');
+}
+
+#[test]
+fn structural_blank_output_rows_bind_but_zero_length_output_does_not() {
+    let mut blank = TerminalState::new(8, 4);
+    blank.process_input(
+        b"\x1b]133;A\x07\x1b]133;C;id=structural\x07\r\n\r\n\x1b]133;D;0;id=structural\x07",
+    );
+    let record = blank.command_record("structural").unwrap();
+    let provenance = blank
+        .finished_output_provenance
+        .get(&record.sequence)
+        .expect("two structural rows are exact output");
+    assert_eq!(provenance.rows.len(), 2);
+    assert_eq!(
+        (provenance.range.start.col, provenance.range.end.col),
+        (0, 8)
+    );
+
+    let mut empty = TerminalState::new(8, 4);
+    empty.process_input(b"\x1b]133;A\x07\x1b]133;C;id=empty\x07\x1b]133;D;0;id=empty\x07");
+    let sequence = empty.command_record("empty").unwrap().sequence;
+    assert_eq!(empty.finished_output_range(sequence), None);
+}
+
+#[test]
+fn long_finished_range_front_eviction_checks_only_each_record_start() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.set_max_scrollback(128);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=long\x07");
+    for _ in 0..48 {
+        terminal.process_input(b"x\r\n");
+    }
+    terminal.process_input(b"\x1b]133;D;0;id=long\x07");
+    let sequence = terminal.command_record("long").unwrap().sequence;
+    assert!(terminal
+        .finished_output_provenance
+        .get(&sequence)
+        .is_some_and(|provenance| provenance.rows.len() > 40));
+
+    FINISHED_OUTPUT_EVICTION_ROW_CHECKS.with(|checks| checks.set(0));
+    terminal.set_max_scrollback(1);
+    let checks = FINISHED_OUTPUT_EVICTION_ROW_CHECKS.with(std::cell::Cell::get);
+    assert_eq!(checks, 1, "eviction must never scan every row in the range");
+    assert!(!terminal.finished_output_provenance.contains_key(&sequence));
+}
+
+#[test]
+fn command_sequence_exhaustion_seals_records_and_output_sidecars() {
+    let mut terminal = TerminalState::new(16, 4);
+    terminal.next_command_sequence = u64::MAX;
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=last\x07x\x1b]133;D;0;id=last\x07");
+    let last = terminal
+        .command_record("last")
+        .expect("u64::MAX is issued once");
+    assert_eq!(last.sequence, u64::MAX);
+    assert!(terminal.finished_output_range(last.sequence).is_some());
+    let records = terminal.command_records.len();
+    let sidecars = terminal.finished_output_provenance.len();
+    let marks = terminal.command_marks.len();
+
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=reused\x07y\x1b]133;D;0;id=reused\x07");
+    assert_eq!(terminal.next_command_sequence, 0);
+    assert_eq!(terminal.command_records.len(), records);
+    assert_eq!(terminal.finished_output_provenance.len(), sidecars);
+    assert_eq!(terminal.command_marks.len(), marks);
+    assert!(terminal.command_record("reused").is_none());
+
+    terminal.process_input(b"\x1bc");
+    assert_eq!(terminal.next_command_sequence, 0);
+    terminal
+        .process_input(b"\x1b]133;A\x07\x1b]133;C;id=after-ris\x07z\x1b]133;D;0;id=after-ris\x07");
+    assert!(terminal.command_records.is_empty());
+    assert!(terminal.finished_output_provenance.is_empty());
+}
+
+#[test]
+fn finished_output_revision_exhaustion_stays_uncacheable() {
+    let mut terminal = TerminalState::new(12, 3);
+    terminal.finished_output_revision = u64::MAX;
+    let _ = emit_completed_block(&mut terminal, 0);
+    assert_eq!(terminal.finished_output_revision(), 0);
+
+    terminal.process_input(b"\rZ");
+    assert_eq!(terminal.finished_output_revision(), 0);
+}
+
+#[test]
 fn replay_prompt_guard_treats_whitespace_as_existing_user_input() {
     let mut terminal = TerminalState::new(18, 5);
     terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=live\x07");
@@ -2440,6 +4263,39 @@ fn semantic_command_jump_survives_a_noop_resize() {
 
     assert_eq!(terminal.scroll_offset, jumped_offset);
     assert_eq!(terminal.viewport_row_to_absolute(0), target_row);
+}
+
+#[test]
+fn command_edge_anchor_resolves_retained_top_and_bottom_rows() {
+    let mut terminal = TerminalState::new(8, 6);
+    terminal.process_input(
+        b"\x1b]133;A\x07$ first\r\n\x1b]133;C;id=first\x07one\r\ntwo\r\n\x1b]133;D;0;id=first\x07",
+    );
+    terminal.process_input(b"\x1b]133;A\x07$ second\x1b]133;C;id=second\x07");
+    let first_prompt = terminal.command_record("first").unwrap().prompt_start;
+    let second_prompt = terminal.command_record("second").unwrap().prompt_start;
+    let normalize = |anchor: super::BufferAnchor| {
+        if anchor.column >= 8 {
+            anchor.line_id.saturating_add(1)
+        } else {
+            anchor.line_id
+        }
+    };
+
+    assert_eq!(
+        terminal.command_edge_anchor("first", false),
+        Some(super::BufferAnchor {
+            line_id: normalize(first_prompt),
+            column: 0,
+        })
+    );
+    assert_eq!(
+        terminal.command_edge_anchor("first", true),
+        Some(super::BufferAnchor {
+            line_id: normalize(second_prompt).saturating_sub(1),
+            column: 0,
+        })
+    );
 }
 
 #[test]

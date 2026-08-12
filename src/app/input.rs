@@ -5,6 +5,14 @@ use super::state::TerminalApp;
 use crate::{config, keybindings, layout, search};
 use eframe::egui;
 
+fn transformed_next_command_returns_to_bottom(
+    next: bool,
+    target_found: bool,
+    offset_from_bottom: usize,
+) -> bool {
+    next && !target_found && offset_from_bottom > 0
+}
+
 /// Central input-routing decision for UI surfaces that own keyboard input.
 /// Keep this pure so regressions (especially Enter/Escape leaking into the PTY)
 /// can be covered without constructing a PTY-backed [`TerminalApp`].
@@ -802,38 +810,19 @@ impl TerminalApp {
             keybindings::Command::TerminalClear => self.queue_terminal_control_input(0x0c),
             keybindings::Command::TerminalScrollUp => {
                 if !self.block_context_scroll(crate::block_mode::SelectStep::Older) {
-                    let mut terminal = self
-                        .session_manager
-                        .get_active_session_mut()
-                        .terminal
-                        .lock();
-                    if !terminal.is_alt_buffer_active() {
-                        terminal.scroll(3);
-                    }
+                    self.scroll_active_terminal(3);
                 }
             }
             keybindings::Command::TerminalScrollDown => {
                 if !self.block_context_scroll(crate::block_mode::SelectStep::Newer) {
-                    let mut terminal = self
-                        .session_manager
-                        .get_active_session_mut()
-                        .terminal
-                        .lock();
-                    if !terminal.is_alt_buffer_active() {
-                        terminal.scroll(-3);
-                    }
+                    self.scroll_active_terminal(-3);
                 }
             }
             keybindings::Command::TerminalJumpPrevMark => {
                 if self.block_scroll_selected_edge(false) {
                     return false;
                 }
-                let jumped = self
-                    .session_manager
-                    .get_active_session_mut()
-                    .terminal
-                    .lock()
-                    .jump_to_prev_command();
+                let jumped = self.jump_adjacent_command(false);
                 if !jumped {
                     self.set_status("No previous command mark");
                 }
@@ -842,12 +831,7 @@ impl TerminalApp {
                 if self.block_scroll_selected_edge(true) {
                     return false;
                 }
-                let jumped = self
-                    .session_manager
-                    .get_active_session_mut()
-                    .terminal
-                    .lock()
-                    .jump_to_next_command();
+                let jumped = self.jump_adjacent_command(true);
                 if !jumped {
                     self.set_status("No next command mark");
                 }
@@ -1060,7 +1044,7 @@ impl TerminalApp {
                 std::sync::Arc::clone(&capture.terminal)
             });
         if let Some(terminal) = cancelled_local_terminal {
-            terminal.lock().selection = None;
+            terminal.lock().clear_text_selection();
             self.renderer.cancel_local_selection_capture();
             for renderer in &mut self.pane_renderers {
                 renderer.cancel_local_selection_capture();
@@ -1085,13 +1069,19 @@ impl TerminalApp {
     /// 针对当前活跃会话重算搜索结果，并记录结果所属的 grid/session 版本。
     pub(super) fn refresh_search_matches(&mut self) {
         let session_idx = self.session_manager.active_index();
+        let previous_results_session_id = self.search_state.results_session_id.clone();
+        let previous_projection_message = self.search_state.projection_message.clone();
+        let previous_hidden_zone = self.search_state.hidden_projection_zone;
+        let previous_policy_revision = self.search_state.projection_policy_revision;
         let selected_match = self
             .search_state
             .matches
             .get(self.search_state.current_match_index)
             .copied();
-        let (matches, error, truncated, grid_version) = {
+        let (matches, error, truncated, grid_version, session_id, policy_revision) = {
             let session = self.session_manager.get_active_session_mut();
+            let session_id = session.metadata.session_id.clone();
+            let policy_revision = session.projection_policy.revision();
             let terminal = session.terminal.lock();
             let (matches, error, truncated) = search::SearchEngine::search(
                 &terminal,
@@ -1099,7 +1089,14 @@ impl TerminalApp {
                 self.search_state.use_regex,
                 self.search_state.case_sensitive,
             );
-            (matches, error, truncated, terminal.get_grid_version())
+            (
+                matches,
+                error,
+                truncated,
+                terminal.get_grid_version(),
+                session_id,
+                policy_revision,
+            )
         };
         self.search_state.matches = matches;
         self.search_state.error_message = error;
@@ -1112,12 +1109,40 @@ impl TerminalApp {
                     .position(|candidate| *candidate == selected)
             })
             .unwrap_or(0);
+        let selected_survived = selected_match.is_some_and(|selected| {
+            self.search_state
+                .matches
+                .get(self.search_state.current_match_index)
+                .is_some_and(|current| *current == selected)
+        });
+        let diagnostic_context_survived = selected_survived
+            && previous_results_session_id.as_deref() == Some(session_id.as_str())
+            && previous_policy_revision == Some(policy_revision);
+        self.search_state.projection_message = diagnostic_context_survived
+            .then_some(previous_projection_message)
+            .flatten();
+        self.search_state.hidden_projection_zone = diagnostic_context_survived
+            .then_some(previous_hidden_zone)
+            .flatten();
+        self.search_state.projection_policy_revision = diagnostic_context_survived
+            .then_some(previous_policy_revision)
+            .flatten();
         self.search_state.results_grid_version = Some(grid_version);
         self.search_state.results_session_idx = Some(session_idx);
+        self.search_state.results_session_id = Some(session_id);
         self.search_state.results_refreshed_at = Some(std::time::Instant::now());
     }
 
-    fn reveal_current_search_match(&mut self) {
+    pub(crate) fn reveal_current_search_match(&mut self) {
+        let active_session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        if self.search_state.results_session_id.as_deref() != Some(active_session_id.as_str()) {
+            self.refresh_search_matches();
+        }
         let Some(search_match) = self
             .search_state
             .matches
@@ -1126,11 +1151,221 @@ impl TerminalApp {
         else {
             return;
         };
+        self.search_state.clear_projection_diagnostic();
+        let block_mode = self.config.block_mode;
+        let (location, policy_revision) = {
+            let session = self.session_manager.get_active_session_mut();
+            let terminal_arc = std::sync::Arc::clone(&session.terminal);
+            let policy = &session.projection_policy;
+            let policy_revision = policy.revision();
+            let view_state = &mut session.projection_view_state;
+            let mut terminal = terminal_arc.lock();
+            let viewport = terminal.projected_viewport_with_state(
+                crate::terminal::HistoryProjection::identity(),
+                block_mode,
+                policy,
+                view_state,
+            );
+            if viewport.is_transformed() {
+                (
+                    terminal.reveal_buffer_anchor_in_projection(
+                        policy,
+                        view_state,
+                        search_match.anchor(),
+                    ),
+                    policy_revision,
+                )
+            } else if terminal.scroll_to_buffer_anchor(search_match.anchor()) {
+                (
+                    crate::terminal::ProjectedBufferAnchorLocation::Identity,
+                    policy_revision,
+                )
+            } else {
+                (
+                    crate::terminal::ProjectedBufferAnchorLocation::Unmapped,
+                    policy_revision,
+                )
+            }
+        };
+        match location {
+            crate::terminal::ProjectedBufferAnchorLocation::Hidden { zone_id } => {
+                self.search_state.hidden_projection_zone = Some(zone_id);
+                self.search_state.projection_message =
+                    Some("Match is hidden in a collapsed block".to_owned());
+                self.search_state.projection_policy_revision = Some(policy_revision);
+            }
+            crate::terminal::ProjectedBufferAnchorLocation::Unmapped => {
+                self.search_state.projection_message =
+                    Some("Match is no longer retained in the terminal".to_owned());
+                self.search_state.projection_policy_revision = Some(policy_revision);
+            }
+            crate::terminal::ProjectedBufferAnchorLocation::Identity
+            | crate::terminal::ProjectedBufferAnchorLocation::Visible { .. } => {}
+        }
+    }
+
+    pub(super) fn reveal_hidden_search_match(&mut self) {
+        let Some(zone_id) = self.search_state.hidden_projection_zone else {
+            return;
+        };
+        let Some(search_match) = self
+            .search_state
+            .matches
+            .get(self.search_state.current_match_index)
+            .copied()
+        else {
+            self.search_state.clear_projection_diagnostic();
+            return;
+        };
+        let (session_id, policy_revision) = {
+            let session = self.session_manager.get_active_session_mut();
+            (
+                session.metadata.session_id.clone(),
+                session.projection_policy.revision(),
+            )
+        };
+        if !self
+            .search_state
+            .projection_diagnostic_is_current(&session_id, policy_revision)
+        {
+            self.search_state.clear_projection_diagnostic();
+            self.reveal_current_search_match();
+            return;
+        }
+        let still_hidden_by_same_zone = {
+            let session = self.session_manager.get_active_session_mut();
+            let terminal_arc = std::sync::Arc::clone(&session.terminal);
+            let policy = &session.projection_policy;
+            let view_state = &mut session.projection_view_state;
+            let mut terminal = terminal_arc.lock();
+            let viewport = terminal.projected_viewport_with_state(
+                crate::terminal::HistoryProjection::identity(),
+                self.config.block_mode,
+                policy,
+                view_state,
+            );
+            viewport.is_transformed()
+                && matches!(
+                    terminal.reveal_buffer_anchor_in_projection(
+                        policy,
+                        view_state,
+                        search_match.anchor(),
+                    ),
+                    crate::terminal::ProjectedBufferAnchorLocation::Hidden {
+                        zone_id: current_zone
+                    } if current_zone == zone_id
+                )
+        };
+        if !still_hidden_by_same_zone {
+            self.search_state.clear_projection_diagnostic();
+            self.reveal_current_search_match();
+            return;
+        }
+        let changed = {
+            let session = self.session_manager.get_active_session_mut();
+            let changed = session.projection_policy.expand(zone_id);
+            if changed {
+                session.terminal.lock().clear_text_selection();
+            }
+            changed
+        };
+        if changed {
+            self.search_state.clear_projection_diagnostic();
+            self.reveal_current_search_match();
+        } else {
+            self.search_state.clear_projection_diagnostic();
+        }
+    }
+
+    fn scroll_active_terminal(&mut self, lines: isize) {
+        let block_mode = self.config.block_mode;
         let session = self.session_manager.get_active_session_mut();
-        session
-            .terminal
-            .lock()
-            .scroll_to_buffer_anchor(search_match.anchor());
+        let terminal_arc = std::sync::Arc::clone(&session.terminal);
+        let policy = &session.projection_policy;
+        let view_state = &mut session.projection_view_state;
+        let mut terminal = terminal_arc.lock();
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            block_mode,
+            policy,
+            view_state,
+        );
+        if viewport.is_transformed() {
+            view_state.scroll(lines, &viewport);
+        } else if !terminal.is_alt_buffer_active() {
+            terminal.scroll(lines);
+        }
+    }
+
+    fn jump_adjacent_command(&mut self, next: bool) -> bool {
+        let block_mode = self.config.block_mode;
+        let session = self.session_manager.get_active_session_mut();
+        let terminal_arc = std::sync::Arc::clone(&session.terminal);
+        let policy = &session.projection_policy;
+        let view_state = &mut session.projection_view_state;
+        let mut terminal = terminal_arc.lock();
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            block_mode,
+            policy,
+            view_state,
+        );
+        if !viewport.is_transformed() {
+            return if next {
+                terminal.jump_to_next_command()
+            } else {
+                terminal.jump_to_prev_command()
+            };
+        }
+
+        let top_row = viewport.top_padding();
+        let current_top = match viewport.row_kind(top_row) {
+            Some(crate::terminal::ProjectedRowKind::CollapsedSummary { hidden_range, .. }) => {
+                terminal.raw_cell_anchor_to_buffer_anchor(crate::terminal::RawCellAnchor {
+                    row_id: hidden_range.start.row,
+                    column: hidden_range.start.col,
+                })
+            }
+            _ => viewport
+                .view_row_absolute(top_row)
+                .and_then(|absolute| terminal.absolute_to_buffer_anchor((absolute, 0))),
+        }
+        .map(|anchor| anchor.line_id)
+        .unwrap_or(terminal.total_lines_scrolled);
+        let cols = terminal.grid.row_len();
+        let target = if next {
+            terminal.command_records().iter().find(|record| {
+                crate::block_mode::prompt_row_line_id(
+                    record.prompt_start.line_id,
+                    record.prompt_start.column,
+                    cols,
+                ) > current_top
+            })
+        } else {
+            terminal.command_records().iter().rev().find(|record| {
+                crate::block_mode::prompt_row_line_id(
+                    record.prompt_start.line_id,
+                    record.prompt_start.column,
+                    cols,
+                ) < current_top
+            })
+        };
+        let anchor = target.map(|record| record.prompt_start);
+        if transformed_next_command_returns_to_bottom(
+            next,
+            anchor.is_some(),
+            view_state.offset_from_bottom(),
+        ) {
+            view_state.scroll_to_bottom();
+            return true;
+        }
+        let Some(anchor) = anchor else {
+            return false;
+        };
+        matches!(
+            terminal.reveal_buffer_anchor_in_projection(policy, view_state, anchor),
+            crate::terminal::ProjectedBufferAnchorLocation::Visible { .. }
+        )
     }
 
     pub(super) fn select_next_search_match(&mut self) {
@@ -1730,6 +1965,14 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transformed_next_after_last_mark_returns_to_live_bottom() {
+        assert!(transformed_next_command_returns_to_bottom(true, false, 7));
+        assert!(!transformed_next_command_returns_to_bottom(true, false, 0));
+        assert!(!transformed_next_command_returns_to_bottom(true, true, 7));
+        assert!(!transformed_next_command_returns_to_bottom(false, false, 7));
+    }
 
     #[test]
     fn copy_prefers_terminal_text_then_whole_blocks() {

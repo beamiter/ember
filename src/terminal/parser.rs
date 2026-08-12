@@ -235,6 +235,7 @@ impl super::TerminalState {
                     if self.cursor_col > 0 {
                         self.cursor_col -= 1;
                     }
+                    self.note_output_cursor_reposition(false);
                     i += 1;
                 }
                 b'\x7f' => {
@@ -244,6 +245,13 @@ impl super::TerminalState {
                 b'\n' => {
                     // Linefeed - move cursor down or scroll
                     self.pending_wrap = false;
+                    let departed_row_id = self.grid.row_id(self.cursor_row);
+                    let departed_boundary = BufferAnchor {
+                        line_id: self
+                            .total_lines_scrolled
+                            .saturating_add(self.cursor_row as u64),
+                        column: self.grid.row_len(),
+                    };
                     if self.cursor_row == self.scroll_region_bottom {
                         // 恰在滚动区底边距:向上滚动区域,光标保持在底行
                         self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
@@ -251,11 +259,23 @@ impl super::TerminalState {
                         // 区内或区外(底边距下方)正常下移,不滚动
                         self.cursor_row += 1;
                     }
+                    let next_boundary = BufferAnchor {
+                        line_id: self
+                            .total_lines_scrolled
+                            .saturating_add(self.cursor_row as u64),
+                        column: 0,
+                    };
+                    self.note_output_hard_line_advance(
+                        departed_row_id,
+                        departed_boundary,
+                        next_boundary,
+                    );
                     i += 1;
                 }
                 b'\r' => {
                     self.pending_wrap = false;
                     self.cursor_col = 0;
+                    self.note_output_cursor_reposition(false);
                     i += 1;
                 }
                 b'\x0e' => {
@@ -274,6 +294,7 @@ impl super::TerminalState {
                     // Tab - 前进到下一个制表位(支持自定义 HTS/TBC 制表位)
                     self.pending_wrap = false;
                     self.cursor_col = self.next_tab_stop(self.cursor_col);
+                    self.note_output_cursor_reposition(false);
                     i += 1;
                 }
                 b'\x1b' => {
@@ -556,6 +577,13 @@ impl super::TerminalState {
                             // 否则正常下移(在区域下方时不应滚动)。
                             i += 2;
 
+                            let departed_row_id = self.grid.row_id(self.cursor_row);
+                            let departed_boundary = BufferAnchor {
+                                line_id: self
+                                    .total_lines_scrolled
+                                    .saturating_add(self.cursor_row as u64),
+                                column: self.grid.row_len(),
+                            };
                             if self.cursor_row == self.scroll_region_bottom {
                                 self.scroll_region_up(
                                     self.scroll_region_top,
@@ -564,6 +592,17 @@ impl super::TerminalState {
                             } else if self.cursor_row + 1 < self.grid.rows() {
                                 self.cursor_row += 1;
                             }
+                            let next_boundary = BufferAnchor {
+                                line_id: self
+                                    .total_lines_scrolled
+                                    .saturating_add(self.cursor_row as u64),
+                                column: 0,
+                            };
+                            self.note_output_hard_line_advance(
+                                departed_row_id,
+                                departed_boundary,
+                                next_boundary,
+                            );
                         }
                         b'[' => {
                             i += 2;
@@ -705,6 +744,11 @@ impl super::TerminalState {
         ) {
             self.pending_wrap = false;
         }
+        if matches!(cmd, 'A' | 'B' | 'E' | 'F' | 'H' | 'f' | 'd') {
+            self.note_output_cursor_reposition(true);
+        } else if matches!(cmd, 'C' | 'D' | 'G' | '`') {
+            self.note_output_cursor_reposition(false);
+        }
         match cmd {
             'A' => {
                 // CUU - Cursor Up:仅移动光标,绝不滚动。
@@ -807,12 +851,27 @@ impl super::TerminalState {
                 match params.first().copied().unwrap_or(0) {
                     0 => {
                         // Clear from cursor to end of display
+                        let cols = self.grid.row_len();
+                        let spans: Vec<_> = (self.cursor_row..self.grid.rows())
+                            .map(|row| {
+                                (
+                                    row,
+                                    if row == self.cursor_row {
+                                        self.cursor_col
+                                    } else {
+                                        0
+                                    },
+                                    cols,
+                                )
+                            })
+                            .collect();
+                        self.invalidate_grid_mutation_spans(&spans);
                         for col in self.cursor_col..self.grid.row_len() {
-                            self.clear_cell(self.cursor_row, col);
+                            self.clear_cell_unchecked(self.cursor_row, col);
                         }
                         for row in (self.cursor_row + 1)..self.grid.rows() {
                             for col in 0..self.grid.row_len() {
-                                self.clear_cell(row, col);
+                                self.clear_cell_unchecked(row, col);
                             }
                         }
                         // Mark affected rows as dirty
@@ -822,6 +881,21 @@ impl super::TerminalState {
                     }
                     1 => {
                         // Clear from start to cursor
+                        let cols = self.grid.row_len();
+                        let spans: Vec<_> = (0..=self.cursor_row)
+                            .map(|row| {
+                                (
+                                    row,
+                                    0,
+                                    if row == self.cursor_row {
+                                        self.cursor_col.saturating_add(1).min(cols)
+                                    } else {
+                                        cols
+                                    },
+                                )
+                            })
+                            .collect();
+                        self.invalidate_grid_mutation_spans(&spans);
                         for row in 0..=self.cursor_row {
                             let end_col = if row == self.cursor_row {
                                 self.cursor_col + 1
@@ -829,7 +903,7 @@ impl super::TerminalState {
                                 self.grid.row_len()
                             };
                             for col in 0..end_col {
-                                self.clear_cell(row, col);
+                                self.clear_cell_unchecked(row, col);
                             }
                         }
                         // Mark affected rows as dirty
@@ -851,7 +925,7 @@ impl super::TerminalState {
                     }
                     3 => {
                         // Clear scrollback buffer (xterm extension)
-                        self.scrollback.clear();
+                        self.clear_scrollback_with_projection_provenance();
                         self.invalidate_scrollback_view_cache();
                         self.kitty_graphics.clear_scrollback_placements();
                         self.scroll_offset = 0;
@@ -864,8 +938,13 @@ impl super::TerminalState {
                 match params.first().copied().unwrap_or(0) {
                     0 => {
                         // Clear from cursor to end of line
+                        self.invalidate_grid_mutation_spans(&[(
+                            self.cursor_row,
+                            self.cursor_col,
+                            self.grid.row_len(),
+                        )]);
                         for col in self.cursor_col..self.grid.row_len() {
-                            self.clear_cell(self.cursor_row, col);
+                            self.clear_cell_unchecked(self.cursor_row, col);
                         }
                         // Mark the line as dirty
                         self.dirty_region.mark_row(self.cursor_row);
@@ -873,8 +952,13 @@ impl super::TerminalState {
                     }
                     1 => {
                         // Clear from start of line to cursor
+                        self.invalidate_grid_mutation_spans(&[(
+                            self.cursor_row,
+                            0,
+                            self.cursor_col.saturating_add(1),
+                        )]);
                         for col in 0..=self.cursor_col {
-                            self.clear_cell(self.cursor_row, col);
+                            self.clear_cell_unchecked(self.cursor_row, col);
                         }
                         // Mark the line as dirty
                         self.dirty_region.mark_row(self.cursor_row);
@@ -882,8 +966,13 @@ impl super::TerminalState {
                     }
                     2 => {
                         // Clear entire line
+                        self.invalidate_grid_mutation_spans(&[(
+                            self.cursor_row,
+                            0,
+                            self.grid.row_len(),
+                        )]);
                         for col in 0..self.grid.row_len() {
-                            self.clear_cell(self.cursor_row, col);
+                            self.clear_cell_unchecked(self.cursor_row, col);
                         }
                         // Mark the line as dirty
                         self.dirty_region.mark_row(self.cursor_row);
@@ -904,6 +993,10 @@ impl super::TerminalState {
                     let n = n.min(region_height);
                     let blank = self.create_blank_cell();
                     let cols = self.grid.row_len();
+                    self.forget_output_provenance_for_grid_rows(
+                        self.scroll_region_bottom + 1 - n,
+                        self.scroll_region_bottom,
+                    );
                     for _ in 0..n {
                         let src_start = self.cursor_row * cols;
                         let src_end = self.scroll_region_bottom * cols;
@@ -930,6 +1023,12 @@ impl super::TerminalState {
                     let n = n.min(region_height);
                     let blank = self.create_blank_cell();
                     let cols = self.grid.row_len();
+                    if n > 0 {
+                        self.forget_output_provenance_for_grid_rows(
+                            self.cursor_row,
+                            self.cursor_row + n - 1,
+                        );
+                    }
                     for _ in 0..n {
                         let src_start = (self.cursor_row + 1) * cols;
                         let src_end = (self.scroll_region_bottom + 1) * cols;
@@ -1168,6 +1267,14 @@ impl super::TerminalState {
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
                     let n = n.min(cols - self.cursor_col);
+                    if n == 0 {
+                        return;
+                    }
+                    self.invalidate_grid_mutation_spans(&[(
+                        self.cursor_row,
+                        self.cursor_col,
+                        cols,
+                    )]);
                     // A double-width character split by the insertion point
                     // cannot survive the shift — its halves would end up n
                     // columns apart — so clear both of them first.
@@ -1177,7 +1284,7 @@ impl super::TerminalState {
                         .flags
                         .wide_continuation()
                     {
-                        self.clear_cell(self.cursor_row, self.cursor_col);
+                        self.clear_cell_unchecked(self.cursor_row, self.cursor_col);
                     }
                     for _ in 0..n {
                         self.grid
@@ -1195,6 +1302,14 @@ impl super::TerminalState {
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
                     let n = n.min(cols - self.cursor_col);
+                    if n == 0 {
+                        return;
+                    }
+                    self.invalidate_grid_mutation_spans(&[(
+                        self.cursor_row,
+                        self.cursor_col,
+                        cols,
+                    )]);
                     // Deleting one half of a double-width character has to take
                     // the other half with it, at both edges of the window: the
                     // lead left standing to the left, and the continuation that
@@ -1216,13 +1331,10 @@ impl super::TerminalState {
             'X' => {
                 // ECH - Erase Character(s)
                 let n = params.first().copied().unwrap_or(1) as usize;
-                for i in 0..n {
-                    let col = self.cursor_col + i;
-                    if col < self.grid.row_len() {
-                        self.clear_cell(self.cursor_row, col);
-                    } else {
-                        break;
-                    }
+                let end = self.cursor_col.saturating_add(n).min(self.grid.row_len());
+                self.invalidate_grid_mutation_spans(&[(self.cursor_row, self.cursor_col, end)]);
+                for col in self.cursor_col..end {
+                    self.clear_cell_unchecked(self.cursor_row, col);
                 }
                 // Mark row as dirty after modification
                 self.mark_row_dirty(self.cursor_row);
@@ -1453,6 +1565,9 @@ impl super::TerminalState {
     /// 供 ED(`CSI 2J`)使用 —— 按 VT 规范擦除显示不得移动光标。
     pub(super) fn erase_screen(&mut self) {
         let bg_color = self.current_bg;
+        let cols = self.grid.row_len();
+        let spans: Vec<_> = (0..self.grid.rows()).map(|row| (row, 0, cols)).collect();
+        self.invalidate_grid_mutation_spans(&spans);
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
                 *cell = TerminalCell {

@@ -72,6 +72,17 @@ pub struct SearchState {
 
     /// 搜索错误消息（正则表达式编译错误等）
     pub error_message: Option<String>,
+    /// Projection-only navigation diagnostic. Keep this separate from regex
+    /// errors so moving from a hidden match to a visible one cannot leave a
+    /// stale error banner behind or erase an engine failure.
+    pub projection_message: Option<String>,
+    /// A hidden raw match is never expanded implicitly by Next/Previous.
+    /// The search panel exposes an explicit reveal action for this owner.
+    pub hidden_projection_zone: Option<u64>,
+    /// Projection diagnostics are capabilities scoped to the exact policy
+    /// revision that classified the current match. A later collapse/expand
+    /// must reclassify before a reveal action can mutate session policy.
+    pub projection_policy_revision: Option<u64>,
     /// More matches existed than we retain/render. Navigation remains bounded
     /// to the deterministic first [`MAX_SEARCH_MATCHES`] results.
     pub results_truncated: bool,
@@ -80,6 +91,9 @@ pub struct SearchState {
     /// 避免搜索面板显示旧会话的匹配计数与高亮。
     pub results_grid_version: Option<u64>,
     pub results_session_idx: Option<usize>,
+    /// Stable owner for the result set. Session indices can be reused or
+    /// reordered, while this id follows the terminal session itself.
+    pub results_session_id: Option<String>,
     pub results_refreshed_at: Option<std::time::Instant>,
 }
 
@@ -112,11 +126,27 @@ impl SearchState {
             history_nav_index: None,
             last_query: String::new(),
             error_message: None,
+            projection_message: None,
+            hidden_projection_zone: None,
+            projection_policy_revision: None,
             results_truncated: false,
             results_grid_version: None,
             results_session_idx: None,
+            results_session_id: None,
             results_refreshed_at: None,
         }
+    }
+
+    pub fn clear_projection_diagnostic(&mut self) {
+        self.projection_message = None;
+        self.hidden_projection_zone = None;
+        self.projection_policy_revision = None;
+    }
+
+    pub fn projection_diagnostic_is_current(&self, session_id: &str, policy_revision: u64) -> bool {
+        self.projection_message.is_some()
+            && self.results_session_id.as_deref() == Some(session_id)
+            && self.projection_policy_revision == Some(policy_revision)
     }
 
     /// 打开并聚焦搜索。重复调用保持打开，而不是意外切换为关闭。
@@ -603,5 +633,22 @@ mod tests {
         };
         assert!(!terminal.viewport_buffer_mapping_is_exact());
         assert_eq!(search_match.viewport_row(&terminal), None);
+    }
+
+    #[test]
+    fn projection_diagnostic_is_scoped_to_stable_session_and_policy() {
+        let mut state = SearchState::new();
+        state.projection_message = Some("hidden".to_owned());
+        state.hidden_projection_zone = Some(1);
+        state.projection_policy_revision = Some(4);
+        state.results_session_id = Some("session-a".to_owned());
+
+        assert!(state.projection_diagnostic_is_current("session-a", 4));
+        assert!(!state.projection_diagnostic_is_current("session-b", 4));
+        assert!(!state.projection_diagnostic_is_current("session-a", 5));
+
+        state.clear_projection_diagnostic();
+        assert!(!state.projection_diagnostic_is_current("session-a", 4));
+        assert!(state.hidden_projection_zone.is_none());
     }
 }

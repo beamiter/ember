@@ -874,14 +874,35 @@ impl TerminalApp {
             return;
         }
         let jumped = {
-            let Some(session) = self.session_manager.sessions().get(index) else {
+            let block_mode = self.config.block_mode;
+            let Some(session) = self.session_manager.sessions_mut().get_mut(index) else {
                 self.set_status("Command session is no longer available");
                 return;
             };
-            session
-                .terminal
-                .lock()
-                .scroll_to_command(&target.execution_id)
+            let terminal_arc = std::sync::Arc::clone(&session.terminal);
+            let policy = &session.projection_policy;
+            let view_state = &mut session.projection_view_state;
+            let mut terminal = terminal_arc.lock();
+            let Some(anchor) = terminal
+                .command_record(&target.execution_id)
+                .map(|record| record.prompt_start)
+            else {
+                return self.set_status("Command position is no longer in scrollback");
+            };
+            let viewport = terminal.projected_viewport_with_state(
+                crate::terminal::HistoryProjection::identity(),
+                block_mode,
+                policy,
+                view_state,
+            );
+            if viewport.is_transformed() {
+                matches!(
+                    terminal.reveal_buffer_anchor_in_projection(policy, view_state, anchor),
+                    crate::terminal::ProjectedBufferAnchorLocation::Visible { .. }
+                )
+            } else {
+                terminal.scroll_to_command(&target.execution_id)
+            }
         };
         if jumped {
             self.smooth_scroll_velocity = 0.0;
@@ -1427,18 +1448,92 @@ impl TerminalApp {
                 self.block_toggle_bookmark_target(&target)
             }
             crate::block_mode::BlockMenuAction::CopyJson => self.copy_block_json(&target),
+            crate::block_mode::BlockMenuAction::CollapseOutput => {
+                self.block_set_output_collapsed(&target, true)
+            }
+            crate::block_mode::BlockMenuAction::ExpandOutput => {
+                self.block_set_output_collapsed(&target, false)
+            }
+        }
+    }
+
+    fn block_set_output_collapsed(&mut self, target: &CommandTarget, collapsed: bool) {
+        let Some(index) = self.session_manager.index_of(&target.session_id) else {
+            self.set_status("Command block is no longer available");
+            return;
+        };
+        let Some(session) = self.session_manager.sessions_mut().get_mut(index) else {
+            self.set_status("Command block is no longer available");
+            return;
+        };
+        let terminal = std::sync::Arc::clone(&session.terminal);
+        let sequence = {
+            let terminal = terminal.lock();
+            let Some(record) = terminal
+                .command_record(&target.execution_id)
+                .filter(|record| record.complete)
+            else {
+                self.set_status("Command block is no longer available");
+                return;
+            };
+            if collapsed && terminal.finished_output_range(record.sequence).is_none() {
+                self.set_status("This block has no exact retained output to collapse");
+                return;
+            }
+            record.sequence
+        };
+        let changed = if collapsed {
+            session.projection_policy.collapse(sequence)
+        } else {
+            session.projection_policy.expand(sequence)
+        };
+        if changed {
+            terminal.lock().clear_text_selection();
+            self.smooth_scroll_velocity = 0.0;
+            self.smooth_scroll_pixel_offset = 0.0;
+            self.set_status(if collapsed {
+                "Collapsed block output"
+            } else {
+                "Expanded block output"
+            });
+            if self.search_state.is_open {
+                self.reveal_current_search_match();
+            }
         }
     }
 
     fn block_scroll_target_edge(&mut self, target: &CommandTarget, bottom: bool) {
+        let block_mode = self.config.block_mode;
         let jumped = self
             .target_session_index(target)
-            .and_then(|index| self.session_manager.sessions().get(index))
+            .and_then(|index| self.session_manager.sessions_mut().get_mut(index))
             .is_some_and(|session| {
-                session
-                    .terminal
-                    .lock()
-                    .scroll_to_command_edge(&target.execution_id, bottom)
+                let terminal_arc = std::sync::Arc::clone(&session.terminal);
+                let policy = &session.projection_policy;
+                let view_state = &mut session.projection_view_state;
+                let mut terminal = terminal_arc.lock();
+                let viewport = terminal.projected_viewport_with_state(
+                    crate::terminal::HistoryProjection::identity(),
+                    block_mode,
+                    policy,
+                    view_state,
+                );
+                if !viewport.is_transformed() {
+                    return terminal.scroll_to_command_edge(&target.execution_id, bottom);
+                }
+                let Some(anchor) = terminal.command_edge_anchor(&target.execution_id, bottom)
+                else {
+                    return false;
+                };
+                match terminal.reveal_buffer_anchor_in_projection(policy, view_state, anchor) {
+                    crate::terminal::ProjectedBufferAnchorLocation::Visible { .. } => true,
+                    crate::terminal::ProjectedBufferAnchorLocation::Hidden { zone_id }
+                        if bottom && policy.is_collapsed(zone_id) =>
+                    {
+                        terminal.reveal_collapsed_summary(policy, view_state, zone_id)
+                    }
+                    _ => false,
+                }
             });
         if jumped {
             self.smooth_scroll_velocity = 0.0;
@@ -2192,6 +2287,8 @@ impl TerminalApp {
             let mut terminal = session.terminal.lock();
             terminal.note_user_input(&payload);
             terminal.scroll_to_bottom();
+            drop(terminal);
+            session.projection_view_state.scroll_to_bottom();
             Ok(count)
         };
 
@@ -2801,6 +2898,8 @@ impl TerminalApp {
                             let mut terminal = session.terminal.lock();
                             terminal.note_user_input(&payload);
                             terminal.scroll_to_bottom();
+                            drop(terminal);
+                            session.projection_view_state.scroll_to_bottom();
                             if run {
                                 ReplayOutcome::Ran
                             } else {

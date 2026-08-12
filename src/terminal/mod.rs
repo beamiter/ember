@@ -2,7 +2,7 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use smallvec::SmallVec;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
@@ -220,10 +220,62 @@ mod tests;
 pub use grid::*;
 pub(crate) use hyperlink::is_supported_hyperlink_uri;
 pub use hyperlink::HyperlinkId;
+#[allow(unused_imports)] // Public P1 contract; UI consumers land in the next slice.
 pub use projection::{
-    DisplayPoint, HistoryProjection, ProjectedViewport, ProjectionCacheKey, ProjectionLayoutKey,
-    RawCellAnchor,
+    DisplayPoint, FinishedOutputRange, HistoryProjection, ProjectedBufferAnchorLocation,
+    ProjectedRowKind, ProjectedViewport, ProjectionCacheKey, ProjectionLayoutKey, ProjectionPolicy,
+    ProjectionViewState, RawCellAnchor, RawCellBoundary, SyntheticRowKey,
 };
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by the transformed projection slice.
+struct FinishedOutputProvenance {
+    range: FinishedOutputRange,
+    start_line_id: u64,
+    rows: Vec<FinishedOutputRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinishedOutputRow {
+    row_id: RawRowId,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinishedOutputOwner {
+    zone_id: u64,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FINISHED_OUTPUT_EVICTION_ROW_CHECKS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveOutputProvenance {
+    zone_id: u64,
+    start: BufferAnchor,
+    start_row_id: RawRowId,
+    extent: Option<BufferAnchor>,
+    extent_row_id: Option<RawRowId>,
+    last_write_end: Option<BufferAnchor>,
+    /// Boundary produced by real terminal output events. Printable writes use
+    /// their cell end; LF/IND use the following row at column zero. Explicit
+    /// cursor positioning never updates this value.
+    semantic_end: Option<BufferAnchor>,
+    /// CR/BS/tab and other horizontal cursor controls are only exact when a
+    /// subsequent output event resolves them. A D immediately after the move
+    /// must fail closed rather than infer cells from cursor position alone.
+    cursor_moved_since_output: bool,
+    /// Unsupported non-linear output (for example a write above OSC 133 C)
+    /// must fail closed instead of claiming prompt/header cells.
+    invalid: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMode {
@@ -236,6 +288,17 @@ pub struct Selection {
     pub anchor: (usize, usize),
     pub active: (usize, usize),
     pub mode: SelectionMode,
+}
+
+/// Selection coordinates in a transformed projected document. These cannot
+/// be mixed with raw scrollback indices because collapse summaries introduce
+/// holes and synthetic rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectedSelection {
+    plan_revision: u64,
+    anchor: (usize, usize),
+    active: (usize, usize),
+    mode: SelectionMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -343,6 +406,8 @@ pub struct TerminalState {
     alt_grid: TerminalGrid,
     pub scrollback: VecDeque<ScrollbackLine>,
     pub selection: Option<Selection>,
+    projected_selection: Option<ProjectedSelection>,
+    selection_revision: u64,
     pub scroll_offset: usize,
     max_scrollback: usize,
     use_alt_buffer: bool,
@@ -438,6 +503,11 @@ pub struct TerminalState {
     /// P0 is an identity projection over `visible_cells_cache`, so the cell
     /// allocation is shared and only the stable-origin index is cached here.
     projected_viewport_cache: Option<ProjectedViewport>,
+    /// Cell-free full-document plan and late-materialized transformed slice.
+    /// Their exact keys intentionally have different invalidation domains.
+    projection_plan_cache: Option<projection::ProjectionPlanCache>,
+    transformed_viewport_cache: Option<projection::TransformedViewportCache>,
+    next_projection_plan_revision: u64,
     /// Cached answer for whether raw buffer coordinates exactly match the
     /// lazily reflowed viewport. Interior mutability keeps per-match lookup
     /// O(1) while the first lookup for a new viewport performs one scan.
@@ -482,6 +552,11 @@ pub struct TerminalState {
     /// of `ProjectionCacheKey` even when PTY cell bytes did not otherwise bump
     /// the terminal grid version.
     row_identity_revision: u64,
+    /// Canonical primary full-screen row-transfer counter. Noncanonical row
+    /// moves advance only `row_identity_revision`, so the two key deltas fail
+    /// closed for that batch and a later full rebuild establishes a recoverable
+    /// baseline. Zero permanently disables advancement only after overflow.
+    full_screen_scroll_revision: u64,
 
     /// OSC 133 command boundaries recorded by FinalTerm-aware shells. FIFO,
     /// capped at `MAX_COMMAND_MARKS`. Marks pointing to lines that have been
@@ -490,6 +565,12 @@ pub struct TerminalState {
 
     command_records: VecDeque<CommandRecord>,
     next_command_sequence: u64,
+    finished_output_provenance: HashMap<u64, FinishedOutputProvenance>,
+    finished_output_owners: HashMap<RawRowId, Vec<FinishedOutputOwner>>,
+    /// Monotonic structural revision for completed-range ownership. This is
+    /// independent from ordinary cell paint changes.
+    finished_output_revision: u64,
+    active_output_provenance: Option<ActiveOutputProvenance>,
     pending_completed_command_outputs: VecDeque<CompletedCommandOutput>,
     captured_command_output_bytes: usize,
     agent_prompt_input_tainted: bool,

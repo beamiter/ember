@@ -154,6 +154,26 @@ pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<Str
     }
 }
 
+/// Compact placeholder copy for a finished block whose output rows are
+/// hidden by the projection. Keep the row count explicit so folding never
+/// looks like output loss, and keep the affordance in the label because the
+/// whole summary row is clickable.
+pub fn collapsed_summary_text(hidden_rows: usize) -> String {
+    let noun = if hidden_rows == 1 { "row" } else { "rows" };
+    format!("▸ {hidden_rows} output {noun} hidden — click to expand")
+}
+
+/// Context-menu label for the requested output-fold policy. Requested state is
+/// authoritative here: a stale or overlap-pruned request must still offer
+/// Expand so the user can clear it and recover the identity fast path.
+pub fn output_collapse_menu_label(is_requested_collapsed: bool) -> &'static str {
+    if is_requested_collapsed {
+        "Expand output"
+    } else {
+        "Collapse output"
+    }
+}
+
 /// The row a prompt anchor actually renders on. `current_buffer_anchor`
 /// records a pending-wrap position as `column == cols` ("end of this row"),
 /// which means the next glyph — the prompt itself — lands on the following
@@ -427,6 +447,8 @@ pub enum BlockMenuAction {
     Search,
     ToggleBookmark,
     CopyJson,
+    CollapseOutput,
+    ExpandOutput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1096,6 +1118,28 @@ mod tests {
             running_badge_refresh_interval(3_600_000),
             std::time::Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn collapsed_summary_uses_output_row_count_and_expand_affordance() {
+        assert_eq!(
+            collapsed_summary_text(0),
+            "▸ 0 output rows hidden — click to expand"
+        );
+        assert_eq!(
+            collapsed_summary_text(1),
+            "▸ 1 output row hidden — click to expand"
+        );
+        assert_eq!(
+            collapsed_summary_text(42),
+            "▸ 42 output rows hidden — click to expand"
+        );
+    }
+
+    #[test]
+    fn collapse_menu_label_tracks_requested_policy_state() {
+        assert_eq!(output_collapse_menu_label(false), "Collapse output");
+        assert_eq!(output_collapse_menu_label(true), "Expand output");
     }
 
     #[test]

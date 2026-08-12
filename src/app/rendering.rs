@@ -10,6 +10,39 @@ const MAX_FRAME_BUDGET: usize = 256 * 1024;
 const TARGET_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
 const MIN_ADAPTIVE_SAMPLE_BYTES: usize = 4 * 1024;
 
+fn prune_permanently_unavailable_collapses(
+    policy: &mut crate::terminal::ProjectionPolicy,
+    terminal: &crate::terminal::TerminalState,
+    checked: &mut Option<(u64, u64)>,
+) {
+    let finished_revision = terminal.finished_output_revision();
+    let source = (policy.revision(), finished_revision);
+    if !collapse_availability_check_needed(*checked, policy.revision(), finished_revision) {
+        return;
+    }
+    if policy.is_identity() {
+        *checked = (finished_revision != 0).then_some(source);
+        return;
+    }
+    let stale: smallvec::SmallVec<[u64; 4]> = policy
+        .collapsed_zone_ids()
+        .filter(|zone_id| terminal.finished_output_range(*zone_id).is_none())
+        .collect();
+    for zone_id in stale {
+        policy.expand(zone_id);
+    }
+    let finished_revision = terminal.finished_output_revision();
+    *checked = (finished_revision != 0).then_some((policy.revision(), finished_revision));
+}
+
+fn collapse_availability_check_needed(
+    cached: Option<(u64, u64)>,
+    policy_revision: u64,
+    finished_revision: u64,
+) -> bool {
+    finished_revision == 0 || cached != Some((policy_revision, finished_revision))
+}
+
 fn paste_confirmation_decision(
     armed: bool,
     requested: Option<bool>,
@@ -624,17 +657,34 @@ impl TerminalApp {
                     self.pane_renderers[pane_idx].grid_dimensions(content_rect.size());
                 if let Some(session) = self.session_manager.get_session_mut(session_idx) {
                     let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
-                    let mut terminal_guard = session.terminal.lock();
+                    let terminal_arc = std::sync::Arc::clone(&session.terminal);
+                    let mut terminal_guard = terminal_arc.lock();
                     if pane_cols != terminal_guard.grid.row_len()
                         || pane_rows != terminal_guard.grid.rows()
                     {
                         terminal_guard.on_resize(pane_cols, pane_rows);
                         let _ = session.shell.resize(pane_cols, pane_rows);
                     }
+                    prune_permanently_unavailable_collapses(
+                        &mut session.projection_policy,
+                        &terminal_guard,
+                        &mut session.collapse_availability_cache,
+                    );
+                    let projection_policy = &session.projection_policy;
+                    let projection_view_state = &mut session.projection_view_state;
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
                     // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
                     let renderer = &mut self.pane_renderers[pane_idx];
-                    let viewport = renderer.projected_viewport(&mut terminal_guard);
+                    let viewport = renderer.projected_viewport_with_state(
+                        &mut terminal_guard,
+                        projection_policy,
+                        projection_view_state,
+                    );
+                    renderer.set_projection_frame(
+                        &terminal_guard,
+                        viewport.clone(),
+                        projection_policy,
+                    );
                     let projection_key = viewport.key();
                     if renderer.cached_links_projection_key != Some(projection_key)
                         || terminal_ptr != renderer.cached_links_terminal_ptr
@@ -686,6 +736,16 @@ impl TerminalApp {
                         pane_hovered_link,
                         content_rect,
                     );
+                    if let Some(request) = renderer.take_projected_scroll_request() {
+                        match request {
+                            crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
+                                projection_view_state.set_offset(offset, &viewport);
+                            }
+                            crate::ui::ProjectedScrollRequest::Delta(lines) => {
+                                projection_view_state.scroll(lines, &viewport);
+                            }
+                        }
+                    }
 
                     if let Some(click) = renderer.block_click.take() {
                         pending_block_click = Some((session.metadata.session_id.clone(), click));
@@ -850,10 +910,27 @@ impl TerminalApp {
                 self.renderer
                     .set_block_bookmarks(self.block_bookmarks.get(&session_id));
                 let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
-                let mut terminal_guard = session.terminal.lock();
+                let terminal_arc = std::sync::Arc::clone(&session.terminal);
+                let mut terminal_guard = terminal_arc.lock();
+                prune_permanently_unavailable_collapses(
+                    &mut session.projection_policy,
+                    &terminal_guard,
+                    &mut session.collapse_availability_cache,
+                );
+                let projection_policy = &session.projection_policy;
+                let projection_view_state = &mut session.projection_view_state;
 
                 // 获取链接列表用于渲染（使用缓存）
-                let viewport = self.renderer.projected_viewport(&mut terminal_guard);
+                let viewport = self.renderer.projected_viewport_with_state(
+                    &mut terminal_guard,
+                    projection_policy,
+                    projection_view_state,
+                );
+                self.renderer.set_projection_frame(
+                    &terminal_guard,
+                    viewport.clone(),
+                    projection_policy,
+                );
                 let projection_key = viewport.key();
 
                 if self.cached_links_projection_key != Some(projection_key)
@@ -877,6 +954,16 @@ impl TerminalApp {
                     &self.cached_links,
                     &self.hovered_link,
                 );
+                if let Some(request) = self.renderer.take_projected_scroll_request() {
+                    match request {
+                        crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
+                            projection_view_state.set_offset(offset, &viewport);
+                        }
+                        crate::ui::ProjectedScrollRequest::Delta(lines) => {
+                            projection_view_state.scroll(lines, &viewport);
+                        }
+                    }
+                }
                 drop(terminal_guard);
                 if let Some(click) = self.renderer.block_click.take() {
                     pending_block_click = Some((session_id.clone(), click));
@@ -910,13 +997,32 @@ impl TerminalApp {
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
         const LIVE_SEARCH_REFRESH_INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(300);
+        if self.search_state.is_open && self.search_state.projection_message.is_some() {
+            let (session_id, policy_revision) = {
+                let session = self.session_manager.get_active_session_mut();
+                (
+                    session.metadata.session_id.clone(),
+                    session.projection_policy.revision(),
+                )
+            };
+            if !self
+                .search_state
+                .projection_diagnostic_is_current(&session_id, policy_revision)
+            {
+                self.reveal_current_search_match();
+            }
+        }
         let (search_needs_refresh, delayed_refresh) = if self.search_state.is_open {
             let session_idx = self.session_manager.active_index();
-            let grid_version = {
+            let (grid_version, session_id) = {
                 let session = self.session_manager.get_active_session_mut();
-                session.terminal.lock().get_grid_version()
+                (
+                    session.terminal.lock().get_grid_version(),
+                    session.metadata.session_id.clone(),
+                )
             };
-            let session_changed = self.search_state.results_session_idx != Some(session_idx);
+            let session_changed = self.search_state.results_session_idx != Some(session_idx)
+                || self.search_state.results_session_id.as_deref() != Some(session_id.as_str());
             let grid_changed = self.search_state.results_grid_version != Some(grid_version);
             let elapsed = self
                 .search_state
@@ -943,12 +1049,14 @@ impl TerminalApp {
             let screen_rect = ctx.viewport_rect();
             let search_width = (screen_rect.width() - 24.0).clamp(300.0, 520.0);
             let search_height = if self.search_state.error_message.is_some()
+                || self.search_state.projection_message.is_some()
                 || self.search_state.results_truncated
             {
                 82.0
             } else {
                 52.0
             };
+            let mut reveal_hidden_match = false;
             egui::Window::new("Search")
                 .title_bar(false)
                 .resizable(false)
@@ -1039,6 +1147,15 @@ impl TerminalApp {
                     // 显示错误信息（如正则表达式错误）
                     if let Some(error) = &self.search_state.error_message {
                         ui.label(egui::RichText::new(error).color(egui::Color32::RED));
+                    } else if let Some(message) = &self.search_state.projection_message {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(message).color(egui::Color32::YELLOW));
+                            if self.search_state.hidden_projection_zone.is_some()
+                                && ui.button("Reveal match").clicked()
+                            {
+                                reveal_hidden_match = true;
+                            }
+                        });
                     } else if self.search_state.results_truncated {
                         ui.label(
                             egui::RichText::new(format!(
@@ -1049,6 +1166,10 @@ impl TerminalApp {
                         );
                     }
                 });
+            if reveal_hidden_match {
+                self.reveal_hidden_search_match();
+                self.search_state.search_focused = true;
+            }
         }
 
         // 命令调色板 UI（中央弹窗）
@@ -2157,5 +2278,44 @@ mod tests {
         assert!(!terminal_frame_interaction_enabled(false, true));
         assert!(!terminal_frame_interaction_enabled(true, false));
         assert!(!terminal_frame_interaction_enabled(true, true));
+    }
+
+    #[test]
+    fn permanently_evicted_collapse_requests_return_to_the_identity_fast_path() {
+        let mut terminal = crate::terminal::TerminalState::new(12, 6);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;C;id=fold\x07OUT\r\n\x1b]133;D;0;id=fold\x07",
+        );
+        let zone_id = terminal.command_records().back().unwrap().sequence;
+        assert!(terminal.finished_output_range(zone_id).is_some());
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+
+        // A real resize deliberately invalidates exact raw output ownership.
+        // Keeping the request would make every identity frame resolve a stale
+        // policy forever even though no menu target can restore it.
+        terminal.on_resize(13, 6);
+        let mut checked = None;
+        prune_permanently_unavailable_collapses(&mut policy, &terminal, &mut checked);
+        assert!(policy.is_identity());
+        assert_eq!(
+            checked,
+            Some((policy.revision(), terminal.finished_output_revision()))
+        );
+        assert!(!collapse_availability_check_needed(
+            checked,
+            policy.revision(),
+            terminal.finished_output_revision(),
+        ));
+        assert!(collapse_availability_check_needed(
+            checked,
+            policy.revision().saturating_add(1),
+            terminal.finished_output_revision(),
+        ));
+        assert!(collapse_availability_check_needed(
+            checked,
+            policy.revision(),
+            0
+        ));
     }
 }

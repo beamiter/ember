@@ -54,21 +54,54 @@ fn hovered_link_color() -> Color32 {
     Color32::from_rgb(100, 200, 255)
 }
 
-fn viewport_search_map<'a>(
+#[derive(Clone, Copy)]
+struct ViewportSearchMatch {
+    source: crate::search::SearchMatch,
+    col_start: usize,
+    col_end: usize,
+}
+
+fn search_match_in_projection(
     terminal: &TerminalState,
-    matches: &'a [crate::search::SearchMatch],
+    viewport: &ProjectedViewport,
+    search_match: crate::search::SearchMatch,
+) -> Option<(usize, usize, usize)> {
+    if !viewport.is_transformed() {
+        let row = search_match.viewport_row(terminal)?;
+        return Some((row, search_match.col_start, search_match.col_end));
+    }
+    let start = terminal.buffer_anchor_to_projected(viewport, search_match.anchor())?;
+    let mut end_anchor = search_match.anchor();
+    let end_column = search_match.col_end.checked_sub(1)?;
+    end_anchor.column = end_column;
+    let end = terminal.buffer_anchor_to_projected(viewport, end_anchor)?;
+    (start.row == end.row && start.column <= end.column).then_some((
+        start.row,
+        start.column,
+        end.column + 1,
+    ))
+}
+
+fn viewport_search_map(
+    terminal: &TerminalState,
+    viewport: &ProjectedViewport,
+    matches: &[crate::search::SearchMatch],
     rows: usize,
-) -> Vec<Vec<&'a crate::search::SearchMatch>> {
+) -> Vec<Vec<ViewportSearchMatch>> {
     let mut map = vec![Vec::new(); rows];
-    if !terminal.viewport_buffer_mapping_is_exact() {
+    if !viewport.is_transformed() && !terminal.viewport_buffer_mapping_is_exact() {
         return map;
     }
-    for search_match in matches {
-        if let Some(viewport_row) = search_match
-            .viewport_row(terminal)
-            .filter(|viewport_row| *viewport_row < rows)
+    for &search_match in matches {
+        if let Some((row, col_start, col_end)) =
+            search_match_in_projection(terminal, viewport, search_match)
+                .filter(|(row, _, _)| *row < rows)
         {
-            map[viewport_row].push(search_match);
+            map[row].push(ViewportSearchMatch {
+                source: search_match,
+                col_start,
+                col_end,
+            });
         }
     }
     map
@@ -528,6 +561,10 @@ struct BlockChromeEntry {
     /// Prompt/command header range in normalized continuous-grid coordinates.
     /// Output begins at the exclusive end, including a same-row column split.
     header_range: Option<((u64, usize), (u64, usize))>,
+    /// Exact inclusive header cells in a transformed viewport. `None` is a
+    /// fail-closed answer, not permission to fall back to raw scroll geometry.
+    projected_header_range: Option<(DisplayPoint, DisplayPoint)>,
+    projected_geometry: bool,
     outcome: crate::block_mode::BlockOutcome,
     /// The newest incomplete semantic record owns the live input/running
     /// surface. It receives the accent card independently of block selection.
@@ -541,11 +578,148 @@ struct BlockChromeEntry {
     finished_at: Option<std::time::SystemTime>,
 }
 
+fn previous_buffer_cell(
+    boundary: (u64, usize),
+    cols: usize,
+) -> Option<crate::terminal::BufferAnchor> {
+    if boundary.1 > 0 {
+        return Some(crate::terminal::BufferAnchor {
+            line_id: boundary.0,
+            column: boundary.1 - 1,
+        });
+    }
+    (boundary.0 > 0 && cols > 0).then_some(crate::terminal::BufferAnchor {
+        line_id: boundary.0 - 1,
+        column: cols - 1,
+    })
+}
+
+fn projected_header_contains(
+    range: Option<(DisplayPoint, DisplayPoint)>,
+    point: DisplayPoint,
+) -> bool {
+    range.is_some_and(|(start, end)| start <= point && point <= end)
+}
+
+fn projected_span_edge_flags(
+    prompt: Option<DisplayPoint>,
+    next_prompt: Option<DisplayPoint>,
+    first_row: usize,
+    last_row: usize,
+) -> (bool, bool) {
+    let starts = prompt.is_some_and(|point| point.row == first_row);
+    let ends = next_prompt
+        .is_some_and(|next| next.column == 0 && last_row.checked_add(1) == Some(next.row));
+    (starts, ends)
+}
+
+fn command_record_index_for_sequence(
+    records: &std::collections::VecDeque<crate::terminal::CommandRecord>,
+    sequence: u64,
+) -> Option<usize> {
+    let mut start = 0usize;
+    let mut end = records.len();
+    while start < end {
+        let middle = start + (end - start) / 2;
+        let record = records.get(middle)?;
+        match record.sequence.cmp(&sequence) {
+            std::cmp::Ordering::Less => start = middle + 1,
+            std::cmp::Ordering::Greater => end = middle,
+            std::cmp::Ordering::Equal => return Some(middle),
+        }
+    }
+    None
+}
+
+fn kitty_absolute_row(scrollback_len: usize, placement_y: i64) -> Option<usize> {
+    let history_len = i64::try_from(scrollback_len).ok()?;
+    usize::try_from(history_len.checked_add(placement_y)?).ok()
+}
+
+fn projected_kitty_row_budget(viewport_rows: usize) -> usize {
+    viewport_rows.saturating_mul(8).min(4096)
+}
+
+fn reserve_projected_kitty_rows(remaining: &mut usize, rows: usize) -> bool {
+    if rows == 0 || rows > *remaining {
+        return false;
+    }
+    *remaining -= rows;
+    true
+}
+
+fn mark_changed_grid_rows(
+    terminal: &TerminalState,
+    viewport: &ProjectedViewport,
+    raw_grid_rows: &[usize],
+    dirty_rows: &mut [bool],
+) {
+    if dirty_rows.is_empty() {
+        return;
+    }
+    for &raw_grid_row in raw_grid_rows {
+        if viewport.is_transformed() {
+            let Some(absolute) = terminal.scrollback.len().checked_add(raw_grid_row) else {
+                dirty_rows.fill(true);
+                return;
+            };
+            let Some(raw_row) = terminal.raw_row_id_at_absolute(absolute) else {
+                dirty_rows.fill(true);
+                return;
+            };
+            if let Some((first, last)) = viewport.raw_row_view_bounds(raw_row) {
+                let last_exclusive = last.min(dirty_rows.len() - 1) + 1;
+                if first < last_exclusive {
+                    dirty_rows[first..last_exclusive].fill(true);
+                }
+            }
+        } else if let Some(dirty) = dirty_rows.get_mut(raw_grid_row) {
+            *dirty = true;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BlockPrimaryPress {
     terminal: usize,
     record_id: String,
     gesture: crate::block_mode::BlockSelectionGesture,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryRowEntry {
+    row: usize,
+    key: crate::terminal::SyntheticRowKey,
+    hidden_rows: usize,
+    record_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryPrimaryPress {
+    terminal: usize,
+    projection_key: ProjectionCacheKey,
+    key: crate::terminal::SyntheticRowKey,
+    record_id: String,
+}
+
+fn stable_summary_activation(
+    press: &SummaryPrimaryPress,
+    rendered_terminal: usize,
+    projection_key: ProjectionCacheKey,
+    current: Option<&SummaryRowEntry>,
+) -> Option<String> {
+    let current = current?;
+    (press.terminal == rendered_terminal
+        && press.projection_key == projection_key
+        && press.key == current.key
+        && press.record_id == current.record_id)
+        .then(|| press.record_id.clone())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectedScrollRequest {
+    SetOffset(usize),
+    Delta(isize),
 }
 
 /// Layout-owned space before terminal column zero while Block Mode is on.
@@ -718,6 +892,10 @@ pub struct TerminalRenderer {
     // Kitty graphics texture cache with count and byte-budget eviction.
     texture_cache: LruCache<u32, (egui::TextureHandle, u32, u32, u64)>,
     texture_cache_bytes: usize,
+    /// Shared across all three Kitty z-layers in one transformed frame. This
+    /// bounds P1's all-or-nothing raw/projected rectangle validation while
+    /// retaining the legacy identity rendering path without a new cap.
+    projected_kitty_rows_remaining: Option<usize>,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
     pub opacity: f32,
@@ -731,6 +909,11 @@ pub struct TerminalRenderer {
     /// Projection-only state is renderer-owned and versioned independently
     /// from PTY/grid mutations. P0 exposes only the identity policy.
     history_projection: HistoryProjection,
+    /// Session-owned projection materialized by the app before link detection.
+    /// The terminal pointer prevents a renderer reused by another tab/pane
+    /// from consuming a stale snapshot; the value is drained by render.
+    frame_projection: Option<(usize, ProjectedViewport)>,
+    requested_collapsed_zone_ids: std::collections::HashSet<u64>,
     /// Tighten card-only spacing/radius without changing the terminal grid or
     /// PTY geometry.
     pub block_compact: bool,
@@ -755,6 +938,8 @@ pub struct TerminalRenderer {
     /// Press-time whole-card ownership. Gesture, modifiers and stable target
     /// never get recomputed from the release position.
     block_primary_press: Option<BlockPrimaryPress>,
+    summary_primary_press: Option<SummaryPrimaryPress>,
+    projected_scroll_request: Option<ProjectedScrollRequest>,
     /// Whether to use GPU-accelerated grid rendering
     pub gpu_rendering: bool,
     /// wgpu render state for GPU-accelerated grid rendering
@@ -786,6 +971,7 @@ pub struct TerminalRenderer {
     last_rendered_grid_version: u64,
     last_rendered_projection_layout_key: Option<ProjectionLayoutKey>,
     last_rendered_selection: Option<crate::terminal::Selection>,
+    last_rendered_selection_revision: u64,
     last_rendered_search_hash: u64,
     last_search_match_lines: Vec<usize>,
     last_rendered_hovered_link: Option<crate::link::Link>,
@@ -847,6 +1033,8 @@ impl TerminalRenderer {
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
             history_projection: HistoryProjection::identity(),
+            frame_projection: None,
+            requested_collapsed_zone_ids: std::collections::HashSet::new(),
             block_compact: false,
             selected_block_ids: Vec::new(),
             selected_block_id_set: std::collections::HashSet::new(),
@@ -857,9 +1045,12 @@ impl TerminalRenderer {
             context_block_id: None,
             context_block_terminal: None,
             block_primary_press: None,
+            summary_primary_press: None,
+            projected_scroll_request: None,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             texture_cache_bytes: 0,
+            projected_kitty_rows_remaining: None,
             wgpu_render_state: None,
             gpu_surface_id: gpu::callback::GridSurfaceId::allocate(),
             cursor_move_input: Vec::new(),
@@ -875,6 +1066,7 @@ impl TerminalRenderer {
             last_rendered_grid_version: 0,
             last_rendered_projection_layout_key: None,
             last_rendered_selection: None,
+            last_rendered_selection_revision: 0,
             last_rendered_search_hash: 0,
             last_search_match_lines: Vec::new(),
             last_rendered_hovered_link: None,
@@ -896,6 +1088,36 @@ impl TerminalRenderer {
     /// only small `Arc`s; the cells and origin index stay shared.
     pub fn projected_viewport(&self, terminal: &mut TerminalState) -> ProjectedViewport {
         terminal.projected_viewport(self.history_projection, self.block_mode)
+    }
+
+    pub fn projected_viewport_with_state(
+        &self,
+        terminal: &mut TerminalState,
+        policy: &crate::terminal::ProjectionPolicy,
+        view_state: &mut crate::terminal::ProjectionViewState,
+    ) -> ProjectedViewport {
+        terminal.projected_viewport_with_state(
+            self.history_projection,
+            self.block_mode,
+            policy,
+            view_state,
+        )
+    }
+
+    pub fn set_projection_frame(
+        &mut self,
+        terminal: &TerminalState,
+        viewport: ProjectedViewport,
+        policy: &crate::terminal::ProjectionPolicy,
+    ) {
+        self.frame_projection = Some((terminal as *const TerminalState as usize, viewport));
+        self.requested_collapsed_zone_ids.clear();
+        self.requested_collapsed_zone_ids
+            .extend(policy.collapsed_zone_ids());
+    }
+
+    pub fn take_projected_scroll_request(&mut self) -> Option<ProjectedScrollRequest> {
+        self.projected_scroll_request.take()
     }
 
     /// 重置 renderer 的 IME 状态缓存，使下一帧重新同步 IME 状态
@@ -1101,18 +1323,42 @@ impl TerminalRenderer {
             .kitty_graphics
             .get_placements()
             .iter()
-            .filter(|placement| {
-                let viewport_row = viewport.kitty_viewport_row(placement.y);
-                layer.contains(placement.z_index)
-                    && viewport_row < viewport_rows
-                    && viewport_row.saturating_add(i64::from(placement.height)) > 0
+            .filter_map(|placement| {
+                if !layer.contains(placement.z_index) {
+                    return None;
+                }
+                let (viewport_row, viewport_col) = if viewport.is_transformed() {
+                    let rows = usize::try_from(placement.height).ok()?;
+                    let cols = usize::try_from(placement.width).ok()?;
+                    if rows == 0
+                        || cols == 0
+                        || rows > viewport.rows()
+                        || cols > viewport.columns()
+                        || !reserve_projected_kitty_rows(
+                            self.projected_kitty_rows_remaining.as_mut()?,
+                            rows,
+                        )
+                    {
+                        return None;
+                    }
+                    let point = Self::projected_kitty_anchor(terminal, viewport, placement)?;
+                    (i64::try_from(point.row).ok()?, point.column)
+                } else {
+                    (
+                        viewport.kitty_viewport_row(placement.y),
+                        usize::try_from(placement.x).ok()?,
+                    )
+                };
+                (viewport_row < viewport_rows
+                    && viewport_row.saturating_add(i64::from(placement.height)) > 0)
+                    .then_some((placement, viewport_row, viewport_col))
             })
             .collect();
-        placements.sort_by_key(|placement| (placement.z_index, placement.image_id));
+        placements.sort_by_key(|(placement, ..)| (placement.z_index, placement.image_id));
 
         let painter = painter.with_clip_rect(content_rect);
         let pixels_per_point = ctx.pixels_per_point().max(0.1);
-        for placement in placements {
+        for (placement, viewport_row, viewport_col) in placements {
             let Some(image) = terminal.kitty_graphics.get_image(placement.image_id) else {
                 continue;
             };
@@ -1141,11 +1387,10 @@ impl TerminalRenderer {
             if display_width <= 0.0 || display_height <= 0.0 {
                 continue;
             }
-            let viewport_row = viewport.kitty_viewport_row(placement.y);
             let image_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     content_rect.left()
-                        + placement.x as f32 * char_width
+                        + viewport_col as f32 * char_width
                         + placement.cell_x_offset as f32 / pixels_per_point,
                     content_rect.top()
                         + viewport_row as f32 * line_height
@@ -1192,6 +1437,45 @@ impl TerminalRenderer {
             };
             painter.add(egui::Shape::mesh(mesh));
         }
+    }
+
+    fn projected_kitty_anchor(
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        placement: &crate::kitty_graphics::KittyPlacement,
+    ) -> Option<DisplayPoint> {
+        if !viewport.is_transformed() {
+            return None;
+        }
+        let rows = usize::try_from(placement.height).ok()?;
+        let cols = usize::try_from(placement.width).ok()?;
+        if rows == 0 || cols == 0 || rows > viewport.rows() || cols > viewport.columns() {
+            return None;
+        }
+        let start_absolute = kitty_absolute_row(terminal.scrollback.len(), placement.y)?;
+        let mut first = None;
+        for delta_row in 0..rows {
+            let raw_row =
+                terminal.raw_row_id_at_absolute(start_absolute.checked_add(delta_row)?)?;
+            let start = viewport.display_point_for(crate::terminal::RawCellAnchor {
+                row_id: raw_row,
+                column: placement.x as usize,
+            })?;
+            let end = viewport.display_point_for(crate::terminal::RawCellAnchor {
+                row_id: raw_row,
+                column: (placement.x as usize).checked_add(cols - 1)?,
+            })?;
+            if start.row != end.row
+                || end.column != start.column.checked_add(cols - 1)?
+                || first.is_some_and(|first: DisplayPoint| {
+                    start.row != first.row + delta_row || start.column != first.column
+                })
+            {
+                return None;
+            }
+            first.get_or_insert(start);
+        }
+        first
     }
 
     fn block_gutter_width(&self) -> f32 {
@@ -1381,6 +1665,8 @@ impl TerminalRenderer {
                 viewport_top_line_id: viewport_top,
                 cols,
                 header_range,
+                projected_header_range: None,
+                projected_geometry: false,
                 outcome,
                 duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
                     running_duration_ms
@@ -1392,6 +1678,278 @@ impl TerminalRenderer {
             });
         }
         Some(entries)
+    }
+
+    fn projected_summary_rows(
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+    ) -> Vec<SummaryRowEntry> {
+        viewport
+            .row_kinds()
+            .iter()
+            .enumerate()
+            .filter_map(|(row, kind)| {
+                let crate::terminal::ProjectedRowKind::CollapsedSummary {
+                    key,
+                    hidden_display_rows,
+                    ..
+                } = *kind
+                else {
+                    return None;
+                };
+                let record = terminal
+                    .command_records()
+                    .get(command_record_index_for_sequence(
+                        terminal.command_records(),
+                        key.zone_id,
+                    )?)?;
+                if !record.complete {
+                    return None;
+                }
+                Some(SummaryRowEntry {
+                    row,
+                    key,
+                    hidden_rows: hidden_display_rows,
+                    record_id: record.id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn projected_buffer_point(
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        point: (u64, usize),
+    ) -> Option<DisplayPoint> {
+        terminal.buffer_anchor_to_projected(
+            viewport,
+            crate::terminal::BufferAnchor {
+                line_id: point.0,
+                column: point.1,
+            },
+        )
+    }
+
+    fn projected_header_range(
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        range: Option<((u64, usize), (u64, usize))>,
+        cols: usize,
+    ) -> Option<(DisplayPoint, DisplayPoint)> {
+        let (start_boundary, end_boundary) = range?;
+        let start = Self::projected_buffer_point(terminal, viewport, start_boundary)?;
+        let mut end_anchor = previous_buffer_cell(end_boundary, cols)?;
+        // A semantic header extends through the raw row's trailing cells, but
+        // transformed projection may omit those blanks. Search at most the
+        // boundary's preceding physical row; a fully blank extra row fails
+        // closed instead of making every visible block scan the whole viewport.
+        let search_budget = cols.max(1);
+        for _ in 0..search_budget {
+            if (end_anchor.line_id, end_anchor.column) < start_boundary {
+                return None;
+            }
+            if let Some(end) = terminal.buffer_anchor_to_projected(viewport, end_anchor) {
+                return (start <= end).then_some((start, end));
+            }
+            end_anchor = previous_buffer_cell((end_anchor.line_id, end_anchor.column), cols)?;
+        }
+        None
+    }
+
+    fn compute_projected_block_chrome(
+        &self,
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+    ) -> Option<Vec<BlockChromeEntry>> {
+        if !self.block_mode || terminal.is_alt_buffer_active() {
+            return None;
+        }
+        let records = terminal.command_records();
+        if records.is_empty() {
+            return None;
+        }
+        let cols = terminal.grid.row_len();
+        // Only visible blocks need per-frame chrome. A full-record vector made
+        // idle rendering grow with retained command history even when only a
+        // handful of rows were on screen.
+        let mut rows_by_record = std::collections::BTreeMap::<usize, (usize, usize)>::new();
+        for row in 0..viewport.rows() {
+            let Some(kind) = viewport.row_kind(row) else {
+                continue;
+            };
+            let record_index = match kind {
+                crate::terminal::ProjectedRowKind::CollapsedSummary { key, .. } => {
+                    command_record_index_for_sequence(records, key.zone_id)
+                        .filter(|index| records[*index].complete)
+                }
+                crate::terminal::ProjectedRowKind::Raw => {
+                    let Some(absolute) = viewport.view_row_absolute(row) else {
+                        continue;
+                    };
+                    let Some(raw_row_id) = terminal.raw_row_id_at_absolute(absolute) else {
+                        continue;
+                    };
+                    // A genuine empty raw row has row provenance but no cell
+                    // origin span. It still belongs to its command card; only
+                    // synthetic padding has neither and was gated above.
+                    let raw_anchor = viewport.first_raw_anchor_in_row(row).unwrap_or(
+                        crate::terminal::RawCellAnchor {
+                            row_id: raw_row_id,
+                            column: 0,
+                        },
+                    );
+                    // The projected row already carries the absolute source of
+                    // its first tracked origin. Validate the stable identity
+                    // in O(1) instead of searching the full scrollback by id
+                    // for every visible row on every frame.
+                    if raw_row_id != raw_anchor.row_id {
+                        continue;
+                    }
+                    let Some(anchor) =
+                        terminal.absolute_to_buffer_anchor((absolute, raw_anchor.column))
+                    else {
+                        continue;
+                    };
+                    let after = records.partition_point(|record| {
+                        normalized_block_anchor(
+                            record.prompt_start.line_id,
+                            record.prompt_start.column,
+                            cols,
+                        ) <= (anchor.line_id, anchor.column)
+                    });
+                    after.checked_sub(1)
+                }
+                crate::terminal::ProjectedRowKind::Padding => None,
+            };
+            if let Some(index) = record_index {
+                rows_by_record
+                    .entry(index)
+                    .and_modify(|bounds| {
+                        bounds.0 = bounds.0.min(row);
+                        bounds.1 = bounds.1.max(row);
+                    })
+                    .or_insert((row, row));
+            }
+        }
+        let newest = records.len() - 1;
+        let running_duration_ms = terminal.running_duration_ms();
+        let mut entries = Vec::new();
+        for (record_index, (first_row, last_row)) in rows_by_record {
+            let record = &records[record_index];
+            let outcome = crate::block_mode::classify_outcome(
+                record.command.as_deref(),
+                record.command_truncated,
+                record.exit_code,
+                record.state,
+                record.complete,
+                record_index == newest,
+            );
+            let live = record_index == newest && !record.complete;
+            let has_command = record
+                .command
+                .as_deref()
+                .is_some_and(|command| !command.trim().is_empty());
+            let header_range = semantic_block_header_range(
+                has_command,
+                record.complete,
+                record.prompt_start,
+                record.command_start,
+                record.output_start,
+                cols,
+            );
+            let projected_header_range =
+                Self::projected_header_range(terminal, viewport, header_range, cols);
+            let prompt = normalized_block_anchor(
+                record.prompt_start.line_id,
+                record.prompt_start.column,
+                cols,
+            );
+            let prompt = Self::projected_buffer_point(terminal, viewport, prompt);
+            // A transformed row can contain cells from more than one raw row.
+            // Only seal a completed block when the following prompt is visibly
+            // proven to begin at column zero immediately after this span.
+            let next_prompt = records
+                .get(record_index + 1)
+                .map(|next| {
+                    normalized_block_anchor(
+                        next.prompt_start.line_id,
+                        next.prompt_start.column,
+                        cols,
+                    )
+                })
+                .and_then(|next| Self::projected_buffer_point(terminal, viewport, next));
+            let (starts_in_viewport, ends_in_viewport) =
+                projected_span_edge_flags(prompt, next_prompt, first_row, last_row);
+            entries.push(BlockChromeEntry {
+                selected: self.selected_block_id_set.contains(record.id.as_str()),
+                active: self.active_block_id.as_deref() == Some(record.id.as_str()),
+                bookmarked: self.bookmarked_block_ids.contains(record.id.as_str()),
+                live,
+                hovered: false,
+                id: record.id.clone(),
+                viewport_top_line_id: 0,
+                cols,
+                header_range,
+                projected_header_range,
+                projected_geometry: true,
+                outcome,
+                duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
+                    running_duration_ms
+                } else {
+                    record.duration_ms
+                },
+                finished_at: record.finished_at,
+                span: crate::block_mode::VisibleBlockSpan {
+                    record_index,
+                    first_row,
+                    last_row,
+                    starts_in_viewport,
+                    ends_in_viewport,
+                },
+            });
+        }
+        (!entries.is_empty()).then_some(entries)
+    }
+
+    fn summary_at_position(
+        summaries: &[SummaryRowEntry],
+        pos: egui::Pos2,
+        content_rect: egui::Rect,
+        line_height: f32,
+        rows: usize,
+    ) -> Option<&SummaryRowEntry> {
+        if !content_rect.contains(pos) || !line_height.is_finite() || line_height <= 0.0 {
+            return None;
+        }
+        let row = (((pos.y - content_rect.top()) / line_height).floor() as usize)
+            .min(rows.saturating_sub(1));
+        summaries.iter().find(|summary| summary.row == row)
+    }
+
+    fn draw_collapsed_summaries(
+        &self,
+        painter: &egui::Painter,
+        summaries: &[SummaryRowEntry],
+        content_rect: egui::Rect,
+        line_height: f32,
+    ) {
+        let color = self.theme.terminal_foreground().gamma_multiply(0.72);
+        let font = FontId::monospace((self.font_size * 0.9).max(9.0));
+        for summary in summaries {
+            let (_, row_height) = snapped_span(content_rect.top(), summary.row, line_height);
+            let y = content_rect.top() + summary.row as f32 * line_height + row_height * 0.5;
+            let clip = egui::Rect::from_min_max(
+                egui::pos2(content_rect.left(), y - row_height * 0.5),
+                egui::pos2(content_rect.right(), y + row_height * 0.5),
+            );
+            painter.with_clip_rect(clip).text(
+                egui::pos2(content_rect.left() + self.char_width, y),
+                egui::Align2::LEFT_CENTER,
+                crate::block_mode::collapsed_summary_text(summary.hidden_rows),
+                font.clone(),
+                color,
+            );
+        }
     }
 
     fn block_accent_color(&self) -> Color32 {
@@ -1529,8 +2087,12 @@ impl TerminalRenderer {
         } else {
             0
         };
-        let point = (entry.viewport_top_line_id.saturating_add(row as u64), col);
-        let header = block_header_contains(entry.header_range, point);
+        let header = if entry.projected_geometry {
+            projected_header_contains(entry.projected_header_range, DisplayPoint::new(row, col))
+        } else {
+            let point = (entry.viewport_top_line_id.saturating_add(row as u64), col);
+            block_header_contains(entry.header_range, point)
+        };
         Some((entry, header))
     }
 
@@ -1550,6 +2112,66 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         pos: egui::Pos2,
     ) -> bool {
+        if viewport.is_transformed() {
+            let Some(content_rect) = self.last_content_rect.filter(|rect| rect.contains(pos))
+            else {
+                return false;
+            };
+            let (row, col) = grid_position_from_content(
+                pos,
+                content_rect,
+                self.char_width,
+                self.line_height,
+                viewport.columns(),
+                viewport.rows(),
+            );
+            let Some((raw_grid_row, _)) = viewport.application_cell(DisplayPoint::new(row, col))
+            else {
+                return false;
+            };
+            if !matches!(
+                viewport.row_kind(row),
+                Some(crate::terminal::ProjectedRowKind::Raw)
+            ) {
+                return false;
+            }
+            let records = terminal.command_records();
+            let Some((record_index, record)) = records.iter().enumerate().next_back() else {
+                return true;
+            };
+            if record.complete {
+                return false;
+            }
+            let cols = terminal.grid.row_len();
+            let start = crate::block_mode::prompt_row_line_id(
+                record.prompt_start.line_id,
+                record.prompt_start.column,
+                cols,
+            );
+            let raw_line = terminal
+                .total_lines_scrolled
+                .saturating_add(raw_grid_row as u64);
+            let cursor_line = terminal
+                .total_lines_scrolled
+                .saturating_add(terminal.get_cursor_pos().0 as u64);
+            let extent = record
+                .output_start
+                .and_then(|start| terminal.primary_content_extent_from(start))
+                .unwrap_or(cursor_line)
+                .max(cursor_line);
+            let Some(span) = crate::block_mode::visible_live_block_span(
+                record_index,
+                start,
+                extent,
+                terminal.total_lines_scrolled,
+                terminal.grid.rows(),
+            ) else {
+                return false;
+            };
+            return span.first_row <= raw_grid_row
+                && raw_grid_row <= span.last_row
+                && raw_line >= start;
+        }
         self.pointer_app_mouse_eligible_for_rows(terminal, pos, viewport.rows())
     }
 
@@ -1602,6 +2224,45 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         pos: egui::Pos2,
     ) -> bool {
+        if viewport.is_transformed() {
+            let Some(content_rect) = self.last_content_rect.filter(|rect| rect.contains(pos))
+            else {
+                return false;
+            };
+            let (row, col) = grid_position_from_content(
+                pos,
+                content_rect,
+                self.char_width,
+                self.line_height,
+                viewport.columns(),
+                viewport.rows(),
+            );
+            if !matches!(
+                viewport.row_kind(row),
+                Some(crate::terminal::ProjectedRowKind::Raw)
+            ) || viewport
+                .raw_anchor_at(DisplayPoint::new(row, col))
+                .is_none()
+            {
+                return false;
+            }
+            if terminal.is_alt_buffer_active() || !self.block_mode {
+                return true;
+            }
+            return !self
+                .compute_projected_block_chrome(terminal, viewport)
+                .as_deref()
+                .and_then(|entries| {
+                    self.finished_block_at_position(
+                        entries,
+                        pos,
+                        content_rect,
+                        self.line_height,
+                        viewport.rows(),
+                    )
+                })
+                .is_some_and(|(_, header)| header);
+        }
         self.pointer_link_eligible_for_rows(terminal, pos, viewport.rows())
     }
 
@@ -1768,6 +2429,10 @@ impl TerminalRenderer {
         let long_block = clicked_end.saturating_sub(clicked_start)
             >= terminal.grid.rows().saturating_sub(1) as u64;
         let bookmarked = self.bookmarked_block_ids.contains(target_id.as_str());
+        let collapse_requested = self
+            .requested_collapsed_zone_ids
+            .contains(&clicked.sequence);
+        let collapse_available = terminal.finished_output_range(clicked.sequence).is_some();
         let mut chosen = None;
 
         response.context_menu(|ui| {
@@ -1840,6 +2505,20 @@ impl TerminalRenderer {
                 "The selection has no command to insert",
             ) {
                 chosen = Some(crate::block_mode::BlockMenuAction::Reinput);
+                ui.close();
+            }
+            let collapse_label = crate::block_mode::output_collapse_menu_label(collapse_requested);
+            if block_menu_button(
+                ui,
+                collapse_label,
+                collapse_requested || collapse_available,
+                "This block has no exact retained output to collapse",
+            ) {
+                chosen = Some(if collapse_requested {
+                    crate::block_mode::BlockMenuAction::ExpandOutput
+                } else {
+                    crate::block_mode::BlockMenuAction::CollapseOutput
+                });
                 ui.close();
             }
             ui.separator();
@@ -2381,7 +3060,16 @@ impl TerminalRenderer {
             (char_width * pixels_per_point).round().max(1.0) as u32,
             (line_height * pixels_per_point).round().max(1.0) as u32,
         );
-        let viewport = self.projected_viewport(terminal);
+        let terminal_ptr = terminal as *const TerminalState as usize;
+        let viewport = self
+            .frame_projection
+            .take()
+            .filter(|(source, _)| *source == terminal_ptr)
+            .map(|(_, viewport)| viewport)
+            .unwrap_or_else(|| self.projected_viewport(terminal));
+        self.projected_kitty_rows_remaining = viewport
+            .is_transformed()
+            .then(|| projected_kitty_row_budget(viewport.rows()));
         let grid = viewport.cells_arc();
         let rows = viewport.rows();
         let cols = viewport.columns();
@@ -2407,7 +3095,12 @@ impl TerminalRenderer {
         // Owned per-frame snapshot of visible command blocks, shared by the
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
-        let mut block_chrome = self.compute_block_chrome(terminal, rows);
+        let summaries = Self::projected_summary_rows(terminal, &viewport);
+        let mut block_chrome = if viewport.is_transformed() {
+            self.compute_projected_block_chrome(terminal, &viewport)
+        } else {
+            self.compute_block_chrome(terminal, rows)
+        };
         if let Some(entries) = block_chrome.as_deref_mut() {
             self.update_block_hover(
                 entries,
@@ -2491,7 +3184,8 @@ impl TerminalRenderer {
                 .expand(Self::SCROLLBAR_HIT_EXPAND)
                 .contains(pos)
         });
-        let show_scrollbar = viewport.history_len() > 0
+        let projected_scroll_range = viewport.max_scroll_offset();
+        let show_scrollbar = projected_scroll_range > 0
             && match self.scrollbar_visibility {
                 crate::config::ScrollbarVisibility::Always => true,
                 crate::config::ScrollbarVisibility::Auto => {
@@ -2502,6 +3196,9 @@ impl TerminalRenderer {
         let rendered_terminal = terminal as *const TerminalState as usize;
         let primary_pressed =
             ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        let pressed_summary = response.interact_pointer_pos().and_then(|pos| {
+            Self::summary_at_position(&summaries, pos, content_rect, line_height, rows)
+        });
         let press_app_mouse_eligible = primary_pressed
             && response.interact_pointer_pos().is_some_and(|pos| {
                 self.pointer_app_mouse_eligible_projected(terminal, &viewport, pos)
@@ -2515,12 +3212,15 @@ impl TerminalRenderer {
             primary_pressed,
             ui.input(|input| input.modifiers.shift),
         );
+        if primary_pressed && pressed_summary.is_some() {
+            self.local_selection_terminal = None;
+        }
         let local_selection_enabled = self.local_selection_terminal == Some(rendered_terminal);
 
         // Compute thumb rect and related values for interaction
         let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> =
-            if viewport.history_len() > 0 {
-                let total_lines = viewport.total_lines();
+            if projected_scroll_range > 0 {
+                let total_lines = viewport.document_rows();
                 let visible_lines = rows;
                 if total_lines > visible_lines {
                     let scrollbar_height = scrollbar_rect.height();
@@ -2529,7 +3229,7 @@ impl TerminalRenderer {
                     // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                     let thumb_y = scrollbar_height
                         - thumb_height
-                        - (viewport.scroll_offset() as f32 / viewport.history_len() as f32)
+                        - (viewport.scroll_offset() as f32 / projected_scroll_range as f32)
                             * (scrollbar_height - thumb_height);
                     let thumb_rect = egui::Rect::from_min_size(
                         egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
@@ -2539,7 +3239,7 @@ impl TerminalRenderer {
                         thumb_rect,
                         scrollbar_height,
                         thumb_height,
-                        viewport.history_len() as f32,
+                        projected_scroll_range as f32,
                     ))
                 } else {
                     None
@@ -2577,11 +3277,16 @@ impl TerminalRenderer {
                         let new_offset = (((track_height - relative_y) / track_height)
                             * scrollback_len_f)
                             .round() as usize;
-                        let new_offset = new_offset.min(terminal.scrollback.len());
+                        let new_offset = new_offset.min(projected_scroll_range);
                         // Like wheel scrolling, dragging the scrollbar only
                         // moves the viewport. Selection endpoints are anchored
                         // in absolute buffer coordinates and remain valid.
-                        terminal.scroll_offset = new_offset;
+                        if viewport.is_transformed() {
+                            self.projected_scroll_request =
+                                Some(ProjectedScrollRequest::SetOffset(new_offset));
+                        } else {
+                            terminal.scroll_offset = new_offset;
+                        }
                     }
                 }
             }
@@ -2595,14 +3300,24 @@ impl TerminalRenderer {
         // Click in scrollbar track (not on thumb): page up/down
         if interaction_enabled && response.drag_started() && !self.dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
-                if pos.x >= scrollbar_x && viewport.history_len() > 0 {
+                if pos.x >= scrollbar_x && projected_scroll_range > 0 {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
                         if pos.y < thumb_rect.top() {
                             // Click above thumb: scroll up (see older history)
-                            terminal.scroll(rows as isize);
+                            if viewport.is_transformed() {
+                                self.projected_scroll_request =
+                                    Some(ProjectedScrollRequest::Delta(rows as isize));
+                            } else {
+                                terminal.scroll(rows as isize);
+                            }
                         } else if pos.y > thumb_rect.bottom() {
                             // Click below thumb: scroll down (see newest content)
-                            terminal.scroll(-(rows as isize));
+                            if viewport.is_transformed() {
+                                self.projected_scroll_request =
+                                    Some(ProjectedScrollRequest::Delta(-(rows as isize)));
+                            } else {
+                                terminal.scroll(-(rows as isize));
+                            }
                         }
                     }
                 }
@@ -2625,21 +3340,25 @@ impl TerminalRenderer {
             )
             .map(|(entry, header)| (entry.id.clone(), header))
         });
+        let summary_hit = click_pos.and_then(|pos| {
+            Self::summary_at_position(&summaries, pos, content_rect, line_height, rows)
+        });
         let modifiers = ui.input(|input| input.modifiers);
-        let primary_block_gesture = (interaction_enabled && primary_pressed)
-            .then_some(())
-            .and(block_hit.as_ref())
-            .and_then(|(record_id, header)| {
-                let gesture = block_press_gesture(modifiers, *header)?;
-                Some((record_id.clone(), gesture))
-            });
+        let primary_block_gesture =
+            (interaction_enabled && primary_pressed && summary_hit.is_none())
+                .then_some(())
+                .and(block_hit.as_ref())
+                .and_then(|(record_id, header)| {
+                    let gesture = block_press_gesture(modifiers, *header)?;
+                    Some((record_id.clone(), gesture))
+                });
         if let Some((record_id, gesture)) = primary_block_gesture.as_ref() {
             self.block_primary_press = Some(BlockPrimaryPress {
                 terminal: rendered_terminal,
                 record_id: record_id.clone(),
                 gesture: *gesture,
             });
-            terminal.selection = None;
+            terminal.clear_text_selection();
             self.block_click = Some(crate::block_mode::BlockClick::Select {
                 record_id: record_id.clone(),
                 gesture: *gesture,
@@ -2657,18 +3376,55 @@ impl TerminalRenderer {
             self.block_click = Some(crate::block_mode::BlockClick::Clear);
         }
 
-        let block_press_claimed = self.block_primary_press.as_ref().is_some_and(|press| {
-            press.terminal == rendered_terminal
-                && terminal
-                    .command_record(&press.record_id)
-                    .is_some_and(|record| record.complete)
-                && matches!(
-                    press.gesture,
-                    crate::block_mode::BlockSelectionGesture::Plain
-                        | crate::block_mode::BlockSelectionGesture::Extend
-                        | crate::block_mode::BlockSelectionGesture::Toggle
-                )
-        });
+        if interaction_enabled && primary_pressed {
+            self.summary_primary_press = summary_hit.map(|summary| SummaryPrimaryPress {
+                terminal: rendered_terminal,
+                projection_key: viewport.key(),
+                key: summary.key,
+                record_id: summary.record_id.clone(),
+            });
+            if self.summary_primary_press.is_some() {
+                terminal.clear_text_selection();
+                self.block_primary_press = None;
+            }
+        }
+        if response.dragged() && self.summary_primary_press.is_some() {
+            self.summary_primary_press = None;
+        }
+        let primary_released =
+            ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
+        let mut summary_release_claimed = false;
+        if interaction_enabled && primary_released {
+            if let Some(press) = self.summary_primary_press.take() {
+                summary_release_claimed = true;
+                if let Some(record_id) = stable_summary_activation(
+                    &press,
+                    rendered_terminal,
+                    viewport.key(),
+                    summary_hit,
+                ) {
+                    self.block_menu_action = Some(crate::block_mode::BlockMenuRequest {
+                        record_id,
+                        action: crate::block_mode::BlockMenuAction::ExpandOutput,
+                    });
+                }
+            }
+        }
+
+        let block_press_claimed = summary_release_claimed
+            || self.summary_primary_press.is_some()
+            || self.block_primary_press.as_ref().is_some_and(|press| {
+                press.terminal == rendered_terminal
+                    && terminal
+                        .command_record(&press.record_id)
+                        .is_some_and(|record| record.complete)
+                    && matches!(
+                        press.gesture,
+                        crate::block_mode::BlockSelectionGesture::Plain
+                            | crate::block_mode::BlockSelectionGesture::Extend
+                            | crate::block_mode::BlockSelectionGesture::Toggle
+                    )
+            });
 
         let secondary_pressed = interaction_enabled
             && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary));
@@ -2676,7 +3432,9 @@ impl TerminalRenderer {
             self.context_block_id = context_target_after_pointer_frame(
                 self.context_block_id.take(),
                 true,
-                block_hit.as_ref().map(|(record_id, _)| record_id.as_str()),
+                summary_hit
+                    .map(|summary| summary.record_id.as_str())
+                    .or_else(|| block_hit.as_ref().map(|(record_id, _)| record_id.as_str())),
             );
             if let Some(record_id) = self.context_block_id.clone() {
                 self.context_block_terminal = Some(rendered_terminal);
@@ -2708,7 +3466,7 @@ impl TerminalRenderer {
             // Any other plain content click drops the app-level block
             // selection along with the local text selection.
             self.block_click = Some(crate::block_mode::BlockClick::Clear);
-            terminal.selection = None;
+            terminal.clear_text_selection();
 
             if let Some(pos) = click_pos {
                 let (click_row, click_col) = grid_position_from_content(
@@ -2864,6 +3622,7 @@ impl TerminalRenderer {
         if !ui.input(|input| input.pointer.any_down()) {
             self.local_selection_terminal = None;
             self.block_primary_press = None;
+            self.summary_primary_press = None;
         }
 
         // Extremely negative z-index images sit below non-default cell
@@ -2944,6 +3703,7 @@ impl TerminalRenderer {
                 line_height,
             );
         }
+        self.draw_collapsed_summaries(&painter, &summaries, content_rect, line_height);
 
         // Zero/positive z-index images are above terminal text and UI chrome;
         // a terminal graphic must not be washed by a later translucent card
@@ -3063,7 +3823,7 @@ impl TerminalRenderer {
 
             // Recompute thumb with current scroll_offset (may have changed from interaction)
             if let Some((_, scrollbar_height, _, scrollback_len_f)) = scrollbar_thumb_rect {
-                let total_lines = viewport.total_lines();
+                let total_lines = viewport.document_rows();
                 let visible_lines = rows;
                 let thumb_height =
                     Self::scrollbar_thumb_height(visible_lines, total_lines, scrollbar_height);
@@ -3091,7 +3851,7 @@ impl TerminalRenderer {
             // Failed-block markers, painted AFTER the thumb so a large thumb
             // never hides them (frost draws them over the thumb too). Same
             // red as the Failed gutter stripe.
-            if self.block_mode && !terminal.is_alt_buffer_active() {
+            if self.block_mode && !terminal.is_alt_buffer_active() && !viewport.is_transformed() {
                 let marker_color =
                     self.block_outcome_color(crate::block_mode::BlockOutcome::Failed(1));
                 // ~3 physical px tall regardless of DPI scale.
@@ -3173,6 +3933,7 @@ impl TerminalRenderer {
         let current_projection_key = viewport.key();
         let current_projection_layout_key = current_projection_key.layout_key();
         let current_selection = terminal.selection;
+        let current_selection_revision = terminal.selection_revision();
         let search_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -3188,17 +3949,12 @@ impl TerminalRenderer {
             h.finish()
         };
 
-        // Detect major screen changes (e.g., alternate screen switch)
-        let grid_version_jumped =
-            current_grid_version > self.last_rendered_grid_version + rows as u64;
-
         let need_full_rebuild = self.cached_instances.is_empty()
             || self.last_rendered_font_generation != font_generation_before
             || self.last_rendered_terminal_ptr != terminal_ptr
             || self.last_rendered_rows != rows
             || self.last_rendered_cols != cols
-            || self.last_rendered_projection_layout_key != Some(current_projection_layout_key)
-            || grid_version_jumped;
+            || self.last_rendered_projection_layout_key != Some(current_projection_layout_key);
 
         // 跨帧复用 dirty_rows 缓冲:make_mut 在上一帧 callback 已 drop(refcount==1)时
         // 原地复用底层 buffer,避免每帧重新分配 Vec<bool>。
@@ -3215,14 +3971,12 @@ impl TerminalRenderer {
                 self.last_rendered_grid_version,
                 &mut self.changed_rows_buffer,
             );
-            for &r in &self.changed_rows_buffer {
-                if r < rows {
-                    dirty_rows[r] = true;
-                }
-            }
+            mark_changed_grid_rows(terminal, viewport, &self.changed_rows_buffer, dirty_rows);
 
             // Selection overlay changes
-            if self.last_rendered_selection != current_selection {
+            if self.last_rendered_selection != current_selection
+                || self.last_rendered_selection_revision != current_selection_revision
+            {
                 // Selection is a viewport overlay whose absolute rows may span
                 // live grid, scrollback and reflowed soft wraps. Rebuild every
                 // visible row when it changes so the GPU cache cannot retain
@@ -3241,9 +3995,9 @@ impl TerminalRenderer {
 
                 // Mark all currently matched lines as dirty
                 for m in &search_state.matches {
-                    if let Some(viewport_row) = m
-                        .viewport_row(terminal)
-                        .filter(|viewport_row| *viewport_row < dirty_rows.len())
+                    if let Some((viewport_row, _, _)) =
+                        search_match_in_projection(terminal, viewport, *m)
+                            .filter(|(viewport_row, _, _)| *viewport_row < dirty_rows.len())
                     {
                         dirty_rows[viewport_row] = true;
                     }
@@ -3321,7 +4075,7 @@ impl TerminalRenderer {
                 let search_map = if !has_search {
                     Vec::new()
                 } else {
-                    viewport_search_map(terminal, &search_state.matches, rows)
+                    viewport_search_map(terminal, viewport, &search_state.matches, rows)
                 };
 
                 if need_full_rebuild {
@@ -3467,12 +4221,13 @@ impl TerminalRenderer {
         self.last_rendered_grid_version = current_grid_version;
         self.last_rendered_projection_layout_key = Some(current_projection_layout_key);
         self.last_rendered_selection = current_selection;
+        self.last_rendered_selection_revision = current_selection_revision;
         self.last_rendered_search_hash = search_hash;
         self.last_rendered_block_backdrop_hash = block_backdrop_hash;
         // Update last_search_match_lines for next frame's dirty tracking
         self.last_search_match_lines.clear();
         for m in &search_state.matches {
-            if let Some(viewport_row) = m.viewport_row(terminal) {
+            if let Some((viewport_row, _, _)) = search_match_in_projection(terminal, viewport, *m) {
                 self.last_search_match_lines.push(viewport_row);
             }
         }
@@ -3563,7 +4318,7 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         search_state: &crate::search::SearchState,
         link_map: &[Vec<&crate::link::Link>],
-        search_map: &[Vec<&crate::search::SearchMatch>],
+        search_map: &[Vec<ViewportSearchMatch>],
         hovered_link: &Option<crate::link::Link>,
         theme: &crate::theme::Theme,
         default_bg: Color32,
@@ -3695,7 +4450,7 @@ impl TerminalRenderer {
                                 bold,
                                 dim,
                             );
-                            if active_match_pos == Some((m.line_id, m.col_start)) {
+                            if active_match_pos == Some((m.source.line_id, m.source.col_start)) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
                                     (r as u16 * 180 / 255) as u8,
@@ -3880,7 +4635,7 @@ impl TerminalRenderer {
     ) {
         let has_search = !search_state.matches.is_empty() && !search_state.query.is_empty();
         let search_map = if has_search {
-            viewport_search_map(terminal, &search_state.matches, rows)
+            viewport_search_map(terminal, viewport, &search_state.matches, rows)
         } else {
             Vec::new()
         };
@@ -3948,7 +4703,7 @@ impl TerminalRenderer {
                                 bold,
                                 dim,
                             );
-                            if active_match == Some(*m) {
+                            if active_match == Some(&m.source) {
                                 let [r, g, b, _a] = bg_color.to_srgba_unmultiplied();
                                 bg_color = Color32::from_rgba_unmultiplied(
                                     (r as u16 * 180 / 255) as u8,
@@ -4284,6 +5039,199 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_sequence_lookup_is_exact_for_monotonic_retained_history() {
+        let mut terminal = TerminalState::new(12, 4);
+        for id in ["a", "b", "c"] {
+            terminal.process_input(
+                format!("\x1b]133;A\x07$ \x1b]133;C;id={id}\x07x\x1b]133;D;0;id={id}\x07")
+                    .as_bytes(),
+            );
+        }
+        let records = terminal.command_records();
+        let sequences: Vec<_> = records.iter().map(|record| record.sequence).collect();
+        assert_eq!(
+            command_record_index_for_sequence(records, sequences[0]),
+            Some(0)
+        );
+        assert_eq!(
+            command_record_index_for_sequence(records, sequences[2]),
+            Some(2)
+        );
+        assert_eq!(command_record_index_for_sequence(records, u64::MAX), None);
+    }
+
+    #[test]
+    fn transformed_kitty_row_budget_is_shared_and_fail_closed() {
+        let mut remaining = projected_kitty_row_budget(24);
+        assert_eq!(remaining, 192);
+        for _ in 0..8 {
+            assert!(reserve_projected_kitty_rows(&mut remaining, 24));
+        }
+        assert_eq!(remaining, 0);
+        assert!(!reserve_projected_kitty_rows(&mut remaining, 1));
+
+        let mut short = 3;
+        assert!(!reserve_projected_kitty_rows(&mut short, 4));
+        assert_eq!(
+            short, 3,
+            "a rejected placement must not starve smaller ones"
+        );
+        assert!(reserve_projected_kitty_rows(&mut short, 3));
+        assert!(!reserve_projected_kitty_rows(&mut short, 0));
+        assert_eq!(projected_kitty_row_budget(usize::MAX), 4096);
+    }
+
+    #[test]
+    fn summary_activation_requires_the_same_terminal_projection_and_key() {
+        let mut terminal = TerminalState::new(8, 2);
+        let projection = terminal.projected_viewport(HistoryProjection::identity(), true);
+        let key = crate::terminal::SyntheticRowKey {
+            zone_id: 7,
+            policy_revision: 3,
+        };
+        let current = SummaryRowEntry {
+            row: 0,
+            key,
+            hidden_rows: 2,
+            record_id: "record".to_owned(),
+        };
+        let press = SummaryPrimaryPress {
+            terminal: 11,
+            projection_key: projection.key(),
+            key,
+            record_id: "record".to_owned(),
+        };
+        assert_eq!(
+            stable_summary_activation(&press, 11, projection.key(), Some(&current)).as_deref(),
+            Some("record")
+        );
+        assert_eq!(
+            stable_summary_activation(&press, 12, projection.key(), Some(&current)),
+            None
+        );
+        let mut changed =
+            terminal.projected_viewport(HistoryProjection::identity_at_revision(9), true);
+        assert_eq!(
+            stable_summary_activation(&press, 11, changed.key(), Some(&current)),
+            None
+        );
+        changed = terminal.projected_viewport(HistoryProjection::identity(), false);
+        assert_eq!(
+            stable_summary_activation(&press, 11, changed.key(), Some(&current)),
+            None
+        );
+    }
+
+    #[test]
+    fn projected_header_and_edge_geometry_fail_closed_when_clipped() {
+        let header = Some((DisplayPoint::new(2, 1), DisplayPoint::new(3, 4)));
+        assert!(projected_header_contains(header, DisplayPoint::new(2, 1)));
+        assert!(projected_header_contains(header, DisplayPoint::new(3, 4)));
+        assert!(!projected_header_contains(header, DisplayPoint::new(3, 5)));
+        assert!(!projected_header_contains(None, DisplayPoint::new(2, 1)));
+
+        assert_eq!(
+            projected_span_edge_flags(
+                Some(DisplayPoint::new(1, 3)),
+                Some(DisplayPoint::new(4, 0)),
+                1,
+                3,
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            projected_span_edge_flags(None, Some(DisplayPoint::new(4, 2)), 1, 3),
+            (false, false),
+            "a clipped start or same-row next prompt must not invent a cap"
+        );
+    }
+
+    #[test]
+    fn kitty_history_rows_use_signed_live_grid_coordinates() {
+        assert_eq!(kitty_absolute_row(12, -12), Some(0));
+        assert_eq!(kitty_absolute_row(12, -3), Some(9));
+        assert_eq!(kitty_absolute_row(12, 4), Some(16));
+        assert_eq!(kitty_absolute_row(2, -3), None);
+        assert_eq!(kitty_absolute_row(usize::MAX, 0), None);
+    }
+
+    #[test]
+    fn transformed_header_owns_ctrl_link_and_dirty_rows_follow_raw_ids() {
+        let mut terminal = TerminalState::new(16, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let completed = terminal
+            .command_records()
+            .iter()
+            .find(|record| record.complete)
+            .expect("completed command");
+        let sequence = completed.sequence;
+        let record_id = completed.id.clone();
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(sequence));
+        let mut view_state = crate::terminal::ProjectionViewState::new();
+        let viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut view_state,
+        );
+        assert!(viewport.is_transformed());
+
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let entries = renderer
+            .compute_projected_block_chrome(&terminal, &viewport)
+            .expect("projected chrome");
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == record_id)
+            .expect("completed block chrome");
+        let (header_start, _) = entry
+            .projected_header_range
+            .expect("visible command header provenance");
+        assert!(entry.span.starts_in_viewport);
+        assert!(entry.span.ends_in_viewport);
+
+        let content_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                renderer.char_width * viewport.columns() as f32,
+                renderer.line_height * viewport.rows() as f32,
+            ),
+        );
+        renderer.last_content_rect = Some(content_rect);
+        let header_pos = egui::pos2(
+            content_rect.left() + (header_start.column as f32 + 0.5) * renderer.char_width,
+            content_rect.top() + (header_start.row as f32 + 0.5) * renderer.line_height,
+        );
+        assert!(!renderer.pointer_link_eligible_projected(&terminal, &viewport, header_pos,));
+
+        let raw_grid_row = (0..terminal.grid.rows())
+            .find(|row| {
+                let absolute = terminal.scrollback.len() + row;
+                terminal
+                    .raw_row_id_at_absolute(absolute)
+                    .and_then(|raw| viewport.raw_row_view_bounds(raw))
+                    .is_some()
+            })
+            .expect("visible raw grid row");
+        let raw_id = terminal
+            .raw_row_id_at_absolute(terminal.scrollback.len() + raw_grid_row)
+            .unwrap();
+        let (first, last) = viewport.raw_row_view_bounds(raw_id).unwrap();
+        let mut dirty = vec![false; viewport.rows()];
+        mark_changed_grid_rows(&terminal, &viewport, &[raw_grid_row], &mut dirty);
+        assert!(dirty[first..=last].iter().all(|dirty| *dirty));
+    }
 
     fn render_semantic_paste_pointer_suffix(
         interaction_enabled: bool,

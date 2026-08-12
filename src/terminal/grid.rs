@@ -1,4 +1,5 @@
 use super::hyperlink::HyperlinkId;
+use smallvec::SmallVec;
 
 /// 连续内存网格存储 - 优化内存局部性和缓存命中率
 /// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
@@ -428,6 +429,11 @@ pub struct ScrollbackLine {
     /// the line is compressed lets viewport reflow count rows without first
     /// allocating and decoding every line in the scrollback tail.
     reflow_content_len: u16,
+    /// Physical columns containing wide-character continuation cells inside
+    /// the exact prefix retained by projection reflow. Keeping this compact
+    /// geometry beside the compressed row lets the projection planner avoid
+    /// decoding historical cells merely to preserve wide glyph boundaries.
+    reflow_wide_continuations: SmallVec<[u16; 2]>,
     raw_row_id: RawRowId,
 }
 
@@ -448,7 +454,19 @@ impl ScrollbackLine {
         let reflow_content_len = cells
             .iter()
             .rposition(|cell| !cell.is_reflow_trimmable_blank())
-            .map_or(0, |index| index + 1) as u16;
+            .map_or(0, |index| index + 1);
+        let reflow_wide_continuations = cells[..reflow_content_len]
+            .iter()
+            .enumerate()
+            .filter_map(|(column, cell)| {
+                if cell.flags.wide_continuation() {
+                    u16::try_from(column).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let reflow_content_len = reflow_content_len as u16;
         let trailing_blanks = cells
             .iter()
             .rev()
@@ -480,6 +498,7 @@ impl ScrollbackLine {
                 is_wrapped,
                 cols,
                 reflow_content_len,
+                reflow_wide_continuations,
                 raw_row_id: RawRowId::UNTRACKED,
             }
         } else {
@@ -489,6 +508,7 @@ impl ScrollbackLine {
                 is_wrapped,
                 cols,
                 reflow_content_len,
+                reflow_wide_continuations,
                 raw_row_id: RawRowId::UNTRACKED,
             }
         }
@@ -497,6 +517,11 @@ impl ScrollbackLine {
     #[inline]
     pub(super) fn reflow_content_len(&self) -> usize {
         self.reflow_content_len as usize
+    }
+
+    #[inline]
+    pub(super) fn reflow_wide_continuations(&self) -> &[u16] {
+        &self.reflow_wide_continuations
     }
 
     #[inline]

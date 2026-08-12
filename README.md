@@ -246,10 +246,13 @@ contiguous range and `Ctrl+Shift+Click` toggles one card. Plain output clicks,
 drags, double-clicks, and triple-clicks remain native terminal text selection,
 and text selection takes precedence over whole-card copying. Right-click uses
 the pressed card as a stable target and exposes selection-aware copy/reinput,
-search, bookmark, Agent, JSON-copy, and navigation actions. Per-card output
-filtering, deletion, and file export are shown as unavailable because Ember's
-history is one continuous terminal grid; pretending to delete only metadata
-would leave the visible terminal bytes behind.
+search, bookmark, Agent, JSON-copy, navigation, and **Collapse Output** actions.
+Collapsing a finished block replaces only its projected output rows with one
+expandable summary row; the raw terminal history, search index, captured output,
+and PTY bytes remain unchanged. Per-card filtering, deletion, and file export
+are shown as unavailable because Ember's history is one continuous terminal
+grid; pretending to delete only metadata would leave the visible terminal bytes
+behind.
 
 Select a failed row in the **Commands** sidebar (or use its context menu) to
 start a fresh Agent task with **Fix**, **Explain**, or **Create task**. The task
@@ -486,11 +489,12 @@ TerminalState + parser ── dirty rows / snapshots ──► TerminalRenderer
 TerminalApp coordinates tabs, panes, input, search, config and persistence.
 ```
 
-`HistoryProjection` is currently a P0 identity boundary around the existing
-visible-grid materialization. It shares the legacy cell allocation, adds a
-separately versioned cache key and fail-closed raw/display cell origins, and
-routes renderer consumers without changing bytes or geometry. This foundation
-does **not** implement history Collapse, Filter or Delete.
+`HistoryProjection` keeps an allocation-sharing identity fast path and provides
+fail-closed raw/display origins for renderer consumers. In Block Mode, a
+session-owned projection policy can splice finished output into synthetic
+collapse summaries before the viewport is sliced, with independent projected
+scroll anchoring and without mutating terminal history. Filter and Delete are
+not implemented.
 
 Important modules:
 

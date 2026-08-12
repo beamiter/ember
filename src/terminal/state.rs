@@ -1,4 +1,28 @@
+use super::projection::{
+    MaterializedProjection, OriginSpan, ProjectedTopAnchor, ProjectionMode, ProjectionPlan,
+    ProjectionPlanCacheKey, ProjectionPlanRow, RawRowLayout, ResolvedCollapse,
+    TransformedViewportCacheKey,
+};
 use super::*;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static PROJECTION_PLAN_HISTORY_LAYOUT_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static PROJECTION_PLAN_ORACLE_HISTORY_DECOMPRESSES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static PROJECTION_PLAN_BUILD_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static PROJECTION_VIEW_HISTORY_DECOMPRESSES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static VISIBLE_CELLS_RECYCLE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 const OUTPUT_TRUNCATION_MARKER: &str = "\n… output truncated …\n";
 
@@ -266,6 +290,8 @@ impl super::TerminalState {
             alt_grid,
             scrollback: VecDeque::new(),
             selection: None,
+            projected_selection: None,
+            selection_revision: 1,
             scroll_offset: 0,
             max_scrollback: 10000,
             use_alt_buffer: false,
@@ -321,6 +347,9 @@ impl super::TerminalState {
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
             projected_viewport_cache: None,
+            projection_plan_cache: None,
+            transformed_viewport_cache: None,
+            next_projection_plan_revision: 1,
             viewport_mapping_exact_cache: std::cell::Cell::new(None),
             hyperlinks: hyperlink::HyperlinkTable::default(),
             current_hyperlink: HyperlinkId::NONE,
@@ -338,9 +367,14 @@ impl super::TerminalState {
             total_lines_scrolled: 0,
             next_raw_row_id,
             row_identity_revision: 1,
+            full_screen_scroll_revision: 1,
             command_marks: VecDeque::new(),
             command_records: VecDeque::new(),
             next_command_sequence: 1,
+            finished_output_provenance: HashMap::new(),
+            finished_output_owners: HashMap::new(),
+            finished_output_revision: 1,
+            active_output_provenance: None,
             pending_completed_command_outputs: VecDeque::new(),
             captured_command_output_bytes: 0,
             agent_prompt_input_tainted: false,
@@ -788,9 +822,21 @@ impl super::TerminalState {
         let mut chars = nfc.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
             if c != base {
+                self.invalidate_finished_output_span(
+                    self.cursor_row,
+                    base_col,
+                    base_col.saturating_add(1),
+                );
                 self.grid.get_mut(self.cursor_row, base_col).character = c;
                 self.dirty_region.mark_row(self.cursor_row);
                 self.mark_row_dirty(self.cursor_row);
+                let row_id = self.grid.row_id(self.cursor_row);
+                self.note_output_write(
+                    self.cursor_row,
+                    row_id,
+                    base_col,
+                    base_col.saturating_add(1),
+                );
             }
         }
     }
@@ -834,6 +880,15 @@ impl super::TerminalState {
 
         // IRM (insert mode, ANSI mode 4): shift existing cells right by `width`
         // before writing, discarding cells pushed past the end of the row.
+        let mutation_end = if self.insert_mode {
+            cols
+        } else {
+            self.cursor_col.saturating_add(width)
+        };
+        let (mutation_start, mutation_end) =
+            self.expanded_cell_mutation_span(self.cursor_row, self.cursor_col, mutation_end);
+        self.invalidate_finished_output_span(self.cursor_row, mutation_start, mutation_end);
+
         if self.insert_mode {
             for _ in 0..width {
                 if self.cursor_col < cols {
@@ -851,6 +906,10 @@ impl super::TerminalState {
         // that continuation on somebody else's lead orphans *its* continuation
         // one column further right.
         self.split_wide_pairs_around(self.cursor_row, self.cursor_col, self.cursor_col + width);
+
+        let output_row = self.cursor_row;
+        let output_col = self.cursor_col;
+        let output_row_id = self.grid.row_id(output_row);
 
         // Write character
         let cell = self.grid.get_mut(self.cursor_row, self.cursor_col);
@@ -884,6 +943,12 @@ impl super::TerminalState {
         // Mark the row as dirty after writing character
         self.dirty_region.mark_row(self.cursor_row);
         self.mark_row_dirty(self.cursor_row);
+        self.note_output_write(
+            output_row,
+            output_row_id,
+            output_col,
+            output_col.saturating_add(width),
+        );
     }
 
     pub(super) fn put_ascii_run(&mut self, bytes: &[u8]) {
@@ -921,12 +986,17 @@ impl super::TerminalState {
             flags.set_wide(false);
             flags.set_wide_continuation(false);
             let col = self.cursor_col;
+            let output_row = self.cursor_row;
+            let output_row_id = self.grid.row_id(output_row);
             // This chunk overwrites a whole span at once, so — exactly as
             // put_char does per cell — clear the double-width halves it leaves
             // stranded on either side. Without this, ASCII typed over CJK left
             // an orphaned continuation cell that the renderer skips (the
             // character reads as empty background) and that the next write
             // there blanks its left neighbour to repair.
+            let (mutation_start, mutation_end) =
+                self.expanded_cell_mutation_span(self.cursor_row, col, col + chunk_len);
+            self.invalidate_finished_output_span(self.cursor_row, mutation_start, mutation_end);
             self.split_wide_pairs_around(self.cursor_row, col, col + chunk_len);
             let row = &mut self.grid[self.cursor_row][col..col + chunk_len];
             for (cell, &byte) in row.iter_mut().zip(&bytes[pos..pos + chunk_len]) {
@@ -942,6 +1012,12 @@ impl super::TerminalState {
 
             self.dirty_region.mark_row(self.cursor_row);
             self.mark_row_dirty(self.cursor_row);
+            self.note_output_write(
+                output_row,
+                output_row_id,
+                col,
+                col.saturating_add(chunk_len),
+            );
 
             // 写满末列时不立即换行,改为置延迟换行标志,
             // 光标停在末列,等待下一个可打印字符再决定是否换行。
@@ -959,6 +1035,7 @@ impl super::TerminalState {
     /// 此前换行只与 grid.rows() 比较并调用全屏 scroll_down(),会让区内文本溢出到
     /// 底边距下方,破坏 pager/分屏 TUI 布局。
     pub(super) fn wrap_to_next_line(&mut self) {
+        let departed_row_id = self.grid.row_id(self.cursor_row);
         self.grid.row_wrapped[self.cursor_row] = true;
         self.cursor_col = 0;
         if self.cursor_row == self.scroll_region_bottom {
@@ -966,6 +1043,7 @@ impl super::TerminalState {
         } else if self.cursor_row + 1 < self.grid.rows() {
             self.cursor_row += 1;
         }
+        self.rebase_active_output_start_after_initial_wrap(departed_row_id);
     }
 
     pub(super) fn create_blank_cell(&self) -> TerminalCell {
@@ -1083,10 +1161,18 @@ impl super::TerminalState {
         allocate_raw_row_id_from(&mut self.next_raw_row_id)
     }
 
-    pub(super) fn mark_row_identity_changed(&mut self) {
+    fn mark_row_identity_changed_preserving_scroll_journal(&mut self) {
         self.row_identity_revision = self.row_identity_revision.wrapping_add(1);
         self.visible_cells_cache = None;
         self.projected_viewport_cache = None;
+        // Keep the stale full-document plan available for the strictly
+        // validated full-screen-scroll append fast path. Other identity
+        // changes miss its exact key and replace it with a full rebuild.
+        self.transformed_viewport_cache = None;
+    }
+
+    pub(super) fn mark_row_identity_changed(&mut self) {
+        self.mark_row_identity_changed_preserving_scroll_journal();
     }
 
     fn fill_untracked_grid_row_ids(&mut self) {
@@ -1133,13 +1219,14 @@ impl super::TerminalState {
             let id = self.fresh_raw_row_id();
             self.grid.row_ids[row] = id;
         }
-        self.mark_row_identity_changed();
+        self.mark_row_identity_changed_preserving_scroll_journal();
     }
 
     #[inline]
     pub(super) fn invalidate_scrollback_view_cache(&mut self) {
         self.visible_cells_cache = None;
         self.projected_viewport_cache = None;
+        self.transformed_viewport_cache = None;
         self.viewport_mapping_exact_cache.set(None);
     }
 
@@ -1173,11 +1260,13 @@ impl super::TerminalState {
             return;
         }
         if self.scrollback.len() >= self.max_scrollback {
-            self.scrollback.pop_front();
+            if let Some(evicted) = self.scrollback.pop_front() {
+                self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
+            }
         }
         self.scrollback.push_back(line);
         self.total_lines_scrolled = self.total_lines_scrolled.saturating_add(1);
-        self.mark_row_identity_changed();
+        self.mark_row_identity_changed_preserving_scroll_journal();
         self.invalidate_scrollback_view_cache();
     }
 
@@ -1185,6 +1274,10 @@ impl super::TerminalState {
         if top >= self.grid.rows() || bottom >= self.grid.rows() || top > bottom {
             return;
         }
+        // The bottom physical row is discarded, while every other RawRowId is
+        // merely moved. Remove ownership before the copy so the reverse index
+        // cannot retain a zone whose protected cells no longer exist.
+        self.forget_output_provenance_for_grid_rows(bottom, bottom);
         let cols = self.grid.row_len();
         // Shift rows down: move [top..bottom) to [top+1..=bottom]
         let src_start = top * cols;
@@ -1227,6 +1320,12 @@ impl super::TerminalState {
             None
         };
 
+        // A top-margin scroll transfers the RawRowId into scrollback. Partial
+        // regions (and non-archiving buffers) really discard it instead.
+        if scrollback_line.is_none() {
+            self.forget_output_provenance_for_grid_rows(top, top);
+        }
+
         let src_start = (top + 1) * cols;
         let src_end = (bottom + 1) * cols;
         let dst_start = top * cols;
@@ -1250,6 +1349,13 @@ impl super::TerminalState {
 
         if let Some(line) = scrollback_line {
             self.push_scrollback_transferred_with_options(line, allow_alt_scrollback);
+            if !self.use_alt_buffer
+                && bottom + 1 == self.grid.rows()
+                && self.full_screen_scroll_revision != 0
+            {
+                self.full_screen_scroll_revision =
+                    self.full_screen_scroll_revision.checked_add(1).unwrap_or(0);
+            }
         }
     }
 
@@ -1318,7 +1424,23 @@ impl super::TerminalState {
         }
     }
 
-    pub(super) fn clear_cell(&mut self, row: usize, col: usize) {
+    fn expanded_cell_mutation_span(&self, row: usize, start: usize, end: usize) -> (usize, usize) {
+        let cols = self.grid.row_len();
+        let mut start = start.min(cols);
+        let mut end = end.min(cols);
+        if row >= self.grid.rows() || start >= end {
+            return (start, end);
+        }
+        if start > 0 && self.grid.get(row, start - 1).flags.wide() {
+            start -= 1;
+        }
+        if end < cols && self.grid.get(row, end).flags.wide_continuation() {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    pub(super) fn clear_cell_unchecked(&mut self, row: usize, col: usize) {
         let cols = self.grid.row_len();
         let bg_color = self.current_bg;
         let blank_cell = TerminalCell {
@@ -1454,11 +1576,13 @@ impl super::TerminalState {
         let cell_size = self.kitty_graphics.cell_size_pixels();
         let next_raw_row_id = self.next_raw_row_id;
         let row_identity_revision = self.row_identity_revision;
+        let next_command_sequence = self.next_command_sequence;
         *self = Self::new(cols, rows);
         // A reset replaces every physical row but must never restart the
         // allocator and let an old external origin retarget into the new grid.
         self.next_raw_row_id = next_raw_row_id;
         self.row_identity_revision = row_identity_revision;
+        self.next_command_sequence = next_command_sequence;
         self.grid.row_ids.fill(RawRowId::UNTRACKED);
         self.alt_grid.row_ids.fill(RawRowId::UNTRACKED);
         self.fill_untracked_grid_row_ids();
@@ -1489,13 +1613,177 @@ impl super::TerminalState {
 
         let old_len = self.scrollback.len();
         while self.scrollback.len() > self.max_scrollback {
-            self.scrollback.pop_front();
+            if let Some(evicted) = self.scrollback.pop_front() {
+                self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
+            }
         }
         if self.scrollback.len() != old_len {
             self.invalidate_scrollback_view_cache();
         }
 
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+    }
+
+    fn register_finished_output_provenance(&mut self, provenance: FinishedOutputProvenance) {
+        let zone_id = provenance.range.zone_id;
+        self.unregister_finished_output_zone(zone_id);
+        for row in &provenance.rows {
+            self.finished_output_owners
+                .entry(row.row_id)
+                .or_default()
+                .push(FinishedOutputOwner {
+                    zone_id,
+                    start_col: row.start_col,
+                    end_col: row.end_col,
+                });
+        }
+        self.finished_output_provenance.insert(zone_id, provenance);
+        self.mark_finished_output_provenance_changed();
+    }
+
+    fn unregister_finished_output_zone(&mut self, zone_id: u64) {
+        let Some(provenance) = self.finished_output_provenance.remove(&zone_id) else {
+            return;
+        };
+        for row in provenance.rows {
+            let remove_bucket =
+                if let Some(owners) = self.finished_output_owners.get_mut(&row.row_id) {
+                    owners.retain(|owner| owner.zone_id != zone_id);
+                    owners.is_empty()
+                } else {
+                    false
+                };
+            if remove_bucket {
+                self.finished_output_owners.remove(&row.row_id);
+            }
+        }
+        self.mark_finished_output_provenance_changed();
+    }
+
+    fn mark_finished_output_provenance_changed(&mut self) {
+        if self.finished_output_revision != 0 {
+            self.finished_output_revision =
+                self.finished_output_revision.checked_add(1).unwrap_or(0);
+        }
+        // Even if the diagnostic counter is exhausted, clearing both exact
+        // caches prevents a mutation from reusing the previous ownership map.
+        self.projection_plan_cache = None;
+        self.transformed_viewport_cache = None;
+    }
+
+    pub(super) fn invalidate_finished_output_spans(&mut self, spans: &[(RawRowId, usize, usize)]) {
+        if self.use_alt_buffer || spans.is_empty() {
+            return;
+        }
+        let mut zones = HashSet::new();
+        for &(row_id, start_col, end_col) in spans {
+            if !row_id.is_tracked() || start_col >= end_col {
+                continue;
+            }
+            if let Some(owners) = self.finished_output_owners.get(&row_id) {
+                zones.extend(
+                    owners
+                        .iter()
+                        .filter(|owner| start_col < owner.end_col && owner.start_col < end_col)
+                        .map(|owner| owner.zone_id),
+                );
+            }
+        }
+        for zone_id in zones {
+            self.unregister_finished_output_zone(zone_id);
+        }
+    }
+
+    fn invalidate_finished_output_span(&mut self, row: usize, start_col: usize, end_col: usize) {
+        if self.use_alt_buffer || row >= self.grid.rows() {
+            return;
+        }
+        self.invalidate_finished_output_spans(&[(self.grid.row_id(row), start_col, end_col)]);
+    }
+
+    pub(super) fn invalidate_grid_mutation_spans(&mut self, spans: &[(usize, usize, usize)]) {
+        if self.use_alt_buffer {
+            return;
+        }
+        let raw_spans: Vec<_> = spans
+            .iter()
+            .filter_map(|&(row, start, end)| {
+                if row >= self.grid.rows() {
+                    return None;
+                }
+                let (start, end) = self.expanded_cell_mutation_span(row, start, end);
+                (start < end).then_some((self.grid.row_id(row), start, end))
+            })
+            .collect();
+        self.invalidate_finished_output_spans(&raw_spans);
+    }
+
+    fn forget_output_provenance_for_raw_row(&mut self, row_id: RawRowId) {
+        if !row_id.is_tracked() {
+            return;
+        }
+        let zones: Vec<_> = self
+            .finished_output_owners
+            .get(&row_id)
+            .into_iter()
+            .flatten()
+            .map(|owner| owner.zone_id)
+            .collect();
+        #[cfg(test)]
+        FINISHED_OUTPUT_EVICTION_ROW_CHECKS.with(|checks| {
+            checks.set(checks.get().saturating_add(zones.len()));
+        });
+        for zone_id in zones {
+            self.unregister_finished_output_zone(zone_id);
+        }
+        if self.active_output_provenance.is_some_and(|active| {
+            active.start_row_id == row_id || active.extent_row_id == Some(row_id)
+        }) {
+            self.active_output_provenance = None;
+        }
+    }
+
+    pub(super) fn forget_output_provenance_for_grid_rows(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+    ) {
+        if start_row > end_row || start_row >= self.grid.rows() {
+            return;
+        }
+        let row_ids: Vec<_> = (start_row..=end_row.min(self.grid.rows() - 1))
+            .map(|row| self.grid.row_id(row))
+            .collect();
+        for row_id in row_ids {
+            self.forget_output_provenance_for_raw_row(row_id);
+        }
+    }
+
+    pub(super) fn clear_scrollback_with_projection_provenance(&mut self) {
+        let evicted: HashSet<_> = self
+            .scrollback
+            .iter()
+            .map(ScrollbackLine::raw_row_id)
+            .filter(|row| row.is_tracked())
+            .collect();
+        let zones: HashSet<_> = evicted
+            .iter()
+            .filter_map(|row| self.finished_output_owners.get(row))
+            .flatten()
+            .map(|owner| owner.zone_id)
+            .collect();
+        for zone_id in zones {
+            self.unregister_finished_output_zone(zone_id);
+        }
+        self.scrollback.clear();
+        if self.active_output_provenance.is_some_and(|active| {
+            evicted.contains(&active.start_row_id)
+                || active
+                    .extent_row_id
+                    .is_some_and(|row| evicted.contains(&row))
+        }) {
+            self.active_output_provenance = None;
+        }
     }
 
     pub fn is_cursor_visible(&self) -> bool {
@@ -1526,6 +1814,377 @@ impl super::TerminalState {
                 .saturating_add(self.cursor_row as u64),
             column,
         }
+    }
+
+    fn retained_raw_row(&self, absolute_row: usize) -> Option<(RawRowId, usize)> {
+        if let Some(line) = self.scrollback.get(absolute_row) {
+            return Some((line.raw_row_id(), line.columns()));
+        }
+        let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
+        (grid_row < self.grid.rows()).then(|| (self.grid.row_id(grid_row), self.grid.row_len()))
+    }
+
+    /// Stable physical-row identity at an absolute primary-buffer row.
+    pub fn raw_row_id_at_absolute(&self, absolute_row: usize) -> Option<RawRowId> {
+        self.retained_raw_row(absolute_row)
+            .map(|(row_id, _)| row_id)
+    }
+
+    /// Convert an exact raw-cell origin back to the terminal's stable
+    /// line-id coordinate space. Trimmed and untracked rows fail closed.
+    pub fn raw_cell_anchor_to_buffer_anchor(&self, anchor: RawCellAnchor) -> Option<BufferAnchor> {
+        let absolute = self.retained_absolute_for_raw(anchor.row_id)?;
+        let (_, width) = self.retained_raw_row(absolute)?;
+        (anchor.column <= width)
+            .then(|| self.absolute_to_buffer_anchor((absolute, anchor.column)))?
+    }
+
+    /// Resolve a retained physical row by stable identity. The positional
+    /// anchor is the O(1) common path (including full-screen scroll into
+    /// history); the bounded live-grid fallback covers identity-preserving
+    /// partial-region IL/DL/RI moves without scanning deep scrollback.
+    fn retained_raw_row_absolute(
+        &self,
+        row_id: RawRowId,
+        preferred: Option<BufferAnchor>,
+    ) -> Option<(usize, usize)> {
+        if !row_id.is_tracked() {
+            return None;
+        }
+        if let Some(anchor) = preferred {
+            if let Some((absolute, _)) = self.buffer_anchor_to_absolute(anchor) {
+                if let Some((candidate, width)) = self.retained_raw_row(absolute) {
+                    if candidate == row_id {
+                        return Some((absolute, width));
+                    }
+                }
+            }
+        }
+        self.grid
+            .row_ids
+            .iter()
+            .position(|candidate| *candidate == row_id)
+            .map(|row| (self.scrollback.len() + row, self.grid.row_len()))
+    }
+
+    fn retained_cell_is_wide_continuation(&self, absolute_row: usize, col: usize) -> Option<bool> {
+        if let Some(line) = self.scrollback.get(absolute_row) {
+            return line
+                .decompress()
+                .get(col)
+                .map(|cell| cell.flags.wide_continuation());
+        }
+        let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
+        (grid_row < self.grid.rows() && col < self.grid.row_len())
+            .then(|| self.grid.get(grid_row, col).flags.wide_continuation())
+    }
+
+    fn note_output_write(
+        &mut self,
+        grid_row: usize,
+        row_id: RawRowId,
+        start_col: usize,
+        end_col: usize,
+    ) {
+        if self.use_alt_buffer {
+            return;
+        }
+        let Some(snapshot) = self.active_output_provenance else {
+            return;
+        };
+        if snapshot.invalid {
+            return;
+        }
+        let write_start = BufferAnchor {
+            line_id: self.total_lines_scrolled.saturating_add(grid_row as u64),
+            column: start_col.min(self.grid.row_len()),
+        };
+        let extent = BufferAnchor {
+            line_id: write_start.line_id,
+            column: end_col.min(self.grid.row_len()),
+        };
+        let Some((write_absolute, _)) = self.retained_raw_row_absolute(row_id, Some(write_start))
+        else {
+            if let Some(active) = self.active_output_provenance.as_mut() {
+                active.invalid = true;
+            }
+            return;
+        };
+        let Some((start_absolute, _)) =
+            self.retained_raw_row_absolute(snapshot.start_row_id, Some(snapshot.start))
+        else {
+            if let Some(active) = self.active_output_provenance.as_mut() {
+                active.invalid = true;
+            }
+            return;
+        };
+        if write_absolute < start_absolute {
+            if let Some(active) = self.active_output_provenance.as_mut() {
+                active.invalid = true;
+            }
+            return;
+        }
+
+        let previous_extent_absolute = snapshot.extent_row_id.and_then(|extent_row_id| {
+            self.retained_raw_row_absolute(extent_row_id, snapshot.extent)
+                .map(|(absolute, _)| absolute)
+        });
+        let Some(active) = self.active_output_provenance.as_mut() else {
+            return;
+        };
+        if write_absolute == start_absolute {
+            if active.start_row_id != row_id {
+                active.invalid = true;
+                return;
+            }
+            if start_col < active.start.column {
+                active.start.column = start_col;
+            }
+        }
+        active.last_write_end = Some(extent);
+        active.semantic_end = Some(extent);
+        active.cursor_moved_since_output = false;
+        match (active.extent, previous_extent_absolute) {
+            (None, _) => {
+                active.extent = Some(extent);
+                active.extent_row_id = Some(row_id);
+            }
+            (Some(_), Some(previous_absolute)) if write_absolute > previous_absolute => {
+                active.extent = Some(extent);
+                active.extent_row_id = Some(row_id);
+            }
+            (Some(previous), Some(previous_absolute)) if write_absolute == previous_absolute => {
+                if active.extent_row_id != Some(row_id) {
+                    active.invalid = true;
+                    return;
+                }
+                if extent.column > previous.column {
+                    active.extent = Some(extent);
+                }
+            }
+            (Some(_), Some(_)) => {}
+            (Some(_), None) => active.invalid = true,
+        }
+    }
+
+    /// Record a real hard line advance (LF/IND), never an explicit cursor move.
+    /// `departed_*` describes the physical row before the move and
+    /// `next_boundary` is the logical boundary immediately after it.
+    pub(super) fn note_output_hard_line_advance(
+        &mut self,
+        departed_row_id: RawRowId,
+        departed_boundary: BufferAnchor,
+        next_boundary: BufferAnchor,
+    ) {
+        if self.use_alt_buffer {
+            return;
+        }
+        let Some(snapshot) = self.active_output_provenance else {
+            return;
+        };
+        if snapshot.invalid {
+            return;
+        }
+        let Some((departed_absolute, departed_width)) =
+            self.retained_raw_row_absolute(departed_row_id, Some(departed_boundary))
+        else {
+            if let Some(active) = self.active_output_provenance.as_mut() {
+                active.invalid = true;
+            }
+            return;
+        };
+        let Some((start_absolute, _)) =
+            self.retained_raw_row_absolute(snapshot.start_row_id, Some(snapshot.start))
+        else {
+            if let Some(active) = self.active_output_provenance.as_mut() {
+                active.invalid = true;
+            }
+            return;
+        };
+        if departed_absolute < start_absolute {
+            if let Some(active) = self.active_output_provenance.as_mut() {
+                active.invalid = true;
+            }
+            return;
+        }
+        let extent = BufferAnchor {
+            line_id: departed_boundary.line_id,
+            column: departed_width,
+        };
+        let previous_extent_absolute = snapshot.extent_row_id.and_then(|extent_row_id| {
+            self.retained_raw_row_absolute(extent_row_id, snapshot.extent)
+                .map(|(absolute, _)| absolute)
+        });
+        let Some(active) = self.active_output_provenance.as_mut() else {
+            return;
+        };
+        match (active.extent, previous_extent_absolute) {
+            (None, _) => {
+                active.extent = Some(extent);
+                active.extent_row_id = Some(departed_row_id);
+            }
+            (Some(_), Some(previous_absolute)) if departed_absolute > previous_absolute => {
+                active.extent = Some(extent);
+                active.extent_row_id = Some(departed_row_id);
+            }
+            (Some(previous), Some(previous_absolute))
+                if departed_absolute == previous_absolute && previous.column < departed_width =>
+            {
+                if active.extent_row_id != Some(departed_row_id) {
+                    active.invalid = true;
+                    return;
+                }
+                active.extent = Some(extent);
+            }
+            (Some(_), Some(_)) => {}
+            (Some(_), None) => {
+                active.invalid = true;
+                return;
+            }
+        }
+        active.semantic_end = Some(next_boundary);
+        active.cursor_moved_since_output = false;
+    }
+
+    /// Mark a cursor-only control within an active output lifecycle. Horizontal
+    /// moves may be resolved by a later write/LF; non-linear vertical moves are
+    /// conservatively ineligible because a single contiguous raw range cannot
+    /// prove that skipped or revisited rows belong to command output.
+    pub(super) fn note_output_cursor_reposition(&mut self, non_linear: bool) {
+        if self.use_alt_buffer {
+            return;
+        }
+        if let Some(active) = self.active_output_provenance.as_mut() {
+            active.cursor_moved_since_output = true;
+            active.invalid |= non_linear;
+        }
+    }
+
+    /// An automatic soft wrap before the first output cell must not make the
+    /// already-full command/header row part of the output. Rebase C to the new
+    /// physical row; later wraps retain the original output start.
+    fn rebase_active_output_start_after_initial_wrap(&mut self, departed_row_id: RawRowId) {
+        if self.use_alt_buffer {
+            return;
+        }
+        let should_rebase = self.active_output_provenance.is_some_and(|active| {
+            !active.invalid
+                && active.start_row_id == departed_row_id
+                && active.extent.is_none()
+                && active.last_write_end.is_none()
+        });
+        if !should_rebase {
+            return;
+        }
+        let start = BufferAnchor {
+            line_id: self
+                .total_lines_scrolled
+                .saturating_add(self.cursor_row as u64),
+            column: 0,
+        };
+        let row_id = self.grid.row_id(self.cursor_row);
+        if let Some(active) = self.active_output_provenance.as_mut() {
+            active.start = start;
+            active.start_row_id = row_id;
+        }
+    }
+
+    pub(super) fn bind_finished_output_provenance(
+        &self,
+        zone_id: u64,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> Option<FinishedOutputProvenance> {
+        if start_row > end_row {
+            return None;
+        }
+        let (start_id, start_width) = self.retained_raw_row(start_row)?;
+        let (end_id, end_width) = self.retained_raw_row(end_row)?;
+        if !start_id.is_tracked() || !end_id.is_tracked() {
+            return None;
+        }
+        let mut start_col = start_col.min(start_width);
+        if start_col > 0
+            && start_col < start_width
+            && self.retained_cell_is_wide_continuation(start_row, start_col)?
+        {
+            start_col -= 1;
+        }
+        let mut end_col = end_col.min(end_width);
+        if end_col < end_width && self.retained_cell_is_wide_continuation(end_row, end_col)? {
+            end_col = end_col.saturating_add(1).min(end_width);
+        }
+        if start_row == end_row && start_col >= end_col {
+            return None;
+        }
+        let rows: Vec<_> = (start_row..=end_row)
+            .map(|row| {
+                let (row_id, width) = self.retained_raw_row(row)?;
+                Some(FinishedOutputRow {
+                    row_id,
+                    start_col: if row == start_row { start_col } else { 0 },
+                    end_col: if row == end_row { end_col } else { width },
+                })
+            })
+            .collect::<Option<_>>()?;
+        if rows
+            .iter()
+            .any(|row| !row.row_id.is_tracked() || row.start_col >= row.end_col)
+        {
+            return None;
+        }
+        Some(FinishedOutputProvenance {
+            range: FinishedOutputRange {
+                zone_id,
+                start: RawCellBoundary {
+                    row: start_id,
+                    col: start_col,
+                },
+                end: RawCellBoundary {
+                    row: end_id,
+                    col: end_col,
+                },
+            },
+            start_line_id: self.absolute_to_buffer_anchor((start_row, 0))?.line_id,
+            rows,
+        })
+    }
+
+    fn finish_active_output_provenance(
+        &mut self,
+        zone_id: u64,
+    ) -> Option<(FinishedOutputProvenance, BufferAnchor, BufferAnchor)> {
+        let active = self.active_output_provenance.take()?;
+        if active.zone_id != zone_id || active.invalid || active.cursor_moved_since_output {
+            return None;
+        }
+        let (start_row, _) =
+            self.retained_raw_row_absolute(active.start_row_id, Some(active.start))?;
+        let start_col = active.start.column;
+        let (Some(extent), Some(extent_row_id)) = (active.extent, active.extent_row_id) else {
+            return None;
+        };
+        let (extent_row, _) = self.retained_raw_row_absolute(extent_row_id, Some(extent))?;
+        if start_row > extent_row {
+            return None;
+        };
+        let provenance = self.bind_finished_output_provenance(
+            zone_id,
+            start_row,
+            start_col,
+            extent_row,
+            extent.column,
+        )?;
+        let output_start =
+            self.absolute_to_buffer_anchor((start_row, provenance.range.start.col))?;
+        let cell_end = self.absolute_to_buffer_anchor((extent_row, provenance.range.end.col))?;
+        let output_end = active
+            .semantic_end
+            .filter(|end| *end >= output_start && self.buffer_anchor_to_absolute(*end).is_some())
+            .map_or(cell_end, |end| end.max(cell_end));
+        Some((provenance, output_start, output_end))
     }
 
     /// Highest still-visible primary-grid row containing output at or after a
@@ -1630,10 +2289,13 @@ impl super::TerminalState {
         format!("local:{sequence}")
     }
 
-    fn next_command_identity(&mut self) -> (u64, String) {
+    fn next_command_identity(&mut self) -> Option<(u64, String)> {
         let sequence = self.next_command_sequence;
-        self.next_command_sequence = self.next_command_sequence.saturating_add(1);
-        (sequence, Self::local_command_id(sequence))
+        if sequence == 0 {
+            return None;
+        }
+        self.next_command_sequence = sequence.checked_add(1).unwrap_or(0);
+        Some((sequence, Self::local_command_id(sequence)))
     }
 
     fn record_index_for_id(&self, id: &str) -> Option<usize> {
@@ -1706,10 +2368,17 @@ impl super::TerminalState {
         id: Option<&str>,
         command: Option<&str>,
         cwd: Option<&str>,
-    ) -> usize {
-        let (sequence, local_id) = self.next_command_identity();
+    ) -> Option<usize> {
+        let (sequence, local_id) = self.next_command_identity()?;
         if self.command_records.len() >= MAX_COMMAND_MARKS {
             if let Some(evicted) = self.command_records.pop_front() {
+                self.unregister_finished_output_zone(evicted.sequence);
+                if self
+                    .active_output_provenance
+                    .is_some_and(|active| active.zone_id == evicted.sequence)
+                {
+                    self.active_output_provenance = None;
+                }
                 self.captured_command_output_bytes =
                     self.captured_command_output_bytes.saturating_sub(
                         evicted
@@ -1745,14 +2414,15 @@ impl super::TerminalState {
         });
         let index = self.command_records.len() - 1;
         self.apply_record_metadata(index, id, command, cwd);
-        index
+        Some(index)
     }
 
-    fn ensure_active_record(&mut self) -> usize {
+    fn ensure_active_record(&mut self) -> Option<usize> {
         if let Some(index) = self.active_record_index() {
-            return index;
+            return Some(index);
         }
         let anchor = self.current_buffer_anchor();
+        let index = self.push_command_record(anchor, None, None, None)?;
         if self.command_marks.len() >= MAX_COMMAND_MARKS {
             self.command_marks.pop_front();
         }
@@ -1760,7 +2430,7 @@ impl super::TerminalState {
             line_id: anchor.line_id,
             exit_code: None,
         });
-        self.push_command_record(anchor, None, None, None)
+        Some(index)
     }
 
     fn record_prompt_start_with_metadata(
@@ -1804,21 +2474,24 @@ impl super::TerminalState {
             self.finish_command_record(index, anchor, None, None);
         }
 
-        if self.command_marks.len() >= MAX_COMMAND_MARKS {
-            self.command_marks.pop_front();
+        if self.push_command_record(anchor, id, command, cwd).is_some() {
+            if self.command_marks.len() >= MAX_COMMAND_MARKS {
+                self.command_marks.pop_front();
+            }
+            self.command_marks.push_back(CommandMark {
+                line_id: anchor.line_id,
+                exit_code: None,
+            });
         }
-        self.command_marks.push_back(CommandMark {
-            line_id: anchor.line_id,
-            exit_code: None,
-        });
-        self.push_command_record(anchor, id, command, cwd);
     }
 
     fn record_command_start(&mut self, id: Option<&str>, command: Option<&str>, cwd: Option<&str>) {
         if self.use_alt_buffer {
             return;
         }
-        let index = self.ensure_active_record();
+        let Some(index) = self.ensure_active_record() else {
+            return;
+        };
         self.apply_record_metadata(index, id, command, cwd);
         let anchor = self.current_buffer_anchor();
         if let Some(record) = self.command_records.get_mut(index) {
@@ -1839,7 +2512,9 @@ impl super::TerminalState {
         if self.use_alt_buffer {
             return;
         }
-        let index = self.ensure_active_record();
+        let Some(index) = self.ensure_active_record() else {
+            return;
+        };
         let anchor = self.current_buffer_anchor();
         let reconstructed = self
             .command_records
@@ -1851,6 +2526,7 @@ impl super::TerminalState {
             .filter(|command| !command.is_empty());
 
         self.apply_record_metadata(index, id, command, cwd);
+        let mut initialize_provenance = false;
         if let Some(record) = self.command_records.get_mut(index) {
             if command_truncated {
                 record.command = None;
@@ -1860,7 +2536,10 @@ impl super::TerminalState {
             if record.command.is_none() && !record.command_truncated {
                 record.command = reconstructed;
             }
-            record.output_start.get_or_insert(anchor);
+            if record.output_start.is_none() {
+                record.output_start = Some(anchor);
+                initialize_provenance = true;
+            }
             record.state = CommandState::Running;
             record
                 .started_at
@@ -1868,6 +2547,23 @@ impl super::TerminalState {
             record
                 .started_instant
                 .get_or_insert_with(std::time::Instant::now);
+        }
+        if initialize_provenance {
+            self.active_output_provenance = self.command_records.get(index).and_then(|record| {
+                let (absolute_row, _) = self.buffer_anchor_to_absolute(anchor)?;
+                let (start_row_id, _) = self.retained_raw_row(absolute_row)?;
+                start_row_id.is_tracked().then_some(ActiveOutputProvenance {
+                    zone_id: record.sequence,
+                    start: anchor,
+                    start_row_id,
+                    extent: None,
+                    extent_row_id: None,
+                    last_write_end: None,
+                    semantic_end: None,
+                    cursor_moved_since_output: false,
+                    invalid: false,
+                })
+            });
         }
 
         // Bind the local one-shot generation only after the shell begins the
@@ -1978,9 +2674,23 @@ impl super::TerminalState {
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
     ) {
+        let exact_output = self
+            .command_records
+            .get(index)
+            .map(|record| record.sequence)
+            .and_then(|zone_id| self.finish_active_output_provenance(zone_id));
+        if let Some((provenance, _, _)) = exact_output.as_ref() {
+            self.register_finished_output_provenance(provenance.clone());
+        }
         if let Some(record) = self.command_records.get_mut(index) {
-            record.output_end = Some(anchor);
-            record.end = Some(anchor);
+            if let Some((_, output_start, output_end)) = exact_output {
+                record.output_start = Some(output_start);
+                record.output_end = Some(output_end);
+                record.end = Some(output_end);
+            } else {
+                record.output_end = Some(anchor);
+                record.end = Some(anchor);
+            }
             record.exit_code = exit_code;
             record.duration_ms = duration_ms.or_else(|| {
                 record
@@ -2114,6 +2824,52 @@ impl super::TerminalState {
     pub fn command_record(&self, id: &str) -> Option<&CommandRecord> {
         self.record_index_for_id(id)
             .and_then(|index| self.command_records.get(index))
+    }
+
+    /// Exact half-open raw output range for one completed command sequence.
+    /// Every retained row identity is revalidated so eviction, replacement,
+    /// resize, or stale ids fail closed instead of retargeting terminal cells.
+    #[allow(dead_code)] // Public terminal contract; projection policy wiring lands next.
+    pub fn finished_output_range(&self, zone_id: u64) -> Option<FinishedOutputRange> {
+        self.command_records
+            .iter()
+            .any(|record| record.sequence == zone_id && record.complete)
+            .then_some(())?;
+        let provenance = self.finished_output_provenance.get(&zone_id)?;
+        if provenance.range.zone_id != zone_id || provenance.rows.is_empty() {
+            return None;
+        }
+        let preferred_start = BufferAnchor {
+            line_id: provenance.start_line_id,
+            column: provenance.range.start.col,
+        };
+        let (start_absolute, _) =
+            self.retained_raw_row_absolute(provenance.range.start.row, Some(preferred_start))?;
+        for (offset, expected) in provenance.rows.iter().enumerate() {
+            if self
+                .retained_raw_row(start_absolute.saturating_add(offset))?
+                .0
+                != expected.row_id
+            {
+                return None;
+            }
+        }
+        let end_absolute = start_absolute.checked_add(provenance.rows.len().checked_sub(1)?)?;
+        let (start_id, start_width) = self.retained_raw_row(start_absolute)?;
+        let (end_id, end_width) = self.retained_raw_row(end_absolute)?;
+        (start_id == provenance.range.start.row
+            && end_id == provenance.range.end.row
+            && provenance.range.start.col <= start_width
+            && provenance.range.end.col <= end_width
+            && (start_absolute < end_absolute
+                || provenance.range.start.col < provenance.range.end.col))
+            .then_some(provenance.range)
+    }
+
+    /// Revision of the retained completed-output ownership index. Callers may
+    /// use this to avoid revalidating unchanged collapse ids every frame.
+    pub fn finished_output_revision(&self) -> u64 {
+        self.finished_output_revision
     }
 
     /// Whether the current editable prompt is provably empty. Block recall is
@@ -2338,6 +3094,122 @@ impl super::TerminalState {
             .map(|viewport_row| (viewport_row, column))
     }
 
+    /// Resolve a stable buffer anchor through the exact provenance of a
+    /// projected viewport. Hidden cells and structural rows fail closed.
+    pub fn buffer_anchor_to_projected(
+        &self,
+        viewport: &ProjectedViewport,
+        anchor: BufferAnchor,
+    ) -> Option<DisplayPoint> {
+        let (absolute_row, column) = self.buffer_anchor_to_absolute(anchor)?;
+        let row_id = self.raw_row_id_at_absolute(absolute_row)?;
+        viewport.display_point_for(RawCellAnchor { row_id, column })
+    }
+
+    /// Classify and, when visible, reveal a stable buffer anchor in the exact
+    /// current projected plan. Hidden output is reported to the caller but is
+    /// never expanded here; stale or ambiguous provenance fails closed.
+    #[allow(dead_code)] // Public library/search hook; binary wiring may be feature-gated.
+    pub fn reveal_buffer_anchor_in_projection(
+        &mut self,
+        policy: &ProjectionPolicy,
+        view_state: &mut ProjectionViewState,
+        anchor: BufferAnchor,
+    ) -> ProjectedBufferAnchorLocation {
+        if policy.is_identity() || self.use_alt_buffer {
+            return ProjectedBufferAnchorLocation::Identity;
+        }
+        let Some((absolute_row, column)) = self.buffer_anchor_to_absolute(anchor) else {
+            return ProjectedBufferAnchorLocation::Unmapped;
+        };
+        let Some(row_id) = self.raw_row_id_at_absolute(absolute_row) else {
+            return ProjectedBufferAnchorLocation::Unmapped;
+        };
+        let raw = RawCellAnchor { row_id, column };
+        let cols = self.grid.row_len().max(1);
+        let plan_key = self.projection_plan_cache_key(cols, policy);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            return ProjectedBufferAnchorLocation::Unmapped;
+        };
+        if plan.plan_revision == 0 || !self.projection_plan_key_matches_current_source(&plan_key) {
+            return ProjectedBufferAnchorLocation::Unmapped;
+        }
+        if let Some(summary_row) = plan.summary_owning_raw_cell(raw) {
+            return match plan.row(summary_row).map(|row| row.kind) {
+                Some(ProjectedRowKind::CollapsedSummary { key, .. })
+                    if key.policy_revision == policy.revision() =>
+                {
+                    ProjectedBufferAnchorLocation::Hidden {
+                        zone_id: key.zone_id,
+                    }
+                }
+                _ => ProjectedBufferAnchorLocation::Unmapped,
+            };
+        }
+        let Some(document_row) = plan
+            .raw_cell_document_row(raw)
+            .or_else(|| plan.raw_row_document_row(raw.row_id))
+        else {
+            return ProjectedBufferAnchorLocation::Unmapped;
+        };
+        let max_start = plan.document_rows().saturating_sub(self.grid.rows());
+        view_state.offset_from_bottom = max_start.saturating_sub(document_row.min(max_start));
+        view_state.follow_bottom = false;
+        view_state.top_anchor = Some(ProjectedTopAnchor::RawCell(raw));
+        view_state.last_plan_key = Some(plan_key);
+        ProjectedBufferAnchorLocation::Visible { document_row }
+    }
+
+    /// Reveal the exact synthetic row owned by one effective collapse without
+    /// changing the requested policy. This is used by block-bottom navigation:
+    /// a hidden raw edge must land on its summary, never a neighbouring row.
+    pub fn reveal_collapsed_summary(
+        &mut self,
+        policy: &ProjectionPolicy,
+        view_state: &mut ProjectionViewState,
+        zone_id: u64,
+    ) -> bool {
+        if self.use_alt_buffer || !policy.is_collapsed(zone_id) {
+            return false;
+        }
+        let cols = self.grid.row_len().max(1);
+        let plan_key = self.projection_plan_cache_key(cols, policy);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            return false;
+        };
+        let Some((document_row, hidden_range)) =
+            plan.rows
+                .iter()
+                .enumerate()
+                .find_map(|(row, planned)| match planned.kind {
+                    ProjectedRowKind::CollapsedSummary {
+                        key, hidden_range, ..
+                    } if key.zone_id == zone_id && key.policy_revision == policy.revision() => {
+                        Some((row, hidden_range))
+                    }
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        let max_start = plan.document_rows().saturating_sub(self.grid.rows());
+        view_state.offset_from_bottom = max_start.saturating_sub(document_row.min(max_start));
+        view_state.follow_bottom = false;
+        view_state.top_anchor = Some(ProjectedTopAnchor::Summary {
+            zone_id,
+            hidden_range,
+        });
+        view_state.last_plan_key = Some(plan_key);
+        true
+    }
+
+    /// Cheap render invalidation token for terminal text selection. The raw
+    /// selection value remains public for compatibility; transformed changes
+    /// advance this token without exposing projected document coordinates.
+    pub fn selection_revision(&self) -> u64 {
+        self.selection_revision
+    }
+
     /// Scroll enough to reveal a stable buffer anchor. Historical matches are
     /// placed at the top of the viewport; live-grid matches return to the live
     /// tail. If the row is already visible, the current viewport is preserved.
@@ -2537,13 +3409,11 @@ impl super::TerminalState {
     /// Bottom navigation aligns the edge with the viewport bottom when it is
     /// retained, matching the private-scroll card action in anvil/forge while
     /// keeping Ember's one continuous grid.
-    pub fn scroll_to_command_edge(&mut self, id: &str, bottom: bool) -> bool {
+    pub fn command_edge_anchor(&self, id: &str, bottom: bool) -> Option<BufferAnchor> {
         if self.use_alt_buffer {
-            return false;
+            return None;
         }
-        let Some(index) = self.record_index_for_id(id) else {
-            return false;
-        };
+        let index = self.record_index_for_id(id)?;
         let cols = self.grid.row_len();
         let normalized = |anchor: BufferAnchor| {
             if cols > 0 && anchor.column >= cols {
@@ -2562,20 +3432,25 @@ impl super::TerminalState {
         } else {
             start
         };
-        if self
-            .buffer_anchor_to_absolute(BufferAnchor {
-                line_id: target,
-                column: 0,
-            })
-            .is_none()
-        {
+        let anchor = BufferAnchor {
+            line_id: target,
+            column: 0,
+        };
+        self.buffer_anchor_to_absolute(anchor)?;
+        Some(anchor)
+    }
+
+    pub fn scroll_to_command_edge(&mut self, id: &str, bottom: bool) -> bool {
+        let Some(target) = self.command_edge_anchor(id, bottom) else {
             return false;
-        }
+        };
         if !bottom {
-            return self.scroll_to_line_id(target);
+            return self.scroll_to_line_id(target.line_id);
         }
-        let desired_top = target.saturating_sub(self.grid.rows().saturating_sub(1) as u64);
-        self.scroll_to_line_id(desired_top) || self.scroll_to_line_id(target)
+        let desired_top = target
+            .line_id
+            .saturating_sub(self.grid.rows().saturating_sub(1) as u64);
+        self.scroll_to_line_id(desired_top) || self.scroll_to_line_id(target.line_id)
     }
 
     /// Scroll the viewport so the row at `line_id` lands at the top of
@@ -2806,6 +3681,761 @@ impl super::TerminalState {
         std::mem::take(&mut self.pending_clipboard_requests)
     }
 
+    /// Plan the complete identity document before any viewport slicing.
+    ///
+    /// Scrollback contributes cached geometry only: this path neither decodes
+    /// compressed cell records nor scans their bytes. The live grid is already
+    /// at display width, so its rows are appended as hard, full-width
+    /// boundaries without inspecting their cells.
+    #[allow(dead_code)] // Dormant P1 planner; viewport/collapse wiring lands later.
+    pub(super) fn identity_projection_plan(&self, cols: usize) -> ProjectionPlan {
+        let cols = cols.max(1);
+        let source_base = usize::try_from(
+            self.total_lines_scrolled
+                .saturating_sub(self.scrollback.len() as u64),
+        )
+        .unwrap_or(usize::MAX.saturating_sub(self.scrollback.len()));
+        let history_layouts = self
+            .scrollback
+            .iter()
+            .enumerate()
+            .map(|(absolute_row, line)| {
+                #[cfg(test)]
+                PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|visits| {
+                    visits.set(visits.get().saturating_add(1));
+                });
+                RawRowLayout::new(
+                    source_base.saturating_add(absolute_row),
+                    line.raw_row_id(),
+                    line.reflow_content_len(),
+                    line.reflow_wide_continuations()
+                        .iter()
+                        .copied()
+                        .map(usize::from),
+                    line.is_wrapped,
+                )
+            });
+        let history_len = self.scrollback.len();
+        let grid_layouts = (0..self.grid.rows()).map(|grid_row| {
+            RawRowLayout::new(
+                source_base
+                    .saturating_add(history_len)
+                    .saturating_add(grid_row),
+                self.grid.row_id(grid_row),
+                cols,
+                std::iter::empty(),
+                self.grid.row_wrapped[grid_row],
+            )
+        });
+
+        ProjectionPlan::identity(history_layouts, grid_layouts, cols)
+    }
+
+    /// Resolve requested collapse ids to exact retained raw coordinates before
+    /// building a full-document plan. Invalid, stale and overlapping ranges
+    /// fail closed; two disjoint ranges on the same physical row remain valid.
+    fn resolved_collapses(&self, policy: &ProjectionPolicy) -> Vec<ResolvedCollapse> {
+        let source_base = usize::try_from(
+            self.total_lines_scrolled
+                .saturating_sub(self.scrollback.len() as u64),
+        )
+        .unwrap_or(usize::MAX.saturating_sub(self.scrollback.len()));
+        let mut candidates = Vec::new();
+        for zone_id in policy.collapsed_zone_ids() {
+            let Some(range) = self.finished_output_range(zone_id) else {
+                continue;
+            };
+            let Some(provenance) = self.finished_output_provenance.get(&zone_id) else {
+                continue;
+            };
+            let preferred = BufferAnchor {
+                line_id: provenance.start_line_id,
+                column: range.start.col,
+            };
+            let Some((start_absolute, _)) =
+                self.retained_raw_row_absolute(range.start.row, Some(preferred))
+            else {
+                continue;
+            };
+            let Some(end_absolute) = start_absolute.checked_add(provenance.rows.len() - 1) else {
+                continue;
+            };
+            if self
+                .retained_raw_row(end_absolute)
+                .is_none_or(|(row, _)| row != range.end.row)
+            {
+                continue;
+            }
+            candidates.push(ResolvedCollapse {
+                range,
+                start_absolute: source_base.saturating_add(start_absolute),
+                end_absolute: source_base.saturating_add(end_absolute),
+            });
+        }
+        candidates.sort_unstable_by_key(|collapse| {
+            (
+                collapse.start_absolute,
+                collapse.range.start.col,
+                collapse.end_absolute,
+                collapse.range.end.col,
+                collapse.range.zone_id,
+            )
+        });
+
+        // Reject an entire connected overlap component. Silently choosing one
+        // owner would make a stale policy retarget neighbouring block output.
+        let mut resolved = Vec::with_capacity(candidates.len());
+        let mut index = 0usize;
+        while index < candidates.len() {
+            let component_start = index;
+            let mut component_end = (
+                candidates[index].end_absolute,
+                candidates[index].range.end.col,
+            );
+            index += 1;
+            while let Some(candidate) = candidates.get(index) {
+                let start = (candidate.start_absolute, candidate.range.start.col);
+                if start >= component_end {
+                    break;
+                }
+                component_end =
+                    component_end.max((candidate.end_absolute, candidate.range.end.col));
+                index += 1;
+            }
+            if index == component_start + 1 {
+                resolved.push(candidates[component_start]);
+            }
+        }
+        resolved
+    }
+
+    fn projection_plan_cache_key(
+        &self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> ProjectionPlanCacheKey {
+        ProjectionPlanCacheKey {
+            total_lines_scrolled: self.total_lines_scrolled,
+            row_identity_revision: self.row_identity_revision,
+            finished_output_revision: self.finished_output_revision,
+            scrollback_len: self.scrollback.len(),
+            rows: self.grid.rows(),
+            cols,
+            row_wrapped: self.grid.row_wrapped.iter().copied().collect(),
+            policy_revision: policy.revision(),
+            policy_ids: policy.ids(),
+            full_screen_scroll_revision: self.full_screen_scroll_revision,
+        }
+    }
+
+    fn projection_source_base(&self) -> Option<usize> {
+        usize::try_from(
+            self.total_lines_scrolled
+                .checked_sub(self.scrollback.len() as u64)?,
+        )
+        .ok()
+    }
+
+    fn projection_source_to_absolute(&self, source: usize) -> Option<usize> {
+        let absolute = source.checked_sub(self.projection_source_base()?)?;
+        (absolute < self.scrollback.len().saturating_add(self.grid.rows())).then_some(absolute)
+    }
+
+    /// Return an exact cached full-document plan. A stale policy is resolved
+    /// first and exits here without visiting historical layout metadata.
+    fn cached_collapsed_projection_plan(
+        &mut self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> Option<std::sync::Arc<ProjectionPlan>> {
+        let key = self.projection_plan_cache_key(cols, policy);
+        if let Some((cached_key, plan)) = &self.projection_plan_cache {
+            if self.finished_output_revision != 0 && *cached_key == key {
+                return (!plan.effective_collapsed.is_empty()).then(|| std::sync::Arc::clone(plan));
+            }
+        }
+
+        if let Some((cached_key, mut cached_plan)) = self.projection_plan_cache.take() {
+            if let Some(plan) = std::sync::Arc::get_mut(&mut cached_plan) {
+                if self.try_advance_collapsed_projection_plan(&cached_key, &key, plan) {
+                    if plan.effective_collapsed.is_empty() {
+                        self.projection_plan_cache = Some((key, cached_plan));
+                        return None;
+                    }
+                    let plan_revision = self.next_projection_plan_revision;
+                    if plan_revision != 0 {
+                        let incremental_appended_rows = usize::try_from(
+                            key.total_lines_scrolled
+                                .saturating_sub(cached_key.total_lines_scrolled),
+                        )
+                        .unwrap_or(usize::MAX);
+                        plan.incremental_from = Some(cached_key);
+                        plan.incremental_appended_rows = incremental_appended_rows;
+                        plan.plan_revision = plan_revision;
+                        self.next_projection_plan_revision =
+                            plan_revision.checked_add(1).unwrap_or(0);
+                        self.projection_plan_cache =
+                            Some((key, std::sync::Arc::clone(&cached_plan)));
+                        return Some(cached_plan);
+                    }
+                }
+            }
+        }
+
+        let resolved = self.resolved_collapses(policy);
+        if resolved.is_empty() {
+            return None;
+        }
+        #[cfg(test)]
+        PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        let mut plan = self
+            .identity_projection_plan(cols)
+            .splice_collapses(&resolved, policy.revision());
+        if plan.effective_collapsed.is_empty() {
+            self.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
+            return None;
+        }
+        let plan_revision = self.next_projection_plan_revision;
+        if plan_revision == 0 {
+            return None;
+        }
+        plan.plan_revision = plan_revision;
+        self.next_projection_plan_revision = plan_revision.checked_add(1).unwrap_or(0);
+        let plan = std::sync::Arc::new(plan);
+        self.projection_plan_cache = Some((key, std::sync::Arc::clone(&plan)));
+        Some(plan)
+    }
+
+    fn try_advance_collapsed_projection_plan(
+        &self,
+        old_key: &ProjectionPlanCacheKey,
+        new_key: &ProjectionPlanCacheKey,
+        plan: &mut ProjectionPlan,
+    ) -> bool {
+        let Some(appended) = new_key
+            .total_lines_scrolled
+            .checked_sub(old_key.total_lines_scrolled)
+            .and_then(|rows| usize::try_from(rows).ok())
+            .filter(|rows| *rows > 0)
+        else {
+            return false;
+        };
+        let Some(old_source_base) = old_key
+            .total_lines_scrolled
+            .checked_sub(old_key.scrollback_len as u64)
+            .and_then(|base| usize::try_from(base).ok())
+        else {
+            return false;
+        };
+        if old_key.finished_output_revision == 0
+            || old_key.full_screen_scroll_revision == 0
+            || new_key.full_screen_scroll_revision == 0
+            || new_key
+                .full_screen_scroll_revision
+                .checked_sub(old_key.full_screen_scroll_revision)
+                != Some(appended as u64)
+            || new_key
+                .row_identity_revision
+                .checked_sub(old_key.row_identity_revision)
+                != Some((appended as u64).saturating_mul(2))
+            || old_key.finished_output_revision != new_key.finished_output_revision
+            || old_key.policy_revision != new_key.policy_revision
+            || old_key.policy_ids != new_key.policy_ids
+            || old_key.cols != new_key.cols
+            || old_key.rows != new_key.rows
+            || plan.history_rows != old_key.scrollback_len
+            || plan.raw_absolute_base != old_source_base
+            || old_key.row_wrapped.iter().any(|wrapped| *wrapped)
+            || new_key.row_wrapped.iter().any(|wrapped| *wrapped)
+            || old_key.scrollback_len > 0
+                && self
+                    .scrollback
+                    .get(new_key.scrollback_len.saturating_sub(appended + 1))
+                    .is_some_and(|line| line.is_wrapped)
+        {
+            return false;
+        }
+        let Some(expected_history) = old_key.scrollback_len.checked_add(appended) else {
+            return false;
+        };
+        let evicted = expected_history.saturating_sub(new_key.scrollback_len);
+        if expected_history < new_key.scrollback_len || evicted > old_key.scrollback_len {
+            return false;
+        }
+        let evicted_old_history = evicted.min(old_key.scrollback_len);
+        if !plan.front_rows_are_independently_evictable(evicted_old_history) {
+            return false;
+        }
+        let Some(old_grid_start) = plan.raw_rows.get(old_key.scrollback_len) else {
+            return false;
+        };
+        if plan
+            .resolved_collapses
+            .iter()
+            .any(|collapse| collapse.end_absolute >= old_grid_start.absolute_row)
+        {
+            return false;
+        }
+        if new_key.scrollback_len > 0 {
+            let retained_new_history = appended.min(new_key.scrollback_len);
+            if new_key.scrollback_len > retained_new_history {
+                let Some(expected_front) = plan
+                    .raw_rows
+                    .get(evicted_old_history)
+                    .map(|row| row.raw_row)
+                else {
+                    return false;
+                };
+                if self.scrollback.front().map(ScrollbackLine::raw_row_id) != Some(expected_front) {
+                    return false;
+                }
+            }
+        }
+
+        let source_base = match self.projection_source_base() {
+            Some(base) => base,
+            None => return false,
+        };
+        let retained_new_history = appended.min(new_key.scrollback_len);
+        let appended_start = new_key.scrollback_len.saturating_sub(retained_new_history);
+        let appended_layouts = (appended_start..new_key.scrollback_len).map(|absolute| {
+            let line = &self.scrollback[absolute];
+            #[cfg(test)]
+            PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|visits| {
+                visits.set(visits.get().saturating_add(1));
+            });
+            RawRowLayout::new(
+                source_base.saturating_add(absolute),
+                line.raw_row_id(),
+                line.reflow_content_len(),
+                line.reflow_wide_continuations()
+                    .iter()
+                    .copied()
+                    .map(usize::from),
+                line.is_wrapped,
+            )
+        });
+        let grid_layouts = (0..self.grid.rows()).map(|row| {
+            RawRowLayout::new(
+                source_base
+                    .saturating_add(self.scrollback.len())
+                    .saturating_add(row),
+                self.grid.row_id(row),
+                self.grid.row_len(),
+                std::iter::empty(),
+                self.grid.row_wrapped[row],
+            )
+        });
+        plan.advance_full_screen_scroll(evicted_old_history, appended_layouts, grid_layouts)
+    }
+
+    fn bump_selection_revision(&mut self) {
+        self.selection_revision = self.selection_revision.checked_add(1).unwrap_or(1);
+    }
+
+    /// Raw and transformed document coordinates are intentionally exclusive.
+    /// A projected selection survives paint-only updates and viewport scrolling
+    /// while the exact cached plan instance remains the same.
+    fn enter_transformed_selection_space(&mut self, plan_revision: u64) {
+        let raw_changed = self.selection.take().is_some();
+        let projected_changed = plan_revision == 0
+            || self
+                .projected_selection
+                .is_some_and(|selection| selection.plan_revision != plan_revision);
+        if projected_changed {
+            self.projected_selection = None;
+        }
+        if raw_changed || projected_changed {
+            self.bump_selection_revision();
+        }
+    }
+
+    fn leave_transformed_selection_space(&mut self) {
+        if self.projected_selection.take().is_some() {
+            self.bump_selection_revision();
+        }
+    }
+
+    fn materialize_projection_plan(
+        &self,
+        plan: &ProjectionPlan,
+        document_start: usize,
+        viewport_rows: usize,
+    ) -> MaterializedProjection {
+        let document_start = document_start.min(plan.document_rows());
+        let visible_rows = plan
+            .document_rows()
+            .saturating_sub(document_start)
+            .min(viewport_rows);
+        let top_padding = viewport_rows.saturating_sub(visible_rows);
+        let mut cells = Vec::with_capacity(viewport_rows);
+        let mut row_wrapped = Vec::with_capacity(viewport_rows);
+        let mut row_kinds = Vec::with_capacity(viewport_rows);
+        let mut row_sources = Vec::with_capacity(viewport_rows);
+        let mut origins = Vec::new();
+        for _ in 0..top_padding {
+            cells.push(vec![TerminalCell::default(); plan.cols]);
+            row_wrapped.push(false);
+            row_kinds.push(ProjectedRowKind::Padding);
+            row_sources.push(None);
+        }
+
+        let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
+        for planned_row in plan.rows.iter().skip(document_start).take(visible_rows) {
+            let display_row = cells.len();
+            let mut line = vec![TerminalCell::default(); plan.cols];
+            for slice in &planned_row.raw_slices {
+                let Some(source_absolute) =
+                    self.projection_source_to_absolute(slice.source.absolute_row)
+                else {
+                    continue;
+                };
+                let source = if source_absolute < self.scrollback.len() {
+                    history_cache
+                        .entry(source_absolute)
+                        .or_insert_with(|| {
+                            #[cfg(test)]
+                            PROJECTION_VIEW_HISTORY_DECOMPRESSES.with(|count| {
+                                count.set(count.get().saturating_add(1));
+                            });
+                            self.scrollback[source_absolute].decompress()
+                        })
+                        .as_slice()
+                } else {
+                    let Some(grid_row) = source_absolute
+                        .checked_sub(self.scrollback.len())
+                        .filter(|row| *row < self.grid.rows())
+                    else {
+                        continue;
+                    };
+                    &self.grid[grid_row]
+                };
+                let Some(source_end) = slice.source.col_start.checked_add(slice.len) else {
+                    continue;
+                };
+                let Some(view_end) = slice.view_col_start.checked_add(slice.len) else {
+                    continue;
+                };
+                if source_end > source.len() || view_end > line.len() {
+                    continue;
+                }
+                line[slice.view_col_start..view_end]
+                    .copy_from_slice(&source[slice.source.col_start..source_end]);
+                if slice.narrow_wide_body {
+                    line[slice.view_col_start].flags.set_wide(false);
+                }
+                if let Some(origin) = slice.origin {
+                    origins.push(OriginSpan {
+                        display_start: DisplayPoint::new(display_row, slice.view_col_start),
+                        raw_start: RawCellAnchor {
+                            row_id: origin.row,
+                            column: origin.col_start,
+                        },
+                        len: slice.len,
+                    });
+                }
+            }
+            cells.push(line);
+            row_wrapped.push(planned_row.wrapped);
+            row_kinds.push(planned_row.kind);
+            row_sources.push(planned_row.row_source.and_then(|source| {
+                Some(super::projection::RawRowSource {
+                    raw_row: source.raw_row,
+                    raw_absolute_row: self
+                        .projection_source_to_absolute(source.raw_absolute_row)?,
+                })
+            }));
+        }
+
+        MaterializedProjection {
+            cells,
+            row_wrapped,
+            row_kinds,
+            row_sources,
+            origins,
+            document_start,
+            top_padding,
+        }
+    }
+
+    fn projected_top_anchor(&self, viewport: &ProjectedViewport) -> Option<ProjectedTopAnchor> {
+        viewport.stable_top_anchor().or_else(|| {
+            let view_row = viewport.top_padding();
+            let absolute = viewport
+                .view_row_absolute(view_row)
+                .unwrap_or_else(|| viewport.legacy_absolute_row(view_row));
+            let (row, _) = self.retained_raw_row(absolute)?;
+            row.is_tracked().then_some(ProjectedTopAnchor::RawRow(row))
+        })
+    }
+
+    fn retained_absolute_for_raw(&self, row: RawRowId) -> Option<usize> {
+        if !row.is_tracked() {
+            return None;
+        }
+        self.scrollback
+            .iter()
+            .position(|line| line.raw_row_id() == row)
+            .or_else(|| {
+                self.grid
+                    .row_ids
+                    .iter()
+                    .position(|candidate| *candidate == row)
+                    .map(|grid_row| self.scrollback.len().saturating_add(grid_row))
+            })
+    }
+
+    fn restore_identity_scroll_from_projection(&mut self, state: &ProjectionViewState) {
+        if state.follow_bottom {
+            self.scroll_offset = 0;
+            return;
+        }
+        let row = match state.top_anchor {
+            Some(ProjectedTopAnchor::RawCell(anchor)) => Some(anchor.row_id),
+            Some(ProjectedTopAnchor::RawRow(row)) => Some(row),
+            Some(ProjectedTopAnchor::Summary { hidden_range, .. }) => Some(hidden_range.start.row),
+            None => None,
+        };
+        let Some(absolute) = row.and_then(|row| self.retained_absolute_for_raw(row)) else {
+            self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+            return;
+        };
+        let desired_start = absolute.min(self.scrollback.len());
+        self.scroll_offset = self.scrollback.len().saturating_sub(desired_start);
+    }
+
+    /// Materialize a primary-screen block document after applying the
+    /// session-owned policy. Identity, bypass and ineffective policies return
+    /// the exact P0 viewport allocation. Rebuilds preserve a stable top raw or
+    /// synthetic anchor, while offset zero continues following the bottom.
+    pub fn projected_viewport_with_state(
+        &mut self,
+        projection: HistoryProjection,
+        block_mode: bool,
+        policy: &ProjectionPolicy,
+        view_state: &mut ProjectionViewState,
+    ) -> ProjectedViewport {
+        if !block_mode || self.use_alt_buffer {
+            self.leave_transformed_selection_space();
+            return self.projected_viewport(projection, block_mode);
+        }
+        if policy.is_identity() {
+            self.leave_transformed_selection_space();
+            if view_state.last_plan_key.is_some() {
+                self.restore_identity_scroll_from_projection(view_state);
+                view_state.last_plan_key = None;
+            }
+            return self.projected_viewport(projection, true);
+        }
+
+        if view_state.last_plan_key.is_none() && self.scroll_offset > 0 {
+            let identity = self.projected_viewport(projection, true);
+            view_state.top_anchor = self.projected_top_anchor(&identity);
+            view_state.follow_bottom = false;
+        }
+
+        let cols = self.grid.row_len().max(1);
+        let plan_key = self.projection_plan_cache_key(cols, policy);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            self.leave_transformed_selection_space();
+            if view_state.last_plan_key.is_some() {
+                self.restore_identity_scroll_from_projection(view_state);
+                view_state.last_plan_key = None;
+            }
+            return self.projected_viewport(projection, true);
+        };
+        self.enter_transformed_selection_space(plan.plan_revision);
+        let viewport_rows = self.grid.rows();
+        let max_offset = plan.document_rows().saturating_sub(viewport_rows);
+        if view_state.last_plan_key.as_ref() != Some(&plan_key) {
+            if view_state.follow_bottom {
+                view_state.offset_from_bottom = 0;
+            } else if plan.incremental_from.as_ref() == view_state.last_plan_key.as_ref() {
+                view_state.offset_from_bottom = view_state
+                    .offset_from_bottom
+                    .saturating_add(plan.incremental_appended_rows)
+                    .min(max_offset);
+            } else if let Some(target) = view_state
+                .top_anchor
+                .and_then(|anchor| plan.document_row_for_anchor(anchor))
+            {
+                view_state.offset_from_bottom = max_offset.saturating_sub(target.min(max_offset));
+            } else {
+                view_state.offset_from_bottom = view_state.offset_from_bottom.min(max_offset);
+            }
+        }
+        let document_start = max_offset.saturating_sub(view_state.offset_from_bottom);
+        let cursor_row_id = self.grid.row_id(self.cursor_row.min(self.grid.rows() - 1));
+        let viewport_key = TransformedViewportCacheKey {
+            plan: plan_key.clone(),
+            projection_revision: plan.plan_revision,
+            grid_version: self.grid_version,
+            document_start,
+            viewport_rows,
+            cursor_row: cursor_row_id,
+            cursor_col: self.cursor_col,
+        };
+        let viewport = if let Some((cached_key, viewport)) = &self.transformed_viewport_cache {
+            if *cached_key == viewport_key {
+                viewport.clone()
+            } else {
+                let materialized =
+                    self.materialize_projection_plan(&plan, document_start, viewport_rows);
+                let cursor = materialized
+                    .origins
+                    .iter()
+                    .find_map(|span| {
+                        let end = span.raw_start.column.saturating_add(span.len);
+                        (span.raw_start.row_id == cursor_row_id
+                            && (span.raw_start.column..end).contains(&self.cursor_col))
+                        .then(|| {
+                            DisplayPoint::new(
+                                span.display_start.row,
+                                span.display_start.column + self.cursor_col - span.raw_start.column,
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|| DisplayPoint::new(usize::MAX, usize::MAX));
+                let key = ProjectionCacheKey::new(
+                    self.grid_version,
+                    plan.plan_revision,
+                    self.total_lines_scrolled,
+                    self.row_identity_revision,
+                    self.scrollback.len(),
+                    view_state.offset_from_bottom,
+                    viewport_rows,
+                    cols,
+                    false,
+                    ProjectionMode::Transformed,
+                );
+                ProjectedViewport::new_transformed(
+                    key,
+                    materialized.cells,
+                    materialized.row_wrapped,
+                    materialized.row_kinds,
+                    materialized.row_sources,
+                    materialized.origins,
+                    cursor,
+                    plan.document_rows(),
+                    materialized.document_start,
+                    materialized.top_padding,
+                    plan.effective_collapsed.clone(),
+                )
+            }
+        } else {
+            let materialized =
+                self.materialize_projection_plan(&plan, document_start, viewport_rows);
+            let cursor = materialized
+                .origins
+                .iter()
+                .find_map(|span| {
+                    let end = span.raw_start.column.saturating_add(span.len);
+                    (span.raw_start.row_id == cursor_row_id
+                        && (span.raw_start.column..end).contains(&self.cursor_col))
+                    .then(|| {
+                        DisplayPoint::new(
+                            span.display_start.row,
+                            span.display_start.column + self.cursor_col - span.raw_start.column,
+                        )
+                    })
+                })
+                .unwrap_or_else(|| DisplayPoint::new(usize::MAX, usize::MAX));
+            let key = ProjectionCacheKey::new(
+                self.grid_version,
+                plan.plan_revision,
+                self.total_lines_scrolled,
+                self.row_identity_revision,
+                self.scrollback.len(),
+                view_state.offset_from_bottom,
+                viewport_rows,
+                cols,
+                false,
+                ProjectionMode::Transformed,
+            );
+            ProjectedViewport::new_transformed(
+                key,
+                materialized.cells,
+                materialized.row_wrapped,
+                materialized.row_kinds,
+                materialized.row_sources,
+                materialized.origins,
+                cursor,
+                plan.document_rows(),
+                materialized.document_start,
+                materialized.top_padding,
+                plan.effective_collapsed.clone(),
+            )
+        };
+        if self
+            .transformed_viewport_cache
+            .as_ref()
+            .is_none_or(|(cached_key, _)| *cached_key != viewport_key)
+        {
+            self.transformed_viewport_cache = Some((viewport_key, viewport.clone()));
+        }
+        view_state.offset_from_bottom = viewport.scroll_offset();
+        view_state.follow_bottom = view_state.offset_from_bottom == 0;
+        view_state.top_anchor = (!view_state.follow_bottom)
+            .then(|| self.projected_top_anchor(&viewport))
+            .flatten();
+        view_state.last_plan_key = Some(plan_key);
+        viewport
+    }
+
+    /// Test oracle for the future viewport materializer. It intentionally
+    /// reads only `RawSlice::source`: an untracked row has no stable origin,
+    /// but its terminal bytes must still survive identity projection.
+    #[cfg(test)]
+    pub(super) fn materialize_identity_projection_plan(
+        &self,
+        plan: &ProjectionPlan,
+    ) -> (Vec<Vec<TerminalCell>>, Vec<bool>) {
+        let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
+        let rows = plan
+            .rows
+            .iter()
+            .map(|planned_row| {
+                let mut cells = vec![TerminalCell::default(); plan.cols];
+                for slice in &planned_row.raw_slices {
+                    let source_absolute = self
+                        .projection_source_to_absolute(slice.source.absolute_row)
+                        .expect("planned source should remain retained");
+                    let source = if source_absolute < self.scrollback.len() {
+                        history_cache
+                            .entry(source_absolute)
+                            .or_insert_with(|| {
+                                PROJECTION_PLAN_ORACLE_HISTORY_DECOMPRESSES.with(|count| {
+                                    count.set(count.get().saturating_add(1));
+                                });
+                                self.scrollback[source_absolute].decompress()
+                            })
+                            .as_slice()
+                    } else {
+                        let grid_row = source_absolute - self.scrollback.len();
+                        &self.grid[grid_row]
+                    };
+                    let source_end = slice
+                        .source
+                        .col_start
+                        .checked_add(slice.len)
+                        .expect("planned source slice overflow");
+                    let view_end = slice
+                        .view_col_start
+                        .checked_add(slice.len)
+                        .expect("planned view slice overflow");
+                    cells[slice.view_col_start..view_end]
+                        .copy_from_slice(&source[slice.source.col_start..source_end]);
+                    if slice.narrow_wide_body {
+                        cells[slice.view_col_start].flags.set_wide(false);
+                    }
+                }
+                cells
+            })
+            .collect();
+        let wrapped = plan.rows.iter().map(|row| row.wrapped).collect();
+        (rows, wrapped)
+    }
+
     /// Return the next joined logical-line boundary and the number of visual
     /// rows that logical line occupies at `new_cols`.
     ///
@@ -2942,6 +4572,10 @@ impl super::TerminalState {
             // Fast path: copy current grid, reusing inner Vec capacity when possible.
             if let Some(mut arc) = recycled.take() {
                 if let Some(buf) = std::sync::Arc::get_mut(&mut arc) {
+                    #[cfg(test)]
+                    VISIBLE_CELLS_RECYCLE_COUNT.with(|count| {
+                        count.set(count.get().saturating_add(1));
+                    });
                     // Incremental path: if the recycled buffer already holds a same-sized
                     // snapshot taken at scroll_offset==0, only re-copy rows whose
                     // row_versions changed since that snapshot. Untouched rows already
@@ -3188,6 +4822,7 @@ impl super::TerminalState {
         projection: HistoryProjection,
         block_mode: bool,
     ) -> ProjectedViewport {
+        self.leave_transformed_selection_space();
         let rows = self.grid.rows();
         let columns = self.grid.row_len();
         let mode = if !block_mode || self.use_alt_buffer {
@@ -3214,6 +4849,14 @@ impl super::TerminalState {
         {
             return cached.clone();
         }
+
+        // A stale identity/bypass viewport owns one extra clone of the same
+        // cells Arc as `visible_cells_cache`. Release that internal clone
+        // before asking the legacy cache to rebuild, otherwise Arc::get_mut
+        // can never recycle the allocation even after the renderer dropped
+        // its previous-frame viewport. A caller-held viewport remains an
+        // external owner and correctly keeps the rebuild copy-on-write.
+        self.projected_viewport_cache = None;
 
         // Identity fast path: do not clone cells. `get_visible_cells` already
         // owns the legacy incremental/live and lazy historical caches.
@@ -3447,6 +5090,140 @@ impl super::TerminalState {
         (viewport_row < self.grid.rows()).then_some(viewport_row)
     }
 
+    pub fn clear_text_selection(&mut self) {
+        if self.selection.take().is_some() || self.projected_selection.take().is_some() {
+            self.bump_selection_revision();
+        }
+    }
+
+    #[allow(dead_code)] // Public library compatibility; UI may query raw storage directly.
+    pub fn has_text_selection(&self) -> bool {
+        self.selection.is_some() || self.projected_selection.is_some()
+    }
+
+    fn set_raw_selection(&mut self, selection: Selection) {
+        self.projected_selection = None;
+        self.selection = Some(selection);
+        self.bump_selection_revision();
+    }
+
+    fn set_projected_selection(&mut self, selection: ProjectedSelection) {
+        self.selection = None;
+        self.projected_selection = Some(selection);
+        self.bump_selection_revision();
+    }
+
+    fn projection_plan_key_matches_current_source(&self, key: &ProjectionPlanCacheKey) -> bool {
+        self.finished_output_revision != 0
+            && key.finished_output_revision != 0
+            && key.total_lines_scrolled == self.total_lines_scrolled
+            && key.row_identity_revision == self.row_identity_revision
+            && key.finished_output_revision == self.finished_output_revision
+            && key.scrollback_len == self.scrollback.len()
+            && key.rows == self.grid.rows()
+            && key.cols == self.grid.row_len().max(1)
+            && key.row_wrapped.as_slice() == self.grid.row_wrapped.as_slice()
+    }
+
+    fn projected_selection_plan_revision(&self, viewport: &ProjectedViewport) -> Option<u64> {
+        let revision = viewport.plan_revision()?;
+        let (key, plan) = self.projection_plan_cache.as_ref()?;
+        (plan.plan_revision == revision
+            && self.projection_plan_key_matches_current_source(key)
+            && plan.document_rows() == viewport.document_rows())
+        .then_some(revision)
+    }
+
+    /// Normalize a wide continuation to its glyph body, then return a stable
+    /// projected-document coordinate. A structural hole in a partial row is
+    /// not selectable; a genuine empty tracked raw row is.
+    fn projected_selection_point(
+        viewport: &ProjectedViewport,
+        display_pos: (usize, usize),
+    ) -> Option<(usize, usize)> {
+        let mut point = DisplayPoint::new(display_pos.0, display_pos.1);
+        if viewport
+            .cells()
+            .get(point.row)?
+            .get(point.column)?
+            .flags
+            .wide_continuation()
+            && point.column > 0
+        {
+            point.column -= 1;
+        }
+        if viewport.raw_anchor_at(point).is_none() {
+            if viewport.row_has_origin(point.row) {
+                return None;
+            }
+            let source = viewport.row_source_at(point.row)?;
+            if !source.raw_row.is_tracked()
+                || !matches!(viewport.row_kind(point.row), Some(ProjectedRowKind::Raw))
+            {
+                return None;
+            }
+        }
+        Some((viewport.view_document_row(point.row)?, point.column))
+    }
+
+    fn wide_atomic_selection_columns(
+        mut left: usize,
+        mut right: usize,
+        mut flags_at: impl FnMut(usize) -> Option<StyleFlags>,
+    ) -> Option<(usize, usize)> {
+        if left > right {
+            return None;
+        }
+        if flags_at(left).is_some_and(|flags| flags.wide_continuation()) {
+            left = left.checked_sub(1)?;
+        }
+        if flags_at(right).is_some_and(|flags| flags.wide()) {
+            let continuation = right.checked_add(1)?;
+            if flags_at(continuation).is_some_and(|flags| flags.wide_continuation()) {
+                right = continuation;
+            }
+        }
+        Some((left, right))
+    }
+
+    fn projected_plan_cell_flags(
+        &self,
+        planned: &ProjectionPlanRow,
+        view_column: usize,
+        history_cache: &mut Option<(usize, Vec<TerminalCell>)>,
+    ) -> Option<StyleFlags> {
+        let slice = planned.raw_slices.iter().find(|slice| {
+            view_column >= slice.view_col_start
+                && view_column < slice.view_col_start.saturating_add(slice.len)
+        })?;
+        let source_column = slice
+            .source
+            .col_start
+            .checked_add(view_column.checked_sub(slice.view_col_start)?)?;
+        let source_absolute = self.projection_source_to_absolute(slice.source.absolute_row)?;
+        if source_absolute < self.scrollback.len() {
+            if history_cache.as_ref().map(|(row, _)| *row) != Some(source_absolute) {
+                *history_cache = Some((
+                    source_absolute,
+                    self.scrollback.get(source_absolute)?.decompress(),
+                ));
+            }
+            return history_cache
+                .as_ref()?
+                .1
+                .get(source_column)
+                .map(|cell| cell.flags);
+        }
+        let grid_row = slice.source.absolute_row;
+        let grid_row = self
+            .projection_source_to_absolute(grid_row)?
+            .checked_sub(self.scrollback.len())?;
+        (grid_row < self.grid.rows())
+            .then(|| self.grid[grid_row].get(source_column))
+            .flatten()
+            .map(|cell| cell.flags)
+    }
+
     /// Start a new selection at a viewport-relative position.
     /// Converts to absolute buffer coordinates internally.
     #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
@@ -3485,7 +5262,7 @@ impl super::TerminalState {
             self.viewport_row_to_absolute(viewport_pos.0),
             viewport_pos.1,
         );
-        self.selection = Some(Selection {
+        self.set_raw_selection(Selection {
             anchor: abs,
             active: abs,
             mode,
@@ -3498,8 +5275,25 @@ impl super::TerminalState {
         display_pos: (usize, usize),
         mode: SelectionMode,
     ) {
+        if viewport.is_transformed() {
+            let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(point) = Self::projected_selection_point(viewport, display_pos) else {
+                self.clear_text_selection();
+                return;
+            };
+            self.set_projected_selection(ProjectedSelection {
+                plan_revision,
+                anchor: point,
+                active: point,
+                mode,
+            });
+            return;
+        }
         let abs = (viewport.legacy_absolute_row(display_pos.0), display_pos.1);
-        self.selection = Some(Selection {
+        self.set_raw_selection(Selection {
             anchor: abs,
             active: abs,
             mode,
@@ -3512,6 +5306,7 @@ impl super::TerminalState {
         let abs_row = self.viewport_row_to_absolute(viewport_pos.0);
         if let Some(ref mut sel) = self.selection {
             sel.active = (abs_row, viewport_pos.1);
+            self.bump_selection_revision();
         }
     }
 
@@ -3520,9 +5315,34 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         display_pos: (usize, usize),
     ) {
+        if viewport.is_transformed() {
+            let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(point) = Self::projected_selection_point(viewport, display_pos) else {
+                // Dragging across a summary/padding row keeps the last valid
+                // endpoint; synthetic rows never become anchors themselves.
+                return;
+            };
+            let Some(selection) = self.projected_selection.as_mut() else {
+                return;
+            };
+            if selection.plan_revision != plan_revision {
+                self.clear_text_selection();
+                return;
+            }
+            if selection.active != point {
+                selection.active = point;
+                self.bump_selection_revision();
+            }
+            return;
+        }
+        self.projected_selection = None;
         let abs_row = viewport.legacy_absolute_row(display_pos.0);
         if let Some(ref mut sel) = self.selection {
             sel.active = (abs_row, display_pos.1);
+            self.bump_selection_revision();
         }
     }
 
@@ -3545,6 +5365,31 @@ impl super::TerminalState {
         row: usize,
         col: usize,
     ) {
+        if viewport.is_transformed() {
+            let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some((start, end)) =
+                Self::word_span_in_view(viewport.cells(), viewport.row_wrapped(), row, col)
+            else {
+                return;
+            };
+            let (Some(anchor), Some(active)) = (
+                Self::projected_selection_point(viewport, start),
+                Self::projected_selection_point(viewport, end),
+            ) else {
+                self.clear_text_selection();
+                return;
+            };
+            self.set_projected_selection(ProjectedSelection {
+                plan_revision,
+                anchor,
+                active,
+                mode: SelectionMode::Normal,
+            });
+            return;
+        }
         self.select_word_in_view(
             viewport.cells(),
             viewport.row_wrapped(),
@@ -3562,24 +5407,31 @@ impl super::TerminalState {
         col: usize,
         to_absolute_row: impl Fn(usize) -> usize,
     ) {
-        if row >= visible.len() {
+        let Some((anchor, active)) = Self::word_span_in_view(visible, wrapped, row, col) else {
             return;
-        }
-        let line = &visible[row];
-        let cols = line.len();
-        if col >= cols {
-            return;
-        }
+        };
+        self.set_raw_selection(Selection {
+            anchor: (to_absolute_row(anchor.0), anchor.1),
+            active: (to_absolute_row(active.0), active.1),
+            mode: SelectionMode::Normal,
+        });
+    }
 
-        // Skip wide_continuation to find the real character
+    fn word_span_in_view(
+        visible: &[Vec<TerminalCell>],
+        wrapped: &[bool],
+        row: usize,
+        col: usize,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let line = visible.get(row)?;
+        let cols = line.len();
+        if col >= cols || cols == 0 {
+            return None;
+        }
         let mut start_col = col;
         if line[start_col].flags.wide_continuation() && start_col > 0 {
             start_col -= 1;
         }
-
-        // Paths and URLs commonly span several visual rows. Treat adjacent
-        // soft-wrapped rows as one logical line so a double-click selects the
-        // complete token rather than only the fragment under the pointer.
         let mut logical_start_row = row;
         while logical_start_row > 0 && wrapped.get(logical_start_row - 1).copied().unwrap_or(false)
         {
@@ -3607,12 +5459,7 @@ impl super::TerminalState {
         if let Some((left, right)) = Self::select_extended_token_span(&logical_cells, logical_col) {
             let first_row = logical_start_row + left / cols;
             let last_row = logical_start_row + right / cols;
-            self.selection = Some(Selection {
-                anchor: (to_absolute_row(first_row), left % cols),
-                active: (to_absolute_row(last_row), right % cols),
-                mode: SelectionMode::Normal,
-            });
-            return;
+            return Some(((first_row, left % cols), (last_row, right % cols)));
         }
 
         let ch = line[start_col].character;
@@ -3665,12 +5512,7 @@ impl super::TerminalState {
             right += 1;
         }
 
-        let abs_row = to_absolute_row(row);
-        self.selection = Some(Selection {
-            anchor: (abs_row, left),
-            active: (abs_row, right),
-            mode: SelectionMode::Normal,
-        });
+        Some(((row, left), (row, right)))
     }
 
     #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
@@ -3683,6 +5525,47 @@ impl super::TerminalState {
     }
 
     pub fn select_line_at_projected(&mut self, viewport: &ProjectedViewport, row: usize) {
+        if viewport.is_transformed() {
+            let Some(plan_revision) = self.projected_selection_plan_revision(viewport) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some((left, mut right)) = viewport.real_column_bounds(row) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(line) = viewport.cells().get(row) else {
+                self.clear_text_selection();
+                return;
+            };
+            while right > left {
+                let cell = &line[right];
+                if !cell.flags.wide_continuation() && cell.character != ' ' {
+                    break;
+                }
+                right -= 1;
+            }
+            if line
+                .get(right)
+                .is_some_and(|cell| cell.flags.wide() && right + 1 < line.len())
+            {
+                right += 1;
+            }
+            let (Some(anchor), Some(active)) = (
+                Self::projected_selection_point(viewport, (row, left)),
+                Self::projected_selection_point(viewport, (row, right)),
+            ) else {
+                self.clear_text_selection();
+                return;
+            };
+            self.set_projected_selection(ProjectedSelection {
+                plan_revision,
+                anchor,
+                active,
+                mode: SelectionMode::Normal,
+            });
+            return;
+        }
         self.select_line_in_view(viewport.cells(), row, |display_row| {
             viewport.legacy_absolute_row(display_row)
         });
@@ -3716,7 +5599,7 @@ impl super::TerminalState {
         }
 
         let abs_row = to_absolute_row(row);
-        self.selection = Some(Selection {
+        self.set_raw_selection(Selection {
             anchor: (abs_row, 0),
             active: (abs_row, right),
             mode: SelectionMode::Normal,
@@ -3811,7 +5694,127 @@ impl super::TerminalState {
         Some((left, right))
     }
 
+    fn copy_projected_selection(&self) -> Option<String> {
+        let selection = self.projected_selection?;
+        let (plan_key, plan) = self.projection_plan_cache.as_ref()?;
+        if selection.plan_revision == 0
+            || plan.plan_revision != selection.plan_revision
+            || !self.projection_plan_key_matches_current_source(plan_key)
+        {
+            return None;
+        }
+        let (start, end) = if selection.anchor <= selection.active {
+            (selection.anchor, selection.active)
+        } else {
+            (selection.active, selection.anchor)
+        };
+        if start.0 >= plan.document_rows() || end.0 >= plan.document_rows() {
+            return None;
+        }
+
+        let mut result = String::new();
+        // Projected slices are monotonic in raw document order, so retaining
+        // only the most recently decoded history row bounds memory while
+        // sharing a source used by multiple visible fragments.
+        let mut history_cache: Option<(usize, Vec<TerminalCell>)> = None;
+        let mut hard_break_pending = false;
+        for document_row in start.0..=end.0 {
+            let planned = plan.row(document_row)?;
+            let (selected_left, selected_right) = if selection.mode == SelectionMode::Block {
+                (
+                    selection.anchor.1.min(selection.active.1),
+                    selection.anchor.1.max(selection.active.1),
+                )
+            } else {
+                (
+                    if document_row == start.0 { start.1 } else { 0 },
+                    if document_row == end.0 {
+                        end.1
+                    } else {
+                        plan.cols.saturating_sub(1)
+                    },
+                )
+            };
+            let (selected_left, selected_right) =
+                Self::wide_atomic_selection_columns(selected_left, selected_right, |column| {
+                    self.projected_plan_cell_flags(planned, column, &mut history_cache)
+                })?;
+
+            if matches!(planned.kind, ProjectedRowKind::CollapsedSummary { .. }) {
+                hard_break_pending = !result.ends_with('\n');
+                continue;
+            }
+            if !matches!(planned.kind, ProjectedRowKind::Raw) {
+                continue;
+            }
+            if hard_break_pending {
+                result.push('\n');
+                hard_break_pending = false;
+            }
+            if planned.raw_slices.is_empty()
+                && planned.row_source.is_some()
+                && selected_left <= selected_right
+            {
+                result.extend(std::iter::repeat_n(
+                    ' ',
+                    selected_right
+                        .min(plan.cols.saturating_sub(1))
+                        .saturating_sub(selected_left)
+                        .saturating_add(1),
+                ));
+            }
+            for slice in &planned.raw_slices {
+                let slice_start = slice.view_col_start;
+                let slice_end = slice_start.checked_add(slice.len)?;
+                let overlap_start = slice_start.max(selected_left);
+                let overlap_end = slice_end.min(selected_right.saturating_add(1));
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                let source_absolute =
+                    self.projection_source_to_absolute(slice.source.absolute_row)?;
+                let source = if source_absolute < self.scrollback.len() {
+                    if history_cache.as_ref().map(|(row, _)| *row) != Some(source_absolute) {
+                        history_cache = Some((
+                            source_absolute,
+                            self.scrollback.get(source_absolute)?.decompress(),
+                        ));
+                    }
+                    history_cache.as_ref()?.1.as_slice()
+                } else {
+                    let grid_row = slice.source.absolute_row;
+                    let grid_row = self
+                        .projection_source_to_absolute(grid_row)?
+                        .checked_sub(self.scrollback.len())?;
+                    if grid_row >= self.grid.rows() {
+                        return None;
+                    }
+                    &self.grid[grid_row]
+                };
+                let source_start = slice
+                    .source
+                    .col_start
+                    .checked_add(overlap_start - slice_start)?;
+                let source_end = source_start.checked_add(overlap_end - overlap_start)?;
+                for cell in source.get(source_start..source_end)? {
+                    if !cell.flags.wide_continuation() {
+                        result.push(cell.character);
+                    }
+                }
+            }
+            if document_row < end.0 && (selection.mode == SelectionMode::Block || !planned.wrapped)
+            {
+                result.push('\n');
+                hard_break_pending = false;
+            }
+        }
+        Some(result)
+    }
+
     pub fn copy_selection(&self) -> Option<String> {
+        if self.projected_selection.is_some() {
+            return self.copy_projected_selection();
+        }
         self.selection.map(|sel| {
             let (start, end) = if sel.anchor <= sel.active {
                 (sel.anchor, sel.active)
@@ -3986,6 +5989,17 @@ impl super::TerminalState {
             return;
         }
 
+        // Reflow and grid resize can keep a RawRowId while changing its cell
+        // geometry or contents. Exact output ownership is therefore sealed
+        // to the dimensions at D; a real resize invalidates both completed
+        // and in-flight provenance. Same-size repaint requests returned above.
+        if !self.finished_output_provenance.is_empty() || !self.finished_output_owners.is_empty() {
+            self.finished_output_provenance.clear();
+            self.finished_output_owners.clear();
+            self.mark_finished_output_provenance_changed();
+        }
+        self.active_output_provenance = None;
+
         // Dimensions and row contents are part of every renderer/search cache
         // key. A resize can happen while the PTY is otherwise idle, so it must
         // invalidate them independently of new parser input.
@@ -4106,6 +6120,46 @@ impl super::TerminalState {
         viewport: &ProjectedViewport,
         display_row: usize,
     ) -> Option<(usize, usize)> {
+        if viewport.is_transformed() {
+            let selection = self.projected_selection?;
+            if self.projected_selection_plan_revision(viewport)? != selection.plan_revision
+                || !matches!(viewport.row_kind(display_row), Some(ProjectedRowKind::Raw))
+            {
+                return None;
+            }
+            let document_row = viewport.view_document_row(display_row)?;
+            let (start, end) = if selection.anchor <= selection.active {
+                (selection.anchor, selection.active)
+            } else {
+                (selection.active, selection.anchor)
+            };
+            if document_row < start.0 || document_row > end.0 {
+                return None;
+            }
+            let (mut left, mut right) = if selection.mode == SelectionMode::Block {
+                (
+                    selection.anchor.1.min(selection.active.1),
+                    selection.anchor.1.max(selection.active.1),
+                )
+            } else {
+                (
+                    if document_row == start.0 { start.1 } else { 0 },
+                    if document_row == end.0 {
+                        end.1
+                    } else {
+                        usize::MAX
+                    },
+                )
+            };
+            let (real_left, real_right) = viewport.real_column_bounds(display_row)?;
+            left = left.max(real_left);
+            right = right.min(real_right);
+            let cells = viewport.cells().get(display_row)?;
+            (left, right) = Self::wide_atomic_selection_columns(left, right, |column| {
+                cells.get(column).map(|cell| cell.flags)
+            })?;
+            return (left <= right).then_some((left, right));
+        }
         self.row_selection_cols_at_absolute(viewport.legacy_absolute_row(display_row))
     }
 
