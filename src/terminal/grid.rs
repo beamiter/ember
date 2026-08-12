@@ -8,6 +8,9 @@ pub struct TerminalGrid {
     rows: usize,
     cols: usize,
     pub row_wrapped: Vec<bool>,
+    /// Stable identity travels with retained physical rows across structural
+    /// moves. `UNTRACKED` is fail-closed after allocator exhaustion.
+    pub(super) row_ids: Vec<RawRowId>,
 }
 
 impl TerminalGrid {
@@ -17,6 +20,7 @@ impl TerminalGrid {
             rows,
             cols,
             row_wrapped: vec![false; rows],
+            row_ids: vec![RawRowId::UNTRACKED; rows],
         }
     }
 
@@ -44,6 +48,14 @@ impl TerminalGrid {
     #[inline]
     pub fn row_len(&self) -> usize {
         self.cols
+    }
+
+    #[inline]
+    pub(super) fn row_id(&self, row: usize) -> RawRowId {
+        self.row_ids
+            .get(row)
+            .copied()
+            .unwrap_or(RawRowId::UNTRACKED)
     }
 
     /// 获取所有行为 `Vec<Vec<_>>`（用于兼容旧代码）。
@@ -114,6 +126,9 @@ impl TerminalGrid {
         let mut new_wrapped = vec![false; new_rows];
         new_wrapped[..copy_rows].copy_from_slice(&self.row_wrapped[..copy_rows]);
         self.row_wrapped = new_wrapped;
+        let mut new_row_ids = vec![RawRowId::UNTRACKED; new_rows];
+        new_row_ids[..copy_rows].copy_from_slice(&self.row_ids[..copy_rows]);
+        self.row_ids = new_row_ids;
         self.rows = new_rows;
         self.cols = new_cols;
     }
@@ -129,6 +144,7 @@ impl TerminalGrid {
             for w in self.row_wrapped.iter_mut() {
                 *w = false;
             }
+            self.row_ids.fill(RawRowId::UNTRACKED);
             return;
         }
         let cols = self.cols;
@@ -139,6 +155,8 @@ impl TerminalGrid {
         for w in self.row_wrapped[self.rows - n..].iter_mut() {
             *w = false;
         }
+        self.row_ids.copy_within(n.., 0);
+        self.row_ids[self.rows - n..].fill(RawRowId::UNTRACKED);
     }
 
     /// 获取mut访问所有行
@@ -374,6 +392,32 @@ impl StyleFlags {
     }
 }
 
+/// Stable identity of one retained physical raw row. Zero means the row is
+/// deliberately untracked (allocator exhausted); it never aliases a real id.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RawRowId(u64);
+
+impl RawRowId {
+    pub const UNTRACKED: Self = Self(0);
+
+    #[allow(dead_code)] // Public library accessor; binary keeps the id opaque.
+    pub const fn get(self) -> Option<u64> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(self.0)
+        }
+    }
+
+    pub const fn is_tracked(self) -> bool {
+        self.0 != 0
+    }
+
+    pub(super) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScrollbackLine {
     data: CompressedLineData,
@@ -384,6 +428,7 @@ pub struct ScrollbackLine {
     /// the line is compressed lets viewport reflow count rows without first
     /// allocating and decoding every line in the scrollback tail.
     reflow_content_len: u16,
+    raw_row_id: RawRowId,
 }
 
 #[derive(Clone, Debug)]
@@ -435,6 +480,7 @@ impl ScrollbackLine {
                 is_wrapped,
                 cols,
                 reflow_content_len,
+                raw_row_id: RawRowId::UNTRACKED,
             }
         } else {
             let encoded = Self::encode_cells(&cells[..active_len]);
@@ -443,6 +489,7 @@ impl ScrollbackLine {
                 is_wrapped,
                 cols,
                 reflow_content_len,
+                raw_row_id: RawRowId::UNTRACKED,
             }
         }
     }
@@ -450,6 +497,16 @@ impl ScrollbackLine {
     #[inline]
     pub(super) fn reflow_content_len(&self) -> usize {
         self.reflow_content_len as usize
+    }
+
+    #[inline]
+    pub fn raw_row_id(&self) -> RawRowId {
+        self.raw_row_id
+    }
+
+    #[inline]
+    pub(super) fn set_raw_row_id(&mut self, id: RawRowId) {
+        self.raw_row_id = id;
     }
 
     pub fn decompress(&self) -> Vec<TerminalCell> {

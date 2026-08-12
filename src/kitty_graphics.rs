@@ -88,6 +88,7 @@ pub struct KittyPlacement {
 }
 
 impl KittyPlacement {
+    #[allow(dead_code)] // Legacy public entrypoint; renderer now uses ProjectedViewport.
     pub fn viewport_row(&self, scroll_offset: usize) -> i64 {
         self.y
             .saturating_add(i64::try_from(scroll_offset).unwrap_or(i64::MAX))

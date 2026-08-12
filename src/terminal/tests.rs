@@ -1,7 +1,8 @@
 use super::hyperlink::{MAX_OSC8_PARAMS_BYTES, MAX_OSC8_URI_BYTES};
 use super::{
-    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, ExtractedText, HyperlinkId,
-    ScrollbackLine, TerminalCell, TerminalState, UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES,
+    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, DisplayPoint, ExtractedText,
+    HistoryProjection, HyperlinkId, RawCellAnchor, RawRowId, ScrollbackLine, TerminalCell,
+    TerminalState, UnderlineStyle, MAX_CAPTURED_COMMAND_OUTPUT_BYTES,
     MAX_COMPLETED_COMMAND_OUTPUT_BYTES, MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES,
     MAX_PENDING_ESCAPE,
 };
@@ -751,6 +752,493 @@ fn streamed_scrollback_reflow_matches_legacy_results_across_offsets_and_resize()
             &format!("streamed reflow after resize at offset {offset}"),
         );
     }
+}
+
+#[test]
+fn identity_projection_reuses_visible_cells_and_versions_only_its_metadata() {
+    let mut terminal = TerminalState::new(5, 2);
+    terminal.process_input(b"hello");
+    let legacy = terminal.get_visible_cells();
+
+    let first = terminal.projected_viewport(HistoryProjection::identity(), true);
+    assert!(std::sync::Arc::ptr_eq(&legacy, &first.cells_arc()));
+    assert!(!first.key().is_bypass());
+    assert_eq!(first.cells()[0][0].character, 'h');
+    assert_eq!(first.cursor(), DisplayPoint::new(0, 4));
+
+    let cached = terminal.projected_viewport(HistoryProjection::identity(), true);
+    assert_eq!(cached.key(), first.key());
+    assert!(std::sync::Arc::ptr_eq(
+        &first.cells_arc(),
+        &cached.cells_arc()
+    ));
+
+    let revised = terminal.projected_viewport(HistoryProjection::identity_at_revision(7), true);
+    assert_ne!(revised.key(), first.key());
+    assert_eq!(revised.key().projection_revision, 7);
+    assert!(std::sync::Arc::ptr_eq(
+        &first.cells_arc(),
+        &revised.cells_arc()
+    ));
+
+    let bypass = terminal.projected_viewport(HistoryProjection::identity(), false);
+    assert!(bypass.key().is_bypass());
+    assert_cell_grids_equal(bypass.cells(), legacy.as_ref(), "block-off bypass");
+}
+
+#[test]
+fn identity_projection_live_origins_round_trip_each_physical_wide_cell() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input("点x".as_bytes());
+    let row_id = terminal.grid.row_id(0);
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+
+    for column in 0..3 {
+        let display = DisplayPoint::new(0, column);
+        let raw = viewport
+            .raw_anchor_at(display)
+            .expect("live grid cell should have an origin");
+        assert_eq!(raw, RawCellAnchor { row_id, column });
+        assert_eq!(viewport.display_point_for(raw), Some(display));
+    }
+    assert!(viewport.cells()[0][1].flags.wide_continuation());
+    assert_eq!(
+        viewport.raw_anchor_at(DisplayPoint::new(0, 1)),
+        Some(RawCellAnchor { row_id, column: 1 })
+    );
+}
+
+#[test]
+fn identity_projection_reflow_preserves_raw_origins_and_rejects_padding() {
+    fn line(text: &str, cols: usize, wrapped: bool) -> ScrollbackLine {
+        let mut cells = vec![TerminalCell::default(); cols];
+        for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+            cell.character = ch;
+        }
+        ScrollbackLine::compress(&cells, wrapped)
+    }
+
+    let mut terminal = TerminalState::new(3, 3);
+    terminal.push_scrollback_compressed(line("abc", 4, true));
+    terminal.push_scrollback_compressed(line("de", 4, false));
+    let first_id = terminal.scrollback[0].raw_row_id();
+    let second_id = terminal.scrollback[1].raw_row_id();
+    let live_id = terminal.grid.row_id(0);
+    terminal.scroll_offset = 2;
+
+    let legacy = terminal.get_visible_cells();
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+    assert_cell_grids_equal(viewport.cells(), legacy.as_ref(), "historical identity");
+    assert_eq!(
+        viewport.cells()[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>(),
+        "abc"
+    );
+    assert_eq!(
+        viewport.cells()[1]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>(),
+        "de "
+    );
+
+    for column in 0..3 {
+        let display = DisplayPoint::new(0, column);
+        let raw = RawCellAnchor {
+            row_id: first_id,
+            column,
+        };
+        assert_eq!(viewport.raw_anchor_at(display), Some(raw));
+        assert_eq!(viewport.display_point_for(raw), Some(display));
+    }
+    for column in 0..2 {
+        let display = DisplayPoint::new(1, column);
+        let raw = RawCellAnchor {
+            row_id: second_id,
+            column,
+        };
+        assert_eq!(viewport.raw_anchor_at(display), Some(raw));
+        assert_eq!(viewport.display_point_for(raw), Some(display));
+    }
+    assert_eq!(viewport.raw_anchor_at(DisplayPoint::new(1, 2)), None);
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: second_id,
+            column: 2
+        }),
+        None
+    );
+
+    // The live-grid row appended after historical materialization keeps its
+    // primary raw id and all of its physical blank cells are real, not padding.
+    assert_eq!(
+        viewport.raw_anchor_at(DisplayPoint::new(2, 2)),
+        Some(RawCellAnchor {
+            row_id: live_id,
+            column: 2
+        })
+    );
+}
+
+#[test]
+fn identity_projection_matches_legacy_and_round_trips_across_widths_and_offsets() {
+    fn line(text: &str, cols: usize, wrapped: bool) -> ScrollbackLine {
+        let mut cells = vec![TerminalCell::default(); cols];
+        for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+            cell.character = ch;
+        }
+        ScrollbackLine::compress(&cells, wrapped)
+    }
+
+    for width in [2, 3, 5, 8] {
+        let mut terminal = TerminalState::new(6, 4);
+        terminal.push_scrollback_compressed(line("abcdef", 6, true));
+        terminal.push_scrollback_compressed(line("ghi", 6, false));
+        terminal.push_scrollback_compressed(line("jklmno", 6, true));
+        terminal.push_scrollback_compressed(line("pq", 6, false));
+        terminal.on_resize(width, 4);
+
+        for offset in 0..=terminal.scrollback.len() {
+            terminal.scroll_offset = offset;
+            let legacy = terminal.get_visible_cells();
+            let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+            assert_cell_grids_equal(
+                viewport.cells(),
+                legacy.as_ref(),
+                &format!("identity width={width} offset={offset}"),
+            );
+
+            for row in 0..viewport.rows() {
+                for column in 0..viewport.columns() {
+                    let display = DisplayPoint::new(row, column);
+                    if let Some(raw) = viewport.raw_anchor_at(display) {
+                        assert_eq!(
+                            viewport.display_point_for(raw),
+                            Some(display),
+                            "origin roundtrip width={width} offset={offset} at {row}:{column}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn identity_projection_alt_screen_bypasses_semantics_and_maps_only_active_origins() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"primary");
+    let primary_id = terminal.grid.row_id(0);
+    terminal.process_input(b"\x1b[?1049hALT");
+    let alt_id = terminal.grid.row_id(0);
+
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+    assert!(viewport.key().is_bypass());
+    assert_eq!(viewport.cells()[0][0].character, 'A');
+    assert_eq!(
+        viewport.raw_anchor_at(DisplayPoint::new(0, 0)),
+        Some(RawCellAnchor {
+            row_id: alt_id,
+            column: 0
+        })
+    );
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: alt_id,
+            column: 0
+        }),
+        Some(DisplayPoint::new(0, 0))
+    );
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: primary_id,
+            column: 0
+        }),
+        None
+    );
+}
+
+#[test]
+fn projected_viewport_cache_invalidates_on_scrollback_only_mutation() {
+    let mut terminal = TerminalState::new(3, 2);
+    let mut row = vec![TerminalCell::default(); 3];
+    row[0].character = 'A';
+    terminal.push_scrollback_compressed(ScrollbackLine::compress(&row, false));
+    terminal.scroll_offset = 1;
+    let before = terminal.projected_viewport(HistoryProjection::identity(), true);
+    let grid_version = terminal.grid_version;
+
+    row[0].character = 'B';
+    terminal.push_scrollback_compressed(ScrollbackLine::compress(&row, false));
+    assert_eq!(terminal.grid_version, grid_version);
+    let after = terminal.projected_viewport(HistoryProjection::identity(), true);
+
+    assert_ne!(before.key(), after.key());
+    assert!(!std::sync::Arc::ptr_eq(
+        &before.cells_arc(),
+        &after.cells_arc()
+    ));
+    assert_eq!(after.cells()[0][0].character, 'B');
+}
+
+#[test]
+fn projected_selection_entrypoints_match_legacy_geometry_and_copy_bytes() {
+    fn populated() -> TerminalState {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.scroll(1);
+        terminal
+    }
+
+    let mut legacy = populated();
+    legacy.start_selection((0, 1));
+    legacy.update_selection((2, 3));
+
+    let mut projected = populated();
+    let viewport = projected.projected_viewport(HistoryProjection::identity(), true);
+    projected.start_selection_projected(&viewport, (0, 1));
+    projected.update_selection_projected(&viewport, (2, 3));
+
+    assert_eq!(projected.selection, legacy.selection);
+    assert_eq!(projected.copy_selection(), legacy.copy_selection());
+    for row in 0..viewport.rows() {
+        assert_eq!(
+            projected.row_selection_cols_projected(&viewport, row),
+            legacy.row_selection_cols(row),
+            "selection highlight row {row}"
+        );
+    }
+
+    let mut legacy_word = populated();
+    legacy_word.select_word_at(1, 1);
+    let mut projected_word = populated();
+    let word_view = projected_word.projected_viewport(HistoryProjection::identity(), true);
+    projected_word.select_word_at_projected(&word_view, 1, 1);
+    assert_eq!(projected_word.selection, legacy_word.selection);
+    assert_eq!(
+        projected_word.copy_selection(),
+        legacy_word.copy_selection()
+    );
+
+    let mut legacy_line = populated();
+    legacy_line.select_line_at(1);
+    let mut projected_line = populated();
+    let line_view = projected_line.projected_viewport(HistoryProjection::identity(), true);
+    projected_line.select_line_at_projected(&line_view, 1);
+    assert_eq!(projected_line.selection, legacy_line.selection);
+    assert_eq!(
+        projected_line.copy_selection(),
+        legacy_line.copy_selection()
+    );
+}
+
+#[test]
+fn projected_legacy_metrics_preserve_mouse_scrollbar_cursor_and_kitty_coordinates() {
+    let mut terminal = TerminalState::new(5, 3);
+    terminal.process_input(b"zero\r\none\r\ntwo\r\nthree");
+    terminal.scroll(1);
+    let cursor = terminal.get_cursor_pos();
+    let history_len = terminal.scrollback_len();
+    let scroll_offset = terminal.scroll_offset;
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+
+    assert_eq!(viewport.cursor(), DisplayPoint::new(cursor.0, cursor.1));
+    assert_eq!(viewport.history_len(), history_len);
+    assert_eq!(viewport.scroll_offset(), scroll_offset);
+    assert_eq!(viewport.total_lines(), history_len + viewport.rows());
+    assert_eq!(
+        viewport.application_cell(DisplayPoint::new(2, 4)),
+        Some((2, 4))
+    );
+    assert_eq!(viewport.application_cell(DisplayPoint::new(3, 0)), None);
+    assert_eq!(viewport.kitty_viewport_row(-1), -1 + scroll_offset as i64);
+}
+
+#[test]
+fn raw_row_identity_follows_local_scroll_moves_and_drops_removed_rows() {
+    let mut terminal = TerminalState::new(4, 4);
+    let original: Vec<_> = (0..4).map(|row| terminal.grid.row_id(row)).collect();
+
+    terminal.scroll_region_up(1, 3);
+    assert_eq!(terminal.grid.row_id(0), original[0]);
+    assert_eq!(terminal.grid.row_id(1), original[2]);
+    assert_eq!(terminal.grid.row_id(2), original[3]);
+    let fresh_bottom = terminal.grid.row_id(3);
+    assert!(!original.contains(&fresh_bottom));
+
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: original[2],
+            column: 0,
+        }),
+        Some(DisplayPoint::new(1, 0))
+    );
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: original[1],
+            column: 0,
+        }),
+        None
+    );
+
+    terminal.scroll_region_down(1, 3);
+    assert_eq!(terminal.grid.row_id(2), original[2]);
+    assert_eq!(terminal.grid.row_id(3), original[3]);
+    let fresh_top = terminal.grid.row_id(1);
+    assert!(!original.contains(&fresh_top));
+    assert_ne!(fresh_top, fresh_bottom);
+
+    // Display order is now [old0, fresh-high-id, old2, old3], so reverse
+    // lookup must use the separately raw-sorted index rather than assuming
+    // monotonic allocation implies monotonic display order.
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+    for (row, row_id) in [original[0], fresh_top, original[2], original[3]]
+        .into_iter()
+        .enumerate()
+    {
+        let display = DisplayPoint::new(row, 0);
+        let raw = RawCellAnchor { row_id, column: 0 };
+        assert_eq!(viewport.raw_anchor_at(display), Some(raw));
+        assert_eq!(viewport.display_point_for(raw), Some(display));
+    }
+}
+
+#[test]
+fn raw_row_identity_tracks_csi_insert_and_delete_lines() {
+    let mut insert = TerminalState::new(4, 4);
+    let original: Vec<_> = (0..4).map(|row| insert.grid.row_id(row)).collect();
+    insert.process_input(b"\x1b[2;1H\x1b[2L");
+    assert_eq!(insert.grid.row_id(0), original[0]);
+    assert_eq!(insert.grid.row_id(3), original[1]);
+    assert!(!original.contains(&insert.grid.row_id(1)));
+    assert!(!original.contains(&insert.grid.row_id(2)));
+    assert_ne!(insert.grid.row_id(1), insert.grid.row_id(2));
+
+    let mut delete = TerminalState::new(4, 4);
+    let original: Vec<_> = (0..4).map(|row| delete.grid.row_id(row)).collect();
+    delete.process_input(b"\x1b[2;1H\x1b[2M");
+    assert_eq!(delete.grid.row_id(0), original[0]);
+    assert_eq!(delete.grid.row_id(1), original[3]);
+    assert!(!original.contains(&delete.grid.row_id(2)));
+    assert!(!original.contains(&delete.grid.row_id(3)));
+    assert_ne!(delete.grid.row_id(2), delete.grid.row_id(3));
+}
+
+#[test]
+fn full_scroll_transfers_identity_but_archive_snapshot_duplicates_it() {
+    let mut terminal = TerminalState::new(6, 3);
+    terminal.grid[0][0].character = 'A';
+    terminal.grid[1][0].character = 'B';
+    let first = terminal.grid.row_id(0);
+    let second = terminal.grid.row_id(1);
+    terminal.cursor_row = 2;
+    terminal.scroll_region_up(0, 2);
+
+    assert_eq!(terminal.scrollback.back().unwrap().raw_row_id(), first);
+    assert_eq!(terminal.grid.row_id(0), second);
+    assert!(!terminal.grid.row_id(2).is_tracked() || terminal.grid.row_id(2) != first);
+
+    let live_source = terminal.grid.row_id(0);
+    terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+    let snapshot = terminal.scrollback.back().unwrap().raw_row_id();
+    assert!(snapshot.is_tracked());
+    assert_ne!(snapshot, live_source);
+    assert_eq!(terminal.grid.row_id(0), live_source);
+}
+
+#[test]
+fn resize_retains_surviving_row_ids_and_allocates_only_new_rows() {
+    let mut terminal = TerminalState::new(4, 2);
+    let retained: Vec<_> = (0..2).map(|row| terminal.grid.row_id(row)).collect();
+    terminal.on_resize(7, 4);
+
+    assert_eq!(terminal.grid.row_id(0), retained[0]);
+    assert_eq!(terminal.grid.row_id(1), retained[1]);
+    assert!(!retained.contains(&terminal.grid.row_id(2)));
+    assert!(!retained.contains(&terminal.grid.row_id(3)));
+    assert_ne!(terminal.grid.row_id(2), terminal.grid.row_id(3));
+
+    let dropped = terminal.grid.row_id(3);
+    terminal.cursor_row = 0;
+    terminal.on_resize(7, 3);
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: dropped,
+            column: 0,
+        }),
+        None
+    );
+}
+
+#[test]
+fn alternate_screen_swap_preserves_each_grids_row_identity() {
+    let mut terminal = TerminalState::new(4, 2);
+    let primary: Vec<_> = (0..2).map(|row| terminal.grid.row_id(row)).collect();
+    let hidden_alt: Vec<_> = (0..2).map(|row| terminal.alt_grid.row_id(row)).collect();
+
+    terminal.process_input(b"\x1b[?1049h");
+    assert_eq!(terminal.grid.row_ids, hidden_alt);
+    terminal.process_input(b"\x1b[?1049l");
+    assert_eq!(terminal.grid.row_ids, primary);
+}
+
+#[test]
+fn projection_key_distinguishes_primary_and_alt_even_when_both_bypass() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"primary");
+    let primary = terminal.projected_viewport(HistoryProjection::identity(), false);
+    assert!(!primary.key().alt_screen);
+
+    terminal.process_input(b"\x1b[?47hALT");
+    let alternate = terminal.projected_viewport(HistoryProjection::identity(), false);
+    assert!(alternate.key().alt_screen);
+    assert_ne!(alternate.key(), primary.key());
+    assert!(!std::sync::Arc::ptr_eq(
+        &alternate.cells_arc(),
+        &primary.cells_arc()
+    ));
+
+    terminal.process_input(b"\x1b[?47l");
+    let restored = terminal.projected_viewport(HistoryProjection::identity(), false);
+    assert!(!restored.key().alt_screen);
+    assert_ne!(restored.key(), primary.key());
+    assert_eq!(restored.cells()[0][0].character, 'p');
+}
+
+#[test]
+fn raw_row_allocator_exhaustion_never_reuses_zero_or_a_prior_id() {
+    let mut terminal = TerminalState::new(2, 2);
+    terminal.next_raw_row_id = u64::MAX;
+
+    let last = terminal.fresh_raw_row_id();
+    let exhausted = terminal.fresh_raw_row_id();
+    let still_exhausted = terminal.fresh_raw_row_id();
+
+    assert_eq!(last.get(), Some(u64::MAX));
+    assert_eq!(exhausted, RawRowId::UNTRACKED);
+    assert_eq!(still_exhausted, RawRowId::UNTRACKED);
+    assert_eq!(terminal.next_raw_row_id, 0);
+}
+
+#[test]
+fn hard_reset_does_not_retarget_origins_into_replacement_rows() {
+    let mut terminal = TerminalState::new(3, 2);
+    let stale = terminal.grid.row_id(0);
+    terminal.hard_reset();
+    let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+
+    assert_ne!(terminal.grid.row_id(0), stale);
+    assert_eq!(
+        viewport.display_point_for(RawCellAnchor {
+            row_id: stale,
+            column: 0,
+        }),
+        None
+    );
 }
 
 #[test]

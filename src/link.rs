@@ -466,7 +466,7 @@ fn expand_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::TerminalState;
+    use crate::terminal::{HistoryProjection, TerminalState};
 
     #[test]
     fn osc8_masked_label_resolves_to_real_target() {
@@ -475,13 +475,12 @@ mod tests {
         terminal.process_input(
             format!("\x1b]8;id=masked;{TARGET}\x1b\\click here\x1b]8;;\x1b\\").as_bytes(),
         );
-        let cells = terminal.get_visible_cells();
-        let wrapped = terminal.get_visible_row_wrapped();
+        let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
         let detector = LinkDetector::new(LinkDetectionConfig::default());
 
         let links = detector.detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-            &cells,
-            &wrapped,
+            viewport.cells(),
+            viewport.row_wrapped(),
             |id| terminal.hyperlink_uri(id).map(str::to_owned),
         );
 
@@ -500,13 +499,12 @@ mod tests {
         terminal.process_input(
             format!("\x1b]8;;{TARGET}\x1b\\https://decoy.example\x1b]8;;\x1b\\").as_bytes(),
         );
-        let cells = terminal.get_visible_cells();
-        let wrapped = terminal.get_visible_row_wrapped();
+        let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
         let detector = LinkDetector::new(LinkDetectionConfig::default());
 
         let links = detector.detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
-            &cells,
-            &wrapped,
+            viewport.cells(),
+            viewport.row_wrapped(),
             |id| terminal.hyperlink_uri(id).map(str::to_owned),
         );
 

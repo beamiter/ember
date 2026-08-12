@@ -211,6 +211,8 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
 mod grid;
 mod hyperlink;
 mod parser;
+#[allow(dead_code)] // Public in the library; the binary mirrors modules privately.
+mod projection;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -218,6 +220,10 @@ mod tests;
 pub use grid::*;
 pub(crate) use hyperlink::is_supported_hyperlink_uri;
 pub use hyperlink::HyperlinkId;
+pub use projection::{
+    DisplayPoint, HistoryProjection, ProjectedViewport, ProjectionCacheKey, ProjectionLayoutKey,
+    RawCellAnchor,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMode {
@@ -428,6 +434,10 @@ pub struct TerminalState {
 
     // Cached visible cells to avoid per-frame cloning
     visible_cells_cache: Option<VisibleCellsCache>,
+    /// Projection metadata is versioned independently from the terminal grid.
+    /// P0 is an identity projection over `visible_cells_cache`, so the cell
+    /// allocation is shared and only the stable-origin index is cached here.
+    projected_viewport_cache: Option<ProjectedViewport>,
     /// Cached answer for whether raw buffer coordinates exactly match the
     /// lazily reflowed viewport. Interior mutability keeps per-match lookup
     /// O(1) while the first lookup for a new viewport performs one scan.
@@ -464,6 +474,14 @@ pub struct TerminalState {
     /// translate a stable `line_id` back to a current scrollback index even
     /// after old lines have been evicted.
     pub total_lines_scrolled: u64,
+
+    /// Checked monotonic allocator for projection-only physical row identity.
+    /// Zero is the exhausted sentinel and is never emitted as a tracked id.
+    next_raw_row_id: u64,
+    /// Independent generation for row moves/fresh-row creation. This is part
+    /// of `ProjectionCacheKey` even when PTY cell bytes did not otherwise bump
+    /// the terminal grid version.
+    row_identity_revision: u64,
 
     /// OSC 133 command boundaries recorded by FinalTerm-aware shells. FIFO,
     /// capped at `MAX_COMMAND_MARKS`. Marks pointing to lines that have been

@@ -486,6 +486,12 @@ TerminalState + parser ── dirty rows / snapshots ──► TerminalRenderer
 TerminalApp coordinates tabs, panes, input, search, config and persistence.
 ```
 
+`HistoryProjection` is currently a P0 identity boundary around the existing
+visible-grid materialization. It shares the legacy cell allocation, adds a
+separately versioned cache key and fail-closed raw/display cell origins, and
+routes renderer consumers without changing bytes or geometry. This foundation
+does **not** implement history Collapse, Filter or Delete.
+
 Important modules:
 
 - `src/terminal/` — grid, parser, modes, selection and scrollback

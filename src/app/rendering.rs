@@ -633,24 +633,20 @@ impl TerminalApp {
                     }
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
                     // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
-                    let grid_version = terminal_guard.get_grid_version();
-                    let scroll_offset = terminal_guard.scroll_offset;
                     let renderer = &mut self.pane_renderers[pane_idx];
-                    if grid_version != renderer.cached_links_grid_version
-                        || scroll_offset != renderer.cached_links_scroll_offset
+                    let viewport = renderer.projected_viewport(&mut terminal_guard);
+                    let projection_key = viewport.key();
+                    if renderer.cached_links_projection_key != Some(projection_key)
                         || terminal_ptr != renderer.cached_links_terminal_ptr
                     {
-                        let visible_cells = terminal_guard.get_visible_cells();
-                        let row_wrapped = terminal_guard.get_visible_row_wrapped();
                         renderer.cached_links = std::sync::Arc::new(
                             self.link_detector
                                 .detect_links_in_visible_cells_with_wrapping(
-                                    &visible_cells,
-                                    &row_wrapped,
+                                    viewport.cells(),
+                                    viewport.row_wrapped(),
                                 ),
                         );
-                        renderer.cached_links_grid_version = grid_version;
-                        renderer.cached_links_scroll_offset = scroll_offset;
+                        renderer.cached_links_projection_key = Some(projection_key);
                         renderer.cached_links_terminal_ptr = terminal_ptr;
                     }
                     // O(1) clone Arc,规避 &mut renderer 与 &renderer.cached_links 借用冲突。
@@ -857,20 +853,19 @@ impl TerminalApp {
                 let mut terminal_guard = session.terminal.lock();
 
                 // 获取链接列表用于渲染（使用缓存）
-                let grid_version = terminal_guard.get_grid_version();
-                let scroll_offset = terminal_guard.scroll_offset;
+                let viewport = self.renderer.projected_viewport(&mut terminal_guard);
+                let projection_key = viewport.key();
 
-                if grid_version != self.cached_links_grid_version
-                    || scroll_offset != self.cached_links_scroll_offset
+                if self.cached_links_projection_key != Some(projection_key)
                     || terminal_ptr != self.cached_links_terminal_ptr
                 {
-                    let visible_cells = terminal_guard.get_visible_cells();
-                    let row_wrapped = terminal_guard.get_visible_row_wrapped();
                     self.cached_links = self
                         .link_detector
-                        .detect_links_in_visible_cells_with_wrapping(&visible_cells, &row_wrapped);
-                    self.cached_links_grid_version = grid_version;
-                    self.cached_links_scroll_offset = scroll_offset;
+                        .detect_links_in_visible_cells_with_wrapping(
+                            viewport.cells(),
+                            viewport.row_wrapped(),
+                        );
+                    self.cached_links_projection_key = Some(projection_key);
                     self.cached_links_terminal_ptr = terminal_ptr;
                 }
                 self.renderer.render(

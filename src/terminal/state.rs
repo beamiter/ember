@@ -2,6 +2,15 @@ use super::*;
 
 const OUTPUT_TRUNCATION_MARKER: &str = "\n… output truncated …\n";
 
+fn allocate_raw_row_id_from(next: &mut u64) -> RawRowId {
+    if *next == 0 {
+        return RawRowId::UNTRACKED;
+    }
+    let id = RawRowId::new(*next);
+    *next = next.checked_add(1).unwrap_or(0);
+    id
+}
+
 /// Whether a cell is styled the way shells paint an inline suggestion.
 ///
 /// There is no protocol for "this text is a preview", only a convention, and
@@ -235,8 +244,12 @@ impl super::TerminalState {
 
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-        let grid = TerminalGrid::new(rows, cols);
-        let alt_grid = TerminalGrid::new(rows, cols);
+        let mut grid = TerminalGrid::new(rows, cols);
+        let mut alt_grid = TerminalGrid::new(rows, cols);
+        let mut next_raw_row_id = 1u64;
+        for id in grid.row_ids.iter_mut().chain(alt_grid.row_ids.iter_mut()) {
+            *id = allocate_raw_row_id_from(&mut next_raw_row_id);
+        }
 
         let mut modes = TerminalModes::default();
         modes.insert(25);
@@ -307,6 +320,7 @@ impl super::TerminalState {
             // This ensures dirty tracking works correctly even with scrollback
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
+            projected_viewport_cache: None,
             viewport_mapping_exact_cache: std::cell::Cell::new(None),
             hyperlinks: hyperlink::HyperlinkTable::default(),
             current_hyperlink: HyperlinkId::NONE,
@@ -322,6 +336,8 @@ impl super::TerminalState {
             dynamic_palette: [None; 256],
             pending_notifications: Vec::new(),
             total_lines_scrolled: 0,
+            next_raw_row_id,
+            row_identity_revision: 1,
             command_marks: VecDeque::new(),
             command_records: VecDeque::new(),
             next_command_sequence: 1,
@@ -1058,21 +1074,101 @@ impl super::TerminalState {
         }
     }
 
+    #[allow(dead_code)] // Test/internal copy entrypoint; production uses options explicitly.
     pub(super) fn push_scrollback_compressed(&mut self, line: ScrollbackLine) {
         self.push_scrollback_compressed_with_options(line, false);
+    }
+
+    pub(super) fn fresh_raw_row_id(&mut self) -> RawRowId {
+        allocate_raw_row_id_from(&mut self.next_raw_row_id)
+    }
+
+    pub(super) fn mark_row_identity_changed(&mut self) {
+        self.row_identity_revision = self.row_identity_revision.wrapping_add(1);
+        self.visible_cells_cache = None;
+        self.projected_viewport_cache = None;
+    }
+
+    fn fill_untracked_grid_row_ids(&mut self) {
+        for row in 0..self.grid.rows() {
+            if !self.grid.row_id(row).is_tracked() {
+                let id = self.fresh_raw_row_id();
+                self.grid.row_ids[row] = id;
+            }
+        }
+        for row in 0..self.alt_grid.rows() {
+            if !self.alt_grid.row_id(row).is_tracked() {
+                let id = self.fresh_raw_row_id();
+                self.alt_grid.row_ids[row] = id;
+            }
+        }
+    }
+
+    pub(super) fn shift_row_id_region_down(&mut self, top: usize, bottom: usize, count: usize) {
+        if top > bottom || bottom >= self.grid.rows() || count == 0 {
+            return;
+        }
+        let count = count.min(bottom - top + 1);
+        if count < bottom - top + 1 {
+            self.grid
+                .row_ids
+                .copy_within(top..=bottom - count, top + count);
+        }
+        for row in top..top + count {
+            let id = self.fresh_raw_row_id();
+            self.grid.row_ids[row] = id;
+        }
+        self.mark_row_identity_changed();
+    }
+
+    pub(super) fn shift_row_id_region_up(&mut self, top: usize, bottom: usize, count: usize) {
+        if top > bottom || bottom >= self.grid.rows() || count == 0 {
+            return;
+        }
+        let count = count.min(bottom - top + 1);
+        if count < bottom - top + 1 {
+            self.grid.row_ids.copy_within(top + count..=bottom, top);
+        }
+        for row in bottom + 1 - count..=bottom {
+            let id = self.fresh_raw_row_id();
+            self.grid.row_ids[row] = id;
+        }
+        self.mark_row_identity_changed();
     }
 
     #[inline]
     pub(super) fn invalidate_scrollback_view_cache(&mut self) {
         self.visible_cells_cache = None;
+        self.projected_viewport_cache = None;
         self.viewport_mapping_exact_cache.set(None);
     }
 
     pub(super) fn push_scrollback_compressed_with_options(
         &mut self,
+        mut line: ScrollbackLine,
+        allow_alt_buffer: bool,
+    ) {
+        if self.use_alt_buffer && !allow_alt_buffer {
+            return;
+        }
+        // Archival/snapshot callers copy a row rather than move it. Always
+        // allocate a distinct identity so the same origin cannot resolve at
+        // both the snapshot and its still-live source.
+        line.set_raw_row_id(self.fresh_raw_row_id());
+        self.push_scrollback_line(line, allow_alt_buffer);
+    }
+
+    fn push_scrollback_transferred_with_options(
+        &mut self,
         line: ScrollbackLine,
         allow_alt_buffer: bool,
     ) {
+        // A real top-margin scroll moves the physical row into scrollback;
+        // preserve even UNTRACKED so allocator exhaustion stays fail-closed.
+        self.push_scrollback_line(line, allow_alt_buffer);
+    }
+
+    fn push_scrollback_line(&mut self, line: ScrollbackLine, allow_alt_buffer: bool) {
         if self.use_alt_buffer && !allow_alt_buffer {
             return;
         }
@@ -1081,6 +1177,7 @@ impl super::TerminalState {
         }
         self.scrollback.push_back(line);
         self.total_lines_scrolled = self.total_lines_scrolled.saturating_add(1);
+        self.mark_row_identity_changed();
         self.invalidate_scrollback_view_cache();
     }
 
@@ -1099,6 +1196,7 @@ impl super::TerminalState {
         self.grid.cells[src_start..src_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top..bottom, top + 1);
         self.grid.row_wrapped[top] = false;
+        self.shift_row_id_region_down(top, bottom, 1);
         self.kitty_graphics.scroll_region_down(top, bottom, 1);
         self.dirty_region.mark_rows(top, bottom);
         self.mark_rows_dirty(top, bottom);
@@ -1119,15 +1217,15 @@ impl super::TerminalState {
         // Compress the removed line directly from the grid slice before mutating,
         // avoiding a per-line Vec allocation from get_row.
         let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
-        let scrollback_line =
-            if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
-                Some(ScrollbackLine::compress(
-                    &self.grid[top],
-                    self.grid.row_wrapped[top],
-                ))
-            } else {
-                None
-            };
+        let scrollback_line = if scrolls_off_screen_top
+            && (!self.use_alt_buffer || allow_alt_scrollback)
+        {
+            let mut line = ScrollbackLine::compress(&self.grid[top], self.grid.row_wrapped[top]);
+            line.set_raw_row_id(self.grid.row_id(top));
+            Some(line)
+        } else {
+            None
+        };
 
         let src_start = (top + 1) * cols;
         let src_end = (bottom + 1) * cols;
@@ -1139,6 +1237,7 @@ impl super::TerminalState {
         self.grid.cells[blank_start..blank_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
         self.grid.row_wrapped[bottom] = false;
+        self.shift_row_id_region_up(top, bottom, 1);
         self.kitty_graphics.scroll_region_up(
             top,
             bottom,
@@ -1150,7 +1249,7 @@ impl super::TerminalState {
         self.mark_rows_dirty(top, bottom);
 
         if let Some(line) = scrollback_line {
-            self.push_scrollback_compressed_with_options(line, allow_alt_scrollback);
+            self.push_scrollback_transferred_with_options(line, allow_alt_scrollback);
         }
     }
 
@@ -1353,7 +1452,17 @@ impl super::TerminalState {
         let rows = self.grid.rows();
         let max_scrollback = self.max_scrollback;
         let cell_size = self.kitty_graphics.cell_size_pixels();
+        let next_raw_row_id = self.next_raw_row_id;
+        let row_identity_revision = self.row_identity_revision;
         *self = Self::new(cols, rows);
+        // A reset replaces every physical row but must never restart the
+        // allocator and let an old external origin retarget into the new grid.
+        self.next_raw_row_id = next_raw_row_id;
+        self.row_identity_revision = row_identity_revision;
+        self.grid.row_ids.fill(RawRowId::UNTRACKED);
+        self.alt_grid.row_ids.fill(RawRowId::UNTRACKED);
+        self.fill_untracked_grid_row_ids();
+        self.mark_row_identity_changed();
         self.set_max_scrollback(max_scrollback);
         self.kitty_graphics
             .set_cell_size_pixels(cell_size.0, cell_size.1);
@@ -2927,6 +3036,201 @@ impl super::TerminalState {
         arc
     }
 
+    fn append_projected_origin_span(
+        origins: &mut Vec<super::projection::OriginSpan>,
+        display_start: DisplayPoint,
+        raw_start: RawCellAnchor,
+        len: usize,
+    ) {
+        if len == 0 || !raw_start.row_id.is_tracked() {
+            return;
+        }
+
+        // Preserve one affine run whenever both coordinate spaces continue
+        // contiguously. This keeps lookup metadata proportional to raw rows,
+        // not viewport cells, in the common identity case.
+        if let Some(previous) = origins.last_mut() {
+            let display_contiguous = previous.display_start.row == display_start.row
+                && previous.display_start.column.saturating_add(previous.len)
+                    == display_start.column;
+            let raw_contiguous = previous.raw_start.row_id == raw_start.row_id
+                && previous.raw_start.column.saturating_add(previous.len) == raw_start.column;
+            if display_contiguous && raw_contiguous {
+                previous.len = previous.len.saturating_add(len);
+                return;
+            }
+        }
+
+        origins.push(super::projection::OriginSpan {
+            display_start,
+            raw_start,
+            len,
+        });
+    }
+
+    /// Build stable raw-cell provenance for the exact rows materialized by
+    /// `get_visible_cells`. This mirrors the existing lazy reflow window but
+    /// never changes it: retained content gets an affine origin span and the
+    /// blank cells introduced only to pad a projected row remain unmapped.
+    fn identity_projection_origins(
+        &self,
+        viewport_rows: usize,
+        cols: usize,
+    ) -> Vec<super::projection::OriginSpan> {
+        if viewport_rows == 0 || cols == 0 {
+            return Vec::new();
+        }
+
+        let mut origins = Vec::with_capacity(viewport_rows);
+        if self.scroll_offset == 0 {
+            for row in 0..viewport_rows.min(self.grid.rows()) {
+                Self::append_projected_origin_span(
+                    &mut origins,
+                    DisplayPoint::new(row, 0),
+                    RawCellAnchor {
+                        row_id: self.grid.row_id(row),
+                        column: 0,
+                    },
+                    cols.min(self.grid[row].len()),
+                );
+            }
+            return origins;
+        }
+
+        let start_idx = self
+            .scrollback
+            .len()
+            .saturating_sub(self.scroll_offset.saturating_add(viewport_rows));
+        let mut start_idx = start_idx;
+        while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
+            start_idx -= 1;
+        }
+        let end_idx = self.scrollback.len();
+
+        let mut total_visual_rows = 0usize;
+        let mut source = start_idx;
+        while source < end_idx {
+            let (next, visual_rows) = Self::reflow_span(&self.scrollback, source, end_idx, cols);
+            total_visual_rows = total_visual_rows.saturating_add(visual_rows);
+            source = next;
+        }
+        let target_start = total_visual_rows.saturating_sub(self.scroll_offset);
+        let target_end = target_start
+            .saturating_add(viewport_rows)
+            .min(total_visual_rows);
+        source = start_idx;
+        let mut visual_start = 0usize;
+        let mut display_row = 0usize;
+        while source < end_idx && visual_start < target_end {
+            let (next, visual_rows) = Self::reflow_span(&self.scrollback, source, end_idx, cols);
+            let visual_end = visual_start.saturating_add(visual_rows);
+            if visual_end > target_start {
+                let first_chunk = target_start.saturating_sub(visual_start);
+                let last_chunk = target_end.saturating_sub(visual_start).min(visual_rows);
+
+                for chunk_index in first_chunk..last_chunk {
+                    let chunk_start = chunk_index.saturating_mul(cols);
+                    let chunk_end = chunk_start.saturating_add(cols);
+                    let mut logical_start = 0usize;
+                    for raw_index in source..next {
+                        let raw_len = self.scrollback[raw_index].reflow_content_len();
+                        let raw_end = logical_start.saturating_add(raw_len);
+                        let intersection_start = chunk_start.max(logical_start);
+                        let intersection_end = chunk_end.min(raw_end);
+                        if intersection_start < intersection_end {
+                            Self::append_projected_origin_span(
+                                &mut origins,
+                                DisplayPoint::new(display_row, intersection_start - chunk_start),
+                                RawCellAnchor {
+                                    row_id: self.scrollback[raw_index].raw_row_id(),
+                                    column: intersection_start - logical_start,
+                                },
+                                intersection_end - intersection_start,
+                            );
+                        }
+                        logical_start = raw_end;
+                    }
+                    display_row = display_row.saturating_add(1);
+                }
+            }
+            visual_start = visual_end;
+            source = next;
+        }
+
+        // The legacy materializer fills any remaining viewport rows from the
+        // live grid and finally with structural blank rows. Only the former
+        // have a stable primary-buffer origin.
+        for grid_row in 0..self.grid.rows() {
+            if display_row >= viewport_rows {
+                break;
+            }
+            Self::append_projected_origin_span(
+                &mut origins,
+                DisplayPoint::new(display_row, 0),
+                RawCellAnchor {
+                    row_id: self.grid.row_id(grid_row),
+                    column: 0,
+                },
+                cols.min(self.grid[grid_row].len()),
+            );
+            display_row = display_row.saturating_add(1);
+        }
+
+        origins
+    }
+
+    /// Materialize the current viewport through the versioned history
+    /// projection boundary. P0 is deliberately identity-only: it shares the
+    /// exact visible-cell allocation and wraps it with stable provenance and
+    /// pass-through geometry used by all viewport consumers.
+    pub fn projected_viewport(
+        &mut self,
+        projection: HistoryProjection,
+        block_mode: bool,
+    ) -> ProjectedViewport {
+        let rows = self.grid.rows();
+        let columns = self.grid.row_len();
+        let mode = if !block_mode || self.use_alt_buffer {
+            super::projection::ProjectionMode::Bypass
+        } else {
+            super::projection::ProjectionMode::Identity
+        };
+        let key = ProjectionCacheKey::new(
+            self.grid_version,
+            projection.revision(),
+            self.total_lines_scrolled,
+            self.row_identity_revision,
+            self.scrollback.len(),
+            self.scroll_offset,
+            rows,
+            columns,
+            self.use_alt_buffer,
+            mode,
+        );
+        if let Some(cached) = self
+            .projected_viewport_cache
+            .as_ref()
+            .filter(|cached| cached.key() == key)
+        {
+            return cached.clone();
+        }
+
+        // Identity fast path: do not clone cells. `get_visible_cells` already
+        // owns the legacy incremental/live and lazy historical caches.
+        let cells = self.get_visible_cells();
+        let row_wrapped = self.get_visible_row_wrapped();
+        let origins = self.identity_projection_origins(cells.len(), columns);
+        let viewport = ProjectedViewport::new(
+            key,
+            cells,
+            row_wrapped,
+            origins,
+            DisplayPoint::new(self.cursor_row, self.cursor_col),
+        );
+        self.projected_viewport_cache = Some(viewport.clone());
+        viewport
+    }
+
     pub fn get_cursor_pos(&self) -> (usize, usize) {
         (self.cursor_row, self.cursor_col)
     }
@@ -3145,14 +3449,33 @@ impl super::TerminalState {
 
     /// Start a new selection at a viewport-relative position.
     /// Converts to absolute buffer coordinates internally.
+    #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn start_selection(&mut self, viewport_pos: (usize, usize)) {
         self.start_selection_with_mode(viewport_pos, SelectionMode::Normal);
     }
 
+    pub fn start_selection_projected(
+        &mut self,
+        viewport: &ProjectedViewport,
+        display_pos: (usize, usize),
+    ) {
+        self.start_selection_with_projected_mode(viewport, display_pos, SelectionMode::Normal);
+    }
+
+    #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn start_block_selection(&mut self, viewport_pos: (usize, usize)) {
         self.start_selection_with_mode(viewport_pos, SelectionMode::Block);
     }
 
+    pub fn start_block_selection_projected(
+        &mut self,
+        viewport: &ProjectedViewport,
+        display_pos: (usize, usize),
+    ) {
+        self.start_selection_with_projected_mode(viewport, display_pos, SelectionMode::Block);
+    }
+
+    #[allow(dead_code)]
     pub(super) fn start_selection_with_mode(
         &mut self,
         viewport_pos: (usize, usize),
@@ -3169,7 +3492,22 @@ impl super::TerminalState {
         });
     }
 
+    fn start_selection_with_projected_mode(
+        &mut self,
+        viewport: &ProjectedViewport,
+        display_pos: (usize, usize),
+        mode: SelectionMode,
+    ) {
+        let abs = (viewport.legacy_absolute_row(display_pos.0), display_pos.1);
+        self.selection = Some(Selection {
+            anchor: abs,
+            active: abs,
+            mode,
+        });
+    }
+
     /// Update the active end of the current selection with a viewport-relative position.
+    #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn update_selection(&mut self, viewport_pos: (usize, usize)) {
         let abs_row = self.viewport_row_to_absolute(viewport_pos.0);
         if let Some(ref mut sel) = self.selection {
@@ -3177,11 +3515,53 @@ impl super::TerminalState {
         }
     }
 
+    pub fn update_selection_projected(
+        &mut self,
+        viewport: &ProjectedViewport,
+        display_pos: (usize, usize),
+    ) {
+        let abs_row = viewport.legacy_absolute_row(display_pos.0);
+        if let Some(ref mut sel) = self.selection {
+            sel.active = (abs_row, display_pos.1);
+        }
+    }
+
     /// Select the word at the given (row, col) position in the visible grid.
     /// Word boundaries are determined by character class: alphanumeric/underscore,
     /// whitespace, or punctuation/symbols.
+    #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn select_word_at(&mut self, row: usize, col: usize) {
         let visible = self.get_visible_cells();
+        let wrapped = self.get_visible_row_wrapped();
+        let viewport_base = self.viewport_row_to_absolute(0);
+        self.select_word_in_view(visible.as_ref(), &wrapped, row, col, |viewport_row| {
+            viewport_base.saturating_add(viewport_row)
+        });
+    }
+
+    pub fn select_word_at_projected(
+        &mut self,
+        viewport: &ProjectedViewport,
+        row: usize,
+        col: usize,
+    ) {
+        self.select_word_in_view(
+            viewport.cells(),
+            viewport.row_wrapped(),
+            row,
+            col,
+            |display_row| viewport.legacy_absolute_row(display_row),
+        );
+    }
+
+    fn select_word_in_view(
+        &mut self,
+        visible: &[Vec<TerminalCell>],
+        wrapped: &[bool],
+        row: usize,
+        col: usize,
+        to_absolute_row: impl Fn(usize) -> usize,
+    ) {
         if row >= visible.len() {
             return;
         }
@@ -3200,7 +3580,6 @@ impl super::TerminalState {
         // Paths and URLs commonly span several visual rows. Treat adjacent
         // soft-wrapped rows as one logical line so a double-click selects the
         // complete token rather than only the fragment under the pointer.
-        let wrapped = self.get_visible_row_wrapped();
         let mut logical_start_row = row;
         while logical_start_row > 0 && wrapped.get(logical_start_row - 1).copied().unwrap_or(false)
         {
@@ -3214,8 +3593,12 @@ impl super::TerminalState {
         }
         let mut logical_cells =
             Vec::with_capacity((logical_end_row - logical_start_row + 1).saturating_mul(cols));
-        for logical_row in logical_start_row..=logical_end_row {
-            logical_cells.extend_from_slice(&visible[logical_row]);
+        for logical_row in visible
+            .iter()
+            .take(logical_end_row.saturating_add(1))
+            .skip(logical_start_row)
+        {
+            logical_cells.extend_from_slice(logical_row);
         }
         let logical_col = (row - logical_start_row)
             .saturating_mul(cols)
@@ -3225,8 +3608,8 @@ impl super::TerminalState {
             let first_row = logical_start_row + left / cols;
             let last_row = logical_start_row + right / cols;
             self.selection = Some(Selection {
-                anchor: (self.viewport_row_to_absolute(first_row), left % cols),
-                active: (self.viewport_row_to_absolute(last_row), right % cols),
+                anchor: (to_absolute_row(first_row), left % cols),
+                active: (to_absolute_row(last_row), right % cols),
                 mode: SelectionMode::Normal,
             });
             return;
@@ -3282,7 +3665,7 @@ impl super::TerminalState {
             right += 1;
         }
 
-        let abs_row = self.viewport_row_to_absolute(row);
+        let abs_row = to_absolute_row(row);
         self.selection = Some(Selection {
             anchor: (abs_row, left),
             active: (abs_row, right),
@@ -3290,8 +3673,27 @@ impl super::TerminalState {
         });
     }
 
+    #[allow(dead_code)] // Public library compatibility; UI uses the projected variant.
     pub fn select_line_at(&mut self, row: usize) {
         let visible = self.get_visible_cells();
+        let viewport_base = self.viewport_row_to_absolute(0);
+        self.select_line_in_view(visible.as_ref(), row, |viewport_row| {
+            viewport_base.saturating_add(viewport_row)
+        });
+    }
+
+    pub fn select_line_at_projected(&mut self, viewport: &ProjectedViewport, row: usize) {
+        self.select_line_in_view(viewport.cells(), row, |display_row| {
+            viewport.legacy_absolute_row(display_row)
+        });
+    }
+
+    fn select_line_in_view(
+        &mut self,
+        visible: &[Vec<TerminalCell>],
+        row: usize,
+        to_absolute_row: impl Fn(usize) -> usize,
+    ) {
         if row >= visible.len() {
             return;
         }
@@ -3313,7 +3715,7 @@ impl super::TerminalState {
             right += 1;
         }
 
-        let abs_row = self.viewport_row_to_absolute(row);
+        let abs_row = to_absolute_row(row);
         self.selection = Some(Selection {
             anchor: (abs_row, 0),
             active: (abs_row, right),
@@ -3588,8 +3990,7 @@ impl super::TerminalState {
         // key. A resize can happen while the PTY is otherwise idle, so it must
         // invalidate them independently of new parser input.
         self.grid_version = self.grid_version.saturating_add(1);
-        self.visible_cells_cache = None;
-        self.viewport_mapping_exact_cache.set(None);
+        self.invalidate_scrollback_view_cache();
 
         let old_rows = self.grid.rows();
         let had_full_screen_region = old_rows == 0
@@ -3616,8 +4017,10 @@ impl super::TerminalState {
             let from_top = need.min(self.cursor_row);
             if from_top > 0 {
                 for r in 0..from_top {
-                    let line = ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
-                    self.push_scrollback_compressed(line);
+                    let mut line =
+                        ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
+                    line.set_raw_row_id(self.grid.row_id(r));
+                    self.push_scrollback_transferred_with_options(line, false);
                 }
                 self.grid.scroll_up_by(from_top, blank_cell);
                 self.kitty_graphics
@@ -3628,6 +4031,8 @@ impl super::TerminalState {
 
         self.grid.resize(rows, cols, blank_cell);
         self.alt_grid.resize(rows, cols, inactive_blank_cell);
+        self.fill_untracked_grid_row_ids();
+        self.mark_row_identity_changed();
         // Narrowing can cut a double-width character in half at the new right
         // edge; its lead half cannot stay behind on its own.
         for row in 0..rows {
@@ -3691,9 +4096,21 @@ impl super::TerminalState {
     }
 
     #[inline]
+    #[allow(dead_code)] // Public library compatibility; renderer uses projected rows.
     pub fn row_selection_cols(&self, viewport_row: usize) -> Option<(usize, usize)> {
+        self.row_selection_cols_at_absolute(self.viewport_row_to_absolute(viewport_row))
+    }
+
+    pub fn row_selection_cols_projected(
+        &self,
+        viewport: &ProjectedViewport,
+        display_row: usize,
+    ) -> Option<(usize, usize)> {
+        self.row_selection_cols_at_absolute(viewport.legacy_absolute_row(display_row))
+    }
+
+    fn row_selection_cols_at_absolute(&self, abs_row: usize) -> Option<(usize, usize)> {
         let sel = self.selection?;
-        let abs_row = self.viewport_row_to_absolute(viewport_row);
         let (start, end) = if sel.anchor <= sel.active {
             (sel.anchor, sel.active)
         } else {

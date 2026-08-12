@@ -1,6 +1,9 @@
 use crate::color;
 use crate::gpu;
-use crate::terminal::{clamp_terminal_dimensions, TerminalState};
+use crate::terminal::{
+    clamp_terminal_dimensions, DisplayPoint, HistoryProjection, ProjectedViewport,
+    ProjectionCacheKey, ProjectionLayoutKey, TerminalState,
+};
 use crate::theme::ThemeExt as _;
 use egui::{Color32, FontId, Response, Ui, Vec2};
 use lru::LruCache;
@@ -725,6 +728,9 @@ pub struct TerminalRenderer {
     /// Whether to draw command-block chrome (`block_mode`): gutter stripes,
     /// separators and outcome badges derived from OSC 133 records.
     pub block_mode: bool,
+    /// Projection-only state is renderer-owned and versioned independently
+    /// from PTY/grid mutations. P0 exposes only the identity policy.
+    history_projection: HistoryProjection,
     /// Tighten card-only spacing/radius without changing the terminal grid or
     /// PTY geometry.
     pub block_compact: bool,
@@ -767,11 +773,10 @@ pub struct TerminalRenderer {
     pub scroll_pixel_offset: f32,
 
     /// Per-pane 链接检测缓存(多窗格路径用)。单窗格走 App 上的缓存,多窗格每个
-    /// pane 一份,仅当 grid_version/scroll_offset 变化时重建,避免每帧重做检测+String 分配。
+    /// pane 一份,仅当完整 projection key 变化时重建,避免每帧重做检测+String 分配。
     /// 用 Arc 以便渲染前 O(1) clone 出来,规避 &mut self 与字段 & 的借用冲突。
     pub cached_links: std::sync::Arc<Vec<crate::link::Link>>,
-    pub cached_links_grid_version: u64,
-    pub cached_links_scroll_offset: usize,
+    pub cached_links_projection_key: Option<ProjectionCacheKey>,
     pub cached_links_terminal_ptr: usize,
 
     // Dirty-region rendering cache
@@ -779,7 +784,7 @@ pub struct TerminalRenderer {
     row_instance_offsets: std::sync::Arc<Vec<usize>>,
     row_instance_counts: std::sync::Arc<Vec<usize>>,
     last_rendered_grid_version: u64,
-    last_rendered_scroll_offset: usize,
+    last_rendered_projection_layout_key: Option<ProjectionLayoutKey>,
     last_rendered_selection: Option<crate::terminal::Selection>,
     last_rendered_search_hash: u64,
     last_search_match_lines: Vec<usize>,
@@ -841,6 +846,7 @@ impl TerminalRenderer {
             font_ligatures: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
+            history_projection: HistoryProjection::identity(),
             block_compact: false,
             selected_block_ids: Vec::new(),
             selected_block_id_set: std::collections::HashSet::new(),
@@ -860,16 +866,14 @@ impl TerminalRenderer {
             cursor_move_terminal_ptr: None,
             scroll_pixel_offset: 0.0,
             cached_links: std::sync::Arc::new(Vec::new()),
-            // u64::MAX 作哨兵,保证首帧必定重建链接缓存。
-            cached_links_grid_version: u64::MAX,
-            cached_links_scroll_offset: usize::MAX,
+            cached_links_projection_key: None,
             cached_links_terminal_ptr: usize::MAX,
             // Dirty-region rendering cache (initialized empty)
             cached_instances: std::sync::Arc::new(Vec::new()),
             row_instance_offsets: std::sync::Arc::new(Vec::new()),
             row_instance_counts: std::sync::Arc::new(Vec::new()),
             last_rendered_grid_version: 0,
-            last_rendered_scroll_offset: 0,
+            last_rendered_projection_layout_key: None,
             last_rendered_selection: None,
             last_rendered_search_hash: 0,
             last_search_match_lines: Vec::new(),
@@ -885,6 +889,13 @@ impl TerminalRenderer {
             cached_atlas_h: 1.0,
             last_rendered_font_generation: (0, 0),
         }
+    }
+
+    /// Return the immutable viewport snapshot consumed by this renderer and
+    /// its link/mouse frontends. Repeated calls with an unchanged key clone
+    /// only small `Arc`s; the cells and origin index stay shared.
+    pub fn projected_viewport(&self, terminal: &mut TerminalState) -> ProjectedViewport {
+        terminal.projected_viewport(self.history_projection, self.block_mode)
     }
 
     /// 重置 renderer 的 IME 状态缓存，使下一帧重新同步 IME 状态
@@ -1079,19 +1090,19 @@ impl TerminalRenderer {
         ctx: &egui::Context,
         painter: &egui::Painter,
         terminal: &TerminalState,
+        viewport: &ProjectedViewport,
         content_rect: egui::Rect,
         char_width: f32,
         line_height: f32,
         layer: KittyImageLayer,
     ) {
-        let viewport_rows = i64::try_from(terminal.grid.rows()).unwrap_or(i64::MAX);
-        let scroll_offset = terminal.scroll_offset;
+        let viewport_rows = i64::try_from(viewport.rows()).unwrap_or(i64::MAX);
         let mut placements: Vec<_> = terminal
             .kitty_graphics
             .get_placements()
             .iter()
             .filter(|placement| {
-                let viewport_row = placement.viewport_row(scroll_offset);
+                let viewport_row = viewport.kitty_viewport_row(placement.y);
                 layer.contains(placement.z_index)
                     && viewport_row < viewport_rows
                     && viewport_row.saturating_add(i64::from(placement.height)) > 0
@@ -1130,7 +1141,7 @@ impl TerminalRenderer {
             if display_width <= 0.0 || display_height <= 0.0 {
                 continue;
             }
-            let viewport_row = placement.viewport_row(scroll_offset);
+            let viewport_row = viewport.kitty_viewport_row(placement.y);
             let image_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     content_rect.left()
@@ -1528,7 +1539,26 @@ impl TerminalRenderer {
     /// area (gutter, padding, scrollbar) stay local. Only the semantic live
     /// card span belongs to an app on the primary grid; alternate-screen
     /// content is wholly app-owned.
+    #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_app_mouse_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        self.pointer_app_mouse_eligible_for_rows(terminal, pos, terminal.grid.rows())
+    }
+
+    pub fn pointer_app_mouse_eligible_projected(
+        &self,
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        pos: egui::Pos2,
+    ) -> bool {
+        self.pointer_app_mouse_eligible_for_rows(terminal, pos, viewport.rows())
+    }
+
+    fn pointer_app_mouse_eligible_for_rows(
+        &self,
+        terminal: &TerminalState,
+        pos: egui::Pos2,
+        rows: usize,
+    ) -> bool {
         let Some(content_rect) = self.last_content_rect else {
             return false;
         };
@@ -1544,7 +1574,6 @@ impl TerminalRenderer {
         if !self.line_height.is_finite() || self.line_height <= 0.0 {
             return false;
         }
-        let rows = terminal.grid.rows();
         let row = (((pos.y - content_rect.top()) / self.line_height)
             .floor()
             .max(0.0) as usize)
@@ -1562,7 +1591,26 @@ impl TerminalRenderer {
     /// reporting: every real grid cell may contain a link, including unzoned
     /// history, but a finished command header is reserved for whole-card
     /// selection. Gutter, padding, and scrollbar remain outside this surface.
+    #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_link_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        self.pointer_link_eligible_for_rows(terminal, pos, terminal.grid.rows())
+    }
+
+    pub fn pointer_link_eligible_projected(
+        &self,
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        pos: egui::Pos2,
+    ) -> bool {
+        self.pointer_link_eligible_for_rows(terminal, pos, viewport.rows())
+    }
+
+    fn pointer_link_eligible_for_rows(
+        &self,
+        terminal: &TerminalState,
+        pos: egui::Pos2,
+        rows: usize,
+    ) -> bool {
         let Some(content_rect) = self.last_content_rect else {
             return false;
         };
@@ -1572,7 +1620,6 @@ impl TerminalRenderer {
         if terminal.is_alt_buffer_active() || !self.block_mode {
             return true;
         }
-        let rows = terminal.grid.rows();
         !self
             .compute_block_chrome(terminal, rows)
             .as_deref()
@@ -2334,9 +2381,10 @@ impl TerminalRenderer {
             (char_width * pixels_per_point).round().max(1.0) as u32,
             (line_height * pixels_per_point).round().max(1.0) as u32,
         );
-        let grid = terminal.get_visible_cells();
-        let rows = grid.len();
-        let cols = if rows > 0 { grid[0].len() } else { 80 };
+        let viewport = self.projected_viewport(terminal);
+        let grid = viewport.cells_arc();
+        let rows = viewport.rows();
+        let cols = viewport.columns();
 
         // eprintln!("[UI] Rect: {:?}", rect);
 
@@ -2375,7 +2423,8 @@ impl TerminalRenderer {
         } else {
             Vec::new()
         };
-        let cursor_pos = terminal.get_cursor_pos();
+        let cursor_point = viewport.cursor();
+        let cursor_pos = (cursor_point.row, cursor_point.column);
         let ime_rect = cursor_rect(
             content_rect,
             cursor_pos.0,
@@ -2442,7 +2491,7 @@ impl TerminalRenderer {
                 .expand(Self::SCROLLBAR_HIT_EXPAND)
                 .contains(pos)
         });
-        let show_scrollbar = !terminal.scrollback.is_empty()
+        let show_scrollbar = viewport.history_len() > 0
             && match self.scrollbar_visibility {
                 crate::config::ScrollbarVisibility::Always => true,
                 crate::config::ScrollbarVisibility::Auto => {
@@ -2454,9 +2503,9 @@ impl TerminalRenderer {
         let primary_pressed =
             ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
         let press_app_mouse_eligible = primary_pressed
-            && response
-                .interact_pointer_pos()
-                .is_some_and(|pos| self.pointer_app_mouse_eligible(terminal, pos));
+            && response.interact_pointer_pos().is_some_and(|pos| {
+                self.pointer_app_mouse_eligible_projected(terminal, &viewport, pos)
+            });
         self.local_selection_terminal = local_selection_capture_after_press(
             self.local_selection_terminal,
             rendered_terminal,
@@ -2470,8 +2519,8 @@ impl TerminalRenderer {
 
         // Compute thumb rect and related values for interaction
         let scrollbar_thumb_rect: Option<(egui::Rect, f32, f32, f32)> =
-            if !terminal.scrollback.is_empty() {
-                let total_lines = terminal.scrollback.len() + rows;
+            if viewport.history_len() > 0 {
+                let total_lines = viewport.total_lines();
                 let visible_lines = rows;
                 if total_lines > visible_lines {
                     let scrollbar_height = scrollbar_rect.height();
@@ -2480,7 +2529,7 @@ impl TerminalRenderer {
                     // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                     let thumb_y = scrollbar_height
                         - thumb_height
-                        - (terminal.scroll_offset as f32 / terminal.scrollback.len() as f32)
+                        - (viewport.scroll_offset() as f32 / viewport.history_len() as f32)
                             * (scrollbar_height - thumb_height);
                     let thumb_rect = egui::Rect::from_min_size(
                         egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
@@ -2490,7 +2539,7 @@ impl TerminalRenderer {
                         thumb_rect,
                         scrollbar_height,
                         thumb_height,
-                        terminal.scrollback.len() as f32,
+                        viewport.history_len() as f32,
                     ))
                 } else {
                     None
@@ -2546,7 +2595,7 @@ impl TerminalRenderer {
         // Click in scrollbar track (not on thumb): page up/down
         if interaction_enabled && response.drag_started() && !self.dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
-                if pos.x >= scrollbar_x && !terminal.scrollback.is_empty() {
+                if pos.x >= scrollbar_x && viewport.history_len() > 0 {
                     if let Some((thumb_rect, ..)) = scrollbar_thumb_rect {
                         if pos.y < thumb_rect.top() {
                             // Click above thumb: scroll up (see older history)
@@ -2676,8 +2725,12 @@ impl TerminalRenderer {
                 self.cursor_move_input.clear();
                 self.cursor_move_terminal_ptr = None;
 
-                let bytes =
-                    terminal.click_cursor_move(click_row, click_col, self.click_moves_cursor);
+                let bytes = viewport
+                    .application_cell(DisplayPoint::new(click_row, click_col))
+                    .map(|(row, column)| {
+                        terminal.click_cursor_move(row, column, self.click_moves_cursor)
+                    })
+                    .unwrap_or_default();
                 if !bytes.is_empty() {
                     self.cursor_move_terminal_ptr = Some(rendered_terminal);
                     self.cursor_move_input = bytes;
@@ -2700,7 +2753,7 @@ impl TerminalRenderer {
                     } else {
                         0
                     };
-                    terminal.select_line_at(row);
+                    terminal.select_line_at_projected(&viewport, row);
                     // Replacing the text selection drops the block selection
                     // too, like any other real content interaction.
                     self.block_click = Some(crate::block_mode::BlockClick::Clear);
@@ -2729,7 +2782,7 @@ impl TerminalRenderer {
                     } else {
                         0
                     };
-                    terminal.select_word_at(row, col);
+                    terminal.select_word_at_projected(&viewport, row, col);
                     // 同上:双击换选中也一并清掉 block 选中。
                     self.block_click = Some(crate::block_mode::BlockClick::Clear);
                 }
@@ -2765,9 +2818,9 @@ impl TerminalRenderer {
                     };
                     let alt_held = ui.input(|i| i.modifiers.alt);
                     if alt_held {
-                        terminal.start_block_selection((row, col));
+                        terminal.start_block_selection_projected(&viewport, (row, col));
                     } else {
-                        terminal.start_selection((row, col));
+                        terminal.start_selection_projected(&viewport, (row, col));
                     }
                     self.block_click = Some(crate::block_mode::BlockClick::Clear);
                     ui.ctx().request_repaint();
@@ -2800,7 +2853,7 @@ impl TerminalRenderer {
                     } else {
                         0
                     };
-                    terminal.update_selection((row, col));
+                    terminal.update_selection_projected(&viewport, (row, col));
                     ui.ctx().request_repaint(); // Force repaint to show selection update
                 }
             }
@@ -2820,6 +2873,7 @@ impl TerminalRenderer {
             ui.ctx(),
             &painter,
             terminal,
+            &viewport,
             content_rect,
             char_width,
             line_height,
@@ -2831,6 +2885,7 @@ impl TerminalRenderer {
             self.render_grid_gpu(
                 ui,
                 terminal,
+                &viewport,
                 search_state,
                 links,
                 hovered_link,
@@ -2863,6 +2918,7 @@ impl TerminalRenderer {
                 ui,
                 &painter,
                 terminal,
+                &viewport,
                 search_state,
                 &link_map,
                 hovered_link,
@@ -2896,6 +2952,7 @@ impl TerminalRenderer {
             ui.ctx(),
             &painter,
             terminal,
+            &viewport,
             content_rect,
             char_width,
             line_height,
@@ -3006,14 +3063,14 @@ impl TerminalRenderer {
 
             // Recompute thumb with current scroll_offset (may have changed from interaction)
             if let Some((_, scrollbar_height, _, scrollback_len_f)) = scrollbar_thumb_rect {
-                let total_lines = terminal.scrollback.len() + rows;
+                let total_lines = viewport.total_lines();
                 let visible_lines = rows;
                 let thumb_height =
                     Self::scrollbar_thumb_height(visible_lines, total_lines, scrollbar_height);
                 // 反转逻辑：scroll_offset=0时thumb在底部（最新内容），scroll_offset=max时thumb在顶部（历史）
                 let thumb_y = scrollbar_height
                     - thumb_height
-                    - (terminal.scroll_offset as f32 / scrollback_len_f)
+                    - (viewport.scroll_offset() as f32 / scrollback_len_f)
                         * (scrollbar_height - thumb_height);
                 let thumb_rect = egui::Rect::from_min_size(
                     egui::pos2(scrollbar_x, scrollbar_rect.top() + thumb_y),
@@ -3068,6 +3125,7 @@ impl TerminalRenderer {
         &mut self,
         ui: &mut Ui,
         terminal: &TerminalState,
+        viewport: &ProjectedViewport,
         search_state: &crate::search::SearchState,
         links: &[crate::link::Link],
         hovered_link: &Option<crate::link::Link>,
@@ -3112,7 +3170,8 @@ impl TerminalRenderer {
         // --- Dirty detection: determine which rows need rebuild ---
         let terminal_ptr = terminal as *const _ as usize;
         let current_grid_version = terminal.get_grid_version();
-        let current_scroll_offset = terminal.scroll_offset;
+        let current_projection_key = viewport.key();
+        let current_projection_layout_key = current_projection_key.layout_key();
         let current_selection = terminal.selection;
         let search_hash = {
             use std::hash::{Hash, Hasher};
@@ -3138,7 +3197,7 @@ impl TerminalRenderer {
             || self.last_rendered_terminal_ptr != terminal_ptr
             || self.last_rendered_rows != rows
             || self.last_rendered_cols != cols
-            || self.last_rendered_scroll_offset != current_scroll_offset
+            || self.last_rendered_projection_layout_key != Some(current_projection_layout_key)
             || grid_version_jumped;
 
         // 跨帧复用 dirty_rows 缓冲:make_mut 在上一帧 callback 已 drop(refcount==1)时
@@ -3282,6 +3341,7 @@ impl TerminalRenderer {
                             gpu_res,
                             grid,
                             terminal,
+                            viewport,
                             search_state,
                             &link_map,
                             &search_map,
@@ -3317,6 +3377,7 @@ impl TerminalRenderer {
                             gpu_res,
                             grid,
                             terminal,
+                            viewport,
                             search_state,
                             &link_map,
                             &search_map,
@@ -3366,6 +3427,7 @@ impl TerminalRenderer {
                                 gpu_res,
                                 grid,
                                 terminal,
+                                viewport,
                                 search_state,
                                 &link_map,
                                 &search_map,
@@ -3403,7 +3465,7 @@ impl TerminalRenderer {
         // Update tracking state
         self.last_rendered_terminal_ptr = terminal_ptr;
         self.last_rendered_grid_version = current_grid_version;
-        self.last_rendered_scroll_offset = current_scroll_offset;
+        self.last_rendered_projection_layout_key = Some(current_projection_layout_key);
         self.last_rendered_selection = current_selection;
         self.last_rendered_search_hash = search_hash;
         self.last_rendered_block_backdrop_hash = block_backdrop_hash;
@@ -3479,6 +3541,7 @@ impl TerminalRenderer {
             ui.ctx(),
             &painter,
             terminal,
+            viewport,
             content_rect,
             char_width,
             line_height,
@@ -3497,6 +3560,7 @@ impl TerminalRenderer {
         gpu_res: &mut gpu::callback::GpuResources,
         grid: &[Vec<crate::terminal::TerminalCell>],
         terminal: &TerminalState,
+        viewport: &ProjectedViewport,
         search_state: &crate::search::SearchState,
         link_map: &[Vec<&crate::link::Link>],
         search_map: &[Vec<&crate::search::SearchMatch>],
@@ -3511,7 +3575,7 @@ impl TerminalRenderer {
         row_idx: usize,
         cols: usize,
     ) {
-        let sel_cols = terminal.row_selection_cols(row_idx);
+        let sel_cols = terminal.row_selection_cols_projected(viewport, row_idx);
         let row_default_bg = block_row_backdrops
             .get(row_idx)
             .copied()
@@ -3803,6 +3867,7 @@ impl TerminalRenderer {
         ui: &mut Ui,
         painter: &egui::Painter,
         terminal: &TerminalState,
+        viewport: &ProjectedViewport,
         search_state: &crate::search::SearchState,
         link_map: &[Vec<&crate::link::Link>],
         hovered_link: &Option<crate::link::Link>,
@@ -3827,7 +3892,7 @@ impl TerminalRenderer {
         };
 
         for (row_idx, row) in grid.iter().enumerate().take(rows) {
-            let sel_cols = terminal.row_selection_cols(row_idx);
+            let sel_cols = terminal.row_selection_cols_projected(viewport, row_idx);
 
             for (col_idx, cell) in row.iter().enumerate().take(cols) {
                 if cell.flags.wide_continuation() {
@@ -3924,6 +3989,7 @@ impl TerminalRenderer {
             ui.ctx(),
             painter,
             terminal,
+            viewport,
             content_rect,
             char_width,
             line_height,
@@ -3932,7 +3998,7 @@ impl TerminalRenderer {
 
         // Phase 2: Render characters
         for (row_idx, row) in grid.iter().enumerate().take(rows) {
-            let sel_cols = terminal.row_selection_cols(row_idx);
+            let sel_cols = terminal.row_selection_cols_projected(viewport, row_idx);
             let (_, snapped_height) = snapped_span(content_rect.top(), row_idx, line_height);
             let y = snapped_span(content_rect.top(), row_idx, line_height).0;
 

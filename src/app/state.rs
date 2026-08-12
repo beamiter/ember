@@ -245,8 +245,7 @@ pub struct TerminalApp {
     /// than retargeting to whatever happens to be hovered at button-up.
     pub pending_link_activation: Option<PendingLinkActivation>,
     pub cached_links: Vec<link::Link>,
-    pub cached_links_grid_version: u64,
-    pub cached_links_scroll_offset: usize,
+    pub cached_links_projection_key: Option<crate::terminal::ProjectionCacheKey>,
     /// Cache identity must follow the terminal object, not a reusable session
     /// vector index. A closed tab can be replaced at the same index with the
     /// same grid version and scroll offset.

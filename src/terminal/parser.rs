@@ -911,6 +911,7 @@ impl super::TerminalState {
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         self.grid.cells[src_start..src_start + cols].fill(blank);
                     }
+                    self.shift_row_id_region_down(self.cursor_row, self.scroll_region_bottom, n);
                     self.kitty_graphics.scroll_region_down(
                         self.cursor_row,
                         self.scroll_region_bottom,
@@ -937,6 +938,7 @@ impl super::TerminalState {
                         let blank_start = self.scroll_region_bottom * cols;
                         self.grid.cells[blank_start..blank_start + cols].fill(blank);
                     }
+                    self.shift_row_id_region_up(self.cursor_row, self.scroll_region_bottom, n);
                     self.kitty_graphics.scroll_region_up(
                         self.cursor_row,
                         self.scroll_region_bottom,
@@ -1492,6 +1494,7 @@ impl super::TerminalState {
         // 备用屏不显示 scrollback
         self.scroll_offset = 0;
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.mark_row_identity_changed();
         self.kitty_graphics.switch_screen();
         self.alt_cursor_row = self.cursor_row;
         self.alt_cursor_col = self.cursor_col;
@@ -1524,6 +1527,7 @@ impl super::TerminalState {
         self.alt_cursor_row = self.cursor_row;
         self.alt_cursor_col = self.cursor_col;
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
+        self.mark_row_identity_changed();
         self.kitty_graphics.switch_screen();
         if restore_cursor {
             self.cursor_row = self.saved_cursor_row;
