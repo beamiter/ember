@@ -1591,6 +1591,19 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
 }
 
 #[test]
+fn replay_prompt_guard_treats_whitespace_as_existing_user_input() {
+    let mut terminal = TerminalState::new(18, 5);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=live\x07");
+    assert!(terminal.prompt_input_is_empty());
+    terminal.note_user_input(b" ");
+    terminal.process_input(b" ");
+    assert!(
+        !terminal.prompt_input_is_empty(),
+        "reinput must not append to or overwrite a whitespace-only edit"
+    );
+}
+
+#[test]
 fn agent_generation_is_local_one_shot_and_requires_a_fresh_empty_prompt() {
     let mut terminal = TerminalState::new(24, 5);
     terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");

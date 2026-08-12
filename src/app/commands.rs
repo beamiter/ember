@@ -15,6 +15,39 @@ use std::time::{Duration, SystemTime};
 const COMMAND_DETAIL_COMMAND_BYTES: usize = 8 * 1024;
 const COMMAND_DETAIL_OUTPUT_BYTES: usize = 16 * 1024;
 const DETAIL_TRUNCATION_MARKER: &str = "\n… preview truncated …\n";
+const MAX_BLOCK_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockClipboardBuildError {
+    TooLarge,
+    Allocation,
+}
+
+fn append_bounded_block_part(
+    aggregate: &mut String,
+    part: &str,
+    separator: &str,
+    limit: usize,
+) -> Result<(), BlockClipboardBuildError> {
+    let separator = if aggregate.is_empty() { "" } else { separator };
+    let additional = separator
+        .len()
+        .checked_add(part.len())
+        .ok_or(BlockClipboardBuildError::TooLarge)?;
+    let next_len = aggregate
+        .len()
+        .checked_add(additional)
+        .ok_or(BlockClipboardBuildError::TooLarge)?;
+    if next_len > limit {
+        return Err(BlockClipboardBuildError::TooLarge);
+    }
+    aggregate
+        .try_reserve(additional)
+        .map_err(|_| BlockClipboardBuildError::Allocation)?;
+    aggregate.push_str(separator);
+    aggregate.push_str(part);
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandTarget {
@@ -89,6 +122,7 @@ struct CommandRowSnapshot {
     cwd: Option<String>,
     cwd_context_fits: bool,
     state: CommandState,
+    complete: bool,
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     started_at: Option<SystemTime>,
@@ -151,6 +185,7 @@ enum ReplayOutcome {
     AlternateScreen,
     BracketedPasteDisabled,
     PendingInput,
+    PromptNotEmpty,
     EmptyCommand,
     UnsafeCommand(String),
     MultilineRun,
@@ -189,6 +224,7 @@ enum SelectedReplayError {
     AlternateScreen,
     BracketedPasteDisabled,
     PendingInput,
+    PromptNotEmpty,
     UnsafeCommand(crate::review_text::ReviewTextError),
     TooLarge { limit: usize },
     WriteFailed(crate::shell::ShellWriteError),
@@ -200,6 +236,7 @@ struct SelectedReplayRecord<'a> {
     command: Option<&'a str>,
     exact: bool,
     truncated: bool,
+    complete: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +245,7 @@ struct SelectedReplayGuard {
     prompt_ready: bool,
     bracketed_paste: bool,
     pending_input: bool,
+    prompt_empty: bool,
 }
 
 /// Gate ownership before replay mechanics. A foreground/alt-screen program
@@ -225,6 +263,9 @@ fn prepare_selected_replay<T>(
         return Err(SelectedReplayError::NotPromptReady);
     }
     let prepared = prepare()?;
+    if !guard.prompt_empty {
+        return Err(SelectedReplayError::PromptNotEmpty);
+    }
     if !guard.bracketed_paste {
         return Err(SelectedReplayError::BracketedPasteDisabled);
     }
@@ -339,6 +380,7 @@ impl TerminalApp {
                                 && cwd.len() <= crate::agent::context::AGENT_BLOCK_CWD_PROMPT_BYTES
                         }),
                         state: record.state,
+                        complete: record.complete,
                         exit_code: record.exit_code,
                         duration_ms: record.duration_ms,
                         started_at: record.started_at,
@@ -581,12 +623,13 @@ impl TerminalApp {
                             // selection (id-based, same session): a sidebar
                             // click selects the block, just as selecting a
                             // block highlights the sidebar row.
-                            self.block_selection = self.config.block_mode.then(|| {
-                                crate::block_mode::BlockSelection::single(
-                                    row.target.session_id.clone(),
-                                    row.target.execution_id.clone(),
-                                )
-                            });
+                            self.block_selection =
+                                (self.config.block_mode && row.complete).then(|| {
+                                    crate::block_mode::BlockSelection::single(
+                                        row.target.session_id.clone(),
+                                        row.target.execution_id.clone(),
+                                    )
+                                });
                             action = Some(CommandAction {
                                 target: row.target.clone(),
                                 kind: CommandActionKind::Jump,
@@ -776,8 +819,8 @@ impl TerminalApp {
             CommandActionKind::CopyCombined => {
                 self.copy_sidebar_command_text(&action.target, CopyKind::Combined)
             }
-            CommandActionKind::Fill => self.replay_sidebar_command(&action.target, false),
-            CommandActionKind::RunAgain => self.replay_sidebar_command(&action.target, true),
+            CommandActionKind::Fill => self.replay_sidebar_command(&action.target, false, false),
+            CommandActionKind::RunAgain => self.replay_sidebar_command(&action.target, true, false),
             CommandActionKind::FixWithAgent => {
                 self.start_agent_task_for_command(&action.target, AgentTaskIntent::Fix)
             }
@@ -856,8 +899,10 @@ impl TerminalApp {
     /// it: command authority always comes from the live record; a journal
     /// record whose full live identity was verified may fill output after the
     /// captured buffer has been evicted.
-    /// Returns `(command, command_exact, output)` where output is
-    /// `(text, truncated)`; `None` when neither source knows the record.
+    /// The command snapshot keeps raw-presence/truncation provenance separate
+    /// from its sanitized copy text. A present but unsafe/oversized command
+    /// must never collapse into a background block merely because no safe
+    /// command string can be returned.
     fn captured_block_text(
         &self,
         target: &CommandTarget,
@@ -871,14 +916,11 @@ impl TerminalApp {
             .and_then(|session| {
                 let terminal = session.terminal.lock();
                 let record = terminal.command_record(&target.execution_id)?;
-                let raw_command = record.command.as_deref().unwrap_or_default();
-                let command = crate::review_text::sanitize_history_replay(
-                    raw_command,
-                    crate::review_text::MAX_HISTORY_COMMAND_BYTES,
-                )
-                .unwrap_or_default();
-                let command_exact =
-                    record.command_exact && !record.command_truncated && !command.is_empty();
+                let (command, command_present, command_exact) = captured_command_provenance(
+                    record.command.as_deref(),
+                    record.command_exact,
+                    record.command_truncated,
+                );
                 let output = want_output
                     .then(|| {
                         terminal
@@ -889,14 +931,17 @@ impl TerminalApp {
                             .map(|text| (text.text, text.truncated))
                     })
                     .flatten();
-                Some((command, command_exact, output))
+                Some(CapturedBlockText {
+                    command,
+                    command_present,
+                    command_exact,
+                    command_truncated: record.command_truncated,
+                    output,
+                })
             });
         let persisted_captured = self.persisted_sidebar_execution(target).map(|record| {
-            let command = crate::review_text::sanitize_history_replay(
-                &record.command,
-                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
-            )
-            .unwrap_or_default();
+            let (command, command_present, command_exact) =
+                captured_command_provenance(Some(&record.command), true, record.command_truncated);
             let output = want_output
                 .then(|| {
                     record
@@ -905,18 +950,20 @@ impl TerminalApp {
                         .map(|output| (output.text.clone(), output.truncated))
                 })
                 .flatten();
-            (
-                command.clone(),
-                !record.command_truncated && !command.is_empty(),
+            CapturedBlockText {
+                command,
+                command_present,
+                command_exact,
+                command_truncated: record.command_truncated,
                 output,
-            )
+            }
         });
         match (live_captured, persisted_captured) {
-            (Some((command, command_exact, mut output)), Some(persisted)) => {
-                if output.is_none() {
-                    output = persisted.2;
+            (Some(mut live), Some(persisted)) => {
+                if live.output.is_none() {
+                    live.output = persisted.output;
                 }
-                Some((command, command_exact, output))
+                Some(live)
             }
             (Some(captured), None) | (None, Some(captured)) => Some(captured),
             (None, None) => None,
@@ -1094,12 +1141,16 @@ impl TerminalApp {
         };
 
         let (text, truncated, label) = match kind {
-            CopyKind::Command if !captured.1 || captured.0.is_empty() => {
+            CopyKind::Command if !captured.command_exact || captured.command.is_none() => {
                 self.set_status("Exact command text is unavailable");
                 return;
             }
-            CopyKind::Command => (captured.0, false, "command"),
-            CopyKind::Output => match captured.2 {
+            CopyKind::Command => (
+                captured.command.expect("guarded exact command"),
+                false,
+                "command",
+            ),
+            CopyKind::Output => match captured.output {
                 Some((output, truncated)) if !output.is_empty() => {
                     (output, truncated, "command output")
                 }
@@ -1109,16 +1160,19 @@ impl TerminalApp {
                 }
             },
             CopyKind::Combined => {
-                if !captured.1 || captured.0.is_empty() {
+                if !captured.command_exact || captured.command.is_none() {
                     self.set_status("Exact command text is unavailable");
                     return;
                 }
-                let Some((output, truncated)) = captured.2 else {
+                let Some((output, truncated)) = captured.output else {
                     self.set_status("Command output is unavailable");
                     return;
                 };
                 (
-                    combine_command_and_output(&captured.0, &output),
+                    combine_command_and_output(
+                        captured.command.as_deref().expect("guarded exact command"),
+                        &output,
+                    ),
                     truncated,
                     "command and output",
                 )
@@ -1143,7 +1197,7 @@ impl TerminalApp {
 
     /// The current block selection as a sidebar-style target, or `None` when
     /// it dangles (session closed or record evicted) — never a panic.
-    fn live_block_target(&self) -> Option<CommandTarget> {
+    pub(crate) fn live_block_target(&self) -> Option<CommandTarget> {
         let selection = self.block_selection.as_ref()?;
         let session_id = &selection.session_id;
         let record_id = &selection.active_id;
@@ -1156,7 +1210,7 @@ impl TerminalApp {
             .terminal
             .lock()
             .command_record(record_id)
-            .is_some()
+            .is_some_and(|record| record.complete)
             .then(|| CommandTarget {
                 session_id: session_id.clone(),
                 execution_id: record_id.clone(),
@@ -1185,10 +1239,11 @@ impl TerminalApp {
     }
 
     fn record_has_command(record: &crate::terminal::CommandRecord) -> bool {
-        record
-            .command
-            .as_deref()
-            .is_some_and(|command| !command.trim().is_empty())
+        record.command_truncated
+            || record
+                .command
+                .as_deref()
+                .is_some_and(|command| !command.trim().is_empty())
     }
 
     fn record_has_output(record: &crate::terminal::CommandRecord) -> bool {
@@ -1220,28 +1275,769 @@ impl TerminalApp {
         self.apply_block_selection(target);
     }
 
+    /// Apply a mouse gesture to one immutable, completed history card. The
+    /// renderer has already classified the hit zone, but record identity and
+    /// completion are checked again here so a PTY update between paint and
+    /// dispatch cannot retarget the click.
+    pub(crate) fn apply_block_pointer_selection(
+        &mut self,
+        session_id: &str,
+        record_id: &str,
+        gesture: crate::block_mode::BlockSelectionGesture,
+    ) {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return;
+        }
+        let Some(index) = self.session_manager.index_of(session_id) else {
+            self.clear_block_selection_for_session(session_id);
+            return;
+        };
+        let ordered_ids = {
+            let Some(session) = self.session_manager.sessions().get(index) else {
+                return;
+            };
+            let terminal = session.terminal.lock();
+            if terminal.is_alt_buffer_active()
+                || !terminal
+                    .command_record(record_id)
+                    .is_some_and(|record| record.complete)
+            {
+                return;
+            }
+            terminal
+                .command_records()
+                .iter()
+                .filter(|record| record.complete)
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>()
+        };
+        if !ordered_ids.iter().any(|id| id == record_id) {
+            return;
+        }
+
+        let current = self
+            .block_selection
+            .clone()
+            .filter(|selection| selection.session_id == session_id);
+        let selection = match gesture {
+            crate::block_mode::BlockSelectionGesture::Plain => {
+                Some(crate::block_mode::BlockSelection::single(
+                    session_id.to_owned(),
+                    record_id.to_owned(),
+                ))
+            }
+            crate::block_mode::BlockSelectionGesture::Extend => {
+                let mut selection = current.unwrap_or_else(|| {
+                    crate::block_mode::BlockSelection::single(
+                        session_id.to_owned(),
+                        record_id.to_owned(),
+                    )
+                });
+                selection.extend_to(&ordered_ids, record_id);
+                Some(selection)
+            }
+            crate::block_mode::BlockSelectionGesture::Toggle => {
+                if let Some(mut selection) = current {
+                    selection
+                        .toggle(&ordered_ids, record_id)
+                        .then_some(selection)
+                } else {
+                    Some(crate::block_mode::BlockSelection::single(
+                        session_id.to_owned(),
+                        record_id.to_owned(),
+                    ))
+                }
+            }
+            crate::block_mode::BlockSelectionGesture::Activate => {
+                let mut selection = current.unwrap_or_else(|| {
+                    crate::block_mode::BlockSelection::single(
+                        session_id.to_owned(),
+                        record_id.to_owned(),
+                    )
+                });
+                selection.activate(record_id);
+                Some(selection)
+            }
+        };
+        let Some(selection) = selection else {
+            self.clear_block_selection_for_session(session_id);
+            return;
+        };
+        let target = CommandTarget {
+            session_id: session_id.to_owned(),
+            execution_id: selection.active_id.clone(),
+        };
+        self.block_selection = Some(selection);
+        self.sync_block_selection_to_sidebar(&target);
+    }
+
+    /// Dispatch a context-menu request against its stable clicked record. All
+    /// clicked-only actions use `request.record_id`; batch actions use the
+    /// current range only when it still contains that id.
+    pub(crate) fn execute_block_menu_action(
+        &mut self,
+        session_id: &str,
+        request: crate::block_mode::BlockMenuRequest,
+    ) {
+        let target_is_live_finished = self
+            .session_manager
+            .index_of(session_id)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .is_some_and(|session| {
+                let terminal = session.terminal.lock();
+                !terminal.is_alt_buffer_active()
+                    && terminal
+                        .command_record(&request.record_id)
+                        .is_some_and(|record| record.complete)
+            });
+        if !target_is_live_finished {
+            self.set_status("Command block is no longer available");
+            return;
+        }
+        let target = CommandTarget {
+            session_id: session_id.to_owned(),
+            execution_id: request.record_id,
+        };
+        match request.action {
+            crate::block_mode::BlockMenuAction::CopyCommands => {
+                self.copy_block_context(&target, CopyKind::Command)
+            }
+            crate::block_mode::BlockMenuAction::AskAgent => {
+                self.block_ask_agent_about_target(&target)
+            }
+            crate::block_mode::BlockMenuAction::CopyOutputs => {
+                self.copy_block_context(&target, CopyKind::Output)
+            }
+            crate::block_mode::BlockMenuAction::CopyBlocks => {
+                self.copy_block_context(&target, CopyKind::Combined)
+            }
+            crate::block_mode::BlockMenuAction::CopyMarkdown => {
+                self.copy_block_context_markdown(&target)
+            }
+            crate::block_mode::BlockMenuAction::Reinput => self.block_reinput_selected_commands(),
+            crate::block_mode::BlockMenuAction::ScrollTop => {
+                self.block_scroll_target_edge(&target, false)
+            }
+            crate::block_mode::BlockMenuAction::ScrollBottom => {
+                self.block_scroll_target_edge(&target, true)
+            }
+            crate::block_mode::BlockMenuAction::Search => self.block_search_toggle(),
+            crate::block_mode::BlockMenuAction::ToggleBookmark => {
+                self.block_toggle_bookmark_target(&target)
+            }
+            crate::block_mode::BlockMenuAction::CopyJson => self.copy_block_json(&target),
+        }
+    }
+
+    fn block_scroll_target_edge(&mut self, target: &CommandTarget, bottom: bool) {
+        let jumped = self
+            .target_session_index(target)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .is_some_and(|session| {
+                session
+                    .terminal
+                    .lock()
+                    .scroll_to_command_edge(&target.execution_id, bottom)
+            });
+        if jumped {
+            self.smooth_scroll_velocity = 0.0;
+            self.smooth_scroll_pixel_offset = 0.0;
+            self.renderer.scroll_pixel_offset = 0.0;
+            for renderer in &mut self.pane_renderers {
+                renderer.scroll_pixel_offset = 0.0;
+            }
+        } else {
+            self.set_status("Command position is no longer in scrollback");
+        }
+    }
+
+    pub(crate) fn block_scroll_selected_edge(&mut self, bottom: bool) -> bool {
+        let Some(target) = self.live_block_target() else {
+            return false;
+        };
+        self.block_scroll_target_edge(&target, bottom);
+        true
+    }
+
+    fn block_toggle_bookmark_target(&mut self, target: &CommandTarget) {
+        let target_is_complete = self
+            .target_session_index(target)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .is_some_and(|session| {
+                session
+                    .terminal
+                    .lock()
+                    .command_record(&target.execution_id)
+                    .is_some_and(|record| record.complete)
+            });
+        if !target_is_complete {
+            self.set_status("Command block is no longer available");
+            return;
+        }
+        let bookmarks = self
+            .block_bookmarks
+            .entry(target.session_id.clone())
+            .or_default();
+        let added = if bookmarks.remove(&target.execution_id) {
+            false
+        } else {
+            bookmarks.insert(target.execution_id.clone());
+            true
+        };
+        if bookmarks.is_empty() {
+            self.block_bookmarks.remove(&target.session_id);
+        }
+        self.set_status(if added {
+            "Bookmarked command block"
+        } else {
+            "Removed command block bookmark"
+        });
+    }
+
+    pub(crate) fn block_toggle_bookmark(&mut self) {
+        let Some(target) = self.live_block_target().filter(|target| {
+            self.target_session_index(target)
+                .and_then(|index| self.session_manager.sessions().get(index))
+                .is_some_and(|session| {
+                    session
+                        .terminal
+                        .lock()
+                        .command_record(&target.execution_id)
+                        .is_some_and(|record| record.complete)
+                })
+        }) else {
+            self.set_status("Select a completed command block to bookmark");
+            return;
+        };
+        self.block_toggle_bookmark_target(&target);
+    }
+
+    pub(crate) fn block_jump_bookmark(&mut self, step: crate::block_mode::SelectStep) {
+        let session = self.session_manager.get_active_session_mut();
+        let session_id = session.metadata.session_id.clone();
+        let terminal = session.terminal.lock();
+        if terminal.is_alt_buffer_active() {
+            return;
+        }
+        let records = terminal.command_records();
+        let valid_ids = records
+            .iter()
+            .filter(|record| record.complete)
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        let current = self
+            .block_selection
+            .as_ref()
+            .filter(|selection| selection.session_id == session_id)
+            .and_then(|selection| valid_ids.iter().position(|id| id == &selection.active_id));
+        let mut bookmarked_indices = self
+            .block_bookmarks
+            .get(&session_id)
+            .map(|bookmarks| {
+                valid_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, id)| bookmarks.contains(id).then_some(index))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        drop(terminal);
+        if let Some(bookmarks) = self.block_bookmarks.get_mut(&session_id) {
+            bookmarks.retain(|id| valid_ids.iter().any(|valid| valid == id));
+        }
+        if bookmarked_indices.is_empty() {
+            self.set_status("No bookmarked command blocks in this session");
+            return;
+        }
+        bookmarked_indices.sort_unstable();
+        let target_index = match step {
+            crate::block_mode::SelectStep::Older => current
+                .and_then(|current| {
+                    bookmarked_indices
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|index| *index < current)
+                })
+                .unwrap_or_else(|| *bookmarked_indices.last().expect("non-empty bookmarks")),
+            crate::block_mode::SelectStep::Newer => current
+                .and_then(|current| {
+                    bookmarked_indices
+                        .iter()
+                        .copied()
+                        .find(|index| *index > current)
+                })
+                .unwrap_or(bookmarked_indices[0]),
+        };
+        let Some(record_id) = valid_ids.get(target_index).cloned() else {
+            return;
+        };
+        self.apply_block_selection(CommandTarget {
+            session_id,
+            execution_id: record_id,
+        });
+    }
+
+    fn block_ask_agent_about_target(&mut self, target: &CommandTarget) {
+        if !self.config.ai_enabled {
+            self.set_status_for(
+                "Enable AI in Settings before asking about a block",
+                Duration::from_secs(5),
+            );
+            return;
+        }
+        let semantic = match self.semantic_context_for_command(target) {
+            Ok(semantic) => semantic,
+            Err(error) => {
+                self.set_status_for(error, Duration::from_secs(5));
+                return;
+            }
+        };
+        if let Some(reason) = crate::agent::context::block_agent_context_disabled_reason(
+            semantic.command.as_deref(),
+            semantic.command_exact,
+            semantic.command_truncated,
+            semantic.cwd.as_deref(),
+            Some(semantic.output_available),
+        ) {
+            self.set_status_for(reason, Duration::from_secs(5));
+            return;
+        };
+        match self
+            .agent_panel
+            .start_for_block(&self.config, semantic, None)
+        {
+            Ok(()) => self.set_status("Created an Agent task with the block attached"),
+            Err(error) => self.set_status_for(
+                format!("Could not start Agent task: {error}"),
+                Duration::from_secs(5),
+            ),
+        }
+    }
+
+    /// Resolve the clicked card's effective selection in terminal order. A
+    /// dangling member rejects the whole batch instead of silently copying a
+    /// different subset after history eviction.
+    fn block_context_targets(
+        &self,
+        clicked: &CommandTarget,
+    ) -> Result<Vec<CommandTarget>, &'static str> {
+        let Some(index) = self.target_session_index(clicked) else {
+            return Err("Command session is no longer available");
+        };
+        let Some(session) = self.session_manager.sessions().get(index) else {
+            return Err("Command session is no longer available");
+        };
+        let terminal = session.terminal.lock();
+        if terminal.is_alt_buffer_active()
+            || !terminal
+                .command_record(&clicked.execution_id)
+                .is_some_and(|record| record.complete)
+        {
+            return Err("Command block is no longer available");
+        }
+        let selected = self.block_selection.as_ref().filter(|selection| {
+            selection.session_id == clicked.session_id
+                && selection
+                    .selected_ids
+                    .iter()
+                    .any(|id| id == &clicked.execution_id)
+        });
+        let wanted = selected
+            .map(|selection| selection.selected_ids.as_slice())
+            .unwrap_or(std::slice::from_ref(&clicked.execution_id));
+        let targets = terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete && wanted.iter().any(|id| id == &record.id))
+            .map(|record| CommandTarget {
+                session_id: clicked.session_id.clone(),
+                execution_id: record.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if targets.len() != wanted.len() {
+            return Err("A selected command block is no longer available");
+        }
+        Ok(targets)
+    }
+
+    fn copy_block_context(&mut self, clicked: &CommandTarget, kind: CopyKind) {
+        match self.block_context_targets(clicked) {
+            Ok(targets) => self.copy_block_targets(&targets, kind),
+            Err(error) => self.set_status(error),
+        }
+    }
+
+    fn copy_block_context_markdown(&mut self, clicked: &CommandTarget) {
+        match self.block_context_targets(clicked) {
+            Ok(targets) => self.copy_block_targets_markdown(&targets),
+            Err(error) => self.set_status(error),
+        }
+    }
+
+    /// Selection-aware target resolution for keyboard commands. A selection
+    /// in the active session is authoritative and copied old-to-new; no
+    /// selection falls back to the newest completed matching record.
+    fn block_targets_or_newest(
+        &mut self,
+        wanted: impl Fn(&crate::terminal::CommandRecord) -> bool,
+        missing: &str,
+    ) -> Option<Vec<CommandTarget>> {
+        let active_session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let selected_ids = self
+            .block_selection
+            .as_ref()
+            .filter(|selection| selection.session_id == active_session_id)
+            .map(|selection| selection.selected_ids.clone());
+        if let Some(selected_ids) = selected_ids {
+            let targets = {
+                let session = self.session_manager.get_active_session_mut();
+                let terminal = session.terminal.lock();
+                terminal
+                    .command_records()
+                    .iter()
+                    .filter(|record| {
+                        record.complete && selected_ids.iter().any(|id| id == &record.id)
+                    })
+                    .map(|record| CommandTarget {
+                        session_id: active_session_id.clone(),
+                        execution_id: record.id.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if targets.len() != selected_ids.len() {
+                self.set_status("A selected command block is no longer available");
+                return None;
+            }
+            return Some(targets);
+        }
+        let target = self.latest_block_target(wanted);
+        if target.is_none() {
+            self.set_status(missing);
+        }
+        target.map(|target| vec![target])
+    }
+
+    fn report_block_clipboard_build_error(&mut self, error: BlockClipboardBuildError) {
+        self.set_status_for(
+            match error {
+                BlockClipboardBuildError::TooLarge => {
+                    "Selected blocks exceed the 32 MiB clipboard limit"
+                }
+                BlockClipboardBuildError::Allocation => {
+                    "Could not allocate the bounded block clipboard payload"
+                }
+            },
+            Duration::from_secs(5),
+        );
+    }
+
+    fn copy_block_targets(&mut self, targets: &[CommandTarget], kind: CopyKind) {
+        let separator = if matches!(kind, CopyKind::Command) {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let mut text = String::new();
+        let mut count = 0usize;
+        let mut any_truncated = false;
+        for target in targets {
+            let Some(captured) =
+                self.captured_block_text(target, !matches!(kind, CopyKind::Command))
+            else {
+                self.set_status("A selected command block is no longer available");
+                return;
+            };
+            let background = captured.is_background();
+            let part = match kind {
+                CopyKind::Command => {
+                    if background {
+                        None
+                    } else {
+                        if !captured.command_exact || captured.command.is_none() {
+                            self.set_status(
+                                "Exact command text is unavailable for part of the selection",
+                            );
+                            return;
+                        }
+                        captured.command
+                    }
+                }
+                CopyKind::Output => captured.output.filter(|(text, _)| !text.is_empty()).map(
+                    |(output, truncated)| {
+                        any_truncated |= truncated;
+                        output
+                    },
+                ),
+                CopyKind::Combined => {
+                    if !background && (!captured.command_exact || captured.command.is_none()) {
+                        self.set_status(
+                            "Exact command text is unavailable for part of the selection",
+                        );
+                        return;
+                    }
+                    match (background, captured.command, captured.output) {
+                        (false, Some(command), Some((output, truncated))) => {
+                            any_truncated |= truncated;
+                            Some(combine_command_and_output(&command, &output))
+                        }
+                        (false, Some(command), None) => Some(command),
+                        (true, _, Some((output, truncated))) if !output.is_empty() => {
+                            any_truncated |= truncated;
+                            Some(output)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            let Some(part) = part else {
+                continue;
+            };
+            if let Err(error) =
+                append_bounded_block_part(&mut text, &part, separator, MAX_BLOCK_CLIPBOARD_BYTES)
+            {
+                self.report_block_clipboard_build_error(error);
+                return;
+            }
+            count += 1;
+        }
+        if count == 0 {
+            self.set_status(match kind {
+                CopyKind::Command => "The selected blocks contain no commands",
+                CopyKind::Output => "The selected blocks contain no captured output",
+                CopyKind::Combined => "The selected blocks contain no copyable text",
+            });
+            return;
+        }
+        let result = self
+            .clipboard
+            .as_ref()
+            .map(|clipboard| clipboard.copy(&text));
+        match result {
+            Some(Ok(())) => self.set_status(format!(
+                "Copied {count} block{}{}",
+                if count == 1 { "" } else { "s" },
+                if any_truncated {
+                    " (truncated output)"
+                } else {
+                    ""
+                }
+            )),
+            Some(Err(error)) => {
+                self.set_status_for(format!("Copy failed: {error}"), Duration::from_secs(4))
+            }
+            None => self.set_status("Clipboard is unavailable"),
+        }
+    }
+
+    fn block_markdown_for_target(&self, target: &CommandTarget) -> Result<String, &'static str> {
+        let Some(captured) = self.captured_block_text(target, true) else {
+            return Err("Command block is no longer available");
+        };
+        let background = captured.is_background();
+        let (exit_code, duration_ms, finished_secs, cwd) = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .and_then(|session| {
+                let terminal = session.terminal.lock();
+                terminal.command_record(&target.execution_id).map(|record| {
+                    (
+                        record.exit_code,
+                        record.duration_ms,
+                        record.finished_at.and_then(crate::block_mode::epoch_secs),
+                        record.cwd.clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.persisted_sidebar_execution(target).map(|record| {
+                    (
+                        record.exit_code,
+                        record.duration_ms,
+                        record.ended_at_ms.map(|ms| ms / 1000),
+                        (!record.cwd.is_empty()).then(|| record.cwd.clone()),
+                    )
+                })
+            })
+            .unwrap_or((None, None, None, None));
+        let finished = finished_secs.map(|secs| {
+            crate::block_mode::format_local_datetime(
+                secs,
+                crate::block_mode::local_utc_offset_secs(secs),
+            )
+        });
+        let (output, output_truncated) = captured.output.unwrap_or_default();
+        let command = (!captured.command_truncated)
+            .then_some(captured.command.as_deref())
+            .flatten();
+        Ok(crate::block_mode::block_markdown(
+            &crate::block_mode::MarkdownBlock {
+                command,
+                command_exact: captured.command_exact,
+                command_omitted: !background && command.is_none(),
+                command_truncated: captured.command_truncated,
+                output: &output,
+                output_truncated,
+                exit_code,
+                duration_ms,
+                finished: finished.as_deref(),
+                cwd: cwd.as_deref(),
+            },
+        ))
+    }
+
+    fn block_json_for_target(&self, target: &CommandTarget) -> Result<String, &'static str> {
+        let Some(captured) = self.captured_block_text(target, true) else {
+            return Err("Command block is no longer available");
+        };
+        let metadata = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .and_then(|session| {
+                let terminal = session.terminal.lock();
+                terminal.command_record(&target.execution_id).map(|record| {
+                    (
+                        record.sequence,
+                        record.cwd.clone(),
+                        record.exit_code,
+                        record.duration_ms,
+                        record
+                            .started_at
+                            .and_then(crate::block_mode::epoch_secs)
+                            .map(|seconds| seconds.saturating_mul(1_000)),
+                        record
+                            .finished_at
+                            .and_then(crate::block_mode::epoch_secs)
+                            .map(|seconds| seconds.saturating_mul(1_000)),
+                        terminal.grid.row_len(),
+                    )
+                })
+            })
+            .ok_or("Command block is no longer available")?;
+        let background = captured.is_background();
+        let (output, output_truncated) = captured.output.unwrap_or_default();
+        let command = (!captured.command_truncated)
+            .then_some(captured.command)
+            .flatten();
+        let command_omitted = !background && command.is_none();
+        let value = serde_json::json!({
+            "id": target.execution_id,
+            "sequence": metadata.0,
+            "kind": if background { "background" } else { "command" },
+            "prompt": serde_json::Value::Null,
+            "cmd": command,
+            "command_present": captured.command_present,
+            "command_omitted": command_omitted,
+            "command_exact": captured.command_exact,
+            "command_truncated": captured.command_truncated,
+            "output": output,
+            "output_truncated": output_truncated,
+            "exit_code": if background { None } else { metadata.2 },
+            "duration_ms": if background { None } else { metadata.3 },
+            "start_time_ms": metadata.4,
+            "end_time_ms": metadata.5,
+            "cwd": metadata.1,
+            "cols": metadata.6,
+        });
+        serde_json::to_string_pretty(&value).map_err(|_| "Could not serialize command block")
+    }
+
+    fn copy_block_json(&mut self, target: &CommandTarget) {
+        let json = match self.block_json_for_target(target) {
+            Ok(json) => json,
+            Err(error) => {
+                self.set_status(error);
+                return;
+            }
+        };
+        let result = self
+            .clipboard
+            .as_ref()
+            .map(|clipboard| clipboard.copy(&json));
+        match result {
+            Some(Ok(())) => self.set_status("Copied block as JSON"),
+            Some(Err(error)) => {
+                self.set_status_for(format!("Copy failed: {error}"), Duration::from_secs(4))
+            }
+            None => self.set_status("Clipboard is unavailable"),
+        }
+    }
+
+    fn copy_block_targets_markdown(&mut self, targets: &[CommandTarget]) {
+        let mut aggregate = String::new();
+        let mut count = 0usize;
+        for target in targets {
+            match self.block_markdown_for_target(target) {
+                Ok(markdown) => {
+                    if let Err(error) = append_bounded_block_part(
+                        &mut aggregate,
+                        &markdown,
+                        "\n\n---\n\n",
+                        MAX_BLOCK_CLIPBOARD_BYTES,
+                    ) {
+                        self.report_block_clipboard_build_error(error);
+                        return;
+                    }
+                    count += 1;
+                }
+                Err(error) => {
+                    self.set_status(error);
+                    return;
+                }
+            }
+        }
+        if count == 0 {
+            self.set_status("No command block to copy");
+            return;
+        }
+        let result = self
+            .clipboard
+            .as_ref()
+            .map(|clipboard| clipboard.copy(&aggregate));
+        match result {
+            Some(Ok(())) => self.set_status(format!(
+                "Copied {count} block{} as Markdown",
+                if count == 1 { "" } else { "s" }
+            )),
+            Some(Err(error)) => {
+                self.set_status_for(format!("Copy failed: {error}"), Duration::from_secs(4))
+            }
+            None => self.set_status("Clipboard is unavailable"),
+        }
+    }
+
     /// `block:copy_command`: copy the selected block's command; with no
     /// selection, the most recent complete record with one.
     pub(crate) fn block_copy_command(&mut self) {
-        let Some(target) =
-            self.block_target_or_newest(Self::record_has_command, "No command block to copy from")
+        let Some(targets) =
+            self.block_targets_or_newest(Self::record_has_command, "No command block to copy from")
         else {
             return;
         };
-        self.copy_sidebar_command_text(&target, CopyKind::Command);
+        self.copy_block_targets(&targets, CopyKind::Command);
     }
 
     /// `block:copy_output`: copy the selected block's output (captured text,
     /// or extracted from its output anchors); with no selection, the most
     /// recent complete record with output.
     pub(crate) fn block_copy_output(&mut self) {
-        let Some(target) = self.block_target_or_newest(
+        let Some(targets) = self.block_targets_or_newest(
             Self::record_has_output,
             "No command block with output to copy",
         ) else {
             return;
         };
-        self.copy_sidebar_command_text(&target, CopyKind::Output);
+        self.copy_block_targets(&targets, CopyKind::Output);
     }
 
     /// `block:recall_command`: insert (never execute) the selected/latest
@@ -1253,7 +2049,7 @@ impl TerminalApp {
         else {
             return;
         };
-        self.replay_sidebar_command(&target, false);
+        self.replay_sidebar_command(&target, false, true);
     }
 
     /// `block:select_prev`: move the block selection to the next-older
@@ -1272,7 +2068,7 @@ impl TerminalApp {
     /// The oldest id is the fixed range anchor and the newest id is the active
     /// edge, so the first Shift+Up contracts the range exactly like anvil.
     pub(crate) fn block_select_all(&mut self) {
-        let Some((session_id, ids)) = self.selectable_block_ids(true) else {
+        let Some((session_id, ids)) = self.selectable_block_ids() else {
             return;
         };
         let count = ids.len();
@@ -1366,6 +2162,7 @@ impl TerminalApp {
                     prompt_ready: terminal.shell_is_prompt_ready(),
                     bracketed_paste: terminal.is_bracketed_paste_enabled(),
                     pending_input: direct_input_blocked || !session.pending_input.is_empty(),
+                    prompt_empty: terminal.prompt_input_is_empty(),
                 };
                 prepare_selected_replay(guard, || {
                     selected_commands_in_terminal_order(
@@ -1377,6 +2174,7 @@ impl TerminalApp {
                                 command: record.command.as_deref(),
                                 exact: record.command_exact,
                                 truncated: record.command_truncated,
+                                complete: record.complete,
                             }),
                         &selection.selected_ids,
                         crate::review_text::MAX_PROMPT_INSERT_BYTES,
@@ -1426,6 +2224,9 @@ impl TerminalApp {
             }
             SelectedReplayError::PendingInput => {
                 "Wait for pending terminal input to be delivered".to_string()
+            }
+            SelectedReplayError::PromptNotEmpty => {
+                "Clear the current prompt before inserting selected commands".to_string()
             }
             SelectedReplayError::UnsafeCommand(error) => {
                 format!("Command replay rejected: {error}")
@@ -1477,7 +2278,7 @@ impl TerminalApp {
         step: crate::block_mode::SelectStep,
         extend: bool,
     ) -> bool {
-        let Some((session_id, ordered_ids)) = self.selectable_block_ids(false) else {
+        let Some((session_id, ordered_ids)) = self.selectable_block_ids() else {
             return false;
         };
         let Some(mut selection) = self
@@ -1522,11 +2323,10 @@ impl TerminalApp {
         true
     }
 
-    /// Snapshot the current pane's selectable block ids in terminal order.
-    /// `completed_only` excludes the running command for Select all, while
-    /// gutter/arrow navigation retains ember's existing ability to select it.
-    /// Alternate-screen applications expose no block canvas and return None.
-    fn selectable_block_ids(&mut self, completed_only: bool) -> Option<(String, Vec<String>)> {
+    /// Snapshot immutable, completed block ids in terminal order. Live prompt
+    /// and running rows always remain PTY-owned and can never enter a block
+    /// selection through keyboard navigation or range extension.
+    fn selectable_block_ids(&mut self) -> Option<(String, Vec<String>)> {
         if !self.config.block_mode {
             self.clear_block_selection();
             return None;
@@ -1543,7 +2343,7 @@ impl TerminalApp {
             .iter()
             .enumerate()
             .filter(|(index, record)| {
-                (!completed_only || record.complete)
+                record.complete
                     && crate::block_mode::classify_outcome(
                         record.command.as_deref(),
                         record.command_truncated,
@@ -1558,8 +2358,8 @@ impl TerminalApp {
         Some((session_id, ids))
     }
 
-    /// Keyboard navigation over the same selectable set as gutter clicks
-    /// (`outcome != Prompt`, Running included). Clamped at either end the
+    /// Keyboard navigation over the same completed set as card clicks.
+    /// Clamped at either end the
     /// selection is kept silently; a dangling selected id counts as no
     /// selection and both directions restart at the newest selectable block.
     fn block_select_step(&mut self, step: crate::block_mode::SelectStep) {
@@ -1635,6 +2435,9 @@ impl TerminalApp {
             .iter()
             .enumerate()
             .map(|(index, record)| {
+                if !record.complete {
+                    return crate::block_mode::BlockOutcome::Prompt;
+                }
                 crate::block_mode::classify_outcome(
                     record.command.as_deref(),
                     record.command_truncated,
@@ -1652,7 +2455,7 @@ impl TerminalApp {
             .and_then(|selection| {
                 records
                     .iter()
-                    .position(|record| record.id == selection.active_id)
+                    .position(|record| record.complete && record.id == selection.active_id)
             });
         let target = pick(&outcomes, current)
             .and_then(|index| records.get(index))
@@ -1675,6 +2478,20 @@ impl TerminalApp {
     fn apply_block_selection(&mut self, target: CommandTarget) {
         if !self.config.block_mode {
             self.clear_block_selection();
+            return;
+        }
+        let completed = self
+            .target_session_index(&target)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .is_some_and(|session| {
+                session
+                    .terminal
+                    .lock()
+                    .command_record(&target.execution_id)
+                    .is_some_and(|record| record.complete)
+            });
+        if !completed {
+            self.set_status("Command block is no longer available");
             return;
         }
         self.block_selection = Some(crate::block_mode::BlockSelection::single(
@@ -1780,6 +2597,7 @@ impl TerminalApp {
             .command_records()
             .iter()
             .rev()
+            .filter(|record| record.complete)
             .map(|record| {
                 let output = match record.captured_output.as_ref() {
                     // Captures are produced under MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
@@ -1858,125 +2676,33 @@ impl TerminalApp {
         }
     }
 
-    /// Whether the target's live record carries a real command line; a
-    /// background block (no command) copies output only.
-    fn target_record_has_command(&self, target: &CommandTarget) -> bool {
-        self.session_manager
-            .sessions()
-            .iter()
-            .find(|session| session.metadata.session_id == target.session_id)
-            .and_then(|session| {
-                session
-                    .terminal
-                    .lock()
-                    .command_record(&target.execution_id)
-                    .map(Self::record_has_command)
-            })
-            .unwrap_or(false)
-    }
-
     /// `block:copy_block`: the whole block as plain text — command line,
     /// newline, output. Background blocks copy output only (anvil/forge
     /// `block_clipboard_text` family rule).
     pub(crate) fn block_copy_block(&mut self) {
-        let Some(target) = self.block_target_or_newest(
+        let Some(targets) = self.block_targets_or_newest(
             |record| Self::record_has_command(record) || Self::record_has_output(record),
             "No command block to copy",
         ) else {
             return;
         };
-        let kind = if self.target_record_has_command(&target) {
-            CopyKind::Combined
-        } else {
-            CopyKind::Output
-        };
-        self.copy_sidebar_command_text(&target, kind);
+        self.copy_block_targets(&targets, CopyKind::Combined);
     }
 
     /// `block:copy_markdown`: the block as a Markdown document. The exact
     /// shape (and its sanitization) is pinned in `block_mode` tests; frost
     /// ships the same format.
     pub(crate) fn block_copy_markdown(&mut self) {
-        let Some(target) = self.block_target_or_newest(
+        let Some(targets) = self.block_targets_or_newest(
             |record| Self::record_has_command(record) || Self::record_has_output(record),
             "No command block to copy",
         ) else {
             return;
         };
-        if self.target_session_index(&target).is_none() {
-            self.set_status("Command session is no longer available");
-            return;
-        }
-        // Same command/output source as block:copy_block/copy_output — the
-        // live record merged with the persisted sidebar record — so Markdown
-        // never renders an empty fence where a plain copy would succeed.
-        let Some((command, command_exact, output)) = self.captured_block_text(&target, true) else {
-            self.set_status("Command record is no longer available");
-            return;
-        };
-        let (exit_code, duration_ms, finished_secs, cwd) = self
-            .session_manager
-            .sessions()
-            .iter()
-            .find(|session| session.metadata.session_id == target.session_id)
-            .and_then(|session| {
-                let terminal = session.terminal.lock();
-                terminal.command_record(&target.execution_id).map(|record| {
-                    (
-                        record.exit_code,
-                        record.duration_ms,
-                        record.finished_at.and_then(crate::block_mode::epoch_secs),
-                        record.cwd.clone(),
-                    )
-                })
-            })
-            .or_else(|| {
-                // Live record evicted: the persisted sidebar record carries
-                // the same metadata.
-                self.persisted_sidebar_execution(&target).map(|record| {
-                    (
-                        record.exit_code,
-                        record.duration_ms,
-                        record.ended_at_ms.map(|ms| ms / 1000),
-                        (!record.cwd.is_empty()).then(|| record.cwd.clone()),
-                    )
-                })
-            })
-            .unwrap_or((None, None, None, None));
-        let finished = finished_secs.map(|secs| {
-            crate::block_mode::format_local_datetime(
-                secs,
-                crate::block_mode::local_utc_offset_secs(secs),
-            )
-        });
-        let (output, output_truncated) = output.unwrap_or_default();
-        let markdown = crate::block_mode::block_markdown(&crate::block_mode::MarkdownBlock {
-            command: (!command.is_empty()).then_some(command.as_str()),
-            command_exact,
-            output: &output,
-            output_truncated,
-            exit_code,
-            duration_ms,
-            finished: finished.as_deref(),
-            cwd: cwd.as_deref(),
-        });
-        let char_count = markdown.chars().count();
-        let copy_result = self
-            .clipboard
-            .as_ref()
-            .map(|clipboard| clipboard.copy(&markdown));
-        match copy_result {
-            Some(Ok(())) => self.set_status(format!(
-                "Copied block as Markdown ({char_count} characters)"
-            )),
-            Some(Err(error)) => {
-                self.set_status_for(format!("Copy failed: {error}"), Duration::from_secs(4))
-            }
-            None => self.set_status("Clipboard is unavailable"),
-        }
+        self.copy_block_targets_markdown(&targets);
     }
 
-    fn replay_sidebar_command(&mut self, target: &CommandTarget, run: bool) {
+    fn replay_sidebar_command(&mut self, target: &CommandTarget, run: bool, require_empty: bool) {
         let Some(index) = self.target_session_index(target) else {
             self.set_status("Command session is no longer available");
             return;
@@ -2033,6 +2759,7 @@ impl TerminalApp {
                     terminal.shell_is_prompt_ready(),
                     terminal.is_alt_buffer(),
                     terminal.is_bracketed_paste_enabled(),
+                    terminal.prompt_input_is_empty(),
                 )
             };
             let Some(command) = replay.0 else {
@@ -2060,6 +2787,8 @@ impl TerminalApp {
                 ReplayOutcome::BracketedPasteDisabled
             } else if pending_input {
                 ReplayOutcome::PendingInput
+            } else if require_empty && !replay.7 {
+                ReplayOutcome::PromptNotEmpty
             } else if command.is_empty() {
                 ReplayOutcome::EmptyCommand
             } else if run && replay_command_is_multiline(&command) {
@@ -2099,6 +2828,9 @@ impl TerminalApp {
             }
             ReplayOutcome::PendingInput => {
                 self.set_status("Wait for pending terminal input to be delivered")
+            }
+            ReplayOutcome::PromptNotEmpty => {
+                self.set_status("Clear the current prompt before recalling a command")
             }
             ReplayOutcome::EmptyCommand => self.set_status("Command text is empty"),
             ReplayOutcome::UnsafeCommand(error) => self.set_status_for(
@@ -2146,9 +2878,46 @@ struct BlockNavigation {
     any_failed: bool,
 }
 
-/// `(command, command_exact, output)` where output is `(text, truncated)` —
-/// see [`TerminalApp::captured_block_text`].
-type CapturedBlockText = (String, bool, Option<(String, bool)>);
+/// Copy/export snapshot that cannot confuse an unavailable command with a
+/// genuine background-output record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedBlockText {
+    /// Sanitized replay/display text, absent when the raw command was omitted
+    /// or rejected by the bounded visual-spoof guard.
+    command: Option<String>,
+    /// Whether nonblank raw command metadata existed before sanitization.
+    command_present: bool,
+    /// Exact, untruncated metadata whose sanitized text remains available.
+    command_exact: bool,
+    /// Producer-declared omission/shortening, independent of `command`.
+    command_truncated: bool,
+    output: Option<(String, bool)>,
+}
+
+impl CapturedBlockText {
+    fn is_background(&self) -> bool {
+        !self.command_present && !self.command_truncated
+    }
+}
+
+fn captured_command_provenance(
+    raw_command: Option<&str>,
+    command_exact: bool,
+    command_truncated: bool,
+) -> (Option<String>, bool, bool) {
+    let raw_command = raw_command.filter(|command| !command.trim().is_empty());
+    let command_present = raw_command.is_some();
+    let command = raw_command.and_then(|command| {
+        crate::review_text::sanitize_history_replay(
+            command,
+            crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+        )
+        .ok()
+    });
+    let command_is_exact =
+        command_exact && !command_truncated && command_present && command.is_some();
+    (command, command_present, command_is_exact)
+}
 
 fn enrich_semantic_context_from_history(
     context: &mut crate::agent::SemanticCommandContext,
@@ -2814,12 +3583,21 @@ fn selected_commands_in_terminal_order<'a>(
             continue;
         }
         seen_records += 1;
+        if !record.complete {
+            return Err(SelectedReplayError::MissingRecord);
+        }
+        // A producer may omit an oversized command entirely. Inspect that
+        // provenance before treating a blank value as a background block, so
+        // a mixed range is rejected atomically rather than partially recalled.
+        if record.truncated {
+            return Err(SelectedReplayError::ExactCommandUnavailable);
+        }
         let Some(raw_command) = record.command.filter(|command| !command.trim().is_empty()) else {
             // A background block is part of the visual range but contributes
             // neither an empty command nor an extra separator.
             continue;
         };
-        if !record.exact || record.truncated {
+        if !record.exact {
             return Err(SelectedReplayError::ExactCommandUnavailable);
         }
         let command =
@@ -2999,6 +3777,7 @@ mod tests {
             cwd: None,
             cwd_context_fits: true,
             state: CommandState::Complete,
+            complete: true,
             exit_code: Some(0),
             duration_ms: None,
             started_at: None,
@@ -3158,18 +3937,21 @@ mod tests {
                 command: Some("printf old"),
                 exact: true,
                 truncated: false,
+                complete: true,
             },
             SelectedReplayRecord {
                 id: "background",
                 command: None,
                 exact: false,
                 truncated: false,
+                complete: true,
             },
             SelectedReplayRecord {
                 id: "new",
                 command: Some("printf new\n"),
                 exact: true,
                 truncated: false,
+                complete: true,
             },
         ];
         // Selection storage order is irrelevant; record order is canonical.
@@ -3187,6 +3969,7 @@ mod tests {
             command: Some("echo exact"),
             exact: true,
             truncated: false,
+            complete: true,
         };
         assert!(matches!(
             selected_commands_in_terminal_order(
@@ -3202,11 +3985,28 @@ mod tests {
             command: Some("echo reconstructed"),
             exact: false,
             truncated: false,
+            complete: true,
         };
         assert!(matches!(
             selected_commands_in_terminal_order(
                 [exact, inexact],
                 &["exact".to_string(), "inexact".to_string()],
+                1024,
+            ),
+            Err(SelectedReplayError::ExactCommandUnavailable)
+        ));
+
+        let omitted_truncated = SelectedReplayRecord {
+            id: "omitted",
+            command: None,
+            exact: false,
+            truncated: true,
+            complete: true,
+        };
+        assert!(matches!(
+            selected_commands_in_terminal_order(
+                [exact, omitted_truncated],
+                &["exact".to_string(), "omitted".to_string()],
                 1024,
             ),
             Err(SelectedReplayError::ExactCommandUnavailable)
@@ -3225,6 +4025,7 @@ mod tests {
             prompt_ready: false,
             bracketed_paste: true,
             pending_input: true,
+            prompt_empty: true,
         };
         assert!(matches!(
             prepare_selected_replay::<()>(pending_running, || {
@@ -3239,12 +4040,14 @@ mod tests {
                 prompt_ready: true,
                 bracketed_paste: true,
                 pending_input: true,
+                prompt_empty: true,
             },
             SelectedReplayGuard {
                 alternate_screen: false,
                 prompt_ready: true,
                 bracketed_paste: false,
                 pending_input: false,
+                prompt_empty: true,
             },
         ] {
             assert!(matches!(
@@ -3263,11 +4066,33 @@ mod tests {
             // `try_reinput_selected_commands` folds both pending_input and
             // the session-scoped mouse/protocol gate into this field.
             pending_input: true,
+            prompt_empty: true,
         };
         assert!(matches!(
             prepare_selected_replay(barriered_idle_prompt, || Ok("echo safe")),
             Err(SelectedReplayError::PendingInput)
         ));
+
+        let edited_prompt = SelectedReplayGuard {
+            alternate_screen: false,
+            prompt_ready: true,
+            bracketed_paste: true,
+            pending_input: false,
+            prompt_empty: false,
+        };
+        assert!(matches!(
+            prepare_selected_replay(edited_prompt, || Ok("echo safe")),
+            Err(SelectedReplayError::PromptNotEmpty)
+        ));
+        assert!(
+            matches!(
+                prepare_selected_replay::<()>(edited_prompt, || {
+                    Err(SelectedReplayError::NoCommands)
+                }),
+                Err(SelectedReplayError::NoCommands)
+            ),
+            "an empty/background target must leave Enter to the child"
+        );
     }
 
     #[test]
@@ -3533,6 +4358,83 @@ mod tests {
             "echo hi\nhi\n"
         );
         assert_eq!(combine_command_and_output("true", ""), "true");
+    }
+
+    #[test]
+    fn captured_command_provenance_never_relabels_omitted_or_unsafe_as_background() {
+        let (command, present, exact) = captured_command_provenance(None, false, false);
+        let background = CapturedBlockText {
+            command,
+            command_present: present,
+            command_exact: exact,
+            command_truncated: false,
+            output: Some(("motd".into(), false)),
+        };
+        assert!(background.is_background());
+
+        let (command, present, exact) = captured_command_provenance(None, false, true);
+        let omitted = CapturedBlockText {
+            command,
+            command_present: present,
+            command_exact: exact,
+            command_truncated: true,
+            output: Some(("partial".into(), false)),
+        };
+        assert!(!omitted.is_background());
+        assert!(omitted.command.is_none());
+        assert!(omitted.command_truncated);
+
+        let unsafe_raw = "echo safe\u{202e}hidden";
+        let (command, present, exact) = captured_command_provenance(Some(unsafe_raw), true, false);
+        let unsafe_command = CapturedBlockText {
+            command,
+            command_present: present,
+            command_exact: exact,
+            command_truncated: false,
+            output: None,
+        };
+        assert!(!unsafe_command.is_background());
+        assert!(unsafe_command.command_present);
+        assert!(unsafe_command.command.is_none());
+        assert!(!unsafe_command.command_exact);
+
+        let (command, present, exact) =
+            captured_command_provenance(Some("echo reconstructed"), false, false);
+        assert_eq!(command.as_deref(), Some("echo reconstructed"));
+        assert!(present);
+        assert!(!exact, "Markdown may export it, but replay/copy cannot");
+    }
+
+    #[test]
+    fn block_clipboard_aggregate_accepts_exact_family_cap_and_rejects_plus_one() {
+        let exact = "x".repeat(MAX_BLOCK_CLIPBOARD_BYTES);
+        let mut aggregate = String::new();
+        assert_eq!(
+            append_bounded_block_part(&mut aggregate, &exact, "\n\n", MAX_BLOCK_CLIPBOARD_BYTES,),
+            Ok(())
+        );
+        assert_eq!(aggregate.len(), MAX_BLOCK_CLIPBOARD_BYTES);
+        drop(aggregate);
+        drop(exact);
+
+        let over = "x".repeat(MAX_BLOCK_CLIPBOARD_BYTES + 1);
+        assert_eq!(
+            append_bounded_block_part(&mut String::new(), &over, "\n\n", MAX_BLOCK_CLIPBOARD_BYTES,),
+            Err(BlockClipboardBuildError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn markdown_aggregate_charges_document_separator_before_appending() {
+        let mut aggregate = String::new();
+        append_bounded_block_part(&mut aggregate, "abc", "\n\n---\n\n", 16).unwrap();
+        append_bounded_block_part(&mut aggregate, "123456", "\n\n---\n\n", 16).unwrap();
+        assert_eq!(aggregate.len(), 16);
+        assert_eq!(
+            append_bounded_block_part(&mut aggregate, "x", "\n\n---\n\n", 16),
+            Err(BlockClipboardBuildError::TooLarge)
+        );
+        assert_eq!(aggregate.len(), 16, "oversize rejection is atomic");
     }
 
     #[test]

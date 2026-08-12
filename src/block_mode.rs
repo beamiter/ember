@@ -352,6 +352,87 @@ impl BlockSelection {
             self.anchor_id = target.to_string();
         }
     }
+
+    /// Make `target` the active edge without collapsing an existing range.
+    /// Right-click uses this contract: a click outside the range replaces it,
+    /// while a click inside preserves the range and resets its Shift anchor.
+    pub fn activate(&mut self, target: &str) {
+        if self.selected_ids.iter().any(|id| id == target) {
+            self.active_id = target.to_string();
+            self.anchor_id = target.to_string();
+        } else {
+            *self = Self::single(self.session_id.clone(), target.to_string());
+        }
+    }
+
+    /// Ctrl+Shift-click toggles one block while retaining terminal order.
+    /// Removing the last selected id returns `false` so callers can clear the
+    /// selection and its sidebar mirror atomically.
+    pub fn toggle(&mut self, ordered_ids: &[String], target: &str) -> bool {
+        if let Some(index) = self.selected_ids.iter().position(|id| id == target) {
+            self.selected_ids.remove(index);
+            if self.selected_ids.is_empty() {
+                return false;
+            }
+            if self.active_id == target || !self.selected_ids.iter().any(|id| id == &self.active_id)
+            {
+                self.active_id = ordered_ids
+                    .iter()
+                    .rev()
+                    .find(|id| self.selected_ids.iter().any(|selected| selected == *id))
+                    .cloned()
+                    .unwrap_or_else(|| self.selected_ids[self.selected_ids.len() - 1].clone());
+            }
+            if self.anchor_id == target || !self.selected_ids.iter().any(|id| id == &self.anchor_id)
+            {
+                self.anchor_id = self.active_id.clone();
+            }
+        } else {
+            self.selected_ids.push(target.to_string());
+            self.selected_ids.sort_by_key(|selected| {
+                ordered_ids
+                    .iter()
+                    .position(|id| id == selected)
+                    .unwrap_or(usize::MAX)
+            });
+            self.active_id = target.to_string();
+            self.anchor_id = target.to_string();
+        }
+        true
+    }
+}
+
+/// Semantic mouse gesture reported by the renderer after block hit-testing.
+/// Keeping raw modifier interpretation out of the app prevents PTY mouse
+/// routing and whole-block selection from disagreeing about click ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSelectionGesture {
+    Plain,
+    Extend,
+    Toggle,
+    Activate,
+}
+
+/// Action selected from a finished card's context menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockMenuAction {
+    CopyCommands,
+    AskAgent,
+    CopyOutputs,
+    CopyBlocks,
+    CopyMarkdown,
+    Reinput,
+    ScrollTop,
+    ScrollBottom,
+    Search,
+    ToggleBookmark,
+    CopyJson,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockMenuRequest {
+    pub record_id: String,
+    pub action: BlockMenuAction,
 }
 
 /// Inclusive terminal-order range used by Shift+Up/Down. Missing endpoints
@@ -372,8 +453,9 @@ pub fn selected_id_range(ordered_ids: &[String], anchor: &str, target: &str) -> 
     ordered_ids[start..=end].to_vec()
 }
 
-/// Keyboard block navigation over the same selectable set as gutter clicks
-/// (`outcome != Prompt`; `Running` included). `current` is the resolved index
+/// Keyboard block navigation over immutable finished cards only. Prompt and
+/// Running outcomes remain terminal-owned even if a caller accidentally
+/// includes them in the snapshot. `current` is the resolved index
 /// of the currently selected record, or `None` when nothing is selected or
 /// the selected id no longer resolves (evicted → treated as no selection, in
 /// which case both directions pick the NEWEST selectable block). Returns the
@@ -387,7 +469,7 @@ pub fn next_selected_index(
     let selectable: Vec<usize> = outcomes
         .iter()
         .enumerate()
-        .filter(|(_, outcome)| **outcome != BlockOutcome::Prompt)
+        .filter(|(_, outcome)| !matches!(outcome, BlockOutcome::Prompt | BlockOutcome::Running))
         .map(|(index, _)| index)
         .collect();
     let position =
@@ -663,6 +745,10 @@ pub struct MarkdownBlock<'a> {
     /// True when `command` is the byte-exact, untruncated OSC 133 text. A
     /// screen-reconstructed command still exports, flagged by a Note line.
     pub command_exact: bool,
+    /// A foreground command existed but cannot be included safely. This keeps
+    /// omitted/truncated metadata distinct from a genuine background block.
+    pub command_omitted: bool,
+    pub command_truncated: bool,
     pub output: &'a str,
     /// True when `output` was cut at the capture limit (Note line).
     pub output_truncated: bool,
@@ -685,7 +771,9 @@ pub fn block_markdown(block: &MarkdownBlock<'_>) -> String {
     let output = sanitize_fenced_body(block.output);
     let mut doc = String::from("## Command Block\n");
     let mut meta = String::new();
-    if command.is_some() {
+    let has_command_provenance =
+        command.is_some() || block.command_omitted || block.command_truncated;
+    if has_command_provenance {
         match block.exit_code {
             Some(code) => {
                 meta.push_str(&format!("- Exit: {code}"));
@@ -710,7 +798,11 @@ pub fn block_markdown(block: &MarkdownBlock<'_>) -> String {
     if let Some(cwd) = block.cwd {
         meta.push_str(&format!("- Cwd: {}\n", sanitize_meta_line_value(cwd)));
     }
-    if command.is_some() && !block.command_exact {
+    if block.command_truncated {
+        meta.push_str("- Note: command omitted because source text was truncated\n");
+    } else if block.command_omitted {
+        meta.push_str("- Note: command omitted because no safe display text is available\n");
+    } else if command.is_some() && !block.command_exact {
         meta.push_str("- Note: command reconstructed from screen\n");
     }
     if block.output_truncated {
@@ -845,12 +937,14 @@ pub fn oldest_failed_index(outcomes: &[BlockOutcome]) -> Option<usize> {
 }
 
 /// Result of a click routed through block-mode hit testing. `Select` carries
-/// the record id of the block whose gutter band was clicked; `Clear` is any
-/// other plain content click (block selection follows real interaction, like
-/// anvil's precedent that real input clears it).
+/// the stable record id plus family gesture; `Clear` is any other plain
+/// terminal-content interaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockClick {
-    Select(String),
+    Select {
+        record_id: String,
+        gesture: BlockSelectionGesture,
+    },
     Clear,
 }
 
@@ -1168,9 +1262,9 @@ mod tests {
     #[test]
     fn selection_starts_at_the_newest_selectable_block() {
         use BlockOutcome::*;
-        // The live prompt block is never selectable; Running is (like the
-        // gutter). A dangling selection resolves to `current: None` and both
-        // directions restart at the newest selectable block.
+        // Live prompt/running blocks are never selectable. A dangling
+        // selection resolves to `current: None` and both directions restart
+        // at the newest completed card.
         let outcomes = [Success, Failed(1), Background, Prompt];
         assert_eq!(
             next_selected_index(&outcomes, None, SelectStep::Older),
@@ -1183,7 +1277,7 @@ mod tests {
         let with_running = [Success, Running];
         assert_eq!(
             next_selected_index(&with_running, None, SelectStep::Older),
-            Some(1)
+            Some(0)
         );
         // Nothing selectable at all.
         assert_eq!(
@@ -1191,6 +1285,23 @@ mod tests {
             None
         );
         assert_eq!(next_selected_index(&[], None, SelectStep::Older), None);
+    }
+
+    #[test]
+    fn running_newest_is_excluded_from_ctrl_up_select_all_and_shift_ranges() {
+        use BlockOutcome::*;
+        let outcomes = [Success, Background, Running];
+        assert_eq!(
+            next_selected_index(&outcomes, None, SelectStep::Older),
+            Some(1),
+            "Ctrl+Up enters the newest completed card"
+        );
+        let completed_ids = ["old", "new"].map(str::to_owned).to_vec();
+        assert_eq!(
+            selected_id_range(&completed_ids, "old", "new"),
+            completed_ids,
+            "Select All and Shift ranges are built from completed ids only"
+        );
     }
 
     #[test]
@@ -1251,6 +1362,20 @@ mod tests {
         assert_eq!(selection.selected_ids, reverse_ids[..=1]);
         assert_eq!(selection.active_id, "zero");
         assert_eq!(selection.anchor_id, "oldest");
+
+        selection.activate("zero");
+        assert_eq!(selection.selected_ids, reverse_ids[..=1]);
+        assert_eq!(selection.active_id, "zero");
+        assert_eq!(selection.anchor_id, "zero");
+
+        assert!(selection.toggle(&reverse_ids, "middle"));
+        assert_eq!(selection.selected_ids, vec!["zero", "oldest", "middle"]);
+        assert_eq!(selection.active_id, "middle");
+        assert!(selection.toggle(&reverse_ids, "oldest"));
+        assert_eq!(selection.selected_ids, vec!["zero", "middle"]);
+
+        let mut single = BlockSelection::single("session".into(), "zero".into());
+        assert!(!single.toggle(&reverse_ids, "zero"));
     }
 
     #[test]
@@ -1476,6 +1601,8 @@ mod tests {
         let doc = block_markdown(&MarkdownBlock {
             command: Some("cargo test"),
             command_exact: true,
+            command_omitted: false,
+            command_truncated: false,
             output: "ok\n",
             output_truncated: false,
             exit_code: Some(0),
@@ -1513,6 +1640,8 @@ mod tests {
         let doc = block_markdown(&MarkdownBlock {
             command: Some("echo hi\u{1b}[31m"),
             command_exact: true,
+            command_omitted: false,
+            command_truncated: false,
             output: "ok\n",
             output_truncated: false,
             exit_code: Some(0),
@@ -1554,6 +1683,8 @@ mod tests {
         let doc = block_markdown(&MarkdownBlock {
             command: Some("make build"),
             command_exact: false,
+            command_omitted: false,
+            command_truncated: false,
             output: "partial",
             output_truncated: true,
             exit_code: Some(0),
@@ -1576,6 +1707,8 @@ mod tests {
         let background = block_markdown(&MarkdownBlock {
             command: None,
             command_exact: false,
+            command_omitted: false,
+            command_truncated: false,
             output: "motd\n",
             output_truncated: false,
             exit_code: None,
@@ -1584,6 +1717,22 @@ mod tests {
             cwd: None,
         });
         assert!(!background.contains("reconstructed"));
+
+        let omitted = block_markdown(&MarkdownBlock {
+            command: None,
+            command_exact: false,
+            command_omitted: true,
+            command_truncated: true,
+            output: "partial",
+            output_truncated: false,
+            exit_code: None,
+            duration_ms: None,
+            finished: None,
+            cwd: None,
+        });
+        assert!(omitted.contains("- Exit: not reported\n"));
+        assert!(omitted.contains("- Note: command omitted because source text was truncated\n"));
+        assert!(!omitted.contains("Command:\n"));
     }
 
     #[test]
@@ -1591,6 +1740,8 @@ mod tests {
         let doc = block_markdown(&MarkdownBlock {
             command: Some("sleep 100"),
             command_exact: true,
+            command_omitted: false,
+            command_truncated: false,
             output: "",
             output_truncated: false,
             exit_code: Some(130),
@@ -1620,6 +1771,8 @@ mod tests {
         let unreported = block_markdown(&MarkdownBlock {
             command: Some("true"),
             command_exact: true,
+            command_omitted: false,
+            command_truncated: false,
             output: "",
             output_truncated: false,
             exit_code: None,
@@ -1635,6 +1788,8 @@ mod tests {
         let doc = block_markdown(&MarkdownBlock {
             command: None,
             command_exact: true,
+            command_omitted: false,
+            command_truncated: false,
             output: "motd\n",
             output_truncated: false,
             exit_code: Some(0),
@@ -1659,6 +1814,8 @@ mod tests {
         let doc = block_markdown(&MarkdownBlock {
             command: None,
             command_exact: true,
+            command_omitted: false,
+            command_truncated: false,
             output: "```rust\nfn x() {}\n```\n",
             output_truncated: false,
             exit_code: None,

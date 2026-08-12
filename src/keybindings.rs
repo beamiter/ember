@@ -71,6 +71,9 @@ pub enum Command {
     BlockJumpNextFailed,
     /// 跨块搜索选择器（命令文本 + 输出行的大小写不敏感子串匹配）。
     BlockSearchToggle,
+    BlockToggleBookmark,
+    BlockJumpPrevBookmark,
+    BlockJumpNextBookmark,
 
     FontIncrease,
     FontDecrease,
@@ -161,6 +164,9 @@ impl std::fmt::Display for Command {
             Command::BlockJumpPrevFailed => write!(f, "block:jump_prev_failed"),
             Command::BlockJumpNextFailed => write!(f, "block:jump_next_failed"),
             Command::BlockSearchToggle => write!(f, "block:search"),
+            Command::BlockToggleBookmark => write!(f, "block:toggle_bookmark"),
+            Command::BlockJumpPrevBookmark => write!(f, "block:jump_prev_bookmark"),
+            Command::BlockJumpNextBookmark => write!(f, "block:jump_next_bookmark"),
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
@@ -236,6 +242,9 @@ impl std::str::FromStr for Command {
             "block:jump_prev_failed" => Ok(Command::BlockJumpPrevFailed),
             "block:jump_next_failed" => Ok(Command::BlockJumpNextFailed),
             "block:search" => Ok(Command::BlockSearchToggle),
+            "block:toggle_bookmark" => Ok(Command::BlockToggleBookmark),
+            "block:jump_prev_bookmark" => Ok(Command::BlockJumpPrevBookmark),
+            "block:jump_next_bookmark" => Ok(Command::BlockJumpNextBookmark),
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
@@ -469,6 +478,16 @@ impl KeyBindings {
             "ctrl+shift+i".to_string(),
             "block:reinput_selected_commands".to_string(),
         );
+        bindings.bindings.insert(
+            "ctrl+shift+b".to_string(),
+            "block:toggle_bookmark".to_string(),
+        );
+        bindings
+            .bindings
+            .insert("ctrl+,".to_string(), "block:jump_prev_bookmark".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+.".to_string(), "block:jump_next_bookmark".to_string());
         // Keep font zoom in the same configurable command path as every other
         // keyboard shortcut. Different keyboard layouts can report `+` either
         // with or without Shift, while `Ctrl+=` is the conventional spelling.
@@ -840,6 +859,9 @@ mod tests {
             Command::BlockJumpPrevFailed,
             Command::BlockJumpNextFailed,
             Command::BlockSearchToggle,
+            Command::BlockToggleBookmark,
+            Command::BlockJumpPrevBookmark,
+            Command::BlockJumpNextBookmark,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
@@ -865,6 +887,9 @@ mod tests {
             ("ctrl+shift+alt+a", Command::AgentToggle),
             ("ctrl+shift+a", Command::BlockSelectAll),
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
+            ("ctrl+shift+b", Command::BlockToggleBookmark),
+            ("ctrl+,", Command::BlockJumpPrevBookmark),
+            ("ctrl+.", Command::BlockJumpNextBookmark),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
             ("ctrl+shift+return", Command::PaneZoomToggle),
@@ -900,7 +925,6 @@ mod tests {
 
         for removed in [
             "ctrl+shift+,",
-            "ctrl+shift+b",
             "ctrl+shift+r",
             "ctrl+shift+q",
             "alt+left",

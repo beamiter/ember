@@ -1210,6 +1210,42 @@ fn link_at_pointer(
         .cloned()
 }
 
+const LINK_ACTIVATION_DRAG_THRESHOLD: f32 = 4.0;
+
+fn link_activation_dragged(origin: egui::Pos2, current: egui::Pos2) -> bool {
+    current.distance(origin) > LINK_ACTIVATION_DRAG_THRESHOLD
+}
+
+fn link_activation_release_allowed(
+    pressed_session: &str,
+    active_session: &str,
+    cancelled: bool,
+    multiple_click: bool,
+) -> bool {
+    pressed_session == active_session && !cancelled && !multiple_click
+}
+
+fn link_activation_ready(released_at: Option<f64>, now: f64, double_click_delay: f64) -> bool {
+    released_at.is_some_and(|released_at| {
+        now.is_finite()
+            && released_at.is_finite()
+            && now - released_at >= double_click_delay.max(0.0)
+    })
+}
+
+fn mouse_press_reports_to_app(
+    mouse_enabled: bool,
+    shift_bypass: bool,
+    app_surface: bool,
+    host_link_override: bool,
+) -> bool {
+    mouse_enabled && !shift_bypass && app_surface && !host_link_override
+}
+
+fn mouse_capture_accepts_new_press(capture_active: bool) -> bool {
+    !capture_active
+}
+
 #[derive(Debug)]
 pub(crate) struct DesktopNotification {
     title: String,
@@ -2021,9 +2057,11 @@ impl TerminalApp {
             task_sidebar: Default::default(),
             block_selection: None,
             block_search: Default::default(),
+            block_bookmarks: Default::default(),
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
+            pending_link_activation: None,
             cached_links: Vec::new(),
             cached_links_grid_version: 0,
             cached_links_scroll_offset: 0,
@@ -3690,11 +3728,88 @@ impl eframe::App for TerminalApp {
                 && terminal.is_mouse_enabled()
         };
         let shift_mouse_bypass = ctx.input(|input| input.modifiers.shift);
+        let pointer_pos =
+            ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
+        let pointer_app_mouse_eligible = pointer_over_active_terminal
+            && pointer_pos.is_some_and(|pos| {
+                let renderer = active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer);
+                let terminal = session.terminal.lock();
+                renderer.pointer_app_mouse_eligible(&terminal, pos)
+            });
+
+        // Resolve Ctrl-only link ownership before creating a PTY mouse
+        // capture. Host link activation owns this press on any real grid cell
+        // except a finished command header, so a mouse-reporting foreground
+        // application must never receive the same press as the host opener.
+        let link_press = ctx.input(|input| {
+            input
+                .pointer
+                .button_pressed(egui::PointerButton::Primary)
+                .then_some((
+                    input.modifiers.ctrl
+                        && !input.modifiers.shift
+                        && !input.modifiers.alt
+                        && !input.modifiers.command,
+                    input
+                        .pointer
+                        .button_double_clicked(egui::PointerButton::Primary)
+                        || input
+                            .pointer
+                            .button_triple_clicked(egui::PointerButton::Primary),
+                    input.pointer.interact_pos().or(input.pointer.hover_pos()),
+                ))
+        });
+        let mut link_press_override = false;
+        if let Some((ctrl_only, multiple_click, press_pos)) = link_press {
+            self.pending_link_activation = None;
+            if !terminal_pointer_input_blocked && ctrl_only && !multiple_click {
+                if let Some(origin) = press_pos {
+                    let renderer = active_pane_renderer_idx
+                        .and_then(|index| self.pane_renderers.get(index))
+                        .unwrap_or(&self.renderer);
+                    let mut terminal = session.terminal.lock();
+                    if renderer.pointer_link_eligible(&terminal, origin) {
+                        let (link_cols, link_rows) = terminal.get_dimensions();
+                        let links = self
+                            .link_detector
+                            .detect_links_in_visible_cells_with_wrapping_and_hyperlinks(
+                                &terminal.get_visible_cells(),
+                                &terminal.get_visible_row_wrapped(),
+                                |id| terminal.hyperlink_uri(id).map(str::to_owned),
+                            );
+                        let content_rect = renderer
+                            .last_content_rect
+                            .unwrap_or_else(|| ctx.viewport_rect());
+                        if let Some(link) = link_at_pointer(
+                            &links,
+                            origin,
+                            content_rect,
+                            renderer.char_width,
+                            renderer.line_height,
+                            link_cols,
+                            link_rows,
+                        ) {
+                            self.pending_link_activation =
+                                Some(crate::app::state::PendingLinkActivation {
+                                    session_id: active_session_id.clone(),
+                                    link,
+                                    origin,
+                                    cancelled: false,
+                                    released_at: None,
+                                });
+                            link_press_override = true;
+                        }
+                    }
+                }
+            }
+        }
 
         let middle_paste_requested = session.purpose
             != crate::session::SessionPurpose::RetainedCommand
             && !terminal_pointer_input_blocked
-            && (!mouse_enabled || shift_mouse_bypass)
+            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
             && pointer_over_active_terminal
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
 
@@ -3746,7 +3861,7 @@ impl eframe::App for TerminalApp {
             && pointer_over_active_terminal
             && scroll_delta != 0.0
             && !ctrl_scroll_this_frame
-            && (!mouse_enabled || shift_mouse_bypass)
+            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
         {
             // 0.35 阻尼系数：原始的 scroll_speed 直接乘 delta 会让单次滚轮累积约 7 倍位移，滑得太快
             const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
@@ -3848,10 +3963,8 @@ impl eframe::App for TerminalApp {
             }
             buttons
         });
-        let pointer_pos =
-            ctx.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
         if let Some(button) = terminal_button_pressed.filter(|button| {
-            self.terminal_mouse_capture.is_none()
+            mouse_capture_accepts_new_press(self.terminal_mouse_capture.is_some())
                 && (mouse_enabled || *button == 0)
                 && !terminal_pointer_input_blocked
                 && pointer_over_active_terminal
@@ -3873,7 +3986,12 @@ impl eframe::App for TerminalApp {
             );
             self.terminal_mouse_capture = Some(crate::app::state::TerminalMouseCapture {
                 session_id: active_session_id.clone(),
-                reported_to_app: mouse_enabled && !shift_mouse_bypass,
+                reported_to_app: mouse_press_reports_to_app(
+                    mouse_enabled,
+                    shift_mouse_bypass,
+                    pointer_app_mouse_eligible,
+                    link_press_override,
+                ),
                 button,
                 terminal: Arc::clone(&session.terminal),
                 write_tx: session.shell.write_sender(),
@@ -3886,7 +4004,11 @@ impl eframe::App for TerminalApp {
                 pending_controls: std::collections::VecDeque::new(),
                 press_accepted: false,
                 release_observed: false,
-                local_selection_cancelled: false,
+                // A host Ctrl-link owns the complete primary-button gesture.
+                // Suppress the local-selection release path as well as PTY
+                // reporting so an older terminal selection cannot overwrite
+                // PRIMARY when the link opens.
+                local_selection_cancelled: link_press_override,
             });
         }
 
@@ -3928,7 +4050,7 @@ impl eframe::App for TerminalApp {
             pointer_over_active_terminal || capture_for_route.is_some();
         let sequence_reports_to_app = capture_route_state
             .map(|(reported_to_app, _)| reported_to_app)
-            .unwrap_or(!shift_mouse_bypass);
+            .unwrap_or(!shift_mouse_bypass && pointer_app_mouse_eligible);
         let reported_capture_release = captured_release_button(
             capture_route_state,
             &terminal_buttons_released,
@@ -4226,6 +4348,7 @@ impl eframe::App for TerminalApp {
         // Step 12: 链接检测和交互
         if terminal_pointer_input_blocked {
             self.hovered_link = None;
+            self.pending_link_activation = None;
         } else {
             let terminal_ptr = Arc::as_ptr(&session.terminal) as usize;
             let mut terminal = session.terminal.lock();
@@ -4306,15 +4429,21 @@ impl eframe::App for TerminalApp {
                         )
                     })
             };
+            let hovered_link_eligible = pointer.is_some_and(|pos| {
+                active_pane_renderer_idx
+                    .and_then(|index| self.pane_renderers.get(index))
+                    .unwrap_or(&self.renderer)
+                    .pointer_link_eligible(&terminal, pos)
+            });
             drop(terminal);
-            if self.hovered_link.is_some() {
+            if self.hovered_link.is_some() && hovered_link_eligible {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
 
             // 链接悬停提示:在指针右下方画一个浮层显示完整 URL 和 Ctrl+Click 操作提示。
             // OSC8 等链接显示的"文本"可能与真实目标不同(例如 "click here"),
             // 鼠标悬停透出真实跳转目标,避免用户被诱导点击未知链接。
-            if let Some(ref link) = self.hovered_link {
+            if let Some(link) = self.hovered_link.as_ref().filter(|_| hovered_link_eligible) {
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                     egui::Area::new(egui::Id::new("link_hover_tooltip"))
                         .order(egui::Order::Tooltip)
@@ -4330,24 +4459,98 @@ impl eframe::App for TerminalApp {
                 }
             }
 
-            // 处理 Ctrl+Click 打开链接
-            if ctx.input(|i| {
-                i.pointer.button_clicked(egui::PointerButton::Primary) && i.modifiers.ctrl
-            }) {
-                if let Some(link) = self.hovered_link.clone() {
-                    let (msg, dur) = match link::open_link(&link) {
-                        Ok(_) => (
-                            format!("Opened: {}", link.text),
-                            Duration::from_millis(2500),
-                        ),
-                        Err(e) => (
-                            format!("Failed to open link: {}", e),
-                            Duration::from_secs(4),
-                        ),
-                    };
-                    self.status_message = msg;
-                    self.status_expires_at = Some(std::time::Instant::now() + dur);
+            // The stable Ctrl-link target was captured before PTY mouse-route
+            // ownership above. Modifier release does not change that target;
+            // only a drag/session change/multiclick cancels it here.
+            if let Some(pending) = self.pending_link_activation.as_mut() {
+                if pending.session_id != active_session_id
+                    || ctx.input(|input| {
+                        input.pointer.any_down()
+                            && input
+                                .pointer
+                                .hover_pos()
+                                .is_some_and(|pos| link_activation_dragged(pending.origin, pos))
+                    })
+                {
+                    pending.cancelled = true;
                 }
+            }
+            let link_release = ctx.input(|input| {
+                let awaiting_release = self
+                    .pending_link_activation
+                    .as_ref()
+                    .is_some_and(|pending| pending.released_at.is_none());
+                let released = input.pointer.button_released(egui::PointerButton::Primary)
+                    || (!input.pointer.any_down() && awaiting_release);
+                (
+                    released,
+                    input
+                        .pointer
+                        .button_double_clicked(egui::PointerButton::Primary)
+                        || input
+                            .pointer
+                            .button_triple_clicked(egui::PointerButton::Primary),
+                )
+            });
+            if link_release.0 {
+                let releasable = self
+                    .pending_link_activation
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        link_activation_release_allowed(
+                            &pending.session_id,
+                            &active_session_id,
+                            pending.cancelled,
+                            link_release.1,
+                        )
+                    });
+                if releasable {
+                    let released_at = ctx.input(|input| input.time);
+                    if let Some(pending) = self.pending_link_activation.as_mut() {
+                        pending.released_at = Some(released_at);
+                    }
+                    let raw_delay =
+                        ctx.options(|options| options.input_options.max_double_click_delay);
+                    let delay = if raw_delay.is_finite() {
+                        raw_delay.max(0.0)
+                    } else {
+                        0.3
+                    };
+                    ctx.request_repaint_after(Duration::from_secs_f64(delay));
+                } else {
+                    self.pending_link_activation = None;
+                }
+            }
+            let raw_delay = ctx.options(|options| options.input_options.max_double_click_delay);
+            let double_click_delay = if raw_delay.is_finite() {
+                raw_delay.max(0.0)
+            } else {
+                0.3
+            };
+            let now = ctx.input(|input| input.time);
+            let link = self
+                .pending_link_activation
+                .as_ref()
+                .filter(|pending| {
+                    link_activation_ready(pending.released_at, now, double_click_delay)
+                })
+                .is_some()
+                .then(|| self.pending_link_activation.take())
+                .flatten()
+                .map(|pending| pending.link);
+            if let Some(link) = link {
+                let (msg, dur) = match link::open_link(&link) {
+                    Ok(_) => (
+                        format!("Opened: {}", link.text),
+                        Duration::from_millis(2500),
+                    ),
+                    Err(e) => (
+                        format!("Failed to open link: {}", e),
+                        Duration::from_secs(4),
+                    ),
+                };
+                self.status_message = msg;
+                self.status_expires_at = Some(std::time::Instant::now() + dur);
             }
         }
 
@@ -4371,7 +4574,13 @@ impl eframe::App for TerminalApp {
         }
 
         // 渲染 UI
-        self.render_ui(root_ui, terminal_pointer_input_blocked);
+        // A host-owned Ctrl-link press must not start renderer-local text
+        // selection in the same frame. The mouse capture already suppresses
+        // PTY reporting and PRIMARY-copy release for this gesture.
+        self.render_ui(
+            root_ui,
+            terminal_pointer_input_blocked || link_press_override,
+        );
 
         if !terminal_pointer_input_blocked && !self.terminal_input_blocked(ctx) {
             let selection_for_primary = match primary_copy_route {
@@ -4508,10 +4717,12 @@ mod tests {
         bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
-        flush_pending_mouse_controls, kitty_graphics_payload, mouse_lossy_reports_allowed,
-        mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
-        normalized_paste_body, osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows,
-        paste_policy, paste_requires_confirmation, primary_copy_route, queue_mouse_control,
+        flush_pending_mouse_controls, kitty_graphics_payload, link_activation_dragged,
+        link_activation_ready, link_activation_release_allowed, mouse_capture_accepts_new_press,
+        mouse_lossy_reports_allowed, mouse_press_reports_to_app, mouse_protocol_input_is_blocked,
+        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
+        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
+        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
         workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification, PasteOrigin,
@@ -5310,6 +5521,64 @@ mod tests {
                 repeat: false,
                 modifiers,
             }]
+        );
+    }
+
+    #[test]
+    fn ctrl_link_release_uses_press_target_and_drag_or_multiclick_cancels() {
+        let origin = egui::pos2(10.0, 10.0);
+        assert!(!link_activation_dragged(origin, egui::pos2(12.0, 11.0)));
+        assert!(link_activation_dragged(origin, egui::pos2(40.0, 10.0)));
+        // Modifier state is intentionally absent: Ctrl-only eligibility was
+        // decided at press, so releasing Ctrl before mouse-up cannot retarget.
+        assert!(link_activation_release_allowed(
+            "session-a",
+            "session-a",
+            false,
+            false,
+        ));
+        assert!(!link_activation_release_allowed(
+            "session-a",
+            "session-b",
+            false,
+            false,
+        ));
+        assert!(!link_activation_release_allowed(
+            "session-a",
+            "session-a",
+            true,
+            false,
+        ));
+        assert!(!link_activation_release_allowed(
+            "session-a",
+            "session-a",
+            false,
+            true,
+        ));
+        assert!(!link_activation_ready(None, 1.0, 0.3));
+        assert!(!link_activation_ready(Some(1.0), 1.29, 0.3));
+        assert!(
+            link_activation_ready(Some(1.0), 1.3, 0.3),
+            "single-click open waits until a second click can no longer promote the gesture"
+        );
+    }
+
+    #[test]
+    fn host_link_press_suppresses_app_mouse_and_second_button_fails_closed() {
+        assert!(mouse_press_reports_to_app(true, false, true, false));
+        assert!(!mouse_press_reports_to_app(true, false, true, true));
+        assert_eq!(
+            primary_copy_route(Some((false, true, 0)), true, true),
+            PrimaryCopyRoute::SuppressCaptured,
+            "a consumed host-link release must not copy a stale local selection to PRIMARY"
+        );
+        assert!(!mouse_press_reports_to_app(true, true, true, false));
+        assert!(!mouse_press_reports_to_app(true, false, false, false));
+
+        assert!(mouse_capture_accepts_new_press(false));
+        assert!(
+            !mouse_capture_accepts_new_press(true),
+            "left-down capture rejects an interleaved right/middle press instead of overwriting its release route"
         );
     }
 

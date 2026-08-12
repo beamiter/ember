@@ -12,6 +12,49 @@ pub const AGENT_BLOCK_COMMAND_PROMPT_BYTES: usize = 16 * 1024;
 pub const AGENT_BLOCK_OUTPUT_PROMPT_BYTES: usize = 64 * 1024;
 pub const AGENT_BLOCK_CWD_PROMPT_BYTES: usize = 4 * 1024;
 
+/// The pinned compatibility context has no nullable exit status. Keep the
+/// sentinel out of the semantic domain and explain it in the attached output
+/// so the model cannot mistake it for a shell-reported process status.
+pub const UNKNOWN_EXIT_STATUS_SENTINEL: i32 = -1;
+pub const UNKNOWN_EXIT_STATUS_NOTE: &str =
+    "[Ember context: shell reported no exit status; -1 is a compatibility sentinel.]\n";
+
+/// The exact preflight shared by the block menu and the Agent panel. A blank
+/// untruncated command is a genuine background-output block; a missing command
+/// whose producer set `command_truncated` is not silently reclassified.
+/// `output_available == None` means a lightweight UI snapshot cannot know
+/// whether the verified journal can recover an evicted live capture; the
+/// backend always passes `Some` after authoritative live+journal resolution.
+pub fn block_agent_context_disabled_reason(
+    command: Option<&str>,
+    command_exact: bool,
+    command_truncated: bool,
+    cwd: Option<&str>,
+    output_available: Option<bool>,
+) -> Option<&'static str> {
+    let command = command.filter(|command| !command.trim().is_empty());
+    if command_truncated {
+        return Some("The shell omitted or truncated the command metadata");
+    }
+    let Some(command) = command else {
+        return matches!(output_available, Some(false))
+            .then_some("Captured block output is unavailable");
+    };
+    if !command_exact {
+        return Some("Exact command metadata is required");
+    }
+    if command.len() > AGENT_BLOCK_COMMAND_PROMPT_BYTES {
+        return Some("The exact command exceeds the Agent context limit");
+    }
+    let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) else {
+        return Some("The command working directory is unavailable");
+    };
+    if cwd.len() > AGENT_BLOCK_CWD_PROMPT_BYTES {
+        return Some("The command working directory exceeds the Agent context limit");
+    }
+    matches!(output_available, Some(false)).then_some("Captured block output is unavailable")
+}
+
 /// An owned snapshot of one semantic command execution.
 ///
 /// The source identifiers remain stable when tabs and split panes are
@@ -62,7 +105,6 @@ pub enum ContextError {
     CommandTruncated,
     CommandExceedsPromptBudget,
     CwdExceedsPromptBudget,
-    MissingExitCode,
     OutputUnavailable,
 }
 
@@ -79,7 +121,6 @@ impl fmt::Display for ContextError {
             Self::CwdExceedsPromptBudget => {
                 "semantic command cwd exceeds the Agent prompt's workspace budget"
             }
-            Self::MissingExitCode => "semantic command context has no reported exit code",
             Self::OutputUnavailable => "semantic command context has no captured command output",
         })
     }
@@ -92,13 +133,14 @@ impl SemanticCommandContext {
     /// `jterm_core` agent prompt.
     ///
     /// This adapter is intentionally strict about unavailable evidence. In
-    /// particular, it never turns an unreported exit status into a made-up
-    /// failure code and never turns a failed output capture into genuine empty
-    /// output. The compatibility type has no command provenance fields, so an
-    /// explicitly truncated command is rejected rather than silently losing
-    /// that fact. `command_exact == false` remains representable as untrusted
-    /// evidence; callers must still require `command_exact` for Retry or any
-    /// other execution-authorizing action.
+    /// particular, an unreported exit status remains `None` in this semantic
+    /// snapshot; only the compatibility value uses `-1`, accompanied by an
+    /// explicit bounded note in its output. A failed output capture is never
+    /// turned into genuine empty output. The compatibility type has no command
+    /// provenance fields, so an explicitly truncated command is rejected
+    /// rather than silently losing that fact. `command_exact == false` remains
+    /// representable as untrusted evidence; callers must still require
+    /// `command_exact` for Retry or any other execution-authorizing action.
     pub fn to_block_context(&self) -> Result<BlockContext, ContextError> {
         if self.source_session_id.is_empty() {
             return Err(ContextError::MissingSourceSessionId);
@@ -124,21 +166,71 @@ impl SemanticCommandContext {
         {
             return Err(ContextError::CwdExceedsPromptBudget);
         }
-        let exit_code = self.exit_code.ok_or(ContextError::MissingExitCode)?;
         if !self.output_available {
             return Err(ContextError::OutputUnavailable);
         }
 
+        let (exit_code, output, compatibility_truncated) = match self.exit_code {
+            Some(exit_code) => (exit_code, self.output_text.clone(), false),
+            None => {
+                let (output, clipped) = output_with_unknown_exit_note(&self.output_text);
+                let source_budget =
+                    AGENT_BLOCK_OUTPUT_PROMPT_BYTES.saturating_sub(UNKNOWN_EXIT_STATUS_NOTE.len());
+                (
+                    UNKNOWN_EXIT_STATUS_SENTINEL,
+                    output,
+                    clipped || self.output_total_bytes > source_budget,
+                )
+            }
+        };
+
         Ok(BlockContext {
             cmd: command.clone(),
-            output: self.output_text.clone(),
+            output,
             cwd: self.cwd.clone(),
             exit_code,
             truncated: self.output_truncated
+                || compatibility_truncated
                 || self.output_text.len() > AGENT_BLOCK_OUTPUT_PROMPT_BYTES
                 || self.output_total_bytes > AGENT_BLOCK_OUTPUT_PROMPT_BYTES,
         })
     }
+}
+
+/// Prefix the fixed unknown-status explanation while charging it to the
+/// compatibility output budget. Retaining both ends mirrors jagent's prompt
+/// elision and preserves late diagnostics without ever dropping the note.
+fn output_with_unknown_exit_note(output: &str) -> (String, bool) {
+    const ELISION_MARKER: &str = "\n\n… [bytes elided] …\n\n";
+
+    let source_budget =
+        AGENT_BLOCK_OUTPUT_PROMPT_BYTES.saturating_sub(UNKNOWN_EXIT_STATUS_NOTE.len());
+    if output.len() <= source_budget {
+        let mut bounded = String::with_capacity(UNKNOWN_EXIT_STATUS_NOTE.len() + output.len());
+        bounded.push_str(UNKNOWN_EXIT_STATUS_NOTE);
+        bounded.push_str(output);
+        return (bounded, false);
+    }
+
+    let retained_budget = source_budget.saturating_sub(ELISION_MARKER.len());
+    let head_budget = retained_budget / 2;
+    let tail_budget = retained_budget.saturating_sub(head_budget);
+    let mut head_end = head_budget.min(output.len());
+    while head_end > 0 && !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len().saturating_sub(tail_budget);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let mut bounded = String::with_capacity(AGENT_BLOCK_OUTPUT_PROMPT_BYTES);
+    bounded.push_str(UNKNOWN_EXIT_STATUS_NOTE);
+    bounded.push_str(&output[..head_end]);
+    bounded.push_str(ELISION_MARKER);
+    bounded.push_str(&output[tail_start..]);
+    debug_assert!(bounded.len() <= AGENT_BLOCK_OUTPUT_PROMPT_BYTES);
+    (bounded, true)
 }
 
 impl TryFrom<&SemanticCommandContext> for BlockContext {
@@ -211,14 +303,46 @@ mod tests {
     }
 
     #[test]
-    fn missing_exit_code_is_never_coerced_to_failure() {
+    fn missing_exit_code_uses_explained_bounded_compatibility_sentinel() {
         let mut semantic = context();
         semantic.exit_code = None;
+        semantic.output_truncated = false;
+        semantic.output_text = "diagnostic\n".to_string();
+        semantic.output_total_bytes = semantic.output_text.len();
 
+        let block = semantic
+            .to_block_context()
+            .expect("unknown status is analyzable");
+        assert_eq!(block.exit_code, UNKNOWN_EXIT_STATUS_SENTINEL);
+        assert!(block.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+        assert!(block.output.ends_with("diagnostic\n"));
+        assert!(!block.truncated);
         assert_eq!(
-            semantic.to_block_context(),
-            Err(ContextError::MissingExitCode)
+            semantic.exit_code, None,
+            "semantic provenance stays unknown"
         );
+    }
+
+    #[test]
+    fn unknown_exit_note_is_counted_in_output_budget_and_truncation() {
+        let mut semantic = context();
+        semantic.exit_code = None;
+        semantic.output_truncated = false;
+        let source_budget = AGENT_BLOCK_OUTPUT_PROMPT_BYTES - UNKNOWN_EXIT_STATUS_NOTE.len();
+        semantic.output_text = "x".repeat(source_budget);
+        semantic.output_total_bytes = semantic.output_text.len();
+
+        let exact = semantic.to_block_context().unwrap();
+        assert_eq!(exact.output.len(), AGENT_BLOCK_OUTPUT_PROMPT_BYTES);
+        assert!(!exact.truncated);
+
+        semantic.output_text.push('x');
+        semantic.output_total_bytes += 1;
+        let clipped = semantic.to_block_context().unwrap();
+        assert!(clipped.output.len() <= AGENT_BLOCK_OUTPUT_PROMPT_BYTES);
+        assert!(clipped.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+        assert!(clipped.output.contains("bytes elided"));
+        assert!(clipped.truncated);
     }
 
     #[test]
@@ -316,6 +440,71 @@ mod tests {
         assert_eq!(
             BlockContext::try_from(&semantic),
             Err(ContextError::MissingSourceExecutionId)
+        );
+    }
+
+    #[test]
+    fn agent_preflight_distinguishes_background_from_omitted_command_metadata() {
+        assert_eq!(
+            block_agent_context_disabled_reason(None, false, false, None, Some(true)),
+            None,
+            "captured background output needs no invented command or cwd"
+        );
+        assert_eq!(
+            block_agent_context_disabled_reason(None, false, true, None, Some(true)),
+            Some("The shell omitted or truncated the command metadata")
+        );
+        assert_eq!(
+            block_agent_context_disabled_reason(Some("echo ok"), true, false, None, Some(true)),
+            Some("The command working directory is unavailable")
+        );
+        assert_eq!(
+            block_agent_context_disabled_reason(
+                Some("echo ok"),
+                true,
+                false,
+                Some("/tmp"),
+                Some(false),
+            ),
+            Some("Captured block output is unavailable")
+        );
+    }
+
+    #[test]
+    fn agent_preflight_mirrors_command_and_cwd_prompt_budgets() {
+        let command_at_limit = "x".repeat(AGENT_BLOCK_COMMAND_PROMPT_BYTES);
+        let cwd_at_limit = "/".repeat(AGENT_BLOCK_CWD_PROMPT_BYTES);
+        assert_eq!(
+            block_agent_context_disabled_reason(
+                Some(&command_at_limit),
+                true,
+                false,
+                Some(&cwd_at_limit),
+                Some(true),
+            ),
+            None
+        );
+        let command_over = format!("{command_at_limit}x");
+        assert_eq!(
+            block_agent_context_disabled_reason(
+                Some(&command_over),
+                true,
+                false,
+                Some("/tmp"),
+                Some(true),
+            ),
+            Some("The exact command exceeds the Agent context limit")
+        );
+        let cwd_over = format!("{cwd_at_limit}x");
+        assert_eq!(
+            block_agent_context_disabled_reason(
+                Some("echo ok"),
+                true,
+                false,
+                Some(&cwd_over),
+                Some(true),
+            ),
+            Some("The command working directory exceeds the Agent context limit")
         );
     }
 }

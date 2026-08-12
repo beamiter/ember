@@ -240,6 +240,17 @@ blank/background record carrying a nonzero raw status is not a failed command,
 while a real command with no reported status remains unknown rather than
 success.
 
+Whole-block interaction applies only to completed records. A plain click on a
+command header selects that card; `Shift+Click` on any finished row extends a
+contiguous range and `Ctrl+Shift+Click` toggles one card. Plain output clicks,
+drags, double-clicks, and triple-clicks remain native terminal text selection,
+and text selection takes precedence over whole-card copying. Right-click uses
+the pressed card as a stable target and exposes selection-aware copy/reinput,
+search, bookmark, Agent, JSON-copy, and navigation actions. Per-card output
+filtering, deletion, and file export are shown as unavailable because Ember's
+history is one continuous terminal grid; pretending to delete only metadata
+would leave the visible terminal bytes behind.
+
 Select a failed row in the **Commands** sidebar (or use its context menu) to
 start a fresh Agent task with **Fix**, **Explain**, or **Create task**. The task
 never resumes an unrelated saved transcript, remains bound to the source
@@ -315,6 +326,8 @@ Defaults include:
 | Window opacity increase / decrease | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
 | Select all completed command blocks | `Ctrl+Shift+A` |
 | Reinput selected block commands (without running) | `Ctrl+Shift+I` |
+| Toggle bookmark on the active completed block | `Ctrl+Shift+B` |
+| Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
 | Toggle Agent panel | `Ctrl+Shift+Alt+A` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |

@@ -472,6 +472,34 @@ enum BlockSelectionKeyAction {
     Clear,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopySelectionRoute {
+    TerminalText,
+    CommandBlocks,
+    None,
+}
+
+fn copy_selection_route(has_terminal_text: bool, has_command_blocks: bool) -> CopySelectionRoute {
+    if has_terminal_text {
+        CopySelectionRoute::TerminalText
+    } else if has_command_blocks {
+        CopySelectionRoute::CommandBlocks
+    } else {
+        CopySelectionRoute::None
+    }
+}
+
+fn contextual_block_shortcut_available(
+    command: &keybindings::Command,
+    has_completed_selection: bool,
+) -> bool {
+    !matches!(
+        command,
+        keybindings::Command::BlockReinputSelectedCommands
+            | keybindings::Command::BlockToggleBookmark
+    ) || has_completed_selection
+}
+
 fn ime_commit_can_queue_now(terminal_input_seen: bool, commit: &OrderedImeCommit) -> bool {
     !terminal_input_seen && !commit.deferred_input_before
 }
@@ -556,22 +584,35 @@ impl TerminalApp {
             session.terminal.lock().copy_selection()
         };
 
-        let Some(text) = selected else {
-            self.set_status("Nothing selected");
-            return;
-        };
-        let char_count = text.chars().count();
-        match self
-            .clipboard
+        let active_session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let has_blocks = self
+            .block_selection
             .as_ref()
-            .map(|clipboard| clipboard.copy(&text))
-        {
-            Some(Ok(())) => self.set_status(format!("Copied {} characters", char_count)),
-            Some(Err(error)) => self.set_status_for(
-                format!("Copy failed: {}", error),
-                std::time::Duration::from_secs(4),
-            ),
-            None => self.set_status("Clipboard is unavailable"),
+            .is_some_and(|selection| selection.session_id == active_session_id);
+        match copy_selection_route(selected.is_some(), has_blocks) {
+            CopySelectionRoute::TerminalText => {
+                let text = selected.expect("route checked terminal selection");
+                let char_count = text.chars().count();
+                match self
+                    .clipboard
+                    .as_ref()
+                    .map(|clipboard| clipboard.copy(&text))
+                {
+                    Some(Ok(())) => self.set_status(format!("Copied {} characters", char_count)),
+                    Some(Err(error)) => self.set_status_for(
+                        format!("Copy failed: {}", error),
+                        std::time::Duration::from_secs(4),
+                    ),
+                    None => self.set_status("Clipboard is unavailable"),
+                }
+            }
+            CopySelectionRoute::CommandBlocks => self.block_copy_block(),
+            CopySelectionRoute::None => self.set_status("Nothing selected"),
         }
     }
 
@@ -784,6 +825,9 @@ impl TerminalApp {
                 }
             }
             keybindings::Command::TerminalJumpPrevMark => {
+                if self.block_scroll_selected_edge(false) {
+                    return false;
+                }
                 let jumped = self
                     .session_manager
                     .get_active_session_mut()
@@ -795,6 +839,9 @@ impl TerminalApp {
                 }
             }
             keybindings::Command::TerminalJumpNextMark => {
+                if self.block_scroll_selected_edge(true) {
+                    return false;
+                }
                 let jumped = self
                     .session_manager
                     .get_active_session_mut()
@@ -820,6 +867,13 @@ impl TerminalApp {
             keybindings::Command::BlockJumpPrevFailed => self.block_jump_prev_failed(),
             keybindings::Command::BlockJumpNextFailed => self.block_jump_next_failed(),
             keybindings::Command::BlockSearchToggle => self.block_search_toggle(),
+            keybindings::Command::BlockToggleBookmark => self.block_toggle_bookmark(),
+            keybindings::Command::BlockJumpPrevBookmark => {
+                self.block_jump_bookmark(crate::block_mode::SelectStep::Older)
+            }
+            keybindings::Command::BlockJumpNextBookmark => {
+                self.block_jump_bookmark(crate::block_mode::SelectStep::Newer)
+            }
             keybindings::Command::FontIncrease => {
                 self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")
             }
@@ -1423,6 +1477,15 @@ impl TerminalApp {
                     // older bytes when input blocking is recomputed below.
                     return OrderedPressOutcome::Ignored;
                 }
+                if !contextual_block_shortcut_available(
+                    &command,
+                    self.live_block_target().is_some(),
+                ) {
+                    // Contextual shortcuts with no immutable card target stay
+                    // in frame_events for the terminal encoder. Command-palette
+                    // invocation still dispatches normally and may show a toast.
+                    return OrderedPressOutcome::Ignored;
+                }
 
                 let selection_before = self.block_selection.clone();
                 if self.dispatch_command(ctx, command.clone()) {
@@ -1438,6 +1501,8 @@ impl TerminalApp {
                         | keybindings::Command::BlockSelectAll
                         | keybindings::Command::BlockJumpPrevFailed
                         | keybindings::Command::BlockJumpNextFailed
+                        | keybindings::Command::BlockJumpPrevBookmark
+                        | keybindings::Command::BlockJumpNextBookmark
                 );
                 if self.block_selection.is_some()
                     && (self.block_selection != selection_before || selection_command)
@@ -1578,9 +1643,9 @@ impl TerminalApp {
                             terminal.set_preedit(text.clone(), cursor);
                         }
                     }
-                    egui::ImeEvent::Commit(text) => {
+                    egui::ImeEvent::Commit(_text) => {
                         terminal.clear_preedit();
-                        crate::debug_log!("[IME] Commit state: {} bytes", text.len());
+                        crate::debug_log!("[IME] Commit state: {} bytes", _text.len());
                         // 不要在 commit 时置 ime_enabled = false
                         // commit 只是确认一个字/词，不代表用户要退出中文输入模式
                         // 只有 ImeEvent::Disabled 才是真正的 IME 关闭信号
@@ -1665,6 +1730,31 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_prefers_terminal_text_then_whole_blocks() {
+        assert_eq!(
+            copy_selection_route(true, true),
+            CopySelectionRoute::TerminalText
+        );
+        assert_eq!(
+            copy_selection_route(false, true),
+            CopySelectionRoute::CommandBlocks
+        );
+        assert_eq!(copy_selection_route(false, false), CopySelectionRoute::None);
+        assert!(!contextual_block_shortcut_available(
+            &keybindings::Command::BlockToggleBookmark,
+            false,
+        ));
+        assert!(!contextual_block_shortcut_available(
+            &keybindings::Command::BlockReinputSelectedCommands,
+            false,
+        ));
+        assert!(contextual_block_shortcut_available(
+            &keybindings::Command::BlockToggleBookmark,
+            true,
+        ));
+    }
 
     fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {

@@ -108,6 +108,74 @@ pub(crate) fn grid_position_from_content(
     (row, col)
 }
 
+fn normalized_block_anchor(line_id: u64, column: usize, cols: usize) -> (u64, usize) {
+    if cols > 0 && column >= cols {
+        (
+            line_id.saturating_add(u64::try_from(column / cols).unwrap_or(u64::MAX)),
+            column % cols,
+        )
+    } else {
+        (line_id, column)
+    }
+}
+
+fn block_header_contains(range: Option<((u64, usize), (u64, usize))>, point: (u64, usize)) -> bool {
+    range.is_some_and(|(start, end)| start <= point && point < end)
+}
+
+fn semantic_block_header_range(
+    has_command: bool,
+    complete: bool,
+    prompt_start: crate::terminal::BufferAnchor,
+    command_start: Option<crate::terminal::BufferAnchor>,
+    output_start: Option<crate::terminal::BufferAnchor>,
+    cols: usize,
+) -> Option<((u64, usize), (u64, usize))> {
+    if has_command {
+        command_start
+            .zip(output_start)
+            .and_then(|(_command_start, output_start)| {
+                let start =
+                    normalized_block_anchor(prompt_start.line_id, prompt_start.column, cols);
+                let end = normalized_block_anchor(output_start.line_id, output_start.column, cols);
+                (start < end).then_some((start, end))
+            })
+    } else if complete {
+        let row =
+            crate::block_mode::prompt_row_line_id(prompt_start.line_id, prompt_start.column, cols);
+        Some(((row, 0), (row.saturating_add(1), 0)))
+    } else {
+        None
+    }
+}
+
+fn block_press_gesture(
+    modifiers: egui::Modifiers,
+    header: bool,
+) -> Option<crate::block_mode::BlockSelectionGesture> {
+    if modifiers.shift && modifiers.ctrl {
+        Some(crate::block_mode::BlockSelectionGesture::Toggle)
+    } else if modifiers.shift {
+        Some(crate::block_mode::BlockSelectionGesture::Extend)
+    } else if header {
+        Some(crate::block_mode::BlockSelectionGesture::Plain)
+    } else {
+        None
+    }
+}
+
+fn context_target_after_pointer_frame(
+    current: Option<String>,
+    secondary_pressed: bool,
+    pressed_target: Option<&str>,
+) -> Option<String> {
+    if secondary_pressed {
+        pressed_target.map(str::to_owned)
+    } else {
+        current
+    }
+}
+
 fn local_selection_capture_after_press(
     current_terminal: Option<usize>,
     rendered_terminal: usize,
@@ -452,16 +520,29 @@ fn xterm_encode_modify_other_keys(
 struct BlockChromeEntry {
     id: String,
     span: crate::block_mode::VisibleBlockSpan,
+    viewport_top_line_id: u64,
+    cols: usize,
+    /// Prompt/command header range in normalized continuous-grid coordinates.
+    /// Output begins at the exclusive end, including a same-row column split.
+    header_range: Option<((u64, usize), (u64, usize))>,
     outcome: crate::block_mode::BlockOutcome,
     /// The newest incomplete semantic record owns the live input/running
     /// surface. It receives the accent card independently of block selection.
     live: bool,
     selected: bool,
     active: bool,
+    bookmarked: bool,
     hovered: bool,
     duration_ms: Option<u64>,
     /// Finish time, appended to the badge while the block is selected.
     finished_at: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockPrimaryPress {
+    terminal: usize,
+    record_id: String,
+    gesture: crate::block_mode::BlockSelectionGesture,
 }
 
 /// Layout-owned space before terminal column zero while Block Mode is on.
@@ -604,6 +685,17 @@ fn block_stripe_rect(card_rect: egui::Rect, requested_width: f32) -> egui::Rect 
     )
 }
 
+fn block_menu_button(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    enabled: bool,
+    disabled_reason: &'static str,
+) -> bool {
+    ui.add_enabled(enabled, egui::Button::new(label))
+        .on_disabled_hover_text(disabled_reason)
+        .clicked()
+}
+
 pub struct TerminalRenderer {
     pub font_size: f32,
     pub char_width: f32,
@@ -644,9 +736,19 @@ pub struct TerminalRenderer {
     /// Strongly outlined active edge within `selected_block_ids`. The other
     /// selected blocks keep a lighter outline.
     active_block_id: Option<String>,
+    /// Runtime, session-scoped bookmarks mirrored by the app. Kept as a set so
+    /// visible-card lookup remains O(1) even with the maximum retained history.
+    bookmarked_block_ids: std::collections::HashSet<String>,
     /// Block-mode hit-test outcome of this frame's click, drained by the app
     /// the way `cursor_move_input` is.
     pub block_click: Option<crate::block_mode::BlockClick>,
+    /// Context-menu action staged until the app releases its terminal borrow.
+    pub block_menu_action: Option<crate::block_mode::BlockMenuRequest>,
+    context_block_id: Option<String>,
+    context_block_terminal: Option<usize>,
+    /// Press-time whole-card ownership. Gesture, modifiers and stable target
+    /// never get recomputed from the release position.
+    block_primary_press: Option<BlockPrimaryPress>,
     /// Whether to use GPU-accelerated grid rendering
     pub gpu_rendering: bool,
     /// wgpu render state for GPU-accelerated grid rendering
@@ -743,7 +845,12 @@ impl TerminalRenderer {
             selected_block_ids: Vec::new(),
             selected_block_id_set: std::collections::HashSet::new(),
             active_block_id: None,
+            bookmarked_block_ids: std::collections::HashSet::new(),
             block_click: None,
+            block_menu_action: None,
+            context_block_id: None,
+            context_block_terminal: None,
+            block_primary_press: None,
             gpu_rendering: true,
             texture_cache: LruCache::new(NonZeroUsize::new(100).unwrap()),
             texture_cache_bytes: 0,
@@ -811,6 +918,16 @@ impl TerminalRenderer {
                 self.selected_block_id_set.clear();
                 self.active_block_id = None;
             }
+        }
+    }
+
+    pub fn set_block_bookmarks(&mut self, bookmarks: Option<&std::collections::HashSet<String>>) {
+        match bookmarks {
+            Some(bookmarks) if &self.bookmarked_block_ids != bookmarks => {
+                self.bookmarked_block_ids.clone_from(bookmarks);
+            }
+            None => self.bookmarked_block_ids.clear(),
+            Some(_) => {}
         }
     }
 
@@ -1201,10 +1318,13 @@ impl TerminalRenderer {
             });
             let live = record_index == newest && !record.complete;
             let span = if live {
+                let output_extent = record
+                    .output_start
+                    .and_then(|start| terminal.primary_content_extent_from(start));
                 crate::block_mode::visible_live_block_span(
                     record_index,
                     start,
-                    cursor_line_id,
+                    output_extent.map_or(cursor_line_id, |extent| extent.max(cursor_line_id)),
                     viewport_top,
                     rows,
                 )
@@ -1228,12 +1348,28 @@ impl TerminalRenderer {
                 record.complete,
                 record_index == newest,
             );
+            let has_command = record
+                .command
+                .as_deref()
+                .is_some_and(|command| !command.trim().is_empty());
+            let header_range = semantic_block_header_range(
+                has_command,
+                record.complete,
+                record.prompt_start,
+                record.command_start,
+                record.output_start,
+                cols,
+            );
             entries.push(BlockChromeEntry {
                 selected: self.selected_block_id_set.contains(record.id.as_str()),
                 active: self.active_block_id.as_deref() == Some(record.id.as_str()),
+                bookmarked: self.bookmarked_block_ids.contains(record.id.as_str()),
                 live,
                 hovered: false,
                 id: record.id.clone(),
+                viewport_top_line_id: viewport_top,
+                cols,
+                header_range,
                 outcome,
                 duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
                     running_duration_ms
@@ -1340,6 +1476,126 @@ impl TerminalRenderer {
         )
     }
 
+    fn finished_block_at_position<'a>(
+        &self,
+        entries: &'a [BlockChromeEntry],
+        pos: egui::Pos2,
+        content_rect: egui::Rect,
+        line_height: f32,
+        viewport_rows: usize,
+    ) -> Option<(&'a BlockChromeEntry, bool)> {
+        if !line_height.is_finite()
+            || line_height <= 0.0
+            || pos.y < content_rect.top()
+            || pos.y >= content_rect.bottom()
+        {
+            return None;
+        }
+        let row = (((pos.y - content_rect.top()) / line_height)
+            .floor()
+            .max(0.0) as usize)
+            .min(viewport_rows.saturating_sub(1));
+        let entry = entries.iter().find(|entry| {
+            entry.span.first_row <= row
+                && row <= entry.span.last_row
+                && !entry.live
+                && entry.outcome != crate::block_mode::BlockOutcome::Prompt
+        })?;
+        let geometry = self.card_geometry(entry, content_rect, line_height, viewport_rows)?;
+        let hit_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                geometry.rect.left() - crate::block_mode::GUTTER_CLICK_BAND_PX,
+                geometry.rect.top(),
+            ),
+            geometry.rect.right_bottom(),
+        );
+        if !hit_rect.contains(pos) {
+            return None;
+        }
+        let col = if self.char_width.is_finite() && self.char_width > 0.0 {
+            (((pos.x - content_rect.left()).max(0.0) / self.char_width).floor() as usize)
+                .min(entry.cols.saturating_sub(1))
+        } else {
+            0
+        };
+        let point = (entry.viewport_top_line_id.saturating_add(row as u64), col);
+        let header = block_header_contains(entry.header_range, point);
+        Some((entry, header))
+    }
+
+    /// Exact surface ownership used by all three buttons and wheel routing.
+    /// In Block Mode, immutable finished/history rows and every non-content
+    /// area (gutter, padding, scrollbar) stay local. Only the semantic live
+    /// card span belongs to an app on the primary grid; alternate-screen
+    /// content is wholly app-owned.
+    pub fn pointer_app_mouse_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        let Some(content_rect) = self.last_content_rect else {
+            return false;
+        };
+        if !content_rect.contains(pos) {
+            return false;
+        }
+        if terminal.is_alt_buffer_active() {
+            return true;
+        }
+        if !self.block_mode {
+            return true;
+        }
+        if !self.line_height.is_finite() || self.line_height <= 0.0 {
+            return false;
+        }
+        let rows = terminal.grid.rows();
+        let row = (((pos.y - content_rect.top()) / self.line_height)
+            .floor()
+            .max(0.0) as usize)
+            .min(rows.saturating_sub(1));
+        self.compute_block_chrome(terminal, rows)
+            .as_deref()
+            .is_none_or(|entries| {
+                entries.iter().any(|entry| {
+                    entry.live && entry.span.first_row <= row && row <= entry.span.last_row
+                })
+            })
+    }
+
+    /// Host-side Ctrl-link ownership is broader than application mouse
+    /// reporting: every real grid cell may contain a link, including unzoned
+    /// history, but a finished command header is reserved for whole-card
+    /// selection. Gutter, padding, and scrollbar remain outside this surface.
+    pub fn pointer_link_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        let Some(content_rect) = self.last_content_rect else {
+            return false;
+        };
+        if !content_rect.contains(pos) {
+            return false;
+        }
+        if terminal.is_alt_buffer_active() || !self.block_mode {
+            return true;
+        }
+        let rows = terminal.grid.rows();
+        !self
+            .compute_block_chrome(terminal, rows)
+            .as_deref()
+            .and_then(|entries| {
+                self.finished_block_at_position(entries, pos, content_rect, self.line_height, rows)
+            })
+            .is_some_and(|(_, header)| header)
+    }
+
+    #[cfg(test)]
+    fn pointer_is_finished_block_output(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
+        let Some(content_rect) = self.last_content_rect else {
+            return false;
+        };
+        let rows = terminal.grid.rows();
+        self.compute_block_chrome(terminal, rows)
+            .as_deref()
+            .and_then(|entries| {
+                self.finished_block_at_position(entries, pos, content_rect, self.line_height, rows)
+            })
+            .is_some_and(|(_, header)| !header)
+    }
+
     fn update_block_hover(
         &self,
         entries: &mut [BlockChromeEntry],
@@ -1380,6 +1636,221 @@ impl TerminalRenderer {
             geometry.rect.right_bottom(),
         );
         entry.hovered = hover_rect.contains(pos);
+    }
+
+    fn show_block_context_menu(
+        &mut self,
+        response: &egui::Response,
+        terminal: &TerminalState,
+        rendered_terminal: usize,
+    ) {
+        if self.context_block_terminal != Some(rendered_terminal) {
+            self.context_block_id = None;
+            self.context_block_terminal = Some(rendered_terminal);
+            egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
+        }
+        let Some(target_id) = self.context_block_id.clone() else {
+            return;
+        };
+        let records = terminal.command_records();
+        let Some(clicked_index) = records.iter().position(|record| record.id == target_id) else {
+            self.context_block_id = None;
+            egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
+            return;
+        };
+        let selected_ids: Vec<&str> = if self.selected_block_id_set.contains(target_id.as_str()) {
+            self.selected_block_ids.iter().map(String::as_str).collect()
+        } else {
+            vec![target_id.as_str()]
+        };
+        let selected_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.complete && selected_ids.iter().any(|id| *id == record.id))
+            .collect();
+        let selected_count = selected_records.len().max(1);
+        let plural = selected_count > 1;
+        let has_commands = selected_records.iter().any(|record| {
+            record.command_truncated
+                || record
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty())
+        });
+        let has_outputs = selected_records.iter().any(|record| {
+            record
+                .captured_output
+                .as_ref()
+                .is_some_and(|output| !output.text.is_empty())
+                || record.output_start.is_some()
+        });
+        let clicked = &records[clicked_index];
+        if !clicked.complete {
+            self.context_block_id = None;
+            egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
+            return;
+        }
+        // Static fields can be mirrored exactly here. Output availability is
+        // deliberately unknown: the app may recover an evicted live capture
+        // from its verified journal, which the renderer does not own. The
+        // backend applies the authoritative output gate after that merge.
+        let ask_agent_disabled_reason = crate::agent::context::block_agent_context_disabled_reason(
+            clicked.command.as_deref(),
+            clicked.command_exact,
+            clicked.command_truncated,
+            clicked.cwd.as_deref(),
+            None,
+        );
+        let can_ask_agent = ask_agent_disabled_reason.is_none();
+        let clicked_start = crate::block_mode::prompt_row_line_id(
+            clicked.prompt_start.line_id,
+            clicked.prompt_start.column,
+            terminal.grid.row_len(),
+        );
+        let clicked_end = records
+            .get(clicked_index + 1)
+            .map(|next| {
+                crate::block_mode::prompt_row_line_id(
+                    next.prompt_start.line_id,
+                    next.prompt_start.column,
+                    terminal.grid.row_len(),
+                )
+                .saturating_sub(1)
+            })
+            .or_else(|| clicked.end.map(|end| end.line_id))
+            .unwrap_or(clicked_start);
+        let long_block = clicked_end.saturating_sub(clicked_start)
+            >= terminal.grid.rows().saturating_sub(1) as u64;
+        let bookmarked = self.bookmarked_block_ids.contains(target_id.as_str());
+        let mut chosen = None;
+
+        response.context_menu(|ui| {
+            ui.set_min_width(220.0);
+            if block_menu_button(
+                ui,
+                if plural {
+                    "Copy Commands"
+                } else {
+                    "Copy Command"
+                },
+                has_commands,
+                "The selected block has no command",
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::CopyCommands);
+                ui.close();
+            }
+            if block_menu_button(
+                ui,
+                "Ask Agent About Block",
+                can_ask_agent,
+                ask_agent_disabled_reason.unwrap_or("Agent context is unavailable"),
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::AskAgent);
+                ui.close();
+            }
+            if block_menu_button(
+                ui,
+                if plural {
+                    "Copy Outputs"
+                } else {
+                    "Copy Output"
+                },
+                has_outputs,
+                "The selected block has no captured output",
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::CopyOutputs);
+                ui.close();
+            }
+            if block_menu_button(
+                ui,
+                if plural { "Copy Blocks" } else { "Copy Block" },
+                has_commands || has_outputs,
+                "The selected block has no copyable text",
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::CopyBlocks);
+                ui.close();
+            }
+            if block_menu_button(
+                ui,
+                if plural {
+                    "Copy Blocks as Markdown"
+                } else {
+                    "Copy Block as Markdown"
+                },
+                has_commands || has_outputs,
+                "The selected block has no exportable text",
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::CopyMarkdown);
+                ui.close();
+            }
+            if block_menu_button(
+                ui,
+                if plural {
+                    "Insert Commands at Prompt"
+                } else {
+                    "Insert Command at Prompt"
+                },
+                has_commands,
+                "The selection has no command to insert",
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::Reinput);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Scroll to Top of Block").clicked() {
+                chosen = Some(crate::block_mode::BlockMenuAction::ScrollTop);
+                ui.close();
+            }
+            if long_block && ui.button("Jump to Bottom of Block").clicked() {
+                chosen = Some(crate::block_mode::BlockMenuAction::ScrollBottom);
+                ui.close();
+            }
+            if ui.button("Search Across Blocks…").clicked() {
+                chosen = Some(crate::block_mode::BlockMenuAction::Search);
+                ui.close();
+            }
+            let _ = block_menu_button(
+                ui,
+                "Toggle Output Filter",
+                false,
+                "Per-block filtering is unavailable on Ember's continuous terminal grid",
+            );
+            if ui
+                .button(if bookmarked {
+                    "Remove Bookmark"
+                } else {
+                    "Bookmark Block"
+                })
+                .clicked()
+            {
+                chosen = Some(crate::block_mode::BlockMenuAction::ToggleBookmark);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Copy This Block as JSON").clicked() {
+                chosen = Some(crate::block_mode::BlockMenuAction::CopyJson);
+                ui.close();
+            }
+            let _ = block_menu_button(
+                ui,
+                "Export Block to File…",
+                false,
+                "File export is not yet available in Ember",
+            );
+            let _ = block_menu_button(
+                ui,
+                "Delete Block",
+                false,
+                "A single block cannot be safely deleted from Ember's continuous terminal grid",
+            );
+        });
+
+        if let Some(action) = chosen {
+            self.block_menu_action = Some(crate::block_mode::BlockMenuRequest {
+                record_id: target_id,
+                action,
+            });
+            self.context_block_id = None;
+        }
     }
 
     /// The card painter runs once per visible span before terminal cell
@@ -1566,6 +2037,22 @@ impl TerminalRenderer {
                 geometry,
                 egui::Stroke::new(border_width, border_color),
             );
+
+            if entry.bookmarked && entry.span.starts_in_viewport {
+                // Keep the marker wholly inside the layout-owned 8px gutter:
+                // a bookmarked card gains a persistent, non-text affordance
+                // without shifting or covering terminal column zero.
+                let center = egui::pos2(
+                    geometry.rect.left() - 6.0,
+                    (top_y + line_height * 0.32).min(geometry.rect.bottom() - 2.0),
+                );
+                painter.circle_filled(center, 2.2, self.block_accent_color());
+                painter.circle_stroke(
+                    center,
+                    2.2,
+                    egui::Stroke::new(0.7, self.theme.terminal_foreground()),
+                );
+            }
 
             // Right-aligned outcome badge on the first row, drawn only when
             // every cell it would cover is blank — never over prompt text.
@@ -1964,13 +2451,19 @@ impl TerminalRenderer {
             };
         let mouse_enabled = terminal.is_mouse_enabled();
         let rendered_terminal = terminal as *const TerminalState as usize;
+        let primary_pressed =
+            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        let press_app_mouse_eligible = primary_pressed
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pos| self.pointer_app_mouse_eligible(terminal, pos));
         self.local_selection_terminal = local_selection_capture_after_press(
             self.local_selection_terminal,
             rendered_terminal,
-            mouse_enabled,
+            mouse_enabled && press_app_mouse_eligible,
             interaction_enabled,
             response.hovered(),
-            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary)),
+            primary_pressed,
             ui.input(|input| input.modifiers.shift),
         );
         let local_selection_enabled = self.local_selection_terminal == Some(rendered_terminal);
@@ -2067,56 +2560,102 @@ impl TerminalRenderer {
             }
         }
 
-        // A plain local click in the content area dismisses the previous
-        // selection. Scrollbar navigation preserves it, and double/triple
-        // clicks replace it in their dedicated handlers below.
+        // Resolve the finished-card hit before any terminal selection/cursor
+        // path. This ordering is also mirrored by main.rs before PTY mouse
+        // encoding, so a historical card and a live mouse-reporting app never
+        // both consume the same edge.
         let click_pos = response.interact_pointer_pos();
         let pointer_in_content = click_pos.is_some_and(|pos| pos.x < scrollbar_x);
-        let plain_content_click = interaction_enabled
+        let block_hit = click_pos.and_then(|pos| {
+            self.finished_block_at_position(
+                block_chrome.as_deref()?,
+                pos,
+                content_rect,
+                line_height,
+                rows,
+            )
+            .map(|(entry, header)| (entry.id.clone(), header))
+        });
+        let modifiers = ui.input(|input| input.modifiers);
+        let primary_block_gesture = (interaction_enabled && primary_pressed)
+            .then_some(())
+            .and(block_hit.as_ref())
+            .and_then(|(record_id, header)| {
+                let gesture = block_press_gesture(modifiers, *header)?;
+                Some((record_id.clone(), gesture))
+            });
+        if let Some((record_id, gesture)) = primary_block_gesture.as_ref() {
+            self.block_primary_press = Some(BlockPrimaryPress {
+                terminal: rendered_terminal,
+                record_id: record_id.clone(),
+                gesture: *gesture,
+            });
+            terminal.selection = None;
+            self.block_click = Some(crate::block_mode::BlockClick::Select {
+                record_id: record_id.clone(),
+                gesture: *gesture,
+            });
+        } else if interaction_enabled
+            && primary_pressed
+            && block_hit
+                .as_ref()
+                .is_some_and(|(_, header)| !*header && !modifiers.shift)
+        {
+            self.block_primary_press = None;
+            // Any unclaimed history-body press belongs to native terminal
+            // text interaction, including a drag and the first edge of a
+            // double/triple click. Retire whole-card state immediately.
+            self.block_click = Some(crate::block_mode::BlockClick::Clear);
+        }
+
+        let block_press_claimed = self.block_primary_press.as_ref().is_some_and(|press| {
+            press.terminal == rendered_terminal
+                && terminal
+                    .command_record(&press.record_id)
+                    .is_some_and(|record| record.complete)
+                && matches!(
+                    press.gesture,
+                    crate::block_mode::BlockSelectionGesture::Plain
+                        | crate::block_mode::BlockSelectionGesture::Extend
+                        | crate::block_mode::BlockSelectionGesture::Toggle
+                )
+        });
+
+        let secondary_pressed = interaction_enabled
+            && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary));
+        if secondary_pressed {
+            self.context_block_id = context_target_after_pointer_frame(
+                self.context_block_id.take(),
+                true,
+                block_hit.as_ref().map(|(record_id, _)| record_id.as_str()),
+            );
+            if let Some(record_id) = self.context_block_id.clone() {
+                self.context_block_terminal = Some(rendered_terminal);
+                self.block_click = Some(crate::block_mode::BlockClick::Select {
+                    record_id,
+                    gesture: crate::block_mode::BlockSelectionGesture::Activate,
+                });
+            } else {
+                egui::Popup::close_id(ctx, egui::Popup::default_response_id(&response));
+            }
+        }
+        self.show_block_context_menu(&response, terminal, rendered_terminal);
+
+        // A plain local body click dismisses the previous selection. Scrollbar
+        // navigation preserves it; header/modifier gestures above own their
+        // edge; double/triple clicks replace text selection below.
+        let plain_content_click = !block_press_claimed
+            && interaction_enabled
             && should_clear_selection_on_click(
                 local_selection_enabled,
-                ui.input(|input| input.modifiers.ctrl),
+                modifiers.ctrl,
                 response.clicked(),
                 response.double_clicked(),
                 response.triple_clicked(),
                 self.dragging_scrollbar,
                 pointer_in_content,
             );
-        // Block-mode gutter hit test: a plain click inside the narrow band at
-        // the content left edge selects the block on that row and consumes
-        // the click (no cursor move). Only stripe-bearing blocks are
-        // selectable; on the live prompt block (Prompt/Editing — exactly
-        // where click-to-place-cursor matters) the click falls through to
-        // normal handling.
-        let gutter_selected_block = if plain_content_click {
-            click_pos.and_then(|pos| {
-                let entries = block_chrome.as_ref()?;
-                let (row, _) = grid_position_from_content(
-                    pos,
-                    content_rect,
-                    char_width,
-                    line_height,
-                    cols,
-                    rows,
-                );
-                let entry = entries
-                    .iter()
-                    .find(|entry| entry.span.first_row <= row && row <= entry.span.last_row)
-                    .filter(|entry| entry.outcome != crate::block_mode::BlockOutcome::Prompt)?;
-                let geometry = self.card_geometry(entry, content_rect, line_height, rows)?;
-                (pos.x >= geometry.rect.left() - crate::block_mode::GUTTER_CLICK_BAND_PX
-                    && pos.x < geometry.rect.left())
-                .then(|| entry.id.clone())
-            })
-        } else {
-            None
-        };
-        if let Some(id) = gutter_selected_block {
-            // A consumed gutter click still dismisses the text selection, so
-            // a stale highlight cannot survive and be copied later.
-            terminal.selection = None;
-            self.block_click = Some(crate::block_mode::BlockClick::Select(id));
-        } else if plain_content_click {
+        if plain_content_click {
             // Any other plain content click drops the app-level block
             // selection along with the local text selection.
             self.block_click = Some(crate::block_mode::BlockClick::Clear);
@@ -2198,10 +2737,12 @@ impl TerminalRenderer {
         }
 
         // Text selection: only when not interacting with scrollbar
+        let modifier_block_gesture_owns_drag = block_press_claimed;
         if interaction_enabled
             && local_selection_enabled
             && response.drag_started()
             && !self.dragging_scrollbar
+            && !modifier_block_gesture_owns_drag
         {
             if let Some(pos) = response.interact_pointer_pos() {
                 // Only select text if NOT in scrollbar area
@@ -2228,6 +2769,7 @@ impl TerminalRenderer {
                     } else {
                         terminal.start_selection((row, col));
                     }
+                    self.block_click = Some(crate::block_mode::BlockClick::Clear);
                     ui.ctx().request_repaint();
                 }
             }
@@ -2238,6 +2780,7 @@ impl TerminalRenderer {
             && local_selection_enabled
             && response.dragged()
             && !self.dragging_scrollbar
+            && !modifier_block_gesture_owns_drag
         {
             if let Some(pos) = response.interact_pointer_pos() {
                 if pos.x < scrollbar_x {
@@ -2267,6 +2810,7 @@ impl TerminalRenderer {
         // handlers above still observe the press-time routing decision.
         if !ui.input(|input| input.pointer.any_down()) {
             self.local_selection_terminal = None;
+            self.block_primary_press = None;
         }
 
         // Extremely negative z-index images sit below non-default cell
@@ -4253,6 +4797,301 @@ mod tests {
         assert_eq!(renderer.grid_dimensions(available), (11, 5));
         assert_eq!(without_content.left(), 2.0);
         assert_eq!(without_content.right(), with_content.right());
+    }
+
+    #[test]
+    fn command_header_hit_spans_wrapped_rows_and_stops_at_same_row_output() {
+        // A pending-wrap prompt/command anchor normalizes onto the next
+        // physical row instead of turning the clipped row into a fake header.
+        assert_eq!(normalized_block_anchor(10, 8, 8), (11, 0));
+
+        let wrapped_multiline = Some(((100, 2), (103, 4)));
+        assert!(!block_header_contains(wrapped_multiline, (100, 1)));
+        assert!(block_header_contains(wrapped_multiline, (100, 2)));
+        assert!(block_header_contains(wrapped_multiline, (101, 0)));
+        assert!(block_header_contains(wrapped_multiline, (102, 7)));
+        assert!(block_header_contains(wrapped_multiline, (103, 3)));
+        assert!(!block_header_contains(wrapped_multiline, (103, 4)));
+
+        let same_row_output = Some(((40, 0), (40, 12)));
+        assert!(block_header_contains(same_row_output, (40, 11)));
+        assert!(!block_header_contains(same_row_output, (40, 12)));
+        assert!(!block_header_contains(None, (40, 0)));
+
+        let background = semantic_block_header_range(
+            false,
+            true,
+            crate::terminal::BufferAnchor {
+                line_id: 50,
+                column: 3,
+            },
+            None,
+            Some(crate::terminal::BufferAnchor {
+                line_id: 50,
+                column: 3,
+            }),
+            8,
+        );
+        assert!(block_header_contains(background, (50, 0)));
+        assert!(block_header_contains(background, (50, 7)));
+        assert!(!block_header_contains(background, (51, 0)));
+        assert_eq!(
+            block_press_gesture(egui::Modifiers::NONE, true),
+            Some(crate::block_mode::BlockSelectionGesture::Plain),
+            "plain background first-row clicks select the card"
+        );
+        assert_eq!(
+            block_press_gesture(egui::Modifiers::NONE, false),
+            None,
+            "later background output rows keep native text interaction"
+        );
+        assert_eq!(
+            semantic_block_header_range(
+                false,
+                false,
+                crate::terminal::BufferAnchor {
+                    line_id: 50,
+                    column: 3,
+                },
+                None,
+                None,
+                8,
+            ),
+            None,
+            "live background output is terminal-owned"
+        );
+    }
+
+    #[test]
+    fn ask_agent_menu_preflight_matches_background_and_command_contract() {
+        use crate::agent::context::block_agent_context_disabled_reason as reason;
+
+        assert_eq!(reason(None, false, false, None, None), None);
+        assert_eq!(
+            reason(None, false, true, None, None),
+            Some("The shell omitted or truncated the command metadata")
+        );
+        assert_eq!(
+            reason(Some("echo ok"), false, false, Some("/tmp"), None),
+            Some("Exact command metadata is required")
+        );
+        assert_eq!(
+            reason(Some("echo ok"), true, false, Some("/tmp"), None),
+            None,
+            "unknown output must not false-disable a journal-recoverable block"
+        );
+    }
+
+    #[test]
+    fn whole_block_gesture_and_target_are_owned_at_mouse_down() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            block_press_gesture(shift, false),
+            Some(crate::block_mode::BlockSelectionGesture::Extend)
+        );
+        assert_eq!(
+            block_press_gesture(ctrl_shift, false),
+            Some(crate::block_mode::BlockSelectionGesture::Toggle)
+        );
+        assert_eq!(
+            block_press_gesture(egui::Modifiers::NONE, true),
+            Some(crate::block_mode::BlockSelectionGesture::Plain)
+        );
+        assert_eq!(block_press_gesture(egui::Modifiers::NONE, false), None);
+
+        let press = BlockPrimaryPress {
+            terminal: 7,
+            record_id: "block-a".into(),
+            gesture: block_press_gesture(shift, false).expect("shift owns press"),
+        };
+        // Releasing Shift and moving over another card cannot change either
+        // field because release routing consumes this owned snapshot.
+        assert_eq!(press.record_id, "block-a");
+        assert_eq!(
+            press.gesture,
+            crate::block_mode::BlockSelectionGesture::Extend
+        );
+
+        let pressed_a = context_target_after_pointer_frame(None, true, Some("block-a"));
+        let released_over_b = context_target_after_pointer_frame(pressed_a, false, Some("block-b"));
+        assert_eq!(released_over_b.as_deref(), Some("block-a"));
+        assert_eq!(
+            context_target_after_pointer_frame(released_over_b, true, None),
+            None,
+            "a new background press cancels the stale menu target"
+        );
+    }
+
+    #[test]
+    fn app_mouse_surface_excludes_finished_rows_gutter_and_scrollbar() {
+        let mut terminal = TerminalState::new(20, 8);
+        terminal.process_input(b"pre-zone history\r\n");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=done\x07echo ok\r\n");
+        terminal.process_input(
+            b"\x1b]133;C;jsh_id=done;cmdline_url=echo%20ok\x07output\r\n\x1b]133;D;0;jsh_id=done\x07\r\n",
+        );
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=live\x07");
+        terminal.process_input(b"\x1b[?1000h");
+
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        renderer.char_width = 8.0;
+        renderer.line_height = 20.0;
+        renderer.last_content_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(10.0, 10.0),
+            egui::vec2(160.0, 160.0),
+        ));
+        let point_for = |row: usize| egui::pos2(14.0, 20.0 * row as f32 + 20.0);
+        let done_row = terminal
+            .buffer_anchor_to_viewport(
+                terminal
+                    .command_record("done")
+                    .expect("finished block")
+                    .prompt_start,
+            )
+            .expect("finished row visible")
+            .0;
+        let output_row = terminal
+            .buffer_anchor_to_viewport(
+                terminal
+                    .command_record("done")
+                    .expect("finished block")
+                    .output_start
+                    .expect("output anchor"),
+            )
+            .expect("output row visible")
+            .0;
+        let live_row = terminal
+            .buffer_anchor_to_viewport(
+                terminal
+                    .command_record("live")
+                    .expect("live prompt")
+                    .prompt_start,
+            )
+            .expect("live row visible")
+            .0;
+
+        // One predicate is shared by primary, secondary, middle and wheel in
+        // main.rs, so the finished result cannot diverge by input kind.
+        let pre_zone = point_for(0);
+        assert!(!renderer.pointer_app_mouse_eligible(&terminal, pre_zone));
+        assert_eq!(
+            local_selection_capture_after_press(
+                None,
+                99,
+                terminal.is_mouse_enabled()
+                    && renderer.pointer_app_mouse_eligible(&terminal, pre_zone),
+                true,
+                true,
+                true,
+                false,
+            ),
+            Some(99),
+            "mouse mode must not leave pre-zone history owned by neither app nor local selection"
+        );
+        assert!(!renderer.pointer_app_mouse_eligible(&terminal, point_for(done_row)));
+        assert!(renderer.pointer_app_mouse_eligible(&terminal, point_for(live_row)));
+        assert_eq!(
+            local_selection_capture_after_press(
+                None,
+                99,
+                terminal.is_mouse_enabled()
+                    && renderer.pointer_app_mouse_eligible(&terminal, point_for(live_row)),
+                true,
+                true,
+                true,
+                false,
+            ),
+            None,
+            "the live card remains application-owned in mouse mode"
+        );
+        assert!(!renderer.pointer_link_eligible(&terminal, point_for(done_row)));
+        assert!(renderer.pointer_link_eligible(&terminal, point_for(output_row)));
+        assert!(renderer.pointer_link_eligible(&terminal, point_for(live_row)));
+        assert!(!renderer.pointer_is_finished_block_output(&terminal, point_for(done_row)));
+        assert!(renderer.pointer_is_finished_block_output(&terminal, point_for(output_row)));
+        assert!(!renderer.pointer_is_finished_block_output(&terminal, point_for(live_row)));
+        assert!(!renderer
+            .pointer_app_mouse_eligible(&terminal, egui::pos2(5.0, point_for(live_row).y),));
+        assert!(!renderer
+            .pointer_app_mouse_eligible(&terminal, egui::pos2(175.0, point_for(live_row).y),));
+
+        let unzoned_primary = TerminalState::new(20, 8);
+        assert!(
+            renderer.pointer_app_mouse_eligible(&unzoned_primary, point_for(0)),
+            "a primary grid without a usable OSC 133 partition falls back to terminal ownership"
+        );
+        assert!(renderer.pointer_link_eligible(&unzoned_primary, point_for(0)));
+
+        renderer.block_mode = false;
+        assert!(renderer.pointer_app_mouse_eligible(&terminal, point_for(done_row)));
+        assert!(renderer.pointer_link_eligible(&terminal, point_for(done_row)));
+        renderer.block_mode = true;
+
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(renderer.pointer_app_mouse_eligible(&terminal, point_for(0)));
+        assert!(renderer.pointer_link_eligible(&terminal, point_for(0)));
+        assert!(!renderer.pointer_link_eligible(&terminal, egui::pos2(5.0, 20.0)));
+    }
+
+    #[test]
+    fn live_app_mouse_surface_keeps_visible_output_below_a_cursor_up() {
+        let mut terminal = TerminalState::new(20, 14);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=live\x07run\r\n\x1b]133;C;jsh_id=live;cmdline_url=run\x07",
+        );
+        terminal.process_input(b"0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\x1b[7A");
+        let output_start = terminal
+            .command_record("live")
+            .and_then(|record| record.output_start)
+            .expect("running output anchor");
+        let extent = terminal
+            .primary_content_extent_from(output_start)
+            .expect("visible running output extent");
+        let cursor_line = terminal
+            .total_lines_scrolled
+            .saturating_add(terminal.get_cursor_pos().0 as u64);
+        assert!(extent > cursor_line.saturating_add(3));
+
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        renderer.char_width = 8.0;
+        renderer.line_height = 20.0;
+        renderer.last_content_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(10.0, 10.0),
+            egui::vec2(160.0, 280.0),
+        ));
+        let extent_row = terminal
+            .buffer_anchor_to_viewport(crate::terminal::BufferAnchor {
+                line_id: extent,
+                column: 0,
+            })
+            .expect("extent remains visible")
+            .0;
+        assert!(renderer.pointer_app_mouse_eligible(
+            &terminal,
+            egui::pos2(14.0, 20.0 * extent_row as f32 + 20.0),
+        ));
     }
 
     #[test]

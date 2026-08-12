@@ -76,6 +76,17 @@ pub struct PaneDrag {
     pub active: bool,
 }
 
+pub struct PendingLinkActivation {
+    pub session_id: String,
+    pub link: link::Link,
+    pub origin: egui::Pos2,
+    pub cancelled: bool,
+    /// Egui monotonic time of button-up. Opening is delayed through the
+    /// double-click window so the first edge of a double/triple click remains
+    /// native text selection rather than opening a link prematurely.
+    pub released_at: Option<f64>,
+}
+
 /// Show the confirmation dialog when the paste contains a newline (the most
 /// common foot-gun: pasting a multi-line block that runs commands without
 /// review) or when the paste is large enough that the user probably wants
@@ -219,12 +230,20 @@ pub struct TerminalApp {
     /// 输入,终端事件被拦截,因此不会顺带清掉 block_selection。
     pub block_search: crate::block_search::BlockSearchState,
 
+    /// Runtime bookmarks keyed by stable session and execution identity, not
+    /// mutable tab/pane indices.
+    pub block_bookmarks: std::collections::HashMap<String, std::collections::HashSet<String>>,
+
     // Find & Replace (operates on selection)
     pub search_replace_panel: search_replace_panel::SearchReplacePanel,
 
     // Link detection
     pub link_detector: link::LinkDetector,
     pub hovered_link: Option<link::Link>,
+    /// Ctrl-only link activation is captured at primary-button press. The
+    /// stable target survives modifier release; pointer drag cancels it rather
+    /// than retargeting to whatever happens to be hovered at button-up.
+    pub pending_link_activation: Option<PendingLinkActivation>,
     pub cached_links: Vec<link::Link>,
     pub cached_links_grid_version: u64,
     pub cached_links_scroll_offset: usize,

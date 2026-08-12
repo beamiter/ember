@@ -1419,6 +1419,23 @@ impl super::TerminalState {
         }
     }
 
+    /// Highest still-visible primary-grid row containing output at or after a
+    /// semantic output anchor. A full-screen program can print below the
+    /// cursor and then CUP back upward; mouse ownership must continue to cover
+    /// those displayed rows even though the cursor no longer reaches them.
+    pub(crate) fn primary_content_extent_from(&self, start: BufferAnchor) -> Option<u64> {
+        if self.use_alt_buffer {
+            return None;
+        }
+        let first_row = start
+            .line_id
+            .saturating_sub(self.total_lines_scrolled)
+            .min(self.grid.rows() as u64) as usize;
+        (first_row..self.grid.rows())
+            .rfind(|row| !self.line_is_blank(*row))
+            .map(|row| self.total_lines_scrolled.saturating_add(row as u64))
+    }
+
     /// Translate a recorded `line_id` to its current `scrollback` index, or
     /// `None` if the line has been evicted (or now lives in the live grid,
     /// which means it's already on screen).
@@ -1990,6 +2007,27 @@ impl super::TerminalState {
             .and_then(|index| self.command_records.get(index))
     }
 
+    /// Whether the current editable prompt is provably empty. Block recall is
+    /// intentionally stricter than an ordinary paste: it must never erase or
+    /// append to text the user already entered while reviewing a selection.
+    pub fn prompt_input_is_empty(&self) -> bool {
+        if self.agent_prompt_input_tainted || !self.shell_is_prompt_ready() {
+            return false;
+        }
+        let Some(record) = self.command_records.back() else {
+            return false;
+        };
+        let Some(start) = record.command_start else {
+            return false;
+        };
+        self.extract_text_range(
+            start,
+            self.current_buffer_anchor(),
+            MAX_OSC_133_COMMAND_BYTES,
+        )
+        .is_some_and(|text| text.text.is_empty())
+    }
+
     /// The command the shell reported as running via OSC 133, if any.
     ///
     /// Only the newest record can be running; an earlier one still marked
@@ -2384,6 +2422,51 @@ impl super::TerminalState {
             return false;
         }
         self.scroll_to_line_id(anchor.line_id)
+    }
+
+    /// Scroll the selected block's semantic top or bottom edge into view.
+    /// Bottom navigation aligns the edge with the viewport bottom when it is
+    /// retained, matching the private-scroll card action in anvil/forge while
+    /// keeping Ember's one continuous grid.
+    pub fn scroll_to_command_edge(&mut self, id: &str, bottom: bool) -> bool {
+        if self.use_alt_buffer {
+            return false;
+        }
+        let Some(index) = self.record_index_for_id(id) else {
+            return false;
+        };
+        let cols = self.grid.row_len();
+        let normalized = |anchor: BufferAnchor| {
+            if cols > 0 && anchor.column >= cols {
+                anchor.line_id.saturating_add(1)
+            } else {
+                anchor.line_id
+            }
+        };
+        let start = normalized(self.command_records[index].prompt_start);
+        let target = if bottom {
+            self.command_records
+                .get(index + 1)
+                .map(|record| normalized(record.prompt_start).saturating_sub(1))
+                .or_else(|| self.command_records[index].end.map(normalized))
+                .unwrap_or(start)
+        } else {
+            start
+        };
+        if self
+            .buffer_anchor_to_absolute(BufferAnchor {
+                line_id: target,
+                column: 0,
+            })
+            .is_none()
+        {
+            return false;
+        }
+        if !bottom {
+            return self.scroll_to_line_id(target);
+        }
+        let desired_top = target.saturating_sub(self.grid.rows().saturating_sub(1) as u64);
+        self.scroll_to_line_id(desired_top) || self.scroll_to_line_id(target)
     }
 
     /// Scroll the viewport so the row at `line_id` lands at the top of

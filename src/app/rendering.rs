@@ -593,6 +593,7 @@ impl TerminalApp {
         // Block-mode gutter clicks reported by whichever renderer drew the
         // clicked pane this frame, applied after every pane has rendered.
         let mut pending_block_click: Option<(String, crate::block_mode::BlockClick)> = None;
+        let mut pending_block_menu: Option<(String, crate::block_mode::BlockMenuRequest)> = None;
 
         // 多窗格支持：如果有多于一个窗格，则进行分屏渲染
         if self.layout().panes().len() > 1 {
@@ -673,6 +674,9 @@ impl TerminalApp {
                         .as_ref()
                         .filter(|selection| selection.session_id == session.metadata.session_id);
                     renderer.set_block_selection(pane_block_selection);
+                    renderer.set_block_bookmarks(
+                        self.block_bookmarks.get(&session.metadata.session_id),
+                    );
 
                     // 在指定矩形内渲染（多窗格模式专用方法）
                     renderer.render_in_rect(
@@ -689,6 +693,9 @@ impl TerminalApp {
 
                     if let Some(click) = renderer.block_click.take() {
                         pending_block_click = Some((session.metadata.session_id.clone(), click));
+                    }
+                    if let Some(action) = renderer.block_menu_action.take() {
+                        pending_block_menu = Some((session.metadata.session_id.clone(), action));
                     }
                 }
             }
@@ -844,6 +851,8 @@ impl TerminalApp {
                     .as_ref()
                     .filter(|selection| selection.session_id == session_id);
                 self.renderer.set_block_selection(block_selection);
+                self.renderer
+                    .set_block_bookmarks(self.block_bookmarks.get(&session_id));
                 let terminal_ptr = std::sync::Arc::as_ptr(&session.terminal) as usize;
                 let mut terminal_guard = session.terminal.lock();
 
@@ -875,7 +884,10 @@ impl TerminalApp {
                 );
                 drop(terminal_guard);
                 if let Some(click) = self.renderer.block_click.take() {
-                    pending_block_click = Some((session_id, click));
+                    pending_block_click = Some((session_id.clone(), click));
+                }
+                if let Some(action) = self.renderer.block_menu_action.take() {
+                    pending_block_menu = Some((session_id, action));
                 }
             }
         }
@@ -884,21 +896,8 @@ impl TerminalApp {
 
         if let Some((session_id, click)) = pending_block_click {
             match click {
-                crate::block_mode::BlockClick::Select(record_id) => {
-                    if !self.config.block_mode {
-                        self.clear_block_selection();
-                        return;
-                    }
-                    self.block_selection = Some(crate::block_mode::BlockSelection::single(
-                        session_id.clone(),
-                        record_id.clone(),
-                    ));
-                    // A gutter click highlights the matching Commands-sidebar
-                    // row, like keyboard selection and jump_first_failed do.
-                    self.sync_block_selection_to_sidebar(&super::commands::CommandTarget {
-                        session_id,
-                        execution_id: record_id,
-                    });
+                crate::block_mode::BlockClick::Select { record_id, gesture } => {
+                    self.apply_block_pointer_selection(&session_id, &record_id, gesture);
                 }
                 crate::block_mode::BlockClick::Clear => {
                     // Full-duplex sync: deselecting either view also drops
@@ -906,6 +905,9 @@ impl TerminalApp {
                     self.clear_block_selection();
                 }
             }
+        }
+        if let Some((session_id, request)) = pending_block_menu {
+            self.execute_block_menu_action(&session_id, request);
         }
     }
 
