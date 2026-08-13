@@ -117,8 +117,12 @@ pub struct ConfigPanel {
     edit_ai_temperature: String,
     edit_ai_redact_secrets: bool,
     edit_ai_share_command_context: bool,
+    /// Configured credential path retained for hand-edited configs. The UI
+    /// stores newly entered keys at ember's private default instead of asking
+    /// the user to enter a path.
     edit_ai_api_key_file: String,
-    /// 待存储的 API key 明文；点击 Store 写成 0600 文件后立即清空，从不落盘。
+    /// 待存储的 API key 明文；点击 Save key 写成 0600 文件后立即清空，
+    /// 从不进入 config.toml。
     edit_ai_key_draft: String,
     /// 最近一次存 key 的结果提示（成功路径或错误信息）。
     ai_key_store_status: Option<Result<String, String>>,
@@ -274,6 +278,9 @@ impl ConfigPanel {
         self.edit_ai_redact_secrets = config.ai_redact_secrets;
         self.edit_ai_share_command_context = config.ai_share_command_context;
         self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
+        // Never carry a secret draft across reopening/resetting the panel.
+        self.edit_ai_key_draft.clear();
+        self.ai_key_store_status = None;
         self.edit_agent_max_turns = config.agent_max_turns;
         self.edit_experimental_task_sidebar = config.experimental_task_sidebar;
         self.edit_remote_hosts = config
@@ -1144,45 +1151,33 @@ impl ConfigPanel {
             ui.label("0.0–2.0, empty = provider default");
         });
 
-        ui.horizontal(|ui| {
-            ui.label("API key file:");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.edit_ai_api_key_file)
-                        .hint_text("~/.config/ember/ai.key (chmod 600)")
-                        .desired_width(260.0),
-                )
-                .changed()
-            {
-                self.has_changes = true;
-            }
-        });
-        ui.label(
-            RichText::new(
-                "Optional single-line key file owned by you with 0600 permissions. \
-                 Environment variables (EMBER_AI_API_KEY_FILE, EMBER_AI_API_KEY, \
-                 ANTHROPIC_API_KEY, …) take precedence; the key itself is never \
-                 written to config.toml.",
-            )
-            .size(11.0)
-            .color(ui.visuals().weak_text_color()),
-        );
-
+        let default_key_path = jterm_core::ai::default_api_key_path();
         ui.horizontal(|ui| {
             ui.label("API key:");
-            ui.add(
+            let key_hint = if self.edit_ai_api_key_file.is_empty() {
+                "Paste API key"
+            } else {
+                "******** (stored; enter to replace)"
+            };
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut self.edit_ai_key_draft)
                     .password(true)
-                    .hint_text("paste key, Store writes a 600 file")
-                    .desired_width(200.0),
+                    .hint_text(key_hint)
+                    .desired_width(260.0),
             );
-            if ui.button("Store").clicked() {
-                // Same write-target rule as the rest of the family: the
-                // configured path, else the per-app default. The environment
-                // override stays read-only and is never written to.
-                let path = Some(self.edit_ai_api_key_file.trim().to_string())
-                    .filter(|path| !path.is_empty())
-                    .unwrap_or_else(jterm_core::ai::default_api_key_path);
+            if response.changed() {
+                self.ai_key_store_status = None;
+            }
+            if ui
+                .add_enabled(
+                    !self.edit_ai_key_draft.trim().is_empty(),
+                    egui::Button::new("Save key"),
+                )
+                .clicked()
+            {
+                // The environment override remains read-only. Settings-entered
+                // keys always use ember's private per-user default.
+                let path = default_key_path.clone();
                 self.ai_key_store_status = Some(match crate::persistence_file::write_api_key_file(
                     &path,
                     &self.edit_ai_key_draft,
@@ -1197,6 +1192,13 @@ impl ConfigPanel {
                 });
             }
         });
+        ui.label(
+            RichText::new(format!(
+                "Keys entered here are saved to {default_key_path} with owner-only permissions. The value is masked and is never written to config.toml. Environment API key variables still take precedence."
+            ))
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
         if let Some(status) = &self.ai_key_store_status {
             let (text, color) = match status {
                 Ok(message) => (message.as_str(), ui.visuals().weak_text_color()),
@@ -1752,6 +1754,25 @@ mod tests {
         let serialized = toml::to_string_pretty(&applied).expect("serialize config");
         let reparsed: Config = toml::from_str(&serialized).expect("reparse config");
         assert!(reparsed.ai_share_command_context);
+    }
+
+    #[test]
+    fn api_key_draft_is_ephemeral_and_configured_path_still_round_trips() {
+        let source = Config {
+            ai_api_key_file: Some("/run/private/ember.key".to_string()),
+            ..Config::default()
+        };
+        let mut panel = ConfigPanel::new();
+        panel.edit_ai_key_draft = "must-not-survive".to_string();
+        panel.ai_key_store_status = Some(Ok("old status".to_string()));
+
+        panel.sync_from_config(&source);
+
+        assert!(panel.edit_ai_key_draft.is_empty());
+        assert!(panel.ai_key_store_status.is_none());
+        let mut applied = Config::default();
+        panel.apply_to_config(&mut applied);
+        assert_eq!(applied.ai_api_key_file, source.ai_api_key_file);
     }
 
     #[test]

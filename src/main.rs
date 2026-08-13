@@ -2768,6 +2768,9 @@ impl eframe::App for TerminalApp {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Modal/search/settings text fields need egui's semantic clipboard
+        // events. They must bypass the terminal-specific Ctrl+C/X/V rewrite.
+        let ui_owns_clipboard = self.terminal_input_blocked(ctx);
         let preserve_paste_event = {
             let terminal = self
                 .session_manager
@@ -2780,7 +2783,7 @@ impl eframe::App for TerminalApp {
         // Egui-winit swallows Ctrl+V press when clipboard has no text (e.g. image only),
         // leaving only V's release. Track real/semantic V presses across frames so only
         // a genuinely orphaned release restores the application-facing Ctrl+V event.
-        if raw_input.focused {
+        if raw_input.focused && !ui_owns_clipboard {
             restore_missing_image_paste_key_event(&mut raw_input.events, &mut self.paste_key_state);
         } else {
             self.paste_key_state.reset();
@@ -2801,6 +2804,7 @@ impl eframe::App for TerminalApp {
             shortcut_modifiers,
             restore_shortcuts,
             preserve_paste_event,
+            ui_owns_clipboard,
         );
     }
 
@@ -5920,7 +5924,7 @@ mod tests {
         };
         let mut events = vec![egui::Event::Paste("ignored clipboard payload".to_owned())];
 
-        normalize_terminal_shortcut_events(&mut events, modifiers, true, false);
+        normalize_terminal_shortcut_events(&mut events, modifiers, true, false, false);
 
         assert_eq!(
             events,
@@ -6001,9 +6005,28 @@ mod tests {
             egui::Event::Text("a".to_owned()),
         ];
 
-        normalize_terminal_shortcut_events(&mut events, modifiers, false, false);
+        normalize_terminal_shortcut_events(&mut events, modifiers, false, false, false);
 
         assert_eq!(events, vec![egui::Event::Text("a".to_owned())]);
+    }
+
+    #[test]
+    fn settings_text_edit_keeps_semantic_clipboard_events() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            egui::Event::Copy,
+            egui::Event::Cut,
+            egui::Event::Paste("pasted API key".to_owned()),
+        ];
+        let expected = events.clone();
+
+        normalize_terminal_shortcut_events(&mut events, modifiers, true, false, true);
+
+        assert_eq!(events, expected);
     }
 
     #[test]
@@ -6015,7 +6038,7 @@ mod tests {
         };
         let mut events = vec![egui::Event::Paste("ignored".to_owned())];
 
-        normalize_terminal_shortcut_events(&mut events, modifiers, true, true);
+        normalize_terminal_shortcut_events(&mut events, modifiers, true, true, false);
 
         assert_eq!(events, vec![egui::Event::Paste("ignored".to_owned())]);
     }
@@ -6030,7 +6053,7 @@ mod tests {
         };
         let mut events = vec![egui::Event::Paste("clipboard text".to_owned())];
 
-        normalize_terminal_shortcut_events(&mut events, modifiers, true, true);
+        normalize_terminal_shortcut_events(&mut events, modifiers, true, true, false);
 
         assert_eq!(
             events,
@@ -6064,7 +6087,7 @@ mod tests {
         ];
 
         let recovered = semantic_paste_modifiers(&events, egui::Modifiers::NONE);
-        normalize_terminal_shortcut_events(&mut events, recovered, true, true);
+        normalize_terminal_shortcut_events(&mut events, recovered, true, true, false);
 
         assert!(events.iter().any(|event| {
             matches!(event,
@@ -6100,7 +6123,7 @@ mod tests {
         ];
 
         let recovered = semantic_paste_modifiers(&events, egui::Modifiers::NONE);
-        normalize_terminal_shortcut_events(&mut events, recovered, true, true);
+        normalize_terminal_shortcut_events(&mut events, recovered, true, true, false);
 
         assert!(events
             .iter()

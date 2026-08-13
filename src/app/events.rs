@@ -112,13 +112,24 @@ pub fn normalize_terminal_shortcut_events(
     modifiers: egui::Modifiers,
     restore_shortcuts: bool,
     preserve_paste_event: bool,
+    ui_owns_clipboard: bool,
 ) {
     crate::debug_log!(
-        "[NORMALIZE] input: {} events, restore_shortcuts={}, preserve_paste_event={}",
+        "[NORMALIZE] input: {} events, restore_shortcuts={}, preserve_paste_event={}, ui_owns_clipboard={}",
         events.len(),
         restore_shortcuts,
-        preserve_paste_event
+        preserve_paste_event,
+        ui_owns_clipboard
     );
+
+    // Text edits consume egui's semantic Copy/Cut/Paste events directly. In
+    // particular, converting Paste back into Ctrl+V (or dropping it) here
+    // makes settings fields accept only individually typed characters. A UI
+    // surface that blocks PTY input owns these events unchanged.
+    if ui_owns_clipboard {
+        crate::debug_log!("[NORMALIZE] preserving clipboard events for UI input owner");
+        return;
+    }
 
     let mut normalized_events = Vec::with_capacity(events.len());
 
