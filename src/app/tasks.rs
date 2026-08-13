@@ -7,15 +7,15 @@
 
 use crate::agent::{
     AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
-    CodexAppServerPhase, CodexAppServerViewSnapshot, NativePromptPolicy, TaskId, TaskRuntimeKind,
-    TaskStatus, TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX,
+    CodexAppServerPhase, CodexAppServerTurnHistory, CodexAppServerViewSnapshot, NativePromptPolicy,
+    TaskId, TaskRuntimeKind, TaskStatus, TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX,
     NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
 };
 use crate::app::state::TerminalApp;
-use crate::review_text::visible_bounded;
+use crate::review_text::{sanitize_prompt_payload, visible_bounded, VisualSpoofDisposition};
 use eframe::egui;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -157,7 +157,39 @@ fn render_native_codex_view(
                         .weak(),
                 );
             }
+            if let Some((kind, ordinal)) = native_flat_turn_heading(view) {
+                ui.label(
+                    egui::RichText::new(format!("· {kind} {ordinal}"))
+                        .small()
+                        .weak(),
+                );
+            }
         });
+
+        let history = visible_native_turn_history(view);
+        if !history.is_empty() || view.dropped_turns > 0 {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Completed turns ({})", history.len()))
+                        .small()
+                        .strong(),
+                );
+                if view.dropped_turns > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "· {} earlier turn(s) compacted",
+                            view.dropped_turns
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
+            for turn in history {
+                render_native_turn_history(ui, task_id, turn);
+            }
+        }
 
         for approval in &view.pending_approvals {
             ui.separator();
@@ -205,7 +237,12 @@ fn render_native_codex_view(
                         .strong(),
                 );
                 egui::ScrollArea::vertical()
-                    .id_salt(("native-file-approval", approval.id))
+                    .id_salt((
+                        "native-file-approval",
+                        task_id,
+                        view.displayed_turn_id,
+                        approval.id,
+                    ))
                     .max_height(280.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
@@ -266,9 +303,31 @@ fn render_native_codex_view(
             });
         }
 
+        if let Some(feedback) = view.displayed_follow_up_feedback.as_deref() {
+            ui.separator();
+            egui::CollapsingHeader::new("Your feedback")
+                .id_salt(("native-flat-feedback", task_id, view.displayed_turn_id))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("native-flat-feedback-scroll", task_id, view.displayed_turn_id))
+                        .max_height(160.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(native_feedback_display(feedback)).small(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                });
+        }
+
         if !view.agent_text.is_empty() {
             ui.separator();
             egui::CollapsingHeader::new("Agent response")
+                .id_salt(("native-flat-response", task_id, view.displayed_turn_id))
                 .default_open(true)
                 .show(ui, |ui| {
                     ui.add(
@@ -288,9 +347,9 @@ fn render_native_codex_view(
         }
 
         if !view.commands.is_empty() {
-            egui::CollapsingHeader::new(format!("Commands ({})", view.commands.len())).show(
-                ui,
-                |ui| {
+            egui::CollapsingHeader::new(format!("Commands ({})", view.commands.len()))
+                .id_salt(("native-flat-commands", task_id, view.displayed_turn_id))
+                .show(ui, |ui| {
                     let first = view.commands.len().saturating_sub(4);
                     for command in &view.commands[first..] {
                         ui.label(
@@ -303,8 +362,7 @@ fn render_native_codex_view(
                             .monospace(),
                         );
                     }
-                },
-            );
+                });
         }
 
         if !view.file_changes.is_empty() {
@@ -325,6 +383,164 @@ fn render_native_codex_view(
                     .small()
                     .color(ui.visuals().error_fg_color),
             );
+        }
+    });
+}
+
+fn native_flat_turn_heading(view: &CodexAppServerViewSnapshot) -> Option<(&'static str, usize)> {
+    let ordinal = view.displayed_turn_ordinal?;
+    let kind = if view.completed_turns >= ordinal {
+        "Latest turn"
+    } else if matches!(
+        view.phase,
+        CodexAppServerPhase::Failed | CodexAppServerPhase::Ended
+    ) {
+        "Stopped turn"
+    } else {
+        "Current turn"
+    };
+    Some((kind, ordinal))
+}
+
+fn visible_native_turn_history(
+    view: &CodexAppServerViewSnapshot,
+) -> Vec<&CodexAppServerTurnHistory> {
+    let mut seen = HashSet::with_capacity(view.turn_history.len());
+    view.turn_history
+        .iter()
+        .filter(|turn| {
+            Some(turn.local_turn_id) != view.displayed_turn_id && seen.insert(turn.local_turn_id)
+        })
+        .collect()
+}
+
+fn native_feedback_display(text: &str) -> String {
+    sanitize_prompt_payload(
+        text,
+        NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+        VisualSpoofDisposition::Reject,
+    )
+    .map(|payload| payload.text)
+    .unwrap_or_else(|_| visible_bounded(text, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES))
+}
+
+fn render_native_turn_history(
+    ui: &mut egui::Ui,
+    task_id: TaskId,
+    turn: &CodexAppServerTurnHistory,
+) {
+    let command_count = turn.commands.len();
+    let file_count = turn.file_changes.iter().fold(0usize, |total, file| {
+        total.saturating_add(file.change_count)
+    });
+    egui::CollapsingHeader::new(format!(
+        "Turn {} · completed · {command_count} command(s) · {file_count} file change(s)",
+        turn.ordinal
+    ))
+    .id_salt(("native-history-turn", task_id, turn.local_turn_id))
+    .default_open(false)
+    .show(ui, |ui| {
+        if turn.dropped_updates > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} update(s) compacted in this turn",
+                    turn.dropped_updates
+                ))
+                .small()
+                .weak(),
+            );
+        }
+        if let Some(feedback) = turn.follow_up_feedback.as_deref() {
+            ui.label(egui::RichText::new("Your feedback").small().strong());
+            egui::ScrollArea::vertical()
+                .id_salt(("native-history-feedback", task_id, turn.local_turn_id))
+                .max_height(120.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(native_feedback_display(feedback)).small(),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+        if !turn.agent_text.is_empty() {
+            ui.label(egui::RichText::new("Agent response").small().strong());
+            egui::ScrollArea::vertical()
+                .id_salt(("native-history-response", task_id, turn.local_turn_id))
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(visible_bounded(
+                                &turn.agent_text,
+                                MAX_NATIVE_AGENT_TEXT_DISPLAY_BYTES,
+                            ))
+                            .small(),
+                        )
+                        .wrap(),
+                    );
+                });
+            if turn.agent_text_truncated {
+                ui.label(
+                    egui::RichText::new("Earlier response text was compacted")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+        if !turn.commands.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("Commands ({command_count})"))
+                    .small()
+                    .strong(),
+            );
+            for command in &turn.commands {
+                let omitted = if command.output_omitted {
+                    " · output omitted"
+                } else {
+                    ""
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}{omitted}",
+                        visible_bounded(&command.status, 64),
+                        visible_bounded(&command.command, MAX_NATIVE_ITEM_DISPLAY_BYTES)
+                    ))
+                    .small()
+                    .monospace(),
+                );
+            }
+        }
+        if !turn.file_changes.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("File changes ({file_count})"))
+                    .small()
+                    .strong(),
+            );
+            for file in &turn.file_changes {
+                let path = file
+                    .path
+                    .as_deref()
+                    .map(|path| visible_bounded(path, MAX_NATIVE_ITEM_DISPLAY_BYTES))
+                    .unwrap_or_else(|| "path unavailable".to_string());
+                let compacted = if file.changes_truncated || file.path_truncated {
+                    " · compacted"
+                } else {
+                    ""
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {} change(s) · {path}{compacted}",
+                        visible_bounded(&file.status, 64),
+                        file.change_count
+                    ))
+                    .small()
+                    .monospace(),
+                );
+            }
         }
     });
 }
@@ -1489,6 +1705,11 @@ mod tests {
         let rendered = visible_bounded("safe\u{202e}spoof", 32);
         assert_eq!(rendered, "safe\\u{202E}spoof");
         assert!(visible_bounded(&"x".repeat(500), 20).len() <= 20);
+        assert_eq!(native_feedback_display("first\nsecond"), "first\nsecond");
+        let hostile_feedback = native_feedback_display("safe\u{202e}\0spoof");
+        assert!(!hostile_feedback.contains('\u{202e}'));
+        assert!(!hostile_feedback.contains('\0'));
+        assert!(hostile_feedback.contains("\\u{202E}"));
     }
 
     #[test]
@@ -1514,5 +1735,51 @@ mod tests {
             "one turn too many",
             CODEX_APP_SERVER_LIVE_TURN_MAX,
         ));
+    }
+
+    #[test]
+    fn native_history_projection_is_ordered_deduplicated_and_excludes_the_flat_turn() {
+        fn turn(
+            ordinal: usize,
+            local_turn_id: crate::agent::AgentTurnId,
+        ) -> CodexAppServerTurnHistory {
+            CodexAppServerTurnHistory {
+                ordinal,
+                local_turn_id,
+                follow_up_feedback: (ordinal > 1).then(|| format!("feedback-{ordinal}")),
+                agent_text: format!("answer-{ordinal}"),
+                agent_text_truncated: false,
+                commands: Vec::new(),
+                file_changes: Vec::new(),
+                dropped_updates: 0,
+            }
+        }
+
+        let first = crate::agent::AgentTurnId::new();
+        let latest = crate::agent::AgentTurnId::new();
+        let mut view = CodexAppServerViewSnapshot {
+            phase: CodexAppServerPhase::Ready,
+            displayed_turn_id: Some(latest),
+            displayed_turn_ordinal: Some(2),
+            completed_turns: 2,
+            turn_history: Arc::from([turn(1, first), turn(1, first), turn(2, latest)]),
+            ..CodexAppServerViewSnapshot::default()
+        };
+
+        let visible = visible_native_turn_history(&view);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].local_turn_id, first);
+        assert_eq!(visible[0].ordinal, 1);
+        assert_eq!(native_flat_turn_heading(&view), Some(("Latest turn", 2)));
+
+        view.phase = CodexAppServerPhase::Running;
+        view.displayed_turn_ordinal = Some(3);
+        assert_eq!(native_flat_turn_heading(&view), Some(("Current turn", 3)));
+        view.phase = CodexAppServerPhase::Failed;
+        assert_eq!(native_flat_turn_heading(&view), Some(("Stopped turn", 3)));
+        view.phase = CodexAppServerPhase::Ended;
+        assert_eq!(native_flat_turn_heading(&view), Some(("Stopped turn", 3)));
+        view.completed_turns = 3;
+        assert_eq!(native_flat_turn_heading(&view), Some(("Latest turn", 3)));
     }
 }

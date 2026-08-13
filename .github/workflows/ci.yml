@@ -113,6 +113,19 @@ jobs:
         with:
           shared-key: tests
 
+      - name: Start native Agent containment prerequisites
+        shell: bash
+        run: |
+          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+          runner_uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${runner_uid}.service"
+          runtime_dir="/run/user/${runner_uid}"
+          test -S "${runtime_dir}/bus"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus" >> "$GITHUB_ENV"
+          echo "EMBER_REQUIRE_NATIVE_CODEX_E2E=1" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
 

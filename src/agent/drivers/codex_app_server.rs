@@ -56,6 +56,10 @@ pub const CODEX_APP_SERVER_APPROVAL_FROZEN_MAX_BYTES: usize = 256 * 1024;
 /// completed provider turn identity for the full session prevents an old ID
 /// from regaining authority after bounded tombstone eviction.
 pub const CODEX_APP_SERVER_LIVE_TURN_MAX: usize = 32;
+/// Maximum completed turn projections retained before the current/latest turn.
+pub const CODEX_APP_SERVER_TURN_HISTORY_CAPACITY: usize = 8;
+/// Hard accounted byte budget for all retained completed turn projections.
+pub const CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES: usize = 1024 * 1024;
 const RESOLVED_APPROVAL_TOMBSTONE_CAPACITY: usize = 32;
 
 const STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
@@ -230,12 +234,61 @@ pub struct CodexAppServerFileChangeView {
     pub changes_truncated: bool,
 }
 
+/// Compact, non-authoritative command evidence from one completed turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexAppServerTurnCommandSummary {
+    pub command: String,
+    pub status: String,
+    /// True when command output existed (including an already-truncated flat
+    /// projection) but was intentionally omitted from compact history.
+    pub output_omitted: bool,
+}
+
+/// Compact, non-authoritative file evidence from one completed turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexAppServerTurnFileSummary {
+    pub status: String,
+    /// First display-safe affected path, when the item reported one.
+    pub path: Option<String>,
+    pub change_count: usize,
+    /// True when additional changes were omitted from this compact summary or
+    /// the current-turn projection had already truncated its change list.
+    pub changes_truncated: bool,
+    /// True when the retained path is only a display-safe projection.
+    pub path_truncated: bool,
+}
+
+/// Bounded presentation history. These local identities and summaries never
+/// participate in provider correlation or approval authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexAppServerTurnHistory {
+    /// Stable, one-based turn position within this live native session.
+    pub ordinal: usize,
+    pub local_turn_id: AgentTurnId,
+    /// User feedback after the runtime's consent gate, optional secret
+    /// redaction, and control/bidirectional-character rejection. This is not
+    /// a provider-framed prompt. The initial task prompt is deliberately not
+    /// retained here.
+    pub follow_up_feedback: Option<String>,
+    pub agent_text: String,
+    pub agent_text_truncated: bool,
+    pub commands: Vec<CodexAppServerTurnCommandSummary>,
+    pub file_changes: Vec<CodexAppServerTurnFileSummary>,
+    pub dropped_updates: u64,
+}
+
 /// Cheap clone of the worker's bounded presentation state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexAppServerViewSnapshot {
     pub phase: CodexAppServerPhase,
     pub provider_thread_id: Option<String>,
     pub provider_turn_id: Option<String>,
+    /// Stable Ember-local identity for the current/latest flat projection.
+    pub displayed_turn_id: Option<AgentTurnId>,
+    pub displayed_turn_ordinal: Option<usize>,
+    /// Consent-gated user feedback that started the displayed turn. The
+    /// initial task prompt is deliberately not retained here.
+    pub displayed_follow_up_feedback: Option<String>,
     pub agent_text: String,
     pub agent_text_truncated: bool,
     pub commands: Vec<CodexAppServerCommandView>,
@@ -243,6 +296,13 @@ pub struct CodexAppServerViewSnapshot {
     pub pending_approvals: Vec<CodexAppServerApproval>,
     /// Completed turns in this still-loaded provider session.
     pub completed_turns: usize,
+    /// Oldest-to-newest completed turns preceding the current/latest flat
+    /// projection. Its independent history-only budget excludes the already
+    /// bounded flat projection. Arc keeps frame-level snapshot cloning
+    /// independent of the retained history payload size.
+    pub turn_history: Arc<[CodexAppServerTurnHistory]>,
+    /// Number of oldest history turns discarded by the count or byte budget.
+    pub dropped_turns: usize,
     pub last_error: Option<String>,
     pub dropped_updates: u64,
 }
@@ -253,12 +313,17 @@ impl Default for CodexAppServerViewSnapshot {
             phase: CodexAppServerPhase::Created,
             provider_thread_id: None,
             provider_turn_id: None,
+            displayed_turn_id: None,
+            displayed_turn_ordinal: None,
+            displayed_follow_up_feedback: None,
             agent_text: String::new(),
             agent_text_truncated: false,
             commands: Vec::new(),
             file_changes: Vec::new(),
             pending_approvals: Vec::new(),
             completed_turns: 0,
+            turn_history: Arc::from([]),
+            dropped_turns: 0,
             last_error: None,
             dropped_updates: 0,
         }
@@ -2000,6 +2065,7 @@ struct ProtocolMachine {
     resolved_approvals: VecDeque<ApprovalId>,
     agent_delta_items: HashSet<String>,
     completed_provider_turn_ids: VecDeque<String>,
+    displayed_turn_completed: bool,
 }
 
 struct NativeProtocolAuthority {
@@ -2038,6 +2104,7 @@ impl ProtocolMachine {
             resolved_approvals: VecDeque::new(),
             agent_delta_items: HashSet::new(),
             completed_provider_turn_ids: VecDeque::new(),
+            displayed_turn_completed: false,
         }
     }
 
@@ -2238,7 +2305,7 @@ impl ProtocolMachine {
                 let thread_id = required_bounded_string(result, &["thread", "id"], "thread id")?;
                 self.accept_thread_id(thread_id)?;
                 if let Some(prompt) = self.initial_prompt.take() {
-                    self.queue_turn(prompt, writes)?;
+                    self.queue_turn(prompt, false, writes)?;
                 } else {
                     self.startup_complete = true;
                     self.view.lock().phase = CodexAppServerPhase::Ready;
@@ -2700,7 +2767,7 @@ impl ProtocolMachine {
         }
         match command {
             AgentCommand::Prompt(prompt) => {
-                self.queue_turn(prompt, writes)?;
+                self.queue_turn(prompt, true, writes)?;
                 Ok(None)
             }
             AgentCommand::FinishSession => {
@@ -2811,6 +2878,7 @@ impl ProtocolMachine {
     fn queue_turn(
         &mut self,
         prompt: AgentPrompt,
+        retain_feedback: bool,
         writes: &mut WireWriteQueue,
     ) -> Result<(), WorkerFailure> {
         if !self.is_idle() {
@@ -2829,6 +2897,7 @@ impl ProtocolMachine {
             .clone()
             .ok_or_else(|| WorkerFailure::protocol("cannot start turn before thread start"))?;
         let local_turn_id = prompt.turn_id;
+        let follow_up_feedback = retain_feedback.then(|| prompt.text.clone());
         self.queue_request(
             "turn/start",
             json!({
@@ -2853,9 +2922,20 @@ impl ProtocolMachine {
         self.turn_started_emitted = false;
         self.agent_delta_items.clear();
         self.resolved_approvals.clear();
-        let mut view = self.view.lock();
+        // Commit presentation state only after the turn/start record and its
+        // request correlation have both been queued successfully. Archive and
+        // flat-view replacement share one critical section, so snapshots can
+        // never observe the same turn in both projections. A failed queue
+        // leaves the completed flat view and history untouched.
+        let view_handle = Arc::clone(&self.view);
+        let mut view = view_handle.lock();
+        self.archive_displayed_completed_turn(&mut view);
+        self.displayed_turn_completed = false;
         view.phase = CodexAppServerPhase::StartingTurn;
         view.provider_turn_id = None;
+        view.displayed_turn_id = Some(local_turn_id);
+        view.displayed_turn_ordinal = Some(self.completed_provider_turn_ids.len() + 1);
+        view.displayed_follow_up_feedback = follow_up_feedback;
         view.agent_text.clear();
         view.agent_text_truncated = false;
         view.commands.clear();
@@ -2866,8 +2946,64 @@ impl ProtocolMachine {
         Ok(())
     }
 
+    fn archive_displayed_completed_turn(&mut self, view: &mut CodexAppServerViewSnapshot) {
+        if !self.displayed_turn_completed {
+            return;
+        }
+        let (Some(local_turn_id), Some(ordinal)) =
+            (view.displayed_turn_id, view.displayed_turn_ordinal)
+        else {
+            debug_assert!(false, "completed displayed turn has no local identity");
+            return;
+        };
+        let commands = view
+            .commands
+            .iter()
+            .map(|command| CodexAppServerTurnCommandSummary {
+                command: command.command.clone(),
+                status: command.status.clone(),
+                output_omitted: command.output_truncated || !command.output.is_empty(),
+            })
+            .collect();
+        let file_changes = view
+            .file_changes
+            .iter()
+            .map(|file| {
+                let first = file.changes.first();
+                CodexAppServerTurnFileSummary {
+                    status: file.status.clone(),
+                    path: first.map(|change| change.path.clone()),
+                    change_count: file.changes.len(),
+                    changes_truncated: file.changes_truncated || file.changes.len() > 1,
+                    path_truncated: first.is_some_and(|change| !change.path_exact),
+                }
+            })
+            .collect();
+        let archived = CodexAppServerTurnHistory {
+            ordinal,
+            local_turn_id,
+            follow_up_feedback: view.displayed_follow_up_feedback.take(),
+            agent_text: view.agent_text.clone(),
+            agent_text_truncated: view.agent_text_truncated,
+            commands,
+            file_changes,
+            dropped_updates: view.dropped_updates,
+        };
+        let mut history: VecDeque<_> = view.turn_history.iter().cloned().collect();
+        history.push_back(archived);
+        while history.len() > CODEX_APP_SERVER_TURN_HISTORY_CAPACITY
+            || turn_history_retained_bytes(&history) > CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES
+        {
+            history.pop_front();
+            view.dropped_turns = view.dropped_turns.saturating_add(1);
+        }
+        view.turn_history = Arc::from(history.into_iter().collect::<Vec<_>>());
+        self.displayed_turn_completed = false;
+    }
+
     fn complete_turn(&mut self, provider_turn_id: String) {
         self.remember_completed_turn(provider_turn_id);
+        self.displayed_turn_completed = true;
         self.provider_turn_id = None;
         self.local_turn_id = None;
         self.turn_started_emitted = false;
@@ -3389,6 +3525,31 @@ fn approval_retained_bytes(approval: &CodexAppServerApproval) -> usize {
             .saturating_add(change.kind.len())
             .saturating_add(change.diff.len())
             .saturating_add(change.move_path.as_ref().map_or(0, String::len));
+    }
+    total
+}
+
+fn turn_history_retained_bytes(history: &VecDeque<CodexAppServerTurnHistory>) -> usize {
+    history.iter().fold(0usize, |total, turn| {
+        total.saturating_add(turn_history_entry_retained_bytes(turn))
+    })
+}
+
+fn turn_history_entry_retained_bytes(turn: &CodexAppServerTurnHistory) -> usize {
+    let mut total = std::mem::size_of::<CodexAppServerTurnHistory>()
+        .saturating_add(turn.follow_up_feedback.as_ref().map_or(0, String::len))
+        .saturating_add(turn.agent_text.len());
+    for command in &turn.commands {
+        total = total
+            .saturating_add(std::mem::size_of::<CodexAppServerTurnCommandSummary>())
+            .saturating_add(command.command.len())
+            .saturating_add(command.status.len());
+    }
+    for file in &turn.file_changes {
+        total = total
+            .saturating_add(std::mem::size_of::<CodexAppServerTurnFileSummary>())
+            .saturating_add(file.status.len())
+            .saturating_add(file.path.as_ref().map_or(0, String::len));
     }
     total
 }
@@ -3954,8 +4115,34 @@ mod tests {
             snapshot.phase = CodexAppServerPhase::Running;
             snapshot.provider_thread_id = Some("thread-1".into());
             snapshot.provider_turn_id = Some("turn-1".into());
+            snapshot.displayed_turn_id = Some(turn_id);
+            snapshot.displayed_turn_ordinal = Some(1);
         }
         (machine, queue, receiver, view, turn_id)
+    }
+
+    fn archive_history_turn(
+        machine: &mut ProtocolMachine,
+        view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+        ordinal: usize,
+        follow_up_feedback: Option<String>,
+        agent_text: String,
+    ) -> AgentTurnId {
+        let local_turn_id = AgentTurnId::new();
+        machine.displayed_turn_completed = true;
+        let view_handle = Arc::clone(view);
+        let mut snapshot = view_handle.lock();
+        snapshot.displayed_turn_id = Some(local_turn_id);
+        snapshot.displayed_turn_ordinal = Some(ordinal);
+        snapshot.displayed_follow_up_feedback = follow_up_feedback;
+        snapshot.agent_text = agent_text;
+        snapshot.agent_text_truncated = false;
+        snapshot.commands.clear();
+        snapshot.file_changes.clear();
+        snapshot.pending_approvals.clear();
+        snapshot.dropped_updates = 0;
+        machine.archive_displayed_completed_turn(&mut snapshot);
+        local_turn_id
     }
 
     #[test]
@@ -4131,9 +4318,13 @@ mod tests {
             assert_eq!(snapshot.phase, CodexAppServerPhase::Ready);
             assert_eq!(snapshot.provider_thread_id.as_deref(), Some("thread-1"));
             assert!(snapshot.provider_turn_id.is_none());
+            assert_eq!(snapshot.displayed_turn_id, Some(first_local_turn));
+            assert_eq!(snapshot.displayed_turn_ordinal, Some(1));
+            assert!(snapshot.displayed_follow_up_feedback.is_none());
             assert_eq!(snapshot.agent_text, "first answer");
             assert_eq!(snapshot.commands.len(), 1);
             assert_eq!(snapshot.file_changes.len(), 1);
+            assert!(snapshot.turn_history.is_empty());
         }
 
         // A response belonging to the already-completed turn was removed from
@@ -4174,12 +4365,43 @@ mod tests {
             let snapshot = view.lock();
             assert_eq!(snapshot.phase, CodexAppServerPhase::StartingTurn);
             assert_eq!(snapshot.provider_thread_id.as_deref(), Some("thread-1"));
+            assert_eq!(snapshot.displayed_turn_id, Some(follow_up_local_turn));
+            assert_eq!(snapshot.displayed_turn_ordinal, Some(2));
+            assert_eq!(
+                snapshot.displayed_follow_up_feedback.as_deref(),
+                Some("continue with the next fix")
+            );
             assert!(snapshot.agent_text.is_empty());
             assert!(snapshot.commands.is_empty());
             assert!(snapshot.file_changes.is_empty());
             assert!(snapshot.last_error.is_none());
             assert_eq!(snapshot.dropped_updates, 0);
+            assert_eq!(snapshot.turn_history.len(), 1);
+            let archived = &snapshot.turn_history[0];
+            assert_eq!(archived.ordinal, 1);
+            assert_eq!(archived.local_turn_id, first_local_turn);
+            assert!(archived.follow_up_feedback.is_none());
+            assert_eq!(archived.agent_text, "first answer");
+            assert!(!archived.agent_text_truncated);
+            assert_eq!(archived.dropped_updates, 7);
+            assert_eq!(archived.commands.len(), 1);
+            assert_eq!(archived.commands[0].command, "true");
+            assert_eq!(archived.commands[0].status, "completed");
+            assert!(archived.commands[0].output_omitted);
+            assert_eq!(archived.file_changes.len(), 1);
+            assert_eq!(archived.file_changes[0].status, "completed");
+            assert_eq!(archived.file_changes[0].path.as_deref(), Some("src/lib.rs"));
+            assert_eq!(archived.file_changes[0].change_count, 1);
+            assert!(!archived.file_changes[0].changes_truncated);
+            assert!(!archived.file_changes[0].path_truncated);
+            assert_eq!(snapshot.dropped_turns, 0);
         }
+
+        let cloned_snapshot = view.lock().clone();
+        assert!(Arc::ptr_eq(
+            &cloned_snapshot.turn_history,
+            &view.lock().turn_history
+        ));
 
         let request_id = turn_start["id"].clone();
         machine
@@ -4208,6 +4430,191 @@ mod tests {
                 false,
             )
             .is_err());
+    }
+
+    #[test]
+    fn failed_follow_up_queue_preserves_completed_flat_view_and_history_transactionally() {
+        let (mut machine, mut writes, receiver, view, first_local_turn) = active_machine();
+        machine.append_agent_text("completed answer");
+        machine
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"}
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let _ = receiver.try_recv().unwrap();
+        let before = view.lock().clone();
+        assert_eq!(before.displayed_turn_id, Some(first_local_turn));
+        assert!(before.turn_history.is_empty());
+
+        for index in 0..CODEX_APP_SERVER_WRITE_QUEUE_MAX_MESSAGES {
+            machine.pending_requests.insert(
+                RpcId::Integer(10_000 + index as i64),
+                PendingClientRequest::Steer,
+            );
+        }
+        assert!(machine
+            .handle_command(
+                AgentCommand::Prompt(AgentPrompt::new("must remain retryable")),
+                &mut writes,
+            )
+            .is_err());
+
+        assert_eq!(*view.lock(), before);
+        assert!(machine.displayed_turn_completed);
+        assert!(writes.pending.is_empty());
+    }
+
+    #[test]
+    fn turn_history_evicts_oldest_at_count_limit_and_counts_drops() {
+        let (mut machine, _, _, view) = machine(None);
+        let mut local_turn_ids = Vec::new();
+        for ordinal in 1..=(CODEX_APP_SERVER_TURN_HISTORY_CAPACITY + 1) {
+            local_turn_ids.push(archive_history_turn(
+                &mut machine,
+                &view,
+                ordinal,
+                Some(format!("feedback-{ordinal}")),
+                format!("answer-{ordinal}"),
+            ));
+        }
+
+        let snapshot = view.lock();
+        assert_eq!(
+            snapshot.turn_history.len(),
+            CODEX_APP_SERVER_TURN_HISTORY_CAPACITY
+        );
+        assert_eq!(snapshot.dropped_turns, 1);
+        assert_eq!(snapshot.turn_history[0].ordinal, 2);
+        assert_eq!(snapshot.turn_history[0].local_turn_id, local_turn_ids[1]);
+        assert_eq!(
+            snapshot.turn_history.last().unwrap().ordinal,
+            CODEX_APP_SERVER_TURN_HISTORY_CAPACITY + 1
+        );
+        assert_eq!(
+            snapshot
+                .turn_history
+                .last()
+                .unwrap()
+                .follow_up_feedback
+                .as_deref(),
+            Some("feedback-9")
+        );
+    }
+
+    #[test]
+    fn turn_history_hard_byte_budget_evicts_oldest_entries() {
+        let (mut machine, _, _, view) = machine(None);
+        let full_flat_text = "x".repeat(CODEX_APP_SERVER_AGENT_TEXT_MAX_BYTES);
+        for ordinal in 1..=4 {
+            archive_history_turn(
+                &mut machine,
+                &view,
+                ordinal,
+                Some(format!("feedback-{ordinal}")),
+                full_flat_text.clone(),
+            );
+        }
+
+        let snapshot = view.lock();
+        let accounted: VecDeque<_> = snapshot.turn_history.iter().cloned().collect();
+        assert!(turn_history_retained_bytes(&accounted) <= CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES);
+        assert!(snapshot.turn_history.len() < 4);
+        assert_eq!(snapshot.dropped_turns, 4 - snapshot.turn_history.len());
+        assert_eq!(
+            snapshot.turn_history.last().unwrap().ordinal,
+            4,
+            "newest history remains when it fits independently"
+        );
+        assert_eq!(snapshot.turn_history[0].ordinal, snapshot.dropped_turns + 1);
+    }
+
+    #[test]
+    fn finish_retains_history_and_latest_turn_feedback_without_duplication() {
+        let (mut machine, mut writes, receiver, view, first_local_turn) = active_machine();
+        machine.append_agent_text("first answer");
+        machine
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"}
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let _ = receiver.try_recv().unwrap();
+
+        let second_prompt = AgentPrompt::new("review the remaining edge case");
+        let second_local_turn = second_prompt.turn_id;
+        machine
+            .handle_command(AgentCommand::Prompt(second_prompt), &mut writes)
+            .unwrap();
+        let turn_start = pop_wire(&mut writes);
+        machine
+            .handle_message(
+                json!({
+                    "id": turn_start["id"].clone(),
+                    "result": {"turn": {"id": "turn-2"}}
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let _ = receiver.try_recv().unwrap();
+        machine.append_agent_text("second answer");
+        machine
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-2", "status": "completed"}
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let _ = receiver.try_recv().unwrap();
+
+        let intent = machine
+            .handle_command(AgentCommand::FinishSession, &mut writes)
+            .unwrap()
+            .expect("idle finish should terminate cleanly");
+        let report = finish_report(
+            &machine.sink,
+            &view,
+            Arc::new(Mutex::new(CodexAppServerProcessExit::default())),
+            intent,
+            String::new(),
+        );
+        assert_eq!(report.outcome, AgentSessionOutcome::Clean);
+
+        let snapshot = view.lock();
+        assert_eq!(snapshot.phase, CodexAppServerPhase::Ended);
+        assert_eq!(snapshot.completed_turns, 2);
+        assert_eq!(snapshot.turn_history.len(), 1);
+        assert_eq!(snapshot.turn_history[0].ordinal, 1);
+        assert_eq!(snapshot.turn_history[0].local_turn_id, first_local_turn);
+        assert_eq!(snapshot.turn_history[0].agent_text, "first answer");
+        assert_eq!(snapshot.displayed_turn_id, Some(second_local_turn));
+        assert_eq!(snapshot.displayed_turn_ordinal, Some(2));
+        assert_eq!(
+            snapshot.displayed_follow_up_feedback.as_deref(),
+            Some("review the remaining edge case")
+        );
+        assert_eq!(snapshot.agent_text, "second answer");
     }
 
     #[test]

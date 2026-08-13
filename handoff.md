@@ -34,10 +34,12 @@ fail closed.
   a later turn invalidates earlier validation evidence, and **Finish Codex** is
   required before validation can start. Live sessions are capped at 32 turns so
   all completed provider turn IDs remain authoritative tombstones for the whole
-  session. The dashboard projects the current/latest turn while the worktree diff
-  remains cumulative; bounded completed-turn history is still future work. Once
-  that session stops, native restart and cross-process thread resume remain
-  disabled. The provider runs
+  session. The dashboard projects the current/latest turn alongside a compact,
+  byte-budgeted completed-turn history keyed by Ember-local turn identities;
+  oldest summaries are evicted explicitly while the worktree diff remains
+  cumulative. This is still process-local review state, not a durable task
+  transcript. Once that session stops, native restart and cross-process thread
+  resume remain disabled. The provider runs
   in a descriptor-pinned isolated worktree and transient user-systemd cgroup;
   Ember publishes its terminal event only after the cgroup is empty and the
   leader is reaped. File-change requests require an immutable, completely

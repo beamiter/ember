@@ -813,8 +813,9 @@ Deliverables:
    and launcher revalidation in the provider worker immediately before spawn;
    completed turns remain on the same loaded thread for bounded review feedback,
    with a 32-turn identity-retention cap; an explicit clean finish is required
-   before validation and stopped sessions cannot yet resume. The initial view is
-   current/latest-turn only, with bounded completed-turn history still pending;
+   before validation and stopped sessions cannot yet resume. The initial view
+   keeps the current/latest turn plus compact, byte-budgeted completed-turn
+   summaries; durable cross-process transcript history remains pending;
 4. Claude stream-json driver;
 5. native Agent Pane — initial Tasks-dashboard projection implemented;
 6. **Fix this command** — implemented for exact failed-command evidence;

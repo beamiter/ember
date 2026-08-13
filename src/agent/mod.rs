@@ -28,7 +28,9 @@ pub use drivers::{
     CodexAppServerApproval, CodexAppServerApprovalFileChange, CodexAppServerApprovalKind,
     CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,
     CodexAppServerFileChange, CodexAppServerFileChangeView, CodexAppServerPhase,
-    CodexAppServerProcessExit, CodexAppServerViewSnapshot, CODEX_APP_SERVER_LIVE_TURN_MAX,
+    CodexAppServerProcessExit, CodexAppServerTurnCommandSummary, CodexAppServerTurnFileSummary,
+    CodexAppServerTurnHistory, CodexAppServerViewSnapshot, CODEX_APP_SERVER_LIVE_TURN_MAX,
+    CODEX_APP_SERVER_TURN_HISTORY_CAPACITY, CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
 };
 pub use event::{
     AgentEvent, AgentEventEpoch, AgentEventError, AgentEventKind, AgentEventStream,

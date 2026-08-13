@@ -313,10 +313,12 @@ result. Validation remains locked until **Finish Codex** has stopped the full
 containment scope and reaped the provider. The native session itself is still
 single-use: once stopped, it cannot be resumed or replaced with a second native
 session for that task; cross-process `thread/resume` is not enabled.
-The native response, command, and file cards are deliberately a bounded
-current/latest-turn projection rather than a full transcript; the Git diff is
-cumulative from the task's immutable base commit. Completed-turn history is a
-follow-up roadmap item.
+The native response, command, and file cards keep the current/latest turn plus
+an oldest-evicting, byte-budgeted history of compact completed-turn summaries.
+Each history entry retains its Ember-local turn identity; follow-up turns also
+retain the reviewed feedback that caused them, while approval authority remains
+confined to the active turn. This is a bounded review aid rather than a durable
+transcript; the Git diff remains cumulative from the task's immutable base commit.
 
 Native Codex runs with approval policy `never`, hosted web search and tool
 network access disabled, and `/tmp` excluded from tool writable roots. Its
