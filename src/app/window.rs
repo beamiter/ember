@@ -252,9 +252,12 @@ impl TerminalApp {
         ctx: &eframe::egui::Context,
     ) -> Vec<String> {
         let mut notes = Vec::new();
-        if self.agent_runtime.has_any_running() && !new.experimental_task_sidebar {
+        if self.agent_runtime.has_any_activity() && !new.experimental_task_sidebar {
             new.experimental_task_sidebar = true;
-            notes.push("Tasks stays visible until the native Agent has fully stopped".to_string());
+            notes.push(
+                "Tasks remains enabled while native work is active; turn it off after cleanup"
+                    .to_string(),
+            );
         }
         let font_changed = new.font_family != self.config.font_family
             || new.font_backend != self.config.font_backend

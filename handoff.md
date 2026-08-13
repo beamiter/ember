@@ -10,6 +10,20 @@ fail closed.
 
 ## Completed since the previous handoff
 
+- Native Codex startup now has a bounded, cancellable background preparation
+  phase. Git/worktree identity checks, descriptor pinning, launcher validation,
+  prompt construction, and private `CODEX_HOME` setup no longer run on the UI
+  thread. A `TaskId` plus local generation and the still-current sharing/redaction
+  policy gate completion; the task remains `Created + Unassigned` until the UI
+  thread receives the exact current result, while cancellation, stale state,
+  and revoked consent drop their FDs, in-memory credential grant, and temporary
+  home without spawning a provider. Preparation workers remain globally bounded
+  and joined through cleanup even across rapid start/cancel cycles. The provider
+  worker repeats descriptor-backed Git identity and trusted launcher checks just
+  before spawn. Direct Agent terminals and native compatibility fallbacks can
+  both retry after an unsuccessful PTY exit; a successful new PTY atomically
+  replaces the exited transcript binding while sticky provenance is preserved.
+
 - The experimental Tasks dashboard now has a real one-shot Codex app-server
   runtime. It sends explicitly shared, bounded failed-command evidence over
   Codex's structured JSONL protocol, reduces correlated lifecycle events into

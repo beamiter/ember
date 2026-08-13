@@ -6,7 +6,7 @@
 //! native drivers can share the same task/dashboard model.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -308,6 +308,10 @@ pub enum TaskError {
         task_id: TaskId,
         status: TaskStatus,
     },
+    TerminalRetryUnavailable {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
     CannotArchiveRunning(TaskId),
 }
 
@@ -416,6 +420,11 @@ impl fmt::Display for TaskError {
                 "terminal fallback is unavailable for task {task_id} in state {}",
                 status.label()
             ),
+            Self::TerminalRetryUnavailable { task_id, status } => write!(
+                formatter,
+                "terminal retry is unavailable for task {task_id} in state {}",
+                status.label()
+            ),
             Self::CannotArchiveRunning(task_id) => {
                 write!(formatter, "cannot archive running task {task_id}")
             }
@@ -432,6 +441,7 @@ pub struct TaskManager {
     task_indices: HashMap<TaskId, usize>,
     tasks_by_terminal_session: HashMap<String, TaskId>,
     tasks_by_validation_session: HashMap<String, TaskId>,
+    exited_terminal_sessions: HashSet<String>,
     native_event_streams: HashMap<TaskId, NativeEventStreamState>,
 }
 
@@ -968,6 +978,83 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Return the old stable session only when its child exit was observed and
+    /// every retry ownership gate currently passes. Binding repeats these
+    /// checks after the replacement PTY has crossed exec.
+    pub fn terminal_retry_session_id(&self, task_id: TaskId) -> Result<&str, TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActive(task_id));
+        }
+        let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
+        let old_session = task.terminal_session_id.as_deref();
+        if task.status != TaskStatus::Failed
+            || !matches!(
+                task.runtime_kind,
+                TaskRuntimeKind::Terminal | TaskRuntimeKind::TerminalFallback
+            )
+            || task.validation.status == TaskValidationStatus::Running
+            || old_session.is_none()
+            || old_session.and_then(|session| self.tasks_by_terminal_session.get(session))
+                != Some(&task_id)
+            || old_session.is_none_or(|session| !self.exited_terminal_sessions.contains(session))
+        {
+            return Err(TaskError::TerminalRetryUnavailable {
+                task_id,
+                status: task.status,
+            });
+        }
+        Ok(old_session.expect("retry eligibility checked the terminal session"))
+    }
+
+    /// Atomically replace a failed, authoritatively exited PTY with a newly
+    /// spawned retry. Until this commit succeeds the old task↔transcript
+    /// binding, Failed state, and exit status remain untouched.
+    pub fn bind_terminal_retry_session(
+        &mut self,
+        task_id: TaskId,
+        expected_old_session: &str,
+        new_session_id: String,
+    ) -> Result<(), TaskError> {
+        if !crate::session::is_valid_jsh_session_id(&new_session_id) {
+            return Err(TaskError::InvalidTerminalSessionId);
+        }
+        if let Some(existing_task_id) = self
+            .tasks_by_validation_session
+            .get(&new_session_id)
+            .copied()
+            .or_else(|| self.tasks_by_terminal_session.get(&new_session_id).copied())
+        {
+            return Err(TaskError::TerminalSessionAlreadyBound {
+                session_id: new_session_id,
+                task_id: existing_task_id,
+            });
+        }
+        let old_session = self.terminal_retry_session_id(task_id)?;
+        if old_session != expected_old_session {
+            let status = self
+                .get(task_id)
+                .map_or(TaskStatus::Failed, |task| task.status);
+            return Err(TaskError::TerminalRetryUnavailable { task_id, status });
+        }
+        let runtime_kind = self
+            .get(task_id)
+            .expect("retry eligibility checked the task")
+            .runtime_kind;
+
+        let task = self.task_mut(task_id)?;
+        task.terminal_session_id = Some(new_session_id.clone());
+        task.exit_code = None;
+        task.status = TaskStatus::Working;
+        task.status_detail = None;
+        task.updated_at_ms = unix_time_ms();
+        debug_assert_eq!(task.runtime_kind, runtime_kind);
+        self.tasks_by_terminal_session.remove(expected_old_session);
+        self.exited_terminal_sessions.remove(expected_old_session);
+        self.tasks_by_terminal_session
+            .insert(new_session_id, task_id);
+        Ok(())
+    }
+
     /// Explicitly continue a fully stopped failed native attempt through the
     /// compatibility PTY. This is the sole deliberate recovery from the
     /// otherwise sticky Failed state: it never runs while a native stream or
@@ -995,39 +1082,6 @@ impl TaskManager {
         task.status = TaskStatus::Created;
         task.status_detail =
             Some("Native Codex stopped; continuing in the terminal compatibility path".to_string());
-        task.updated_at_ms = unix_time_ms();
-        Ok(())
-    }
-
-    /// Retry only a fully exited compatibility PTY after its non-zero or
-    /// status-less exit. The original native one-shot remains consumed.
-    pub fn prepare_terminal_fallback_retry(&mut self, task_id: TaskId) -> Result<(), TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
-            return Err(TaskError::NativeEventStreamActive(task_id));
-        }
-        let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
-        if task.status != TaskStatus::Failed
-            || task.runtime_kind != TaskRuntimeKind::TerminalFallback
-            || task.validation.status == TaskValidationStatus::Running
-        {
-            return Err(TaskError::TerminalFallbackUnavailable {
-                task_id,
-                status: task.status,
-            });
-        }
-        let old_session =
-            task.terminal_session_id
-                .clone()
-                .ok_or(TaskError::TerminalFallbackUnavailable {
-                    task_id,
-                    status: task.status,
-                })?;
-        self.tasks_by_terminal_session.remove(&old_session);
-        let task = self.task_mut(task_id)?;
-        task.terminal_session_id = None;
-        task.exit_code = None;
-        task.status = TaskStatus::Created;
-        task.status_detail = Some("Retrying the terminal compatibility path".to_string());
         task.updated_at_ms = unix_time_ms();
         Ok(())
     }
@@ -1213,6 +1267,7 @@ impl TaskManager {
             return Some(task_id);
         }
         let task_id = self.tasks_by_terminal_session.get(session_id).copied()?;
+        self.exited_terminal_sessions.insert(session_id.to_string());
         let task = self.task_mut(task_id).ok()?;
         if matches!(
             task.status,
@@ -1953,6 +2008,85 @@ mod tests {
     }
 
     #[test]
+    fn failed_direct_terminal_can_retry_without_changing_runtime_provenance() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("direct terminal retry")).unwrap();
+        manager
+            .bind_terminal_session(id, "direct-terminal-first".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("direct-terminal-first", Some(7));
+
+        let failed = manager.get(id).unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.runtime_kind, TaskRuntimeKind::Terminal);
+        assert_eq!(failed.exit_code, Some(7));
+        assert_eq!(
+            manager
+                .task_for_terminal_session("direct-terminal-first")
+                .map(|task| task.id),
+            Some(id)
+        );
+        manager
+            .bind_terminal_retry_session(
+                id,
+                "direct-terminal-first",
+                "direct-terminal-second".to_string(),
+            )
+            .unwrap();
+        let rebound = manager.get(id).unwrap();
+        assert_eq!(rebound.status, TaskStatus::Working);
+        assert_eq!(rebound.runtime_kind, TaskRuntimeKind::Terminal);
+        assert_eq!(rebound.exit_code, None);
+        assert!(manager
+            .task_for_terminal_session("direct-terminal-first")
+            .is_none());
+        assert_eq!(
+            manager
+                .task_for_terminal_session("direct-terminal-second")
+                .map(|task| task.id),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn terminal_retry_requires_an_authoritative_exit_and_preserves_old_binding_on_failure() {
+        let mut manager = TaskManager::new();
+        let id = manager
+            .create(new_task("terminal retry authority"))
+            .unwrap();
+        manager
+            .bind_terminal_session(id, "terminal-still-live".to_string())
+            .unwrap();
+        manager
+            .update_status(id, TaskStatus::Failed, Some("synthetic failure".into()))
+            .unwrap();
+        let before = manager.get(id).unwrap().clone();
+
+        assert!(matches!(
+            manager.terminal_retry_session_id(id),
+            Err(TaskError::TerminalRetryUnavailable { task_id, .. }) if task_id == id
+        ));
+        assert!(matches!(
+            manager.bind_terminal_retry_session(
+                id,
+                "terminal-still-live",
+                "terminal-must-not-bind".to_string(),
+            ),
+            Err(TaskError::TerminalRetryUnavailable { task_id, .. }) if task_id == id
+        ));
+        assert_eq!(manager.get(id), Some(&before));
+        assert_eq!(
+            manager
+                .task_for_terminal_session("terminal-still-live")
+                .map(|task| task.id),
+            Some(id)
+        );
+        assert!(manager
+            .task_for_terminal_session("terminal-must-not-bind")
+            .is_none());
+    }
+
+    #[test]
     fn disconnect_without_wait_status_fails_closed() {
         let mut manager = TaskManager::new();
         let id = manager.create(new_task("disconnected")).unwrap();
@@ -2439,11 +2573,23 @@ mod tests {
         );
         manager.handle_terminal_session_exit("native-fallback-terminal", Some(7));
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::Failed);
-        manager.prepare_terminal_fallback_retry(id).unwrap();
-        let retry = manager.get(id).unwrap();
-        assert_eq!(retry.status, TaskStatus::Created);
-        assert_eq!(retry.runtime_kind, TaskRuntimeKind::TerminalFallback);
-        assert!(retry.terminal_session_id.is_none());
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::TerminalState { task_id, status: TaskStatus::Failed })
+                if task_id == id
+        ));
+        manager
+            .bind_terminal_retry_session(
+                id,
+                "native-fallback-terminal",
+                "native-fallback-terminal-2".to_string(),
+            )
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
+        assert_eq!(
+            manager.get(id).unwrap().runtime_kind,
+            TaskRuntimeKind::TerminalFallback
+        );
         assert!(manager
             .task_for_terminal_session("native-fallback-terminal")
             .is_none());
@@ -2451,10 +2597,6 @@ mod tests {
             manager.start_agent_event_stream(id),
             Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == id
         ));
-        manager
-            .bind_terminal_session(id, "native-fallback-terminal-2".to_string())
-            .unwrap();
-        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
     }
 
     #[test]

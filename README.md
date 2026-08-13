@@ -281,7 +281,17 @@ The experimental **Tasks** dashboard can be enabled under **Settings → AI &
 Agent** (or with `experimental_task_sidebar = true`). It tracks provider,
 normalized lifecycle state, source-command provenance, an isolated worktree,
 and either an attached Agent PTY or native provider stream by stable identity
-rather than tab position. **Start Codex** is an explicit, one-shot native path:
+rather than tab position. **Start Codex** first enters a cancellable background
+**Preparing** state: registered-worktree verification, descriptor pinning,
+launcher trust checks, prompt construction, and the private Codex home never
+block the UI thread. Only a matching, still-current task generation under the
+current sharing and redaction policy may select the native runtime after
+preparation; cancelled, stale, or consent-revoked results destroy their
+directory capabilities, credential buffers, and temporary home without
+spawning Codex. The provider worker re-proves the descriptor-pinned Git
+identity and re-resolves the trusted Codex/Node launch chain immediately before
+spawn, so a queued preparation cannot authorize later path or branch changes.
+**Start Codex** is an explicit, one-shot native path:
 after both AI and command-context sharing are enabled, Ember sends a bounded,
 optionally redacted user prompt over Codex app-server's newline-delimited
 protocol and consumes structured turn, command, diff, approval, and completion
@@ -346,7 +356,11 @@ runtime failure, and a passing validation still requires the explicit **Mark
 complete** action after diff review. Validation cannot start until a native
 Agent event stream has fully ended. The current native Codex path is one-shot;
 the terminal compatibility path is the explicit continuation after a failed
-native attempt. The validation shell uses non-login command mode so a login profile
+native attempt. A direct Agent terminal or native terminal fallback that exits
+unsuccessfully can be retried in the same isolated worktree; the old transcript
+binding remains authoritative until a new PTY has spawned and atomically takes
+its place, without changing runtime provenance or reopening native one-shot
+authority. The validation shell uses non-login command mode so a login profile
 cannot silently move execution out of the checked worktree directory. Ember
 reuses the source terminal's captured shell identity, disables supported-shell
 startup files, verifies that Git still registers the exact task worktree and

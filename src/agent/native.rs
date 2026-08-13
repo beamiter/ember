@@ -16,6 +16,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Maximum complete native prompt sent to a provider.
@@ -444,6 +446,7 @@ pub(crate) struct PreparedNativeWorkspace {
     wire_path: PathBuf,
     wire_cwd: PathBuf,
     relative_cwd: PathBuf,
+    expected_branch: String,
     pinned_root: PinnedDirectory,
     pinned_source_cwd: PinnedDirectory,
 }
@@ -470,6 +473,69 @@ impl PreparedNativeWorkspace {
 
     pub(crate) fn relative_cwd(&self) -> &Path {
         &self.relative_cwd
+    }
+
+    /// Re-prove that the pinned directory capabilities still name the exact
+    /// registered task worktree immediately before the provider worker spawns.
+    /// This closes the asynchronous result-queue window without moving Git I/O
+    /// back onto the UI thread.
+    pub(crate) fn revalidate_before_spawn(
+        &self,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(), NativeWorkspaceError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(NativeWorkspaceError::Identity(
+                "native preparation was cancelled".into(),
+            ));
+        }
+        let current_root = std::fs::canonicalize(&self.wire_path)
+            .ok()
+            .filter(|path| path.is_dir())
+            .ok_or_else(|| NativeWorkspaceError::WorktreeUnavailable(self.display_path.clone()))?;
+        if current_root != self.display_path {
+            return Err(NativeWorkspaceError::WorktreeRedirected {
+                configured: self.display_path.clone(),
+                resolved: current_root,
+            });
+        }
+        let expected_cwd = self.display_path.join(&self.relative_cwd);
+        let current_cwd = std::fs::canonicalize(&self.wire_cwd)
+            .ok()
+            .filter(|path| path.is_dir())
+            .ok_or_else(|| NativeWorkspaceError::WorktreeCwdUnavailable(expected_cwd.clone()))?;
+        if current_cwd != self.display_path && !current_cwd.starts_with(&self.display_path) {
+            return Err(NativeWorkspaceError::WorktreeCwdEscapesWorktree(
+                current_cwd,
+            ));
+        }
+        let reopened_cwd = self
+            .pinned_root
+            .open_beneath(&self.relative_cwd)
+            .map_err(|error| NativeWorkspaceError::CannotPin(error.to_string()))?;
+        let expected_cwd = std::fs::canonicalize(reopened_cwd.proc_path())
+            .ok()
+            .filter(|path| path.is_dir())
+            .ok_or_else(|| NativeWorkspaceError::WorktreeCwdUnavailable(expected_cwd.clone()))?;
+        if current_cwd != expected_cwd {
+            return Err(NativeWorkspaceError::WorktreeCwdEscapesWorktree(
+                current_cwd,
+            ));
+        }
+        let managed_root = self
+            .display_path
+            .parent()
+            .ok_or(NativeWorkspaceError::WorktreeHasNoManagedRoot)?;
+        super::WorktreeService::new(managed_root)
+            .map(|service| service.with_cancel_flag(cancel))
+            .and_then(|service| {
+                service.verify_active_task_worktree_through(
+                    &self.repository_path,
+                    &self.display_path,
+                    &self.wire_path,
+                    &self.expected_branch,
+                )
+            })
+            .map_err(|error| NativeWorkspaceError::Identity(error.to_string()))
     }
 
     /// Install the capability into a child command. This is the only public
@@ -642,6 +708,7 @@ impl std::error::Error for NativePromptError {}
 /// Revalidate and pin the exact registered task worktree before provider spawn.
 pub(crate) fn prepare_native_agent_workspace(
     task: &AgentTask,
+    cancel: Arc<AtomicBool>,
 ) -> Result<PreparedNativeWorkspace, NativeWorkspaceError> {
     if task.status != TaskStatus::Created {
         return Err(NativeWorkspaceError::TaskNotStartable(task.status));
@@ -701,6 +768,7 @@ pub(crate) fn prepare_native_agent_workspace(
         return Err(NativeWorkspaceError::WorktreeCwdEscapesWorktree(mapped_cwd));
     }
     super::WorktreeService::new(managed_root)
+        .map(|service| service.with_cancel_flag(cancel))
         .and_then(|service| {
             service.verify_active_task_worktree_through(
                 &repository,
@@ -716,6 +784,7 @@ pub(crate) fn prepare_native_agent_workspace(
         wire_path,
         wire_cwd,
         relative_cwd,
+        expected_branch: task.branch.clone(),
         pinned_root,
         pinned_source_cwd,
     })
@@ -850,7 +919,10 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentProvider, TaskId, TaskRuntimeKind, TaskValidationState};
+    use crate::agent::{
+        AgentProvider, CreateWorktreeRequest, TaskId, TaskRuntimeKind, TaskValidationState,
+        WorktreeService,
+    };
     use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
     use std::time::UNIX_EPOCH;
 
@@ -876,6 +948,53 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
         source
+    }
+
+    fn checked_git(cwd: &Path, arguments: &[&str]) {
+        let status = Command::new("/usr/bin/git")
+            .current_dir(cwd)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed with {status}");
+    }
+
+    fn managed_task_fixture() -> (PathBuf, AgentTask) {
+        let root = private_test_directory("workspace");
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        checked_git(&repository, &["init", "--quiet"]);
+        std::fs::write(repository.join("tracked.txt"), b"baseline\n").unwrap();
+        checked_git(&repository, &["add", "--", "tracked.txt"]);
+        checked_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Ember Tests",
+                "-c",
+                "user.email=ember@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+        let service = WorktreeService::new(root.join("managed")).unwrap();
+        let managed = service
+            .create(&CreateWorktreeRequest::new(
+                &repository,
+                "native",
+                "ember/native-revalidation",
+                "HEAD",
+            ))
+            .unwrap();
+        let mut task = task();
+        task.repo_root = managed.repository;
+        task.worktree_path = managed.path;
+        task.branch = managed.branch;
+        task.base_commit = managed.head;
+        task.source_context.as_mut().unwrap().cwd = Some(repository.to_string_lossy().into_owned());
+        (root, task)
     }
 
     fn task() -> AgentTask {
@@ -1026,6 +1145,33 @@ mod tests {
         assert!(bounded.starts_with("head"));
         assert!(bounded.ends_with("tail"));
         assert!(bounded.len() <= 64);
+    }
+
+    #[test]
+    fn prepared_workspace_revalidates_branch_and_honors_cancellation() {
+        let (root, task) = managed_task_fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prepared = prepare_native_agent_workspace(&task, Arc::clone(&cancel)).unwrap();
+        prepared
+            .revalidate_before_spawn(Arc::clone(&cancel))
+            .unwrap();
+
+        checked_git(
+            &task.worktree_path,
+            &["switch", "--quiet", "-c", "ember/replaced-after-prepare"],
+        );
+        assert!(matches!(
+            prepared.revalidate_before_spawn(Arc::clone(&cancel)),
+            Err(NativeWorkspaceError::Identity(_))
+        ));
+
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            prepared.revalidate_before_spawn(cancel),
+            Err(NativeWorkspaceError::Identity(detail)) if detail.contains("cancelled")
+        ));
+        drop(prepared);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

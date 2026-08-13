@@ -14,8 +14,8 @@ use crate::agent::native::{
     NativeCodexCredentials, PreparedNativeCodexHome, PreparedNativeWorkspace,
 };
 use crate::agent::{
-    AgentEvent, AgentEventKind, AgentProvider, AgentSessionOutcome, AgentTurnId, ApprovalId,
-    ProviderSessionId,
+    AgentEvent, AgentEventKind, AgentLaunchSpec, AgentProvider, AgentSessionOutcome, AgentTurnId,
+    ApprovalId, ProviderSessionId,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use parking_lot::Mutex;
@@ -1463,6 +1463,65 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
         view,
         process_snapshot,
     } = context;
+    if cancellation.is_cancelled() {
+        return finish_cancelled_without_child(
+            &sink,
+            &view,
+            process_snapshot,
+            "Native Codex was cancelled before final prerequisite verification",
+        );
+    }
+    if let Err(error) = workspace.revalidate_before_spawn(cancellation.shared_flag()) {
+        if cancellation.is_cancelled() {
+            return finish_cancelled_without_child(
+                &sink,
+                &view,
+                process_snapshot,
+                "Native Codex was cancelled during final worktree verification",
+            );
+        }
+        return finish_without_child(
+            &sink,
+            &view,
+            process_snapshot,
+            WorkerFailure::spawn(format!(
+                "native worktree changed after background preparation: {error}"
+            )),
+        );
+    }
+    let refreshed_launch = match AgentLaunchSpec::resolve_native(
+        AgentProvider::Codex,
+        workspace.repository_path(),
+        workspace.display_path(),
+    ) {
+        Ok(argv) => argv,
+        Err(error) => {
+            return finish_without_child(
+                &sink,
+                &view,
+                process_snapshot,
+                WorkerFailure::spawn(format!(
+                    "native launcher changed after background preparation: {error}"
+                )),
+            )
+        }
+    };
+    if refreshed_launch != launch_argv {
+        return finish_without_child(
+            &sink,
+            &view,
+            process_snapshot,
+            WorkerFailure::spawn("native launcher changed after background preparation"),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return finish_cancelled_without_child(
+            &sink,
+            &view,
+            process_snapshot,
+            "Native Codex was cancelled before credential handoff",
+        );
+    }
     let executable = launch_argv
         .first()
         .map(PathBuf::from)
@@ -1536,6 +1595,15 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
     // This single native boundary performs private process-group setup,
     // descriptor-based fchdir, capability inheritance, and PDEATHSIG.
     workspace.configure_child_command(&mut command);
+
+    if cancellation.is_cancelled() {
+        return finish_cancelled_without_child(
+            &sink,
+            &view,
+            process_snapshot,
+            "Native Codex was cancelled before provider spawn",
+        );
+    }
 
     let child = match command.spawn() {
         Ok(child) => child,
@@ -1786,6 +1854,21 @@ fn finish_without_child(
         view,
         process_snapshot,
         TerminalIntent::failed(failure),
+        String::new(),
+    )
+}
+
+fn finish_cancelled_without_child(
+    sink: &AgentEventSink,
+    view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+    process_snapshot: Arc<Mutex<CodexAppServerProcessExit>>,
+    detail: impl Into<String>,
+) -> CodexAppServerExitReport {
+    finish_report(
+        sink,
+        view,
+        process_snapshot,
+        TerminalIntent::cancelled(detail),
         String::new(),
     )
 }

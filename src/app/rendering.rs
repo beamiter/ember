@@ -1562,13 +1562,13 @@ impl TerminalApp {
                 }
                 config_panel::ConfigAction::SaveRequested => {
                     let bottom_bar_was = self.config.bottom_bar;
-                    let keep_tasks_visible = self.agent_runtime.has_any_running();
+                    let keep_tasks_visible = self.agent_runtime.has_any_activity();
                     // Apply all buffered edit values to config
                     self.config_panel.apply_to_config(&mut self.config);
                     if keep_tasks_visible && !self.config.experimental_task_sidebar {
                         self.config.experimental_task_sidebar = true;
                         self.set_status_for(
-                            "Tasks stays visible until the native Agent has fully stopped",
+                            "Tasks remains enabled while native work is active; turn it off after cleanup",
                             std::time::Duration::from_secs(5),
                         );
                     }
@@ -1601,7 +1601,7 @@ impl TerminalApp {
                 }
                 config_panel::ConfigAction::ResetToDefaults => {
                     let bottom_bar_was = self.config.bottom_bar;
-                    let keep_tasks_visible = self.agent_runtime.has_any_running();
+                    let keep_tasks_visible = self.agent_runtime.has_any_activity();
                     // Replacing the whole struct (never field-by-field) is what
                     // makes Reset the escape hatch out of `Config::load_error`:
                     // an explicit reset is the one time overwriting a broken

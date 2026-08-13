@@ -11,15 +11,20 @@ use super::drivers::codex_app_server::{
 };
 use super::native::{
     build_native_task_prompt, prepare_native_agent_workspace, NativePromptError,
-    NativePromptPolicy, NativeWorkspaceError, PreparedNativeCodexHome,
+    NativePromptPolicy, NativeWorkspaceError, PreparedNativeCodexHome, PreparedNativeWorkspace,
 };
 use super::{
     AgentCommand, AgentDriver, AgentDriverError, AgentEventError, AgentEventStream,
-    AgentLaunchError, AgentLaunchSpec, AgentProvider, AgentSessionOutcome, AgentStartRequest,
-    ApprovalDecision, ApprovalId, NativeCodexHomeError, TaskId, TaskManager,
+    AgentLaunchError, AgentLaunchSpec, AgentPrompt, AgentProvider, AgentSessionOutcome,
+    AgentStartRequest, AgentTask, ApprovalDecision, ApprovalId, NativeCodexHomeError, TaskId,
+    TaskManager, TaskRuntimeKind, TaskStatus, TaskValidationStatus,
 };
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 /// Global event-work limit for one UI frame.
 ///
@@ -28,6 +33,8 @@ use std::fmt;
 pub const NATIVE_AGENT_EVENTS_PER_FRAME: usize = 64;
 /// Prevent one noisy provider from consuming the whole global frame budget.
 pub const NATIVE_AGENT_EVENTS_PER_TASK_PER_FRAME: usize = 16;
+/// Bound simultaneous filesystem/Git/credential preparation workers.
+pub const NATIVE_AGENT_PREPARATIONS_MAX: usize = 8;
 
 struct RunningCodexAgent {
     driver: CodexAppServerDriver,
@@ -42,6 +49,27 @@ struct RetainedCodexAgent {
     exit_report: Option<CodexAppServerExitReport>,
 }
 
+struct PreparedCodexStart {
+    task: AgentTask,
+    workspace: PreparedNativeWorkspace,
+    prompt: AgentPrompt,
+    launch_argv: Vec<String>,
+    native_home: PreparedNativeCodexHome,
+}
+
+struct PreparationResult {
+    generation: u64,
+    result: Result<PreparedCodexStart, AgentRuntimeError>,
+}
+
+struct PendingCodexPreparation {
+    generation: u64,
+    policy: NativePromptPolicy,
+    receiver: Receiver<PreparationResult>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
 /// Process-local owner of native provider adapters and their bounded UI views.
 ///
 /// Runtime instances are deliberately not serialized. Stable task metadata is
@@ -49,8 +77,11 @@ struct RetainedCodexAgent {
 /// be recreated explicitly after process restart.
 #[derive(Default)]
 pub struct AgentRuntimeManager {
+    preparing: HashMap<TaskId, PendingCodexPreparation>,
+    cancelled_preparations: Vec<PendingCodexPreparation>,
     running: HashMap<TaskId, RunningCodexAgent>,
     retained: HashMap<TaskId, RetainedCodexAgent>,
+    next_preparation_generation: u64,
     next_poll_index: usize,
 }
 
@@ -69,6 +100,7 @@ pub enum AgentRuntimeError {
     Launch(AgentLaunchError),
     Driver(AgentDriverError),
     Event(AgentEventError),
+    Preparation(String),
     StartRollback {
         start: Box<AgentRuntimeError>,
         rollback: AgentEventError,
@@ -80,10 +112,16 @@ impl fmt::Display for AgentRuntimeError {
         match self {
             Self::UnknownTask(task_id) => write!(formatter, "Agent task {task_id} is unavailable"),
             Self::AlreadyRunning(task_id) => {
-                write!(formatter, "native Agent task {task_id} is already running")
+                write!(
+                    formatter,
+                    "native Agent task {task_id} is already preparing or running"
+                )
             }
             Self::NotRunning(task_id) => {
-                write!(formatter, "native Agent task {task_id} is not running")
+                write!(
+                    formatter,
+                    "native Agent task {task_id} is not preparing or running"
+                )
             }
             Self::UnsupportedProvider { task_id, provider } => write!(
                 formatter,
@@ -96,6 +134,9 @@ impl fmt::Display for AgentRuntimeError {
             Self::Launch(error) => error.fmt(formatter),
             Self::Driver(error) => error.fmt(formatter),
             Self::Event(error) => error.fmt(formatter),
+            Self::Preparation(detail) => {
+                write!(formatter, "native Agent preparation failed: {detail}")
+            }
             Self::StartRollback { start, rollback } => write!(
                 formatter,
                 "{start}; native stream rollback also failed: {rollback}"
@@ -117,6 +158,7 @@ impl std::error::Error for AgentRuntimeError {
             Self::UnknownTask(_)
             | Self::AlreadyRunning(_)
             | Self::NotRunning(_)
+            | Self::Preparation(_)
             | Self::UnsupportedProvider { .. } => None,
         }
     }
@@ -166,6 +208,8 @@ pub struct AgentRuntimeIssue {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentRuntimePollReport {
+    pub preparations_finished: usize,
+    pub preparations_started: usize,
     pub events_drained: usize,
     pub events_applied: usize,
     pub workers_finished: usize,
@@ -176,7 +220,11 @@ pub struct AgentRuntimePollReport {
 
 impl AgentRuntimePollReport {
     pub fn made_progress(&self) -> bool {
-        self.events_drained > 0 || self.workers_finished > 0 || !self.issues.is_empty()
+        self.preparations_finished > 0
+            || self.preparations_started > 0
+            || self.events_drained > 0
+            || self.workers_finished > 0
+            || !self.issues.is_empty()
     }
 }
 
@@ -193,20 +241,33 @@ impl AgentRuntimeManager {
         Self::default()
     }
 
-    /// Start a real Codex app-server session for one registered task.
+    /// Begin preparing a real Codex app-server session without blocking the UI.
     ///
-    /// Workspace identity and prompt consent are checked before selecting the
-    /// task's runtime. Once the native stream exists, every later failure
-    /// converges through TaskManager only after the worker's stop authority is
-    /// proven; only a synchronous pre-worker failure is rolled back to Created.
+    /// Workspace identity, prompt consent, launcher trust, and the private
+    /// Codex home are resolved on a background worker. The task remains
+    /// Created/Unassigned until [`Self::poll`] receives the matching generation,
+    /// rechecks the immutable task snapshot, and atomically selects native
+    /// authority. Dropping a cancelled/stale receiver drops every prepared FD,
+    /// credential buffer, and private directory when the worker finishes.
     pub fn start_codex(
         &mut self,
         task_manager: &mut TaskManager,
         task_id: TaskId,
         policy: NativePromptPolicy,
     ) -> Result<(), AgentRuntimeError> {
-        if self.running.contains_key(&task_id) {
+        if self.running.contains_key(&task_id) || self.preparing.contains_key(&task_id) {
             return Err(AgentRuntimeError::AlreadyRunning(task_id));
+        }
+        self.reap_cancelled_preparations();
+        if self
+            .preparing
+            .len()
+            .saturating_add(self.cancelled_preparations.len())
+            >= NATIVE_AGENT_PREPARATIONS_MAX
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "at most {NATIVE_AGENT_PREPARATIONS_MAX} tasks may prepare concurrently"
+            )));
         }
         let task = task_manager
             .get(task_id)
@@ -218,31 +279,85 @@ impl AgentRuntimeManager {
                 provider: task.provider,
             });
         }
+        if !policy.share_command_context {
+            return Err(AgentRuntimeError::Prompt(
+                NativePromptError::SharingDisabled,
+            ));
+        }
+        if task.status != TaskStatus::Created
+            || task.runtime_kind != TaskRuntimeKind::Unassigned
+            || task.terminal_session_id.is_some()
+            || task.validation.status == TaskValidationStatus::Running
+            || task_manager.has_active_agent_event_stream(task_id)
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "task must remain Created and unassigned (currently {} / {:?})",
+                task.status.label(),
+                task.runtime_kind
+            )));
+        }
 
-        // The capability owns its pinned directory descriptor. Move the whole
-        // value into the driver; never retain only its raw descriptor here.
-        let workspace = prepare_native_agent_workspace(&task)?;
-        let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
-        // Resolve every fallible host prerequisite before selecting the native
-        // runtime. A missing or unsafe executable leaves a Created task
-        // retryable instead of manufacturing a failed stream incarnation.
-        let launch_argv = AgentLaunchSpec::resolve_native(
-            AgentProvider::Codex,
-            &task.repo_root,
-            &task.worktree_path,
-        )?;
-        let native_home = PreparedNativeCodexHome::prepare()?;
+        let generation = self
+            .next_preparation_generation
+            .checked_add(1)
+            .ok_or_else(|| AgentRuntimeError::Preparation("generation counter exhausted".into()))?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::Builder::new()
+            .name(format!("ember-codex-prepare-{task_id}-{generation}"))
+            .spawn(move || {
+                let result = prepare_codex_start(task, policy, worker_cancel);
+                let _ = sender.send(PreparationResult { generation, result });
+            })
+            .map_err(|error| {
+                AgentRuntimeError::Preparation(format!(
+                    "could not start background preparation worker: {error}"
+                ))
+            })?;
+        self.next_preparation_generation = generation;
+        self.preparing.insert(
+            task_id,
+            PendingCodexPreparation {
+                generation,
+                policy,
+                receiver,
+                cancel,
+                worker: Some(worker),
+            },
+        );
+        Ok(())
+    }
+
+    fn start_prepared_codex(
+        &mut self,
+        task_manager: &mut TaskManager,
+        prepared: PreparedCodexStart,
+    ) -> Result<(), AgentRuntimeError> {
+        let task_id = prepared.task.id;
+        let current = task_manager
+            .get(task_id)
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if current != &prepared.task {
+            return Err(AgentRuntimeError::Preparation(
+                "task changed while native prerequisites were being prepared".into(),
+            ));
+        }
         let stream = task_manager.start_agent_event_stream(task_id)?;
-
-        let mut driver = CodexAppServerDriver::new(launch_argv, workspace, native_home);
+        let worktree_path = prepared.task.worktree_path;
+        let mut driver = CodexAppServerDriver::new(
+            prepared.launch_argv,
+            prepared.workspace,
+            prepared.native_home,
+        );
         let request = AgentStartRequest {
             provider: AgentProvider::Codex,
             stream: stream.clone(),
-            worktree_path: task.worktree_path,
+            worktree_path,
             // The prompt contains the policy-approved, redacted evidence. Do
             // not also hand the adapter the raw semantic snapshot.
             source_context: None,
-            initial_prompt: Some(prompt),
+            initial_prompt: Some(prepared.prompt),
             resume_from: None,
         };
         if let Err(error) = driver.start(request) {
@@ -278,8 +393,14 @@ impl AgentRuntimeManager {
     /// true and its event queue has been drained for this frame. The exit report
     /// is accepted as stop authority only when no child was spawned or the
     /// spawned child was reaped.
-    pub fn poll(&mut self, task_manager: &mut TaskManager) -> AgentRuntimePollReport {
+    pub fn poll(
+        &mut self,
+        task_manager: &mut TaskManager,
+        current_policy: NativePromptPolicy,
+    ) -> AgentRuntimePollReport {
         let mut report = AgentRuntimePollReport::default();
+        self.reap_cancelled_preparations();
+        self.poll_preparations(task_manager, current_policy, &mut report);
         let mut task_ids: Vec<_> = self.running.keys().copied().collect();
         if task_ids.is_empty() {
             self.next_poll_index = 0;
@@ -443,6 +564,15 @@ impl AgentRuntimeManager {
     }
 
     pub fn cancel(&mut self, task_id: TaskId) -> Result<(), AgentRuntimeError> {
+        if let Some(preparation) = self.preparing.remove(&task_id) {
+            preparation.cancel.store(true, Ordering::Release);
+            // Keep ownership of the receiver until the worker acknowledges
+            // cancellation or exits. This bounds rapid Start/Cancel cycles to
+            // the same global worker cap instead of detaching unlimited Git
+            // and credential-preparation threads.
+            self.cancelled_preparations.push(preparation);
+            return Ok(());
+        }
         let runtime = self
             .running
             .get_mut(&task_id)
@@ -498,8 +628,18 @@ impl AgentRuntimeManager {
         self.running.contains_key(&task_id)
     }
 
+    pub fn has_preparing(&self, task_id: TaskId) -> bool {
+        self.preparing.contains_key(&task_id)
+    }
+
     pub fn has_any_running(&self) -> bool {
         !self.running.is_empty()
+    }
+
+    pub fn has_any_activity(&self) -> bool {
+        !self.preparing.is_empty()
+            || !self.cancelled_preparations.is_empty()
+            || !self.running.is_empty()
     }
 
     pub fn clear_retained(&mut self, task_id: TaskId) {
@@ -509,10 +649,161 @@ impl AgentRuntimeManager {
 
 impl Drop for AgentRuntimeManager {
     fn drop(&mut self) {
+        for preparation in self.preparing.values_mut() {
+            preparation.cancel.store(true, Ordering::Release);
+        }
+        for preparation in &mut self.cancelled_preparations {
+            preparation.cancel.store(true, Ordering::Release);
+        }
         for runtime in self.running.values_mut() {
             runtime.driver.cancel();
         }
+        for preparation in self.preparing.values_mut() {
+            if let Some(worker) = preparation.worker.take() {
+                let _ = worker.join();
+            }
+        }
+        for preparation in &mut self.cancelled_preparations {
+            if let Some(worker) = preparation.worker.take() {
+                let _ = worker.join();
+            }
+        }
     }
+}
+
+impl AgentRuntimeManager {
+    fn reap_cancelled_preparations(&mut self) {
+        self.cancelled_preparations.retain_mut(|pending| {
+            if matches!(pending.receiver.try_recv(), Err(TryRecvError::Empty)) {
+                return true;
+            }
+            if let Some(worker) = pending.worker.take() {
+                let _ = worker.join();
+            }
+            false
+        });
+    }
+
+    fn poll_preparations(
+        &mut self,
+        task_manager: &mut TaskManager,
+        current_policy: NativePromptPolicy,
+        report: &mut AgentRuntimePollReport,
+    ) {
+        let task_ids: Vec<_> = self.preparing.keys().copied().collect();
+        for task_id in task_ids {
+            let policy_changed = self
+                .preparing
+                .get(&task_id)
+                .is_some_and(|pending| pending.policy != current_policy);
+            if policy_changed {
+                let pending = self
+                    .preparing
+                    .remove(&task_id)
+                    .expect("preparation was checked above");
+                pending.cancel.store(true, Ordering::Release);
+                self.cancelled_preparations.push(pending);
+                report.preparations_finished += 1;
+                report.issues.push(AgentRuntimeIssue {
+                    task_id,
+                    detail: bounded_runtime_detail(
+                        "native Agent preparation was cancelled because the AI sharing policy changed"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+            let received = self
+                .preparing
+                .get(&task_id)
+                .map(|pending| pending.receiver.try_recv());
+            let message = match received {
+                Some(Ok(message)) => message,
+                Some(Err(TryRecvError::Empty)) | None => continue,
+                Some(Err(TryRecvError::Disconnected)) => PreparationResult {
+                    generation: self
+                        .preparing
+                        .get(&task_id)
+                        .map_or(0, |pending| pending.generation),
+                    result: Err(AgentRuntimeError::Preparation(
+                        "background preparation worker stopped unexpectedly".into(),
+                    )),
+                },
+            };
+            let Some(mut pending) = self.preparing.remove(&task_id) else {
+                continue;
+            };
+            if let Some(worker) = pending.worker.take() {
+                if worker.join().is_err() {
+                    report.preparations_finished += 1;
+                    report.issues.push(AgentRuntimeIssue {
+                        task_id,
+                        detail: bounded_runtime_detail(
+                            "native Agent preparation worker panicked".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+            }
+            report.preparations_finished += 1;
+            if message.generation != pending.generation {
+                report.issues.push(AgentRuntimeIssue {
+                    task_id,
+                    detail: bounded_runtime_detail(
+                        "native Agent preparation generation did not match its request".to_string(),
+                    ),
+                });
+                continue;
+            }
+            let result = message
+                .result
+                .and_then(|prepared| self.start_prepared_codex(task_manager, prepared));
+            match result {
+                Ok(()) => report.preparations_started += 1,
+                Err(error) => report.issues.push(AgentRuntimeIssue {
+                    task_id,
+                    detail: bounded_runtime_detail(error.to_string()),
+                }),
+            }
+        }
+    }
+}
+
+fn preparation_cancelled(cancel: &AtomicBool) -> Result<(), AgentRuntimeError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(AgentRuntimeError::Preparation("cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_codex_start(
+    task: AgentTask,
+    policy: NativePromptPolicy,
+    cancel: Arc<AtomicBool>,
+) -> Result<PreparedCodexStart, AgentRuntimeError> {
+    preparation_cancelled(cancel.as_ref())?;
+    // The capability owns its pinned directory descriptors. It stays in this
+    // result until the UI thread either consumes it or drops a stale result.
+    let workspace = prepare_native_agent_workspace(&task, Arc::clone(&cancel))?;
+    preparation_cancelled(cancel.as_ref())?;
+    let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
+    preparation_cancelled(cancel.as_ref())?;
+    let launch_argv = AgentLaunchSpec::resolve_native(
+        AgentProvider::Codex,
+        &task.repo_root,
+        &task.worktree_path,
+    )?;
+    preparation_cancelled(cancel.as_ref())?;
+    let native_home = PreparedNativeCodexHome::prepare()?;
+    preparation_cancelled(cancel.as_ref())?;
+    Ok(PreparedCodexStart {
+        task,
+        workspace,
+        prompt,
+        launch_argv,
+        native_home,
+    })
 }
 
 fn rollback_failed_start(
@@ -539,12 +830,55 @@ fn bounded_runtime_detail(detail: String) -> String {
 mod tests {
     use super::*;
 
+    const TEST_POLICY: NativePromptPolicy = NativePromptPolicy {
+        share_command_context: true,
+        redact_secrets: true,
+    };
+
+    fn pending_preparation(
+        runtime: &mut AgentRuntimeManager,
+        task_id: TaskId,
+        generation: u64,
+    ) -> mpsc::SyncSender<PreparationResult> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        runtime.preparing.insert(
+            task_id,
+            PendingCodexPreparation {
+                generation,
+                policy: TEST_POLICY,
+                receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
+                worker: None,
+            },
+        );
+        sender
+    }
+
+    fn task_manager() -> (TaskManager, TaskId) {
+        let mut tasks = TaskManager::new();
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let task_id = tasks
+            .create(super::super::NewTask {
+                title: "async native preparation".into(),
+                provider: AgentProvider::Codex,
+                repo_root: format!("/tmp/ember-runtime-test-repository-{token}").into(),
+                worktree_path: format!("/tmp/ember-runtime-test-worktree-{token}").into(),
+                branch: "ember/async-native-preparation".into(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                source_context: None,
+            })
+            .unwrap();
+        (tasks, task_id)
+    }
+
     #[test]
     fn empty_runtime_has_no_running_or_retained_state() {
         let mut runtime = AgentRuntimeManager::new();
         let task_id = TaskId::new();
         assert!(!runtime.has_running(task_id));
+        assert!(!runtime.has_preparing(task_id));
         assert!(!runtime.has_any_running());
+        assert!(!runtime.has_any_activity());
         assert!(runtime.snapshot(task_id).is_none());
         assert!(runtime.exit_report(task_id).is_none());
         assert!(matches!(
@@ -557,8 +891,170 @@ mod tests {
     fn empty_poll_is_bounded_and_idle() {
         let mut runtime = AgentRuntimeManager::new();
         let mut tasks = TaskManager::new();
-        let report = runtime.poll(&mut tasks);
+        let report = runtime.poll(&mut tasks, TEST_POLICY);
         assert_eq!(report, AgentRuntimePollReport::default());
         assert!(!report.made_progress());
+    }
+
+    #[test]
+    fn pending_preparation_is_activity_rejects_duplicate_start_and_cancels_promptly() {
+        let mut runtime = AgentRuntimeManager::new();
+        let task_id = TaskId::new();
+        let sender = pending_preparation(&mut runtime, task_id, 7);
+        let mut tasks = TaskManager::new();
+
+        assert!(runtime.has_preparing(task_id));
+        assert!(!runtime.has_running(task_id));
+        assert!(runtime.has_any_activity());
+        assert!(matches!(
+            runtime.start_codex(
+                &mut tasks,
+                task_id,
+                TEST_POLICY,
+            ),
+            Err(AgentRuntimeError::AlreadyRunning(id)) if id == task_id
+        ));
+
+        runtime.cancel(task_id).unwrap();
+        assert!(!runtime.has_preparing(task_id));
+        assert!(runtime.has_any_activity());
+        assert!(sender
+            .send(PreparationResult {
+                generation: 7,
+                result: Err(AgentRuntimeError::Preparation("late".into())),
+            })
+            .is_ok());
+        assert_eq!(
+            runtime.poll(&mut tasks, TEST_POLICY),
+            AgentRuntimePollReport::default()
+        );
+        assert!(runtime.cancelled_preparations.is_empty());
+        assert!(!runtime.has_any_activity());
+    }
+
+    #[test]
+    fn preparation_failure_is_reported_without_selecting_task_runtime() {
+        let (mut tasks, task_id) = task_manager();
+        let before = tasks.get(task_id).unwrap().clone();
+        let mut runtime = AgentRuntimeManager::new();
+        let sender = pending_preparation(&mut runtime, task_id, 11);
+        sender
+            .send(PreparationResult {
+                generation: 11,
+                result: Err(AgentRuntimeError::Preparation(
+                    "fixture prerequisite failed".into(),
+                )),
+            })
+            .unwrap();
+
+        let report = runtime.poll(&mut tasks, TEST_POLICY);
+        assert_eq!(report.preparations_finished, 1);
+        assert_eq!(report.issues.len(), 1);
+        assert!(report.issues[0]
+            .detail
+            .contains("fixture prerequisite failed"));
+        assert_eq!(tasks.get(task_id), Some(&before));
+        assert!(!tasks.has_active_agent_event_stream(task_id));
+        assert!(!runtime.has_any_activity());
+    }
+
+    #[test]
+    fn changed_sharing_policy_cancels_even_a_ready_preparation_generation() {
+        let mut runtime = AgentRuntimeManager::new();
+        let task_id = TaskId::new();
+        let sender = pending_preparation(&mut runtime, task_id, 13);
+        sender
+            .send(PreparationResult {
+                generation: 13,
+                result: Err(AgentRuntimeError::Preparation(
+                    "ready result must not win revoked consent".into(),
+                )),
+            })
+            .unwrap();
+        let mut tasks = TaskManager::new();
+
+        let report = runtime.poll(
+            &mut tasks,
+            NativePromptPolicy {
+                share_command_context: false,
+                redact_secrets: true,
+            },
+        );
+        assert_eq!(report.preparations_finished, 1);
+        assert_eq!(report.preparations_started, 0);
+        assert_eq!(report.issues.len(), 1);
+        assert!(report.issues[0].detail.contains("sharing policy changed"));
+        assert!(!runtime.has_preparing(task_id));
+        assert!(runtime.has_any_activity());
+
+        assert_eq!(
+            runtime.poll(&mut tasks, TEST_POLICY),
+            AgentRuntimePollReport::default()
+        );
+        assert!(!runtime.has_any_activity());
+        assert!(!tasks.has_active_agent_event_stream(task_id));
+    }
+
+    #[test]
+    fn cancelled_preparation_workers_remain_globally_bounded_until_they_exit() {
+        let mut runtime = AgentRuntimeManager::new();
+        let mut senders = Vec::new();
+        for generation in 1..=NATIVE_AGENT_PREPARATIONS_MAX as u64 {
+            let task_id = TaskId::new();
+            senders.push(pending_preparation(&mut runtime, task_id, generation));
+            runtime.cancel(task_id).unwrap();
+        }
+        assert_eq!(
+            runtime.cancelled_preparations.len(),
+            NATIVE_AGENT_PREPARATIONS_MAX
+        );
+
+        let mut tasks = TaskManager::new();
+        let other = TaskId::new();
+        assert!(matches!(
+            runtime.start_codex(
+                &mut tasks,
+                other,
+                TEST_POLICY,
+            ),
+            Err(AgentRuntimeError::Preparation(detail)) if detail.contains("at most")
+        ));
+
+        drop(senders.pop());
+        assert!(matches!(
+            runtime.start_codex(
+                &mut tasks,
+                other,
+                TEST_POLICY,
+            ),
+            Err(AgentRuntimeError::UnknownTask(id)) if id == other
+        ));
+    }
+
+    #[test]
+    fn real_preparation_failure_arrives_asynchronously_and_keeps_task_retryable() {
+        let (mut tasks, task_id) = task_manager();
+        let before = tasks.get(task_id).unwrap().clone();
+        let mut runtime = AgentRuntimeManager::new();
+        runtime
+            .start_codex(&mut tasks, task_id, TEST_POLICY)
+            .unwrap();
+        assert!(runtime.has_preparing(task_id));
+        assert_eq!(tasks.get(task_id), Some(&before));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let report = loop {
+            let report = runtime.poll(&mut tasks, TEST_POLICY);
+            if report.preparations_finished > 0 {
+                break report;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(report.preparations_finished, 1);
+        assert_eq!(report.preparations_started, 0);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(tasks.get(task_id), Some(&before));
+        assert!(!runtime.has_any_activity());
     }
 }

@@ -86,6 +86,8 @@ struct TaskRowSnapshot {
     has_agent_terminal: bool,
     has_validation_terminal: bool,
     has_active_agent_stream: bool,
+    native_preparing: bool,
+    terminal_retry_available: bool,
     validation_status: TaskValidationStatus,
     validation_attempt: u64,
     validation_detail: Option<String>,
@@ -98,6 +100,7 @@ impl TaskRowSnapshot {
         self.status.is_running()
             || self.validation_status == TaskValidationStatus::Running
             || self.has_active_agent_stream
+            || self.native_preparing
     }
 
     fn group_rank(&self) -> u8 {
@@ -477,6 +480,11 @@ impl TerminalApp {
                     .as_deref()
                     .is_some_and(|session_id| self.session_manager.index_of(session_id).is_some()),
                 has_active_agent_stream: self.task_manager.has_active_agent_event_stream(task.id),
+                native_preparing: self.agent_runtime.has_preparing(task.id),
+                terminal_retry_available: self
+                    .task_manager
+                    .terminal_retry_session_id(task.id)
+                    .is_ok(),
                 validation_status: task.validation.status,
                 validation_attempt: task.validation.attempt,
                 validation_detail: task
@@ -533,7 +541,9 @@ impl TerminalApp {
                     } else {
                         "·"
                     };
-                    let color = if row.validation_status == TaskValidationStatus::NotRun {
+                    let color = if row.native_preparing {
+                        egui::Color32::from_rgb(90, 150, 230)
+                    } else if row.validation_status == TaskValidationStatus::NotRun {
                         task_status_color(ui, row.status)
                     } else {
                         task_validation_color(ui, row.validation_status)
@@ -554,7 +564,9 @@ impl TerminalApp {
 
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
-                        let activity = if row.validation_attempt == 0 {
+                        let activity = if row.native_preparing {
+                            format!("{} · Preparing…", row.provider.display_name())
+                        } else if row.validation_attempt == 0 {
                             format!("{} · {}", row.provider.display_name(), row.status.label())
                         } else {
                             format!(
@@ -565,6 +577,9 @@ impl TerminalApp {
                             )
                         };
                         ui.label(egui::RichText::new(activity).small().color(color));
+                        if row.native_preparing {
+                            ui.spinner();
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
@@ -579,6 +594,7 @@ impl TerminalApp {
                         ui.horizontal_wrapped(|ui| {
                             if row.status == TaskStatus::Created
                                 && row.runtime_kind == TaskRuntimeKind::Unassigned
+                                && !row.native_preparing
                             {
                                 if ui
                                     .add_enabled(
@@ -606,12 +622,23 @@ impl TerminalApp {
                                 }
                             }
                             if row.status == TaskStatus::Created
-                                && row.runtime_kind == TaskRuntimeKind::TerminalFallback
+                                && matches!(
+                                    row.runtime_kind,
+                                    TaskRuntimeKind::Terminal | TaskRuntimeKind::TerminalFallback
+                                )
                                 && ui
-                                    .button("Retry terminal fallback")
-                                    .on_hover_text(
-                                        "Retry only the provider CLI compatibility path; native one-shot authority remains consumed",
-                                    )
+                                    .button(if row.runtime_kind == TaskRuntimeKind::TerminalFallback {
+                                        "Retry terminal fallback"
+                                    } else {
+                                        "Retry Agent terminal"
+                                    })
+                                    .on_hover_text(if row.runtime_kind
+                                        == TaskRuntimeKind::TerminalFallback
+                                    {
+                                        "Retry only the provider CLI compatibility path; native one-shot authority remains consumed"
+                                    } else {
+                                        "Retry the provider CLI after its previous terminal exited"
+                                    })
                                     .clicked()
                             {
                                 pending = Some(TaskSidebarAction::StartTerminal(row.id));
@@ -630,22 +657,40 @@ impl TerminalApp {
                                 pending = Some(TaskSidebarAction::StartTerminal(row.id));
                             }
                             if row.status == TaskStatus::Failed
-                                && row.runtime_kind == TaskRuntimeKind::TerminalFallback
+                                && matches!(
+                                    row.runtime_kind,
+                                    TaskRuntimeKind::Terminal | TaskRuntimeKind::TerminalFallback
+                                )
+                                && row.terminal_retry_available
                                 && ui
-                                    .button("Retry terminal fallback")
-                                    .on_hover_text(
-                                        "Start another provider CLI compatibility PTY; native one-shot authority remains consumed",
-                                    )
+                                    .button(if row.runtime_kind == TaskRuntimeKind::TerminalFallback {
+                                        "Retry terminal fallback"
+                                    } else {
+                                        "Retry Agent terminal"
+                                    })
+                                    .on_hover_text(if row.runtime_kind
+                                        == TaskRuntimeKind::TerminalFallback
+                                    {
+                                        "Start another provider CLI compatibility PTY; native one-shot authority remains consumed"
+                                    } else {
+                                        "Start another provider CLI PTY in the same isolated worktree"
+                                    })
                                     .clicked()
                             {
                                 pending = Some(TaskSidebarAction::StartTerminal(row.id));
                             }
-                            if row.has_active_agent_stream
+                            if (row.native_preparing || row.has_active_agent_stream)
                                 && ui
-                                    .button("Stop Codex")
-                                    .on_hover_text(
-                                        "Interrupt the turn, stop its process group, and wait for reap",
-                                    )
+                                    .button(if row.native_preparing {
+                                        "Cancel preparation"
+                                    } else {
+                                        "Stop Codex"
+                                    })
+                                    .on_hover_text(if row.native_preparing {
+                                        "Discard this background preparation; no provider process has started"
+                                    } else {
+                                        "Interrupt the turn, stop its process group, and wait for reap"
+                                    })
                                     .clicked()
                             {
                                 pending = Some(TaskSidebarAction::StopCodex(row.id));
@@ -775,7 +820,15 @@ impl TerminalApp {
             TaskSidebarAction::StartCodex(task_id) => self.start_task_native_codex(task_id),
             TaskSidebarAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
             TaskSidebarAction::StopCodex(task_id) => match self.agent_runtime.cancel(task_id) {
-                Ok(()) => self.set_status("Stopping Codex and waiting for process cleanup…"),
+                Ok(()) => {
+                    if self.agent_runtime.has_running(task_id) {
+                        self.set_status("Stopping Codex and waiting for process cleanup…");
+                    } else {
+                        self.set_status(
+                            "Native Codex preparation cancelled; finishing background cleanup…",
+                        );
+                    }
+                }
                 Err(error) => {
                     self.set_status_for(error.to_string(), Duration::from_secs(6));
                 }
@@ -867,9 +920,7 @@ impl TerminalApp {
             .agent_runtime
             .start_codex(&mut self.task_manager, task_id, policy)
         {
-            Ok(()) => self.set_status(
-                "Started native Codex in the isolated worktree; waiting for app-server events…",
-            ),
+            Ok(()) => self.set_status("Preparing native Codex prerequisites in the background…"),
             Err(error) => self.set_status_for(
                 format!("Could not start native Codex: {error}"),
                 Duration::from_secs(8),
@@ -900,7 +951,13 @@ impl TerminalApp {
     /// Drain only already-buffered native events. The runtime applies its own
     /// global/per-task frame budgets and never waits for provider I/O here.
     pub(crate) fn poll_native_agent_runtime(&mut self, ctx: &egui::Context) {
-        let report = self.agent_runtime.poll(&mut self.task_manager);
+        let current_policy = NativePromptPolicy {
+            share_command_context: self.config.ai_enabled && self.config.ai_share_command_context,
+            redact_secrets: self.config.ai_redact_secrets,
+        };
+        let report = self
+            .agent_runtime
+            .poll(&mut self.task_manager, current_policy);
         if let Some(issue) = report.issues.last() {
             self.set_status_for(
                 format!("Native Agent issue: {}", issue.detail),
@@ -931,30 +988,41 @@ impl TerminalApp {
                 }
             };
             self.set_status_for(message, Duration::from_secs(8));
+        } else if report.preparations_started > 0 {
+            self.set_status(if report.preparations_started == 1 {
+                "Native Codex prerequisites verified; starting app-server…".to_string()
+            } else {
+                format!(
+                    "{} native Codex sessions finished preparation and are starting…",
+                    report.preparations_started
+                )
+            });
         }
         if self.agent_runtime.has_any_running() || report.budget_exhausted {
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.agent_runtime.has_any_activity() {
+            ctx.request_repaint_after(Duration::from_millis(75));
         } else if report.made_progress() {
             ctx.request_repaint();
         }
     }
 
     fn start_task_agent_terminal(&mut self, task_id: TaskId) {
-        let needs_failed_terminal_retry = self.task_manager.get(task_id).is_some_and(|task| {
-            task.status == TaskStatus::Failed
-                && task.runtime_kind == TaskRuntimeKind::TerminalFallback
-        });
+        if self.agent_runtime.has_preparing(task_id) {
+            self.set_status("Cancel native Codex preparation before starting a terminal");
+            return;
+        }
+        let failed_terminal_retry = self
+            .task_manager
+            .terminal_retry_session_id(task_id)
+            .ok()
+            .map(str::to_owned);
         let needs_failed_native_recovery = self.task_manager.get(task_id).is_some_and(|task| {
             task.status == TaskStatus::Failed
                 && task.runtime_kind == TaskRuntimeKind::Native
                 && self.agent_runtime.exit_report(task_id).is_some()
         });
-        if needs_failed_terminal_retry {
-            if let Err(error) = self.task_manager.prepare_terminal_fallback_retry(task_id) {
-                self.set_status_for(error.to_string(), Duration::from_secs(6));
-                return;
-            }
-        } else if needs_failed_native_recovery {
+        if failed_terminal_retry.is_none() && needs_failed_native_recovery {
             if let Err(error) = self
                 .task_manager
                 .prepare_terminal_fallback_after_native_failure(task_id)
@@ -965,7 +1033,11 @@ impl TerminalApp {
             self.agent_runtime.clear_retained(task_id);
         }
         let launch = self.task_manager.get(task_id).and_then(|task| {
-            (task.status == TaskStatus::Created && task.terminal_session_id.is_none()).then(|| {
+            ((task.status == TaskStatus::Created && task.terminal_session_id.is_none())
+                || failed_terminal_retry
+                    .as_deref()
+                    .is_some_and(|old| task.terminal_session_id.as_deref() == Some(old)))
+            .then(|| {
                 (
                     task.provider,
                     task.title.clone(),
@@ -982,20 +1054,24 @@ impl TerminalApp {
         {
             Ok(launch) => launch,
             Err(error) => {
-                // update_status preserves TerminalFallback provenance, so a
-                // failed compatibility launch remains terminal-only.
-                let _ = self.task_manager.update_status(
-                    task_id,
-                    TaskStatus::Created,
-                    Some(error.to_string()),
-                );
+                if failed_terminal_retry.is_none() {
+                    // update_status preserves TerminalFallback provenance, so
+                    // a failed compatibility launch remains terminal-only.
+                    let _ = self.task_manager.update_status(
+                        task_id,
+                        TaskStatus::Created,
+                        Some(error.to_string()),
+                    );
+                }
                 self.set_status_for(error.to_string(), Duration::from_secs(6));
                 return;
             }
         };
-        let _ = self
-            .task_manager
-            .update_status(task_id, TaskStatus::Starting, None);
+        if failed_terminal_retry.is_none() {
+            let _ = self
+                .task_manager
+                .update_status(task_id, TaskStatus::Starting, None);
+        }
 
         let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
         let session_name = format!(
@@ -1013,11 +1089,13 @@ impl TerminalApp {
         ) {
             Ok(created) => created,
             Err(error) => {
-                let _ = self.task_manager.update_status(
-                    task_id,
-                    TaskStatus::Created,
-                    Some(error.clone()),
-                );
+                if failed_terminal_retry.is_none() {
+                    let _ = self.task_manager.update_status(
+                        task_id,
+                        TaskStatus::Created,
+                        Some(error.clone()),
+                    );
+                }
                 self.set_status_for(
                     format!("Could not start {}: {error}", provider.display_name()),
                     Duration::from_secs(6),
@@ -1026,22 +1104,31 @@ impl TerminalApp {
             }
         };
 
-        if let Err(error) = self
-            .task_manager
-            .bind_terminal_session(task_id, created.session_id.clone())
-        {
+        let binding = if let Some(old_session) = failed_terminal_retry.as_deref() {
+            self.task_manager.bind_terminal_retry_session(
+                task_id,
+                old_session,
+                created.session_id.clone(),
+            )
+        } else {
+            self.task_manager
+                .bind_terminal_session(task_id, created.session_id.clone())
+        };
+        if let Err(error) = binding {
             // The session was inserted but has not entered TabManager yet;
             // removing it immediately restores the original index layout.
             let _ = self.session_manager.close_session(created.session_index);
-            let _ = self.task_manager.update_status(
-                task_id,
-                // The PTY was closed before it gained task authority. Keep
-                // the selected runtime family retryable; in particular a
-                // consumed native one-shot remains TerminalFallback and can
-                // never expose Start Codex again.
-                TaskStatus::Created,
-                Some(error.to_string()),
-            );
+            if failed_terminal_retry.is_none() {
+                let _ = self.task_manager.update_status(
+                    task_id,
+                    // The PTY was closed before it gained task authority. Keep
+                    // the selected runtime family retryable; in particular a
+                    // consumed native one-shot remains TerminalFallback and can
+                    // never expose Start Codex again.
+                    TaskStatus::Created,
+                    Some(error.to_string()),
+                );
+            }
             self.set_status_for(error.to_string(), Duration::from_secs(6));
             return;
         }
@@ -1185,6 +1272,8 @@ mod tests {
             has_agent_terminal: true,
             has_validation_terminal: false,
             has_active_agent_stream: false,
+            native_preparing: false,
+            terminal_retry_available: false,
             validation_status: TaskValidationStatus::NotRun,
             validation_attempt: 0,
             validation_detail: None,
@@ -1195,15 +1284,22 @@ mod tests {
 
     #[test]
     fn dashboard_orders_attention_then_running_then_finished() {
+        let mut preparing = row(TaskStatus::Created, 30, "preparing");
+        preparing.native_preparing = true;
+        assert!(preparing.is_running());
         let mut rows = vec![
             row(TaskStatus::Completed, 50, "done"),
+            preparing,
             row(TaskStatus::Working, 10, "working"),
             row(TaskStatus::Failed, 1, "failed-old"),
             row(TaskStatus::WaitingForHuman, 20, "waiting-new"),
         ];
         sort_rows(&mut rows);
         let titles: Vec<_> = rows.iter().map(|row| row.title.as_str()).collect();
-        assert_eq!(titles, vec!["waiting-new", "failed-old", "working", "done"]);
+        assert_eq!(
+            titles,
+            vec!["waiting-new", "failed-old", "preparing", "working", "done"]
+        );
     }
 
     #[test]
