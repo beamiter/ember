@@ -640,6 +640,8 @@ pub(super) fn status_after_event(
 }
 
 pub(super) fn event_ends_stream(event: &AgentEventKind) -> bool {
+    // TurnCompleted is deliberately absent: one provider session/stream may
+    // carry another strictly correlated turn after its review point.
     matches!(
         event,
         AgentEventKind::SessionEnded { .. }

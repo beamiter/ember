@@ -52,6 +52,10 @@ pub const CODEX_APP_SERVER_FILE_VIEW_CAPACITY: usize = 16;
 pub const CODEX_APP_SERVER_APPROVAL_CAPACITY: usize = 8;
 /// Aggregate exact string bytes retained by all pending approval snapshots.
 pub const CODEX_APP_SERVER_APPROVAL_FROZEN_MAX_BYTES: usize = 256 * 1024;
+/// Maximum sequential turns one live native session may own. Keeping every
+/// completed provider turn identity for the full session prevents an old ID
+/// from regaining authority after bounded tombstone eviction.
+pub const CODEX_APP_SERVER_LIVE_TURN_MAX: usize = 32;
 const RESOLVED_APPROVAL_TOMBSTONE_CAPACITY: usize = 32;
 
 const STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
@@ -62,6 +66,7 @@ const FIELD_MAX_BYTES: usize = 4096;
 const TOOL_PATH_MAX_BYTES: usize = 16 * 1024;
 const TOOL_PATH_MAX_DIRECTORIES: usize = 64;
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const IDLE_IO_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const CANCEL_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
 const STARTUP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINATE_GRACE: Duration = Duration::from_millis(500);
@@ -150,6 +155,7 @@ pub enum CodexAppServerPhase {
     Spawning,
     Initializing,
     StartingThread,
+    StartingTurn,
     Ready,
     Running,
     WaitingForApproval,
@@ -235,6 +241,8 @@ pub struct CodexAppServerViewSnapshot {
     pub commands: Vec<CodexAppServerCommandView>,
     pub file_changes: Vec<CodexAppServerFileChangeView>,
     pub pending_approvals: Vec<CodexAppServerApproval>,
+    /// Completed turns in this still-loaded provider session.
+    pub completed_turns: usize,
     pub last_error: Option<String>,
     pub dropped_updates: u64,
 }
@@ -250,6 +258,7 @@ impl Default for CodexAppServerViewSnapshot {
             commands: Vec::new(),
             file_changes: Vec::new(),
             pending_approvals: Vec::new(),
+            completed_turns: 0,
             last_error: None,
             dropped_updates: 0,
         }
@@ -340,6 +349,10 @@ impl CodexAppServerDriver {
 
     pub(crate) fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
         self.view.lock().clone()
+    }
+
+    pub(crate) fn phase(&self) -> CodexAppServerPhase {
+        self.view.lock().phase
     }
 
     pub(crate) fn take_exit_report(&self) -> Option<CodexAppServerExitReport> {
@@ -479,15 +492,7 @@ impl AgentDriver for CodexAppServerDriver {
         if self.cancellation.is_cancelled() || self.worker_is_finished() {
             return Err(AgentDriverError::Closed);
         }
-        self.command_sender
-            .try_send(command)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => AgentDriverError::Backpressure {
-                    queued_messages: self.command_sender.len(),
-                    message_capacity: CODEX_APP_SERVER_COMMAND_CAPACITY,
-                },
-                TrySendError::Disconnected(_) => AgentDriverError::Closed,
-            })
+        try_send_command(&self.command_sender, &self.view, command)
     }
 
     fn cancel(&mut self) {
@@ -499,6 +504,51 @@ impl AgentDriver for CodexAppServerDriver {
             return Err(AgentDriverError::NotStarted);
         }
         self.receive_event()
+    }
+}
+
+fn try_send_command(
+    sender: &Sender<AgentCommand>,
+    view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+    command: AgentCommand,
+) -> Result<(), AgentDriverError> {
+    let reservation = match &command {
+        AgentCommand::Prompt(_) => Some(CodexAppServerPhase::StartingTurn),
+        AgentCommand::FinishSession => Some(CodexAppServerPhase::Stopping),
+        AgentCommand::Steer { .. } | AgentCommand::DecideApproval { .. } => None,
+    };
+    let mut snapshot = reservation
+        .map(|phase| {
+            let mut snapshot = view.lock();
+            if snapshot.phase != CodexAppServerPhase::Ready {
+                return Err(AgentDriverError::TurnActive);
+            }
+            if matches!(&command, AgentCommand::Prompt(_))
+                && snapshot.completed_turns >= CODEX_APP_SERVER_LIVE_TURN_MAX
+            {
+                return Err(AgentDriverError::TurnLimitReached {
+                    limit: CODEX_APP_SERVER_LIVE_TURN_MAX,
+                });
+            }
+            snapshot.phase = phase;
+            Ok(snapshot)
+        })
+        .transpose()?;
+
+    match sender.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(snapshot) = snapshot.as_mut() {
+                snapshot.phase = CodexAppServerPhase::Ready;
+            }
+            Err(match error {
+                TrySendError::Full(_) => AgentDriverError::Backpressure {
+                    queued_messages: sender.len(),
+                    message_capacity: CODEX_APP_SERVER_COMMAND_CAPACITY,
+                },
+                TrySendError::Disconnected(_) => AgentDriverError::Closed,
+            })
+        }
     }
 }
 
@@ -1729,7 +1779,7 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
 
         if terminal.is_none() && reader.eof {
             terminal = Some(TerminalIntent::failed(WorkerFailure::protocol(
-                "app-server stdout closed before a terminal turn notification",
+                "app-server stdout closed before Ember ended the native session",
             )));
         }
 
@@ -1738,12 +1788,17 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
         if terminal.is_none() {
             loop {
                 match commands.try_recv() {
-                    Ok(command) => {
-                        if let Err(failure) = machine.handle_command(command, &mut writes) {
+                    Ok(command) => match machine.handle_command(command, &mut writes) {
+                        Ok(Some(intent)) => {
+                            terminal = Some(intent);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(failure) => {
                             terminal = Some(TerminalIntent::failed(failure));
                             break;
                         }
-                    }
+                    },
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
                 }
@@ -1754,7 +1809,7 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
             match process.leader_has_exited() {
                 Ok(true) => {
                     let detail =
-                        "Codex app-server exited before a terminal turn notification".to_string();
+                        "Codex app-server exited before Ember ended the native session".to_string();
                     terminal = Some(if cancellation.is_cancelled() {
                         TerminalIntent::cancelled(detail)
                     } else {
@@ -1767,7 +1822,11 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
         }
 
         if terminal.is_none() {
-            thread::sleep(IO_POLL_INTERVAL);
+            thread::sleep(if machine.is_idle() {
+                IDLE_IO_POLL_INTERVAL
+            } else {
+                IO_POLL_INTERVAL
+            });
         }
     }
 
@@ -1934,12 +1993,13 @@ struct ProtocolMachine {
     provider_turn_id: Option<String>,
     local_turn_id: Option<AgentTurnId>,
     turn_started_emitted: bool,
+    startup_complete: bool,
     initial_prompt: Option<AgentPrompt>,
     deferred_commands: VecDeque<AgentCommand>,
     approvals: HashMap<ApprovalId, PendingApproval>,
     resolved_approvals: VecDeque<ApprovalId>,
     agent_delta_items: HashSet<String>,
-    startup_requires_turn: bool,
+    completed_provider_turn_ids: VecDeque<String>,
 }
 
 struct NativeProtocolAuthority {
@@ -1957,7 +2017,6 @@ impl ProtocolMachine {
         sink: AgentEventSink,
         view: Arc<Mutex<CodexAppServerViewSnapshot>>,
     ) -> Self {
-        let startup_requires_turn = initial_prompt.is_some();
         Self {
             wire_root,
             wire_cwd,
@@ -1972,18 +2031,18 @@ impl ProtocolMachine {
             provider_turn_id: None,
             local_turn_id: None,
             turn_started_emitted: false,
+            startup_complete: false,
             initial_prompt,
             deferred_commands: VecDeque::new(),
             approvals: HashMap::new(),
             resolved_approvals: VecDeque::new(),
             agent_delta_items: HashSet::new(),
-            startup_requires_turn,
+            completed_provider_turn_ids: VecDeque::new(),
         }
     }
 
     fn startup_handshake_complete(&self) -> bool {
-        self.provider_thread_id.is_some()
-            && (!self.startup_requires_turn || self.turn_started_emitted)
+        self.startup_complete
     }
 
     fn queue_initialize(&mut self, writes: &mut WireWriteQueue) -> Result<(), WorkerFailure> {
@@ -2038,6 +2097,8 @@ impl ProtocolMachine {
     fn is_idle(&self) -> bool {
         self.provider_thread_id.is_some()
             && self.provider_turn_id.is_none()
+            && self.local_turn_id.is_none()
+            && self.approvals.is_empty()
             && !self
                 .pending_requests
                 .values()
@@ -2176,11 +2237,15 @@ impl ProtocolMachine {
             PendingClientRequest::ThreadStart => {
                 let thread_id = required_bounded_string(result, &["thread", "id"], "thread id")?;
                 self.accept_thread_id(thread_id)?;
-                self.view.lock().phase = CodexAppServerPhase::Ready;
                 if let Some(prompt) = self.initial_prompt.take() {
                     self.queue_turn(prompt, writes)?;
+                } else {
+                    self.startup_complete = true;
+                    self.view.lock().phase = CodexAppServerPhase::Ready;
                 }
-                self.flush_deferred(writes)?;
+                if let Some(intent) = self.flush_deferred(writes)? {
+                    return Ok(Some(intent));
+                }
             }
             PendingClientRequest::TurnStart(local_turn_id) => {
                 let turn_id = required_bounded_string(result, &["turn", "id"], "turn id")?;
@@ -2254,7 +2319,7 @@ impl ProtocolMachine {
                 "approvalPolicy": "never",
                 "approvalsReviewer": "user",
                 // A read-only thread does not persist project trust or enable
-                // project .codex layers. The one turn supplies its explicit
+                // project .codex layers. Every turn supplies its explicit
                 // descriptor-bound workspaceWrite policy separately.
                 "sandbox": "read-only",
                 "serviceName": "ember",
@@ -2483,25 +2548,36 @@ impl ProtocolMachine {
                 let local_turn_id = self
                     .local_turn_id
                     .ok_or_else(|| WorkerFailure::protocol("turn/completed has no local turn"))?;
-                self.provider_turn_id = None;
-                self.view.lock().provider_turn_id = None;
                 return match status.as_str() {
                     "completed" => {
+                        if !self.approvals.is_empty() {
+                            return Err(WorkerFailure::protocol(
+                                "turn/completed arrived with pending approval authority",
+                            ));
+                        }
                         self.emit_critical(
                             AgentEventKind::TurnCompleted {
                                 turn_id: local_turn_id,
                             },
                             None,
                         )?;
-                        Ok(Some(TerminalIntent::clean()))
+                        self.complete_turn(completed_turn_id);
+                        Ok(None)
                     }
-                    "interrupted" if cancellation_requested => Ok(Some(TerminalIntent::cancelled(
-                        "native Codex turn was interrupted",
-                    ))),
-                    "interrupted" => Ok(Some(TerminalIntent::failed(WorkerFailure::provider(
-                        "Codex turn was interrupted without an Ember cancellation",
-                    )))),
+                    "interrupted" if cancellation_requested => {
+                        self.clear_terminal_turn();
+                        Ok(Some(TerminalIntent::cancelled(
+                            "native Codex turn was interrupted",
+                        )))
+                    }
+                    "interrupted" => {
+                        self.clear_terminal_turn();
+                        Ok(Some(TerminalIntent::failed(WorkerFailure::provider(
+                            "Codex turn was interrupted without an Ember cancellation",
+                        ))))
+                    }
                     "failed" => {
+                        self.clear_terminal_turn();
                         let detail = params
                             .get("turn")
                             .and_then(|turn| turn.get("error"))
@@ -2612,7 +2688,7 @@ impl ProtocolMachine {
         &mut self,
         command: AgentCommand,
         writes: &mut WireWriteQueue,
-    ) -> Result<(), WorkerFailure> {
+    ) -> Result<Option<TerminalIntent>, WorkerFailure> {
         if self.provider_thread_id.is_none() {
             if self.deferred_commands.len() >= CODEX_APP_SERVER_COMMAND_CAPACITY {
                 return Err(WorkerFailure::protocol(
@@ -2620,10 +2696,21 @@ impl ProtocolMachine {
                 ));
             }
             self.deferred_commands.push_back(command);
-            return Ok(());
+            return Ok(None);
         }
         match command {
-            AgentCommand::Prompt(prompt) => self.queue_turn(prompt, writes),
+            AgentCommand::Prompt(prompt) => {
+                self.queue_turn(prompt, writes)?;
+                Ok(None)
+            }
+            AgentCommand::FinishSession => {
+                if !self.is_idle() {
+                    return Err(WorkerFailure::protocol(
+                        "finish session command requires an idle provider thread",
+                    ));
+                }
+                Ok(Some(TerminalIntent::clean()))
+            }
             AgentCommand::Steer { turn_id, text } => {
                 if self.local_turn_id != Some(turn_id) {
                     return Err(WorkerFailure::protocol(
@@ -2647,17 +2734,18 @@ impl ProtocolMachine {
                     }),
                     PendingClientRequest::Steer,
                     writes,
-                )
+                )?;
+                Ok(None)
             }
             AgentCommand::DecideApproval { id, decision } => {
                 if self.resolved_approvals.contains(&id) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let Some(pending) = self.approvals.get(&id).cloned() else {
                     // ApprovalId is generated locally and validated at the
                     // command boundary. Unknown values therefore represent a
                     // stale UI frame and are safe idempotent no-ops.
-                    return Ok(());
+                    return Ok(None);
                 };
                 if matches!(&decision, ApprovalDecision::Approve) {
                     return Err(WorkerFailure::protocol(
@@ -2694,16 +2782,21 @@ impl ProtocolMachine {
                         None,
                     )?;
                 }
-                Ok(())
+                Ok(None)
             }
         }
     }
 
-    fn flush_deferred(&mut self, writes: &mut WireWriteQueue) -> Result<(), WorkerFailure> {
+    fn flush_deferred(
+        &mut self,
+        writes: &mut WireWriteQueue,
+    ) -> Result<Option<TerminalIntent>, WorkerFailure> {
         while let Some(command) = self.deferred_commands.pop_front() {
-            self.handle_command(command, writes)?;
+            if let Some(intent) = self.handle_command(command, writes)? {
+                return Ok(Some(intent));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn remember_settled_approval(&mut self, id: ApprovalId) {
@@ -2720,23 +2813,22 @@ impl ProtocolMachine {
         prompt: AgentPrompt,
         writes: &mut WireWriteQueue,
     ) -> Result<(), WorkerFailure> {
-        if self.local_turn_id.is_some()
-            || self
-                .pending_requests
-                .values()
-                .any(|request| matches!(request, PendingClientRequest::TurnStart(_)))
-        {
+        if !self.is_idle() {
             return Err(WorkerFailure::protocol(
-                "Codex app-server supports only one active task turn",
+                "Codex app-server session is not idle",
             ));
+        }
+        if self.completed_provider_turn_ids.len() >= CODEX_APP_SERVER_LIVE_TURN_MAX {
+            return Err(WorkerFailure::provider(format!(
+                "native Codex session reached its {}-turn limit; finish the session before validation",
+                CODEX_APP_SERVER_LIVE_TURN_MAX
+            )));
         }
         let thread_id = self
             .provider_thread_id
-            .as_deref()
+            .clone()
             .ok_or_else(|| WorkerFailure::protocol("cannot start turn before thread start"))?;
         let local_turn_id = prompt.turn_id;
-        self.local_turn_id = Some(local_turn_id);
-        self.turn_started_emitted = false;
         self.queue_request(
             "turn/start",
             json!({
@@ -2756,7 +2848,57 @@ impl ProtocolMachine {
             }),
             PendingClientRequest::TurnStart(local_turn_id),
             writes,
-        )
+        )?;
+        self.local_turn_id = Some(local_turn_id);
+        self.turn_started_emitted = false;
+        self.agent_delta_items.clear();
+        self.resolved_approvals.clear();
+        let mut view = self.view.lock();
+        view.phase = CodexAppServerPhase::StartingTurn;
+        view.provider_turn_id = None;
+        view.agent_text.clear();
+        view.agent_text_truncated = false;
+        view.commands.clear();
+        view.file_changes.clear();
+        view.pending_approvals.clear();
+        view.last_error = None;
+        view.dropped_updates = 0;
+        Ok(())
+    }
+
+    fn complete_turn(&mut self, provider_turn_id: String) {
+        self.remember_completed_turn(provider_turn_id);
+        self.provider_turn_id = None;
+        self.local_turn_id = None;
+        self.turn_started_emitted = false;
+        self.pending_requests.retain(|_, request| {
+            !matches!(
+                request,
+                PendingClientRequest::TurnStart(_)
+                    | PendingClientRequest::Steer
+                    | PendingClientRequest::Interrupt
+            )
+        });
+        self.approvals.clear();
+        self.resolved_approvals.clear();
+        self.agent_delta_items.clear();
+        let mut view = self.view.lock();
+        view.provider_turn_id = None;
+        view.pending_approvals.clear();
+        view.completed_turns = self.completed_provider_turn_ids.len();
+        view.phase = CodexAppServerPhase::Ready;
+    }
+
+    fn clear_terminal_turn(&mut self) {
+        self.provider_turn_id = None;
+        self.view.lock().provider_turn_id = None;
+    }
+
+    fn remember_completed_turn(&mut self, provider_turn_id: String) {
+        if !self.completed_provider_turn_ids.contains(&provider_turn_id) {
+            self.completed_provider_turn_ids.push_back(provider_turn_id);
+        }
+        debug_assert!(self.completed_provider_turn_ids.len() <= CODEX_APP_SERVER_LIVE_TURN_MAX);
     }
 
     fn accept_thread_id(&mut self, thread_id: String) -> Result<(), WorkerFailure> {
@@ -2797,6 +2939,11 @@ impl ProtocolMachine {
         local_turn_id: AgentTurnId,
         provider_turn_id: String,
     ) -> Result<(), WorkerFailure> {
+        if self.completed_provider_turn_ids.contains(&provider_turn_id) {
+            return Err(WorkerFailure::protocol(
+                "provider reused an already completed turn identity",
+            ));
+        }
         if self.local_turn_id != Some(local_turn_id) {
             return Err(WorkerFailure::protocol(
                 "provider turn does not match pending local turn",
@@ -2823,6 +2970,7 @@ impl ProtocolMachine {
             )?;
             self.turn_started_emitted = true;
         }
+        self.startup_complete = true;
         Ok(())
     }
 
@@ -3800,6 +3948,13 @@ mod tests {
         machine.provider_turn_id = Some("turn-1".into());
         machine.local_turn_id = Some(turn_id);
         machine.turn_started_emitted = true;
+        machine.startup_complete = true;
+        {
+            let mut snapshot = view.lock();
+            snapshot.phase = CodexAppServerPhase::Running;
+            snapshot.provider_thread_id = Some("thread-1".into());
+            snapshot.provider_turn_id = Some("turn-1".into());
+        }
         (machine, queue, receiver, view, turn_id)
     }
 
@@ -3907,6 +4062,346 @@ mod tests {
             receiver.try_recv().unwrap().kind(),
             AgentEventKind::TurnStarted { turn_id } if *turn_id == local_turn
         ));
+        assert!(machine.startup_handshake_complete());
+    }
+
+    #[test]
+    fn completed_turn_becomes_idle_and_follow_up_reuses_thread_and_authority() {
+        let (mut machine, mut writes, receiver, view, first_local_turn) = active_machine();
+        machine.append_agent_text("first answer");
+        machine.update_command_view(
+            "command-1",
+            json!({
+                "command": "true", "cwd": "/workspace", "status": "completed",
+                "aggregatedOutput": "ok"
+            })
+            .as_object()
+            .unwrap(),
+        );
+        machine.update_file_view(
+            "file-1",
+            "completed",
+            &[json!({
+                "path": "src/lib.rs", "kind": {"type": "update"}, "diff": "+done"
+            })],
+        );
+        machine.agent_delta_items.insert("agent-1".into());
+        machine.pending_requests.insert(
+            RpcId::Integer(90),
+            PendingClientRequest::TurnStart(first_local_turn),
+        );
+        machine
+            .pending_requests
+            .insert(RpcId::Integer(91), PendingClientRequest::Steer);
+        {
+            let mut snapshot = view.lock();
+            snapshot.last_error = Some("old turn warning".into());
+            snapshot.dropped_updates = 7;
+        }
+
+        let terminal = machine
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"}
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        assert!(terminal.is_none());
+        assert!(machine.is_idle());
+        assert!(machine.startup_handshake_complete());
+        assert!(machine.pending_requests.is_empty());
+        assert!(machine.agent_delta_items.is_empty());
+        assert_eq!(
+            machine.completed_provider_turn_ids,
+            VecDeque::from(["turn-1".to_string()])
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind(),
+            AgentEventKind::TurnCompleted { turn_id } if *turn_id == first_local_turn
+        ));
+        assert!(receiver.try_recv().is_err());
+        {
+            let snapshot = view.lock();
+            assert_eq!(snapshot.phase, CodexAppServerPhase::Ready);
+            assert_eq!(snapshot.provider_thread_id.as_deref(), Some("thread-1"));
+            assert!(snapshot.provider_turn_id.is_none());
+            assert_eq!(snapshot.agent_text, "first answer");
+            assert_eq!(snapshot.commands.len(), 1);
+            assert_eq!(snapshot.file_changes.len(), 1);
+        }
+
+        // A response belonging to the already-completed turn was removed from
+        // correlation state and cannot revive it.
+        assert!(machine
+            .handle_message(
+                json!({"id": 90, "result": {"turn": {"id": "turn-1"}}}),
+                &mut writes,
+                false,
+            )
+            .unwrap()
+            .is_none());
+
+        let follow_up = AgentPrompt::new("continue with the next fix");
+        let follow_up_local_turn = follow_up.turn_id;
+        assert!(machine
+            .handle_command(AgentCommand::Prompt(follow_up), &mut writes)
+            .unwrap()
+            .is_none());
+        let turn_start = pop_wire(&mut writes);
+        assert_eq!(turn_start["method"], "turn/start");
+        assert_eq!(turn_start["params"]["threadId"], "thread-1");
+        assert_eq!(turn_start["params"]["cwd"], "/proc/self/fd/19/nested");
+        assert_eq!(turn_start["params"]["environments"], json!([]));
+        assert_eq!(turn_start["params"]["approvalPolicy"], "never");
+        assert_eq!(turn_start["params"]["approvalsReviewer"], "user");
+        assert_eq!(
+            turn_start["params"]["sandboxPolicy"],
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/proc/self/fd/19"],
+                "networkAccess": false,
+                "excludeSlashTmp": true,
+                "excludeTmpdirEnvVar": true
+            })
+        );
+        {
+            let snapshot = view.lock();
+            assert_eq!(snapshot.phase, CodexAppServerPhase::StartingTurn);
+            assert_eq!(snapshot.provider_thread_id.as_deref(), Some("thread-1"));
+            assert!(snapshot.agent_text.is_empty());
+            assert!(snapshot.commands.is_empty());
+            assert!(snapshot.file_changes.is_empty());
+            assert!(snapshot.last_error.is_none());
+            assert_eq!(snapshot.dropped_updates, 0);
+        }
+
+        let request_id = turn_start["id"].clone();
+        machine
+            .handle_message(
+                json!({"id": request_id, "result": {"turn": {"id": "turn-2"}}}),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind(),
+            AgentEventKind::TurnStarted { turn_id } if *turn_id == follow_up_local_turn
+        ));
+        assert_eq!(view.lock().phase, CodexAppServerPhase::Running);
+
+        assert!(machine
+            .handle_message(
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1", "turnId": "turn-1",
+                        "itemId": "late-old-item", "delta": "stale"
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn finish_session_requires_idle_and_returns_a_clean_terminal_intent() {
+        let (mut machine, mut writes, receiver, view, _) = active_machine();
+        assert!(machine
+            .handle_command(AgentCommand::FinishSession, &mut writes)
+            .is_err());
+
+        assert!(machine
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"}
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap()
+            .is_none());
+        let _turn_completed = receiver.try_recv().unwrap();
+        assert_eq!(view.lock().phase, CodexAppServerPhase::Ready);
+
+        let intent = machine
+            .handle_command(AgentCommand::FinishSession, &mut writes)
+            .unwrap()
+            .expect("idle finish should end the session");
+        assert_eq!(intent.outcome, AgentSessionOutcome::Clean);
+        assert_eq!(intent.cause, CodexAppServerExitCause::Clean);
+        assert!(intent.detail.is_none());
+    }
+
+    #[test]
+    fn non_completed_terminal_turn_statuses_end_the_session() {
+        for (status, cancellation_requested, expected_outcome) in [
+            ("interrupted", true, AgentSessionOutcome::Cancelled),
+            ("interrupted", false, AgentSessionOutcome::Failed),
+            ("failed", false, AgentSessionOutcome::Failed),
+        ] {
+            let (mut machine, mut writes, _receiver, view, _) = active_machine();
+            let intent = machine
+                .handle_message(
+                    json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {
+                                "id": "turn-1", "status": status,
+                                "error": {"message": "provider failure"}
+                            }
+                        }
+                    }),
+                    &mut writes,
+                    cancellation_requested,
+                )
+                .unwrap()
+                .expect("non-completed status must terminate the session");
+            assert_eq!(intent.outcome, expected_outcome);
+            assert!(machine.provider_turn_id.is_none());
+            assert!(view.lock().provider_turn_id.is_none());
+        }
+    }
+
+    #[test]
+    fn idle_send_reservation_rejects_duplicate_prompt_and_finish_actions() {
+        let (sender, receiver) = bounded(CODEX_APP_SERVER_COMMAND_CAPACITY);
+        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+            phase: CodexAppServerPhase::Ready,
+            ..CodexAppServerViewSnapshot::default()
+        }));
+        let first = AgentPrompt::new("first");
+        let first_turn = first.turn_id;
+        try_send_command(&sender, &view, AgentCommand::Prompt(first)).unwrap();
+        assert_eq!(view.lock().phase, CodexAppServerPhase::StartingTurn);
+        assert_eq!(
+            try_send_command(
+                &sender,
+                &view,
+                AgentCommand::Prompt(AgentPrompt::new("duplicate"))
+            ),
+            Err(AgentDriverError::TurnActive)
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AgentCommand::Prompt(prompt) if prompt.turn_id == first_turn
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        view.lock().phase = CodexAppServerPhase::Running;
+        assert_eq!(
+            try_send_command(&sender, &view, AgentCommand::FinishSession),
+            Err(AgentDriverError::TurnActive)
+        );
+        assert!(receiver.try_recv().is_err());
+
+        view.lock().phase = CodexAppServerPhase::Ready;
+        try_send_command(&sender, &view, AgentCommand::FinishSession).unwrap();
+        assert_eq!(view.lock().phase, CodexAppServerPhase::Stopping);
+        assert_eq!(
+            try_send_command(&sender, &view, AgentCommand::FinishSession),
+            Err(AgentDriverError::TurnActive)
+        );
+        assert_eq!(receiver.try_recv().unwrap(), AgentCommand::FinishSession);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_idle_send_rolls_back_its_phase_reservation() {
+        let (sender, _receiver) = bounded(CODEX_APP_SERVER_COMMAND_CAPACITY);
+        let active_turn = AgentTurnId::new();
+        for _ in 0..CODEX_APP_SERVER_COMMAND_CAPACITY {
+            sender
+                .try_send(AgentCommand::Steer {
+                    turn_id: active_turn,
+                    text: "queued".into(),
+                })
+                .unwrap();
+        }
+        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+            phase: CodexAppServerPhase::Ready,
+            ..CodexAppServerViewSnapshot::default()
+        }));
+        assert!(matches!(
+            try_send_command(
+                &sender,
+                &view,
+                AgentCommand::Prompt(AgentPrompt::new("retry later"))
+            ),
+            Err(AgentDriverError::Backpressure { .. })
+        ));
+        assert_eq!(view.lock().phase, CodexAppServerPhase::Ready);
+    }
+
+    #[test]
+    fn live_turn_limit_never_evicts_an_old_provider_identity() {
+        let (sender, receiver) = bounded(CODEX_APP_SERVER_COMMAND_CAPACITY);
+        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+            phase: CodexAppServerPhase::Ready,
+            completed_turns: CODEX_APP_SERVER_LIVE_TURN_MAX,
+            ..CodexAppServerViewSnapshot::default()
+        }));
+        assert_eq!(
+            try_send_command(
+                &sender,
+                &view,
+                AgentCommand::Prompt(AgentPrompt::new("one turn too many")),
+            ),
+            Err(AgentDriverError::TurnLimitReached {
+                limit: CODEX_APP_SERVER_LIVE_TURN_MAX,
+            })
+        );
+        assert_eq!(view.lock().phase, CodexAppServerPhase::Ready);
+        assert!(receiver.try_recv().is_err());
+        // Finishing remains available at the cap.
+        try_send_command(&sender, &view, AgentCommand::FinishSession).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), AgentCommand::FinishSession);
+
+        let (mut machine, mut writes, receiver, _view, _) = active_machine();
+        machine
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"}
+                    }
+                }),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let _ = receiver.try_recv().unwrap();
+        for ordinal in 2..=CODEX_APP_SERVER_LIVE_TURN_MAX {
+            machine.remember_completed_turn(format!("turn-{ordinal}"));
+        }
+        assert_eq!(
+            machine.completed_provider_turn_ids.len(),
+            CODEX_APP_SERVER_LIVE_TURN_MAX
+        );
+        assert!(machine
+            .completed_provider_turn_ids
+            .contains(&"turn-1".to_string()));
+        assert!(machine
+            .handle_command(
+                AgentCommand::Prompt(AgentPrompt::new("must finish")),
+                &mut writes,
+            )
+            .is_err());
+        assert!(machine
+            .completed_provider_turn_ids
+            .contains(&"turn-1".into()));
     }
 
     #[test]

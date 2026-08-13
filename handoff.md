@@ -24,10 +24,20 @@ fail closed.
   both retry after an unsuccessful PTY exit; a successful new PTY atomically
   replaces the exited transcript binding while sticky provenance is preserved.
 
-- The experimental Tasks dashboard now has a real one-shot Codex app-server
+- The experimental Tasks dashboard now has a live multi-turn Codex app-server
   runtime. It sends explicitly shared, bounded failed-command evidence over
   Codex's structured JSONL protocol, reduces correlated lifecycle events into
-  task state, and retains bounded agent/command/file views. The provider runs
+  task state, and retains bounded agent/command/file views. A completed turn
+  becomes a live review point: bounded user feedback starts another sequential
+  turn on the same provider thread with identical cwd, sandbox, environment,
+  approval, and containment authority. Duplicate/overlapping turns are rejected,
+  a later turn invalidates earlier validation evidence, and **Finish Codex** is
+  required before validation can start. Live sessions are capped at 32 turns so
+  all completed provider turn IDs remain authoritative tombstones for the whole
+  session. The dashboard projects the current/latest turn while the worktree diff
+  remains cumulative; bounded completed-turn history is still future work. Once
+  that session stops, native restart and cross-process thread resume remain
+  disabled. The provider runs
   in a descriptor-pinned isolated worktree and transient user-systemd cgroup;
   Ember publishes its terminal event only after the cgroup is empty and the
   leader is reaped. File-change requests require an immutable, completely
@@ -40,7 +50,10 @@ fail closed.
   are disabled; the audited 0.147.0 protocol is version-gated, and tool
   subprocesses get a separate no-login, proxy-free environment with a vetted
   absolute PATH. Native failure keeps the worktree available for an explicit
-  PTY compatibility continuation; native session resume remains future work.
+  PTY compatibility continuation. If a later turn fails after an earlier review
+  point, that review state remains available and the fully stopped failed session
+  can atomically bind a terminal fallback without losing the old state on spawn
+  failure. Native session resume remains future work.
 
 - Agent tasks that are ready for review can now re-run their originating
   semantic command as a separate validation terminal inside the isolated
@@ -52,8 +65,9 @@ fail closed.
   or manually cancelled validation never turns into an Agent runtime failure.
   The Tasks card retains attempt/result state and exposes validation output,
   rerun, diff review, and an explicit pass-gated Mark complete action. Spawn is
-  gated before PTY creation while a native event stream is active; the current
-  native Codex path is one-shot; and validation uses non-login shell
+  gated before PTY creation while a native event stream is active; one live
+  native session may carry sequential turns but cannot restart after stopping;
+  and validation uses non-login shell
   command mode plus no-rc/scrubbed startup hooks. The actual source-session
   shell identity is captured before config hot reloads, Git registration and
   branch identity are rechecked, and a descriptor-pinned cwd is carried from

@@ -28,7 +28,7 @@ pub use drivers::{
     CodexAppServerApproval, CodexAppServerApprovalFileChange, CodexAppServerApprovalKind,
     CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,
     CodexAppServerFileChange, CodexAppServerFileChangeView, CodexAppServerPhase,
-    CodexAppServerProcessExit, CodexAppServerViewSnapshot,
+    CodexAppServerProcessExit, CodexAppServerViewSnapshot, CODEX_APP_SERVER_LIVE_TURN_MAX,
 };
 pub use event::{
     AgentEvent, AgentEventEpoch, AgentEventError, AgentEventKind, AgentEventStream,
@@ -38,6 +38,7 @@ pub use event::{
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
 pub use native::{
     NativeCodexHomeError, NativePromptError, NativePromptPolicy, NativeWorkspaceError,
+    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
 };
 pub use runtime::{
     AgentRuntimeCompletion, AgentRuntimeError, AgentRuntimeIssue, AgentRuntimeManager,

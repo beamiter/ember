@@ -1058,7 +1058,7 @@ impl ConfigPanel {
                 "Off by default. Nothing leaves this machine until you enable AI \
                  and explicitly submit a request. Native Codex runs in a pinned \
                  workspace sandbox; accepting command and file-change approvals \
-                 is disabled in the current one-shot flow.",
+                 is disabled throughout each live native session.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
@@ -1072,7 +1072,7 @@ impl ConfigPanel {
         );
         ui.label(
             RichText::new(
-                "Native tasks use the installed, ChatGPT-authenticated Codex CLI in an isolated empty config; inline provider/model settings and user Codex extensions do not carry into that one-shot runtime.",
+                "Native tasks use the installed, ChatGPT-authenticated Codex CLI in an isolated empty config; inline provider/model settings and user Codex extensions do not carry into that live runtime.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
@@ -1258,7 +1258,7 @@ impl ConfigPanel {
         }
         ui.label(
             RichText::new(
-                "Enables isolated task worktrees and the one-shot native Codex app-server dashboard. This does not grant cloud command-context sharing.",
+                "Enables isolated task worktrees and the native Codex app-server dashboard. A live session can run sequential review-feedback turns but cannot resume after it stops. This does not grant cloud command-context sharing.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),

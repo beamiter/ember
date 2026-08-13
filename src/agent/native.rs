@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 /// Maximum complete native prompt sent to a provider.
 pub const NATIVE_AGENT_PROMPT_MAX_BYTES: usize = 96 * 1024;
+/// Maximum user-authored review feedback accepted for one live follow-up turn.
+pub const NATIVE_AGENT_FOLLOW_UP_MAX_BYTES: usize = 16 * 1024;
 const NATIVE_AGENT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const NATIVE_CODEX_AUTH_MAX_BYTES: u64 = 64 * 1024;
 const NATIVE_CODEX_HOME_CREATE_ATTEMPTS: usize = 8;
@@ -674,6 +676,9 @@ pub enum NativePromptError {
     CommandNotExact,
     CommandTruncated,
     OutputUnavailable,
+    FollowUpEmpty,
+    FollowUpControl,
+    FollowUpVisualSpoof,
     TooLarge { limit: usize },
     Encode,
 }
@@ -695,6 +700,13 @@ impl fmt::Display for NativePromptError {
             Self::OutputUnavailable => {
                 formatter.write_str("semantic command output is unavailable")
             }
+            Self::FollowUpEmpty => formatter.write_str("follow-up feedback is empty"),
+            Self::FollowUpControl => {
+                formatter.write_str("follow-up feedback contains an unsafe control character")
+            }
+            Self::FollowUpVisualSpoof => formatter.write_str(
+                "follow-up feedback contains invisible or bidirectional formatting characters",
+            ),
             Self::TooLarge { limit } => {
                 write!(formatter, "native Agent prompt exceeds the {limit}-byte limit")
             }
@@ -873,6 +885,47 @@ pub(crate) fn build_native_task_prompt(
     if text.len() > NATIVE_AGENT_PROMPT_MAX_BYTES {
         return Err(NativePromptError::TooLarge {
             limit: NATIVE_AGENT_PROMPT_MAX_BYTES,
+        });
+    }
+    Ok(AgentPrompt::new(text))
+}
+
+/// Build one explicit, user-authored follow-up turn for an already-running
+/// native session. Unlike terminal evidence, this text is intentionally model
+/// instructions; it is still exact, bounded, display-safe, and subject to the
+/// current AI redaction policy before it crosses the provider boundary.
+pub(crate) fn build_native_follow_up_prompt(
+    text: &str,
+    policy: NativePromptPolicy,
+) -> Result<AgentPrompt, NativePromptError> {
+    if !policy.share_command_context {
+        return Err(NativePromptError::SharingDisabled);
+    }
+    if text
+        .trim_matches(|character| matches!(character, ' ' | '\n' | '\t'))
+        .is_empty()
+    {
+        return Err(NativePromptError::FollowUpEmpty);
+    }
+    if text.len() > NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
+        return Err(NativePromptError::TooLarge {
+            limit: NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+        });
+    }
+    if text.chars().any(|character| {
+        matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f) && !matches!(character, '\n' | '\t')
+    }) {
+        return Err(NativePromptError::FollowUpControl);
+    }
+    if text.chars().any(|character| {
+        !matches!(character, '\n' | '\t') && crate::review_text::is_visual_spoof(character)
+    }) {
+        return Err(NativePromptError::FollowUpVisualSpoof);
+    }
+    let text = redact_if_enabled(text, policy.redact_secrets);
+    if text.len() > NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
+        return Err(NativePromptError::TooLarge {
+            limit: NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
         });
     }
     Ok(AgentPrompt::new(text))
@@ -1145,6 +1198,47 @@ mod tests {
         assert!(bounded.starts_with("head"));
         assert!(bounded.ends_with("tail"));
         assert!(bounded.len() <= 64);
+    }
+
+    #[test]
+    fn follow_up_prompt_is_bounded_redacted_and_rejects_display_spoofing() {
+        let policy = NativePromptPolicy {
+            share_command_context: true,
+            redact_secrets: true,
+        };
+        let prompt = build_native_follow_up_prompt(
+            "Please rerun with Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            policy,
+        )
+        .unwrap();
+        assert!(prompt.text.contains("Please rerun"));
+        assert!(!prompt.text.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(
+            build_native_follow_up_prompt(" \n\t", policy),
+            Err(NativePromptError::FollowUpEmpty)
+        );
+        assert_eq!(
+            build_native_follow_up_prompt("safe\u{202e}spoof", policy),
+            Err(NativePromptError::FollowUpVisualSpoof)
+        );
+        assert_eq!(
+            build_native_follow_up_prompt("unsafe\0control", policy),
+            Err(NativePromptError::FollowUpControl)
+        );
+        assert!(build_native_follow_up_prompt(
+            &"x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES),
+            policy
+        )
+        .is_ok());
+        assert!(matches!(
+            build_native_follow_up_prompt(
+                &"x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES + 1),
+                policy
+            ),
+            Err(NativePromptError::TooLarge {
+                limit: NATIVE_AGENT_FOLLOW_UP_MAX_BYTES
+            })
+        ));
     }
 
     #[test]

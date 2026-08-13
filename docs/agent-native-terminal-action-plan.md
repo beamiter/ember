@@ -807,10 +807,14 @@ Deliverables:
 
 1. `AgentDriver` abstraction — implemented for the first Codex vertical slice;
 2. `AgentEvent` normalization — implemented with stream/turn correlation;
-3. Codex app-server driver — one-shot MVP implemented;
+3. Codex app-server driver — live sequential-turn MVP implemented;
    native prerequisites are prepared asynchronously with cancellation and
    generation/policy stale-result rejection, followed by descriptor-backed Git
    and launcher revalidation in the provider worker immediately before spawn;
+   completed turns remain on the same loaded thread for bounded review feedback,
+   with a 32-turn identity-retention cap; an explicit clean finish is required
+   before validation and stopped sessions cannot yet resume. The initial view is
+   current/latest-turn only, with bounded completed-turn history still pending;
 4. Claude stream-json driver;
 5. native Agent Pane — initial Tasks-dashboard projection implemented;
 6. **Fix this command** — implemented for exact failed-command evidence;

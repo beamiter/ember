@@ -7,13 +7,15 @@
 
 use crate::agent::{
     AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
-    CodexAppServerViewSnapshot, NativePromptPolicy, TaskId, TaskRuntimeKind, TaskStatus,
-    TaskValidationStatus,
+    CodexAppServerPhase, CodexAppServerViewSnapshot, NativePromptPolicy, TaskId, TaskRuntimeKind,
+    TaskStatus, TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX,
+    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
 };
 use crate::app::state::TerminalApp;
 use crate::review_text::visible_bounded;
 use eframe::egui;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -26,12 +28,19 @@ const MAX_TASK_BRANCH_DISPLAY_BYTES: usize = 120;
 const MAX_TASK_DETAIL_DISPLAY_BYTES: usize = 320;
 const MAX_NATIVE_AGENT_TEXT_DISPLAY_BYTES: usize = 64 * 1024;
 const MAX_NATIVE_ITEM_DISPLAY_BYTES: usize = 8 * 1024;
+// egui bounds this in Unicode scalar values, while the authority boundary
+// below uses exact UTF-8 bytes. Keeping the larger scalar limit preserves the
+// full ASCII budget; multi-byte text is still rejected once its byte counter
+// exceeds the provider limit.
+const MAX_NATIVE_FOLLOW_UP_CHARS: usize = NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSidebarAction {
     StartCodex(TaskId),
     StartTerminal(TaskId),
     StopCodex(TaskId),
+    FollowUp(TaskId, String),
+    FinishCodex(TaskId),
     Approve(TaskId, ApprovalId),
     Deny(TaskId, ApprovalId),
     FocusTerminal(TaskId),
@@ -47,6 +56,7 @@ pub struct TaskSidebarState {
     pub selected: Option<TaskId>,
     pub pending_action: Option<TaskSidebarAction>,
     pending_creation: Option<PendingTaskCreation>,
+    follow_up_drafts: HashMap<TaskId, String>,
 }
 
 struct PendingTaskCreation {
@@ -88,6 +98,7 @@ struct TaskRowSnapshot {
     has_active_agent_stream: bool,
     native_preparing: bool,
     terminal_retry_available: bool,
+    native_terminal_fallback_available: bool,
     validation_status: TaskValidationStatus,
     validation_attempt: u64,
     validation_detail: Option<String>,
@@ -240,7 +251,7 @@ fn render_native_codex_view(
                     )
                     .on_hover_text("Approve only the exact patch displayed above")
                     .on_disabled_hover_text(
-                        "Native approvals are display-and-deny only in this one-shot runtime",
+                        "Native approvals are display-and-deny only in this live session",
                     )
                     .clicked()
                 {
@@ -323,6 +334,14 @@ fn native_approval_can_allow(
     _runtime_accepts_decisions: bool,
 ) -> bool {
     false
+}
+
+fn native_follow_up_can_send(text: &str, completed_turns: usize) -> bool {
+    !text
+        .trim_matches(|character| matches!(character, ' ' | '\n' | '\t'))
+        .is_empty()
+        && text.len() <= NATIVE_AGENT_FOLLOW_UP_MAX_BYTES
+        && completed_turns < CODEX_APP_SERVER_LIVE_TURN_MAX
 }
 
 impl TerminalApp {
@@ -485,6 +504,11 @@ impl TerminalApp {
                     .task_manager
                     .terminal_retry_session_id(task.id)
                     .is_ok(),
+                native_terminal_fallback_available: self
+                    .task_manager
+                    .native_terminal_fallback_eligible(task.id)
+                    .is_ok()
+                    && self.agent_runtime.can_continue_in_terminal(task.id),
                 validation_status: task.validation.status,
                 validation_attempt: task.validation.attempt,
                 validation_detail: task
@@ -591,6 +615,11 @@ impl TerminalApp {
 
                     if selected {
                         let native_view = self.agent_runtime.snapshot(row.id);
+                        let native_idle = row.status == TaskStatus::ReadyForReview
+                            && row.has_active_agent_stream
+                            && native_view
+                                .as_ref()
+                                .is_some_and(|view| view.phase == CodexAppServerPhase::Ready);
                         ui.horizontal_wrapped(|ui| {
                             if row.status == TaskStatus::Created
                                 && row.runtime_kind == TaskRuntimeKind::Unassigned
@@ -605,7 +634,7 @@ impl TerminalApp {
                                         "Enable AI features and cloud command-context sharing in Settings → AI first",
                                     )
                                     .on_hover_text(
-                                        "Start a one-shot native Codex app-server turn. Agent tool writes are restricted to this worktree; the current Codex sandbox may read other host files.",
+                                        "Start a native Codex app-server session. Review points can continue on the same loaded thread; finish the session before validation. Agent tool writes are restricted to this worktree, while the current Codex sandbox may read other host files.",
                                     )
                                     .clicked()
                                 {
@@ -643,14 +672,15 @@ impl TerminalApp {
                             {
                                 pending = Some(TaskSidebarAction::StartTerminal(row.id));
                             }
-                            if row.status == TaskStatus::Failed
-                                && row.runtime_kind == TaskRuntimeKind::Native
-                                && !row.has_active_agent_stream
-                                && self.agent_runtime.exit_report(row.id).is_some()
+                            if row.native_terminal_fallback_available
                                 && ui
-                                    .button("Continue in terminal")
+                                    .button(if row.status == TaskStatus::ReadyForReview {
+                                        "Continue recovery in terminal"
+                                    } else {
+                                        "Continue in terminal"
+                                    })
                                     .on_hover_text(
-                                        "Keep the isolated worktree and continue through the provider CLI compatibility path",
+                                        "Keep the isolated worktree and continue through the provider CLI compatibility path; this permanently ends native authority for the task",
                                     )
                                     .clicked()
                             {
@@ -680,6 +710,7 @@ impl TerminalApp {
                                 pending = Some(TaskSidebarAction::StartTerminal(row.id));
                             }
                             if (row.native_preparing || row.has_active_agent_stream)
+                                && !native_idle
                                 && ui
                                     .button(if row.native_preparing {
                                         "Cancel preparation"
@@ -719,7 +750,11 @@ impl TerminalApp {
                                         ),
                                     )
                                     .on_disabled_hover_text(if row.has_active_agent_stream {
-                                        "Wait for the native Agent session to end"
+                                        if native_idle {
+                                            "Finish Codex to end the native session and unlock validation"
+                                        } else {
+                                            "Wait for the native Agent turn to reach review, then finish the session"
+                                        }
                                     } else {
                                         "Validation is already running"
                                     })
@@ -778,6 +813,91 @@ impl TerminalApp {
                                 &mut pending,
                             );
                         }
+                        if native_idle {
+                            ui.group(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Review feedback")
+                                        .small()
+                                        .strong(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Send another turn on this loaded Codex thread, or finish the session to unlock validation.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                let draft = self
+                                    .task_sidebar
+                                    .follow_up_drafts
+                                    .entry(row.id)
+                                    .or_default();
+                                ui.add_enabled(
+                                    native_ai_enabled,
+                                    egui::TextEdit::multiline(draft)
+                                        .desired_rows(3)
+                                        .char_limit(MAX_NATIVE_FOLLOW_UP_CHARS)
+                                        .hint_text("Describe what Codex should change next…"),
+                                )
+                                .on_disabled_hover_text(
+                                    "Enable AI features and command-context sharing before sending another cloud turn",
+                                );
+                                let can_send = native_ai_enabled
+                                    && native_follow_up_can_send(
+                                        draft.as_str(),
+                                        native_view
+                                            .as_ref()
+                                            .map_or(0, |view| view.completed_turns),
+                                    );
+                                let can_finish = draft
+                                    .trim_matches(|character| {
+                                        matches!(character, ' ' | '\n' | '\t')
+                                    })
+                                    .is_empty();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(can_send, egui::Button::new("Send follow-up"))
+                                        .on_disabled_hover_text(format!(
+                                            "Feedback must be non-empty, at most {NATIVE_AGENT_FOLLOW_UP_MAX_BYTES} UTF-8 bytes, and sent before the {CODEX_APP_SERVER_LIVE_TURN_MAX}-turn session limit",
+                                        ))
+                                        .clicked()
+                                    {
+                                        pending = Some(TaskSidebarAction::FollowUp(
+                                            row.id,
+                                            draft.clone(),
+                                        ));
+                                    }
+                                    if ui
+                                        .add_enabled(can_finish, egui::Button::new("Finish Codex"))
+                                        .on_hover_text(
+                                            "End this idle native session; validation unlocks only after containment is empty and the provider is reaped",
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Send or clear the draft before finishing Codex",
+                                        )
+                                        .clicked()
+                                    {
+                                        pending = Some(TaskSidebarAction::FinishCodex(row.id));
+                                    }
+                                    if !can_finish && ui.small_button("Clear").clicked() {
+                                        draft.clear();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} / {} bytes · turn {} / {}",
+                                            draft.len(),
+                                            NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+                                            native_view
+                                                .as_ref()
+                                                .map_or(0, |view| view.completed_turns),
+                                            CODEX_APP_SERVER_LIVE_TURN_MAX,
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                            });
+                        }
                         if row.validation_attempt > 0 {
                             let validation_color =
                                 task_validation_color(ui, row.validation_status);
@@ -833,6 +953,38 @@ impl TerminalApp {
                     self.set_status_for(error.to_string(), Duration::from_secs(6));
                 }
             },
+            TaskSidebarAction::FollowUp(task_id, text) => {
+                let policy = NativePromptPolicy {
+                    share_command_context: self.config.ai_enabled
+                        && self.config.ai_share_command_context,
+                    redact_secrets: self.config.ai_redact_secrets,
+                };
+                match self
+                    .agent_runtime
+                    .prompt_codex(&self.task_manager, task_id, &text, policy)
+                {
+                    Ok(()) => {
+                        self.task_sidebar.follow_up_drafts.remove(&task_id);
+                        self.set_status("Follow-up queued on the existing Codex thread…");
+                    }
+                    Err(error) => {
+                        self.set_status_for(error.to_string(), Duration::from_secs(6));
+                    }
+                }
+            }
+            TaskSidebarAction::FinishCodex(task_id) => {
+                match self.agent_runtime.finish_codex(&self.task_manager, task_id) {
+                    Ok(()) => {
+                        self.task_sidebar.follow_up_drafts.remove(&task_id);
+                        self.set_status(
+                            "Finishing Codex and waiting for containment cleanup before validation…",
+                        );
+                    }
+                    Err(error) => {
+                        self.set_status_for(error.to_string(), Duration::from_secs(6));
+                    }
+                }
+            }
             TaskSidebarAction::Approve(task_id, approval_id) => {
                 self.decide_native_approval(task_id, approval_id, ApprovalDecision::Approve)
             }
@@ -901,6 +1053,7 @@ impl TerminalApp {
             TaskSidebarAction::Archive(task_id) => match self.task_manager.archive(task_id) {
                 Ok(()) => {
                     self.agent_runtime.clear_retained(task_id);
+                    self.task_sidebar.follow_up_drafts.remove(&task_id);
                     if self.task_sidebar.selected == Some(task_id) {
                         self.task_sidebar.selected = None;
                     }
@@ -998,10 +1151,10 @@ impl TerminalApp {
                 )
             });
         }
-        if self.agent_runtime.has_any_running() || report.budget_exhausted {
+        if self.agent_runtime.needs_fast_poll() || report.budget_exhausted {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.agent_runtime.has_any_activity() {
-            ctx.request_repaint_after(Duration::from_millis(75));
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else if report.made_progress() {
             ctx.request_repaint();
         }
@@ -1017,23 +1170,15 @@ impl TerminalApp {
             .terminal_retry_session_id(task_id)
             .ok()
             .map(str::to_owned);
-        let needs_failed_native_recovery = self.task_manager.get(task_id).is_some_and(|task| {
-            task.status == TaskStatus::Failed
-                && task.runtime_kind == TaskRuntimeKind::Native
-                && self.agent_runtime.exit_report(task_id).is_some()
-        });
-        if failed_terminal_retry.is_none() && needs_failed_native_recovery {
-            if let Err(error) = self
+        let native_recovery = failed_terminal_retry.is_none()
+            && self.agent_runtime.can_continue_in_terminal(task_id)
+            && self
                 .task_manager
-                .prepare_terminal_fallback_after_native_failure(task_id)
-            {
-                self.set_status_for(error.to_string(), Duration::from_secs(6));
-                return;
-            }
-            self.agent_runtime.clear_retained(task_id);
-        }
+                .native_terminal_fallback_eligible(task_id)
+                .is_ok();
         let launch = self.task_manager.get(task_id).and_then(|task| {
             ((task.status == TaskStatus::Created && task.terminal_session_id.is_none())
+                || (native_recovery && task.terminal_session_id.is_none())
                 || failed_terminal_retry
                     .as_deref()
                     .is_some_and(|old| task.terminal_session_id.as_deref() == Some(old)))
@@ -1054,7 +1199,7 @@ impl TerminalApp {
         {
             Ok(launch) => launch,
             Err(error) => {
-                if failed_terminal_retry.is_none() {
+                if failed_terminal_retry.is_none() && !native_recovery {
                     // update_status preserves TerminalFallback provenance, so
                     // a failed compatibility launch remains terminal-only.
                     let _ = self.task_manager.update_status(
@@ -1067,7 +1212,7 @@ impl TerminalApp {
                 return;
             }
         };
-        if failed_terminal_retry.is_none() {
+        if failed_terminal_retry.is_none() && !native_recovery {
             let _ = self
                 .task_manager
                 .update_status(task_id, TaskStatus::Starting, None);
@@ -1089,7 +1234,7 @@ impl TerminalApp {
         ) {
             Ok(created) => created,
             Err(error) => {
-                if failed_terminal_retry.is_none() {
+                if failed_terminal_retry.is_none() && !native_recovery {
                     let _ = self.task_manager.update_status(
                         task_id,
                         TaskStatus::Created,
@@ -1110,6 +1255,9 @@ impl TerminalApp {
                 old_session,
                 created.session_id.clone(),
             )
+        } else if native_recovery {
+            self.task_manager
+                .bind_native_terminal_fallback_session(task_id, created.session_id.clone())
         } else {
             self.task_manager
                 .bind_terminal_session(task_id, created.session_id.clone())
@@ -1118,7 +1266,7 @@ impl TerminalApp {
             // The session was inserted but has not entered TabManager yet;
             // removing it immediately restores the original index layout.
             let _ = self.session_manager.close_session(created.session_index);
-            if failed_terminal_retry.is_none() {
+            if failed_terminal_retry.is_none() && !native_recovery {
                 let _ = self.task_manager.update_status(
                     task_id,
                     // The PTY was closed before it gained task authority. Keep
@@ -1131,6 +1279,10 @@ impl TerminalApp {
             }
             self.set_status_for(error.to_string(), Duration::from_secs(6));
             return;
+        }
+
+        if native_recovery {
+            self.agent_runtime.clear_retained(task_id);
         }
 
         self.tabs.on_session_inserted(created.session_index);
@@ -1274,6 +1426,7 @@ mod tests {
             has_active_agent_stream: false,
             native_preparing: false,
             terminal_retry_available: false,
+            native_terminal_fallback_available: false,
             validation_status: TaskValidationStatus::NotRun,
             validation_attempt: 0,
             validation_detail: None,
@@ -1336,5 +1489,30 @@ mod tests {
         let rendered = visible_bounded("safe\u{202e}spoof", 32);
         assert_eq!(rendered, "safe\\u{202E}spoof");
         assert!(visible_bounded(&"x".repeat(500), 20).len() <= 20);
+    }
+
+    #[test]
+    fn follow_up_send_predicate_uses_the_exact_utf8_byte_budget() {
+        assert!(!native_follow_up_can_send(" \n\t", 0));
+        assert!(native_follow_up_can_send(
+            "Please fix the remaining test",
+            1
+        ));
+        assert!(native_follow_up_can_send(
+            &"界".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES / "界".len()),
+            1,
+        ));
+        assert!(!native_follow_up_can_send(
+            &"界".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES / "界".len() + 1),
+            1,
+        ));
+        assert!(native_follow_up_can_send(
+            &"x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES),
+            CODEX_APP_SERVER_LIVE_TURN_MAX - 1,
+        ));
+        assert!(!native_follow_up_can_send(
+            "one turn too many",
+            CODEX_APP_SERVER_LIVE_TURN_MAX,
+        ));
     }
 }

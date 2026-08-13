@@ -451,6 +451,7 @@ struct NativeEventStreamState {
     next_sequence: u64,
     session_started: bool,
     active_turn: Option<AgentTurnId>,
+    review_point_reached: bool,
 }
 
 impl TaskManager {
@@ -533,17 +534,13 @@ impl TaskManager {
 
     /// Return the product-level attention state for one task.
     ///
-    /// A completed native turn briefly remains attached to its live provider
-    /// process while the runtime stops and reaps it. That is the only active
-    /// stream state we suppress: approval and human-input requests are
-    /// actionable precisely while their stream is active.
+    /// A live native stream can now remain idle at ReadyForReview until the
+    /// user sends feedback or explicitly finishes it. That review point is
+    /// actionable even though the stream is still active; suppressing it would
+    /// leave a background-completed turn parked indefinitely with no badge.
     pub fn task_needs_attention(&self, task_id: TaskId) -> bool {
-        self.get(task_id).is_some_and(|task| {
-            task.status != TaskStatus::Archived
-                && task.needs_attention()
-                && !(task.status == TaskStatus::ReadyForReview
-                    && self.has_active_agent_event_stream(task.id))
-        })
+        self.get(task_id)
+            .is_some_and(|task| task.status != TaskStatus::Archived && task.needs_attention())
     }
 
     pub fn attention_count(&self) -> usize {
@@ -554,9 +551,9 @@ impl TaskManager {
     }
 
     /// Start a correlated event stream and atomically select the native
-    /// runtime for an unassigned task. The product path is one-shot; an
-    /// already-active or previously finished native stream cannot be started
-    /// again through this entry point.
+    /// runtime for an unassigned task. Selecting a native session is one-shot:
+    /// that live stream may carry sequential turns, but an already-finished
+    /// session cannot be restarted through this entry point.
     pub fn start_agent_event_stream(
         &mut self,
         task_id: TaskId,
@@ -601,8 +598,9 @@ impl TaskManager {
         self.install_agent_event_stream(task_id, NativeAgentSessionId::new(), false)
     }
 
-    /// Test-only transport-incarnation hook. The product's native Codex path
-    /// is deliberately one-shot and has no production restart authority.
+    /// Test-only transport-incarnation hook. A live native Codex session may
+    /// carry several turns, but it has no production restart authority after
+    /// the stream ends.
     #[cfg(test)]
     fn replace_agent_event_stream_after_stop(
         &mut self,
@@ -633,14 +631,21 @@ impl TaskManager {
                 status: current,
             });
         }
+        let review_point_reached = self
+            .native_event_streams
+            .get(&task_id)
+            .is_some_and(|active| active.review_point_reached);
         let event = AgentEventKind::SessionEnded { outcome };
-        let (next, _) = super::event::status_after_event(current, &event).ok_or(
+        let (mut next, _) = super::event::status_after_event(current, &event).ok_or(
             AgentEventError::InvalidTransition {
                 task_id,
                 status: current,
                 event,
             },
         )?;
+        if review_point_reached && outcome != AgentSessionOutcome::Clean {
+            next = TaskStatus::ReadyForReview;
+        }
         let detail = super::event::bounded_event_detail(detail);
         let task = self
             .task_mut(task_id)
@@ -763,12 +768,13 @@ impl TaskManager {
             }
             task.updated_at_ms = unix_time_ms();
         }
-        let active_turn = if replacing {
+        let (active_turn, review_point_reached) = if replacing {
             self.native_event_streams
                 .get(&task_id)
-                .and_then(|active| active.active_turn)
+                .map(|active| (active.active_turn, active.review_point_reached))
+                .unwrap_or((None, false))
         } else {
-            None
+            (None, false)
         };
         self.native_event_streams.insert(
             task_id,
@@ -777,6 +783,7 @@ impl TaskManager {
                 next_sequence: 1,
                 session_started: false,
                 active_turn,
+                review_point_reached,
             },
         );
         Ok(stream)
@@ -886,26 +893,70 @@ impl TaskManager {
             },
             _ => {}
         }
-        let (next, updates_task) = super::event::status_after_event(current, &kind).ok_or(
+        let review_point_reached = active.review_point_reached;
+        let (mut next, updates_task) = super::event::status_after_event(current, &kind).ok_or(
             AgentEventError::InvalidTransition {
                 task_id,
                 status: current,
                 event: kind.clone(),
             },
         )?;
+        if review_point_reached
+            && matches!(
+                &kind,
+                AgentEventKind::Cancelled
+                    | AgentEventKind::SessionEnded {
+                        outcome: AgentSessionOutcome::Cancelled | AgentSessionOutcome::Failed,
+                    }
+                    | AgentEventKind::Error { fatal: true }
+            )
+        {
+            next = TaskStatus::ReadyForReview;
+        }
         let next_sequence = sequence
             .checked_add(1)
             .ok_or(AgentEventError::SequenceExhausted(task_id))?;
+
+        // A provider session may own more than one logical turn. Starting a
+        // later turn is work resumption even though the native stream itself
+        // never ended, so no validation result from an earlier review point
+        // may survive it. Do this only after every correlation, transition,
+        // and sequence check above has succeeded: a stale/rejected turn event
+        // must leave both validation state and its stable session mapping
+        // untouched.
+        let turn_started = matches!(&kind, AgentEventKind::TurnStarted { .. });
+        let invalidated_validation_session = if turn_started {
+            self.get(task_id)
+                .filter(|task| task.validation != TaskValidationState::default())
+                .and_then(|task| task.validation.terminal_session_id.clone())
+        } else {
+            None
+        };
 
         if updates_task {
             let task = self
                 .task_mut(task_id)
                 .map_err(|_| AgentEventError::UnknownTask(task_id))?;
+            if turn_started && task.validation != TaskValidationState::default() {
+                let attempt = task.validation.attempt;
+                task.validation = TaskValidationState {
+                    attempt,
+                    status_detail: Some(
+                        "Agent turn started; the previous validation result is stale".to_string(),
+                    ),
+                    ..TaskValidationState::default()
+                };
+            }
             task.status = next;
             if next != current || detail.is_some() {
                 task.status_detail = detail;
             }
             task.updated_at_ms = unix_time_ms();
+        }
+        if let Some(session_id) = invalidated_validation_session {
+            if self.tasks_by_validation_session.get(&session_id) == Some(&task_id) {
+                self.tasks_by_validation_session.remove(&session_id);
+            }
         }
 
         if next.is_terminal() || super::event::event_ends_stream(&kind) {
@@ -915,7 +966,10 @@ impl TaskManager {
             active.session_started |= is_session_started;
             match &kind {
                 AgentEventKind::TurnStarted { turn_id } => active.active_turn = Some(*turn_id),
-                AgentEventKind::TurnCompleted { .. } => active.active_turn = None,
+                AgentEventKind::TurnCompleted { .. } => {
+                    active.active_turn = None;
+                    active.review_point_reached = true;
+                }
                 _ => {}
             }
         }
@@ -1055,20 +1109,22 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Explicitly continue a fully stopped failed native attempt through the
-    /// compatibility PTY. This is the sole deliberate recovery from the
-    /// otherwise sticky Failed state: it never runs while a native stream or
-    /// validation owns the task, and it preserves the isolated worktree and
-    /// any partial provider changes already made there.
-    pub fn prepare_terminal_fallback_after_native_failure(
-        &mut self,
+    /// Check whether a fully stopped native task can explicitly continue in a
+    /// compatibility PTY. The runtime owner separately proves process stop;
+    /// this domain gate deliberately performs no state transition before a new
+    /// PTY has crossed exec.
+    // The library target does not compile the desktop Tasks UI that consumes
+    // this crate-private gate; keep it sealed despite that target-local fact.
+    #[allow(dead_code)]
+    pub(crate) fn native_terminal_fallback_eligible(
+        &self,
         task_id: TaskId,
     ) -> Result<(), TaskError> {
         if self.native_event_streams.contains_key(&task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
-        let task = self.task_mut(task_id)?;
-        if task.status != TaskStatus::Failed
+        let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
+        if !matches!(task.status, TaskStatus::Failed | TaskStatus::ReadyForReview)
             || task.runtime_kind != TaskRuntimeKind::Native
             || task.terminal_session_id.is_some()
             || task.validation.status == TaskValidationStatus::Running
@@ -1078,11 +1134,65 @@ impl TaskManager {
                 status: task.status,
             });
         }
+        Ok(())
+    }
+
+    /// Atomically bind an already-spawned compatibility PTY to a stopped
+    /// native task. Until this succeeds, the task's review point, validation,
+    /// and native provenance remain unchanged. A successful bind makes the
+    /// terminal fallback sticky and invalidates any older validation result.
+    #[allow(dead_code)]
+    pub(crate) fn bind_native_terminal_fallback_session(
+        &mut self,
+        task_id: TaskId,
+        session_id: String,
+    ) -> Result<(), TaskError> {
+        if !crate::session::is_valid_jsh_session_id(&session_id) {
+            return Err(TaskError::InvalidTerminalSessionId);
+        }
+        if let Some(existing_task_id) = self
+            .tasks_by_validation_session
+            .get(&session_id)
+            .copied()
+            .or_else(|| self.tasks_by_terminal_session.get(&session_id).copied())
+        {
+            return Err(TaskError::TerminalSessionAlreadyBound {
+                session_id,
+                task_id: existing_task_id,
+            });
+        }
+        self.native_terminal_fallback_eligible(task_id)?;
+        let previous_validation = self
+            .get(task_id)
+            .map(|task| task.validation.clone())
+            .ok_or(TaskError::UnknownTask(task_id))?;
+        let invalidated_validation_session = previous_validation.terminal_session_id.clone();
+        let task = self.task_mut(task_id)?;
         task.runtime_kind = TaskRuntimeKind::TerminalFallback;
-        task.status = TaskStatus::Created;
+        task.terminal_session_id = Some(session_id.clone());
+        task.exit_code = None;
+        task.status = TaskStatus::Working;
+        task.validation = if previous_validation == TaskValidationState::default() {
+            TaskValidationState::default()
+        } else {
+            TaskValidationState {
+                attempt: previous_validation.attempt,
+                status_detail: Some(
+                    "Terminal continuation started; the previous validation result is stale"
+                        .to_string(),
+                ),
+                ..TaskValidationState::default()
+            }
+        };
         task.status_detail =
             Some("Native Codex stopped; continuing in the terminal compatibility path".to_string());
         task.updated_at_ms = unix_time_ms();
+        if let Some(validation_session) = invalidated_validation_session {
+            if self.tasks_by_validation_session.get(&validation_session) == Some(&task_id) {
+                self.tasks_by_validation_session.remove(&validation_session);
+            }
+        }
+        self.tasks_by_terminal_session.insert(session_id, task_id);
         Ok(())
     }
 
@@ -1854,8 +1964,8 @@ mod tests {
             .apply_agent_event(stream.event(5, turn_completed(turn), None))
             .unwrap();
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
-        assert!(!manager.task_needs_attention(id));
-        assert_eq!(manager.attention_count(), 0);
+        assert!(manager.task_needs_attention(id));
+        assert_eq!(manager.attention_count(), 1);
         assert_eq!(
             manager.next_validation_attempt(id),
             Err(TaskError::NativeEventStreamActiveDuringValidation(id))
@@ -1865,15 +1975,28 @@ mod tests {
             Err(TaskError::NativeEventStreamActiveDuringValidation(id))
         );
 
+        // A later turn may fail after earlier useful work reached review. The
+        // stopped session must preserve that review point instead of hiding
+        // the accumulated worktree diff behind a terminal Failed state.
+        let third_turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(6, turn_started(third_turn), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
         manager
             .apply_agent_event(stream.event(
-                6,
+                7,
                 AgentEventKind::SessionEnded {
-                    outcome: AgentSessionOutcome::Clean,
+                    outcome: AgentSessionOutcome::Failed,
                 },
-                None,
+                Some("third turn failed".into()),
             ))
             .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert_eq!(
+            manager.get(id).unwrap().status_detail.as_deref(),
+            Some("third turn failed")
+        );
         assert!(manager.task_needs_attention(id));
         assert_eq!(manager.attention_count(), 1);
         manager
@@ -2373,6 +2496,120 @@ mod tests {
     }
 
     #[test]
+    fn active_stream_runs_multiple_turns_and_invalidates_the_prior_review_point() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("multi-turn stream")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let first_turn = AgentTurnId::new();
+        let second_turn = AgentTurnId::new();
+
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Starting);
+        manager
+            .apply_agent_event(stream.event(2, turn_started(first_turn), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(first_turn), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert!(manager.task_needs_attention(id));
+        assert_eq!(
+            manager.next_validation_attempt(id),
+            Err(TaskError::NativeEventStreamActiveDuringValidation(id))
+        );
+
+        // Model a retained result from an earlier review point. Public
+        // validation entry points correctly refuse this while the stream is
+        // active, but TurnStarted must still fail closed if restored or future
+        // orchestration ever presents such state.
+        manager.task_mut(id).unwrap().validation = TaskValidationState {
+            status: TaskValidationStatus::Passed,
+            attempt: 3,
+            terminal_session_id: Some("validation-before-second-turn".to_string()),
+            exit_code: Some(0),
+            status_detail: Some("Validation passed".to_string()),
+        };
+        manager
+            .tasks_by_validation_session
+            .insert("validation-before-second-turn".to_string(), id);
+
+        // A late event from the completed turn has no authority and does not
+        // consume sequence 4 or invalidate its validation result.
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(4, turn_completed(first_turn), None)),
+            Err(AgentEventError::NoActiveTurn(task_id)) if task_id == id
+        ));
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::Passed
+        );
+        assert!(manager
+            .task_for_terminal_session("validation-before-second-turn")
+            .is_some());
+
+        manager
+            .apply_agent_event(stream.event(4, turn_started(second_turn), None))
+            .unwrap();
+        let working = manager.get(id).unwrap();
+        assert_eq!(working.status, TaskStatus::Working);
+        assert_eq!(working.validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(working.validation.attempt, 3);
+        assert!(working.validation.terminal_session_id.is_none());
+        assert!(working
+            .validation
+            .status_detail
+            .as_deref()
+            .unwrap()
+            .contains("previous validation result is stale"));
+        assert!(manager
+            .task_for_terminal_session("validation-before-second-turn")
+            .is_none());
+
+        // Once turn two is active, delayed turn-one traffic is rejected by
+        // identity. The valid event at the same sequence proves the rejection
+        // did not advance the stream cursor.
+        assert!(matches!(
+            manager.apply_agent_event(stream.event(5, approval_requested(first_turn), None)),
+            Err(AgentEventError::TurnMismatch {
+                task_id,
+                expected,
+                received,
+            }) if task_id == id && expected == second_turn && received == first_turn
+        ));
+        manager
+            .apply_agent_event(stream.event(5, turn_completed(second_turn), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert!(manager.task_needs_attention(id));
+        assert_eq!(
+            manager.bind_validation_session(id, "validation-too-soon-multi".to_string()),
+            Err(TaskError::NativeEventStreamActiveDuringValidation(id))
+        );
+
+        manager
+            .apply_agent_event(stream.event(
+                6,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Clean,
+                },
+                None,
+            ))
+            .unwrap();
+        assert!(manager.task_needs_attention(id));
+        assert_eq!(manager.next_validation_attempt(id), Ok(4));
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::NativeStartRequiresCreated {
+                task_id,
+                status: TaskStatus::ReadyForReview,
+            }) if task_id == id
+        ));
+    }
+
+    #[test]
     fn replacement_stream_uses_fresh_identity_and_rejects_stale_callers() {
         let mut manager = TaskManager::new();
         let id = manager.create(new_task("correlated events")).unwrap();
@@ -2542,35 +2779,17 @@ mod tests {
             TaskRuntimeKind::Native
         );
 
+        manager.native_terminal_fallback_eligible(id).unwrap();
         manager
-            .prepare_terminal_fallback_after_native_failure(id)
+            .bind_native_terminal_fallback_session(id, "native-fallback-terminal".to_string())
             .unwrap();
         let recovered = manager.get(id).unwrap();
-        assert_eq!(recovered.status, TaskStatus::Created);
+        assert_eq!(recovered.status, TaskStatus::Working);
         assert_eq!(recovered.runtime_kind, TaskRuntimeKind::TerminalFallback);
         assert!(matches!(
             manager.start_agent_event_stream(id),
             Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == id
         ));
-        manager
-            .update_status(
-                id,
-                TaskStatus::Created,
-                Some("first PTY launch failed".into()),
-            )
-            .unwrap();
-        assert_eq!(
-            manager.get(id).unwrap().runtime_kind,
-            TaskRuntimeKind::TerminalFallback
-        );
-        manager
-            .bind_terminal_session(id, "native-fallback-terminal".to_string())
-            .unwrap();
-        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
-        assert_eq!(
-            manager.get(id).unwrap().runtime_kind,
-            TaskRuntimeKind::TerminalFallback
-        );
         manager.handle_terminal_session_exit("native-fallback-terminal", Some(7));
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::Failed);
         assert!(matches!(
@@ -2596,6 +2815,61 @@ mod tests {
         assert!(matches!(
             manager.start_agent_event_stream(id),
             Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == id
+        ));
+    }
+
+    #[test]
+    fn stopped_native_review_can_atomically_fallback_and_invalidate_validation() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("native review fallback")).unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(
+                4,
+                AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Failed,
+                },
+                Some("later provider failure".into()),
+            ))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+
+        manager
+            .bind_validation_session(id, "review-validation".to_string())
+            .unwrap();
+        manager.handle_terminal_session_exit("review-validation", Some(0));
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::Passed
+        );
+        manager.native_terminal_fallback_eligible(id).unwrap();
+        manager
+            .bind_native_terminal_fallback_session(id, "review-fallback".to_string())
+            .unwrap();
+
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::Working);
+        assert_eq!(task.runtime_kind, TaskRuntimeKind::TerminalFallback);
+        assert_eq!(task.terminal_session_id.as_deref(), Some("review-fallback"));
+        assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(task.validation.attempt, 1);
+        assert!(manager
+            .task_for_terminal_session("review-validation")
+            .is_none());
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::StreamAlreadyActive(task_id))
+                | Err(AgentEventError::TerminalSessionBound(task_id)) if task_id == id
         ));
     }
 
@@ -2783,6 +3057,45 @@ mod tests {
             ),
             Err(AgentEventError::NoActiveStream(task_id)) if task_id == id
         ));
+
+        for outcome in [AgentSessionOutcome::Failed, AgentSessionOutcome::Cancelled] {
+            let mut manager = TaskManager::new();
+            let id = manager
+                .create(new_task("review before transport loss"))
+                .unwrap();
+            let stream = manager.start_agent_event_stream(id).unwrap();
+            let completed = AgentTurnId::new();
+            let interrupted = AgentTurnId::new();
+            manager
+                .apply_agent_event(stream.event(1, session_started(), None))
+                .unwrap();
+            manager
+                .apply_agent_event(stream.event(2, turn_started(completed), None))
+                .unwrap();
+            manager
+                .apply_agent_event(stream.event(3, turn_completed(completed), None))
+                .unwrap();
+            manager
+                .apply_agent_event(stream.event(4, turn_started(interrupted), None))
+                .unwrap();
+            assert_eq!(
+                manager
+                    .finish_agent_event_stream_after_stop(
+                        &stream,
+                        outcome,
+                        Some("provider transport stopped".into()),
+                    )
+                    .unwrap(),
+                TaskStatus::ReadyForReview
+            );
+            assert!(!manager.has_active_agent_event_stream(id));
+            assert!(manager.task_needs_attention(id));
+            assert_eq!(manager.next_validation_attempt(id), Ok(1));
+            assert_eq!(
+                manager.get(id).unwrap().status_detail.as_deref(),
+                Some("provider transport stopped")
+            );
+        }
     }
 
     #[test]

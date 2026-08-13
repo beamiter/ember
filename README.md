@@ -29,7 +29,8 @@ claimed.
   bounded C..D rendered-output snapshot and reported cwd. Experimental Codex
   tasks can run through the structured app-server protocol in a descriptor-
   pinned isolated worktree, show agent output and exact display-and-deny
-  approval snapshots,
+  approval snapshots, continue with bounded review feedback on the same loaded
+  provider thread,
   and open a bounded native Git diff review surface. A finished task can rerun
   its exact source command as a separate validation terminal and retain the
   passed / failed / needs-review result on the task card
@@ -291,13 +292,31 @@ directory capabilities, credential buffers, and temporary home without
 spawning Codex. The provider worker re-proves the descriptor-pinned Git
 identity and re-resolves the trusted Codex/Node launch chain immediately before
 spawn, so a queued preparation cannot authorize later path or branch changes.
-**Start Codex** is an explicit, one-shot native path:
+**Start Codex** explicitly selects one native session for the task:
 after both AI and command-context sharing are enabled, Ember sends a bounded,
 optionally redacted user prompt over Codex app-server's newline-delimited
 protocol and consumes structured turn, command, diff, approval, and completion
 events. The source cwd is mapped to the same repository-relative directory in
 the worktree. Both the root and nested cwd are opened as directory capabilities,
 not re-resolved pathname strings.
+
+Completing a turn leaves that same app-server process and provider thread
+parked at a live **Ready for review** point. From the task card, the user can
+send bounded review feedback to start another sequential turn on the loaded
+thread, or choose **Finish Codex**. Overlapping turns and duplicate follow-up or
+finish actions are rejected atomically. A live session is capped at 32 turns so
+every completed provider turn identity remains remembered and can never regain
+authority through bounded-history eviction. Every later turn reuses the same pinned
+cwd, writable root, disabled network/environment settings, private Codex home,
+and non-accepting approval policy. A new turn invalidates any older validation
+result. Validation remains locked until **Finish Codex** has stopped the full
+containment scope and reaped the provider. The native session itself is still
+single-use: once stopped, it cannot be resumed or replaced with a second native
+session for that task; cross-process `thread/resume` is not enabled.
+The native response, command, and file cards are deliberately a bounded
+current/latest-turn projection rather than a full transcript; the Git diff is
+cumulative from the task's immutable base commit. Completed-turn history is a
+follow-up roadmap item.
 
 Native Codex runs with approval policy `never`, hosted web search and tool
 network access disabled, and `/tmp` excluded from tool writable roots. Its
@@ -354,9 +373,12 @@ attempt as running, passed, failed, needs review (no authoritative exit
 status), or cancelled. A failed validation does not masquerade as an Agent
 runtime failure, and a passing validation still requires the explicit **Mark
 complete** action after diff review. Validation cannot start until a native
-Agent event stream has fully ended. The current native Codex path is one-shot;
-the terminal compatibility path is the explicit continuation after a failed
-native attempt. A direct Agent terminal or native terminal fallback that exits
+Agent event stream has fully ended. A native task may run sequential turns only
+while its original loaded session remains alive; after that session stops, the
+terminal compatibility path is the explicit continuation after an unsuccessful
+native session. If a later turn fails after an earlier review point, Ember
+preserves that reviewable diff and offers either validation or explicit terminal
+recovery after the provider is fully stopped. A direct Agent terminal or native terminal fallback that exits
 unsuccessfully can be retried in the same isolated worktree; the old transcript
 binding remains authoritative until a new PTY has spawned and atomically takes
 its place, without changing runtime provenance or reopening native one-shot

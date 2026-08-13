@@ -10,8 +10,9 @@ use super::drivers::codex_app_server::{
     CodexAppServerViewSnapshot,
 };
 use super::native::{
-    build_native_task_prompt, prepare_native_agent_workspace, NativePromptError,
-    NativePromptPolicy, NativeWorkspaceError, PreparedNativeCodexHome, PreparedNativeWorkspace,
+    build_native_follow_up_prompt, build_native_task_prompt, prepare_native_agent_workspace,
+    NativePromptError, NativePromptPolicy, NativeWorkspaceError, PreparedNativeCodexHome,
+    PreparedNativeWorkspace,
 };
 use super::{
     AgentCommand, AgentDriver, AgentDriverError, AgentEventError, AgentEventStream,
@@ -33,7 +34,9 @@ use std::thread::JoinHandle;
 pub const NATIVE_AGENT_EVENTS_PER_FRAME: usize = 64;
 /// Prevent one noisy provider from consuming the whole global frame budget.
 pub const NATIVE_AGENT_EVENTS_PER_TASK_PER_FRAME: usize = 16;
-/// Bound simultaneous filesystem/Git/credential preparation workers.
+/// Bound simultaneous native preparations and live provider sessions.
+/// Idle multi-turn sessions retain a process, cgroup, credential grant, and
+/// pinned workspace, so they count against the same product-wide resource cap.
 pub const NATIVE_AGENT_PREPARATIONS_MAX: usize = 8;
 
 struct RunningCodexAgent {
@@ -42,11 +45,14 @@ struct RunningCodexAgent {
     worker_joined: bool,
     forced_failure: Option<String>,
     exit_report: Option<CodexAppServerExitReport>,
+    pending_prompt: Option<super::AgentTurnId>,
+    finish_requested: bool,
 }
 
 struct RetainedCodexAgent {
     view: CodexAppServerViewSnapshot,
     exit_report: Option<CodexAppServerExitReport>,
+    effective_outcome: AgentSessionOutcome,
 }
 
 struct PreparedCodexStart {
@@ -263,10 +269,11 @@ impl AgentRuntimeManager {
             .preparing
             .len()
             .saturating_add(self.cancelled_preparations.len())
+            .saturating_add(self.running.len())
             >= NATIVE_AGENT_PREPARATIONS_MAX
         {
             return Err(AgentRuntimeError::Preparation(format!(
-                "at most {NATIVE_AGENT_PREPARATIONS_MAX} tasks may prepare concurrently"
+                "at most {NATIVE_AGENT_PREPARATIONS_MAX} native tasks may prepare or remain live concurrently"
             )));
         }
         let task = task_manager
@@ -382,6 +389,8 @@ impl AgentRuntimeManager {
                 worker_joined: false,
                 forced_failure: None,
                 exit_report: None,
+                pending_prompt: None,
+                finish_requested: false,
             },
         );
         Ok(())
@@ -439,8 +448,19 @@ impl AgentRuntimeManager {
                             {
                                 continue;
                             }
+                            let started_turn = match event.kind() {
+                                super::AgentEventKind::TurnStarted { turn_id } => Some(*turn_id),
+                                _ => None,
+                            };
                             match task_manager.apply_agent_event(event) {
-                                Ok(_) => report.events_applied += 1,
+                                Ok(_) => {
+                                    report.events_applied += 1;
+                                    if started_turn.is_some()
+                                        && runtime.pending_prompt == started_turn
+                                    {
+                                        runtime.pending_prompt = None;
+                                    }
+                                }
                                 Err(error) => {
                                     let detail = bounded_runtime_detail(format!(
                                         "native Agent event was rejected: {error}"
@@ -552,6 +572,7 @@ impl AgentRuntimeManager {
                 RetainedCodexAgent {
                     view,
                     exit_report: Some(exit_report),
+                    effective_outcome: outcome,
                 },
             );
             report.workers_finished += 1;
@@ -600,6 +621,87 @@ impl AgentRuntimeManager {
             .map_err(AgentRuntimeError::Driver)
     }
 
+    /// Start another bounded user turn on the same loaded Codex thread.
+    ///
+    /// The task reducer and driver both repeat the idle-session gate. The
+    /// driver's nonblocking command boundary reserves the idle phase before
+    /// returning so duplicate UI actions cannot queue overlapping turns.
+    pub fn prompt_codex(
+        &mut self,
+        task_manager: &TaskManager,
+        task_id: TaskId,
+        text: &str,
+        policy: NativePromptPolicy,
+    ) -> Result<(), AgentRuntimeError> {
+        let task = task_manager
+            .get(task_id)
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if task.status != TaskStatus::ReadyForReview
+            || task.runtime_kind != TaskRuntimeKind::Native
+            || !task_manager.has_active_agent_event_stream(task_id)
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "task must be at a live native review point (currently {} / {:?})",
+                task.status.label(),
+                task.runtime_kind
+            )));
+        }
+        let prompt = build_native_follow_up_prompt(text, policy)?;
+        let turn_id = prompt.turn_id;
+        let runtime = self
+            .running
+            .get_mut(&task_id)
+            .ok_or(AgentRuntimeError::NotRunning(task_id))?;
+        if runtime.pending_prompt.is_some() || runtime.finish_requested {
+            return Err(AgentRuntimeError::Preparation(
+                "native Codex session already has a queued turn or finish request".into(),
+            ));
+        }
+        runtime
+            .driver
+            .send(AgentCommand::Prompt(prompt))
+            .map_err(AgentRuntimeError::Driver)?;
+        runtime.pending_prompt = Some(turn_id);
+        Ok(())
+    }
+
+    /// Finish an idle live session. Validation remains locked until the worker
+    /// has stopped, containment is empty, and the provider leader is reaped.
+    pub fn finish_codex(
+        &mut self,
+        task_manager: &TaskManager,
+        task_id: TaskId,
+    ) -> Result<(), AgentRuntimeError> {
+        let task = task_manager
+            .get(task_id)
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if task.status != TaskStatus::ReadyForReview
+            || task.runtime_kind != TaskRuntimeKind::Native
+            || !task_manager.has_active_agent_event_stream(task_id)
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "task must be at a live native review point (currently {} / {:?})",
+                task.status.label(),
+                task.runtime_kind
+            )));
+        }
+        let runtime = self
+            .running
+            .get_mut(&task_id)
+            .ok_or(AgentRuntimeError::NotRunning(task_id))?;
+        if runtime.pending_prompt.is_some() || runtime.finish_requested {
+            return Err(AgentRuntimeError::Preparation(
+                "native Codex session already has a queued turn or finish request".into(),
+            ));
+        }
+        runtime
+            .driver
+            .send(AgentCommand::FinishSession)
+            .map_err(AgentRuntimeError::Driver)?;
+        runtime.finish_requested = true;
+        Ok(())
+    }
+
     /// Return the current bounded view, or the final view retained after exit.
     pub fn snapshot(&self, task_id: TaskId) -> Option<CodexAppServerViewSnapshot> {
         self.running
@@ -624,6 +726,23 @@ impl AgentRuntimeManager {
             .and_then(|retained| retained.exit_report.take())
     }
 
+    /// True only when a fully stopped native session ended unsuccessfully and
+    /// its retained process evidence can authorize an explicit PTY recovery.
+    /// Clean Finish remains a review/validation path, not a silent authority
+    /// switch to the opaque provider CLI.
+    pub fn can_continue_in_terminal(&self, task_id: TaskId) -> bool {
+        !self.running.contains_key(&task_id)
+            && self.retained.get(&task_id).is_some_and(|retained| {
+                matches!(
+                    retained.effective_outcome,
+                    AgentSessionOutcome::Failed | AgentSessionOutcome::Cancelled
+                ) && retained.exit_report.as_ref().is_some_and(|exit| {
+                    !exit.process.spawned
+                        || (exit.process.reaped && exit.process.containment_verified_empty)
+                })
+            })
+    }
+
     pub fn has_running(&self, task_id: TaskId) -> bool {
         self.running.contains_key(&task_id)
     }
@@ -634,6 +753,15 @@ impl AgentRuntimeManager {
 
     pub fn has_any_running(&self) -> bool {
         !self.running.is_empty()
+    }
+
+    /// True while a provider is starting, executing, waiting, or stopping.
+    /// A loaded thread parked at an idle review point needs only low-frequency
+    /// lifecycle polling until the user sends another turn or finishes it.
+    pub fn needs_fast_poll(&self) -> bool {
+        self.running
+            .values()
+            .any(|runtime| runtime.driver.phase() != super::CodexAppServerPhase::Ready)
     }
 
     pub fn has_any_activity(&self) -> bool {
@@ -894,6 +1022,58 @@ mod tests {
         let report = runtime.poll(&mut tasks, TEST_POLICY);
         assert_eq!(report, AgentRuntimePollReport::default());
         assert!(!report.made_progress());
+    }
+
+    #[test]
+    fn terminal_continuation_requires_a_stopped_unsuccessful_effective_outcome() {
+        let task_id = TaskId::new();
+        let retained = |effective_outcome, process| RetainedCodexAgent {
+            view: CodexAppServerViewSnapshot::default(),
+            exit_report: Some(CodexAppServerExitReport {
+                // A runtime-forced failure may override a raw clean provider
+                // report, so eligibility intentionally uses the retained
+                // effective outcome instead of this field.
+                outcome: AgentSessionOutcome::Clean,
+                cause: super::super::CodexAppServerExitCause::Clean,
+                detail: None,
+                process,
+                critical_event_delivery_failed: false,
+                stderr_tail: String::new(),
+            }),
+            effective_outcome,
+        };
+
+        let stopped = super::super::CodexAppServerProcessExit {
+            spawned: true,
+            provider_released: true,
+            reaped: true,
+            containment_verified_empty: true,
+            success: true,
+            code: Some(0),
+            signal: None,
+        };
+        let mut runtime = AgentRuntimeManager::new();
+        runtime
+            .retained
+            .insert(task_id, retained(AgentSessionOutcome::Failed, stopped));
+        assert!(runtime.can_continue_in_terminal(task_id));
+
+        runtime
+            .retained
+            .insert(task_id, retained(AgentSessionOutcome::Clean, stopped));
+        assert!(!runtime.can_continue_in_terminal(task_id));
+
+        runtime.retained.insert(
+            task_id,
+            retained(
+                AgentSessionOutcome::Cancelled,
+                super::super::CodexAppServerProcessExit {
+                    containment_verified_empty: false,
+                    ..stopped
+                },
+            ),
+        );
+        assert!(!runtime.can_continue_in_terminal(task_id));
     }
 
     #[test]

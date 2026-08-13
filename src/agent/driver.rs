@@ -461,6 +461,7 @@ pub enum ApprovalDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     Prompt(AgentPrompt),
+    FinishSession,
     Steer {
         turn_id: AgentTurnId,
         text: String,
@@ -475,6 +476,7 @@ impl AgentCommand {
     pub(crate) fn validate(&self) -> Result<(), AgentDriverError> {
         let text = match self {
             Self::Prompt(prompt) => Some(prompt.text.as_str()),
+            Self::FinishSession => None,
             Self::Steer { text, .. } => Some(text.as_str()),
             Self::DecideApproval {
                 decision:
@@ -538,6 +540,10 @@ pub enum AgentDriverError {
     NotStarted,
     InvalidWorktree,
     InvalidCommand,
+    TurnActive,
+    TurnLimitReached {
+        limit: usize,
+    },
     ProviderMismatch,
     Backpressure {
         queued_messages: usize,
@@ -559,6 +565,11 @@ impl fmt::Display for AgentDriverError {
             Self::InvalidCommand => write!(
                 formatter,
                 "Agent command text must be 1..={AGENT_DRIVER_COMMAND_MAX_BYTES} bytes"
+            ),
+            Self::TurnActive => formatter.write_str("Agent session is not idle"),
+            Self::TurnLimitReached { limit } => write!(
+                formatter,
+                "Agent session reached its {limit}-turn limit; finish it before validation"
             ),
             Self::ProviderMismatch => {
                 formatter.write_str("provider session ID does not belong to this Agent driver")
