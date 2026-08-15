@@ -10,6 +10,19 @@ fail closed.
 
 ## Completed since the previous handoff
 
+- The jterm_core pin advances to `86661a7` and the app-owned boundaries sink
+  into it. `src/helpers.rs` is deleted: font and notification helpers now call
+  `jterm_core::helper::{fc_list, fc_match, notify_send}` directly, which carry
+  the same fixed candidates, canonical-chain trust, clamped child PATH,
+  per-stream byte caps, and single group-killing deadline on top of core's
+  `SupervisedChild`. The OSC 8 / link opener policy delegates to
+  `jterm_core::link::is_openable_url` (`MAX_OSC8_URI_BYTES` aliases core's
+  ceiling); local-path and IP *detection* stays local, and activation still
+  routes through the shared policy. The session decoder's text budget and
+  borrowed deferred raw fields now come from `jterm_core::bounded_json`
+  (`TextBudget`, `DeferredRawField`); only ember's schema, repair counters,
+  and seeds remain app-side.
+
 - The source installer accepts `--binary PATH`, allowing release archives, CI
   artifacts, and distro staging to reuse the same path contract without Cargo.
   A real `DESTDIR` install/uninstall test checks all six artifacts, modes,
@@ -19,6 +32,23 @@ fail closed.
   explicitly. `scripts/install.sh` and `scripts/uninstall.sh` now derive the
   default binary from the same `PREFIX/bin` contract (`~/.local/bin` by
   default), and CI checks the scripts with Bash and ShellCheck.
+
+- The app-owned font and notification helpers now run behind a bounded process
+  boundary (`helpers.rs`). `fc-list`, `fc-match`, and `notify-send` resolve only
+  from fixed absolute system candidates whose canonical file and every directory
+  above it are root-owned (or self-owned read-only) and never group/other
+  writable; a non-root user's own owner-writable component fails closed. Each
+  invocation leads its own process group, drains stdout and stderr concurrently
+  under independent byte caps over nonblocking `poll`, and answers to one
+  deadline that SIGKILLs and reaps the whole group — a descendant holding an
+  inherited pipe cannot outlive it. Exit observation uses `waitid(WNOWAIT)`, so
+  the leader stays waitable and its PID/PGID reserved until cleanup; a recycled
+  group id can never be signalled. The notification worker's private
+  kill-and-wait helper is gone, and text link detection is absolute HTTP(S)
+  only: `ftp://` is no longer clickable. Regression tests cover untrusted
+  scratch-path binaries, mutable/foreign ownership, concurrent dual-stream
+  draining, per-stream caps, WNOWAIT observability, and a deadline killing a
+  descendant that holds both pipes.
 
 - Native Codex startup now has a bounded, cancellable background preparation
   phase. Git/worktree identity checks, descriptor pinning, launcher validation,
@@ -142,14 +172,14 @@ fail closed.
 
 ## Remaining boundaries
 
-### Bound the app-owned helpers and configuration files
+### Read font inputs through bounded descriptors
 
-The local `fc-list`, `fc-match`, notification, and opener paths still need
-trusted helper resolution, process groups, deadlines, and concurrent bounded
-pipes. `link.rs` now resolves a trusted absolute opener and reaps it, but the
-font and notification helpers do not. Read font inputs through regular-file,
-descriptor-based size limits. Test fake PATH entries, descendants holding
-pipes, huge output, FIFOs, and oversized files.
+The helper *processes* are now bounded (see above), but the font files their
+output names are still read with `std::fs::read` in `load_font_from_path` and
+the fallback-font loop. Those paths come from fontconfig and the config file,
+so they still need regular-file, descriptor-based size limits (no-follow open,
+`fstat` regular-file check, byte cap) before allocation. FIFOs and oversized
+files behind a font path remain untested.
 
 ## Release checks
 

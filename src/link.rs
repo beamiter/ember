@@ -4,7 +4,7 @@ use regex::Regex;
 /// 链接类型
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum LinkType {
-    /// URL (http/https/ftp)
+    /// URL (http/https)
     Url,
     /// 本地文件路径
     FilePath,
@@ -58,10 +58,11 @@ pub struct LinkDetector {
 
 impl LinkDetector {
     pub fn new(config: LinkDetectionConfig) -> Self {
-        // URL 正则：http(s)?:// 或 ftp://
+        // URL regex: absolute HTTP(S) only. Family policy refuses every other
+        // scheme (ftp, file, ...) so detection cannot offer a clickable target
+        // the opener boundary would reject anyway.
         let url_regex =
-            Regex::new(r"(?:https?|ftp)://[^\s<>\[\]{}|\\^`()]*[^\s<>\[\]{}|\\^`().,;:!?\-]")
-                .unwrap();
+            Regex::new(r"https?://[^\s<>\[\]{}|\\^`()]*[^\s<>\[\]{}|\\^`().,;:!?\-]").unwrap();
 
         // IP 地址正则：x.x.x.x 格式
         let ip_regex = Regex::new(
@@ -540,6 +541,15 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].link_type, LinkType::Url);
         assert_eq!(links[0].text, "https://example.com");
+    }
+
+    #[test]
+    fn ftp_urls_are_not_detected() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        // Detection policy is absolute HTTP(S) only; an ftp:// target must not
+        // become clickable.
+        let links = detector.detect_links_in_line("Mirror at ftp://example.com/pub", 0);
+        assert!(!links.iter().any(|l| l.link_type == LinkType::Url));
     }
 
     #[test]

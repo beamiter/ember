@@ -4,7 +4,8 @@ use std::sync::Arc;
 /// Maximum OSC 8 parameter payload accepted from an attached process.
 pub(super) const MAX_OSC8_PARAMS_BYTES: usize = 256;
 /// Maximum OSC 8 target accepted from an attached process.
-pub(super) const MAX_OSC8_URI_BYTES: usize = 2 * 1024;
+#[cfg(test)]
+pub(super) const MAX_OSC8_URI_BYTES: usize = jterm_core::link::MAX_OPENABLE_URL_BYTES;
 /// Bound hyperlink metadata independently of terminal scrollback size.
 const MAX_HYPERLINKS: usize = 4096;
 
@@ -34,39 +35,15 @@ impl HyperlinkId {
 
 /// Return whether an OSC 8 target may become a click action.
 ///
-/// The policy is an allow-list of exactly one shape: an absolute HTTP(S) URL
+/// The policy lives in `jterm_core::link::is_openable_url` and is shared by
+/// every jterm: an allow-list of exactly one shape, an absolute HTTP(S) URL
 /// with an authority and no userinfo. Everything a terminal-controlled string
 /// could otherwise reach — `javascript:`, `data:`, `file:` (a click that opens
 /// a local file with its default application), `ssh:` and `git:` (a click that
 /// starts a network client), or `https://user:token@host` (a credential the
-/// user never typed) — fails closed here rather than at the opener.
-///
-/// Whitespace, controls, and visually ambiguous characters are refused too: a
-/// hyperlink's label is chosen by the same process that chose its target, so
-/// the only thing keeping the two honest is that the target reads as the origin
-/// it resolves to.
+/// user never typed) — fails closed there rather than at the opener.
 pub(crate) fn is_supported_hyperlink_uri(uri: &str) -> bool {
-    if uri.is_empty()
-        || uri.len() > MAX_OSC8_URI_BYTES
-        || uri
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-        || crate::review_text::contains_visual_spoofing(uri)
-        || uri.contains('\\')
-    {
-        return false;
-    }
-
-    let Some((scheme, rest)) = uri.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return false;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // An empty authority is `http:///path`, which resolves relative to the
-    // opener's idea of a default host rather than to anything the target names.
-    !authority.is_empty() && !authority.contains('@')
+    jterm_core::link::is_openable_url(uri)
 }
 
 fn params_are_valid(params: &str) -> bool {

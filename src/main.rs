@@ -54,7 +54,6 @@ use session_manager::{ProtocolResponseQueueError, ProtocolResponseSender, Sessio
 use shell::{ShellEvent, ShellSession};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -173,14 +172,7 @@ fn load_font_from_path(
 
 #[cfg(target_os = "linux")]
 fn fontconfig_match_file(family: &str) -> Option<String> {
-    let output = Command::new("fc-match")
-        .args(["-f", "%{file}\n", family])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
+    let output = jterm_core::helper::fc_match(&["-f", "%{file}\n", family]).ok()?;
 
     String::from_utf8(output.stdout)
         .ok()?
@@ -193,14 +185,7 @@ fn fontconfig_match_file(family: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn fontconfig_match_bold_file(family: &str) -> Option<String> {
     let query = format!("{}:style=Bold", family);
-    let output = Command::new("fc-match")
-        .args(["-f", "%{file}\n", &query])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
+    let output = jterm_core::helper::fc_match(&["-f", "%{file}\n", &query]).ok()?;
 
     let path = String::from_utf8(output.stdout)
         .ok()?
@@ -1358,50 +1343,19 @@ fn desktop_notification_channel() -> (
     crossbeam_channel::bounded(DESKTOP_NOTIFICATION_QUEUE_CAPACITY)
 }
 
-fn wait_for_child_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> std::io::Result<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            // `kill` can race a natural exit. Either way `wait` is mandatory:
-            // dropping Child does not reap it on Unix.
-            let _ = child.kill();
-            return child.wait();
-        }
-        std::thread::sleep(
-            deadline
-                .saturating_duration_since(now)
-                .min(Duration::from_millis(10)),
-        );
-    }
-}
-
 fn spawn_desktop_notification_worker() -> Option<crossbeam_channel::Sender<DesktopNotification>> {
     let (tx, rx) = desktop_notification_channel();
     std::thread::Builder::new()
         .name("desktop-notification-worker".to_string())
         .spawn(move || {
             while let Ok(notification) = rx.recv() {
-                match std::process::Command::new("notify-send")
-                    .arg("--")
-                    .arg(notification.title)
-                    .arg(notification.body)
-                    .spawn()
+                // `helper::notify_send` resolves a trusted absolute binary and
+                // owns the helper's process group under one deadline, so a
+                // stuck D-Bus bridge cannot strand the worker.
+                if let Err(error) =
+                    jterm_core::helper::notify_send(&notification.title, &notification.body)
                 {
-                    Ok(mut child) => {
-                        if let Err(error) =
-                            wait_for_child_with_timeout(&mut child, Duration::from_secs(2))
-                        {
-                            log::debug!("desktop notification wait failed: {error}");
-                        }
-                    }
-                    Err(error) => log::debug!("desktop notification unavailable: {error}"),
+                    log::debug!("desktop notification unavailable: {error}");
                 }
             }
         })
@@ -4929,11 +4883,10 @@ mod tests {
         osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
         paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
-        show_desktop_notification, take_tagged_cursor_move, wait_for_child_with_timeout,
-        workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification, PasteOrigin,
-        PasteWriteError, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
-        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
-        OSC_5522_DATA_CHUNK_BYTES,
+        show_desktop_notification, take_tagged_cursor_move, workspace_drag_pointer_cancelled,
+        ClipboardRequestGuard, DesktopNotification, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
+        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
+        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -5094,31 +5047,6 @@ mod tests {
         assert!(workspace_drag_pointer_cancelled(false, false, true));
         assert!(!workspace_drag_pointer_cancelled(true, false, true));
         assert!(!workspace_drag_pointer_cancelled(false, true, false));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn background_helper_is_reaped_after_exit_and_timeout() {
-        let mut quick = std::process::Command::new("sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
-        assert!(
-            wait_for_child_with_timeout(&mut quick, std::time::Duration::from_secs(1))
-                .unwrap()
-                .success()
-        );
-        assert!(quick.try_wait().unwrap().is_some());
-
-        let mut slow = std::process::Command::new("sh")
-            .args(["-c", "exec sleep 5"])
-            .spawn()
-            .unwrap();
-        let started = std::time::Instant::now();
-        let _ =
-            wait_for_child_with_timeout(&mut slow, std::time::Duration::from_millis(20)).unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert!(slow.try_wait().unwrap().is_some());
     }
 
     #[test]

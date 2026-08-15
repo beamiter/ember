@@ -1,7 +1,6 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
 
 use crate::persistence_file::FileRevision;
 
@@ -407,7 +406,9 @@ fn default_line_spacing() -> f32 {
 fn detect_fonts_by_query(extra_args: &[&str]) -> Vec<String> {
     let mut args = Vec::from(extra_args);
     args.push("family");
-    if let Ok(output) = Command::new("fc-list").args(&args).output() {
+    // The font list comes from a trusted, output-bounded helper: fc-list runs
+    // on terminal-controlled machines and must never be resolved through PATH.
+    if let Ok(output) = jterm_core::helper::fc_list(&args) {
         if let Ok(stdout) = String::from_utf8(output.stdout) {
             let mut seen = std::collections::HashSet::new();
             let mut families: Vec<String> = stdout
