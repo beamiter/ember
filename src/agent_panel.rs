@@ -2030,7 +2030,7 @@ mod tests {
         assert!(session.transcript().iter().all(|turn| !matches!(
             turn,
             Turn::AssistantProposed { command, .. }
-                if crate::review_text::contains_visual_spoofing(command)
+                if jterm_core::review_input::contains_visual_spoofing(command)
         )));
 
         session.retry_model().unwrap();

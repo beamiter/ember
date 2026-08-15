@@ -3135,7 +3135,8 @@ mod tests {
         assert!(detail.len() <= MAX_AGENT_EVENT_DETAIL_BYTES);
         assert!(detail.contains('?'));
         assert!(!detail.chars().any(|character| {
-            character.is_control() || crate::review_text::is_visual_spoof(character)
+            character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
         }));
 
         manager.apply_agent_event(event).unwrap();

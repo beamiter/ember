@@ -918,7 +918,8 @@ pub(crate) fn build_native_follow_up_prompt(
         return Err(NativePromptError::FollowUpControl);
     }
     if text.chars().any(|character| {
-        !matches!(character, '\n' | '\t') && crate::review_text::is_visual_spoof(character)
+        !matches!(character, '\n' | '\t')
+            && jterm_core::review_input::is_visual_spoofing_character(character)
     }) {
         return Err(NativePromptError::FollowUpVisualSpoof);
     }

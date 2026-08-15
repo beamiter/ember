@@ -45,7 +45,7 @@ impl NativeAgentSessionId {
             || value.chars().any(|character| {
                 character.is_whitespace()
                     || character.is_control()
-                    || crate::review_text::is_visual_spoof(character)
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
             })
         {
             return Err(InvalidNativeAgentSessionId);
@@ -103,7 +103,7 @@ impl ProviderSessionId {
             || opaque.chars().any(|character| {
                 character.is_whitespace()
                     || character.is_control()
-                    || crate::review_text::is_visual_spoof(character)
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
             })
         {
             return Err(InvalidProviderSessionId);
@@ -654,7 +654,9 @@ pub(super) fn bounded_event_detail(detail: Option<String>) -> Option<String> {
     let detail = detail?;
     let mut bounded = String::with_capacity(detail.len().min(MAX_AGENT_EVENT_DETAIL_BYTES));
     for character in detail.chars() {
-        let visible = if character.is_control() || crate::review_text::is_visual_spoof(character) {
+        let visible = if character.is_control()
+            || jterm_core::review_input::is_visual_spoofing_character(character)
+        {
             '?'
         } else {
             character

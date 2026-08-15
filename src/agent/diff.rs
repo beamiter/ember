@@ -917,7 +917,7 @@ fn bounded_lossy_text(bytes: Vec<u8>, limit: usize) -> String {
             '\n' | '\t' => character,
             unsafe_character
                 if unsafe_character.is_control()
-                    || crate::review_text::is_visual_spoof(unsafe_character) =>
+                    || jterm_core::review_input::is_visual_spoofing_character(unsafe_character) =>
             {
                 '?'
             }

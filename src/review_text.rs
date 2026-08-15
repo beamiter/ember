@@ -1,11 +1,14 @@
-//! Compatibility boundary for untrusted command text while ember remains
-//! pinned to the last published `jterm_core`/`jagent` contract.
+//! Ember-specific review-text helpers layered on the shared
+//! `jterm_core::review_input` boundary.
 //!
-//! The pinned revisions reject C0/C1 injection, but predate the complete
-//! visual-spoofing list used by current review surfaces. Keep this small local
-//! module until that contract can be consumed from a published core revision.
+//! The visual-spoofing character class itself lives in core; this module keeps
+//! only ember's per-surface byte budgets, the parameterized strict validator,
+//! and the prompt/history sanitizers whose multiline semantics are
+//! app-specific.
 
 use std::fmt;
+
+use jterm_core::review_input::{contains_visual_spoofing, is_visual_spoofing_character};
 
 /// Pinned jagent's existing command budget; the compatibility layer may only
 /// tighten validation, never enlarge its accepted protocol surface.
@@ -52,36 +55,6 @@ impl fmt::Display for ReviewTextError {
                 .write_str("the command contains invisible or bidirectional formatting characters"),
         }
     }
-}
-
-/// The exact compatibility list from the current shared review contract.
-pub(crate) fn is_visual_spoof(character: char) -> bool {
-    (character.is_whitespace() && character != ' ')
-        || matches!(
-            character,
-            '\u{00ad}'
-                | '\u{034f}'
-                | '\u{061c}'
-                | '\u{115f}'..='\u{1160}'
-                | '\u{17b4}'..='\u{17b5}'
-                | '\u{180b}'..='\u{180f}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{3164}'
-                | '\u{fe00}'..='\u{fe0f}'
-                | '\u{feff}'
-                | '\u{ffa0}'
-                | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
-                | '\u{e0100}'..='\u{e01ef}'
-        )
-}
-
-pub(crate) fn contains_visual_spoofing(text: &str) -> bool {
-    text.chars().any(is_visual_spoof)
 }
 
 /// Strict single-line Agent/review validator. Tabs and every non-ASCII-space
@@ -135,7 +108,7 @@ pub(crate) fn sanitize_prompt_payload(
             }
             '\n' | '\t' => sanitized.push(character),
             control if is_c0_or_c1(control) => {}
-            visual if is_visual_spoof(visual) => {
+            visual if is_visual_spoofing_character(visual) => {
                 had_visual_spoofing = true;
                 if visual_spoofing == VisualSpoofDisposition::Reject {
                     return Err(ReviewTextError::VisualSpoof);
@@ -177,7 +150,9 @@ pub(crate) fn sanitize_history_replay(
             }
             '\n' | '\t' => sanitized.push(character),
             control if is_c0_or_c1(control) => {}
-            visual if is_visual_spoof(visual) => return Err(ReviewTextError::VisualSpoof),
+            visual if is_visual_spoofing_character(visual) => {
+                return Err(ReviewTextError::VisualSpoof)
+            }
             visible => sanitized.push(visible),
         }
     }
@@ -203,7 +178,8 @@ pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
             '\r' => "\\r".to_string(),
             '\t' => "\\t".to_string(),
             unsafe_character
-                if unsafe_character.is_control() || is_visual_spoof(unsafe_character) =>
+                if unsafe_character.is_control()
+                    || is_visual_spoofing_character(unsafe_character) =>
             {
                 format!("\\u{{{:X}}}", unsafe_character as u32)
             }
@@ -232,51 +208,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strict_validator_rejects_the_complete_visual_spoof_contract() {
-        let unsafe_characters = [
-            '\u{00a0}',
-            '\u{2003}',
-            '\u{00ad}',
-            '\u{034f}',
-            '\u{061c}',
-            '\u{115f}',
-            '\u{1160}',
-            '\u{17b4}',
-            '\u{17b5}',
-            '\u{180b}',
-            '\u{180f}',
-            '\u{200b}',
-            '\u{200f}',
-            '\u{2028}',
-            '\u{202e}',
-            '\u{2060}',
-            '\u{206f}',
-            '\u{3164}',
-            '\u{fe00}',
-            '\u{fe0f}',
-            '\u{feff}',
-            '\u{ffa0}',
-            '\u{1bca0}',
-            '\u{1bca3}',
-            '\u{1d173}',
-            '\u{1d17a}',
-            '\u{e0001}',
-            '\u{e0020}',
-            '\u{e007f}',
-            '\u{e0100}',
-            '\u{e01ef}',
-        ];
-        for hidden in unsafe_characters {
+    fn strict_validator_delegates_spoofing_to_core_and_keeps_ember_budgets() {
+        // The full character class is covered by jterm_core::review_input;
+        // here only the wiring and ember's parameterized budget are checked.
+        for spoofed in ["echo safe\u{202e}txt", "echo\u{00a0}not-a-space"] {
             assert_eq!(
-                validate_single_line(&format!("printf safe{hidden}"), 64 * 1024),
+                validate_single_line(spoofed, 64 * 1024),
                 Err(ReviewTextError::VisualSpoof),
-                "{hidden:?}"
+                "{spoofed:?}"
             );
         }
         assert!(validate_single_line("printf '编译🙂'", 64 * 1024).is_ok());
         assert_eq!(
             validate_single_line("echo\tsecret", 64 * 1024),
             Err(ReviewTextError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_single_line(&"x".repeat(64 * 1024 + 1), 64 * 1024),
+            Err(ReviewTextError::TooLarge { limit: 64 * 1024 })
+        );
+        assert_eq!(
+            validate_single_line("  ", 64 * 1024),
+            Err(ReviewTextError::Empty)
         );
     }
 

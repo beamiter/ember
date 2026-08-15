@@ -3504,7 +3504,8 @@ fn bounded_optional_string(
 fn exact_display_string(value: &str, allow_line_feed: bool) -> bool {
     value.chars().all(|character| {
         (allow_line_feed && character == '\n')
-            || (!character.is_control() && !crate::review_text::is_visual_spoof(character))
+            || (!character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(character))
     })
 }
 
@@ -3899,7 +3900,9 @@ fn visible_bounded(value: &str, limit: usize) -> (String, bool) {
     let mut bounded = String::with_capacity(value.len().min(limit));
     let mut truncated = false;
     for character in value.chars() {
-        let visible = if character.is_control() || crate::review_text::is_visual_spoof(character) {
+        let visible = if character.is_control()
+            || jterm_core::review_input::is_visual_spoofing_character(character)
+        {
             '\u{fffd}'
         } else {
             character

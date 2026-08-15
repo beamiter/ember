@@ -3816,7 +3816,7 @@ fn single_line_command_preview(command: &str, max_chars: usize) -> String {
             '\t' => preview.push_str(" ⇥ "),
             unsafe_character
                 if unsafe_character.is_control()
-                    || crate::review_text::is_visual_spoof(unsafe_character) =>
+                    || jterm_core::review_input::is_visual_spoofing_character(unsafe_character) =>
             {
                 preview.push_str(&format!("\\u{{{:X}}}", unsafe_character as u32));
             }
