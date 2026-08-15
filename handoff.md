@@ -10,6 +10,39 @@ fail closed.
 
 ## Completed since the previous handoff
 
+- Font file inputs now read through a bounded descriptor boundary
+  (`src/font_file.rs`). Every candidate named by `fc-match` output or the
+  config file is opened with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`, validated
+  as a regular file through the resulting descriptor, capped at
+  `MAX_FONT_BYTES` (64 MiB — desktop fonts are a few MiB, the largest CJK
+  collections stay under half of that) before allocation, and read from that
+  descriptor only; the path is never reopened, so there is no TOCTOU window.
+  `load_font_from_path` and the bold-variant fallback loop skip a rejected
+  candidate with a path-rich error and fall through to the next one, so a
+  planted symlink, FIFO, device, or oversized file can neither stall nor
+  redirect startup. The `persistence_file` ownership/hard-link/permission
+  contract is deliberately not reused: system fonts are root-owned and
+  world-readable by design. Headless regression tests cover a symlink to a
+  real font, a non-blocking FIFO rejection, an oversized sparse file, an
+  exact-limit load, and the fallback loop skipping a non-regular candidate.
+
+- The jterm_core pin advances to `b8b1b89`, which routes desktop notifications
+  through core's bounded helper boundary. The local `src/review_text.rs`
+  duplicate of core's review boundary is dissolved: the visual-spoofing
+  character class and its whole-string predicates now come from
+  `jterm_core::review_input::{is_visual_spoofing_character,
+  contains_visual_spoofing}` at every former call site (agent event/session-ID
+  guards, codex app-server display bounding, native follow-up validation, diff
+  and command preview neutralization, agent-panel spoof checks). What remains
+  in `src/review_text.rs` is ember-only surface policy with no core
+  counterpart: the per-surface byte budgets (`MAX_AGENT_COMMAND_BYTES`,
+  `MAX_HISTORY_COMMAND_BYTES`, `MAX_PROMPT_INSERT_BYTES`), the parameterized
+  `validate_single_line` with its limit-carrying `ReviewTextError`, and the
+  multiline `sanitize_prompt_payload` / `sanitize_history_replay` /
+  `visible_bounded` helpers, all now delegating their spoof class to core. The
+  duplicated full-list test collapses to a wiring/budget smoke test since core
+  owns the character-class coverage.
+
 - The jterm_core pin advances to `86661a7` and the app-owned boundaries sink
   into it. `src/helpers.rs` is deleted: font and notification helpers now call
   `jterm_core::helper::{fc_list, fc_match, notify_send}` directly, which carry
@@ -172,14 +205,8 @@ fail closed.
 
 ## Remaining boundaries
 
-### Read font inputs through bounded descriptors
-
-The helper *processes* are now bounded (see above), but the font files their
-output names are still read with `std::fs::read` in `load_font_from_path` and
-the fallback-font loop. Those paths come from fontconfig and the config file,
-so they still need regular-file, descriptor-based size limits (no-follow open,
-`fstat` regular-file check, byte cap) before allocation. FIFOs and oversized
-files behind a font path remain untested.
+No open boundaries remain; the font-input descriptor boundary recorded above
+was the last item in this section.
 
 ## Release checks
 

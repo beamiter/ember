@@ -12,6 +12,7 @@ mod config_panel;
 mod debug;
 mod debug_panel;
 mod execution_journal;
+mod font_file;
 mod gpu;
 mod help;
 mod history_persistence;
@@ -150,8 +151,12 @@ fn load_font_from_path(
     let registered_name = if let Some(existing_name) = loaded_paths.get(path) {
         existing_name.clone()
     } else {
-        let Ok(font_data) = std::fs::read(path) else {
-            return false;
+        let font_data = match font_file::read_font_file(std::path::Path::new(path)) {
+            Ok(font_data) => font_data,
+            Err(error) => {
+                eprintln!("[Fonts] Skipping {}: {}", path, error);
+                return false;
+            }
         };
 
         fonts.font_data.insert(
@@ -520,10 +525,15 @@ fn configure_fonts_and_gpu(
         let mut data = None;
         for candidate in &bold_candidates {
             if let Some(path) = fontconfig_match_bold_file(candidate) {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    eprintln!("[Fonts] Loaded bold font: {}", path);
-                    data = Some(bytes);
-                    break;
+                match font_file::read_font_file(std::path::Path::new(&path)) {
+                    Ok(bytes) => {
+                        eprintln!("[Fonts] Loaded bold font: {}", path);
+                        data = Some(bytes);
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("[Fonts] Skipping bold candidate {}: {}", path, error);
+                    }
                 }
             }
         }
@@ -4895,6 +4905,40 @@ mod tests {
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+
+    #[test]
+    fn font_fallback_loop_skips_a_non_regular_candidate() {
+        let root = std::env::temp_dir().join(format!("ember-font-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        // A directory behind a font-looking name fails the descriptor's
+        // regular-file check and must fall through to the next candidate.
+        let bad = root.join("bad.ttf");
+        std::fs::create_dir(&bad).unwrap();
+        let good = root.join("good.ttf");
+        std::fs::write(&good, b"fallback-font-bytes").unwrap();
+
+        let mut fonts = egui::FontDefinitions::default();
+        let mut loaded_paths = std::collections::HashMap::new();
+        assert!(super::load_first_matching_font(
+            &mut fonts,
+            &mut loaded_paths,
+            &[],
+            &[bad.to_str().unwrap(), good.to_str().unwrap()],
+            "fallback_test",
+            &[egui::FontFamily::Monospace],
+            false,
+        ));
+        assert_eq!(
+            fonts.font_data["fallback_test"].font.as_ref(),
+            b"fallback-font-bytes".as_slice()
+        );
+        assert!(fonts.families[&egui::FontFamily::Monospace]
+            .iter()
+            .any(|name| name == "fallback_test"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn transformed_pointer_mapping_rejects_summary_and_reports_raw_grid_coordinates() {
