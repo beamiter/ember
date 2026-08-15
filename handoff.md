@@ -116,10 +116,21 @@ fail closed.
   dropped instead of being applied to a transcript that no longer exists.
 - Execution generations use `checked_add`; exhaustion seals the session instead
   of reusing an identity a late completion could bind to.
-- Session restore now decodes through allocation-charging Serde seeds. Session,
-  tag, retained text, tab, layout-node, depth, and cumulative budgets are
-  enforced while parsing the 4 MiB-bounded input. Oversized layout branches are
-  pruned, and a malformed later tab no longer discards an earlier valid tab.
+- Session restore now decodes through a schema-aware bounded RawValue decoder.
+  The v1–v4 envelope and every nested child are borrowed as
+  `serde_json::value::RawValue` slices of the 4 MiB-bounded input, and each
+  short-lived parser is finished and dropped before the decoder follows its
+  children, so no owned tree ever exists before sanitization. Session, tag,
+  retained text, tab, layout-node, depth, and cumulative budgets are enforced
+  while parsing; sessions past the retained prefix are schema-validated
+  without being retained; an unsupported version short-circuits before any
+  payload is decoded. Oversized layout branches are still pruned rather than
+  dropped, invalid tabs decode transactionally without losing valid
+  neighbours, the active-tab index is remapped onto the input tab it
+  originally named, and an invalid `tabs` field falls back to the legacy
+  `layout` tree. Required known fields stay strict (including inside discarded
+  surplus sessions) while unknown fields, however long their keys, remain
+  forward-compatible.
 - OSC 52 clipboard *write* now defaults to false. Missing configuration and new
   installs refuse terminal-driven clipboard writes; an explicit `true`
   round-trips unchanged.

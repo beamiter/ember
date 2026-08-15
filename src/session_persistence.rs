@@ -101,7 +101,7 @@ pub struct SessionsSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded snapshot decoding
+// Schema-aware bounded snapshot decoding
 // ---------------------------------------------------------------------------
 
 const MAX_RESTORED_TABS: usize = MAX_RESTORED_SESSIONS;
@@ -120,23 +120,32 @@ const MAX_LEGAL_RESTORED_TEXT_BYTES: usize = MAX_RESTORED_SESSIONS
 const MAX_RESTORED_TEXT_BYTES: usize = 600 * 1024;
 const _: () = assert!(MAX_LEGAL_RESTORED_TEXT_BYTES <= MAX_RESTORED_TEXT_BYTES);
 
+/// State shared by the bounded decoder. The 4 MiB input cap alone is not
+/// enough: ordinary derived deserialization can still turn a compact JSON
+/// array into thousands of owned elements before `sanitize` gets a chance to
+/// truncate them. Every nested payload is therefore borrowed as a
+/// [`serde_json::value::RawValue`] slice of the input and only decoded — under
+/// these budgets — by a short-lived parser that is finished and dropped before
+/// the decoder follows any of its children.
 #[derive(Clone, Copy)]
 struct DecodeBudget {
-    remaining_text_bytes: usize,
+    text: jterm_core::bounded_json::TextBudget,
     remaining_layout_nodes: usize,
     repaired_fields: usize,
     extra_sessions: usize,
     layout_repaired: bool,
+    active_tab_repaired: bool,
 }
 
 impl DecodeBudget {
     fn new(text_bytes: usize) -> Self {
         Self {
-            remaining_text_bytes: text_bytes,
+            text: jterm_core::bounded_json::TextBudget::new(text_bytes),
             remaining_layout_nodes: MAX_RESTORED_LAYOUT_NODES,
             repaired_fields: 0,
             extra_sessions: 0,
             layout_repaired: false,
+            active_tab_repaired: false,
         }
     }
 
@@ -145,62 +154,7 @@ impl DecodeBudget {
         field: &'static str,
         bytes: usize,
     ) -> Result<(), E> {
-        let Some(remaining) = self.remaining_text_bytes.checked_sub(bytes) else {
-            return Err(E::custom(format_args!(
-                "session snapshot exceeds its cumulative text budget while decoding '{field}'"
-            )));
-        };
-        self.remaining_text_bytes = remaining;
-        Ok(())
-    }
-}
-
-/// Small retained identifiers are bounded before they become owned.
-struct LimitedText {
-    field: &'static str,
-    limit: usize,
-}
-
-impl<'de> serde::de::DeserializeSeed<'de> for LimitedText {
-    type Value = String;
-
-    fn deserialize<D: serde::Deserializer<'de>>(
-        self,
-        deserializer: D,
-    ) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_str(self)
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for LimitedText {
-    type Value = String;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "a '{}' string of at most {} bytes",
-            self.field, self.limit
-        )
-    }
-
-    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        if value.len() > self.limit {
-            return Err(E::custom(format_args!(
-                "'{}' exceeds its {}-byte restore limit",
-                self.field, self.limit
-            )));
-        }
-        Ok(value.to_owned())
-    }
-
-    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-        if value.len() > self.limit {
-            return Err(E::custom(format_args!(
-                "'{}' exceeds its {}-byte restore limit",
-                self.field, self.limit
-            )));
-        }
-        Ok(value)
+        self.text.charge(field, bytes)
     }
 }
 
@@ -627,28 +581,110 @@ impl<'de> serde::de::Visitor<'de> for SessionsSeed<'_> {
             };
             sessions.push(session);
         }
-        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-            budget.extra_sessions += 1;
+        while seq.next_element_seed(DiscardSessionSeed)?.is_some() {
+            budget.extra_sessions = budget.extra_sessions.saturating_add(1);
         }
         Ok(sessions)
     }
 }
 
-struct RawSessionsSnapshot {
-    version: u32,
-    sessions: Vec<SessionSnapshot>,
-    active_index: Option<usize>,
-    layout: Option<Box<serde_json::value::RawValue>>,
-    tabs: Option<Box<serde_json::value::RawValue>>,
-    active_tab: Option<usize>,
+/// A string that is type-checked but never owned, for validating content that
+/// is decoded past a retention limit.
+struct DiscardStringSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for DiscardStringSeed {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
 }
 
-struct RawSessionsSeed<'a> {
-    budget: &'a mut DecodeBudget,
+impl<'de> serde::de::Visitor<'de> for DiscardStringSeed {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
 }
 
-impl<'de> serde::de::DeserializeSeed<'de> for RawSessionsSeed<'_> {
-    type Value = RawSessionsSnapshot;
+struct DiscardOptionalTextSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for DiscardOptionalTextSeed {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_option(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for DiscardOptionalTextSeed {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("null or a string")
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(DiscardStringSeed)
+    }
+}
+
+struct DiscardTagsSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for DiscardTagsSeed {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for DiscardTagsSeed {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a list of strings")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element_seed(DiscardStringSeed)?.is_some() {}
+        Ok(())
+    }
+}
+
+/// Sessions beyond the retained prefix are still schema-validated, just
+/// without retaining their text. Derived Serde used to reject a wrong-typed,
+/// duplicated, or missing known field at any array position, so truncating
+/// the list must not silently broaden the schema.
+struct DiscardSessionSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for DiscardSessionSeed {
+    type Value = ();
 
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
@@ -658,22 +694,114 @@ impl<'de> serde::de::DeserializeSeed<'de> for RawSessionsSeed<'_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for RawSessionsSeed<'_> {
-    type Value = RawSessionsSnapshot;
+impl<'de> serde::de::Visitor<'de> for DiscardSessionSeed {
+    type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a bounded sessions snapshot")
+        formatter.write_str("a session snapshot")
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         use serde::de::Error as _;
 
-        let budget = self.budget;
+        let mut name = false;
+        let mut tags = false;
+        let mut cwd = false;
+        let mut session_id = false;
+        let mut custom_name = false;
+        while let Some(key) = map.next_key::<SnapshotField>()? {
+            match key {
+                SnapshotField::Name => {
+                    if name {
+                        return Err(A::Error::duplicate_field("name"));
+                    }
+                    name = true;
+                    map.next_value_seed(DiscardStringSeed)?;
+                }
+                SnapshotField::Tags => {
+                    if tags {
+                        return Err(A::Error::duplicate_field("tags"));
+                    }
+                    tags = true;
+                    map.next_value_seed(DiscardTagsSeed)?;
+                }
+                SnapshotField::Cwd => {
+                    if cwd {
+                        return Err(A::Error::duplicate_field("cwd"));
+                    }
+                    cwd = true;
+                    map.next_value_seed(DiscardOptionalTextSeed)?;
+                }
+                SnapshotField::SessionId => {
+                    if session_id {
+                        return Err(A::Error::duplicate_field("session_id"));
+                    }
+                    session_id = true;
+                    map.next_value_seed(DiscardOptionalTextSeed)?;
+                }
+                SnapshotField::CustomName => {
+                    if custom_name {
+                        return Err(A::Error::duplicate_field("custom_name"));
+                    }
+                    custom_name = true;
+                    map.next_value_seed(DiscardOptionalTextSeed)?;
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        if !name {
+            return Err(A::Error::missing_field("name"));
+        }
+        if !tags {
+            return Err(A::Error::missing_field("tags"));
+        }
+        Ok(())
+    }
+}
+
+/// The envelope borrows every nested payload as a raw slice of the input, so
+/// an unsupported version is rejected before any owned session or layout data
+/// exists, and a malformed optional layout never gets cloned once per ancestor
+/// while it is being skipped.
+struct RawSessionsSnapshot<'de> {
+    version: u32,
+    sessions: &'de serde_json::value::RawValue,
+    active_index: Option<usize>,
+    layout: Option<&'de serde_json::value::RawValue>,
+    tabs: Option<&'de serde_json::value::RawValue>,
+    active_tab: Option<usize>,
+}
+
+struct RawSessionsSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for RawSessionsSeed {
+    type Value = RawSessionsSnapshot<'de>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RawSessionsSeed {
+    type Value = RawSessionsSnapshot<'de>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a versioned sessions snapshot")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
         let mut version = None;
-        let mut sessions = None;
+        let mut sessions = DeferredRawField::default();
         let mut active_index: Option<Option<usize>> = None;
-        let mut layout = None;
-        let mut tabs = None;
+        let mut layout = DeferredRawField::default();
+        let mut tabs = DeferredRawField::default();
         let mut active_tab: Option<Option<usize>> = None;
         while let Some(key) = map.next_key::<SnapshotField>()? {
             match key {
@@ -681,34 +809,23 @@ impl<'de> serde::de::Visitor<'de> for RawSessionsSeed<'_> {
                     if version.is_some() {
                         return Err(A::Error::duplicate_field("version"));
                     }
-                    version = Some(map.next_value::<u32>()?);
-                }
-                SnapshotField::Sessions => {
-                    if sessions.is_some() {
-                        return Err(A::Error::duplicate_field("sessions"));
+                    let decoded = map.next_value::<u32>()?;
+                    if !(1..=4).contains(&decoded) {
+                        return Err(A::Error::custom(format_args!(
+                            "unsupported session snapshot version {decoded}"
+                        )));
                     }
-                    sessions = Some(map.next_value_seed(SessionsSeed {
-                        budget: &mut *budget,
-                    })?);
+                    version = Some(decoded);
                 }
+                SnapshotField::Sessions => sessions.read(&mut map)?,
                 SnapshotField::ActiveIndex => {
                     if active_index.is_some() {
                         return Err(A::Error::duplicate_field("active_index"));
                     }
                     active_index = Some(map.next_value::<Option<usize>>()?);
                 }
-                SnapshotField::Layout => {
-                    if layout.is_some() {
-                        return Err(A::Error::duplicate_field("layout"));
-                    }
-                    layout = Some(map.next_value::<Box<serde_json::value::RawValue>>()?);
-                }
-                SnapshotField::Tabs => {
-                    if tabs.is_some() {
-                        return Err(A::Error::duplicate_field("tabs"));
-                    }
-                    tabs = Some(map.next_value::<Box<serde_json::value::RawValue>>()?);
-                }
+                SnapshotField::Layout => layout.read(&mut map)?,
+                SnapshotField::Tabs => tabs.read(&mut map)?,
                 SnapshotField::ActiveTab => {
                     if active_tab.is_some() {
                         return Err(A::Error::duplicate_field("active_tab"));
@@ -722,61 +839,16 @@ impl<'de> serde::de::Visitor<'de> for RawSessionsSeed<'_> {
         }
         Ok(RawSessionsSnapshot {
             version: version.ok_or_else(|| A::Error::missing_field("version"))?,
-            sessions: sessions.ok_or_else(|| A::Error::missing_field("sessions"))?,
+            sessions: sessions.required::<A::Error>("sessions")?,
             active_index: active_index.unwrap_or(None),
-            layout: layout.and_then(|raw| (raw.get().trim() != "null").then_some(raw)),
-            tabs,
+            layout: layout.optional::<A::Error>("layout")?,
+            tabs: tabs.optional::<A::Error>("tabs")?,
             active_tab: active_tab.unwrap_or(None),
         })
     }
 }
 
-struct LayoutNodeSeed<'a> {
-    budget: &'a mut DecodeBudget,
-    depth: usize,
-}
-
-/// `kind` is an internal tag and may appear after variant fields. Defer those
-/// fields as borrowed raw slices so Pane can ignore Split-only data without
-/// spending node budgets. Keeping them borrowed is essential: owning each
-/// nested slice would amplify a skewed layout by depth times the file size.
-#[derive(Default)]
-struct DeferredRawField<'de> {
-    value: Option<&'de serde_json::value::RawValue>,
-    duplicate: bool,
-}
-
-impl<'de> DeferredRawField<'de> {
-    fn read<A: serde::de::MapAccess<'de>>(&mut self, map: &mut A) -> Result<(), A::Error> {
-        if self.value.is_some() {
-            self.duplicate = true;
-            map.next_value::<serde::de::IgnoredAny>()?;
-        } else {
-            self.value = Some(map.next_value::<&'de serde_json::value::RawValue>()?);
-        }
-        Ok(())
-    }
-
-    fn required<E: serde::de::Error>(
-        self,
-        field: &'static str,
-    ) -> Result<&'de serde_json::value::RawValue, E> {
-        if self.duplicate {
-            return Err(E::duplicate_field(field));
-        }
-        self.value.ok_or_else(|| E::missing_field(field))
-    }
-
-    fn optional<E: serde::de::Error>(
-        self,
-        field: &'static str,
-    ) -> Result<Option<&'de serde_json::value::RawValue>, E> {
-        if self.duplicate {
-            return Err(E::duplicate_field(field));
-        }
-        Ok(self.value)
-    }
-}
+use jterm_core::bounded_json::DeferredRawField;
 
 struct LayoutSessionIdSeed<'a> {
     budget: &'a mut DecodeBudget,
@@ -829,8 +901,57 @@ fn decode_layout_session_id(
     Ok(session_id)
 }
 
-impl<'de> serde::de::DeserializeSeed<'de> for LayoutNodeSeed<'_> {
-    type Value = Option<LayoutNodeSnapshot>;
+#[derive(Clone, Copy)]
+enum LayoutKind {
+    Pane,
+    Split,
+}
+
+struct LayoutKindSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for LayoutKindSeed {
+    type Value = LayoutKind;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl serde::de::Visitor<'_> for LayoutKindSeed {
+    type Value = LayoutKind;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("'pane' or 'split'")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        match value {
+            "pane" => Ok(LayoutKind::Pane),
+            "split" => Ok(LayoutKind::Split),
+            other => Err(E::unknown_variant(other, &["pane", "split"])),
+        }
+    }
+}
+
+/// A layout node whose variant fields are still raw slices of the input. The
+/// kind decides which of them are decoded at all: a Pane never spends node or
+/// text budgets on Split-only data, and vice versa.
+struct RawLayoutNode<'de> {
+    kind: LayoutKind,
+    session_id: DeferredRawField<'de>,
+    horizontal: DeferredRawField<'de>,
+    ratio: DeferredRawField<'de>,
+    first: DeferredRawField<'de>,
+    second: DeferredRawField<'de>,
+}
+
+struct RawLayoutNodeSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for RawLayoutNodeSeed {
+    type Value = RawLayoutNode<'de>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
@@ -840,8 +961,8 @@ impl<'de> serde::de::DeserializeSeed<'de> for LayoutNodeSeed<'_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for LayoutNodeSeed<'_> {
-    type Value = Option<LayoutNodeSnapshot>;
+impl<'de> serde::de::Visitor<'de> for RawLayoutNodeSeed {
+    type Value = RawLayoutNode<'de>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a bounded pane-layout node")
@@ -849,17 +970,6 @@ impl<'de> serde::de::Visitor<'de> for LayoutNodeSeed<'_> {
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         use serde::de::Error as _;
-
-        let budget = self.budget;
-        if self.depth > MAX_RESTORED_LAYOUT_DEPTH || budget.remaining_layout_nodes == 0 {
-            budget.layout_repaired = true;
-            while map
-                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                .is_some()
-            {}
-            return Ok(None);
-        }
-        budget.remaining_layout_nodes -= 1;
 
         let mut kind = None;
         let mut session_id = DeferredRawField::default();
@@ -873,10 +983,7 @@ impl<'de> serde::de::Visitor<'de> for LayoutNodeSeed<'_> {
                     if kind.is_some() {
                         return Err(A::Error::duplicate_field("kind"));
                     }
-                    kind = Some(map.next_value_seed(LimitedText {
-                        field: "layout kind",
-                        limit: 16,
-                    })?);
+                    kind = Some(map.next_value_seed(LayoutKindSeed)?);
                 }
                 SnapshotField::SessionId => {
                     session_id.read(&mut map)?;
@@ -898,79 +1005,106 @@ impl<'de> serde::de::Visitor<'de> for LayoutNodeSeed<'_> {
                 }
             }
         }
-
-        match kind.as_deref() {
-            Some("pane") => {
-                let raw = session_id.required::<A::Error>("session_id")?;
-                let session_id = decode_layout_session_id(raw, budget).map_err(A::Error::custom)?;
-                Ok(session_id.map(|session_id| LayoutNodeSnapshot::Pane { session_id }))
-            }
-            Some("split") => {
-                let horizontal = serde_json::from_str::<bool>(
-                    horizontal.required::<A::Error>("horizontal")?.get(),
-                )
-                .map_err(A::Error::custom)?;
-                let ratio = ratio
-                    .optional::<A::Error>("ratio")?
-                    .map(|raw| serde_json::from_str::<f32>(raw.get()))
-                    .transpose()
-                    .map_err(A::Error::custom)?
-                    .unwrap_or_else(default_split_ratio);
-                let first = decode_layout_node(
-                    first.required::<A::Error>("first")?,
-                    budget,
-                    self.depth + 1,
-                )
-                .map_err(A::Error::custom)?;
-                let second = decode_layout_node(
-                    second.required::<A::Error>("second")?,
-                    budget,
-                    self.depth + 1,
-                )
-                .map_err(A::Error::custom)?;
-                match (first, second) {
-                    (Some(first), Some(second)) => Ok(Some(LayoutNodeSnapshot::Split {
-                        horizontal,
-                        ratio,
-                        first: Box::new(first),
-                        second: Box::new(second),
-                    })),
-                    (Some(remaining), None) | (None, Some(remaining)) => {
-                        budget.layout_repaired = true;
-                        Ok(Some(remaining))
-                    }
-                    (None, None) => {
-                        budget.layout_repaired = true;
-                        Ok(None)
-                    }
-                }
-            }
-            Some(other) => Err(A::Error::unknown_variant(other, &["pane", "split"])),
-            None => Err(A::Error::missing_field("kind")),
-        }
+        Ok(RawLayoutNode {
+            kind: kind.ok_or_else(|| A::Error::missing_field("kind"))?,
+            session_id,
+            horizontal,
+            ratio,
+            first,
+            second,
+        })
     }
 }
 
+/// Depth and node budgets prune an oversized branch instead of failing its
+/// tab. The raw slice was already syntax-checked when it was captured, so a
+/// pruned node needs no parser at all.
 fn decode_layout_node(
     raw: &serde_json::value::RawValue,
     budget: &mut DecodeBudget,
     depth: usize,
 ) -> Result<Option<LayoutNodeSnapshot>, serde_json::Error> {
+    if depth > MAX_RESTORED_LAYOUT_DEPTH || budget.remaining_layout_nodes == 0 {
+        budget.layout_repaired = true;
+        return Ok(None);
+    }
+    budget.remaining_layout_nodes -= 1;
+
+    // Finish and drop this parser before following any child. serde_json keeps
+    // a scratch buffer while skipping RawValue contents; recursing from inside
+    // the visitor would retain one near-file-sized buffer per ancestor.
     let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    let node = serde::de::DeserializeSeed::deserialize(
-        LayoutNodeSeed { budget, depth },
-        &mut deserializer,
-    )?;
+    let staged = serde::de::DeserializeSeed::deserialize(RawLayoutNodeSeed, &mut deserializer)?;
     deserializer.end()?;
-    Ok(node)
+    drop(deserializer);
+
+    match staged.kind {
+        LayoutKind::Pane => {
+            let raw = staged
+                .session_id
+                .required::<serde_json::Error>("session_id")?;
+            let session_id = decode_layout_session_id(raw, budget)?;
+            Ok(session_id.map(|session_id| LayoutNodeSnapshot::Pane { session_id }))
+        }
+        LayoutKind::Split => {
+            let horizontal = serde_json::from_str::<bool>(
+                staged
+                    .horizontal
+                    .required::<serde_json::Error>("horizontal")?
+                    .get(),
+            )?;
+            let ratio = staged
+                .ratio
+                .optional::<serde_json::Error>("ratio")?
+                .map(|raw| serde_json::from_str::<f32>(raw.get()))
+                .transpose()?
+                .unwrap_or_else(default_split_ratio);
+            let first = decode_layout_node(
+                staged.first.required::<serde_json::Error>("first")?,
+                budget,
+                depth + 1,
+            )?;
+            let second = decode_layout_node(
+                staged.second.required::<serde_json::Error>("second")?,
+                budget,
+                depth + 1,
+            )?;
+            match (first, second) {
+                (Some(first), Some(second)) => Ok(Some(LayoutNodeSnapshot::Split {
+                    horizontal,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                })),
+                (Some(remaining), None) | (None, Some(remaining)) => {
+                    budget.layout_repaired = true;
+                    Ok(Some(remaining))
+                }
+                (None, None) => {
+                    budget.layout_repaired = true;
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
-struct LayoutSeed<'a> {
+/// One tab layout. Only `root` can grow without bound, so it stays a raw
+/// slice until this tab's own parser has been dropped; the small scalar
+/// fields are validated inline.
+struct RawTabLayout<'de> {
+    root: DeferredRawField<'de>,
+    focused_session_id: Option<String>,
+    pinned: bool,
+    marked: bool,
+}
+
+struct RawTabLayoutSeed<'a> {
     budget: &'a mut DecodeBudget,
 }
 
-impl<'de> serde::de::DeserializeSeed<'de> for LayoutSeed<'_> {
-    type Value = LayoutSnapshot;
+impl<'de> serde::de::DeserializeSeed<'de> for RawTabLayoutSeed<'_> {
+    type Value = RawTabLayout<'de>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
@@ -980,8 +1114,8 @@ impl<'de> serde::de::DeserializeSeed<'de> for LayoutSeed<'_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for LayoutSeed<'_> {
-    type Value = LayoutSnapshot;
+impl<'de> serde::de::Visitor<'de> for RawTabLayoutSeed<'_> {
+    type Value = RawTabLayout<'de>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a bounded tab layout")
@@ -990,28 +1124,21 @@ impl<'de> serde::de::Visitor<'de> for LayoutSeed<'_> {
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         use serde::de::Error as _;
 
-        let budget = self.budget;
-        let mut root = None;
+        let mut root = DeferredRawField::default();
         let mut focused_session_id: Option<Option<String>> = None;
         let mut pinned = None;
         let mut marked = None;
         while let Some(key) = map.next_key::<SnapshotField>()? {
             match key {
                 SnapshotField::Root => {
-                    if root.is_some() {
-                        return Err(A::Error::duplicate_field("root"));
-                    }
-                    root = Some(map.next_value_seed(LayoutNodeSeed {
-                        budget: &mut *budget,
-                        depth: 0,
-                    })?);
+                    root.read(&mut map)?;
                 }
                 SnapshotField::FocusedSessionId => {
                     if focused_session_id.is_some() {
                         return Err(A::Error::duplicate_field("focused_session_id"));
                     }
                     focused_session_id = Some(map.next_value_seed(OptionalTextSeed {
-                        budget: &mut *budget,
+                        budget: self.budget,
                         kind: OptionalTextKind::FocusedSessionId,
                     })?);
                 }
@@ -1032,10 +1159,7 @@ impl<'de> serde::de::Visitor<'de> for LayoutSeed<'_> {
                 }
             }
         }
-        let root = root
-            .ok_or_else(|| A::Error::missing_field("root"))?
-            .ok_or_else(|| A::Error::custom("layout root was removed by restore limits"))?;
-        Ok(LayoutSnapshot {
+        Ok(RawTabLayout {
             root,
             focused_session_id: focused_session_id.unwrap_or(None),
             pinned: pinned.unwrap_or(false),
@@ -1044,12 +1168,44 @@ impl<'de> serde::de::Visitor<'de> for LayoutSeed<'_> {
     }
 }
 
-struct TabsSeed<'a> {
-    budget: &'a mut DecodeBudget,
+fn decode_tab(
+    raw: &serde_json::value::RawValue,
+    budget: &mut DecodeBudget,
+) -> Result<LayoutSnapshot, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    let staged = serde::de::DeserializeSeed::deserialize(
+        RawTabLayoutSeed {
+            budget: &mut *budget,
+        },
+        &mut deserializer,
+    )?;
+    deserializer.end()?;
+    drop(deserializer);
+    let root = decode_layout_node(
+        staged.root.required::<serde_json::Error>("root")?,
+        budget,
+        0,
+    )?
+    .ok_or_else(|| {
+        <serde_json::Error as serde::de::Error>::custom("layout root was removed by restore limits")
+    })?;
+    Ok(LayoutSnapshot {
+        root,
+        focused_session_id: staged.focused_session_id,
+        pinned: staged.pinned,
+        marked: staged.marked,
+    })
 }
 
-impl<'de> serde::de::DeserializeSeed<'de> for TabsSeed<'_> {
-    type Value = Vec<LayoutSnapshot>;
+struct RawTabs<'de> {
+    tabs: Vec<&'de serde_json::value::RawValue>,
+    truncated: bool,
+}
+
+struct RawTabsSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for RawTabsSeed {
+    type Value = RawTabs<'de>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
         self,
@@ -1059,99 +1215,161 @@ impl<'de> serde::de::DeserializeSeed<'de> for TabsSeed<'_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for TabsSeed<'_> {
-    type Value = Vec<LayoutSnapshot>;
+impl<'de> serde::de::Visitor<'de> for RawTabsSeed {
+    type Value = RawTabs<'de>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "at most {MAX_RESTORED_TABS} tab layouts")
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let budget = self.budget;
         let mut tabs = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_RESTORED_TABS));
         let mut input_count = 0;
         while input_count < MAX_RESTORED_TABS {
             let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? else {
-                return Ok(tabs);
+                return Ok(RawTabs {
+                    tabs,
+                    truncated: false,
+                });
             };
             input_count += 1;
-            let before = *budget;
-            match decode_layout(raw, budget) {
-                Ok(tab) => tabs.push(tab),
-                Err(_) => {
-                    *budget = before;
-                    budget.layout_repaired = true;
-                }
-            }
+            tabs.push(raw);
         }
+        let mut truncated = false;
         while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-            budget.layout_repaired = true;
+            truncated = true;
         }
-        Ok(tabs)
+        Ok(RawTabs { tabs, truncated })
     }
 }
 
-fn decode_layout(
-    raw: &serde_json::value::RawValue,
-    budget: &mut DecodeBudget,
-) -> Result<LayoutSnapshot, serde_json::Error> {
-    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    let layout = serde::de::DeserializeSeed::deserialize(
-        LayoutSeed {
-            budget: &mut *budget,
-        },
-        &mut deserializer,
-    )?;
-    deserializer.end()?;
-    Ok(layout)
+/// Tabs that survived their own decode, plus where each one sat in the input,
+/// so `active_tab` can be remapped onto the tab it originally named.
+struct DecodedTabs {
+    tabs: Vec<LayoutSnapshot>,
+    retained_input_indices: Vec<usize>,
 }
 
+impl DecodedTabs {
+    fn empty() -> Self {
+        Self {
+            tabs: Vec::new(),
+            retained_input_indices: Vec::new(),
+        }
+    }
+}
+
+/// Each tab decodes transactionally: a malformed or oversized tab rolls its
+/// budget charges back and is dropped, but never takes a valid neighbour down
+/// with it.
 fn decode_tabs(
     raw: &serde_json::value::RawValue,
     budget: &mut DecodeBudget,
-) -> Result<Vec<LayoutSnapshot>, serde_json::Error> {
+) -> Result<DecodedTabs, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    let tabs = serde::de::DeserializeSeed::deserialize(
-        TabsSeed {
-            budget: &mut *budget,
-        },
-        &mut deserializer,
-    )?;
+    let staged = serde::de::DeserializeSeed::deserialize(RawTabsSeed, &mut deserializer)?;
     deserializer.end()?;
-    Ok(tabs)
+    drop(deserializer);
+    if staged.truncated {
+        budget.layout_repaired = true;
+    }
+    let mut tabs = Vec::with_capacity(staged.tabs.len());
+    let mut retained_input_indices = Vec::with_capacity(staged.tabs.len());
+    for (input_index, raw_tab) in staged.tabs.into_iter().enumerate() {
+        let before = *budget;
+        match decode_tab(raw_tab, budget) {
+            Ok(tab) => {
+                tabs.push(tab);
+                retained_input_indices.push(input_index);
+            }
+            Err(_) => {
+                *budget = before;
+                budget.layout_repaired = true;
+            }
+        }
+    }
+    Ok(DecodedTabs {
+        tabs,
+        retained_input_indices,
+    })
+}
+
+/// `active_tab` names an input position. After transactional discards the
+/// retained tabs have shifted, so follow the identity: the same input tab if
+/// it survived, otherwise the first surviving tab after it.
+fn remap_active_tab(active: Option<usize>, tabs: &DecodedTabs) -> (Option<usize>, bool) {
+    let Some(active) = active else {
+        return (None, false);
+    };
+    if tabs.tabs.is_empty() {
+        return (None, true);
+    }
+    let retained = tabs
+        .retained_input_indices
+        .iter()
+        .position(|index| *index == active);
+    if let Some(retained) = retained {
+        return (Some(retained), false);
+    }
+    let fallback = tabs
+        .retained_input_indices
+        .iter()
+        .position(|index| *index > active)
+        .or_else(|| tabs.tabs.len().checked_sub(1));
+    (fallback, true)
+}
+
+fn decode_sessions(
+    raw: &serde_json::value::RawValue,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<SessionSnapshot>, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    let sessions =
+        serde::de::DeserializeSeed::deserialize(SessionsSeed { budget }, &mut deserializer)?;
+    deserializer.end()?;
+    drop(deserializer);
+    Ok(sessions)
+}
+
+fn raw_is_null(raw: &serde_json::value::RawValue) -> bool {
+    raw.get().trim() == "null"
 }
 
 fn decode_bounded_snapshot_with_text_budget(
     content: &str,
     text_budget: usize,
 ) -> Result<(SessionsSnapshot, Vec<String>), serde_json::Error> {
-    let mut budget = DecodeBudget::new(text_budget);
     let mut deserializer = serde_json::Deserializer::from_str(content);
-    let raw = serde::de::DeserializeSeed::deserialize(
-        RawSessionsSeed {
-            budget: &mut budget,
-        },
-        &mut deserializer,
-    )?;
+    let raw = serde::de::DeserializeSeed::deserialize(RawSessionsSeed, &mut deserializer)?;
     deserializer.end()?;
+    drop(deserializer);
 
-    let mut tabs = Vec::new();
-    if let Some(raw_tabs) = raw.tabs.as_deref() {
-        let before = budget;
-        match decode_tabs(raw_tabs, &mut budget) {
-            Ok(decoded) => tabs = decoded,
-            Err(_) => {
-                budget = before;
-                budget.layout_repaired = true;
+    let mut budget = DecodeBudget::new(text_budget);
+    let sessions = decode_sessions(raw.sessions, &mut budget)?;
+    let decoded_tabs = match raw.tabs {
+        Some(raw_tabs) => {
+            let before = budget;
+            match decode_tabs(raw_tabs, &mut budget) {
+                Ok(tabs) => tabs,
+                Err(_) => {
+                    budget = before;
+                    budget.layout_repaired = true;
+                    DecodedTabs::empty()
+                }
             }
         }
-    }
+        None => DecodedTabs::empty(),
+    };
+    let (active_tab, active_tab_repaired) = remap_active_tab(raw.active_tab, &decoded_tabs);
+    budget.active_tab_repaired = active_tab_repaired;
 
+    // The v3-and-earlier global tree only matters when no per-tab layout
+    // survived; `sanitize` then migrates it into the first tab.
     let mut layout = None;
-    if tabs.is_empty() {
-        if let Some(raw_layout) = raw.layout.as_deref() {
+    if decoded_tabs.tabs.is_empty() {
+        if let Some(raw_layout) = raw.layout.filter(|raw| !raw_is_null(raw)) {
             let before = budget;
-            match decode_layout(raw_layout, &mut budget) {
+            match decode_tab(raw_layout, &mut budget) {
                 Ok(decoded) => layout = Some(decoded),
                 Err(_) => {
                     budget = before;
@@ -1165,7 +1383,7 @@ fn decode_bounded_snapshot_with_text_budget(
     if budget.extra_sessions > 0 {
         warnings.push(format!(
             "restored only the first {MAX_RESTORED_SESSIONS} of {} sessions",
-            raw.sessions.len() + budget.extra_sessions
+            sessions.len() + budget.extra_sessions
         ));
     }
     if budget.repaired_fields > 0 {
@@ -1177,15 +1395,18 @@ fn decode_bounded_snapshot_with_text_budget(
     if budget.layout_repaired {
         warnings.push("repaired an invalid or oversized pane layout".to_string());
     }
+    if budget.active_tab_repaired {
+        warnings.push("active tab index was outside the restored list".to_string());
+    }
 
     Ok((
         SessionsSnapshot {
             version: raw.version,
-            sessions: raw.sessions,
+            sessions,
             active_index: raw.active_index,
             layout,
-            tabs,
-            active_tab: raw.active_tab,
+            tabs: decoded_tabs.tabs,
+            active_tab,
         },
         warnings,
     ))
@@ -1275,13 +1496,6 @@ impl SessionsSnapshot {
             Err(error) => return Err(error.into()),
         };
         let (mut snapshot, mut warnings) = decode_bounded_snapshot(&content)?;
-        if !(1..=4).contains(&snapshot.version) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unsupported session snapshot version {}", snapshot.version),
-            )
-            .into());
-        }
         for warning in snapshot.sanitize() {
             if !warnings.contains(&warning) {
                 warnings.push(warning);
@@ -2276,6 +2490,206 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cumulative text budget"), "{error}");
+    }
+
+    #[test]
+    fn surplus_sessions_are_schema_validated_without_being_retained() {
+        let retained = std::iter::repeat_n(r#"{"name":"a","tags":[]}"#, MAX_RESTORED_SESSIONS)
+            .collect::<Vec<_>>()
+            .join(",");
+        for invalid_surplus in [
+            r#"{"name":"a","tags":[],"cwd":7}"#,
+            r#"{"name":"a","tags":[],"cwd":null,"cwd":null}"#,
+            r#"{"tags":[]}"#,
+        ] {
+            let json = format!(r#"{{"version":4,"sessions":[{retained},{invalid_surplus}]}}"#);
+            assert!(
+                decode_bounded_snapshot(&json).is_err(),
+                "accepted invalid surplus session: {invalid_surplus}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_version_short_circuits_before_scanning_a_later_payload() {
+        // The tail is deliberately malformed. Once a leading future version is
+        // known, the borrowed raw payload behind it is never inspected.
+        let error = decode_bounded_snapshot(r#"{"version":99,"sessions":["#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported session snapshot version 99"),
+            "{error}"
+        );
+
+        // A postfixed version cannot avoid the envelope scan, but still wins
+        // over layout decoding once the valid raw envelope has been collected.
+        let error = decode_bounded_snapshot(
+            r#"{"sessions":[],"layout":{"kind":"split","horizontal":7},"version":99}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported session snapshot version 99"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn required_known_fields_remain_strict() {
+        for invalid in [
+            r#"{"version":4,"version":4,"sessions":[]}"#,
+            r#"{"version":4}"#,
+            r#"{"version":4,"sessions":{}}"#,
+            r#"{"version":4,"sessions":[{"tags":[]}]}"#,
+            r#"{"version":4,"sessions":[{"name":"a","name":"b","tags":[]}]}"#,
+            r#"{"version":4,"sessions":[{"name":"a","tags":[]}],"active_index":"zero"}"#,
+        ] {
+            assert!(
+                decode_bounded_snapshot(invalid).is_err(),
+                "accepted invalid known field: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_decode_is_transactional_and_keeps_valid_neighbors() {
+        let json = r#"{
+            "version": 4,
+            "sessions": [
+                {"name": "a", "tags": [], "session_id": "session-a"},
+                {"name": "b", "tags": [], "session_id": "session-b"}
+            ],
+            "tabs": [
+                {"root": {"kind": "pane", "session_id": "session-a"}, "pinned": true},
+                {"pinned": true},
+                {"root": {"kind": "split", "horizontal": true,
+                          "first": {"kind": "pane", "session_id": "session-b"}}},
+                {"root": {"kind": "pane", "session_id": "session-b"}, "marked": true}
+            ],
+            "active_tab": 3
+        }"#;
+
+        let (mut loaded, mut warnings) = decode_bounded_snapshot(json).unwrap();
+        warnings.extend(loaded.sanitize());
+
+        assert_eq!(loaded.tabs.len(), 2);
+        assert!(loaded.tabs[0].pinned);
+        assert!(loaded.tabs[1].marked);
+        assert!(matches!(
+            &loaded.tabs[1].root,
+            LayoutNodeSnapshot::Pane { session_id } if session_id == "session-b"
+        ));
+        assert_eq!(loaded.active_tab, Some(1));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("pane layout")));
+    }
+
+    #[test]
+    fn active_tab_tracks_its_input_identity_across_transactional_discards() {
+        let invalid = r#"{"pinned":true}"#;
+        let first = r#"{"root":{"kind":"pane","session_id":"session-a"}}"#;
+        let second = r#"{"root":{"kind":"pane","session_id":"session-b"}}"#;
+        let sessions = r#"{"name":"a","tags":[],"session_id":"session-a"},
+                          {"name":"b","tags":[],"session_id":"session-b"}"#;
+
+        let before_active = format!(
+            r#"{{"version":4,"sessions":[{sessions}],"tabs":[{invalid},{first},{second}],"active_tab":1}}"#
+        );
+        let (mut snapshot, _) = decode_bounded_snapshot(&before_active).unwrap();
+        snapshot.sanitize();
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(snapshot.active_tab, Some(0));
+
+        let active_itself = format!(
+            r#"{{"version":4,"sessions":[{sessions}],"tabs":[{first},{invalid},{second}],"active_tab":1}}"#
+        );
+        let (mut snapshot, mut warnings) = decode_bounded_snapshot(&active_itself).unwrap();
+        warnings.extend(snapshot.sanitize());
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(
+            snapshot.active_tab,
+            Some(1),
+            "the first surviving tab after the discarded active tab wins"
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("active tab index")));
+    }
+
+    /// Ember prunes an oversized layout branch instead of dropping its tab, and
+    /// the layout-node budget is shared across all tabs (a session may only
+    /// ever occupy one pane, so 2N-1 nodes always suffice for a legal
+    /// snapshot). A pathological middle tab can therefore spend the whole
+    /// shared budget: it is kept after pruning, a later tab is dropped with a
+    /// warning, and every session still survives the decode.
+    #[test]
+    fn a_deep_middle_tab_is_pruned_while_sessions_and_earlier_tabs_survive() {
+        let mut deep = r#"{"kind":"pane","session_id":"session-b"}"#.to_string();
+        for _ in 0..=MAX_RESTORED_LAYOUT_DEPTH {
+            deep = format!(
+                r#"{{"kind":"split","horizontal":true,"first":{deep},"second":{{"kind":"pane","session_id":"session-b"}}}}"#
+            );
+        }
+        let json = format!(
+            r#"{{"version":4,"sessions":[
+                    {{"name":"a","tags":[],"session_id":"session-a"}},
+                    {{"name":"b","tags":[],"session_id":"session-b"}},
+                    {{"name":"c","tags":[],"session_id":"session-c"}}],
+                 "tabs":[
+                    {{"root":{{"kind":"pane","session_id":"session-a"}}}},
+                    {{"root":{deep}}},
+                    {{"root":{{"kind":"pane","session_id":"session-c"}}}}
+                 ],"active_tab":0}}"#
+        );
+
+        let (mut loaded, mut warnings) = decode_bounded_snapshot(&json).unwrap();
+        warnings.extend(loaded.sanitize());
+
+        assert_eq!(loaded.sessions.len(), 3);
+        assert!(matches!(
+            &loaded.tabs[0].root,
+            LayoutNodeSnapshot::Pane { session_id } if session_id == "session-a"
+        ));
+        // The deep tab is retained after its over-limit branches were pruned;
+        // duplicate panes then collapse it onto its one surviving session.
+        assert!(matches!(
+            &loaded.tabs[1].root,
+            LayoutNodeSnapshot::Pane { session_id } if session_id == "session-b"
+        ));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("pane layout")));
+    }
+
+    #[test]
+    fn an_invalid_tabs_field_falls_back_to_the_legacy_layout() {
+        let json = r#"{
+            "version": 3,
+            "sessions": [
+                {"name": "a", "tags": [], "session_id": "session-a"},
+                {"name": "b", "tags": [], "session_id": "session-b"}
+            ],
+            "tabs": {"not": "an array"},
+            "layout": {
+                "root": {"kind": "split", "horizontal": true,
+                         "first": {"kind": "pane", "session_id": "session-a"},
+                         "second": {"kind": "pane", "session_id": "session-b"}}
+            }
+        }"#;
+
+        let (mut loaded, mut warnings) = decode_bounded_snapshot(json).unwrap();
+        warnings.extend(loaded.sanitize());
+
+        assert_eq!(loaded.tabs.len(), 1);
+        assert!(matches!(
+            loaded.tabs[0].root,
+            LayoutNodeSnapshot::Split { .. }
+        ));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("pane layout")));
     }
 
     #[test]

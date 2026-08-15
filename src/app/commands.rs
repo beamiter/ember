@@ -3507,7 +3507,7 @@ fn agent_task_disabled_reason(row: &CommandRowSnapshot) -> Option<&'static str> 
         Some("The shell did not provide exact command metadata")
     } else if !row.command_context_fits {
         Some("The exact command exceeds the Agent context limit")
-    } else if !row.cwd.as_deref().is_some_and(|cwd| !cwd.trim().is_empty()) {
+    } else if row.cwd.as_deref().is_none_or(|cwd| cwd.trim().is_empty()) {
         Some("The shell did not provide the command working directory")
     } else if !row.cwd_context_fits {
         Some("The command working directory exceeds the Agent context limit")
