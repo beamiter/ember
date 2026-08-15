@@ -16,7 +16,7 @@ Usage: ./scripts/uninstall.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (overrides --prefix)
+  --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 

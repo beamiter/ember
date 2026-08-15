@@ -36,6 +36,34 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  shell:
+    name: Installer scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install script and metadata validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            appstream \
+            desktop-file-utils \
+            shellcheck
+
+      - name: Check installer contracts
+        run: |
+          bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+          shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+          bash scripts/test-install-paths.sh
+
+      - name: Validate desktop integration metadata
+        run: |
+          desktop-file-validate data/io.github.beamiter.ember.desktop
+          appstreamcli validate --pedantic --no-net \
+            data/io.github.beamiter.ember.metainfo.xml
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

@@ -134,10 +134,26 @@ RUST_LOG=ember=debug cargo run
 
 ```bash
 ./scripts/install.sh              # build, then install binary + launcher entry
+./scripts/install.sh --binary /path/to/ember  # install a prebuilt binary, skip Cargo
 ./scripts/install.sh --dry-run    # print every command without changing files
 ./scripts/install.sh --no-desktop # binary only
 ./scripts/uninstall.sh            # remove both; configuration is preserved
 ```
+
+`--binary` suits release archives, CI artifacts, and distro staging: the
+installer never invokes the Rust toolchain, yet still installs the binary,
+desktop entry, AppStream metadata, and icons through the same tested paths.
+The input must be a readable regular file; the installed binary mode is always
+`0755`. It composes with `--prefix`, `--bin-dir`, `--no-desktop`, and
+`DESTDIR`.
+
+Install and uninstall derive their targets from the same runtime paths: the
+binary defaults to `PREFIX/bin/ember`, and the desktop entry and icons live
+under `PREFIX/share`. Re-running the installer updates the same targets.
+`--bin-dir` overrides only the binary directory; pass the same `--bin-dir`
+when uninstalling later. `DESTDIR` merely prepends a packaging root to these
+absolute runtime paths — the desktop entry's `Exec=` still points at the
+runtime path without `DESTDIR`.
 
 This installs into `~/.local` by default (override with `--prefix`/`--bin-dir`,
 and `DESTDIR` for packaging):

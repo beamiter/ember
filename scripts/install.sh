@@ -11,7 +11,7 @@ HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
-PREFIX_EXPLICIT=0
+PREBUILT_BINARY=""
 INSTALL_DESKTOP=1
 DRY_RUN=0
 
@@ -21,15 +21,15 @@ Usage: ./scripts/install.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (default: ~/.cargo/bin;
-                         with --prefix, defaults to PREFIX/bin)
+  --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
+  --binary PATH          Install a prebuilt ember binary instead of building
   --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 
 Environment:
   DESTDIR                Optional staging root for packaging
-  CARGO_TARGET_DIR       Cargo target directory (default: <repo>/target)
+  CARGO_TARGET_DIR       Cargo target directory when building (default: <repo>/target)
 USAGE
 }
 
@@ -103,16 +103,81 @@ desktop_exec_path() {
     esac
 }
 
+# Exec is a command line, not a plain path. Always quote an absolute program
+# path and apply both layers of escaping required by the Desktop Entry spec:
+# generic string decoding happens before Exec quoting/field-code expansion.
+desktop_exec_value() {
+    local remaining="$1" escaped="" character
+    if [[ "${remaining}" == ember ]]; then
+        printf 'ember'
+        return
+    fi
+    while [[ -n "${remaining}" ]]; do
+        character="${remaining:0:1}"
+        remaining="${remaining:1}"
+        case "${character}" in
+            \\) escaped="${escaped}\\\\\\\\" ;;
+            '"') escaped+='\"' ;;
+            '`') escaped+='\`' ;;
+            '$') escaped+='\\$' ;;
+            *) escaped+="${character}" ;;
+        esac
+    done
+    printf '"%s"' "${escaped}"
+}
+
+# TryExec is a plain desktop-entry string rather than a command line. Only the
+# generic string layer applies, so a literal backslash needs one doubling.
+desktop_try_exec_value() {
+    local remaining="$1" escaped="" character
+    while [[ -n "${remaining}" ]]; do
+        character="${remaining:0:1}"
+        remaining="${remaining:1}"
+        case "${character}" in
+            \\) escaped="${escaped}\\\\" ;;
+            *) escaped+="${character}" ;;
+        esac
+    done
+    printf '%s' "${escaped}"
+}
+
+validate_desktop_exec_path() {
+    local path="$1"
+    [[ "${path}" != *'='* ]] \
+        || die "desktop executable path must not contain '=': ${path}"
+    # A literal percent is written as `%%`, but the specification leaves field
+    # codes inside a quoted argument undefined. Absolute paths are quoted so
+    # spaces and other reserved characters work; accepting `%` here therefore
+    # creates entries that validate yet fail to launch in common GLib desktops.
+    [[ "${path}" != *'%'* ]] \
+        || die "desktop executable path must not contain '%': ${path}"
+    if LC_ALL=C grep -q '[[:cntrl:]]' <<<"${path}"; then
+        die "desktop executable path must not contain control characters"
+    fi
+}
+
 install_desktop_entry() {
-    local source="$1" dest="$2" exec_path
+    local source="$1" dest="$2" exec_path exec_value try_exec_value
     exec_path="$(desktop_exec_path)"
+    validate_desktop_exec_path "${exec_path}"
+    exec_value="$(desktop_exec_value "${exec_path}")"
+    try_exec_value="$(desktop_try_exec_value "${exec_path}")"
     printf '  install -Dm0644 (Exec=%s) %q %q\n' "${exec_path}" "${source}" "${dest}"
     ((DRY_RUN == 0)) || return 0
     install -d -m 0755 "$(dirname -- "${dest}")"
-    awk -v exec_path="${exec_path}" '
-        /^Exec=ember([[:space:]]|$)/ || /^TryExec=ember([[:space:]]|$)/ {
+    EMBER_DESKTOP_EXEC_VALUE="${exec_value}" \
+        EMBER_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
+        awk '
+        /^Exec=ember([[:space:]]|$)/ {
             eq = index($0, "=")
-            print substr($0, 1, eq) exec_path substr($0, eq + 7)
+            print substr($0, 1, eq) ENVIRON["EMBER_DESKTOP_EXEC_VALUE"] \
+                substr($0, eq + 6)
+            next
+        }
+        /^TryExec=ember([[:space:]]|$)/ {
+            eq = index($0, "=")
+            print substr($0, 1, eq) ENVIRON["EMBER_DESKTOP_TRY_EXEC_VALUE"] \
+                substr($0, eq + 6)
             next
         }
         { print }
@@ -145,12 +210,10 @@ while (($# > 0)); do
         --prefix)
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
-            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
-            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -160,6 +223,17 @@ while (($# > 0)); do
             ;;
         --bin-dir=*)
             BIN_DIR="${1#*=}"
+            shift
+            ;;
+        --binary)
+            (($# >= 2)) || die "--binary requires a path"
+            PREBUILT_BINARY="$2"
+            [[ -n "${PREBUILT_BINARY}" ]] || die "--binary must not be empty"
+            shift 2
+            ;;
+        --binary=*)
+            PREBUILT_BINARY="${1#*=}"
+            [[ -n "${PREBUILT_BINARY}" ]] || die "--binary must not be empty"
             shift
             ;;
         --no-desktop)
@@ -188,11 +262,7 @@ done
 [[ -n "${PREFIX}" ]] || die "prefix must not be empty"
 [[ "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
 if [[ -z "${BIN_DIR}" ]]; then
-    if ((PREFIX_EXPLICIT == 1)); then
-        BIN_DIR="${PREFIX}/bin"
-    else
-        BIN_DIR="${HOME_DIR}/.cargo/bin"
-    fi
+    BIN_DIR="${PREFIX}/bin"
 fi
 [[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
 if [[ -n "${DESTDIR}" ]]; then
@@ -200,19 +270,30 @@ if [[ -n "${DESTDIR}" ]]; then
     DESTDIR="${DESTDIR%/}"
 fi
 
-TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
-if [[ "${TARGET_DIR}" != /* ]]; then
-    TARGET_DIR="${REPO_ROOT}/${TARGET_DIR}"
-fi
-export CARGO_TARGET_DIR="${TARGET_DIR}"
+if [[ -n "${PREBUILT_BINARY}" ]]; then
+    BINARY="${PREBUILT_BINARY}"
+    printf 'Using prebuilt ember binary: %s\n' "${BINARY}"
+    if ((DRY_RUN == 0)) && [[ ! -f "${BINARY}" ]]; then
+        die "prebuilt binary is not a regular file: ${BINARY}"
+    fi
+    if ((DRY_RUN == 0)) && [[ ! -r "${BINARY}" ]]; then
+        die "prebuilt binary is not readable: ${BINARY}"
+    fi
+else
+    TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+    if [[ "${TARGET_DIR}" != /* ]]; then
+        TARGET_DIR="${REPO_ROOT}/${TARGET_DIR}"
+    fi
+    export CARGO_TARGET_DIR="${TARGET_DIR}"
 
-printf 'Building ember...\n'
-require_command cargo
-run_in_repo cargo build --release --locked
+    printf 'Building ember...\n'
+    require_command cargo
+    run_in_repo cargo build --release --locked
 
-BINARY="${TARGET_DIR}/release/ember"
-if ((DRY_RUN == 0)) && [[ ! -x "${BINARY}" ]]; then
-    die "release binary was not produced at ${BINARY}"
+    BINARY="${TARGET_DIR}/release/ember"
+    if ((DRY_RUN == 0)) && [[ ! -x "${BINARY}" ]]; then
+        die "release binary was not produced at ${BINARY}"
+    fi
 fi
 
 require_command install
@@ -256,6 +337,8 @@ if [[ -z "${DESTDIR}" ]]; then
     fi
     SHADOWING_BIN="$(command -v ember 2>/dev/null || true)"
     if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/ember" ]]; then
+        # The backticks are literal command-name markup in user-facing prose.
+        # shellcheck disable=SC2016
         printf '\nNote: typing `ember` still runs %s, an older copy earlier in PATH.\n' \
             "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"

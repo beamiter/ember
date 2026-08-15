@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-13
+Updated: 2026-08-15
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,16 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- The source installer accepts `--binary PATH`, allowing release archives, CI
+  artifacts, and distro staging to reuse the same path contract without Cargo.
+  A real `DESTDIR` install/uninstall test checks all six artifacts, modes,
+  launcher paths, escaping, and failure diagnostics. Desktop and AppStream
+  validation now run in CI; custom desktop executable paths with
+  undefined/unportable `%`, forbidden `=`, or control characters fail
+  explicitly. `scripts/install.sh` and `scripts/uninstall.sh` now derive the
+  default binary from the same `PREFIX/bin` contract (`~/.local/bin` by
+  default), and CI checks the scripts with Bash and ShellCheck.
 
 - Native Codex startup now has a bounded, cancellable background preparation
   phase. Git/worktree identity checks, descriptor pinning, launcher validation,
@@ -136,4 +146,7 @@ pipes, huge output, FIFOs, and oversized files.
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
+bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+bash scripts/test-install-paths.sh
 ```
