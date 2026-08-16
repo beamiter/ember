@@ -1146,10 +1146,33 @@ impl super::TerminalState {
             self.last_archived_screen_snapshot = snapshot;
         }
 
+        // A synchronized TUI frame is copied into scrollback while the live
+        // grid stays in place. Raw selections use `scrollback + grid` row
+        // coordinates, so history growth must move every live-grid anchor by
+        // the same amount. Codex redraws this way on every frame.
+        let old_grid_base = self.scrollback.len();
         for row in first..=last {
             let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
+        self.rebase_raw_selection_for_grid_base_change(old_grid_base, self.scrollback.len());
+    }
+
+    fn rebase_raw_selection_for_grid_base_change(&mut self, old_base: usize, new_base: usize) {
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        for point in [&mut selection.anchor, &mut selection.active] {
+            if point.0 < old_base {
+                continue;
+            }
+            point.0 = if new_base >= old_base {
+                point.0.saturating_add(new_base - old_base)
+            } else {
+                point.0.saturating_sub(old_base - new_base)
+            };
+        }
+        self.bump_selection_revision();
     }
 
     #[allow(dead_code)] // Test/internal copy entrypoint; production uses options explicitly.

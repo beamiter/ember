@@ -16,6 +16,7 @@ mod font_file;
 mod gpu;
 mod help;
 mod history_persistence;
+mod image_drop;
 mod jsh_ui;
 mod keybindings;
 mod kitty_graphics;
@@ -2735,6 +2736,33 @@ impl eframe::App for TerminalApp {
         // Modal/search/settings text fields need egui's semantic clipboard
         // events. They must bypass the terminal-specific Ctrl+C/X/V rewrite.
         let ui_owns_clipboard = self.terminal_input_blocked(ctx);
+        let dropped_paths = std::mem::take(&mut raw_input.dropped_files)
+            .into_iter()
+            .filter_map(|file| file.path)
+            .collect::<Vec<_>>();
+        if !dropped_paths.is_empty() {
+            if ui_owns_clipboard {
+                self.set_status("图片拖放已忽略：当前面板正在接收输入");
+            } else {
+                match image_drop::prompt_payload(&dropped_paths) {
+                    Ok(payload) => {
+                        let accepted = paste_text_into_session(
+                            self.session_manager.get_active_session_mut(),
+                            payload,
+                            self.config.paste_confirm,
+                            PasteOrigin::PromptInsert,
+                            false,
+                            false,
+                            &mut self.pending_paste_confirm,
+                        );
+                        if let Err(error) = accepted {
+                            self.set_status(format!("图片拖放失败：{error}"));
+                        }
+                    }
+                    Err(error) => self.set_status(format!("图片拖放已拒绝：{error}")),
+                }
+            }
+        }
         let preserve_paste_event = {
             let terminal = self
                 .session_manager

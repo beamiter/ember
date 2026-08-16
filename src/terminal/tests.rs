@@ -1931,6 +1931,26 @@ fn synchronized_alt_screen_snapshots_can_be_scrolled() {
 }
 
 #[test]
+fn synchronized_alt_screen_redraw_rebases_live_selection() {
+    let mut terminal = TerminalState::new(12, 3);
+    terminal.process_input(b"\x1b[?1049h");
+    terminal.process_input(b"\x1b[?2026h\x1b[1;1Hfirst\r\nsecond\x1b[?2026l");
+
+    terminal.start_selection((0, 0));
+    terminal.update_selection((0, 4));
+    let old_base = terminal.scrollback_len();
+    assert_eq!(terminal.selection.unwrap().anchor.0, old_base);
+
+    terminal.process_input(b"\x1b[?2026h\x1b[1;1Hfresh\r\nsecond\r\nthird\x1b[?2026l");
+
+    let new_base = terminal.scrollback_len();
+    assert!(new_base > old_base);
+    assert_eq!(terminal.selection.unwrap().anchor.0, new_base);
+    assert_eq!(terminal.row_selection_cols(0), Some((0, 4)));
+    assert_eq!(terminal.copy_selection().as_deref(), Some("fresh"));
+}
+
+#[test]
 fn linefeed_at_bottom_pushes_to_scrollback_for_full_screen_region() {
     let mut terminal = TerminalState::new(4, 2);
     terminal.grid[0][0].character = 'A';
