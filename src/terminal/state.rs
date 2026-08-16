@@ -5040,8 +5040,18 @@ impl super::TerminalState {
         let columns = self.grid.cols() as i64;
         let cursor = click_cursor::Cell::new(self.cursor_row as i64, self.cursor_col as i64);
         let click = click_cursor::Cell::new(click_row as i64, click_col as i64);
-        let Some(target) = click_cursor::target_cell(cursor, click, columns, self.editable_span())
-        else {
+        let Some(span) = self.editable_span() else {
+            return Vec::new();
+        };
+        // The pinned core still clamps every out-of-span click to Home/End.
+        // Refuse rows belonging to completed blocks here so selecting history
+        // cannot silently move the live shell cursor.
+        let first_row = span.start.row.min(span.end.row);
+        let last_row = span.start.row.max(span.end.row);
+        if click.row < first_row || click.row > last_row {
+            return Vec::new();
+        }
+        let Some(target) = click_cursor::target_cell(cursor, click, columns, Some(span)) else {
             return Vec::new();
         };
 

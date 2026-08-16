@@ -4571,6 +4571,23 @@ fn a_click_on_the_prompt_goes_to_the_start_of_the_line() {
 }
 
 #[test]
+fn a_click_in_a_completed_block_preserves_the_live_cursor() {
+    let mut terminal = TerminalState::new(32, 4);
+    terminal.process_input(b"completed output\r\n");
+    terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
+    assert_eq!(terminal.get_cursor_pos(), (1, 12));
+    assert!(
+        terminal.click_cursor_move(0, 7, true).is_empty(),
+        "history interaction must not synthesize Left/Home for the live editor"
+    );
+    assert_eq!(
+        terminal.click_cursor_move(1, 7, true),
+        b"\x1b[D".repeat(5),
+        "click-to-place remains active on the current input row"
+    );
+}
+
+#[test]
 fn a_click_follows_a_soft_wrap_onto_the_previous_row() {
     // 10 columns: "$ " plus 12 characters wraps onto a second row.
     let terminal = terminal_at_prompt(10, 4, "abcdefghijkl");
