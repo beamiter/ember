@@ -1900,13 +1900,17 @@ impl TerminalApp {
             !terminal.preedit_text.is_empty()
         };
 
-        let reported_window_title = {
-            let terminal = session.terminal.lock();
-            terminal.window_title.clone()
+        let private_title = self.tabs.flags(self.tabs.active_index()).private_title;
+        let window_title = if private_title {
+            "Private — Ember".to_string()
+        } else {
+            let reported_window_title = {
+                let terminal = session.terminal.lock();
+                terminal.window_title.clone()
+            };
+            let fallback_title = format!("{} — Ember", Self::session_cwd_title(session));
+            super::window::safe_window_title(&reported_window_title, &fallback_title)
         };
-        let fallback_title = format!("{} — Ember", Self::session_cwd_title(session));
-        let window_title =
-            super::window::safe_window_title(&reported_window_title, &fallback_title);
         if window_title != self.last_window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));
             self.last_window_title = window_title;

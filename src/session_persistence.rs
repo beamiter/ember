@@ -31,6 +31,9 @@ pub struct LayoutSnapshot {
     /// 同上，用于「重要」标记（多选模型）。
     #[serde(default)]
     pub marked: bool,
+    /// Whether tab chrome should redact the real title.
+    #[serde(default)]
+    pub private_title: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +183,7 @@ enum SnapshotField {
     FocusedSessionId,
     Pinned,
     Marked,
+    PrivateTitle,
     Unknown,
 }
 
@@ -220,6 +224,7 @@ impl serde::de::Visitor<'_> for SnapshotFieldVisitor {
             "focused_session_id" => SnapshotField::FocusedSessionId,
             "pinned" => SnapshotField::Pinned,
             "marked" => SnapshotField::Marked,
+            "private_title" => SnapshotField::PrivateTitle,
             _ => SnapshotField::Unknown,
         })
     }
@@ -1097,6 +1102,7 @@ struct RawTabLayout<'de> {
     focused_session_id: Option<String>,
     pinned: bool,
     marked: bool,
+    private_title: bool,
 }
 
 struct RawTabLayoutSeed<'a> {
@@ -1128,6 +1134,7 @@ impl<'de> serde::de::Visitor<'de> for RawTabLayoutSeed<'_> {
         let mut focused_session_id: Option<Option<String>> = None;
         let mut pinned = None;
         let mut marked = None;
+        let mut private_title = None;
         while let Some(key) = map.next_key::<SnapshotField>()? {
             match key {
                 SnapshotField::Root => {
@@ -1154,6 +1161,12 @@ impl<'de> serde::de::Visitor<'de> for RawTabLayoutSeed<'_> {
                     }
                     marked = Some(map.next_value::<bool>()?);
                 }
+                SnapshotField::PrivateTitle => {
+                    if private_title.is_some() {
+                        return Err(A::Error::duplicate_field("private_title"));
+                    }
+                    private_title = Some(map.next_value::<bool>()?);
+                }
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
                 }
@@ -1164,6 +1177,7 @@ impl<'de> serde::de::Visitor<'de> for RawTabLayoutSeed<'_> {
             focused_session_id: focused_session_id.unwrap_or(None),
             pinned: pinned.unwrap_or(false),
             marked: marked.unwrap_or(false),
+            private_title: private_title.unwrap_or(false),
         })
     }
 }
@@ -1194,6 +1208,7 @@ fn decode_tab(
         focused_session_id: staged.focused_session_id,
         pinned: staged.pinned,
         marked: staged.marked,
+        private_title: staged.private_title,
     })
 }
 
@@ -1620,6 +1635,7 @@ impl SessionsSnapshot {
                         focused_session_id,
                         pinned: tab.pinned,
                         marked: tab.marked,
+                        private_title: tab.private_title,
                     });
                 }
                 // 空 tab 不是可渲染的状态，整个丢掉；它的会话会在启动时
@@ -2016,6 +2032,7 @@ mod tests {
             focused_session_id: Some("second-session".to_string()),
             pinned: false,
             marked: false,
+            private_title: false,
         };
         let snapshot =
             SessionsSnapshot::from_snapshots(snapshots, Some(1), vec![layout.clone()], Some(0));
@@ -2109,6 +2126,7 @@ mod tests {
             focused_session_id: Some(id.to_string()),
             pinned: false,
             marked: false,
+            private_title: false,
         };
         let mut snapshot = SessionsSnapshot::from_snapshots(
             vec![SessionSnapshot {
@@ -2147,6 +2165,7 @@ mod tests {
                 focused_session_id: None,
                 pinned: false,
                 marked: false,
+                private_title: false,
             }],
             Some(9),
         );
@@ -2235,6 +2254,7 @@ mod tests {
                 focused_session_id: Some("session-0".to_string()),
                 pinned: false,
                 marked: false,
+                private_title: false,
             }],
             Some(0),
         );
@@ -2716,6 +2736,7 @@ mod tests {
                     focused_session_id: Some(session_id),
                     pinned: false,
                     marked: false,
+                    private_title: false,
                 }
             })
             .collect();

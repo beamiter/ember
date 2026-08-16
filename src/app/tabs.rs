@@ -48,6 +48,7 @@ enum SidebarTabAction {
     Rename(usize),
     ToggleMarked(usize),
     TogglePinned(usize),
+    TogglePrivateTitle(usize),
     Close(usize),
     CloseOthers(usize),
     CloseToRight(usize),
@@ -227,6 +228,14 @@ impl TerminalApp {
     }
 
     pub fn tab_title(&self, tab_idx: usize) -> String {
+        if self.tabs.flags(tab_idx).private_title {
+            return "Private".to_string();
+        }
+        self.tab_real_title(tab_idx)
+    }
+
+    /// The title behind the privacy mask, used only for explicit rename UI.
+    fn tab_real_title(&self, tab_idx: usize) -> String {
         self.tab_display_session(tab_idx)
             .and_then(|idx| self.session_manager.sessions().get(idx))
             .map(Self::session_cwd_title)
@@ -758,6 +767,9 @@ impl TerminalApp {
         if flags.marked {
             lines.push("★ 已标记为重要".to_string());
         }
+        if flags.private_title {
+            lines.push("标题详情已隐藏".to_string());
+        }
         lines.join("\n")
     }
 
@@ -788,6 +800,15 @@ impl TerminalApp {
         item(ui, "New Tab", SidebarTabAction::NewTab);
         item(ui, "Duplicate", SidebarTabAction::Duplicate(index));
         item(ui, "Rename", SidebarTabAction::Rename(index));
+        item(
+            ui,
+            if info.flags.private_title {
+                "Show Title Details"
+            } else {
+                "Hide Title Details"
+            },
+            SidebarTabAction::TogglePrivateTitle(index),
+        );
         item(
             ui,
             if info.flags.marked {
@@ -852,6 +873,7 @@ impl TerminalApp {
             SidebarTabAction::Rename(_) => {}
             SidebarTabAction::ToggleMarked(index) => self.toggle_tab_marked(index),
             SidebarTabAction::TogglePinned(index) => self.toggle_tab_pinned(index),
+            SidebarTabAction::TogglePrivateTitle(index) => self.toggle_tab_private_title(index),
             SidebarTabAction::Close(index) => {
                 if self.close_tab_synced(index) {
                     self.schedule_session_save();
@@ -892,12 +914,17 @@ impl TerminalApp {
             .tab_display_session(tab_idx)
             .and_then(|idx| self.session_manager.sessions().get(idx))
             .and_then(|session| session.metadata.custom_name.clone());
+        let private_title = self.tabs.flags(tab_idx).private_title;
         self.activate_tab(tab_idx);
         let Some(new_tab) = self.new_tab() else {
             return;
         };
         if let Some(name) = custom_name {
             self.apply_rename(new_tab, name);
+        }
+        if private_title {
+            self.tabs.toggle_private_title(new_tab);
+            self.schedule_session_save();
         }
     }
 
@@ -930,6 +957,19 @@ impl TerminalApp {
             "标签页已固定"
         } else {
             "已取消固定标签页"
+        });
+    }
+
+    pub fn toggle_tab_private_title(&mut self, tab_idx: usize) {
+        if tab_idx >= self.tabs.len() {
+            return;
+        }
+        let private = self.tabs.toggle_private_title(tab_idx);
+        self.schedule_session_save();
+        self.set_status(if private {
+            "Tab title details hidden"
+        } else {
+            "Tab title details visible"
         });
     }
 
@@ -1613,6 +1653,16 @@ impl TerminalApp {
         let active_idx = self.tabs.active_index();
         // 活跃指示条目标位置（非拖拽时用于滑动动画）
         let mut active_indicator_target: Option<(f32, f32, f32)> = None;
+        let tab_count_for_menu = self.tabs.len();
+        let marked_count_for_menu = self.tabs.marked_tabs().len();
+        let remote_entries_for_menu: Vec<(usize, String)> = self
+            .config
+            .remote_hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| (index, host.display_name().to_string()))
+            .collect();
+        let mut top_menu_action: Option<SidebarTabAction> = None;
 
         // 绘制每个标签
         for (i, (_, display_text, _)) in tab_infos.iter().enumerate() {
@@ -1664,6 +1714,34 @@ impl TerminalApp {
 
             if is_hovered && !is_actually_dragging {
                 self.hovered_tab_index = Some(i);
+            }
+
+            // The top strip is custom-painted, so register an invisible egui
+            // response over each painted pill to provide the same right-click
+            // menu as sidebar tabs.
+            let hit_rect = tab_rect_item.intersect(tab_clip_rect);
+            if hit_rect.is_positive() {
+                let response = ui.interact(
+                    hit_rect,
+                    egui::Id::new(("top_tab_context_menu", i)),
+                    egui::Sense::click(),
+                );
+                let info = SidebarTabInfo {
+                    index: i,
+                    title: self.tab_title(i),
+                    unseen: tab_unseen.get(i).copied().unwrap_or(false),
+                    flags: self.tabs.flags(i),
+                };
+                response.context_menu(|ui| {
+                    Self::sidebar_tab_menu(
+                        ui,
+                        &info,
+                        tab_count_for_menu,
+                        marked_count_for_menu,
+                        &remote_entries_for_menu,
+                        &mut top_menu_action,
+                    );
+                });
             }
 
             // 背景色：圆角 pill 风格，hover 强度做淡入淡出
@@ -1836,6 +1914,13 @@ impl TerminalApp {
             }
 
             x_offset += tab_width + tab_spacing;
+        }
+
+        if let Some(action) = top_menu_action {
+            match action {
+                SidebarTabAction::Rename(index) => begin_rename_idx = Some(index),
+                action => self.apply_sidebar_tab_action(action),
+            }
         }
 
         // 活跃指示条滑动动画（非拖拽时）

@@ -194,6 +194,7 @@ impl LayoutManager {
             focused_session_id,
             pinned: false,
             marked: false,
+            private_title: false,
         })
     }
 
@@ -1222,6 +1223,7 @@ mod tests {
             focused_session_id: Some("missing".to_string()),
             pinned: false,
             marked: false,
+            private_title: false,
         };
         let session_ids = vec!["alpha".to_string(), "beta".to_string()];
         let restored = LayoutManager::try_from_snapshot(&snapshot, &session_ids, Some(1)).unwrap();
@@ -1242,6 +1244,7 @@ mod tests {
             focused_session_id: Some("gone".to_string()),
             pinned: false,
             marked: false,
+            private_title: false,
         };
         let session_ids = vec!["alpha".to_string(), "beta".to_string()];
 

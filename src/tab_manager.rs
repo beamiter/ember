@@ -23,6 +23,8 @@ pub struct TabFlags {
     /// Marking is the family's multi-select model: "关闭已标记标签页" acts on
     /// exactly this set.
     pub marked: bool,
+    /// Replace the real tab title with a neutral label in all window chrome.
+    pub private_title: bool,
 }
 
 /// One tab: its private pane layout plus the flags the user set on it.
@@ -98,6 +100,7 @@ impl TabManager {
                         TabFlags {
                             pinned: snapshot.pinned,
                             marked: snapshot.marked,
+                            private_title: snapshot.private_title,
                         },
                     )
                 })
@@ -194,6 +197,17 @@ impl TabManager {
         let pinned = tab.flags.pinned;
         self.reorder_pinned_first();
         pinned
+    }
+
+    /// Toggle title redaction without disturbing the title source itself.
+    pub fn toggle_private_title(&mut self, tab_idx: usize) -> bool {
+        match self.tabs.get_mut(tab_idx) {
+            Some(tab) => {
+                tab.flags.private_title = !tab.flags.private_title;
+                tab.flags.private_title
+            }
+            None => false,
+        }
     }
 
     /// 稳定重排，让固定的 tab 排到最前，同时保持 `active` 指向原来那个 tab。
@@ -639,6 +653,7 @@ mod tests {
                 focused_session_id: focused.map(str::to_string),
                 pinned: false,
                 marked: false,
+                private_title: false,
             }
         }
 
@@ -649,6 +664,7 @@ mod tests {
             let mut plain = tab(pane("session-0"), Some("session-0"));
             let mut marked = tab(pane("session-1"), Some("session-1"));
             marked.marked = true;
+            marked.private_title = true;
             let mut pinned = tab(pane("session-2"), Some("session-2"));
             pinned.pinned = true;
             plain.pinned = false;
@@ -661,6 +677,7 @@ mod tests {
             assert_eq!(tabs.sessions_in(1), vec![0]);
             assert_eq!(tabs.sessions_in(2), vec![1]);
             assert!(tabs.flags(2).marked);
+            assert!(tabs.flags(2).private_title);
             assert_eq!(tabs.marked_tabs(), vec![2]);
             // 重排跟着「用户上次看的那个 tab」走，而不是停在原来的序号上。
             assert_eq!(tabs.active_focused_session(), Some(1));
@@ -676,9 +693,19 @@ mod tests {
             .expect("legacy snapshot parses");
             assert!(!legacy.pinned);
             assert!(!legacy.marked);
+            assert!(!legacy.private_title);
 
             let tabs = TabManager::restore(&[legacy], &ids(1), 0, Some(0));
             assert_eq!(tabs.flags(0), TabFlags::default());
+        }
+
+        #[test]
+        fn private_title_toggles_without_changing_tab_identity() {
+            let mut tabs = TabManager::new(0);
+            assert!(!tabs.flags(0).private_title);
+            assert!(tabs.toggle_private_title(0));
+            assert_eq!(tabs.focused_session_of(0), Some(0));
+            assert!(!tabs.toggle_private_title(0));
         }
 
         #[test]
@@ -807,7 +834,8 @@ mod tests {
             tabs.flags(0),
             TabFlags {
                 pinned: true,
-                marked: true
+                marked: true,
+                private_title: false,
             }
         );
         assert_eq!(tabs.flags(1), TabFlags::default());

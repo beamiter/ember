@@ -116,6 +116,7 @@ impl TerminalApp {
             // 固定/标记是 tab 级别的状态，布局快照本身不知道它们。
             snapshot.pinned = flags.pinned;
             snapshot.marked = flags.marked;
+            snapshot.private_title = flags.private_title;
             if original_index == original_active_tab {
                 active_tab = Some(tabs.len());
             }
