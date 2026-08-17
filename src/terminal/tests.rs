@@ -2869,6 +2869,38 @@ fn trailing_escape_is_buffered_until_next_chunk() {
 }
 
 #[test]
+fn csi_executes_embedded_crlf_and_continues_parsing() {
+    let mut terminal = TerminalState::new(16, 3);
+
+    // util-linux `more` can wrap Git's colored output in the middle of an SGR
+    // parameter, producing this exact ESC [ 3 CR LF 3 m shape.
+    terminal.process_input(b"A\x1b[3\r\n3mB\x1b[mC");
+
+    assert!(terminal.pending_escape.is_empty());
+    assert_eq!(terminal.cursor_row, 1);
+    assert_eq!(terminal.grid[1][0].character, 'B');
+    assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
+    assert_eq!(terminal.grid[1][1].character, 'C');
+    assert_eq!(terminal.grid[1][1].foreground, Color::Default);
+}
+
+#[test]
+fn partial_csi_does_not_replay_embedded_linefeed_on_next_chunk() {
+    let mut terminal = TerminalState::new(16, 4);
+
+    terminal.process_input(b"\x1b[3\r\n");
+    assert_eq!(terminal.cursor_row, 1);
+    assert_eq!(terminal.pending_escape, b"\x1b[3");
+
+    terminal.process_input(b"3mX");
+
+    assert!(terminal.pending_escape.is_empty());
+    assert_eq!(terminal.cursor_row, 1);
+    assert_eq!(terminal.grid[1][0].character, 'X');
+    assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
+}
+
+#[test]
 fn dec_special_graphics_charset_maps_line_drawing() {
     let mut terminal = TerminalState::new(8, 2);
 

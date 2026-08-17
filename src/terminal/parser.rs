@@ -614,6 +614,7 @@ impl super::TerminalState {
                             let mut intermediates = [0u8; 8];
                             let mut inter_len = 0;
                             let mut final_byte = None;
+                            let mut cancelled = false;
 
                             while i < data_slice.len() {
                                 match data_slice[i] {
@@ -633,13 +634,89 @@ impl super::TerminalState {
                                         final_byte = Some(data_slice[i]);
                                         break;
                                     }
+                                    // ECMA-48 permits C0 controls inside a control
+                                    // sequence. Pagers such as util-linux `more`
+                                    // can insert CR/LF while wrapping colored text,
+                                    // even between the digits of an SGR parameter.
+                                    // Execute those controls immediately and keep
+                                    // collecting the surrounding CSI sequence.
+                                    b'\x08' => {
+                                        self.pending_wrap = false;
+                                        self.cursor_col = self.cursor_col.saturating_sub(1);
+                                        self.note_output_cursor_reposition(false);
+                                    }
+                                    b'\t' => {
+                                        self.pending_wrap = false;
+                                        self.cursor_col = self.next_tab_stop(self.cursor_col);
+                                        self.note_output_cursor_reposition(false);
+                                    }
+                                    b'\n' | b'\x0b' | b'\x0c' => {
+                                        self.pending_wrap = false;
+                                        let departed_row_id = self.grid.row_id(self.cursor_row);
+                                        let departed_boundary = BufferAnchor {
+                                            line_id: self
+                                                .total_lines_scrolled
+                                                .saturating_add(self.cursor_row as u64),
+                                            column: self.grid.row_len(),
+                                        };
+                                        if self.cursor_row == self.scroll_region_bottom {
+                                            self.scroll_region_up(
+                                                self.scroll_region_top,
+                                                self.scroll_region_bottom,
+                                            );
+                                        } else if self.cursor_row + 1 < self.grid.rows() {
+                                            self.cursor_row += 1;
+                                        }
+                                        let next_boundary = BufferAnchor {
+                                            line_id: self
+                                                .total_lines_scrolled
+                                                .saturating_add(self.cursor_row as u64),
+                                            column: 0,
+                                        };
+                                        self.note_output_hard_line_advance(
+                                            departed_row_id,
+                                            departed_boundary,
+                                            next_boundary,
+                                        );
+                                    }
+                                    b'\r' => {
+                                        self.pending_wrap = false;
+                                        self.cursor_col = 0;
+                                        self.note_output_cursor_reposition(false);
+                                    }
+                                    b'\x0e' => self.active_charset = self.g1_charset,
+                                    b'\x0f' => self.active_charset = self.g0_charset,
+                                    // CAN and SUB cancel the current sequence. A
+                                    // following ESC belongs to the replacement
+                                    // sequence and must be left for the outer parser.
+                                    b'\x18' | b'\x1a' => {
+                                        cancelled = true;
+                                        i += 1;
+                                        break;
+                                    }
+                                    b'\x1b' => {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    // Other embedded C0 controls have no visible
+                                    // effect here, but do not make the CSI partial.
+                                    0x00..=0x1f => {}
                                     _ => break,
                                 }
                                 i += 1;
                             }
 
+                            if cancelled {
+                                continue;
+                            }
+
                             let Some(final_byte) = final_byte else {
-                                self.stash_pending_escape(&data_slice[esc_start..]);
+                                // Embedded controls were already executed. Buffer
+                                // only CSI syntax so a later PTY batch cannot replay
+                                // a CR/LF while completing the sequence.
+                                self.stash_pending_escape(b"\x1b[");
+                                self.stash_pending_escape(&param_bytes[..param_len]);
+                                self.stash_pending_escape(&intermediates[..inter_len]);
                                 break;
                             };
 
