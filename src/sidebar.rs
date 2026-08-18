@@ -282,12 +282,36 @@ impl FsOpKind {
     }
 }
 
+/// 跨位置粘贴（下载/上传/中转）的载荷。复制成功后才按 cut 删源。
+#[derive(Clone, Debug)]
+pub struct FsTransfer {
+    pub src_loc: FsLocation,
+    pub src: PathBuf,
+    pub src_is_dir: bool,
+    pub dst_loc: FsLocation,
+    /// 目标目录；最终路径 = dst_dir.join(源文件名)。
+    pub dst_dir: PathBuf,
+    pub cut: bool,
+}
+
+impl FsTransfer {
+    /// 状态文案用的方向词。
+    fn direction(&self) -> &'static str {
+        match (&self.src_loc, &self.dst_loc) {
+            (FsLocation::Remote(_), FsLocation::Local) => "下载",
+            (FsLocation::Local, FsLocation::Remote(_)) => "上传",
+            _ => "传输",
+        }
+    }
+}
+
 /// 操作 worker 的内部请求种类：除公开的文件操作外，还有切换位置时的
-/// 起始目录解析（远程 home 目录不能阻塞 UI 线程）。
+/// 起始目录解析（远程 home 目录不能阻塞 UI 线程）和跨位置传输。
 #[derive(Clone, Debug)]
 enum OpRequestKind {
     StartDir,
     Fs(FsOpKind),
+    Transfer(FsTransfer),
 }
 
 #[derive(Clone, Debug)]
@@ -305,8 +329,10 @@ struct FsOpResult {
     generation: u64,
     kind: OpRequestKind,
     clear_clipboard_on_success: bool,
-    /// StartDir 成功时携带解析出的路径；文件操作成功为 Ok(None)。
+    /// StartDir/Transfer 成功时携带路径；文件操作成功为 Ok(None)。
     outcome: Result<Option<PathBuf>, String>,
+    /// 部分成功提示（跨位置 cut：复制成功但删源失败）。
+    warning: Option<String>,
 }
 
 /// 文件操作 worker：单线程串行执行（操作之间本就有先后语义，比如
@@ -344,13 +370,20 @@ impl FsOpService {
 
 fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<FsOpResult>) {
     while let Ok(request) = requests.recv() {
-        let outcome = execute_op(&request).map_err(|error| error.to_string());
+        let execution = execute_op(&request);
         if results
             .send(FsOpResult {
                 generation: request.generation,
                 kind: request.kind,
                 clear_clipboard_on_success: request.clear_clipboard_on_success,
-                outcome,
+                outcome: execution
+                    .as_ref()
+                    .map(|done| done.path.clone())
+                    .map_err(|error| error.to_string()),
+                warning: execution
+                    .as_ref()
+                    .ok()
+                    .and_then(|done| done.warning.clone()),
             })
             .is_err()
         {
@@ -359,25 +392,64 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<FsOpResult>) {
     }
 }
 
-fn execute_op(request: &FsOpRequest) -> io::Result<Option<PathBuf>> {
+/// execute_op 的正面结果：可选路径 + 部分成功提示。
+struct OpDone {
+    path: Option<PathBuf>,
+    warning: Option<String>,
+}
+
+impl OpDone {
+    fn plain(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            warning: None,
+        }
+    }
+}
+
+fn execute_op(request: &FsOpRequest) -> io::Result<OpDone> {
     let location = &request.location;
     let hosts = request.hosts.as_slice();
     match &request.kind {
-        OpRequestKind::StartDir => remote_fs::start_dir(location, hosts).map(Some),
+        OpRequestKind::StartDir => {
+            remote_fs::start_dir(location, hosts).map(|dir| OpDone::plain(Some(dir)))
+        }
         OpRequestKind::Fs(FsOpKind::CreateDir(path)) => {
-            remote_fs::create_dir(location, hosts, path).map(|_| None)
+            remote_fs::create_dir(location, hosts, path).map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::CreateFile(path)) => {
-            remote_fs::create_file(location, hosts, path).map(|_| None)
+            remote_fs::create_file(location, hosts, path).map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::Delete(path)) => {
-            remote_fs::delete(location, hosts, path).map(|_| None)
+            remote_fs::delete(location, hosts, path).map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::Rename { src, dst }) => {
-            remote_fs::rename(location, hosts, src, dst).map(|_| None)
+            remote_fs::rename(location, hosts, src, dst).map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::Copy { src, dst }) => {
-            remote_fs::copy(location, hosts, src, dst).map(|_| None)
+            remote_fs::copy(location, hosts, src, dst).map(|_| OpDone::plain(None))
+        }
+        OpRequestKind::Transfer(transfer) => {
+            let dst = remote_fs::transfer(
+                &transfer.src_loc,
+                hosts,
+                &transfer.src,
+                transfer.src_is_dir,
+                &transfer.dst_loc,
+                &transfer.dst_dir,
+            )?;
+            let mut warning = None;
+            if transfer.cut {
+                // 跨位置 cut = 复制成功后删源；删源失败按部分成功如实上报，
+                // 复制的成果不回滚、剪贴板照样清空（粘贴动作本身已完成）。
+                if let Err(error) = remote_fs::delete(&transfer.src_loc, hosts, &transfer.src) {
+                    warning = Some(format!("源删除失败（已保留）：{error}"));
+                }
+            }
+            Ok(OpDone {
+                path: Some(dst),
+                warning,
+            })
         }
     }
 }
@@ -621,6 +693,19 @@ impl Sidebar {
         self.enqueue_op(OpRequestKind::Fs(kind), clear_clipboard_on_success)
     }
 
+    /// UI 入口：跨位置传输（下载/上传/中转）。cut 在复制成功后经 delete 删源，
+    /// 删源失败按部分成功上报（warning 进状态栏）。
+    pub fn request_transfer(
+        &mut self,
+        transfer: FsTransfer,
+        clear_clipboard_on_success: bool,
+    ) -> Option<String> {
+        self.enqueue_op(
+            OpRequestKind::Transfer(transfer),
+            clear_clipboard_on_success,
+        )
+    }
+
     fn enqueue_op(
         &mut self,
         kind: OpRequestKind,
@@ -705,6 +790,30 @@ impl Sidebar {
                             }
                             Err(error) => {
                                 messages.push(format!("{}：{error}", kind.verb()));
+                            }
+                        },
+                        OpRequestKind::Transfer(transfer) => match result.outcome {
+                            Ok(dst) => {
+                                if result.clear_clipboard_on_success {
+                                    self.clipboard = None;
+                                }
+                                // 落位目录可能正是当前显示的目录，重新扫描它。
+                                if let Some(error) = self.refresh_loaded_node(&transfer.dst_dir) {
+                                    messages.push(format!("文件树刷新失败：{error}"));
+                                }
+                                let mut message = match dst {
+                                    Some(dst) => {
+                                        format!("已{}到 {}", transfer.direction(), dst.display())
+                                    }
+                                    None => format!("已{}", transfer.direction()),
+                                };
+                                if let Some(warning) = result.warning {
+                                    message.push_str(&format!("；{warning}"));
+                                }
+                                messages.push(message);
+                            }
+                            Err(error) => {
+                                messages.push(format!("{}失败：{error}", transfer.direction()));
                             }
                         },
                     }
@@ -1254,5 +1363,71 @@ mod tests {
         let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
         assert!(moved.exists());
         assert!(sidebar.clipboard.is_none());
+    }
+
+    #[test]
+    fn a_failed_transfer_keeps_clipboard_and_never_deletes_the_source() {
+        let dir = TestDir::new();
+        let src = dir.0.join("keep.txt");
+        std::fs::write(&src, b"data").unwrap();
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        assert!(sidebar.refresh().is_none());
+        poll_until_loaded(&mut sidebar);
+
+        // 本机 → 未配置的 Remote(9)：传输在 worker 上失败，错误进状态栏；
+        // cut 的删源只在复制成功后发生 —— 剪贴板保留、源文件原样还在。
+        sidebar.clipboard = Some(remote_fs::FsClipboard {
+            loc: FsLocation::Local,
+            path: src.clone(),
+            is_dir: false,
+            cut: true,
+        });
+        let transfer = FsTransfer {
+            src_loc: FsLocation::Local,
+            src: src.clone(),
+            src_is_dir: false,
+            dst_loc: FsLocation::Remote(9),
+            dst_dir: PathBuf::from("/tmp"),
+            cut: true,
+        };
+        assert!(sidebar.request_transfer(transfer, true).is_none());
+        assert!(sidebar.has_pending_op());
+        let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
+        assert!(
+            messages.iter().any(|message| message.contains("上传失败")),
+            "messages: {messages:?}"
+        );
+        assert!(
+            sidebar.clipboard.is_some(),
+            "failed cut-paste keeps the clipboard"
+        );
+        assert!(src.exists(), "failed transfer never deletes the source");
+    }
+
+    #[test]
+    fn same_location_transfer_is_rejected_before_contacting_a_host() {
+        let dir = TestDir::new();
+        let src = dir.0.join("file.txt");
+        std::fs::write(&src, b"data").unwrap();
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+
+        // 本机 → 本机不是传输（那是 copy/rename），worker 如实报错且不触网。
+        let transfer = FsTransfer {
+            src_loc: FsLocation::Local,
+            src: src.clone(),
+            src_is_dir: false,
+            dst_loc: FsLocation::Local,
+            dst_dir: dir.0.clone(),
+            cut: false,
+        };
+        assert!(sidebar.request_transfer(transfer, false).is_none());
+        let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("传输失败") && message.contains("copy/rename")),
+            "messages: {messages:?}"
+        );
+        assert!(src.exists());
     }
 }

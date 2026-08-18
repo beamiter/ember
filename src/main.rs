@@ -1820,13 +1820,19 @@ enum FsMenuAction {
     Refresh(std::path::PathBuf),
 }
 
-/// 粘贴菜单项的可用状态（禁用时要说明原因）。
+/// 粘贴菜单项的状态：空剪贴板禁用；同位置直接粘贴（copy/rename 探针）；
+/// 跨位置走流式传输（下载/上传/中转）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsPasteState {
     Empty,
+    /// 同位置。
     Ready,
-    /// 剪贴板来自另一个位置（本地 ⇄ 远程），跨位置粘贴禁用。
-    OtherLocation,
+    /// 远程 → 本地。
+    Download,
+    /// 本地 → 远程。
+    Upload,
+    /// 远程 i → 远程 j（经本地临时文件中转）。
+    Relay,
 }
 
 /// 文件树名称输入对话框（New File / New Folder / Rename 共用）。
@@ -2441,11 +2447,24 @@ impl TerminalApp {
         let mut view_changed = false;
         let mut location_changed: Option<remote_fs::FsLocation> = None;
         let mut fs_menu_action: Option<FsMenuAction> = None;
-        // 粘贴只在剪贴板与当前位置一致时可用；跨位置粘贴禁用并说明原因。
+        // 粘贴状态：同位置直接粘贴；跨位置走流式传输（下载/上传/中转）。
         let paste_state = match &self.sidebar.clipboard {
             None => FsPasteState::Empty,
-            Some(clipboard) if clipboard.loc == *self.sidebar.location() => FsPasteState::Ready,
-            Some(_) => FsPasteState::OtherLocation,
+            Some(clipboard) => match (&clipboard.loc, self.sidebar.location()) {
+                (remote_fs::FsLocation::Local, remote_fs::FsLocation::Local) => FsPasteState::Ready,
+                (remote_fs::FsLocation::Remote(i), remote_fs::FsLocation::Remote(j)) if i == j => {
+                    FsPasteState::Ready
+                }
+                (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
+                    FsPasteState::Download
+                }
+                (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => {
+                    FsPasteState::Upload
+                }
+                (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Remote(_)) => {
+                    FsPasteState::Relay
+                }
+            },
         };
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
@@ -2857,20 +2876,23 @@ impl TerminalApp {
                 ui.close();
             }
         }
-        let paste_button = ui.add_enabled(paste == FsPasteState::Ready, egui::Button::new("Paste"));
+        let paste_label = match paste {
+            FsPasteState::Download => "Paste（下载）",
+            FsPasteState::Upload => "Paste（上传）",
+            FsPasteState::Relay => "Paste（中转）",
+            FsPasteState::Ready | FsPasteState::Empty => "Paste",
+        };
+        let paste_button =
+            ui.add_enabled(paste != FsPasteState::Empty, egui::Button::new(paste_label));
         match paste {
-            FsPasteState::Ready => {
+            FsPasteState::Empty => {
+                paste_button.on_disabled_hover_text("剪贴板为空：先 Copy 或 Cut");
+            }
+            _ => {
                 if paste_button.clicked() {
                     *menu = Some(FsMenuAction::Paste(target_dir.to_path_buf()));
                     ui.close();
                 }
-            }
-            FsPasteState::Empty => {
-                paste_button.on_disabled_hover_text("剪贴板为空：先 Copy 或 Cut");
-            }
-            FsPasteState::OtherLocation => {
-                paste_button
-                    .on_disabled_hover_text("仅支持在同一位置内粘贴（本地与远程之间不能直接互粘）");
             }
         }
         ui.separator();
@@ -2942,43 +2964,71 @@ impl TerminalApp {
         }
     }
 
-    /// 粘贴：目标目录 + 源文件名。cut → rename，copy → copy；成功后是否清空
-    /// 剪贴板由 sidebar 按 clear_clipboard_on_success 处理。
+    /// 粘贴：目标目录 + 源文件名。同位置 cut → rename、copy → copy；跨位置
+    /// （下载/上传/中转）走 FsOpService 上的流式传输。成功后是否清空剪贴板
+    /// 由 sidebar 按 clear_clipboard_on_success 处理。
     fn paste_fs_clipboard(&mut self, target_dir: &std::path::Path) {
         let Some(clipboard) = self.sidebar.clipboard.clone() else {
             return;
         };
-        if clipboard.loc != *self.sidebar.location() {
-            self.set_status("仅支持在同一位置内粘贴");
+        let current = self.sidebar.location().clone();
+        if clipboard.loc == current {
+            // 同位置：cut → rename，copy → copy（探针的 17/AlreadyExists 兜底）。
+            let Some(dst) = clipboard.paste_destination(target_dir) else {
+                self.set_status("无法粘贴：源路径没有文件名");
+                return;
+            };
+            if clipboard.cut && clipboard.path == dst {
+                self.set_status("源与目标相同，未移动");
+                return;
+            }
+            let (kind, clear_clipboard_on_success) = if clipboard.cut {
+                (
+                    sidebar::FsOpKind::Rename {
+                        src: clipboard.path.clone(),
+                        dst,
+                    },
+                    true,
+                )
+            } else {
+                (
+                    sidebar::FsOpKind::Copy {
+                        src: clipboard.path.clone(),
+                        dst,
+                    },
+                    false,
+                )
+            };
+            if let Some(error) = self.sidebar.request_fs_op(kind, clear_clipboard_on_success) {
+                self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
+            }
             return;
         }
-        let Some(dst) = clipboard.paste_destination(target_dir) else {
+        // 跨位置：FsOpService 上的流式传输（字节帽见 remote_fs::MAX_TRANSFER_BYTES）。
+        if clipboard.paste_destination(target_dir).is_none() {
             self.set_status("无法粘贴：源路径没有文件名");
             return;
-        };
-        if clipboard.cut && clipboard.path == dst {
-            self.set_status("源与目标相同，未移动");
-            return;
         }
-        let (kind, clear_clipboard_on_success) = if clipboard.cut {
-            (
-                sidebar::FsOpKind::Rename {
-                    src: clipboard.path.clone(),
-                    dst,
-                },
-                true,
-            )
-        } else {
-            (
-                sidebar::FsOpKind::Copy {
-                    src: clipboard.path.clone(),
-                    dst,
-                },
-                false,
-            )
+        let direction = match (&clipboard.loc, &current) {
+            (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => "下载",
+            (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => "上传",
+            _ => "中转",
         };
-        if let Some(error) = self.sidebar.request_fs_op(kind, clear_clipboard_on_success) {
-            self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
+        let cut = clipboard.cut;
+        let transfer = sidebar::FsTransfer {
+            src_loc: clipboard.loc.clone(),
+            src: clipboard.path.clone(),
+            src_is_dir: clipboard.is_dir,
+            dst_loc: current,
+            dst_dir: target_dir.to_path_buf(),
+            cut,
+        };
+        if let Some(error) = self.sidebar.request_transfer(transfer, cut) {
+            self.set_status_for(format!("{direction}失败:{error}"), Duration::from_secs(5));
+        } else {
+            self.set_status(format!(
+                "已开始{direction}（后台进行，大文件可能需要几分钟）"
+            ));
         }
     }
 

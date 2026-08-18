@@ -586,9 +586,14 @@ the jsh-remote launcher — no sshfs, no agent, no extra dependencies, and the
 same dotfile/sorting/truncation policy as local scans. Right-clicking a row
 (or the current-directory header) offers **New File**, **New Folder**,
 **Rename**, **Delete**, **Copy**, **Cut**, **Paste** and **Refresh**, executed
-on a bounded background worker against either backend; pasting is limited to
-entries copied within the same location, and switching location re-roots the
-tree at the remote home directory once the probe answers.
+on a bounded background worker against either backend, and switching location
+re-roots the tree at the remote home directory once the probe answers. Paste
+also works across locations: remote→local **downloads**, local→remote
+**uploads**, and remote→remote relays through a unique local temp file —
+streamed in 64 KiB chunks with a 512 MiB cap (directories travel as tar
+streams, regular files land via a write-then-rename partial file, never
+overwriting an existing target), with cut becoming copy-then-delete and any
+partial success reported as such.
 
 ## Security notes
 
