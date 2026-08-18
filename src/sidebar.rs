@@ -2,6 +2,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use jterm_core::jsh_remote::RemoteHostConfig;
@@ -322,6 +323,9 @@ struct FsOpRequest {
     kind: OpRequestKind,
     /// cut-paste 成功后才清空剪贴板；普通重命名不带这个标记。
     clear_clipboard_on_success: bool,
+    /// 传输取消令牌（仅 Transfer 携带）：排队时 worker 跳过执行，
+    /// 传输途中由 watchdog 按超时同一路径 kill。
+    cancel_token: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -333,6 +337,40 @@ struct FsOpResult {
     outcome: Result<Option<PathBuf>, String>,
     /// 部分成功提示（跨位置 cut：复制成功但删源失败）。
     warning: Option<String>,
+    /// 取消语义（中性，非错误）。
+    cancelled: bool,
+    /// 传输令牌（把 Done/Progress 映射回面板上的在途条目）。
+    cancel_token: Option<Arc<AtomicBool>>,
+}
+
+/// 操作 worker 发给 UI 的消息：进度（有损、通道满就丢）与完成（必达）。
+#[derive(Debug)]
+enum OpEvent {
+    Progress {
+        generation: u64,
+        token: Arc<AtomicBool>,
+        bytes: u64,
+    },
+    Done(FsOpResult),
+}
+
+/// 在途/排队中的传输条目：面板忙碌行的数据 + 取消令牌的载体。
+#[derive(Debug)]
+struct TransferTrack {
+    token: Arc<AtomicBool>,
+    direction: &'static str,
+    name: String,
+    total: Option<u64>,
+    bytes: u64,
+}
+
+/// 面板忙碌行数据（第一个在途传输）。
+#[derive(Clone, Debug)]
+pub struct TransferStatus {
+    pub direction: &'static str,
+    pub name: String,
+    pub bytes: u64,
+    pub total: Option<u64>,
 }
 
 /// 文件操作 worker：单线程串行执行（操作之间本就有先后语义，比如
@@ -340,7 +378,7 @@ struct FsOpResult {
 #[derive(Debug)]
 struct FsOpService {
     request_tx: Sender<FsOpRequest>,
-    result_rx: Receiver<FsOpResult>,
+    result_rx: Receiver<OpEvent>,
 }
 
 impl FsOpService {
@@ -368,11 +406,37 @@ impl FsOpService {
     }
 }
 
-fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<FsOpResult>) {
+fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
     while let Ok(request) = requests.recv() {
-        let execution = execute_op(&request);
+        // 排队期间已被取消（用户点了取消）：按取消收尾，绝不执行。
+        if request
+            .cancel_token
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            if results
+                .send(OpEvent::Done(FsOpResult {
+                    generation: request.generation,
+                    kind: request.kind,
+                    clear_clipboard_on_success: false,
+                    outcome: Ok(None),
+                    warning: None,
+                    cancelled: true,
+                    cancel_token: request.cancel_token,
+                }))
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+        let execution = execute_op(&request, &results);
+        let cancelled = execution
+            .as_ref()
+            .err()
+            .is_some_and(remote_fs::is_cancelled_error);
         if results
-            .send(FsOpResult {
+            .send(OpEvent::Done(FsOpResult {
                 generation: request.generation,
                 kind: request.kind,
                 clear_clipboard_on_success: request.clear_clipboard_on_success,
@@ -384,7 +448,9 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<FsOpResult>) {
                     .as_ref()
                     .ok()
                     .and_then(|done| done.warning.clone()),
-            })
+                cancelled,
+                cancel_token: request.cancel_token,
+            }))
             .is_err()
         {
             break;
@@ -407,7 +473,7 @@ impl OpDone {
     }
 }
 
-fn execute_op(request: &FsOpRequest) -> io::Result<OpDone> {
+fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpDone> {
     let location = &request.location;
     let hosts = request.hosts.as_slice();
     match &request.kind {
@@ -430,6 +496,23 @@ fn execute_op(request: &FsOpRequest) -> io::Result<OpDone> {
             remote_fs::copy(location, hosts, src, dst).map(|_| OpDone::plain(None))
         }
         OpRequestKind::Transfer(transfer) => {
+            // 进度回报：节流后经 OpEvent 通道发给 UI（有损，通道满就丢）。
+            let sink = request.cancel_token.as_ref().map(|token| {
+                let token = token.clone();
+                let generation = request.generation;
+                let events = events.clone();
+                remote_fs::ProgressSink::new(move |bytes| {
+                    let _ = events.try_send(OpEvent::Progress {
+                        generation,
+                        token: token.clone(),
+                        bytes,
+                    });
+                })
+            });
+            let control = remote_fs::TransferControl {
+                progress: sink,
+                cancel: request.cancel_token.clone(),
+            };
             let dst = remote_fs::transfer(
                 &transfer.src_loc,
                 hosts,
@@ -437,6 +520,7 @@ fn execute_op(request: &FsOpRequest) -> io::Result<OpDone> {
                 transfer.src_is_dir,
                 &transfer.dst_loc,
                 &transfer.dst_dir,
+                control,
             )?;
             let mut warning = None;
             if transfer.cut {
@@ -561,6 +645,8 @@ pub struct Sidebar {
     start_dir_pending: bool,
     /// 起始目录解析失败（连不上主机等）时留在面板上的错误。
     location_error: Option<String>,
+    /// 在途/排队中的传输（≤ 队列容量 8）：忙碌行数据 + 取消令牌。
+    transfer_tracks: Vec<TransferTrack>,
 }
 
 impl Sidebar {
@@ -610,6 +696,7 @@ impl Sidebar {
             pending_ops: 0,
             start_dir_pending: false,
             location_error: None,
+            transfer_tracks: Vec::new(),
         }
     }
 
@@ -672,13 +759,18 @@ impl Sidebar {
         self.root = None;
         self.current_dir = PathBuf::new();
         self.start_dir_pending = false;
+        // 离开当前位置即放弃在途/排队的传输：置令牌（worker 按取消收尾），
+        // 面板条目直接清空；迟到的 Progress/Done 会被 generation 检查丢弃。
+        for track in self.transfer_tracks.drain(..) {
+            track.token.store(true, Ordering::SeqCst);
+        }
         if matches!(self.location, FsLocation::Local) {
             self.current_dir = remote_fs::start_dir(&self.location, &self.remote_hosts)
                 .unwrap_or_else(|_| PathBuf::from("/"));
             self.start_root_scan()
         } else {
             self.start_dir_pending = true;
-            self.enqueue_op(OpRequestKind::StartDir, false)
+            self.enqueue_op(OpRequestKind::StartDir, false, None)
         }
     }
 
@@ -690,26 +782,75 @@ impl Sidebar {
         kind: FsOpKind,
         clear_clipboard_on_success: bool,
     ) -> Option<String> {
-        self.enqueue_op(OpRequestKind::Fs(kind), clear_clipboard_on_success)
+        self.enqueue_op(OpRequestKind::Fs(kind), clear_clipboard_on_success, None)
     }
 
     /// UI 入口：跨位置传输（下载/上传/中转）。cut 在复制成功后经 delete 删源，
-    /// 删源失败按部分成功上报（warning 进状态栏）。
+    /// 删源失败按部分成功上报（warning 进状态栏）。每个传输都带取消令牌和
+    /// 面板在途条目（进度/取消按钮的数据来源）。
     pub fn request_transfer(
         &mut self,
         transfer: FsTransfer,
         clear_clipboard_on_success: bool,
     ) -> Option<String> {
-        self.enqueue_op(
+        let token = Arc::new(AtomicBool::new(false));
+        let name = transfer
+            .src
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| transfer.src.display().to_string());
+        // 上传（本地文件）可以用 metadata 显示 X / Y MiB；下载/中转只有已传字节。
+        let total = if !transfer.src_is_dir && matches!(transfer.src_loc, FsLocation::Local) {
+            std::fs::metadata(&transfer.src).ok().map(|meta| meta.len())
+        } else {
+            None
+        };
+        let track = TransferTrack {
+            token: token.clone(),
+            direction: transfer.direction(),
+            name,
+            total,
+            bytes: 0,
+        };
+        let result = self.enqueue_op(
             OpRequestKind::Transfer(transfer),
             clear_clipboard_on_success,
-        )
+            Some(token),
+        );
+        if result.is_none() {
+            self.transfer_tracks.push(track);
+        }
+        result
+    }
+
+    /// 面板忙碌行数据（第一个在途传输）。
+    pub fn transfer_status(&self) -> Option<TransferStatus> {
+        self.transfer_tracks.first().map(|track| TransferStatus {
+            direction: track.direction,
+            name: track.name.clone(),
+            bytes: track.bytes,
+            total: track.total,
+        })
+    }
+
+    /// 取消全部在途/排队传输（通常只有一个）：置令牌。排队中的由 worker
+    /// 取请求时按取消收尾；传输途中的由 watchdog 按超时同一路径 kill。
+    /// 与完成竞争的取消是 no-op。返回新标记的数量。
+    pub fn cancel_transfers(&mut self) -> usize {
+        let mut marked = 0;
+        for track in &self.transfer_tracks {
+            if !track.token.swap(true, Ordering::SeqCst) {
+                marked += 1;
+            }
+        }
+        marked
     }
 
     fn enqueue_op(
         &mut self,
         kind: OpRequestKind,
         clear_clipboard_on_success: bool,
+        cancel_token: Option<Arc<AtomicBool>>,
     ) -> Option<String> {
         let Some(service) = &self.op_service else {
             self.start_dir_pending = false;
@@ -725,6 +866,7 @@ impl Sidebar {
             hosts: self.remote_hosts.clone(),
             kind,
             clear_clipboard_on_success,
+            cancel_token,
         };
         match service.request(request) {
             Ok(()) => {
@@ -738,9 +880,10 @@ impl Sidebar {
         }
     }
 
-    /// 收割操作 worker 的结果，不阻塞 UI 线程。StartDir 成功会落地
-    /// current_dir 并发起根扫描；文件操作成功会安排受影响目录的重新扫描。
-    /// 返回的字符串可直接进状态栏。
+    /// 收割操作 worker 的消息，不阻塞 UI 线程。Progress 只更新在途条目的
+    /// 字节数；StartDir 成功会落地 current_dir 并发起根扫描；文件操作成功
+    /// 会安排受影响目录的重新扫描；取消按中性"已取消"上报。返回的字符串
+    /// 可直接进状态栏。
     pub fn poll_op_results(&mut self) -> Vec<String> {
         let mut messages = Vec::new();
         let Some(service) = &self.op_service else {
@@ -753,10 +896,41 @@ impl Sidebar {
         let receiver = service.result_rx.clone();
         loop {
             match receiver.try_recv() {
-                Ok(result) => {
+                Ok(OpEvent::Progress {
+                    generation,
+                    token,
+                    bytes,
+                }) => {
+                    // set_location 会 bump generation：迟到进度一律丢弃。
+                    if generation != self.scan_generation {
+                        continue;
+                    }
+                    if let Some(track) = self
+                        .transfer_tracks
+                        .iter_mut()
+                        .find(|track| Arc::ptr_eq(&track.token, &token))
+                    {
+                        track.bytes = bytes;
+                    }
+                }
+                Ok(OpEvent::Done(result)) => {
                     self.pending_ops = self.pending_ops.saturating_sub(1);
                     // set_location 会 bump generation：迟到结果一律丢弃。
                     if result.generation != self.scan_generation {
+                        continue;
+                    }
+                    // 传输完成（无论成败）：摘掉在途条目，忙碌行让位给下一个。
+                    if let Some(token) = &result.cancel_token {
+                        self.transfer_tracks
+                            .retain(|track| !Arc::ptr_eq(&track.token, token));
+                    }
+                    // 取消是中性结果：不清剪贴板（cut 可重试），不刷新目录。
+                    if result.cancelled {
+                        let direction = match &result.kind {
+                            OpRequestKind::Transfer(transfer) => transfer.direction(),
+                            _ => "操作",
+                        };
+                        messages.push(format!("已取消{direction}"));
                         continue;
                     }
                     match result.kind {
@@ -824,6 +998,7 @@ impl Sidebar {
                         self.op_disconnect_reported = true;
                         self.pending_ops = 0;
                         self.start_dir_pending = false;
+                        self.transfer_tracks.clear();
                         messages.push("file operation worker stopped".to_string());
                     }
                     break;
@@ -1429,5 +1604,78 @@ mod tests {
             "messages: {messages:?}"
         );
         assert!(src.exists());
+    }
+
+    #[test]
+    fn a_transfer_cancelled_while_queued_is_reported_as_cancelled_not_error() {
+        // 直接驱动 FsOpService：预置取消令牌，worker 取请求时必须按取消
+        // 收尾（中性、非错误），绝不开始执行（Remote(9) 若执行必报错）。
+        let service = FsOpService::new().expect("op service");
+        let token = Arc::new(AtomicBool::new(true));
+        let request = FsOpRequest {
+            generation: 0,
+            location: FsLocation::Local,
+            hosts: Arc::new(Vec::new()),
+            kind: OpRequestKind::Transfer(FsTransfer {
+                src_loc: FsLocation::Local,
+                src: PathBuf::from("/nonexistent-source.bin"),
+                src_is_dir: false,
+                dst_loc: FsLocation::Remote(9),
+                dst_dir: PathBuf::from("/tmp"),
+                cut: false,
+            }),
+            clear_clipboard_on_success: false,
+            cancel_token: Some(token.clone()),
+        };
+        service.request(request).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match service.result_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(OpEvent::Done(result)) => {
+                    assert!(result.cancelled, "queued cancel must surface as cancelled");
+                    assert!(result.outcome.is_ok(), "cancelled is neutral, not an error");
+                    assert!(Arc::ptr_eq(result.cancel_token.as_ref().unwrap(), &token));
+                    break;
+                }
+                Ok(OpEvent::Progress { .. }) => {
+                    panic!("cancelled-before-start must never stream")
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => panic!("timed out waiting for the cancelled result"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_marks_tokens_once_and_set_location_abandons_in_flight_transfers() {
+        let dir = TestDir::new();
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        let make_transfer = || FsTransfer {
+            src_loc: FsLocation::Local,
+            src: dir.0.join("file.bin"),
+            src_is_dir: false,
+            dst_loc: FsLocation::Remote(9),
+            dst_dir: PathBuf::from("/tmp"),
+            cut: false,
+        };
+
+        assert!(sidebar.request_transfer(make_transfer(), false).is_none());
+        assert!(sidebar.transfer_status().is_some());
+        // 取消是幂等的：重复调用不再新标记。
+        assert_eq!(sidebar.cancel_transfers(), 1);
+        assert_eq!(sidebar.cancel_transfers(), 0);
+        // 与完成竞争的取消是 no-op：worker 的 Done 到达后在途条目被摘除。
+        let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.transfer_status().is_some());
+        assert!(!sidebar.transfer_status().is_some());
+
+        // 切换位置即放弃在途传输：条目立即清空，迟到的结果被 generation 丢弃。
+        assert!(sidebar.request_transfer(make_transfer(), false).is_none());
+        assert!(sidebar.transfer_status().is_some());
+        assert!(sidebar.set_location(FsLocation::Remote(0)).is_none());
+        assert!(!sidebar.transfer_status().is_some());
+        let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
+        assert!(!sidebar.transfer_status().is_some());
+        assert!(sidebar.set_location(FsLocation::Local).is_none());
     }
 }

@@ -1816,6 +1816,8 @@ enum FsMenuAction {
     },
     /// 粘贴目标目录。
     Paste(std::path::PathBuf),
+    /// 把条目完整路径复制到系统剪贴板（远程行也是纯路径，不带前缀）。
+    CopyPath(std::path::PathBuf),
     /// 重新扫描该目录（若已加载）。
     Refresh(std::path::PathBuf),
 }
@@ -2447,6 +2449,7 @@ impl TerminalApp {
         let mut view_changed = false;
         let mut location_changed: Option<remote_fs::FsLocation> = None;
         let mut fs_menu_action: Option<FsMenuAction> = None;
+        let mut cancel_transfer = false;
         // 粘贴状态：同位置直接粘贴；跨位置走流式传输（下载/上传/中转）。
         let paste_state = match &self.sidebar.clipboard {
             None => FsPasteState::Empty,
@@ -2580,6 +2583,27 @@ impl TerminalApp {
                                 ui.visuals().error_fg_color,
                                 format!("无法进入该位置：{error}"),
                             );
+                        }
+                        // 传输忙碌行：进度原地更新，✕ 取消（仅传输可取消）。
+                        if let Some(status) = self.sidebar.transfer_status() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                let amount = match status.total {
+                                    Some(total) => format!(
+                                        "{} / {}",
+                                        remote_fs::format_bytes(status.bytes),
+                                        remote_fs::format_bytes(total)
+                                    ),
+                                    None => remote_fs::format_bytes(status.bytes),
+                                };
+                                ui.label(format!(
+                                    "正在{} {}… {}",
+                                    status.direction, status.name, amount
+                                ));
+                                if ui.small_button("✕").on_hover_text("取消传输").clicked() {
+                                    cancel_transfer = true;
+                                }
+                            });
                         }
                         if !self.sidebar.current_dir.as_os_str().is_empty() {
                             if let Some(dir) = self
@@ -2728,6 +2752,9 @@ impl TerminalApp {
         }
         if let Some(action) = fs_menu_action {
             self.apply_fs_menu_action(action);
+        }
+        if cancel_transfer && self.sidebar.cancel_transfers() > 0 {
+            self.set_status("正在取消传输…");
         }
         if view_changed {
             // 记住用户选择的视图，下次默认沿用。
@@ -2896,10 +2923,24 @@ impl TerminalApp {
             }
         }
         ui.separator();
+        // 复制路径：本地与远程行都是完整路径文本（远程不带 ssh:/docker: 前缀），
+        // 复制动作是纯 UI 行为，当场完成；菜单动作只负责状态栏提示。
+        let copy_path = entry.map(|(path, _)| path).unwrap_or(target_dir);
+        if ui.button("复制路径").clicked() {
+            ui.ctx().copy_text(Self::fs_copy_path_payload(copy_path));
+            *menu = Some(FsMenuAction::CopyPath(copy_path.to_path_buf()));
+            ui.close();
+        }
+        ui.separator();
         if ui.button("Refresh").clicked() {
             *menu = Some(FsMenuAction::Refresh(target_dir.to_path_buf()));
             ui.close();
         }
+    }
+
+    /// "复制路径"的剪贴板载荷：本地与远程行都是完整路径文本（远程不带前缀）。
+    fn fs_copy_path_payload(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
     }
 
     /// 执行右键菜单收集到的动作（对话框/剪贴板/操作 worker 分派）。
@@ -2956,6 +2997,9 @@ impl TerminalApp {
                 self.set_status("已剪切到文件剪贴板");
             }
             FsMenuAction::Paste(target_dir) => self.paste_fs_clipboard(&target_dir),
+            FsMenuAction::CopyPath(path) => {
+                self.set_status(format!("已复制路径：{}", path.display()));
+            }
             FsMenuAction::Refresh(dir) => {
                 if let Some(error) = self.sidebar.refresh_loaded_node(&dir) {
                     self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
@@ -5455,6 +5499,23 @@ mod tests {
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+
+    #[test]
+    fn copy_path_payload_is_the_plain_full_path() {
+        // 本地与远程行都是完整路径文本；远程行没有 ssh:/docker: 前缀。
+        assert_eq!(
+            crate::TerminalApp::fs_copy_path_payload(std::path::Path::new("/home/yj/notes.md")),
+            "/home/yj/notes.md"
+        );
+        assert_eq!(
+            crate::TerminalApp::fs_copy_path_payload(std::path::Path::new("/var/log/syslog")),
+            "/var/log/syslog"
+        );
+        assert_eq!(
+            crate::TerminalApp::fs_copy_path_payload(std::path::Path::new("/")),
+            "/"
+        );
+    }
 
     #[test]
     fn font_fallback_loop_skips_a_non_regular_candidate() {

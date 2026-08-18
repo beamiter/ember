@@ -101,12 +101,14 @@ impl FsClipboard {
 /// 一次子进程调用的有界结果。
 #[derive(Debug)]
 pub struct Capture {
-    /// 退出码；子进程被信号杀死（含超时 kill）时为 None。
+    /// 退出码；子进程被信号杀死（超时/取消 kill）时为 None。
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// watchdog 超时并 kill 了子进程。
     pub timed_out: bool,
+    /// 用户取消（令牌触发 kill），区别于超时与真实错误。
+    pub cancelled: bool,
 }
 
 /// 远端探针脚本协议 v2。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
@@ -222,6 +224,91 @@ pub fn validate_new_name(name: &str) -> Result<(), String> {
         return Err("名称不能包含 / 或 NUL".to_string());
     }
     Ok(())
+}
+
+/// 字节数的人性化格式（1024 进制，一位小数）："512 B"、"12.4 KiB"、
+/// "3.0 MiB"、"1.5 GiB"。传输进度行使用。
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    }
+}
+
+/// 进度回报节流间隔：≤4 次/秒。
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// 进度回报节流字节粒度：增量 ≥256 KiB 也立即报一次。
+const PROGRESS_MIN_BYTES: u64 = 256 * 1024;
+
+/// 传输进度回报（节流 sink）：调用方每写完一块就 [`ProgressSink::report`]，
+/// 是否真正外发由节流决定 —— 首次非零立即报；之后距上次 ≥250ms 或增量
+/// ≥256 KiB 才报。成功收尾用 [`ProgressSink::report_final`] 强制报出终值。
+pub struct ProgressSink {
+    report: Box<dyn FnMut(u64) + Send>,
+    last_sent_at: std::time::Instant,
+    last_sent_bytes: u64,
+}
+
+impl ProgressSink {
+    pub fn new(report: impl FnMut(u64) + Send + 'static) -> Self {
+        Self {
+            report: Box::new(report),
+            // 预设成"早已该报"，让第一块就立即外发（UI 尽快出现非零值）。
+            last_sent_at: std::time::Instant::now() - PROGRESS_MIN_INTERVAL,
+            last_sent_bytes: 0,
+        }
+    }
+
+    /// 每写完一块调用一次；是否外发由节流决定。
+    pub fn report(&mut self, total: u64) {
+        if total == self.last_sent_bytes {
+            return;
+        }
+        let due_time = self.last_sent_at.elapsed() >= PROGRESS_MIN_INTERVAL;
+        let due_bytes = total.saturating_sub(self.last_sent_bytes) >= PROGRESS_MIN_BYTES;
+        if due_time || due_bytes {
+            self.emit(total);
+        }
+    }
+
+    /// 成功收尾时强制报出最终字节数（不走节流）。
+    pub fn report_final(&mut self, total: u64) {
+        if total != self.last_sent_bytes {
+            self.emit(total);
+        }
+    }
+
+    fn emit(&mut self, total: u64) {
+        self.last_sent_at = std::time::Instant::now();
+        self.last_sent_bytes = total;
+        (self.report)(total);
+    }
+}
+
+/// 传输控制：进度回报 + 取消令牌，跨 runner 传递。非传输探针不涉及。
+#[derive(Default)]
+pub struct TransferControl {
+    pub progress: Option<ProgressSink>,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// 取消语义的 io 错误。传输管线里 `Interrupted` 只可能来自取消令牌
+/// （本模块自己的 IO 路径不会产出 EINTR），UI 据此显示中性"已取消"。
+pub fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled")
+}
+
+/// 见 [`cancelled_error`]：传输失败是否其实是用户取消。
+pub fn is_cancelled_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
 }
 
 /// POSIX 单引号转义：`'` → `'\''`。
@@ -344,30 +431,54 @@ fn spawn_piped(argv: &[String]) -> io::Result<Child> {
         .spawn()
 }
 
-/// 子进程 + watchdog 的组合：超时强制 kill，try_wait 轮询而不是 wait()
-/// 长持锁（watchdog 需要同一把锁来 kill）。
+/// 子进程 + watchdog 的组合：超时或取消令牌触发时强制 kill（同一条 kill
+/// 路径），try_wait 轮询而不是 wait() 长持锁（watchdog 需要同一把锁来 kill）。
 struct MonitoredChild {
     child: Arc<Mutex<Child>>,
     timed_out: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
     done_tx: mpsc::Sender<()>,
     watchdog: std::thread::JoinHandle<()>,
 }
 
+/// watchdog 的醒转间隔：有取消令牌时按它轮询令牌。
+const WATCHDOG_POLL: Duration = Duration::from_millis(100);
+
 impl MonitoredChild {
-    fn new(child: Child, timeout: Duration) -> io::Result<Self> {
+    fn new(child: Child, timeout: Duration, cancel: Option<Arc<AtomicBool>>) -> io::Result<Self> {
         let child = Arc::new(Mutex::new(child));
         let timed_out = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let watchdog = {
             let child = child.clone();
             let timed_out = timed_out.clone();
+            let cancelled = cancelled.clone();
             std::thread::Builder::new()
                 .name("ember-fs-probe-watchdog".to_string())
                 .spawn(move || {
-                    if done_rx.recv_timeout(timeout).is_err() {
-                        // kill 成功才标记超时，避免与已自然退出的子进程竞争时误报。
-                        if child.lock().kill().is_ok() {
-                            timed_out.store(true, Ordering::SeqCst);
+                    let deadline = std::time::Instant::now() + timeout;
+                    loop {
+                        match done_rx.recv_timeout(WATCHDOG_POLL) {
+                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                // kill 成功才标记，避免与已自然退出的子进程竞争时误报。
+                                if cancel
+                                    .as_ref()
+                                    .is_some_and(|token| token.load(Ordering::SeqCst))
+                                {
+                                    if child.lock().kill().is_ok() {
+                                        cancelled.store(true, Ordering::SeqCst);
+                                    }
+                                    break;
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    if child.lock().kill().is_ok() {
+                                        timed_out.store(true, Ordering::SeqCst);
+                                    }
+                                    break;
+                                }
+                            }
                         }
                     }
                 })?
@@ -375,6 +486,7 @@ impl MonitoredChild {
         Ok(Self {
             child,
             timed_out,
+            cancelled,
             done_tx,
             watchdog,
         })
@@ -385,8 +497,8 @@ impl MonitoredChild {
         let _ = self.child.lock().kill();
     }
 
-    /// 等子进程退出并停掉 watchdog，返回（退出码，是否超时）。
-    fn wait(self) -> io::Result<(Option<i32>, bool)> {
+    /// 等子进程退出并停掉 watchdog，返回（退出码，是否超时，是否取消）。
+    fn wait(self) -> io::Result<(Option<i32>, bool, bool)> {
         let status = loop {
             if let Some(status) = self.child.lock().try_wait()? {
                 break status;
@@ -396,7 +508,11 @@ impl MonitoredChild {
         // 通知 watchdog 停止并等它退出，避免残留线程挂着子进程的锁。
         let _ = self.done_tx.send(());
         let _ = self.watchdog.join();
-        Ok((status.code(), self.timed_out.load(Ordering::SeqCst)))
+        Ok((
+            status.code(),
+            self.timed_out.load(Ordering::SeqCst),
+            self.cancelled.load(Ordering::SeqCst),
+        ))
     }
 }
 
@@ -423,6 +539,17 @@ pub fn run_capture(
     timeout: Duration,
     max_out: u64,
 ) -> io::Result<Capture> {
+    run_capture_with_cancel(argv, stdin_bytes, timeout, max_out, None)
+}
+
+/// [`run_capture`] + 取消令牌（目录解包等传输途中的本地子进程使用）。
+fn run_capture_with_cancel(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: u64,
+    cancel: Option<Arc<AtomicBool>>,
+) -> io::Result<Capture> {
     let mut child = spawn_piped(argv)?;
 
     // 探针脚本约 2KB，远小于 64KB 管道缓冲，同步写不会阻塞；子进程若立即
@@ -440,14 +567,14 @@ pub fn run_capture(
         .take()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
 
-    let monitored = MonitoredChild::new(child, timeout)?;
+    let monitored = MonitoredChild::new(child, timeout, cancel)?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, max_out)?;
 
     let mut stdout = Vec::new();
     let read_result = stdout_pipe.take(max_out).read_to_end(&mut stdout);
     // 读端随 Take 一起 drop，子进程继续写会收到 SIGPIPE 自行退出。
 
-    let (code, timed_out) = monitored.wait()?;
+    let (code, timed_out, cancelled) = monitored.wait()?;
     let stderr = stderr_reader.join().unwrap_or_default();
 
     read_result?;
@@ -456,6 +583,7 @@ pub fn run_capture(
         stdout,
         stderr,
         timed_out,
+        cancelled,
     })
 }
 
@@ -469,13 +597,14 @@ fn too_large_error(max_bytes: u64) -> io::Error {
 
 /// 有界地把子进程 stdout 流进本地文件：整块转发、随时计数，超限或流错误
 /// 立即 kill 子进程并报错；部分文件的清理由调用方负责。返回的 Capture
-/// stdout 恒为空（字节都落盘了）。
+/// stdout 恒为空（字节都落盘了）。`control` 携带进度回报与取消令牌。
 fn run_stream_to_file(
     argv: &[String],
     stdin_bytes: &[u8],
     dest: &Path,
     timeout: Duration,
     max_bytes: u64,
+    mut control: TransferControl,
 ) -> io::Result<Capture> {
     let mut child = spawn_piped(argv)?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -490,7 +619,7 @@ fn run_stream_to_file(
         .take()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
 
-    let monitored = MonitoredChild::new(child, timeout)?;
+    let monitored = MonitoredChild::new(child, timeout, control.cancel.clone())?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
 
     let mut file = std::fs::File::create(dest)?;
@@ -512,6 +641,9 @@ fn run_stream_to_file(
                     stream_error = Some(error);
                     break;
                 }
+                if let Some(sink) = control.progress.as_mut() {
+                    sink.report(total);
+                }
             }
             Err(error) => {
                 monitored.kill();
@@ -522,28 +654,36 @@ fn run_stream_to_file(
     }
     drop(file);
 
-    let (code, timed_out) = monitored.wait()?;
+    let (code, timed_out, cancelled) = monitored.wait()?;
     let stderr = stderr_reader.join().unwrap_or_default();
     if let Some(error) = stream_error {
         return Err(error);
+    }
+    if code == Some(0) && !timed_out && !cancelled {
+        if let Some(sink) = control.progress.as_mut() {
+            sink.report_final(total);
+        }
     }
     Ok(Capture {
         status: code,
         stdout: Vec::new(),
         stderr,
         timed_out,
+        cancelled,
     })
 }
 
 /// 有界地把本地文件流进子进程 stdin：先按 metadata 预检大小，写端在独立
 /// 线程（子进程提前退出时 BrokenPipe 正常收尾，结果看退出码）。子进程退出
 /// 码为 0 但写出的字节数与预检不符（本地文件在传输中被改动）时如实报错 —
-/// 此时远端落位的可能是截断文件，绝不包装成成功。
+/// 此时远端落位的可能是截断文件，绝不包装成成功。`control` 携带进度回报
+/// （在写端线程里按块上报）与取消令牌。
 fn run_stream_from_file(
     argv: &[String],
     src: &Path,
     timeout: Duration,
     max_bytes: u64,
+    control: TransferControl,
 ) -> io::Result<Capture> {
     let expected = std::fs::metadata(src)?.len();
     if expected > max_bytes {
@@ -563,10 +703,11 @@ fn run_stream_from_file(
         .take()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
 
-    let monitored = MonitoredChild::new(child, timeout)?;
+    let monitored = MonitoredChild::new(child, timeout, control.cancel.clone())?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
 
     let src_path = src.to_path_buf();
+    let mut progress = control.progress;
     let writer = std::thread::Builder::new()
         .name("ember-fs-upload-writer".to_string())
         .spawn(move || -> io::Result<u64> {
@@ -574,9 +715,11 @@ fn run_stream_from_file(
             let mut stdin = stdin_pipe;
             let mut buffer = [0u8; STREAM_BUF_SIZE];
             let mut total = 0u64;
+            let mut clean_eof = false;
             loop {
                 let n = file.read(&mut buffer)?;
                 if n == 0 {
+                    clean_eof = true;
                     break;
                 }
                 total += n as u64;
@@ -589,13 +732,21 @@ fn run_stream_from_file(
                     Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
                     Err(error) => return Err(error),
                 }
+                if let Some(sink) = progress.as_mut() {
+                    sink.report(total);
+                }
+            }
+            if clean_eof {
+                if let Some(sink) = progress.as_mut() {
+                    sink.report_final(total);
+                }
             }
             Ok(total)
         })?;
 
     let mut stdout = Vec::new();
     let read_result = stdout_pipe.take(MAX_SMALL_OUTPUT).read_to_end(&mut stdout);
-    let (code, timed_out) = monitored.wait()?;
+    let (code, timed_out, cancelled) = monitored.wait()?;
     let stderr = stderr_reader.join().unwrap_or_default();
     let written = writer
         .join()
@@ -611,6 +762,7 @@ fn run_stream_from_file(
         stdout,
         stderr,
         timed_out,
+        cancelled,
     })
 }
 
@@ -638,7 +790,11 @@ fn run_probe(
 
 /// 探针退出码 → io 错误。脚本协议：0 正常，2 用法/路径非法，3 无法进入
 /// 目录，4 操作失败，17 目标已存在；其余（含 127 = 远端没有 sh）一律 Other。
+/// 取消与超时优先于退出码（被 kill 的进程退出码没有意义）。
 fn probe_output(capture: Capture) -> io::Result<Vec<u8>> {
+    if capture.cancelled {
+        return Err(cancelled_error());
+    }
     if capture.timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -1005,6 +1161,9 @@ fn finalize_part(temp: &Path, dst: &Path) -> io::Result<()> {
 
 /// 本地命令（tar 等）的退出状态检查，语义与 [`probe_output`] 对齐。
 fn local_status(capture: Capture) -> io::Result<()> {
+    if capture.cancelled {
+        return Err(cancelled_error());
+    }
     if capture.timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -1059,7 +1218,7 @@ fn remote_ensure_absent(host: &RemoteHostConfig, path: &Path) -> io::Result<()> 
 
 /// 跨位置传输（下载 / 上传 / 本地中转）的统一入口，在 op worker 上阻塞
 /// 执行；返回最终落位路径。本机→本机不应走这里（那是 copy/rename），
-/// 防御性报错。
+/// 防御性报错。`control` 携带进度回报与取消令牌。
 pub fn transfer(
     src_loc: &FsLocation,
     hosts: &[RemoteHostConfig],
@@ -1067,6 +1226,7 @@ pub fn transfer(
     src_is_dir: bool,
     dst_loc: &FsLocation,
     dst_dir: &Path,
+    control: TransferControl,
 ) -> io::Result<PathBuf> {
     let name = src.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
@@ -1075,15 +1235,15 @@ pub fn transfer(
     match (src_loc, dst_loc) {
         (FsLocation::Remote(index), FsLocation::Local) => {
             let host = host_at(hosts, *index)?;
-            download(host, src, src_is_dir, &dst)
+            download(host, src, src_is_dir, &dst, control)
         }
         (FsLocation::Local, FsLocation::Remote(index)) => {
             let host = host_at(hosts, *index)?;
-            upload(host, src, src_is_dir, dst_dir, &dst)
+            upload(host, src, src_is_dir, dst_dir, &dst, control)
         }
         (FsLocation::Remote(i), FsLocation::Remote(j)) if i != j => {
             let (src_host, dst_host) = (host_at(hosts, *i)?, host_at(hosts, *j)?);
-            relay(src_host, src, src_is_dir, dst_host, dst_dir, &dst)
+            relay(src_host, src, src_is_dir, dst_host, dst_dir, &dst, control)
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1093,20 +1253,68 @@ pub fn transfer(
     .map(|_| dst)
 }
 
+/// 两腿传输共享的进度链：每条腿一个带偏移量的 sink，底层是同一条节流，
+/// 这样第二腿（上传/解包）的字节数接着第一腿（下载/打包）累计。
+struct LegProgress {
+    shared: Option<Arc<Mutex<ProgressSink>>>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl LegProgress {
+    fn new(control: TransferControl) -> Self {
+        Self {
+            shared: control.progress.map(|sink| Arc::new(Mutex::new(sink))),
+            cancel: control.cancel,
+        }
+    }
+
+    fn control_for(&self, base: u64) -> TransferControl {
+        TransferControl {
+            progress: self.shared.clone().map(|shared| {
+                ProgressSink::new(move |bytes| {
+                    shared.lock().report(base + bytes);
+                })
+            }),
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
 /// 下载：远端 → 本地。
-fn download(host: &RemoteHostConfig, src: &Path, src_is_dir: bool, dst: &Path) -> io::Result<()> {
+fn download(
+    host: &RemoteHostConfig,
+    src: &Path,
+    src_is_dir: bool,
+    dst: &Path,
+    control: TransferControl,
+) -> io::Result<()> {
     require_absolute(src)?;
     let arg = path_str(src)?;
     if src_is_dir {
-        download_dir(&probe_argv(host, "tar", &[arg]), dst, MAX_TRANSFER_BYTES)
+        download_dir(
+            &probe_argv(host, "tar", &[arg]),
+            dst,
+            MAX_TRANSFER_BYTES,
+            control,
+        )
     } else {
-        download_file(&probe_argv(host, "cat", &[arg]), dst, MAX_TRANSFER_BYTES)
+        download_file(
+            &probe_argv(host, "cat", &[arg]),
+            dst,
+            MAX_TRANSFER_BYTES,
+            control,
+        )
     }
 }
 
 /// 下载文件核心：argv 是完整的 cat 探针调用（测试可注入本机 sh）。
 /// 目标存在性在流式传输前检查一次、rename 就位前再原子检查一次。
-fn download_file(cat_argv: &[String], dst: &Path, max_bytes: u64) -> io::Result<()> {
+fn download_file(
+    cat_argv: &[String],
+    dst: &Path,
+    max_bytes: u64,
+    control: TransferControl,
+) -> io::Result<()> {
     ensure_absent(dst)?;
     let temp = part_path(dst)?;
     // 上次崩溃可能留下同名部分文件（命名只有我们自己的 pid），清掉再来。
@@ -1117,6 +1325,7 @@ fn download_file(cat_argv: &[String], dst: &Path, max_bytes: u64) -> io::Result<
         &temp,
         TRANSFER_TIMEOUT,
         max_bytes,
+        control,
     )
     .and_then(probe_output_empty)
     .and_then(|()| finalize_part(&temp, dst));
@@ -1127,17 +1336,24 @@ fn download_file(cat_argv: &[String], dst: &Path, max_bytes: u64) -> io::Result<
 }
 
 /// 下载目录核心：远端 tar 流 → 本地临时 tar 文件（限额）→ 本地解包。
-fn download_dir(tar_argv: &[String], dst: &Path, max_bytes: u64) -> io::Result<()> {
+fn download_dir(
+    tar_argv: &[String],
+    dst: &Path,
+    max_bytes: u64,
+    control: TransferControl,
+) -> io::Result<()> {
     require_local_tar()?;
     ensure_absent(dst)?;
     let temp = part_tar_path(dst)?;
     let _ = std::fs::remove_file(&temp);
+    let cancel = control.cancel.clone();
     let downloaded = run_stream_to_file(
         tar_argv,
         PROBE_SCRIPT.as_bytes(),
         &temp,
         TRANSFER_TIMEOUT,
         max_bytes,
+        control,
     )
     .and_then(probe_output_empty);
     let outcome = downloaded.and_then(|()| {
@@ -1151,7 +1367,8 @@ fn download_dir(tar_argv: &[String], dst: &Path, max_bytes: u64) -> io::Result<(
             "-C".to_string(),
             path_str(parent)?.to_string(),
         ];
-        run_capture(&argv, &[], TRANSFER_TIMEOUT, MAX_SMALL_OUTPUT).and_then(local_status)
+        run_capture_with_cancel(&argv, &[], TRANSFER_TIMEOUT, MAX_SMALL_OUTPUT, cancel)
+            .and_then(local_status)
     });
     let _ = std::fs::remove_file(&temp);
     if outcome.is_err() && dst.exists() {
@@ -1168,6 +1385,7 @@ fn upload(
     src_is_dir: bool,
     dst_dir: &Path,
     dst: &Path,
+    control: TransferControl,
 ) -> io::Result<()> {
     require_absolute(dst_dir)?;
     host.validate().map_err(|problem| {
@@ -1177,18 +1395,24 @@ fn upload(
         )
     })?;
     if src_is_dir {
-        upload_dir(host, src, dst_dir, dst, MAX_TRANSFER_BYTES)
+        upload_dir(host, src, dst_dir, dst, MAX_TRANSFER_BYTES, control)
     } else {
         // put 在远端读流之前就检查 [ -e "$p" ] → 17，不浪费字节；
         // mv 就位前再查一次，存在性检查天然原子。
         let argv = sh_c_probe_argv(host, "put", &[path_str(dst)?]);
-        upload_file(&argv, src, MAX_TRANSFER_BYTES)
+        upload_file(&argv, src, MAX_TRANSFER_BYTES, control)
     }
 }
 
 /// 上传文件核心：argv 是完整的 put 探针调用（测试可注入本机 sh）。
-fn upload_file(put_argv: &[String], src: &Path, max_bytes: u64) -> io::Result<()> {
-    run_stream_from_file(put_argv, src, TRANSFER_TIMEOUT, max_bytes).and_then(probe_output_empty)
+fn upload_file(
+    put_argv: &[String],
+    src: &Path,
+    max_bytes: u64,
+    control: TransferControl,
+) -> io::Result<()> {
+    run_stream_from_file(put_argv, src, TRANSFER_TIMEOUT, max_bytes, control)
+        .and_then(probe_output_empty)
 }
 
 /// 上传目录核心：远端存在性预检 → 本地打包（限额）→ 远端解包。
@@ -1198,6 +1422,7 @@ fn upload_dir(
     dst_dir: &Path,
     dst: &Path,
     max_bytes: u64,
+    control: TransferControl,
 ) -> io::Result<()> {
     require_local_tar()?;
     remote_ensure_absent(host, dst)?;
@@ -1221,14 +1446,30 @@ fn upload_dir(
         path_str(parent)?.to_string(),
         name.to_string(),
     ];
+    let legs = LegProgress::new(control);
     let temp = part_tar_path(src)?;
     let _ = std::fs::remove_file(&temp);
-    let packed = run_stream_to_file(&tar_argv, &[], &temp, TRANSFER_TIMEOUT, max_bytes)
-        .and_then(local_status);
+    let packed = run_stream_to_file(
+        &tar_argv,
+        &[],
+        &temp,
+        TRANSFER_TIMEOUT,
+        max_bytes,
+        legs.control_for(0),
+    )
+    .and_then(local_status);
     let outcome = packed.and_then(|()| {
+        // 解包腿的字节数接着打包腿累计。
+        let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
         let untar_argv = sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?]);
-        run_stream_from_file(&untar_argv, &temp, TRANSFER_TIMEOUT, max_bytes)
-            .and_then(probe_output_empty)
+        run_stream_from_file(
+            &untar_argv,
+            &temp,
+            TRANSFER_TIMEOUT,
+            max_bytes,
+            legs.control_for(base),
+        )
+        .and_then(probe_output_empty)
     });
     let _ = std::fs::remove_file(&temp);
     outcome
@@ -1242,44 +1483,44 @@ fn relay(
     dst_host: &RemoteHostConfig,
     dst_dir: &Path,
     dst: &Path,
+    control: TransferControl,
 ) -> io::Result<()> {
     require_absolute(src)?;
     require_absolute(dst_dir)?;
     // 下载腿会先烧掉流量，所以存在性预检提前做（文件靠 put 的 17 兜底
     // 也来得及，但那时下载已经完成，白传一份）。
     remote_ensure_absent(dst_host, dst)?;
+    let legs = LegProgress::new(control);
     let temp = relay_temp_path(src_is_dir);
     let _ = std::fs::remove_file(&temp);
     let src_arg = path_str(src)?;
-    let outcome = if src_is_dir {
-        run_stream_to_file(
-            &probe_argv(src_host, "tar", &[src_arg]),
-            PROBE_SCRIPT.as_bytes(),
+    let download_op = if src_is_dir { "tar" } else { "cat" };
+    let outcome = run_stream_to_file(
+        &probe_argv(src_host, download_op, &[src_arg]),
+        PROBE_SCRIPT.as_bytes(),
+        &temp,
+        TRANSFER_TIMEOUT,
+        MAX_TRANSFER_BYTES,
+        legs.control_for(0),
+    )
+    .and_then(probe_output_empty)
+    .and_then(|()| {
+        // 上传腿的字节数接着下载腿累计。
+        let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
+        let upload_argv = if src_is_dir {
+            sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?])
+        } else {
+            sh_c_probe_argv(dst_host, "put", &[path_str(dst)?])
+        };
+        run_stream_from_file(
+            &upload_argv,
             &temp,
             TRANSFER_TIMEOUT,
             MAX_TRANSFER_BYTES,
+            legs.control_for(base),
         )
         .and_then(probe_output_empty)
-        .and_then(|()| {
-            let untar_argv = sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?]);
-            run_stream_from_file(&untar_argv, &temp, TRANSFER_TIMEOUT, MAX_TRANSFER_BYTES)
-                .and_then(probe_output_empty)
-        })
-    } else {
-        run_stream_to_file(
-            &probe_argv(src_host, "cat", &[src_arg]),
-            PROBE_SCRIPT.as_bytes(),
-            &temp,
-            TRANSFER_TIMEOUT,
-            MAX_TRANSFER_BYTES,
-        )
-        .and_then(probe_output_empty)
-        .and_then(|()| {
-            let put_argv = sh_c_probe_argv(dst_host, "put", &[path_str(dst)?]);
-            run_stream_from_file(&put_argv, &temp, TRANSFER_TIMEOUT, MAX_TRANSFER_BYTES)
-                .and_then(probe_output_empty)
-        })
-    };
+    });
     let _ = std::fs::remove_file(&temp);
     outcome
 }
@@ -1349,6 +1590,7 @@ docker = true
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
             timed_out: false,
+            cancelled: false,
         }
     }
 
@@ -2038,8 +2280,13 @@ docker = true
         let dst = dir.join("dst.bin");
 
         // 1KB 帽下下载 16KB：报错、部分文件被 download_file 清掉、dst 不出现。
-        let error = download_file(&sh_s_argv_locally("cat", &[&big_arg]), &dst, 1024)
-            .expect_err("cap must abort the download");
+        let error = download_file(
+            &sh_s_argv_locally("cat", &[&big_arg]),
+            &dst,
+            1024,
+            TransferControl::default(),
+        )
+        .expect_err("cap must abort the download");
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!dst.exists());
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
@@ -2059,8 +2306,13 @@ docker = true
         let dst_arg = dst.to_str().unwrap().to_string();
 
         // 预检直接报错：子进程从未运行，远端（本机）不出现任何文件。
-        let error = upload_file(&sh_c_argv_locally("put", &[&dst_arg]), &big, 1024)
-            .expect_err("oversized upload must fail before streaming");
+        let error = upload_file(
+            &sh_c_argv_locally("put", &[&dst_arg]),
+            &big,
+            1024,
+            TransferControl::default(),
+        )
+        .expect_err("oversized upload must fail before streaming");
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!dst.exists());
     }
@@ -2078,6 +2330,7 @@ docker = true
             &sh_s_argv_locally("cat", &[&src_arg]),
             &dst,
             MAX_TRANSFER_BYTES,
+            TransferControl::default(),
         )
         .expect_err("existing dst");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
@@ -2125,6 +2378,7 @@ docker = true
             &sh_s_argv_locally("cat", &[&src_arg]),
             &relay_temp,
             MAX_TRANSFER_BYTES,
+            TransferControl::default(),
         )
         .unwrap();
         let dst_arg = final_path.to_str().unwrap().to_string();
@@ -2132,6 +2386,7 @@ docker = true
             &sh_c_argv_locally("put", &[&dst_arg]),
             &relay_temp,
             MAX_TRANSFER_BYTES,
+            TransferControl::default(),
         )
         .unwrap();
         std::fs::remove_file(&relay_temp).unwrap();
@@ -2155,6 +2410,7 @@ docker = true
             &sh_s_argv_locally("cat", &[&src_arg]),
             &dst,
             MAX_TRANSFER_BYTES,
+            TransferControl::default(),
         )
         .unwrap();
         delete(&FsLocation::Local, &[], &src).unwrap();
@@ -2170,6 +2426,7 @@ docker = true
             &sh_s_argv_locally("cat", &[&src2_arg]),
             &dst2,
             MAX_TRANSFER_BYTES,
+            TransferControl::default(),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&src_dir).unwrap().permissions();
@@ -2201,6 +2458,7 @@ docker = true
             false,
             &FsLocation::Local,
             dir.path(),
+            TransferControl::default(),
         )
         .expect_err("same-location transfer");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -2213,6 +2471,7 @@ docker = true
             false,
             &FsLocation::Remote(9),
             dir.path(),
+            TransferControl::default(),
         )
         .expect_err("unknown host");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -2225,8 +2484,140 @@ docker = true
             true,
             &FsLocation::Remote(0),
             dir.path(),
+            TransferControl::default(),
         )
         .expect_err("root source");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // ---- 进度 / 取消 ----
+
+    #[test]
+    fn format_bytes_human_readable() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(12 * 1024 + 410), "12.4 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(13_000_000), "12.4 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024 + 1), "5.0 GiB");
+    }
+
+    #[test]
+    fn progress_sink_throttles_by_bytes_and_time() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = ProgressSink::new({
+            let sent = sent.clone();
+            move |bytes| sent.lock().push(bytes)
+        });
+        // 字节节流：一个 250ms 窗口内每块 1KiB，只有首块 + 每 256KiB 外发。
+        for k in 1..=600u64 {
+            sink.report(k * 1024);
+        }
+        assert_eq!(*sent.lock(), vec![1024, 263_168, 525_312]);
+
+        // 时间节流：窗口之外的小增量也外发。
+        std::thread::sleep(Duration::from_millis(260));
+        sink.report(615_424);
+        assert_eq!(sent.lock().len(), 4);
+
+        // report_final 不走节流，终值必达。
+        sink.report_final(616_448);
+        assert_eq!(sent.lock().len(), 5);
+        assert_eq!(sent.lock().last(), Some(&616_448));
+    }
+
+    #[test]
+    fn cancel_kills_mid_download_and_cleans_the_partial_file() {
+        let dir = TestDir::new();
+        let dst = dir.join("dst.bin");
+        let token = Arc::new(AtomicBool::new(false));
+        // "远端"先吐 3 字节再睡死：取消必定打在传输中途。
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf abc; sleep 30".to_string(),
+        ];
+        let control = TransferControl {
+            progress: None,
+            cancel: Some(token.clone()),
+        };
+        let dst_in_thread = dst.clone();
+        let handle = std::thread::spawn(move || {
+            download_file(&argv, &dst_in_thread, MAX_TRANSFER_BYTES, control)
+        });
+        // 让 abc 落盘、子进程睡死，再取消。
+        std::thread::sleep(Duration::from_millis(300));
+        token.store(true, Ordering::SeqCst);
+        let error = handle
+            .join()
+            .expect("download thread")
+            .expect_err("cancelled download");
+        // 取消是中性语义（Interrupted），不是错误文案。
+        assert!(is_cancelled_error(&error), "{error}");
+        // 目标没有出现，隐藏部分文件也被清掉。
+        assert!(!dst.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".fspart-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn cancel_after_completion_is_a_no_op() {
+        let dir = TestDir::new();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, binary_sample()).unwrap();
+        let src_arg = src.to_str().unwrap().to_string();
+        let dst = dir.join("dst.bin");
+        let token = Arc::new(AtomicBool::new(false));
+        let control = TransferControl {
+            progress: None,
+            cancel: Some(token.clone()),
+        };
+        // 正常下载完成；此刻再置令牌，结果必须不受影响（已落位的文件不动）。
+        download_file(
+            &sh_s_argv_locally("cat", &[&src_arg]),
+            &dst,
+            MAX_TRANSFER_BYTES,
+            control,
+        )
+        .unwrap();
+        token.store(true, Ordering::SeqCst);
+        assert_eq!(std::fs::read(&dst).unwrap(), binary_sample());
+    }
+
+    #[test]
+    fn progress_reports_throttled_totals_during_a_real_download() {
+        let dir = TestDir::new();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, vec![3u8; 600 * 1024]).unwrap();
+        let src_arg = src.to_str().unwrap().to_string();
+        let dst = dir.join("dst.bin");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let control = TransferControl {
+            progress: Some(ProgressSink::new({
+                let sent = sent.clone();
+                move |bytes| sent.lock().push(bytes)
+            })),
+            cancel: None,
+        };
+        download_file(
+            &sh_s_argv_locally("cat", &[&src_arg]),
+            &dst,
+            MAX_TRANSFER_BYTES,
+            control,
+        )
+        .unwrap();
+        let sent = sent.lock().clone();
+        // 600KiB：节流后只有少数几次外发，且终值（report_final）必达。
+        assert!(sent.len() <= 5, "sent: {sent:?}");
+        assert_eq!(sent.last(), Some(&(600 * 1024)), "sent: {sent:?}");
+        assert!(sent.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(std::fs::read(&dst).unwrap().len(), 600 * 1024);
     }
 }

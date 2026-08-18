@@ -593,7 +593,13 @@ also works across locations: remote→local **downloads**, local→remote
 streamed in 64 KiB chunks with a 512 MiB cap (directories travel as tar
 streams, regular files land via a write-then-rename partial file, never
 overwriting an existing target), with cut becoming copy-then-delete and any
-partial success reported as such.
+partial success reported as such. While a transfer runs, the sidebar shows a
+live busy row (正在下载/上传 … with transferred bytes, and the total for
+uploads) with a ✕ button that cancels it — the in-flight child is killed,
+local partial files are cleaned up, and the outcome is reported as a neutral
+已取消 rather than an error. The context menu also offers 复制路径, copying
+the row's full path (plain, unprefixed for remote rows) to the system
+clipboard.
 
 ## Security notes
 
