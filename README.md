@@ -41,7 +41,9 @@ claimed.
   hyperlink metadata survives scrollback, selection and reflow while unsafe or
   oversized targets remain inert
 - A bounded-worker, lazy file sidebar whose scans and pagination never block
-  the UI thread; stale slow-directory results are discarded after navigation
+  the UI thread; stale slow-directory results are discarded after navigation.
+  It browses SSH hosts and Docker containers natively (no sshfs), with
+  right-click file operations that work the same locally and remotely
 - Built-in/custom themes, live configuration reload and resilient configurable bindings
 - Bounded PTY channels, parser-work adaptive budgets, viewport-only historical
   reflow and dirty-row GPU uploads
@@ -574,6 +576,19 @@ The grammar, validation and argv are shared with the whole jterm family
 (`jterm_core::jsh_remote::RemoteHostConfig`); typing `ssh host` or
 `docker exec -it name bash` into a jsh prompt reaches the same machinery with
 no configuration at all.
+
+The **Files** sidebar browses these hosts natively: a location selector next
+to the refresh button switches the tree between **Local** and every configured
+`ssh:` / `docker:` entry. Remote listing runs the system `ssh` / `docker`
+binaries feeding a small POSIX sh probe script (`sh -s -- <op> ...` on the far
+side, script on stdin, arguments single-quote-escaped), the same philosophy as
+the jsh-remote launcher — no sshfs, no agent, no extra dependencies, and the
+same dotfile/sorting/truncation policy as local scans. Right-clicking a row
+(or the current-directory header) offers **New File**, **New Folder**,
+**Rename**, **Delete**, **Copy**, **Cut**, **Paste** and **Refresh**, executed
+on a bounded background worker against either backend; pasting is limited to
+entries copied within the same location, and switching location re-roots the
+tree at the remote home directory once the probe answers.
 
 ## Security notes
 

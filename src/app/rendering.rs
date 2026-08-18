@@ -1541,6 +1541,9 @@ impl TerminalApp {
             self.connect_remote_host(&host);
         }
 
+        // 文件树文件操作对话框（新建/重命名/删除确认，浮动窗口）
+        self.render_sidebar_fs_dialogs(ctx);
+
         // 帮助面板 UI（浮动窗口）
         let mut help_open = self.help_panel.is_open;
         self.help_panel.show(

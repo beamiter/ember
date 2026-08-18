@@ -25,6 +25,7 @@ mod link;
 mod pane_header;
 mod persistence_file;
 mod pty;
+mod remote_fs;
 mod remote_picker;
 mod review_text;
 mod search;
@@ -1793,6 +1794,65 @@ fn service_osc52_clipboard_query(
 
 // key_to_string and build_keybinding_string moved to app::events module
 
+/// 文件树右键菜单收集到的动作（闭包结束后统一执行，见 draw_tree_node）。
+#[derive(Clone, Debug)]
+enum FsMenuAction {
+    /// 目标父目录。
+    NewFile(std::path::PathBuf),
+    NewFolder(std::path::PathBuf),
+    /// 被重命名的源路径。
+    Rename(std::path::PathBuf),
+    Delete {
+        path: std::path::PathBuf,
+        is_dir: bool,
+    },
+    Copy {
+        path: std::path::PathBuf,
+        is_dir: bool,
+    },
+    Cut {
+        path: std::path::PathBuf,
+        is_dir: bool,
+    },
+    /// 粘贴目标目录。
+    Paste(std::path::PathBuf),
+    /// 重新扫描该目录（若已加载）。
+    Refresh(std::path::PathBuf),
+}
+
+/// 粘贴菜单项的可用状态（禁用时要说明原因）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsPasteState {
+    Empty,
+    Ready,
+    /// 剪贴板来自另一个位置（本地 ⇄ 远程），跨位置粘贴禁用。
+    OtherLocation,
+}
+
+/// 文件树名称输入对话框（New File / New Folder / Rename 共用）。
+#[derive(Clone, Debug)]
+struct FsNameDialog {
+    kind: FsNameDialogKind,
+    /// New*：目标父目录；Rename：被重命名的源路径。
+    base: std::path::PathBuf,
+    input: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsNameDialogKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+/// 文件树删除确认对话框。
+#[derive(Clone, Debug)]
+struct FsDeleteDialog {
+    path: std::path::PathBuf,
+    is_dir: bool,
+}
+
 impl TerminalApp {
     /// Route click-to-cursor arrows produced by the previous render before
     /// collecting any input from this frame. The terminal pointer is a stable
@@ -2115,6 +2175,8 @@ impl TerminalApp {
                 sb.view = sidebar::effective_view(cfg.sidebar_view, cfg.experimental_task_sidebar);
                 sb
             },
+            sidebar_name_dialog: None,
+            sidebar_delete_dialog: None,
             command_sidebar: Default::default(),
             task_sidebar: Default::default(),
             block_selection: None,
@@ -2338,11 +2400,20 @@ impl TerminalApp {
         if let Some(error) = self.sidebar.poll_scan_results().into_iter().last() {
             self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
         }
+        // 文件操作 worker 的结果（新建/重命名/删除/粘贴、远程起始目录解析）。
+        for message in self.sidebar.poll_op_results() {
+            self.set_status_for(message, Duration::from_secs(5));
+        }
+        // 远程主机配置可能刚在设置里改过：有变化才替换快照，成本可忽略。
+        self.sidebar.set_remote_hosts(&self.config.remote_hosts);
 
         // Follow the shell's authoritative OSC 7 cwd (or the local process
         // cwd fallback) instead of guessing that a queued `cd` succeeded.
         // This also keeps the file tree correct after users type `cd` by hand.
-        if self.sidebar.view == sidebar::SidebarView::Files {
+        // 仅在浏览本机时跟随：本地 shell 的 cwd 对远程文件系统没有意义。
+        if self.sidebar.view == sidebar::SidebarView::Files
+            && matches!(self.sidebar.location(), remote_fs::FsLocation::Local)
+        {
             let reported_cwd = {
                 let session = self.session_manager.get_active_session_mut();
                 let osc7 = session.terminal.lock().current_working_dir.clone();
@@ -2368,6 +2439,14 @@ impl TerminalApp {
         let mut show_more_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
         let mut view_changed = false;
+        let mut location_changed: Option<remote_fs::FsLocation> = None;
+        let mut fs_menu_action: Option<FsMenuAction> = None;
+        // 粘贴只在剪贴板与当前位置一致时可用；跨位置粘贴禁用并说明原因。
+        let paste_state = match &self.sidebar.clipboard {
+            None => FsPasteState::Empty,
+            Some(clipboard) if clipboard.loc == *self.sidebar.location() => FsPasteState::Ready,
+            Some(_) => FsPasteState::OtherLocation,
+        };
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
         egui::Panel::left("file_tree")
@@ -2431,6 +2510,38 @@ impl TerminalApp {
                     {
                         do_refresh = true;
                     }
+                    if self.sidebar.view == sidebar::SidebarView::Files {
+                        // 浏览位置选择器：本机 + config.remote_hosts 里的
+                        // SSH 主机 / Docker 容器。每帧从配置重建，设置面板
+                        // 的增删改立即生效。
+                        let hosts = &self.config.remote_hosts;
+                        let current = self.sidebar.location().clone();
+                        egui::ComboBox::from_id_salt("sidebar-fs-location")
+                            .selected_text(current.label(hosts))
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        matches!(current, remote_fs::FsLocation::Local),
+                                        "Local",
+                                    )
+                                    .clicked()
+                                {
+                                    location_changed = Some(remote_fs::FsLocation::Local);
+                                }
+                                for (index, _host) in hosts.iter().enumerate() {
+                                    let location = remote_fs::FsLocation::Remote(index);
+                                    if ui
+                                        .selectable_label(
+                                            current == location,
+                                            location.label(hosts),
+                                        )
+                                        .clicked()
+                                    {
+                                        location_changed = Some(location);
+                                    }
+                                }
+                            });
+                    }
                 });
                 ui.separator();
 
@@ -2439,13 +2550,38 @@ impl TerminalApp {
                     sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
                     sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
                     sidebar::SidebarView::Files => {
-                        if let Some(dir) = self
-                            .sidebar
-                            .current_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                        {
-                            ui.label(egui::RichText::new(dir).weak().small());
+                        // 远程位置的起始目录解析/失败提示。
+                        if self.sidebar.is_starting() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("正在连接远程主机…");
+                            });
+                        } else if let Some(error) = self.sidebar.location_error() {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("无法进入该位置：{error}"),
+                            );
+                        }
+                        if !self.sidebar.current_dir.as_os_str().is_empty() {
+                            if let Some(dir) = self
+                                .sidebar
+                                .current_dir
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                            {
+                                // 根目录行也挂上下文菜单：在根里新建/粘贴/刷新。
+                                let root_dir = self.sidebar.current_dir.clone();
+                                ui.label(egui::RichText::new(dir).weak().small())
+                                    .context_menu(|ui| {
+                                        Self::fs_context_menu(
+                                            ui,
+                                            None,
+                                            &root_dir,
+                                            &mut fs_menu_action,
+                                            paste_state,
+                                        );
+                                    });
+                            }
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if let Some(root) = &self.sidebar.root {
@@ -2469,6 +2605,8 @@ impl TerminalApp {
                                         &mut select_path,
                                         &mut cd_path,
                                         &mut show_more_path,
+                                        &mut fs_menu_action,
+                                        paste_state,
                                     );
                                 }
                                 let remaining = root.remaining_children();
@@ -2564,6 +2702,14 @@ impl TerminalApp {
                 self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
             }
         }
+        if let Some(location) = location_changed {
+            if let Some(error) = self.sidebar.set_location(location) {
+                self.set_status_for(format!("切换浏览位置失败:{error}"), Duration::from_secs(5));
+            }
+        }
+        if let Some(action) = fs_menu_action {
+            self.apply_fs_menu_action(action);
+        }
         if view_changed {
             // 记住用户选择的视图，下次默认沿用。
             self.config.sidebar_view = self.sidebar.view;
@@ -2574,7 +2720,7 @@ impl TerminalApp {
                 }
             }
         }
-        if self.sidebar.has_pending_scan() {
+        if self.sidebar.has_pending_scan() || self.sidebar.has_pending_op() {
             root_ui
                 .ctx()
                 .request_repaint_after(Duration::from_millis(50));
@@ -2582,6 +2728,7 @@ impl TerminalApp {
     }
 
     /// 递归绘制文件树节点（关联函数，不持 &self 以避免借用冲突）
+    #[allow(clippy::too_many_arguments)]
     fn draw_tree_node(
         ui: &mut egui::Ui,
         node: &sidebar::FileTreeNode,
@@ -2590,6 +2737,8 @@ impl TerminalApp {
         select: &mut Option<std::path::PathBuf>,
         cd: &mut Option<std::path::PathBuf>,
         show_more: &mut Option<std::path::PathBuf>,
+        menu: &mut Option<FsMenuAction>,
+        paste: FsPasteState,
     ) {
         let is_selected = selected.as_deref() == Some(node.path.as_path());
         if node.is_dir {
@@ -2603,6 +2752,9 @@ impl TerminalApp {
             if resp.double_clicked() {
                 *cd = Some(node.path.clone());
             }
+            resp.context_menu(|ui| {
+                Self::fs_context_menu(ui, Some((&node.path, node.is_dir)), &node.path, menu, paste);
+            });
             resp.on_hover_text("单击展开/折叠，双击进入目录 (cd)");
             if node.expanded {
                 ui.indent(node.path.to_string_lossy(), |ui| {
@@ -2615,7 +2767,9 @@ impl TerminalApp {
                         ui.colored_label(ui.visuals().error_fg_color, format!("无法读取：{error}"));
                     }
                     for child in node.visible_children() {
-                        Self::draw_tree_node(ui, child, selected, toggle, select, cd, show_more);
+                        Self::draw_tree_node(
+                            ui, child, selected, toggle, select, cd, show_more, menu, paste,
+                        );
                     }
                     let remaining = node.remaining_children();
                     if remaining > 0
@@ -2637,6 +2791,324 @@ impl TerminalApp {
             let resp = ui.selectable_label(is_selected, format!("  {}", node.name));
             if resp.clicked() {
                 *select = Some(node.path.clone());
+            }
+            // 文件行的"新建/粘贴/刷新"作用于它所在的目录。
+            let target_dir = node
+                .path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| node.path.clone());
+            resp.context_menu(|ui| {
+                Self::fs_context_menu(
+                    ui,
+                    Some((&node.path, node.is_dir)),
+                    &target_dir,
+                    menu,
+                    paste,
+                );
+            });
+        }
+    }
+
+    /// 文件树右键菜单（目录行/文件行/根目录行共用）。只收集动作、不做任何
+    /// mutate：实际执行在树遍历闭包结束后由 apply_fs_menu_action 完成。
+    /// `entry` 是被右键的条目自身（Rename/Delete/Copy/Cut 的目标），根目录
+    /// 行传 None —— 不允许对浏览根做删除/重命名这类动作。
+    fn fs_context_menu(
+        ui: &mut egui::Ui,
+        entry: Option<(&std::path::Path, bool)>,
+        target_dir: &std::path::Path,
+        menu: &mut Option<FsMenuAction>,
+        paste: FsPasteState,
+    ) {
+        if ui.button("New File").clicked() {
+            *menu = Some(FsMenuAction::NewFile(target_dir.to_path_buf()));
+            ui.close();
+        }
+        if ui.button("New Folder").clicked() {
+            *menu = Some(FsMenuAction::NewFolder(target_dir.to_path_buf()));
+            ui.close();
+        }
+        if let Some((path, is_dir)) = entry {
+            if ui.button("Rename").clicked() {
+                *menu = Some(FsMenuAction::Rename(path.to_path_buf()));
+                ui.close();
+            }
+            if ui.button("Delete").clicked() {
+                *menu = Some(FsMenuAction::Delete {
+                    path: path.to_path_buf(),
+                    is_dir,
+                });
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Copy").clicked() {
+                *menu = Some(FsMenuAction::Copy {
+                    path: path.to_path_buf(),
+                    is_dir,
+                });
+                ui.close();
+            }
+            if ui.button("Cut").clicked() {
+                *menu = Some(FsMenuAction::Cut {
+                    path: path.to_path_buf(),
+                    is_dir,
+                });
+                ui.close();
+            }
+        }
+        let paste_button = ui.add_enabled(paste == FsPasteState::Ready, egui::Button::new("Paste"));
+        match paste {
+            FsPasteState::Ready => {
+                if paste_button.clicked() {
+                    *menu = Some(FsMenuAction::Paste(target_dir.to_path_buf()));
+                    ui.close();
+                }
+            }
+            FsPasteState::Empty => {
+                paste_button.on_disabled_hover_text("剪贴板为空：先 Copy 或 Cut");
+            }
+            FsPasteState::OtherLocation => {
+                paste_button
+                    .on_disabled_hover_text("仅支持在同一位置内粘贴（本地与远程之间不能直接互粘）");
+            }
+        }
+        ui.separator();
+        if ui.button("Refresh").clicked() {
+            *menu = Some(FsMenuAction::Refresh(target_dir.to_path_buf()));
+            ui.close();
+        }
+    }
+
+    /// 执行右键菜单收集到的动作（对话框/剪贴板/操作 worker 分派）。
+    fn apply_fs_menu_action(&mut self, action: FsMenuAction) {
+        match action {
+            FsMenuAction::NewFile(dir) => {
+                self.sidebar_name_dialog = Some(FsNameDialog {
+                    kind: FsNameDialogKind::NewFile,
+                    base: dir,
+                    input: String::new(),
+                    error: None,
+                });
+            }
+            FsMenuAction::NewFolder(dir) => {
+                self.sidebar_name_dialog = Some(FsNameDialog {
+                    kind: FsNameDialogKind::NewFolder,
+                    base: dir,
+                    input: String::new(),
+                    error: None,
+                });
+            }
+            FsMenuAction::Rename(src) => {
+                let input = src
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                self.sidebar_name_dialog = Some(FsNameDialog {
+                    kind: FsNameDialogKind::Rename,
+                    base: src,
+                    input,
+                    error: None,
+                });
+            }
+            FsMenuAction::Delete { path, is_dir } => {
+                self.sidebar_delete_dialog = Some(FsDeleteDialog { path, is_dir });
+            }
+            FsMenuAction::Copy { path, is_dir } => {
+                self.sidebar.clipboard = Some(remote_fs::FsClipboard {
+                    loc: self.sidebar.location().clone(),
+                    path,
+                    is_dir,
+                    cut: false,
+                });
+                self.set_status("已复制到文件剪贴板");
+            }
+            FsMenuAction::Cut { path, is_dir } => {
+                self.sidebar.clipboard = Some(remote_fs::FsClipboard {
+                    loc: self.sidebar.location().clone(),
+                    path,
+                    is_dir,
+                    cut: true,
+                });
+                self.set_status("已剪切到文件剪贴板");
+            }
+            FsMenuAction::Paste(target_dir) => self.paste_fs_clipboard(&target_dir),
+            FsMenuAction::Refresh(dir) => {
+                if let Some(error) = self.sidebar.refresh_loaded_node(&dir) {
+                    self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    /// 粘贴：目标目录 + 源文件名。cut → rename，copy → copy；成功后是否清空
+    /// 剪贴板由 sidebar 按 clear_clipboard_on_success 处理。
+    fn paste_fs_clipboard(&mut self, target_dir: &std::path::Path) {
+        let Some(clipboard) = self.sidebar.clipboard.clone() else {
+            return;
+        };
+        if clipboard.loc != *self.sidebar.location() {
+            self.set_status("仅支持在同一位置内粘贴");
+            return;
+        }
+        let Some(dst) = clipboard.paste_destination(target_dir) else {
+            self.set_status("无法粘贴：源路径没有文件名");
+            return;
+        };
+        if clipboard.cut && clipboard.path == dst {
+            self.set_status("源与目标相同，未移动");
+            return;
+        }
+        let (kind, clear_clipboard_on_success) = if clipboard.cut {
+            (
+                sidebar::FsOpKind::Rename {
+                    src: clipboard.path.clone(),
+                    dst,
+                },
+                true,
+            )
+        } else {
+            (
+                sidebar::FsOpKind::Copy {
+                    src: clipboard.path.clone(),
+                    dst,
+                },
+                false,
+            )
+        };
+        if let Some(error) = self.sidebar.request_fs_op(kind, clear_clipboard_on_success) {
+            self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
+        }
+    }
+
+    /// 名称对话框提交：校验已在对话框内做过，这里负责组装操作并分派。
+    fn submit_fs_name_dialog(&mut self, dialog: FsNameDialog) {
+        let name = dialog.input.trim().to_string();
+        let (kind, verb) = match dialog.kind {
+            FsNameDialogKind::NewFile => (
+                sidebar::FsOpKind::CreateFile(dialog.base.join(&name)),
+                "新建文件",
+            ),
+            FsNameDialogKind::NewFolder => (
+                sidebar::FsOpKind::CreateDir(dialog.base.join(&name)),
+                "新建文件夹",
+            ),
+            FsNameDialogKind::Rename => {
+                let dst = dialog.base.with_file_name(&name);
+                if dst == dialog.base {
+                    // 名字没变：静默关闭，不打扰用户也不发操作。
+                    return;
+                }
+                (
+                    sidebar::FsOpKind::Rename {
+                        src: dialog.base.clone(),
+                        dst,
+                    },
+                    "重命名",
+                )
+            }
+        };
+        if let Some(error) = self.sidebar.request_fs_op(kind, false) {
+            self.set_status_for(format!("{verb}失败:{error}"), Duration::from_secs(5));
+        }
+    }
+
+    /// 文件树的模态对话框：名称输入（New File / New Folder / Rename 共用）
+    /// 与删除确认。浮动窗口，仿 remote_picker 的模式。
+    pub fn render_sidebar_fs_dialogs(&mut self, ctx: &egui::Context) {
+        let mut submitted_dialog: Option<FsNameDialog> = None;
+        if let Some(dialog) = &mut self.sidebar_name_dialog {
+            let mut open = true;
+            let mut cancel = false;
+            let title = match dialog.kind {
+                FsNameDialogKind::NewFile => "New File",
+                FsNameDialogKind::NewFolder => "New Folder",
+                FsNameDialogKind::Rename => "Rename",
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    match dialog.kind {
+                        FsNameDialogKind::NewFile | FsNameDialogKind::NewFolder => {
+                            ui.label(format!("在 {} 中创建：", dialog.base.display()));
+                        }
+                        FsNameDialogKind::Rename => {
+                            ui.label(format!("重命名 {}：", dialog.base.display()));
+                        }
+                    }
+                    let response = ui.text_edit_singleline(&mut dialog.input);
+                    if response.changed() {
+                        dialog.error = None;
+                    }
+                    if let Some(error) = &dialog.error {
+                        ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+                    }
+                    let mut submitted = response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            submitted = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    if submitted {
+                        match remote_fs::validate_new_name(dialog.input.trim()) {
+                            Ok(()) => submitted_dialog = Some(dialog.clone()),
+                            Err(error) => dialog.error = Some(error),
+                        }
+                    }
+                });
+            if !open || cancel || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.sidebar_name_dialog = None;
+            }
+        }
+        if let Some(dialog) = submitted_dialog {
+            self.sidebar_name_dialog = None;
+            self.submit_fs_name_dialog(dialog);
+        }
+
+        let mut confirmed_delete: Option<std::path::PathBuf> = None;
+        if let Some(dialog) = &self.sidebar_delete_dialog {
+            let mut open = true;
+            let mut cancel = false;
+            egui::Window::new("Delete")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("确定删除以下路径吗？");
+                    ui.label(egui::RichText::new(dialog.path.display().to_string()).monospace());
+                    if dialog.is_dir {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "这是一个目录，其中的全部内容都会被递归删除。",
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            confirmed_delete = Some(dialog.path.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if !open || cancel || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.sidebar_delete_dialog = None;
+            }
+        }
+        if let Some(path) = confirmed_delete {
+            self.sidebar_delete_dialog = None;
+            if let Some(error) = self
+                .sidebar
+                .request_fs_op(sidebar::FsOpKind::Delete(path), false)
+            {
+                self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
             }
         }
     }

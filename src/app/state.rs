@@ -214,6 +214,10 @@ pub struct TerminalApp {
 
     // File-tree sidebar
     pub sidebar: sidebar::Sidebar,
+    /// 文件树名称输入对话框（New File / New Folder / Rename）。
+    pub sidebar_name_dialog: Option<crate::FsNameDialog>,
+    /// 文件树删除确认对话框。
+    pub sidebar_delete_dialog: Option<crate::FsDeleteDialog>,
 
     // Semantic command timeline sidebar
     pub command_sidebar: CommandSidebarState,
