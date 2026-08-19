@@ -1802,24 +1802,33 @@ enum FsMenuAction {
     NewFolder(std::path::PathBuf),
     /// 被重命名的源路径。
     Rename(std::path::PathBuf),
+    /// 批量删除目标（单选时长度为 1）。
     Delete {
-        path: std::path::PathBuf,
-        is_dir: bool,
+        paths: Vec<(std::path::PathBuf, bool)>,
     },
     Copy {
-        path: std::path::PathBuf,
-        is_dir: bool,
+        paths: Vec<(std::path::PathBuf, bool)>,
     },
     Cut {
-        path: std::path::PathBuf,
-        is_dir: bool,
+        paths: Vec<(std::path::PathBuf, bool)>,
     },
     /// 粘贴目标目录。
     Paste(std::path::PathBuf),
-    /// 把条目完整路径复制到系统剪贴板（远程行也是纯路径，不带前缀）。
-    CopyPath(std::path::PathBuf),
+    /// 把条目完整路径复制到系统剪贴板（多选时换行连接；远程行是纯路径）。
+    CopyPath(Vec<std::path::PathBuf>),
     /// 重新扫描该目录（若已加载）。
     Refresh(std::path::PathBuf),
+}
+
+/// 点击时的选择模式（修饰键语义）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsSelectMode {
+    /// 单选（无修饰键）。
+    Single,
+    /// ctrl+点击：切换该行。
+    Toggle,
+    /// shift+点击：锚点到该行的可见范围。
+    Range,
 }
 
 /// 粘贴菜单项的状态：空剪贴板禁用；同位置直接粘贴（copy/rename 探针）；
@@ -1854,11 +1863,12 @@ enum FsNameDialogKind {
     Rename,
 }
 
-/// 文件树删除确认对话框。
+/// 文件树删除确认对话框（支持多选批量）。
 #[derive(Clone, Debug)]
 struct FsDeleteDialog {
-    path: std::path::PathBuf,
-    is_dir: bool,
+    paths: Vec<std::path::PathBuf>,
+    /// 其中目录的数量（递归删除警告）。
+    dir_count: usize,
 }
 
 impl TerminalApp {
@@ -2468,7 +2478,7 @@ impl TerminalApp {
 
         // 树遍历期间只收集动作，闭包结束后再 mutate，规避借用冲突
         let mut toggle_path: Option<std::path::PathBuf> = None;
-        let mut select_path: Option<std::path::PathBuf> = None;
+        let mut select_action: Option<(std::path::PathBuf, bool, FsSelectMode)> = None;
         let mut cd_path: Option<std::path::PathBuf> = None;
         let mut show_more_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
@@ -2476,6 +2486,11 @@ impl TerminalApp {
         let mut location_changed: Option<remote_fs::FsLocation> = None;
         let mut fs_menu_action: Option<FsMenuAction> = None;
         let mut cancel_transfer = false;
+        // 右键点在选中集之外：选中集先收缩为该行（闭包结束后写回）。
+        let mut selection_apply: Option<std::collections::BTreeMap<std::path::PathBuf, bool>> =
+            None;
+        // 过滤开关本帧刚打开时给输入行焦点。
+        let mut filter_request_focus = false;
         // 本帧渲染出的文件树行矩形（拖放落点命中测试用，帧级、不持久）。
         let mut tree_row_rects: Vec<(egui::Rect, std::path::PathBuf, bool)> = Vec::new();
         // 粘贴状态：同位置直接粘贴；跨位置走流式传输（下载/上传/中转）。
@@ -2591,6 +2606,25 @@ impl TerminalApp {
                                     }
                                 }
                             });
+                        // 树内过滤开关（客户端过滤已加载的树，不触发新扫描）。
+                        let filter_icon =
+                            if self.sidebar.filter_open && !self.sidebar.filter.is_empty() {
+                                egui::RichText::new("🔍").strong()
+                            } else {
+                                egui::RichText::new("🔍")
+                            };
+                        if ui
+                            .button(filter_icon)
+                            .on_hover_text("树内过滤（名称子串；Esc 或再次点击关闭）")
+                            .clicked()
+                        {
+                            self.sidebar.filter_open = !self.sidebar.filter_open;
+                            if !self.sidebar.filter_open {
+                                self.sidebar.filter.clear();
+                            } else {
+                                filter_request_focus = true;
+                            }
+                        }
                     }
                 });
                 ui.separator();
@@ -2633,6 +2667,31 @@ impl TerminalApp {
                                 }
                             });
                         }
+                        // 树内过滤输入行：客户端过滤已加载的树，不触发新扫描。
+                        if self.sidebar.filter_open {
+                            ui.horizontal(|ui| {
+                                ui.label("过滤:");
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.sidebar.filter)
+                                        .hint_text("名称子串，Esc 关闭")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if filter_request_focus {
+                                    resp.request_focus();
+                                }
+                                if resp.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                                {
+                                    self.sidebar.filter.clear();
+                                    self.sidebar.filter_open = false;
+                                }
+                            });
+                        }
+                        let filter_query = if self.sidebar.filter_open {
+                            self.sidebar.filter.trim().to_lowercase()
+                        } else {
+                            String::new()
+                        };
                         if !self.sidebar.current_dir.as_os_str().is_empty() {
                             if let Some(dir) = self
                                 .sidebar
@@ -2649,6 +2708,7 @@ impl TerminalApp {
                                     Self::fs_context_menu(
                                         ui,
                                         None,
+                                        &[],
                                         &root_dir,
                                         &mut fs_menu_action,
                                         paste_state,
@@ -2658,6 +2718,18 @@ impl TerminalApp {
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if let Some(root) = &self.sidebar.root {
+                                // 过滤视图：命中项 + 祖先（强制展开），纯客户端、不动原树。
+                                let filtered_root;
+                                let root = if filter_query.is_empty() {
+                                    Some(root)
+                                } else {
+                                    filtered_root = root.filtered(&filter_query);
+                                    filtered_root.as_ref()
+                                };
+                                let Some(root) = root else {
+                                    ui.label("无匹配项");
+                                    return;
+                                };
                                 if root.is_loading() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
@@ -2673,14 +2745,15 @@ impl TerminalApp {
                                     Self::draw_tree_node(
                                         ui,
                                         child,
-                                        &self.sidebar.selected_path,
+                                        &self.sidebar.selection,
                                         &mut toggle_path,
-                                        &mut select_path,
+                                        &mut select_action,
                                         &mut cd_path,
                                         &mut show_more_path,
                                         &mut fs_menu_action,
                                         paste_state,
                                         &mut tree_row_rects,
+                                        &mut selection_apply,
                                     );
                                 }
                                 let remaining = root.remaining_children();
@@ -2717,8 +2790,24 @@ impl TerminalApp {
         if let Some(p) = show_more_path {
             self.sidebar.show_more(&p);
         }
-        if let Some(p) = select_path {
-            self.sidebar.selected_path = Some(p);
+        if let Some(selection) = selection_apply {
+            // 右键点在选中集之外：选中集收缩为该行（锚点一并跟过去）。
+            self.sidebar.selection = selection;
+            self.sidebar.selected_path = self.sidebar.selection.keys().next().cloned();
+        }
+        if let Some((p, is_dir, mode)) = select_action {
+            match mode {
+                FsSelectMode::Single => self.sidebar.select_single(&p, is_dir),
+                FsSelectMode::Toggle => self.sidebar.select_toggle(&p, is_dir),
+                FsSelectMode::Range => {
+                    // 范围选择的"可见行序"就是本帧渲染出的行（含根目录行）。
+                    let row_order: Vec<(std::path::PathBuf, bool)> = tree_row_rects
+                        .iter()
+                        .map(|(_, path, is_dir)| (path.clone(), *is_dir))
+                        .collect();
+                    self.sidebar.select_range(&row_order, &p, is_dir);
+                }
+            }
         }
         if let Some(p) = cd_path {
             let quoted = jterm_core::process::shell_quote_path(&p.to_string_lossy());
@@ -2936,37 +3025,68 @@ impl TerminalApp {
     }
 
     /// 递归绘制文件树节点（关联函数，不持 &self 以避免借用冲突）。
-    /// rows 收集本帧每行的矩形（拖放落点命中测试用）。
+    /// rows 收集本帧每行的矩形（拖放落点命中测试用）；selection 是多选集；
+    /// 修饰键（ctrl/shift）按下时点击只改选中集（不展开/不 cd）。
     #[allow(clippy::too_many_arguments)]
     fn draw_tree_node(
         ui: &mut egui::Ui,
         node: &sidebar::FileTreeNode,
-        selected: &Option<std::path::PathBuf>,
+        selection: &std::collections::BTreeMap<std::path::PathBuf, bool>,
         toggle: &mut Option<std::path::PathBuf>,
-        select: &mut Option<std::path::PathBuf>,
+        select: &mut Option<(std::path::PathBuf, bool, FsSelectMode)>,
         cd: &mut Option<std::path::PathBuf>,
         show_more: &mut Option<std::path::PathBuf>,
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
         rows: &mut Vec<(egui::Rect, std::path::PathBuf, bool)>,
+        selection_apply: &mut Option<std::collections::BTreeMap<std::path::PathBuf, bool>>,
     ) {
-        let is_selected = selected.as_deref() == Some(node.path.as_path());
+        let is_selected = selection.contains_key(&node.path);
+        let modifiers = ui.input(|input| input.modifiers);
+        let selection_only = modifiers.ctrl || modifiers.shift;
+        let select_mode = if modifiers.ctrl {
+            FsSelectMode::Toggle
+        } else if modifiers.shift {
+            FsSelectMode::Range
+        } else {
+            FsSelectMode::Single
+        };
         if node.is_dir {
             let arrow = if node.expanded { "▼" } else { "▶" };
             let label = format!("{} {}/", arrow, node.name);
             let resp = ui.selectable_label(is_selected, label);
             rows.push((resp.rect, node.path.clone(), true));
             if resp.clicked() {
-                *toggle = Some(node.path.clone());
-                *select = Some(node.path.clone());
+                if selection_only {
+                    *select = Some((node.path.clone(), true, select_mode));
+                } else {
+                    *toggle = Some(node.path.clone());
+                    *select = Some((node.path.clone(), true, FsSelectMode::Single));
+                }
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !selection_only {
                 *cd = Some(node.path.clone());
             }
+            // 右键点在选中集之外：选中集先收缩为该行（菜单目标随之只有它）。
+            if resp.secondary_clicked() && !selection.contains_key(&node.path) {
+                *selection_apply = Some(std::collections::BTreeMap::from([(
+                    node.path.clone(),
+                    node.is_dir,
+                )]));
+            }
             resp.context_menu(|ui| {
-                Self::fs_context_menu(ui, Some((&node.path, node.is_dir)), &node.path, menu, paste);
+                let (_, targets) =
+                    sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
+                Self::fs_context_menu(
+                    ui,
+                    Some((&node.path, node.is_dir)),
+                    &targets,
+                    &node.path,
+                    menu,
+                    paste,
+                );
             });
-            resp.on_hover_text("单击展开/折叠，双击进入目录 (cd)");
+            resp.on_hover_text("单击展开/折叠，双击进入目录 (cd)；ctrl/shift 点击多选");
             if node.expanded {
                 ui.indent(node.path.to_string_lossy(), |ui| {
                     if node.is_loading() {
@@ -2979,7 +3099,17 @@ impl TerminalApp {
                     }
                     for child in node.visible_children() {
                         Self::draw_tree_node(
-                            ui, child, selected, toggle, select, cd, show_more, menu, paste, rows,
+                            ui,
+                            child,
+                            selection,
+                            toggle,
+                            select,
+                            cd,
+                            show_more,
+                            menu,
+                            paste,
+                            rows,
+                            selection_apply,
                         );
                     }
                     let remaining = node.remaining_children();
@@ -3002,7 +3132,13 @@ impl TerminalApp {
             let resp = ui.selectable_label(is_selected, format!("  {}", node.name));
             rows.push((resp.rect, node.path.clone(), false));
             if resp.clicked() {
-                *select = Some(node.path.clone());
+                *select = Some((node.path.clone(), false, select_mode));
+            }
+            if resp.secondary_clicked() && !selection.contains_key(&node.path) {
+                *selection_apply = Some(std::collections::BTreeMap::from([(
+                    node.path.clone(),
+                    node.is_dir,
+                )]));
             }
             // 文件行的"新建/粘贴/刷新"作用于它所在的目录。
             let target_dir = node
@@ -3011,9 +3147,12 @@ impl TerminalApp {
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| node.path.clone());
             resp.context_menu(|ui| {
+                let (_, targets) =
+                    sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
                 Self::fs_context_menu(
                     ui,
                     Some((&node.path, node.is_dir)),
+                    &targets,
                     &target_dir,
                     menu,
                     paste,
@@ -3024,47 +3163,62 @@ impl TerminalApp {
 
     /// 文件树右键菜单（目录行/文件行/根目录行共用）。只收集动作、不做任何
     /// mutate：实际执行在树遍历闭包结束后由 apply_fs_menu_action 完成。
-    /// `entry` 是被右键的条目自身（Rename/Delete/Copy/Cut 的目标），根目录
-    /// 行传 None —— 不允许对浏览根做删除/重命名这类动作。
+    /// `entry` 是被右键的条目自身（Rename 的目标），根目录行传 None ——
+    /// 不允许对浏览根做删除/重命名这类动作。`targets` 是批量动作
+    /// （Delete/Copy/Cut/复制路径）的目标集：点在选中集内时为整个选中集。
     fn fs_context_menu(
         ui: &mut egui::Ui,
         entry: Option<(&std::path::Path, bool)>,
+        targets: &[(std::path::PathBuf, bool)],
         target_dir: &std::path::Path,
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
     ) {
-        if ui.button("New File").clicked() {
+        let multi = targets.len() > 1;
+        // 多选下新建/重命名没有意义（都是单目标操作）。
+        if ui
+            .add_enabled(!multi, egui::Button::new("New File"))
+            .clicked()
+        {
             *menu = Some(FsMenuAction::NewFile(target_dir.to_path_buf()));
             ui.close();
         }
-        if ui.button("New Folder").clicked() {
+        if ui
+            .add_enabled(!multi, egui::Button::new("New Folder"))
+            .clicked()
+        {
             *menu = Some(FsMenuAction::NewFolder(target_dir.to_path_buf()));
             ui.close();
         }
-        if let Some((path, is_dir)) = entry {
-            if ui.button("Rename").clicked() {
+        if let Some((path, _)) = entry {
+            if ui
+                .add_enabled(targets.len() == 1, egui::Button::new("Rename"))
+                .clicked()
+            {
                 *menu = Some(FsMenuAction::Rename(path.to_path_buf()));
                 ui.close();
             }
-            if ui.button("Delete").clicked() {
+            let delete_label = if multi {
+                format!("删除 {} 项", targets.len())
+            } else {
+                "Delete".to_string()
+            };
+            if ui.button(delete_label).clicked() {
                 *menu = Some(FsMenuAction::Delete {
-                    path: path.to_path_buf(),
-                    is_dir,
+                    paths: targets.to_vec(),
                 });
                 ui.close();
             }
             ui.separator();
             if ui.button("Copy").clicked() {
                 *menu = Some(FsMenuAction::Copy {
-                    path: path.to_path_buf(),
-                    is_dir,
+                    paths: targets.to_vec(),
                 });
                 ui.close();
             }
             if ui.button("Cut").clicked() {
                 *menu = Some(FsMenuAction::Cut {
-                    path: path.to_path_buf(),
-                    is_dir,
+                    paths: targets.to_vec(),
                 });
                 ui.close();
             }
@@ -3089,12 +3243,21 @@ impl TerminalApp {
             }
         }
         ui.separator();
-        // 复制路径：本地与远程行都是完整路径文本（远程不带 ssh:/docker: 前缀），
+        // 复制路径：多选时换行连接；本地与远程行都是完整路径文本（不带前缀）。
         // 复制动作是纯 UI 行为，当场完成；菜单动作只负责状态栏提示。
-        let copy_path = entry.map(|(path, _)| path).unwrap_or(target_dir);
+        let copy_paths: Vec<std::path::PathBuf> = if entry.is_some() {
+            targets.iter().map(|(path, _)| path.clone()).collect()
+        } else {
+            vec![target_dir.to_path_buf()]
+        };
         if ui.button("复制路径").clicked() {
-            ui.ctx().copy_text(Self::fs_copy_path_payload(copy_path));
-            *menu = Some(FsMenuAction::CopyPath(copy_path.to_path_buf()));
+            let payload = copy_paths
+                .iter()
+                .map(|path| Self::fs_copy_path_payload(path))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ui.ctx().copy_text(payload);
+            *menu = Some(FsMenuAction::CopyPath(copy_paths));
             ui.close();
         }
         ui.separator();
@@ -3141,30 +3304,22 @@ impl TerminalApp {
                     error: None,
                 });
             }
-            FsMenuAction::Delete { path, is_dir } => {
-                self.sidebar_delete_dialog = Some(FsDeleteDialog { path, is_dir });
-            }
-            FsMenuAction::Copy { path, is_dir } => {
-                self.sidebar.clipboard = Some(remote_fs::FsClipboard {
-                    loc: self.sidebar.location().clone(),
-                    path,
-                    is_dir,
-                    cut: false,
+            FsMenuAction::Delete { paths } => {
+                let dir_count = paths.iter().filter(|(_, is_dir)| *is_dir).count();
+                self.sidebar_delete_dialog = Some(FsDeleteDialog {
+                    paths: paths.into_iter().map(|(path, _)| path).collect(),
+                    dir_count,
                 });
-                self.set_status("已复制到文件剪贴板");
             }
-            FsMenuAction::Cut { path, is_dir } => {
-                self.sidebar.clipboard = Some(remote_fs::FsClipboard {
-                    loc: self.sidebar.location().clone(),
-                    path,
-                    is_dir,
-                    cut: true,
-                });
-                self.set_status("已剪切到文件剪贴板");
-            }
+            FsMenuAction::Copy { paths } => self.set_fs_clipboard(paths, false),
+            FsMenuAction::Cut { paths } => self.set_fs_clipboard(paths, true),
             FsMenuAction::Paste(target_dir) => self.paste_fs_clipboard(&target_dir),
-            FsMenuAction::CopyPath(path) => {
-                self.set_status(format!("已复制路径：{}", path.display()));
+            FsMenuAction::CopyPath(paths) => {
+                if paths.len() == 1 {
+                    self.set_status(format!("已复制路径：{}", paths[0].display()));
+                } else {
+                    self.set_status(format!("已复制 {} 个路径", paths.len()));
+                }
             }
             FsMenuAction::Refresh(dir) => {
                 if let Some(error) = self.sidebar.refresh_loaded_node(&dir) {
@@ -3174,28 +3329,70 @@ impl TerminalApp {
         }
     }
 
-    /// 粘贴：目标目录 + 源文件名。同位置 cut → rename、copy → copy；跨位置
-    /// （下载/上传/中转）走 FsOpService 上的流式传输。成功后是否清空剪贴板
-    /// 由 sidebar 按 clear_clipboard_on_success 处理。
+    /// Copy/Cut 进文件剪贴板（支持多选批量）。
+    fn set_fs_clipboard(&mut self, paths: Vec<(std::path::PathBuf, bool)>, cut: bool) {
+        let count = paths.len();
+        self.sidebar.clipboard = Some(remote_fs::FsClipboard {
+            loc: self.sidebar.location().clone(),
+            items: paths
+                .into_iter()
+                .map(|(path, is_dir)| remote_fs::FsClipboardItem { path, is_dir })
+                .collect(),
+            cut,
+        });
+        self.set_status(match (count, cut) {
+            (1, false) => "已复制到文件剪贴板".to_string(),
+            (1, true) => "已剪切到文件剪贴板".to_string(),
+            (_, false) => format!("已复制 {count} 项到文件剪贴板"),
+            (_, true) => format!("已剪切 {count} 项到文件剪贴板"),
+        });
+    }
+
+    /// 粘贴：目标目录 + 源文件名。单项保持既有路径（同位置 rename/copy；
+    /// 跨位置流式传输带进度/取消）；多项走批量任务（逐项、跳过失败、汇总，
+    /// 跨位置逐项复用 transfer）。成功后是否清空剪贴板由 sidebar 按
+    /// clear_clipboard_on_success 处理（批量部分失败时收缩为失败项）。
     fn paste_fs_clipboard(&mut self, target_dir: &std::path::Path) {
         let Some(clipboard) = self.sidebar.clipboard.clone() else {
             return;
         };
+        if clipboard.items.is_empty() {
+            return;
+        }
         let current = self.sidebar.location().clone();
+        if clipboard.items.len() > 1 {
+            // 多项：一个批量任务（同位置逐项 rename/copy，跨位置逐项 transfer）。
+            let batch = sidebar::BatchIntent::Paste {
+                src_loc: clipboard.loc.clone(),
+                dst_loc: current,
+                dst_dir: target_dir.to_path_buf(),
+                items: clipboard
+                    .items
+                    .iter()
+                    .map(|item| (item.path.clone(), item.is_dir))
+                    .collect(),
+                cut: clipboard.cut,
+            };
+            if let Some(error) = self.sidebar.request_batch(batch, clipboard.cut) {
+                self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
+            }
+            return;
+        }
+        let item = clipboard.items[0].clone();
         if clipboard.loc == current {
             // 同位置：cut → rename，copy → copy（探针的 17/AlreadyExists 兜底）。
-            let Some(dst) = clipboard.paste_destination(target_dir) else {
+            let Some(dst) = item.paste_destination(target_dir) else {
                 self.set_status("无法粘贴：源路径没有文件名");
                 return;
             };
-            if clipboard.cut && clipboard.path == dst {
+            if clipboard.cut && item.path == dst {
                 self.set_status("源与目标相同，未移动");
                 return;
             }
             let (kind, clear_clipboard_on_success) = if clipboard.cut {
                 (
                     sidebar::FsOpKind::Rename {
-                        src: clipboard.path.clone(),
+                        src: item.path.clone(),
                         dst,
                     },
                     true,
@@ -3203,7 +3400,7 @@ impl TerminalApp {
             } else {
                 (
                     sidebar::FsOpKind::Copy {
-                        src: clipboard.path.clone(),
+                        src: item.path.clone(),
                         dst,
                     },
                     false,
@@ -3215,7 +3412,7 @@ impl TerminalApp {
             return;
         }
         // 跨位置：FsOpService 上的流式传输（字节帽见 remote_fs::MAX_TRANSFER_BYTES）。
-        if clipboard.paste_destination(target_dir).is_none() {
+        if item.paste_destination(target_dir).is_none() {
             self.set_status("无法粘贴：源路径没有文件名");
             return;
         }
@@ -3227,8 +3424,8 @@ impl TerminalApp {
         let cut = clipboard.cut;
         let transfer = sidebar::FsTransfer {
             src_loc: clipboard.loc.clone(),
-            src: clipboard.path.clone(),
-            src_is_dir: clipboard.is_dir,
+            src: item.path.clone(),
+            src_is_dir: item.is_dir,
             dst_loc: current,
             dst_dir: target_dir.to_path_buf(),
             cut,
@@ -3332,7 +3529,7 @@ impl TerminalApp {
             self.submit_fs_name_dialog(dialog);
         }
 
-        let mut confirmed_delete: Option<std::path::PathBuf> = None;
+        let mut confirmed_delete: Option<Vec<std::path::PathBuf>> = None;
         if let Some(dialog) = &self.sidebar_delete_dialog {
             let mut open = true;
             let mut cancel = false;
@@ -3341,17 +3538,33 @@ impl TerminalApp {
                 .resizable(false)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("确定删除以下路径吗？");
-                    ui.label(egui::RichText::new(dialog.path.display().to_string()).monospace());
-                    if dialog.is_dir {
+                    if dialog.paths.len() == 1 {
+                        ui.label("确定删除以下路径吗？");
+                    } else {
+                        ui.label(format!("确定删除以下 {} 项吗？", dialog.paths.len()));
+                    }
+                    for path in dialog.paths.iter().take(5) {
+                        ui.label(egui::RichText::new(path.display().to_string()).monospace());
+                    }
+                    if dialog.paths.len() > 5 {
+                        ui.label(format!("… 等 {} 项", dialog.paths.len()));
+                    }
+                    if dialog.dir_count > 0 {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            "这是一个目录，其中的全部内容都会被递归删除。",
+                            if dialog.paths.len() == 1 {
+                                "这是一个目录，其中的全部内容都会被递归删除。".to_string()
+                            } else {
+                                format!(
+                                    "其中包含 {} 个目录，它们的全部内容都会被递归删除。",
+                                    dialog.dir_count
+                                )
+                            },
                         );
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
-                            confirmed_delete = Some(dialog.path.clone());
+                            confirmed_delete = Some(dialog.paths.clone());
                         }
                         if ui.button("Cancel").clicked() {
                             cancel = true;
@@ -3362,13 +3575,25 @@ impl TerminalApp {
                 self.sidebar_delete_dialog = None;
             }
         }
-        if let Some(path) = confirmed_delete {
+        if let Some(paths) = confirmed_delete {
             self.sidebar_delete_dialog = None;
-            if let Some(error) = self
-                .sidebar
-                .request_fs_op(sidebar::FsOpKind::Delete(path), false)
-            {
-                self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
+            if paths.len() == 1 {
+                let path = paths.into_iter().next().expect("len == 1");
+                if let Some(error) = self
+                    .sidebar
+                    .request_fs_op(sidebar::FsOpKind::Delete(path), false)
+                {
+                    self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
+                }
+            } else {
+                // 多选删除：一个批量任务逐项删除、跳过失败、汇总上报。
+                let batch = sidebar::BatchIntent::Delete {
+                    loc: self.sidebar.location().clone(),
+                    items: paths,
+                };
+                if let Some(error) = self.sidebar.request_batch(batch, false) {
+                    self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
+                }
             }
         }
     }

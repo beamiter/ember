@@ -606,6 +606,15 @@ straight onto the tree: dropping onto a row targets that directory (a file row
 targets its parent, blank space the current root), a hover hint shows the
 destination, drops are capped at 256 items and 512 MiB total, and the import
 runs through the same copy/upload pipeline with progress and cancellation.
+Rows support multi-select (ctrl+click toggles, shift+click extends a range in
+visible order): Delete/Copy/Cut/复制路径 act on the whole selection (delete
+asks once with a count and up to five names), batch paste iterates items with
+per-item AlreadyExists refusal and a summary status (5 项中 2 项失败：…), and
+batch cut deletes only successfully-copied sources. A 🔍 toggle in the Files
+header opens a type-to-filter row that prunes the loaded tree client-side
+(case-insensitive name substring, matches plus auto-expanded ancestors,
+expansion state restored on clear, no new scans — identical for local and
+remote listings).
 
 ## Security notes
 

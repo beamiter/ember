@@ -81,15 +81,22 @@ pub struct Entry {
 
 /// 文件操作剪贴板（Copy / Cut → Paste）。同一 [`FsLocation`] 内粘贴走
 /// copy/rename 探针；跨位置粘贴走流式传输（下载/上传/本地中转）。
+/// 多选批量：items 逐项粘贴（跳过失败、汇总上报）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsClipboard {
     pub loc: FsLocation,
-    pub path: PathBuf,
-    pub is_dir: bool,
+    pub items: Vec<FsClipboardItem>,
     pub cut: bool,
 }
 
-impl FsClipboard {
+/// 剪贴板里的一个条目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsClipboardItem {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+impl FsClipboardItem {
     /// 粘贴目标路径：目标目录 + 源文件名。源是 `/` 这类没有文件名的路径时
     /// 返回 None（调用方应拒绝这次粘贴）。
     pub fn paste_destination(&self, target_dir: &Path) -> Option<PathBuf> {
@@ -1965,23 +1972,19 @@ docker = true
 
     #[test]
     fn paste_destination_joins_the_source_file_name() {
-        let clipboard = FsClipboard {
-            loc: FsLocation::Local,
+        let item = FsClipboardItem {
             path: PathBuf::from("/home/yj/notes.md"),
             is_dir: false,
-            cut: false,
         };
         assert_eq!(
-            clipboard.paste_destination(Path::new("/tmp/target")),
+            item.paste_destination(Path::new("/tmp/target")),
             Some(PathBuf::from("/tmp/target/notes.md"))
         );
-        let root_clipboard = FsClipboard {
-            loc: FsLocation::Local,
+        let root_item = FsClipboardItem {
             path: PathBuf::from("/"),
             is_dir: true,
-            cut: true,
         };
-        assert_eq!(root_clipboard.paste_destination(Path::new("/tmp")), None);
+        assert_eq!(root_item.paste_destination(Path::new("/tmp")), None);
     }
 
     #[test]

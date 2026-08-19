@@ -1,5 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -137,6 +138,38 @@ impl FileTreeNode {
                 .children
                 .iter()
                 .any(FileTreeNode::has_loading_descendant)
+    }
+
+    /// 树内过滤视图（纯函数，不动原树）：名称大小写不敏感命中（含子串）的
+    /// 节点 + 它们的全部祖先；祖先强制展开、命中目录的子树原样保留。
+    /// 什么都不命中返回 None（调用方显示"无匹配"）。只作用于已加载的
+    /// children，绝不触发新扫描。
+    pub fn filtered(&self, query_lower: &str) -> Option<FileTreeNode> {
+        let name_matches = self.name.to_lowercase().contains(query_lower);
+        if name_matches {
+            // 命中节点：整个子树原样保留（子树内不再过滤）。
+            let mut node = self.clone();
+            node.visible_children = node.children.len();
+            node.entries_truncated = false;
+            return Some(node);
+        }
+        let children: Vec<FileTreeNode> = self
+            .children
+            .iter()
+            .filter_map(|child| child.filtered(query_lower))
+            .collect();
+        if children.is_empty() {
+            return None;
+        }
+        let mut node = self.clone();
+        node.children = children;
+        node.visible_children = node.children.len();
+        node.entries_truncated = false;
+        if node.is_dir {
+            // 祖先强制展开（原树的展开状态不受影响，清空过滤即恢复）。
+            node.expanded = true;
+        }
+        Some(node)
     }
 }
 
@@ -306,6 +339,62 @@ impl FsTransfer {
     }
 }
 
+/// 批量操作（多选粘贴 / 批量删除）：一个 worker 任务逐项执行、跳过失败、
+/// 汇总上报。跨位置粘贴逐条复用 remote_fs::transfer（round-2/4 的机制）。
+#[derive(Clone, Debug)]
+pub enum BatchIntent {
+    /// 粘贴：`items`（路径 + 是否目录）从 src_loc 落位到 dst_loc 的 dst_dir。
+    /// 同位置逐项 copy/rename（cut）；跨位置逐项 transfer（cut = 成功后删源，
+    /// 只删复制成功的源）。
+    Paste {
+        src_loc: FsLocation,
+        dst_loc: FsLocation,
+        dst_dir: PathBuf,
+        items: Vec<(PathBuf, bool)>,
+        cut: bool,
+    },
+    /// 批量删除（同一位置内）。
+    Delete {
+        loc: FsLocation,
+        items: Vec<PathBuf>,
+    },
+}
+
+/// 批量操作的账目：成功数 + 逐项失败 + 非致命警告（cut 删源失败等）。
+#[derive(Clone, Debug, Default)]
+pub struct BatchOutcome {
+    pub succeeded: usize,
+    /// （条目完整路径， 错误）；显示时取文件名。
+    pub failed: Vec<(PathBuf, String)>,
+    pub warnings: Vec<String>,
+}
+
+impl BatchOutcome {
+    /// 状态栏汇总文案。
+    pub fn summary(&self, verb: &str, total: usize) -> String {
+        fn display(path: &Path) -> String {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        }
+        let mut message = if self.failed.is_empty() {
+            format!("已{verb} {total} 项")
+        } else {
+            let first = &self.failed[0];
+            format!(
+                "{total} 项中 {} 项失败：{}：{}",
+                self.failed.len(),
+                display(&first.0),
+                first.1
+            )
+        };
+        for warning in &self.warnings {
+            message.push_str(&format!("；{warning}"));
+        }
+        message
+    }
+}
+
 /// 操作 worker 的内部请求种类：除公开的文件操作外，还有切换位置时的
 /// 起始目录解析（远程 home 目录不能阻塞 UI 线程）和跨位置传输。
 #[derive(Clone, Debug)]
@@ -313,6 +402,7 @@ enum OpRequestKind {
     StartDir,
     Fs(FsOpKind),
     Transfer(FsTransfer),
+    Batch(BatchIntent),
 }
 
 #[derive(Clone, Debug)]
@@ -333,17 +423,21 @@ struct FsOpResult {
     generation: u64,
     kind: OpRequestKind,
     clear_clipboard_on_success: bool,
-    /// StartDir/Transfer 成功时携带路径；文件操作成功为 Ok(None)。
+    /// StartDir/Transfer 成功时携带路径；文件操作成功为 Ok(None)；
+    /// Batch 恒为 Ok(None)（成败细节在 batch_outcome）。
     outcome: Result<Option<PathBuf>, String>,
     /// 部分成功提示（跨位置 cut：复制成功但删源失败）。
     warning: Option<String>,
+    /// 批量操作的逐项账目。
+    batch_outcome: Option<BatchOutcome>,
     /// 取消语义（中性，非错误）。
     cancelled: bool,
     /// 传输令牌（把 Done/Progress 映射回面板上的在途条目）。
     cancel_token: Option<Arc<AtomicBool>>,
 }
 
-/// 操作 worker 发给 UI 的消息：进度（有损、通道满就丢）与完成（必达）。
+/// 操作 worker 发给 UI 的消息：进度（有损、通道满就丢）与完成（必达，
+/// Box 避免枚举被 FsOpResult 撑大）。
 #[derive(Debug)]
 enum OpEvent {
     Progress {
@@ -351,7 +445,7 @@ enum OpEvent {
         token: Arc<AtomicBool>,
         bytes: u64,
     },
-    Done(FsOpResult),
+    Done(Box<FsOpResult>),
 }
 
 /// 在途/排队中的传输条目：面板忙碌行的数据 + 取消令牌的载体。
@@ -415,15 +509,16 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
             .is_some_and(|token| token.load(Ordering::SeqCst))
         {
             if results
-                .send(OpEvent::Done(FsOpResult {
+                .send(OpEvent::Done(Box::new(FsOpResult {
                     generation: request.generation,
                     kind: request.kind,
                     clear_clipboard_on_success: false,
                     outcome: Ok(None),
                     warning: None,
+                    batch_outcome: None,
                     cancelled: true,
                     cancel_token: request.cancel_token,
-                }))
+                })))
                 .is_err()
             {
                 break;
@@ -436,7 +531,7 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
             .err()
             .is_some_and(remote_fs::is_cancelled_error);
         if results
-            .send(OpEvent::Done(FsOpResult {
+            .send(OpEvent::Done(Box::new(FsOpResult {
                 generation: request.generation,
                 kind: request.kind,
                 clear_clipboard_on_success: request.clear_clipboard_on_success,
@@ -448,9 +543,10 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
                     .as_ref()
                     .ok()
                     .and_then(|done| done.warning.clone()),
+                batch_outcome: execution.as_ref().ok().and_then(|done| done.batch.clone()),
                 cancelled,
                 cancel_token: request.cancel_token,
-            }))
+            })))
             .is_err()
         {
             break;
@@ -458,10 +554,11 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
     }
 }
 
-/// execute_op 的正面结果：可选路径 + 部分成功提示。
+/// execute_op 的正面结果：可选路径 + 部分成功提示 + 批量账目。
 struct OpDone {
     path: Option<PathBuf>,
     warning: Option<String>,
+    batch: Option<BatchOutcome>,
 }
 
 impl OpDone {
@@ -469,8 +566,77 @@ impl OpDone {
         Self {
             path,
             warning: None,
+            batch: None,
         }
     }
+}
+
+/// 批量操作：逐项执行、跳过失败（含 AlreadyExists）、汇总账目。
+/// 同位置 cut 粘贴 = rename（原子移动）；跨位置 cut = transfer 成功后删源，
+/// 只删复制成功的源。
+fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    match batch {
+        BatchIntent::Paste {
+            src_loc,
+            dst_loc,
+            dst_dir,
+            items,
+            cut,
+        } => {
+            for (src, is_dir) in items {
+                let Some(name) = src.file_name() else {
+                    outcome
+                        .failed
+                        .push((src.clone(), "源路径没有文件名".to_string()));
+                    continue;
+                };
+                let dst = dst_dir.join(name);
+                let name = name.to_string_lossy().into_owned();
+                let result = if src_loc == dst_loc {
+                    if *cut {
+                        remote_fs::rename(dst_loc, hosts, src, &dst)
+                    } else {
+                        remote_fs::copy(dst_loc, hosts, src, &dst)
+                    }
+                } else {
+                    remote_fs::transfer(
+                        src_loc,
+                        hosts,
+                        src,
+                        *is_dir,
+                        dst_loc,
+                        dst_dir,
+                        remote_fs::TransferControl::default(),
+                    )
+                    .map(|_| ())
+                };
+                match result {
+                    Ok(()) => {
+                        outcome.succeeded += 1;
+                        if *cut && src_loc != dst_loc {
+                            // 跨位置 cut：复制成功后删源；删源失败记警告、不回滚。
+                            if let Err(error) = remote_fs::delete(src_loc, hosts, src) {
+                                outcome
+                                    .warnings
+                                    .push(format!("{name}：源删除失败（已保留）：{error}"));
+                            }
+                        }
+                    }
+                    Err(error) => outcome.failed.push((src.clone(), error.to_string())),
+                }
+            }
+        }
+        BatchIntent::Delete { loc, items } => {
+            for path in items {
+                match remote_fs::delete(loc, hosts, path) {
+                    Ok(()) => outcome.succeeded += 1,
+                    Err(error) => outcome.failed.push((path.clone(), error.to_string())),
+                }
+            }
+        }
+    }
+    outcome
 }
 
 fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpDone> {
@@ -533,8 +699,14 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
             Ok(OpDone {
                 path: Some(dst),
                 warning,
+                batch: None,
             })
         }
+        OpRequestKind::Batch(batch) => Ok(OpDone {
+            path: None,
+            warning: None,
+            batch: Some(execute_batch(hosts, batch)),
+        }),
     }
 }
 
@@ -623,9 +795,16 @@ pub struct Sidebar {
     pub current_dir: PathBuf,
     pub root: Option<FileTreeNode>,
     pub selected_path: Option<PathBuf>,
+    /// 多选集合（有序，路径 → 是否目录）。空 = 无选中；`selected_path` 是
+    /// 主选中行（最后点击），兼作 shift 范围选择的锚点。
+    pub selection: BTreeMap<PathBuf, bool>,
+    /// 树内过滤：漏斗按钮展开输入行；非空时对已加载的树做客户端过滤
+    /// （不触发新扫描；本机与远程一致）。
+    pub filter_open: bool,
+    pub filter: String,
     /// 当前侧边栏视图。
     pub view: SidebarView,
-    /// 文件操作剪贴板（Copy/Cut → Paste），只允许同一位置内粘贴。
+    /// 文件操作剪贴板（Copy/Cut → Paste；同位置 copy/rename，跨位置传输）。
     pub clipboard: Option<remote_fs::FsClipboard>,
     scan_generation: u64,
     scan_service: Option<DirectoryScanService>,
@@ -680,6 +859,9 @@ impl Sidebar {
             current_dir,
             root,
             selected_path: None,
+            selection: BTreeMap::new(),
+            filter_open: false,
+            filter: String::new(),
             view: SidebarView::default(),
             clipboard: None,
             scan_generation: 0,
@@ -715,6 +897,7 @@ impl Sidebar {
         }
         self.current_dir = path;
         self.selected_path = None;
+        self.selection.clear();
         self.start_root_scan()
     }
 
@@ -754,6 +937,7 @@ impl Sidebar {
         }
         self.location = location;
         self.selected_path = None;
+        self.selection.clear();
         self.location_error = None;
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.root = None;
@@ -783,6 +967,20 @@ impl Sidebar {
         clear_clipboard_on_success: bool,
     ) -> Option<String> {
         self.enqueue_op(OpRequestKind::Fs(kind), clear_clipboard_on_success, None)
+    }
+
+    /// UI 入口：批量操作（多选粘贴/批量删除）。逐项执行、跳过失败、
+    /// 汇总上报；cut 粘贴部分失败时剪贴板收缩为失败项（便于重试）。
+    pub fn request_batch(
+        &mut self,
+        batch: BatchIntent,
+        clear_clipboard_on_success: bool,
+    ) -> Option<String> {
+        self.enqueue_op(
+            OpRequestKind::Batch(batch),
+            clear_clipboard_on_success,
+            None,
+        )
     }
 
     /// UI 入口：跨位置传输（下载/上传/中转）。cut 在复制成功后经 delete 删源，
@@ -990,6 +1188,51 @@ impl Sidebar {
                                 messages.push(format!("{}失败：{error}", transfer.direction()));
                             }
                         },
+                        OpRequestKind::Batch(batch) => {
+                            let Some(outcome) = result.batch_outcome else {
+                                continue;
+                            };
+                            let (verb, total) = match &batch {
+                                BatchIntent::Paste { items, .. } => ("粘贴", items.len()),
+                                BatchIntent::Delete { items, .. } => ("删除", items.len()),
+                            };
+                            // 批量粘贴刷新落点目录；批量删除刷新每个条目的父目录。
+                            let mut dirs: Vec<PathBuf> = Vec::new();
+                            match &batch {
+                                BatchIntent::Paste { dst_dir, .. } => dirs.push(dst_dir.clone()),
+                                BatchIntent::Delete { items, .. } => {
+                                    for path in items {
+                                        if let Some(parent) = path.parent() {
+                                            let parent = parent.to_path_buf();
+                                            if !dirs.contains(&parent) {
+                                                dirs.push(parent);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for dir in dirs {
+                                if let Some(error) = self.refresh_loaded_node(&dir) {
+                                    messages.push(format!("文件树刷新失败:{error}"));
+                                }
+                            }
+                            // cut 粘贴：全成功清剪贴板；部分失败收缩为失败项（便于重试）。
+                            if result.clear_clipboard_on_success {
+                                if outcome.failed.is_empty() {
+                                    self.clipboard = None;
+                                } else if let Some(clipboard) = &mut self.clipboard {
+                                    let failed: Vec<&Path> = outcome
+                                        .failed
+                                        .iter()
+                                        .map(|(path, _)| path.as_path())
+                                        .collect();
+                                    clipboard
+                                        .items
+                                        .retain(|item| failed.contains(&item.path.as_path()));
+                                }
+                            }
+                            messages.push(outcome.summary(verb, total));
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1021,6 +1264,78 @@ impl Sidebar {
             node.load_state = DirectoryLoadState::Loading;
         }
         self.enqueue_scan(path.to_path_buf(), false)
+    }
+
+    // ---- 多选 ----
+
+    /// 单选：选中集变为仅此行，该行成为范围选择的锚点。
+    pub fn select_single(&mut self, path: &Path, is_dir: bool) {
+        self.selected_path = Some(path.to_path_buf());
+        self.selection = BTreeMap::from([(path.to_path_buf(), is_dir)]);
+    }
+
+    /// ctrl+点击：切换该行的选中状态，锚点跟到该行。
+    pub fn select_toggle(&mut self, path: &Path, is_dir: bool) {
+        self.selected_path = Some(path.to_path_buf());
+        if self.selection.contains_key(path) {
+            self.selection.remove(path);
+        } else {
+            self.selection.insert(path.to_path_buf(), is_dir);
+        }
+    }
+
+    /// shift+点击：锚点（上次点击行）到目标行在可见行序中的闭区间。
+    /// 锚点不动，连续 shift+点击以首次点击为基准扩展；锚点不在可见行序里
+    /// （树变了）就退化为单选。
+    pub fn select_range(
+        &mut self,
+        row_order: &[(PathBuf, bool)],
+        target: &Path,
+        target_is_dir: bool,
+    ) {
+        let Some(anchor) = self
+            .selected_path
+            .clone()
+            .filter(|anchor| row_order.iter().any(|(path, _)| path == anchor))
+        else {
+            self.select_single(target, target_is_dir);
+            return;
+        };
+        let (Some(lo), Some(hi)) = (
+            row_order.iter().position(|(path, _)| *path == anchor),
+            row_order.iter().position(|(path, _)| path == target),
+        ) else {
+            self.select_single(target, target_is_dir);
+            return;
+        };
+        let (lo, hi) = (lo.min(hi), lo.max(hi));
+        // 锚点保持不动：选中集换成闭区间，selected_path 仍是锚点。
+        self.selection = row_order[lo..=hi].iter().cloned().collect();
+    }
+
+    /// 右键菜单的目标集：点在选中集内 → 整个选中集；否则选中集变为该行。
+    /// 返回（新选中集，菜单目标列表）。
+    pub fn resolve_menu_targets(
+        selection: &BTreeMap<PathBuf, bool>,
+        clicked: &Path,
+        clicked_is_dir: bool,
+    ) -> (BTreeMap<PathBuf, bool>, Vec<(PathBuf, bool)>) {
+        if selection.contains_key(clicked) {
+            (
+                selection.clone(),
+                selection
+                    .iter()
+                    .map(|(path, dir)| (path.clone(), *dir))
+                    .collect(),
+            )
+        } else {
+            let single = BTreeMap::from([(clicked.to_path_buf(), clicked_is_dir)]);
+            let targets = single
+                .iter()
+                .map(|(path, dir)| (path.clone(), *dir))
+                .collect();
+            (single, targets)
+        }
     }
 
     /// 切换节点展开状态，并只在第一次展开（或错误后重试）时请求扫描。
@@ -1668,8 +1983,10 @@ mod tests {
         // cut-paste 成功后剪贴板被清空。
         sidebar.clipboard = Some(remote_fs::FsClipboard {
             loc: FsLocation::Local,
-            path: renamed.clone(),
-            is_dir: false,
+            items: vec![remote_fs::FsClipboardItem {
+                path: renamed.clone(),
+                is_dir: false,
+            }],
             cut: true,
         });
         let moved = sub.with_file_name("moved.txt");
@@ -1700,8 +2017,10 @@ mod tests {
         // cut 的删源只在复制成功后发生 —— 剪贴板保留、源文件原样还在。
         sidebar.clipboard = Some(remote_fs::FsClipboard {
             loc: FsLocation::Local,
-            path: src.clone(),
-            is_dir: false,
+            items: vec![remote_fs::FsClipboardItem {
+                path: src.clone(),
+                is_dir: false,
+            }],
             cut: true,
         });
         let transfer = FsTransfer {
@@ -1948,5 +2267,267 @@ mod tests {
         // 只有 top.bin 的 100 字节 + target 目录本身（0）；bottom.bin
         // 在 70 层深处（超帽），big.bin 隔着符号链接（不跟随）。
         assert_eq!(plan.total_bytes, 100, "plan: {plan:?}");
+    }
+
+    // ---- 多选 ----
+
+    fn p(name: &str) -> PathBuf {
+        PathBuf::from(format!("/virtual/{name}"))
+    }
+
+    fn paths(selection: &BTreeMap<PathBuf, bool>) -> Vec<&Path> {
+        selection.keys().map(PathBuf::as_path).collect()
+    }
+
+    #[test]
+    fn select_single_toggle_and_range_semantics() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual"), scanner);
+
+        // 单选：选中集收缩为一个，锚点跟过去。
+        sidebar.select_single(&p("a"), false);
+        assert_eq!(paths(&sidebar.selection), [Path::new("/virtual/a")]);
+        assert_eq!(
+            sidebar.selected_path.as_deref(),
+            Some(Path::new("/virtual/a"))
+        );
+
+        // ctrl 切换：加选 b、再点 a 取消 a。
+        sidebar.select_toggle(&p("b"), true);
+        assert_eq!(sidebar.selection.len(), 2);
+        sidebar.select_toggle(&p("a"), false);
+        assert_eq!(paths(&sidebar.selection), [Path::new("/virtual/b")]);
+        // 锚点是最后点击的行。
+        assert_eq!(
+            sidebar.selected_path.as_deref(),
+            Some(Path::new("/virtual/a"))
+        );
+
+        // shift 范围：锚点 a（不在选中集里了，但仍是锚点）→ d 的闭区间。
+        let rows: Vec<(PathBuf, bool)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| (p(name), false))
+            .collect();
+        sidebar.select_single(&p("a"), false);
+        sidebar.select_range(&rows, &p("c"), false);
+        assert_eq!(
+            paths(&sidebar.selection),
+            [
+                Path::new("/virtual/a"),
+                Path::new("/virtual/b"),
+                Path::new("/virtual/c")
+            ]
+        );
+        // 锚点不动，连续 shift 扩展。
+        assert_eq!(
+            sidebar.selected_path.as_deref(),
+            Some(Path::new("/virtual/a"))
+        );
+        sidebar.select_range(&rows, &p("d"), true);
+        assert_eq!(sidebar.selection.len(), 4);
+
+        // 反向范围（从下往上点）同样工作。
+        sidebar.select_single(&p("d"), false);
+        sidebar.select_range(&rows, &p("b"), false);
+        assert_eq!(sidebar.selection.len(), 3);
+
+        // 锚点不在可见行序里（树变了）→ 退化为单选。
+        sidebar.set_current_dir(p("elsewhere"));
+        sidebar.select_range(&rows, &p("c"), false);
+        assert_eq!(paths(&sidebar.selection), [Path::new("/virtual/c")]);
+    }
+
+    #[test]
+    fn resolve_menu_targets_inside_vs_outside_the_selection() {
+        let mut selection = BTreeMap::from([(p("a"), false), (p("b"), true)]);
+        // 点在选中集内：目标是整个选中集，选中集不变。
+        let (new_selection, targets) = Sidebar::resolve_menu_targets(&selection, &p("a"), false);
+        assert_eq!(new_selection, selection);
+        assert_eq!(targets.len(), 2);
+
+        // 点在选中集外：选中集收缩为该行，目标只有它。
+        let (new_selection, targets) = Sidebar::resolve_menu_targets(&selection, &p("c"), true);
+        assert_eq!(new_selection, BTreeMap::from([(p("c"), true)]));
+        assert_eq!(targets, vec![(p("c"), true)]);
+        selection.clear();
+        let (_, targets) = Sidebar::resolve_menu_targets(&selection, &p("z"), false);
+        assert_eq!(targets, vec![(p("z"), false)]);
+    }
+
+    // ---- 树内过滤 ----
+
+    fn filter_fixture() -> FileTreeNode {
+        // root/
+        //   src/      -> main.rs, lib.rs
+        //   target/   -> app.bin
+        //   README.md
+        let mut root =
+            FileTreeNode::directory(PathBuf::from("/virtual"), "virtual".to_string(), true);
+        let mut src =
+            FileTreeNode::directory(PathBuf::from("/virtual/src"), "src".to_string(), false);
+        src.children = vec![
+            FileTreeNode::from_entry(FileEntry {
+                name: "main.rs".to_string(),
+                path: PathBuf::from("/virtual/src/main.rs"),
+                is_dir: false,
+            }),
+            FileTreeNode::from_entry(FileEntry {
+                name: "lib.rs".to_string(),
+                path: PathBuf::from("/virtual/src/lib.rs"),
+                is_dir: false,
+            }),
+        ];
+        src.visible_children = 2;
+        let mut target = FileTreeNode::directory(
+            PathBuf::from("/virtual/target"),
+            "target".to_string(),
+            false,
+        );
+        target.children = vec![FileTreeNode::from_entry(FileEntry {
+            name: "app.bin".to_string(),
+            path: PathBuf::from("/virtual/target/app.bin"),
+            is_dir: false,
+        })];
+        target.visible_children = 1;
+        root.children = vec![
+            src,
+            target,
+            FileTreeNode::from_entry(FileEntry {
+                name: "README.md".to_string(),
+                path: PathBuf::from("/virtual/README.md"),
+                is_dir: false,
+            }),
+        ];
+        root.visible_children = 3;
+        root.load_state = DirectoryLoadState::Loaded;
+        root
+    }
+
+    #[test]
+    fn filter_keeps_matches_and_ancestors_and_restores_on_clear() {
+        let root = filter_fixture();
+        // 空查询 = 恒等（调用方跳过过滤；直接调用也应全保留）。
+        let filtered = root.filtered("").expect("empty query keeps everything");
+        assert_eq!(filtered.children.len(), 3);
+
+        // "rs"：main.rs/lib.rs 命中，祖先 src 保留且强制展开；target/README 剪掉。
+        let filtered = root.filtered("rs").expect("matches exist");
+        assert_eq!(filtered.children.len(), 1);
+        let src = &filtered.children[0];
+        assert_eq!(src.name, "src");
+        assert!(src.expanded, "ancestor auto-expanded while filtering");
+        assert_eq!(src.children.len(), 2);
+
+        // 大小写不敏感："readme" 命中 README.md。
+        let filtered = root.filtered("readme").expect("case-insensitive");
+        assert_eq!(filtered.children.len(), 1);
+        assert_eq!(filtered.children[0].name, "README.md");
+
+        // 什么都不命中 → None；原树展开状态没有被改动（清空过滤即恢复）。
+        assert!(root.filtered("zzz-no-match").is_none());
+        assert!(!root.children[0].expanded, "原树的展开状态未被过滤改动");
+        assert!(!root.children[1].expanded);
+    }
+
+    // ---- 批量操作 ----
+
+    #[test]
+    fn batch_delete_continues_past_errors_and_summarizes() {
+        let dir = TestDir::new();
+        let a = dir.0.join("a.txt");
+        let b = dir.0.join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let missing = dir.0.join("missing.txt");
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        assert!(sidebar.refresh().is_none());
+        poll_until_loaded(&mut sidebar);
+
+        let batch = BatchIntent::Delete {
+            loc: FsLocation::Local,
+            items: vec![a.clone(), missing.clone(), b.clone()],
+        };
+        assert!(sidebar.request_batch(batch, false).is_none());
+        let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
+        // 三项中一项失败（missing）：失败不阻断其余项，汇总进状态栏。
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("3 项中 1 项失败")
+                    && message.contains("missing.txt")),
+            "messages: {messages:?}"
+        );
+        assert!(!a.exists() && !b.exists());
+        // 父目录被重新扫描：树里不再出现 a/b。
+        poll_until_loaded(&mut sidebar);
+        let names: Vec<&str> = sidebar
+            .root
+            .as_ref()
+            .unwrap()
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"a.txt") && !names.contains(&"b.txt"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn batch_paste_skips_collisions_and_shrinks_the_cut_clipboard() {
+        let dir = TestDir::new();
+        let src_dir = dir.0.join("src");
+        let dst_dir = dir.0.join("dst");
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::create_dir(&dst_dir).unwrap();
+        let a = src_dir.join("a.txt");
+        let b = src_dir.join("b.txt");
+        std::fs::write(&a, b"aa").unwrap();
+        std::fs::write(&b, b"bb").unwrap();
+        // b 的目标已存在 → AlreadyExists，粘贴继续、该项计入失败。
+        std::fs::write(dst_dir.join("b.txt"), b"old").unwrap();
+
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        sidebar.clipboard = Some(remote_fs::FsClipboard {
+            loc: FsLocation::Local,
+            items: vec![
+                remote_fs::FsClipboardItem {
+                    path: a.clone(),
+                    is_dir: false,
+                },
+                remote_fs::FsClipboardItem {
+                    path: b.clone(),
+                    is_dir: false,
+                },
+            ],
+            cut: true,
+        });
+        let batch = BatchIntent::Paste {
+            src_loc: FsLocation::Local,
+            dst_loc: FsLocation::Local,
+            dst_dir: dst_dir.clone(),
+            items: vec![(a.clone(), false), (b.clone(), false)],
+            cut: true,
+        };
+        assert!(sidebar.request_batch(batch, true).is_none());
+        let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("2 项中 1 项失败") && message.contains("b.txt")),
+            "messages: {messages:?}"
+        );
+        // cut = rename：a 移过去了；b 因目标已存在留在原地、目标内容未被覆盖。
+        assert!(!a.exists() && dst_dir.join("a.txt").exists());
+        assert_eq!(std::fs::read(dst_dir.join("b.txt")).unwrap(), b"old");
+        assert!(b.exists());
+        // 剪贴板收缩为失败项（便于换个目录重试）。
+        let clipboard = sidebar
+            .clipboard
+            .as_ref()
+            .expect("clipboard kept on partial");
+        assert_eq!(clipboard.items.len(), 1);
+        assert_eq!(clipboard.items[0].path, b);
     }
 }
