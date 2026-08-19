@@ -1209,6 +1209,153 @@ impl Default for Sidebar {
     }
 }
 
+// ---- 拖放导入（OS 文件管理器 → 文件树） ----
+
+/// 一次拖放最多接受的条目数。
+pub const MAX_DROP_ITEMS: usize = 256;
+/// 预统计目录大小的递归深度上限。
+const MAX_DROP_WALK_DEPTH: usize = 64;
+
+/// 拖放导入计划里的单个条目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DropPlanItem {
+    /// 本机位置：递归复制（round-1 本地复制器）。
+    Copy {
+        src: PathBuf,
+        dst: PathBuf,
+        is_dir: bool,
+    },
+    /// 远程位置：走传输机制上传（进度/取消/状态同粘贴）。
+    Upload {
+        src: PathBuf,
+        dst_dir: PathBuf,
+        is_dir: bool,
+    },
+}
+
+/// 拖放导入计划（纯函数产物，可测）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DropPlan {
+    /// 通过校验、可分派的条目。
+    pub items: Vec<DropPlanItem>,
+    /// 因目标已存在而被拒绝的源路径（仅 Local 位置能就地预检；
+    /// Remote 由 worker 的 17/AlreadyExists 逐条兜底）。
+    pub refused_existing: Vec<PathBuf>,
+    /// 全部条目的总字节数（有界预统计）。
+    pub total_bytes: u64,
+}
+
+/// 预统计一个拖放路径的大小：文件取 metadata 长度；目录递归求和，
+/// 深度超过 64 的部分与符号链接都计 0（symlink_metadata 不跟随链接，
+/// 链接本身由 tar/复制器按链接传输，体量可忽略）。预算耗尽提前收尾。
+/// 读不到的条目计 0（lenient：权限问题交给真正的传输去报错）。
+fn measure_dropped_path(path: &Path, depth: usize, budget: &mut u64) -> u64 {
+    if depth > MAX_DROP_WALK_DEPTH || *budget == 0 {
+        return 0;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        let mut sum = 0u64;
+        for entry in entries.flatten() {
+            if *budget == 0 {
+                break;
+            }
+            sum += measure_dropped_path(&entry.path(), depth + 1, budget);
+        }
+        sum
+    } else if metadata.file_type().is_symlink() {
+        0
+    } else {
+        let size = metadata.len().min(*budget);
+        *budget -= size;
+        size
+    }
+}
+
+/// 拖放导入计划：dropped（本机绝对路径）+ 落点目录 + 当前位置 → 每项
+/// Copy/Upload 计划。超过条目数/总字节帽整批拒绝（Err 文案直接进状态栏）。
+pub fn plan_drop(
+    dropped: &[PathBuf],
+    target_dir: &Path,
+    location: &FsLocation,
+) -> Result<DropPlan, String> {
+    plan_drop_with_limits(
+        dropped,
+        target_dir,
+        location,
+        MAX_DROP_ITEMS,
+        remote_fs::MAX_TRANSFER_BYTES,
+    )
+}
+
+fn plan_drop_with_limits(
+    dropped: &[PathBuf],
+    target_dir: &Path,
+    location: &FsLocation,
+    max_items: usize,
+    max_bytes: u64,
+) -> Result<DropPlan, String> {
+    // 只要本机绝对路径、且得有文件名（"/" 这类没法按名落位）。
+    let candidates: Vec<&PathBuf> = dropped
+        .iter()
+        .filter(|path| path.is_absolute() && path.file_name().is_some())
+        .collect();
+    if candidates.is_empty() {
+        return Err("拖放内容里没有可导入的本地路径".to_string());
+    }
+    if candidates.len() > max_items {
+        return Err(format!(
+            "拖放条目过多（{} > {max_items}），已整批拒绝",
+            candidates.len()
+        ));
+    }
+    // 预算是帽 +1：预算内按真实大小记账，这样一旦真实总量越帽，
+    // 累计值必然超过 max_bytes（预算钳制只用于提前停止遍历，不掩盖越帽）。
+    let mut budget = max_bytes.saturating_add(1);
+    let mut plan = DropPlan::default();
+    for src in candidates {
+        plan.total_bytes += measure_dropped_path(src, 0, &mut budget);
+        if plan.total_bytes > max_bytes {
+            return Err(format!(
+                "拖放内容总计超过 {}，已整批拒绝",
+                remote_fs::format_bytes(max_bytes)
+            ));
+        }
+        let name = src.file_name().expect("filtered above");
+        // 与预统计同一语义：符号链接不跟随（is_dir 对链接为假）。
+        let is_dir = std::fs::symlink_metadata(src)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        match location {
+            FsLocation::Local => {
+                let dst = target_dir.join(name);
+                if std::fs::symlink_metadata(&dst).is_ok() {
+                    plan.refused_existing.push(src.clone());
+                    continue;
+                }
+                plan.items.push(DropPlanItem::Copy {
+                    src: src.clone(),
+                    dst,
+                    is_dir,
+                });
+            }
+            FsLocation::Remote(_) => {
+                plan.items.push(DropPlanItem::Upload {
+                    src: src.clone(),
+                    dst_dir: target_dir.to_path_buf(),
+                    is_dir,
+                });
+            }
+        }
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,5 +1824,129 @@ mod tests {
         let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
         assert!(!sidebar.transfer_status().is_some());
         assert!(sidebar.set_location(FsLocation::Local).is_none());
+    }
+
+    // ---- 拖放导入计划 ----
+
+    #[test]
+    fn plan_drop_builds_copy_items_for_local_and_uploads_for_remote() {
+        let dir = TestDir::new();
+        let src = dir.0.join("inbox");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"aa").unwrap();
+        std::fs::write(dir.0.join("b.bin"), b"bbb").unwrap();
+        let target = dir.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let dropped = vec![src.clone(), dir.0.join("b.bin")];
+
+        let plan = plan_drop(&dropped, &target, &FsLocation::Local).unwrap();
+        assert_eq!(plan.total_bytes, 5);
+        assert!(plan.refused_existing.is_empty());
+        assert_eq!(
+            plan.items,
+            vec![
+                DropPlanItem::Copy {
+                    src: src.clone(),
+                    dst: target.join("inbox"),
+                    is_dir: true,
+                },
+                DropPlanItem::Copy {
+                    src: dir.0.join("b.bin"),
+                    dst: target.join("b.bin"),
+                    is_dir: false,
+                },
+            ]
+        );
+
+        let plan = plan_drop(&dropped, &target, &FsLocation::Remote(0)).unwrap();
+        assert_eq!(
+            plan.items,
+            vec![
+                DropPlanItem::Upload {
+                    src: src.clone(),
+                    dst_dir: target.clone(),
+                    is_dir: true,
+                },
+                DropPlanItem::Upload {
+                    src: dir.0.join("b.bin"),
+                    dst_dir: target.clone(),
+                    is_dir: false,
+                },
+            ]
+        );
+        // Remote 位置不做就地预检（worker 的 17/AlreadyExists 兜底）。
+        assert!(plan.refused_existing.is_empty());
+    }
+
+    #[test]
+    fn plan_drop_flags_existing_targets_and_skips_unusable_paths() {
+        let dir = TestDir::new();
+        let src = dir.0.join("a.txt");
+        std::fs::write(&src, b"aa").unwrap();
+        let target = dir.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("a.txt"), b"old").unwrap();
+
+        let dropped = vec![
+            src.clone(),
+            PathBuf::from("relative/file.txt"),
+            PathBuf::from("/"),
+        ];
+        let plan = plan_drop(&dropped, &target, &FsLocation::Local).unwrap();
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.refused_existing, vec![src]);
+
+        // 全部不可用 → 整批拒绝。
+        let dropped = vec![PathBuf::from("relative/file.txt")];
+        assert!(plan_drop(&dropped, &target, &FsLocation::Local).is_err());
+    }
+
+    #[test]
+    fn plan_drop_refuses_oversized_batches_wholesale() {
+        let dir = TestDir::new();
+        std::fs::write(dir.0.join("a.bin"), vec![1u8; 100]).unwrap();
+        std::fs::write(dir.0.join("b.bin"), vec![2u8; 100]).unwrap();
+        let dropped = vec![dir.0.join("a.bin"), dir.0.join("b.bin")];
+        let target = dir.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+
+        // 字节帽：150 字节的帽容不下 200 字节 → 整批拒绝。
+        let error =
+            plan_drop_with_limits(&dropped, &target, &FsLocation::Local, 256, 150).unwrap_err();
+        assert!(error.contains("整批拒绝"), "{error}");
+        // 条目帽：1 条容不下 2 条。
+        let error =
+            plan_drop_with_limits(&dropped, &target, &FsLocation::Local, 1, u64::MAX).unwrap_err();
+        assert!(error.contains("拖放条目过多"), "{error}");
+        // 正好贴帽可以通过。
+        let plan = plan_drop_with_limits(&dropped, &target, &FsLocation::Local, 2, 200).unwrap();
+        assert_eq!(plan.total_bytes, 200);
+        assert_eq!(plan.items.len(), 2);
+    }
+
+    #[test]
+    fn drop_size_walk_caps_depth_and_never_follows_symlinked_dirs() {
+        let dir = TestDir::new();
+        // 70 层深树：超过 64 层的部分不计入。
+        let mut deep = dir.0.clone();
+        for level in 0..70 {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("bottom.bin"), vec![9u8; 1000]).unwrap();
+        // 浅层文件正常计入。
+        std::fs::write(dir.0.join("top.bin"), vec![1u8; 100]).unwrap();
+        // 符号链接目录不跟随：链接目标在被遍历的树之外，大文件不计入。
+        let outside = TestDir::new();
+        std::fs::write(outside.0.join("big.bin"), vec![7u8; 5000]).unwrap();
+        std::os::unix::fs::symlink(&outside.0, dir.0.join("link")).unwrap();
+
+        let dropped = vec![dir.0.clone()];
+        let target = dir.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let plan = plan_drop(&dropped, &target, &FsLocation::Local).unwrap();
+        // 只有 top.bin 的 100 字节 + target 目录本身（0）；bottom.bin
+        // 在 70 层深处（超帽），big.bin 隔着符号链接（不跟随）。
+        assert_eq!(plan.total_bytes, 100, "plan: {plan:?}");
     }
 }

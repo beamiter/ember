@@ -2185,6 +2185,8 @@ impl TerminalApp {
             },
             sidebar_name_dialog: None,
             sidebar_delete_dialog: None,
+            sidebar_drop_rect: None,
+            last_pointer_pos: None,
             command_sidebar: Default::default(),
             task_sidebar: Default::default(),
             block_selection: None,
@@ -2402,6 +2404,7 @@ impl TerminalApp {
         if !self.sidebar.visible {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
             // 不再使用浮动按钮，避免覆盖终端内容。
+            self.sidebar_drop_rect = None;
             return;
         }
 
@@ -2414,6 +2417,29 @@ impl TerminalApp {
         }
         // 远程主机配置可能刚在设置里改过：有变化才替换快照，成本可忽略。
         self.sidebar.set_remote_hosts(&self.config.remote_hosts);
+
+        // 拖拽导入的帧级输入：落下的文件（raw_input_hook 已按面板区域放行）、
+        // OS 拖悬停状态与指针位置。只在 Files 视图消费。
+        let (dropped_paths, hover_files_active, pointer_pos) =
+            if self.sidebar.view == sidebar::SidebarView::Files {
+                root_ui.ctx().input(|input| {
+                    (
+                        input
+                            .raw
+                            .dropped_files
+                            .iter()
+                            .filter_map(|file| file.path.clone())
+                            .collect::<Vec<std::path::PathBuf>>(),
+                        !input.raw.hovered_files.is_empty(),
+                        input
+                            .pointer
+                            .interact_pos()
+                            .or_else(|| input.pointer.latest_pos()),
+                    )
+                })
+            } else {
+                (Vec::new(), false, None)
+            };
 
         // Follow the shell's authoritative OSC 7 cwd (or the local process
         // cwd fallback) instead of guessing that a queued `cd` succeeded.
@@ -2450,6 +2476,8 @@ impl TerminalApp {
         let mut location_changed: Option<remote_fs::FsLocation> = None;
         let mut fs_menu_action: Option<FsMenuAction> = None;
         let mut cancel_transfer = false;
+        // 本帧渲染出的文件树行矩形（拖放落点命中测试用，帧级、不持久）。
+        let mut tree_row_rects: Vec<(egui::Rect, std::path::PathBuf, bool)> = Vec::new();
         // 粘贴状态：同位置直接粘贴；跨位置走流式传输（下载/上传/中转）。
         let paste_state = match &self.sidebar.clipboard {
             None => FsPasteState::Empty,
@@ -2471,7 +2499,7 @@ impl TerminalApp {
         };
 
         let panel_bg = theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
-        egui::Panel::left("file_tree")
+        let panel_response = egui::Panel::left("file_tree")
             .resizable(true)
             .default_size(self.sidebar.width)
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
@@ -2613,17 +2641,19 @@ impl TerminalApp {
                                 .and_then(|n| n.to_str())
                             {
                                 // 根目录行也挂上下文菜单：在根里新建/粘贴/刷新。
+                                // 行矩形计入拖放命中表（落点 = 当前根目录）。
                                 let root_dir = self.sidebar.current_dir.clone();
-                                ui.label(egui::RichText::new(dir).weak().small())
-                                    .context_menu(|ui| {
-                                        Self::fs_context_menu(
-                                            ui,
-                                            None,
-                                            &root_dir,
-                                            &mut fs_menu_action,
-                                            paste_state,
-                                        );
-                                    });
+                                let label_resp = ui.label(egui::RichText::new(dir).weak().small());
+                                tree_row_rects.push((label_resp.rect, root_dir.clone(), true));
+                                label_resp.context_menu(|ui| {
+                                    Self::fs_context_menu(
+                                        ui,
+                                        None,
+                                        &root_dir,
+                                        &mut fs_menu_action,
+                                        paste_state,
+                                    );
+                                });
                             }
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2650,6 +2680,7 @@ impl TerminalApp {
                                         &mut show_more_path,
                                         &mut fs_menu_action,
                                         paste_state,
+                                        &mut tree_row_rects,
                                     );
                                 }
                                 let remaining = root.remaining_children();
@@ -2766,6 +2797,65 @@ impl TerminalApp {
                 }
             }
         }
+
+        // 拖拽导入：面板矩形 + 行命中测试 + 悬停提示 + 落下分派。
+        let panel_rect = panel_response.response.rect;
+        self.sidebar_drop_rect = (self.sidebar.view == sidebar::SidebarView::Files
+            && !self.sidebar.current_dir.as_os_str().is_empty())
+        .then_some(panel_rect);
+        let drop_root = (!self.sidebar.current_dir.as_os_str().is_empty())
+            .then_some(self.sidebar.current_dir.as_path());
+        if hover_files_active && self.sidebar_drop_rect.is_some() {
+            if let Some(pointer) = pointer_pos {
+                if let Some(target) =
+                    Self::resolve_drop_target(pointer, panel_rect, &tree_row_rects, drop_root)
+                {
+                    // 高亮命中的行 + 指针旁的悬停提示。
+                    if let Some((rect, _, _)) = tree_row_rects
+                        .iter()
+                        .find(|(rect, _, _)| rect.contains(pointer))
+                    {
+                        root_ui.painter().rect_stroke(
+                            *rect,
+                            2.0,
+                            egui::Stroke::new(1.5, root_ui.visuals().selection.stroke.color),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let hint = match self.sidebar.location() {
+                        remote_fs::FsLocation::Local => {
+                            format!("松开以导入到 {}", target.display())
+                        }
+                        location @ remote_fs::FsLocation::Remote(_) => format!(
+                            "松开以上传到 {} 的 {}",
+                            location.label(&self.config.remote_hosts),
+                            target.display()
+                        ),
+                    };
+                    egui::Area::new(egui::Id::new("sidebar-drop-hint"))
+                        .order(egui::Order::Foreground)
+                        .interactable(false)
+                        .fixed_pos(pointer + egui::vec2(12.0, 12.0))
+                        .show(root_ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.label(hint);
+                            });
+                        });
+                }
+            }
+        }
+        if !dropped_paths.is_empty() && self.sidebar_drop_rect.is_some() {
+            if let Some(pointer) = pointer_pos {
+                if let Some(target_dir) =
+                    Self::resolve_drop_target(pointer, panel_rect, &tree_row_rects, drop_root)
+                {
+                    match sidebar::plan_drop(&dropped_paths, &target_dir, self.sidebar.location()) {
+                        Ok(plan) => self.execute_drop_plan(plan),
+                        Err(reason) => self.set_status_for(reason, Duration::from_secs(5)),
+                    }
+                }
+            }
+        }
         if self.sidebar.has_pending_scan() || self.sidebar.has_pending_op() {
             root_ui
                 .ctx()
@@ -2773,7 +2863,80 @@ impl TerminalApp {
         }
     }
 
-    /// 递归绘制文件树节点（关联函数，不持 &self 以避免借用冲突）
+    /// 拖放落点解析：指针在某行 → 目录行是它自己、文件行是它的父目录；
+    /// 在面板空白处 → 当前根目录；面板外 → None（保持终端的拖放行为）。
+    fn resolve_drop_target(
+        pointer: egui::Pos2,
+        panel_rect: egui::Rect,
+        rows: &[(egui::Rect, std::path::PathBuf, bool)],
+        root: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        if !panel_rect.contains(pointer) {
+            return None;
+        }
+        // 行矩形互不重叠，直接取命中的那一行。
+        for (rect, path, is_dir) in rows {
+            if rect.contains(pointer) {
+                return Some(if *is_dir {
+                    path.clone()
+                } else {
+                    path.parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| path.clone())
+                });
+            }
+        }
+        root.map(std::path::Path::to_path_buf)
+    }
+
+    /// 执行拖放导入计划：Local → 递归复制 op；Remote → 传输上传
+    /// （进度/取消/状态与粘贴一致，每项的完成都会刷新落点父目录）。
+    fn execute_drop_plan(&mut self, plan: sidebar::DropPlan) {
+        let mut dispatch_errors = 0usize;
+        let item_count = plan.items.len();
+        for item in plan.items {
+            let error = match item {
+                sidebar::DropPlanItem::Copy { src, dst, .. } => self
+                    .sidebar
+                    .request_fs_op(sidebar::FsOpKind::Copy { src, dst }, false),
+                sidebar::DropPlanItem::Upload {
+                    src,
+                    dst_dir,
+                    is_dir,
+                } => self.sidebar.request_transfer(
+                    sidebar::FsTransfer {
+                        src_loc: remote_fs::FsLocation::Local,
+                        src,
+                        src_is_dir: is_dir,
+                        dst_loc: self.sidebar.location().clone(),
+                        dst_dir,
+                        cut: false,
+                    },
+                    false,
+                ),
+            };
+            if error.is_some() {
+                dispatch_errors += 1;
+            }
+        }
+        let mut parts = vec![format!(
+            "开始导入 {item_count} 项（{}）",
+            remote_fs::format_bytes(plan.total_bytes)
+        )];
+        if !plan.refused_existing.is_empty() {
+            parts.push(format!(
+                "{} 项因目标已存在被跳过",
+                plan.refused_existing.len()
+            ));
+        }
+        if dispatch_errors > 0 {
+            parts.push(format!("{dispatch_errors} 项分派失败"));
+        }
+        self.set_status_for(parts.join("；"), Duration::from_secs(5));
+    }
+
+    /// 递归绘制文件树节点（关联函数，不持 &self 以避免借用冲突）。
+    /// rows 收集本帧每行的矩形（拖放落点命中测试用）。
     #[allow(clippy::too_many_arguments)]
     fn draw_tree_node(
         ui: &mut egui::Ui,
@@ -2785,12 +2948,14 @@ impl TerminalApp {
         show_more: &mut Option<std::path::PathBuf>,
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
+        rows: &mut Vec<(egui::Rect, std::path::PathBuf, bool)>,
     ) {
         let is_selected = selected.as_deref() == Some(node.path.as_path());
         if node.is_dir {
             let arrow = if node.expanded { "▼" } else { "▶" };
             let label = format!("{} {}/", arrow, node.name);
             let resp = ui.selectable_label(is_selected, label);
+            rows.push((resp.rect, node.path.clone(), true));
             if resp.clicked() {
                 *toggle = Some(node.path.clone());
                 *select = Some(node.path.clone());
@@ -2814,7 +2979,7 @@ impl TerminalApp {
                     }
                     for child in node.visible_children() {
                         Self::draw_tree_node(
-                            ui, child, selected, toggle, select, cd, show_more, menu, paste,
+                            ui, child, selected, toggle, select, cd, show_more, menu, paste, rows,
                         );
                     }
                     let remaining = node.remaining_children();
@@ -2835,6 +3000,7 @@ impl TerminalApp {
             }
         } else {
             let resp = ui.selectable_label(is_selected, format!("  {}", node.name));
+            rows.push((resp.rect, node.path.clone(), false));
             if resp.clicked() {
                 *select = Some(node.path.clone());
             }
@@ -3299,13 +3465,32 @@ impl eframe::App for TerminalApp {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // 记录最近一次指针位置：落下的拖放帧不一定带 PointerMoved。
+        for event in &raw_input.events {
+            match event {
+                egui::Event::PointerMoved(pos) => self.last_pointer_pos = Some(*pos),
+                egui::Event::PointerGone => self.last_pointer_pos = None,
+                _ => {}
+            }
+        }
         // Modal/search/settings text fields need egui's semantic clipboard
         // events. They must bypass the terminal-specific Ctrl+C/X/V rewrite.
         let ui_owns_clipboard = self.terminal_input_blocked(ctx);
-        let dropped_paths = std::mem::take(&mut raw_input.dropped_files)
-            .into_iter()
-            .filter_map(|file| file.path)
-            .collect::<Vec<_>>();
+        // 落在文件树面板上的拖放留给侧边栏（raw.dropped_files 原样保留给
+        // egui 与本帧的 render_sidebar）；其余维持今天的行为：图片按 payload
+        // 粘进终端。
+        let drop_targets_sidebar = self
+            .sidebar_drop_rect
+            .zip(self.last_pointer_pos)
+            .is_some_and(|(rect, pos)| rect.contains(pos));
+        let dropped_paths = if drop_targets_sidebar {
+            Vec::new()
+        } else {
+            std::mem::take(&mut raw_input.dropped_files)
+                .into_iter()
+                .filter_map(|file| file.path)
+                .collect::<Vec<_>>()
+        };
         if !dropped_paths.is_empty() {
             if ui_owns_clipboard {
                 self.set_status("图片拖放已忽略：当前面板正在接收输入");
@@ -5499,6 +5684,43 @@ mod tests {
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+
+    #[test]
+    fn drop_target_resolves_rows_blank_space_and_outside() {
+        use egui::{pos2, vec2, Rect};
+        use std::path::{Path, PathBuf};
+        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 400.0));
+        let dir_rect = Rect::from_min_size(pos2(0.0, 20.0), vec2(200.0, 18.0));
+        let file_rect = Rect::from_min_size(pos2(0.0, 38.0), vec2(200.0, 18.0));
+        let rows = vec![
+            (dir_rect, PathBuf::from("/base/docs"), true),
+            (file_rect, PathBuf::from("/base/notes.md"), false),
+        ];
+        let root = Path::new("/base");
+
+        // 目录行 → 目录本身；文件行 → 父目录；空白处 → 根；面板外 → None。
+        assert_eq!(
+            crate::TerminalApp::resolve_drop_target(pos2(50.0, 25.0), panel, &rows, Some(root)),
+            Some(PathBuf::from("/base/docs"))
+        );
+        assert_eq!(
+            crate::TerminalApp::resolve_drop_target(pos2(50.0, 45.0), panel, &rows, Some(root)),
+            Some(PathBuf::from("/base"))
+        );
+        assert_eq!(
+            crate::TerminalApp::resolve_drop_target(pos2(50.0, 300.0), panel, &rows, Some(root)),
+            Some(PathBuf::from("/base"))
+        );
+        assert_eq!(
+            crate::TerminalApp::resolve_drop_target(pos2(500.0, 25.0), panel, &rows, Some(root)),
+            None
+        );
+        // 没有根（远程起始目录未就绪）时，空白处不落点。
+        assert_eq!(
+            crate::TerminalApp::resolve_drop_target(pos2(50.0, 300.0), panel, &rows, None),
+            None
+        );
+    }
 
     #[test]
     fn copy_path_payload_is_the_plain_full_path() {

@@ -111,17 +111,23 @@ pub struct Capture {
     pub cancelled: bool,
 }
 
-/// 远端探针脚本协议 v2。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
+/// 远端探针脚本协议 v3。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
 /// put/untar 例外，走 `sh -c` 内联脚本（stdin 整个留给上传载荷）：
 /// - `list` 的 stdout 是 NUL 分隔的 "<t>\0<name>\0" 对，t ∈ {d, f, l}，相对名。
 /// - v2 新增：`cat` 流式读文件、`put` 流式写新文件（临时名 + mv 原子就位）、
-///   `tar`/`untar` 目录打包流与解包。
+///   `tar` 目录打包流。
+/// - v3：`untar` 改为 `untar <dir> <name>` —— 解包前先查 `<dir>/<name>` 是否
+///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
+///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
+///   打印 "<t> <size>"（f 为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
 /// - 退出码：0 正常，2 用法/路径非法，3 无法进入目录，4 操作失败，17 目标已存在。
-pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v2 — runs under `sh -s -- <op> [args...]`.
+pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 # v2 adds: cat (stream file to stdout), put (stream stdin to a new file),
 # tar (stream dir as tar to stdout), untar (extract stdin tar into a dir).
+# v3: untar takes <dir> <name> and refuses an existing <dir>/<name> (17) before
+# extracting; new stat op prints "<t> <size>" (t in {d,f,l}; bytes for f, else 0).
 set -u
 op=${1:-}
 case "$op" in
@@ -198,10 +204,25 @@ case "$op" in
     ;;
   untar)
     d=${2:-}
+    n=${3:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
+    case "$n" in ""|*/*) exit 2 ;; esac
     [ -d "$d" ] || exit 3
+    [ -e "$d/$n" ] && exit 17
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
     tar xf - -C "$d" || exit 4
+    ;;
+  stat)
+    p=${2:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    if [ -d "$p" ]; then t=d
+    elif [ -L "$p" ]; then t=l
+    elif [ -e "$p" ]; then t=f
+    else exit 3
+    fi
+    s=0
+    if [ "$t" = f ]; then s=$(wc -c < "$p") || exit 4; fi
+    printf '%s %s\n' "$t" "$s"
     ;;
   *) exit 2 ;;
 esac
@@ -1193,21 +1214,57 @@ fn require_local_tar() -> io::Result<()> {
     }
 }
 
-/// 目录/中转传输前的远端存在性预检。`put` 对文件做了原子 17 检查，但
-/// `untar` 没有（tar 解包会合并同名目录），协议内能用的只有 list/cat：
-/// list 成功 → 是目录；cat 成功 → 是可读文件；都为 3 → 不存在。
-fn remote_ensure_absent(host: &RemoteHostConfig, path: &Path) -> io::Result<()> {
+/// 远端 stat 探针的解析结果：类型（d/f/l）与大小（f 为字节数，其余 0）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteStat {
+    /// 探针的类型字符：b'd' / b'f' / b'l'（与 list 同一套约定）。
+    pub kind: u8,
+    pub size: u64,
+}
+
+/// 解析 `stat` 的一行输出："<t> <size>\n"。
+fn parse_stat(bytes: &[u8]) -> Option<RemoteStat> {
+    let line = bytes.split(|byte| *byte == b'\n').next()?;
+    let space = line.iter().position(|byte| *byte == b' ')?;
+    let kind = match &line[..space] {
+        [kind @ (b'd' | b'f' | b'l')] => *kind,
+        _ => return None,
+    };
+    let size = std::str::from_utf8(&line[space + 1..])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(RemoteStat { kind, size })
+}
+
+/// 远端 stat：Ok(Some) 存在，Ok(None) 不存在（探针 3），Err 为传输/用法错误。
+fn remote_stat(host: &RemoteHostConfig, path: &Path) -> io::Result<Option<RemoteStat>> {
     require_absolute(path)?;
-    let arg = path_str(path)?;
-    let as_dir = run_probe(host, "list", &[arg], PROBE_LIST_TIMEOUT, MAX_SMALL_OUTPUT)?;
-    if as_dir.status == Some(0) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("target already exists: {}", path.display()),
-        ));
+    let capture = run_probe(
+        host,
+        "stat",
+        &[path_str(path)?],
+        PROBE_LIST_TIMEOUT,
+        MAX_SMALL_OUTPUT,
+    )?;
+    match capture.status {
+        Some(0) => {
+            Ok(Some(parse_stat(&capture.stdout).ok_or_else(|| {
+                io::Error::other("unparsable stat probe output")
+            })?))
+        }
+        Some(3) => Ok(None),
+        // 其余退出码/超时/取消走统一的错误映射。
+        _ => probe_output(capture).map(|_| None),
     }
-    let as_file = run_probe(host, "cat", &[arg], PROBE_LIST_TIMEOUT, MAX_SMALL_OUTPUT)?;
-    if as_file.status == Some(0) {
+}
+
+/// 目录/中转传输前的远端存在性预检：v3 起用 stat 一次探针完成（取代 v2 的
+/// list+cat 双探针）。untar 自身的 17 检查才是 fail-closed 的权威防线；
+/// 这里的预检只为不浪费本地打包/下载的字节。
+fn remote_ensure_absent(host: &RemoteHostConfig, path: &Path) -> io::Result<()> {
+    if remote_stat(host, path)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("target already exists: {}", path.display()),
@@ -1459,9 +1516,11 @@ fn upload_dir(
     )
     .and_then(local_status);
     let outcome = packed.and_then(|()| {
-        // 解包腿的字节数接着打包腿累计。
+        // 解包腿的字节数接着打包腿累计。untar v3 在解包前原子拒绝
+        // 已存在的 <dir>/<name>（检查与解包之间仍有微秒级 TOCTOU 窗口，
+        // 这是 tar 合并语义的协议极限，Friendly 错误由 17 映射给出）。
         let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
-        let untar_argv = sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?]);
+        let untar_argv = sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?, name]);
         run_stream_from_file(
             &untar_argv,
             &temp,
@@ -1508,7 +1567,14 @@ fn relay(
         // 上传腿的字节数接着下载腿累计。
         let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
         let upload_argv = if src_is_dir {
-            sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?])
+            // tar 流的顶层名就是 src 的 basename（tar 探针 -C 父目录打包）。
+            let name = src
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "source has no UTF-8 file name")
+                })?;
+            sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?, name])
         } else {
             sh_c_probe_argv(dst_host, "put", &[path_str(dst)?])
         };
@@ -2231,7 +2297,7 @@ docker = true
         .unwrap();
         assert_eq!(capture.status, Some(3));
 
-        // untar 解进已存在的目录。
+        // untar 解进已存在的目录（v3：参数为 <dir> <name>，name 是 tar 流顶层名）。
         let out = dir.join("out");
         std::fs::create_dir(&out).unwrap();
         let out_arg = out.to_str().unwrap().to_string();
@@ -2244,7 +2310,7 @@ docker = true
         .unwrap()
         .stdout;
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&out_arg]),
+            &sh_c_argv_locally("untar", &[&out_arg, "tree"]),
             &tar_bytes,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -2257,16 +2323,93 @@ docker = true
         );
         assert_eq!(std::fs::read(out.join("tree/note.txt")).unwrap(), b"hello");
 
-        // 目标目录缺失 → 3。
+        // v3：目标已存在 → 解包前直接 17，不合并不覆盖。
+        let capture = run_capture(
+            &sh_c_argv_locally("untar", &[&out_arg, "tree"]),
+            &tar_bytes,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(17));
+
+        // 目标目录缺失 → 3；name 带 / 或为空 → 2。
         let missing = dir.join("missing").to_str().unwrap().to_string();
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&missing]),
+            &sh_c_argv_locally("untar", &[&missing, "tree"]),
             &tar_bytes,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
         )
         .unwrap();
         assert_eq!(capture.status, Some(3));
+        let capture = run_capture(
+            &sh_c_argv_locally("untar", &[&out_arg, "a/b"]),
+            &tar_bytes,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(2));
+        let capture = run_capture(
+            &sh_c_argv_locally("untar", &[&out_arg]),
+            &tar_bytes,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(2));
+    }
+
+    #[test]
+    fn probe_v3_stat_reports_type_size_and_missing() {
+        let dir = TestDir::new();
+        let file = dir.join("blob.bin");
+        std::fs::write(&file, binary_sample()).unwrap();
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let stat = |path: &Path| {
+            run_capture(
+                &sh_s_argv_locally("stat", &[path.to_str().unwrap()]),
+                PROBE_SCRIPT.as_bytes(),
+                Duration::from_secs(5),
+                MAX_SMALL_OUTPUT,
+            )
+            .unwrap()
+        };
+        let capture = stat(&file);
+        assert_eq!(capture.status, Some(0));
+        assert_eq!(
+            parse_stat(&capture.stdout),
+            Some(RemoteStat {
+                kind: b'f',
+                size: binary_sample().len() as u64,
+            })
+        );
+        assert_eq!(
+            parse_stat(&stat(&sub).stdout),
+            Some(RemoteStat {
+                kind: b'd',
+                size: 0
+            })
+        );
+        assert_eq!(
+            parse_stat(&stat(&link).stdout),
+            Some(RemoteStat {
+                kind: b'l',
+                size: 0
+            })
+        );
+        assert_eq!(stat(&dir.join("missing")).status, Some(3));
+
+        // 解析对垃圾输入防御性失败。
+        assert_eq!(parse_stat(b""), None);
+        assert_eq!(parse_stat(b"x 1"), None);
+        assert_eq!(parse_stat(b"f"), None);
+        assert_eq!(parse_stat(b"f abc"), None);
     }
 
     // ---- 流式 runner 与传输组合（本机 sh 当"远端"） ----

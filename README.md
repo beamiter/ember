@@ -599,7 +599,13 @@ uploads) with a ✕ button that cancels it — the in-flight child is killed,
 local partial files are cleaned up, and the outcome is reported as a neutral
 已取消 rather than an error. The context menu also offers 复制路径, copying
 the row's full path (plain, unprefixed for remote rows) to the system
-clipboard.
+clipboard. The v3 probe refuses directory collisions atomically (`untar
+<dir> <name>` exits 17 before extracting) and answers `stat` for cheap remote
+existence checks. You can also drag files and folders from the OS file manager
+straight onto the tree: dropping onto a row targets that directory (a file row
+targets its parent, blank space the current root), a hover hint shows the
+destination, drops are capped at 256 items and 512 MiB total, and the import
+runs through the same copy/upload pipeline with progress and cancellation.
 
 ## Security notes
 

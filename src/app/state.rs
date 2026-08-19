@@ -218,6 +218,11 @@ pub struct TerminalApp {
     pub sidebar_name_dialog: Option<crate::FsNameDialog>,
     /// 文件树删除确认对话框。
     pub sidebar_delete_dialog: Option<crate::FsDeleteDialog>,
+    /// 上一帧 Files 视图的面板矩形（raw_input_hook 据此把落在侧边栏的
+    /// OS 拖放留给 egui，而不是按图片拖进终端）。非 Files 视图/隐藏时为 None。
+    pub sidebar_drop_rect: Option<egui::Rect>,
+    /// 最近一次指针位置（拖放帧不一定带 PointerMoved，按帧缓存）。
+    pub last_pointer_pos: Option<egui::Pos2>,
 
     // Semantic command timeline sidebar
     pub command_sidebar: CommandSidebarState,
