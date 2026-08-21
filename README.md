@@ -293,6 +293,27 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
+`Ctrl+Shift+G` opens Block Search 2.0. `Aa` selects case-sensitive matching and
+`.*` selects Rust-regex matching; invalid expressions stay visible as query
+errors and cannot activate an older result. `All / Failed / Slow / Bookmarked /
+Background` chips also browse their category with an empty query. Source
+extraction is newest-first with an 8 MiB retained ceiling; the finished
+original/lowercase index has a 16 MiB retained ceiling, counting its Vec
+allocation, record ids, and every String capacity. Omitted history is reported
+as `older blocks not indexed`. Rebuild releases the old cache before extraction,
+so it never holds old+source+new indexes together. The lazy iterator must still
+materialize the first rejected source (up to the 256 KiB per-record output cap),
+and cache admission temporarily constructs one lowercase candidate before
+rejecting it; these short-lived candidates are outside the retained ceilings.
+Ember currently rebuilds this bounded index synchronously on the UI thread only
+when the completed-record version changes; ordinary query/filter edits rescan
+the existing cache. A 4 KiB query boundary (including whitespace) and a 2 MiB
+regex compiler limit bound pasted expressions. Search hits retain Unicode-scalar
+spans, reveal the physical soft-wrap row containing the match when possible
+(expanding only the proven owning collapse), and are
+revalidated against the pane plus oldest/newest record sequence before Enter,
+so deque rotation cannot retarget an old hit.
+
 Select a failed row in the **Commands** sidebar (or use its context menu) to
 start a fresh Agent task with **Fix**, **Explain**, or **Create task**. The task
 never resumes an unrelated saved transcript, remains bound to the source
@@ -468,6 +489,7 @@ Defaults include:
 | Reinput selected block commands (without running) | `Ctrl+Shift+I` |
 | Toggle bookmark on the active completed block | `Ctrl+Shift+B` |
 | Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
+| Search/filter completed command blocks | `Ctrl+Shift+G` |
 | Toggle Agent panel | `Ctrl+Shift+Alt+A` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |

@@ -3637,6 +3637,118 @@ impl super::TerminalState {
         self.scroll_to_line_id(anchor.line_id)
     }
 
+    /// Resolve the retained physical row containing a 1-based logical output
+    /// line. Soft-wrapped rows stay in one logical line. Captured snapshots
+    /// may outlive their raw anchors, so failure is expected and callers fall
+    /// back to the block header without guessing a coordinate.
+    pub fn command_output_line_anchor(&self, id: &str, line_no: usize) -> Option<BufferAnchor> {
+        if self.use_alt_buffer || line_no == 0 {
+            return None;
+        }
+        let record = self.command_record(id)?;
+        let start = record.output_start?;
+        let end = record.output_end?;
+        let (start_row, _) = self.buffer_anchor_to_absolute(start)?;
+        let (end_row, end_col) = self.buffer_anchor_to_absolute(end)?;
+        if end_row < start_row {
+            return None;
+        }
+        let last_row = if end_col == 0 && end_row > start_row {
+            end_row - 1
+        } else {
+            end_row
+        };
+        let mut logical_line = 1usize;
+        for row in start_row..=last_row {
+            if logical_line == line_no {
+                return self.absolute_to_buffer_anchor((row, 0));
+            }
+            if row < last_row && !self.absolute_row_is_wrapped(row)? {
+                logical_line = logical_line.checked_add(1)?;
+            }
+        }
+        None
+    }
+
+    /// Resolve the retained physical row containing the start of a cached
+    /// search match. `match_start..match_end` is a Unicode-scalar range in the
+    /// complete original logical line. The walk mirrors `extract_text_range`:
+    /// the first output column is honored, trailing padding and wide
+    /// continuations do not become characters, and soft wraps concatenate.
+    /// The whole span is validated, so a captured snapshot that outlived or
+    /// diverged from live rows fails closed instead of targeting unrelated
+    /// terminal content.
+    pub fn command_output_match_anchor(
+        &self,
+        id: &str,
+        line_no: usize,
+        match_start: usize,
+        match_end: usize,
+    ) -> Option<BufferAnchor> {
+        if self.use_alt_buffer || line_no == 0 || match_start >= match_end {
+            return None;
+        }
+        let record = self.command_record(id)?;
+        let output_start = record.output_start?;
+        let output_end = record.output_end?;
+        let (output_start_row, output_start_col) = self.buffer_anchor_to_absolute(output_start)?;
+        let (output_end_row, output_end_col) = self.buffer_anchor_to_absolute(output_end)?;
+        if output_end_row < output_start_row
+            || (output_end_row == output_start_row && output_end_col < output_start_col)
+        {
+            return None;
+        }
+        let line_start = self.command_output_line_anchor(id, line_no)?;
+        let (line_start_row, _) = self.buffer_anchor_to_absolute(line_start)?;
+        let last_row = if output_end_col == 0 && output_end_row > output_start_row {
+            output_end_row - 1
+        } else {
+            output_end_row
+        };
+        if line_start_row > last_row {
+            return None;
+        }
+
+        let mut remaining_start = match_start;
+        let mut remaining_end = match_end;
+        let mut target_row = None;
+        for row in line_start_row..=last_row {
+            let cells = self.absolute_row_cells(row)?;
+            let row_start = if row == output_start_row {
+                output_start_col.min(cells.len())
+            } else {
+                0
+            };
+            let mut row_end = if row == output_end_row {
+                output_end_col.min(cells.len())
+            } else {
+                cells.len()
+            };
+            while row_end > row_start
+                && matches!(cells[row_end - 1].character, ' ' | '\0')
+                && !cells[row_end - 1].flags.wide_continuation()
+            {
+                row_end -= 1;
+            }
+            let chars = cells[row_start..row_end]
+                .iter()
+                .filter(|cell| !cell.flags.wide_continuation())
+                .count();
+            if target_row.is_none() && remaining_start < chars {
+                target_row = Some(row);
+            }
+            if remaining_end <= chars {
+                return target_row.and_then(|row| self.absolute_to_buffer_anchor((row, 0)));
+            }
+            if !self.absolute_row_is_wrapped(row)? {
+                return None;
+            }
+            remaining_start = remaining_start.saturating_sub(chars);
+            remaining_end = remaining_end.saturating_sub(chars);
+        }
+        None
+    }
+
     /// Scroll the selected block's semantic top or bottom edge into view.
     /// Bottom navigation aligns the edge with the viewport bottom when it is
     /// retained, matching the private-scroll card action in anvil/forge while

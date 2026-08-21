@@ -2703,31 +2703,160 @@ impl TerminalApp {
 
     /// Recompute the picker's hits for the active session and current query.
     ///
-    /// Record text is NOT re-extracted per keystroke: it lives in the
-    /// extraction cache built by `rebuild_block_search_cache`, refreshed here
-    /// only when `session_id` is stale (first refresh after opening, or a tab
-    /// switch while open). A keystroke therefore only rescans the cached
-    /// strings — no allocation beyond the needle and the hits. Accepted
-    /// staleness: blocks that finish while the picker is open are not seen
-    /// until it is reopened or the session switches.
+    /// Record text is not re-extracted per keystroke: it lives in a bounded
+    /// cache rebuilt only when the active session or finalized-record version
+    /// changes. Invalid regexes preserve the last usable cache/hits and merely
+    /// gate activation until the expression compiles again.
     pub(crate) fn refresh_block_search_hits(&mut self) {
         let query = self.block_search.query.clone();
-        let session_id = self
-            .session_manager
-            .get_active_session_mut()
-            .metadata
-            .session_id
-            .clone();
-        if self.block_search.session_id.as_deref() != Some(session_id.as_str()) {
-            self.rebuild_block_search_cache();
+        let (session_id, record_version) = {
+            let session = self.session_manager.get_active_session_mut();
+            let terminal = session.terminal.lock();
+            let mut complete = terminal
+                .command_records()
+                .iter()
+                .filter(|record| record.complete);
+            let oldest_sequence = complete.next().map(|record| record.sequence);
+            let mut len = usize::from(oldest_sequence.is_some());
+            let mut newest_sequence = oldest_sequence;
+            for record in complete {
+                len += 1;
+                newest_sequence = Some(record.sequence);
+            }
+            (
+                session.metadata.session_id.clone(),
+                crate::block_search::BlockSearchRecordVersion {
+                    len,
+                    oldest_sequence,
+                    newest_sequence,
+                },
+            )
+        };
+        if !self.block_search.needs_refresh(&session_id, record_version) {
+            return;
         }
-        let results = crate::block_mode::search_blocks(&self.block_search.cache, &query);
-        self.block_search.hits = results.hits;
-        self.block_search.capped = results.capped;
-        // The result set changed under the highlight: restart at the top
-        // (newest) hit, the palette's update_search_results precedent.
-        self.block_search.selected_index = 0;
+        if self.block_search.session_id.as_deref() != Some(session_id.as_str())
+            || self.block_search.record_version != Some(record_version)
+        {
+            self.rebuild_block_search_cache(&session_id, record_version);
+        }
+
+        let filter = self.block_search.filter;
+        let eligible: std::collections::HashSet<String> = {
+            let session = self.session_manager.get_active_session_mut();
+            let terminal = session.terminal.lock();
+            terminal
+                .command_records()
+                .iter()
+                .filter(|record| record.complete)
+                .filter(|record| match filter {
+                    crate::block_search::BlockSearchFilter::All => true,
+                    crate::block_search::BlockSearchFilter::Failed => matches!(
+                        crate::block_mode::classify_outcome(
+                            record.command.as_deref(),
+                            record.command_truncated,
+                            record.exit_code,
+                            record.state,
+                            record.complete,
+                            false,
+                        ),
+                        crate::block_mode::BlockOutcome::Failed(_)
+                    ),
+                    crate::block_search::BlockSearchFilter::Slow => {
+                        record.duration_ms.is_some_and(|duration| {
+                            duration >= self.config.notify_long_block_threshold_ms
+                        })
+                    }
+                    crate::block_search::BlockSearchFilter::Bookmarked => self
+                        .block_bookmarks
+                        .get(&session_id)
+                        .is_some_and(|bookmarks| bookmarks.contains(&record.id)),
+                    crate::block_search::BlockSearchFilter::Background => matches!(
+                        crate::block_mode::classify_outcome(
+                            record.command.as_deref(),
+                            record.command_truncated,
+                            record.exit_code,
+                            record.state,
+                            record.complete,
+                            false,
+                        ),
+                        crate::block_mode::BlockOutcome::Background
+                    ),
+                })
+                .map(|record| record.id.clone())
+                .collect()
+        };
+        let results = match crate::block_mode::validated_block_search_query(&query) {
+            Err(error) => Err(error),
+            Ok(validated)
+                if validated.is_empty()
+                    && filter != crate::block_search::BlockSearchFilter::All =>
+            {
+                let mut hits = Vec::new();
+                let mut capped = false;
+                for record in self
+                    .block_search
+                    .cache
+                    .iter()
+                    .rev()
+                    .filter(|record| eligible.contains(&record.record_id))
+                {
+                    if hits.len() >= crate::block_mode::MAX_BLOCK_SEARCH_HITS {
+                        capped = true;
+                        break;
+                    }
+                    let (line_text, is_output_line, line_no) =
+                        if let Some(command) = &record.command {
+                            (command.as_str(), false, None)
+                        } else if let Some(line) = record
+                            .output
+                            .as_deref()
+                            .and_then(|text| text.lines().next())
+                        {
+                            (line, true, Some(1))
+                        } else {
+                            ("Background output", false, None)
+                        };
+                    hits.push(crate::block_mode::BlockSearchHit {
+                        record_id: record.record_id.clone(),
+                        is_output_line,
+                        line_no,
+                        match_span: None,
+                        line_text: crate::block_mode::single_line_clip(
+                            line_text,
+                            crate::block_mode::BLOCK_SEARCH_LINE_TEXT_CHARS,
+                        ),
+                        command_preview: crate::block_mode::single_line_clip(
+                            record.command.as_deref().unwrap_or_default(),
+                            crate::block_mode::BLOCK_SEARCH_COMMAND_PREVIEW_CHARS,
+                        ),
+                    });
+                }
+                Ok(crate::block_mode::BlockSearchResults { hits, capped })
+            }
+            Ok(_) => crate::block_mode::search_blocks_with_options_filtered(
+                &self.block_search.cache,
+                &query,
+                crate::block_mode::BlockSearchOptions {
+                    case_sensitive: self.block_search.case_sensitive,
+                    regex: self.block_search.regex,
+                },
+                |record_id| eligible.contains(record_id),
+            ),
+        };
+        match results {
+            Ok(results) => {
+                self.block_search.hits = results.hits;
+                self.block_search.capped = results.capped;
+                self.block_search.query_error = None;
+                self.block_search.selected_index = 0;
+            }
+            Err(error) => {
+                self.block_search.query_error = Some(error.to_string());
+            }
+        }
         self.block_search.session_id = Some(session_id);
+        self.block_search.record_version = Some(record_version);
         self.block_search.computed_query = Some(query);
     }
 
@@ -2738,32 +2867,50 @@ impl TerminalApp {
     /// extraction as the fallback for records that have no capture yet, each
     /// bounded by the captured-output cap. This is the one extraction pass
     /// per picker-open; per-keystroke searches never touch the terminal.
-    fn rebuild_block_search_cache(&mut self) {
+    fn rebuild_block_search_cache(
+        &mut self,
+        session_id: &str,
+        record_version: crate::block_search::BlockSearchRecordVersion,
+    ) {
+        // Release the previous 16 MiB-class index and hit allocations before
+        // extracting the new 8 MiB source snapshot. Assignment (rather than
+        // `clear`) drops Vec capacity too, keeping peak at old-or-source+new.
+        self.block_search.release_index_for_rebuild();
         let session = self.session_manager.get_active_session_mut();
         let terminal = session.terminal.lock();
-        let cache: Vec<crate::block_mode::CachedBlockSearchRecord> = terminal
-            .command_records()
-            .iter()
-            .rev()
-            .filter(|record| record.complete)
-            .map(|record| {
-                let output = match record.captured_output.as_ref() {
-                    // Captures are produced under MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-                    // so the snapshot is already bounded.
-                    Some(captured) => Some(captured.text.clone()),
-                    None => terminal
-                        .command_output_text(&record.id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
-                        .map(|text| text.text),
-                };
-                crate::block_mode::CachedBlockSearchRecord::new(
-                    &record.id,
-                    record.command.as_deref(),
-                    output,
-                )
-            })
-            .collect();
+        let snapshot = crate::block_mode::bounded_block_search_sources(
+            terminal
+                .command_records()
+                .iter()
+                .rev()
+                .filter(|record| record.complete)
+                .map(|record| {
+                    let output = match record.captured_output.as_ref() {
+                        // Captures are produced under MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
+                        // so the snapshot is already bounded.
+                        Some(captured) => Some(captured.text.clone()),
+                        None => terminal
+                            .command_output_text(&record.id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
+                            .map(|text| text.text),
+                    };
+                    crate::block_mode::BlockSearchSource::new(
+                        record.id.clone(),
+                        record.command.clone(),
+                        output,
+                    )
+                }),
+            crate::block_mode::BLOCK_SEARCH_SOURCE_MAX_BYTES,
+        );
         drop(terminal);
-        self.block_search.cache = cache;
+        let build = crate::block_mode::build_block_search_cache(
+            snapshot,
+            crate::block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
+        );
+        self.block_search.cache = build.records;
+        self.block_search.older_not_indexed = build.older_not_indexed;
+        self.block_search.session_id = Some(session_id.to_string());
+        self.block_search.record_version = Some(record_version);
+        self.block_search.query_error = None;
     }
 
     /// Enter (or a click) on a hit: close the picker, then select and reveal
@@ -2772,19 +2919,89 @@ impl TerminalApp {
     /// A record that scrolled out of reach in the meantime degrades to the
     /// jump path's own toast.
     pub(crate) fn block_search_confirm(&mut self) {
-        let Some(target) = self
+        // A PTY completion can rotate the bounded record deque between the
+        // last paint and Enter. Refresh first so a hit built for an old
+        // finalized-record version is never resolved against the new one.
+        self.refresh_block_search_hits();
+        let Some((target, hit)) = self
             .block_search
             .selected_hit()
             .zip(self.block_search.session_id.as_ref())
-            .map(|(hit, session_id)| CommandTarget {
-                session_id: session_id.clone(),
-                execution_id: hit.record_id.clone(),
+            .map(|(hit, session_id)| {
+                (
+                    CommandTarget {
+                        session_id: session_id.clone(),
+                        execution_id: hit.record_id.clone(),
+                    },
+                    hit.clone(),
+                )
             })
         else {
             return;
         };
         self.block_search.close();
-        self.apply_block_selection(target);
+        self.apply_block_selection(target.clone());
+        if let Some(line_no) = hit.line_no {
+            if let Some(index) = self.session_manager.index_of(&target.session_id) {
+                if let Some(session) = self.session_manager.sessions_mut().get_mut(index) {
+                    let terminal_arc = std::sync::Arc::clone(&session.terminal);
+                    let policy = &mut session.projection_policy;
+                    let view_state = &mut session.projection_view_state;
+                    let mut terminal = terminal_arc.lock();
+                    let anchor = hit
+                        .match_span
+                        .as_ref()
+                        .and_then(|span| {
+                            terminal.command_output_match_anchor(
+                                &target.execution_id,
+                                line_no,
+                                span.start,
+                                span.end,
+                            )
+                        })
+                        .or_else(|| {
+                            terminal.command_output_line_anchor(&target.execution_id, line_no)
+                        });
+                    if let Some(anchor) = anchor {
+                        let transformed = terminal
+                            .projected_viewport_with_state(
+                                crate::terminal::HistoryProjection::identity(),
+                                self.config.block_mode,
+                                policy,
+                                view_state,
+                            )
+                            .is_transformed();
+                        if transformed {
+                            let location = terminal
+                                .reveal_buffer_anchor_in_projection(policy, view_state, anchor);
+                            if let crate::terminal::ProjectedBufferAnchorLocation::Hidden {
+                                zone_id,
+                            } = location
+                            {
+                                // Enter on an explicit search hit means reveal
+                                // its content. Expand only the exact collapse
+                                // proven to own that raw anchor, rebuild the
+                                // plan, then resolve the same stable anchor.
+                                if policy.expand(zone_id) {
+                                    terminal.clear_text_selection();
+                                    let _ = terminal.projected_viewport_with_state(
+                                        crate::terminal::HistoryProjection::identity(),
+                                        self.config.block_mode,
+                                        policy,
+                                        view_state,
+                                    );
+                                    let _ = terminal.reveal_buffer_anchor_in_projection(
+                                        policy, view_state, anchor,
+                                    );
+                                }
+                            }
+                        } else {
+                            let _ = terminal.scroll_to_buffer_anchor(anchor);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Shared targeting rule for every `block:*` copy/recall command: a

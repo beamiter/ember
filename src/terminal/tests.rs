@@ -4557,6 +4557,78 @@ fn command_edge_anchor_resolves_retained_top_and_bottom_rows() {
 }
 
 #[test]
+fn block_search_output_line_anchor_counts_soft_wraps_and_fails_closed_when_trimmed() {
+    let mut terminal = TerminalState::new(5, 4);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=wrapped\x07");
+    terminal.process_input(b"abcdefgh\r\nsecond\r\nthird");
+    terminal.process_input(b"\x1b]133;D;0;id=wrapped\x07");
+
+    let first = terminal
+        .command_output_line_anchor("wrapped", 1)
+        .expect("first logical output line");
+    let second = terminal
+        .command_output_line_anchor("wrapped", 2)
+        .expect("second logical output line");
+    let first_row = terminal.buffer_anchor_to_absolute(first).unwrap().0;
+    let second_row = terminal.buffer_anchor_to_absolute(second).unwrap().0;
+    assert_eq!(second_row, first_row + 2, "one soft wrap stays line one");
+    let continuation = terminal
+        .command_output_match_anchor("wrapped", 1, 5, 8)
+        .expect("match begins on the soft-wrap continuation");
+    assert_eq!(
+        terminal.buffer_anchor_to_absolute(continuation).unwrap().0,
+        first_row + 1
+    );
+    let crossing = terminal
+        .command_output_match_anchor("wrapped", 1, 4, 6)
+        .expect("cross-wrap match starts on the first physical row");
+    assert_eq!(
+        terminal.buffer_anchor_to_absolute(crossing).unwrap().0,
+        first_row
+    );
+    assert!(terminal
+        .command_output_match_anchor("wrapped", 1, 5, 9)
+        .is_none());
+    assert!(terminal
+        .command_output_match_anchor("wrapped", 1, 6, 6)
+        .is_none());
+    assert!(terminal.command_output_line_anchor("wrapped", 0).is_none());
+    assert!(terminal.command_output_line_anchor("wrapped", 4).is_none());
+
+    terminal.set_max_scrollback(0);
+    for _ in 0..12 {
+        terminal.process_input(b"later\r\n");
+    }
+    assert!(terminal.command_output_line_anchor("wrapped", 2).is_none());
+    assert!(terminal
+        .command_output_match_anchor("wrapped", 1, 0, 1)
+        .is_none());
+}
+
+#[test]
+fn block_search_match_anchor_rejects_a_reversed_same_row_range() {
+    let mut terminal = TerminalState::new(20, 4);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=corrupt\x07abc");
+    terminal.process_input(b"\x1b]133;D;0;id=corrupt\x07");
+    let line_id = terminal
+        .command_record("corrupt")
+        .and_then(|record| record.output_start)
+        .expect("output anchor")
+        .line_id;
+    let record = terminal
+        .command_records
+        .iter_mut()
+        .find(|record| record.id == "corrupt")
+        .expect("mutable test record");
+    record.output_start = Some(super::BufferAnchor { line_id, column: 4 });
+    record.output_end = Some(super::BufferAnchor { line_id, column: 2 });
+
+    assert!(terminal
+        .command_output_match_anchor("corrupt", 1, 0, 1)
+        .is_none());
+}
+
+#[test]
 fn jump_to_next_command_returns_to_live_view() {
     let mut terminal = TerminalState::new(8, 3);
     terminal.process_input(b"\x1b]133;A\x07a\n");

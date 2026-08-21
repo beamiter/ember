@@ -4,13 +4,33 @@
 //! Enter/Escape/arrow routing as [`crate::command_palette`]) over every
 //! [`CommandRecord`](crate::terminal::CommandRecord) of the ACTIVE session.
 //! The pure matching lives in [`crate::block_mode::search_blocks`]; this
-//! module owns only the UI state. Record text is extracted ONCE per
-//! picker-open into `cache` (rebuilt on a session switch while open); each
-//! keystroke then only rescans those cached strings, bounded by
-//! `MAX_COMMAND_MARKS` records, the 500-hit cap, and the per-record
-//! captured-output caps.
+//! module owns only the UI state. Record text enters a newest-first 8 MiB
+//! source snapshot and a 16 MiB original/lowercase cache. Finalized-record
+//! version changes rebuild that cache, while query/filter edits only rescan
+//! it. Stable session + record versions prevent old hits from jumping into a
+//! replacement pane.
 
 use crate::block_mode::{BlockSearchHit, CachedBlockSearchRecord};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockSearchFilter {
+    #[default]
+    All,
+    Failed,
+    Slow,
+    Bookmarked,
+    Background,
+}
+
+/// Exact finalized-record set represented by one cache. Length alone is not
+/// enough because the bounded deque can evict one old record while adding one
+/// new record in the same update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockSearchRecordVersion {
+    pub len: usize,
+    pub oldest_sequence: Option<u64>,
+    pub newest_sequence: Option<u64>,
+}
 
 #[derive(Default)]
 pub struct BlockSearchState {
@@ -24,14 +44,19 @@ pub struct BlockSearchState {
     /// True when the last run stopped at the hit cap (older blocks were left
     /// unscanned).
     pub capped: bool,
-    /// Per-open extraction cache the hits are computed from, newest record
-    /// first. Built when `session_id` goes stale (open/tab switch), NOT per
-    /// keystroke — accepted staleness: blocks that finish while the picker
-    /// is open are not seen until it is reopened or the session switches.
+    pub older_not_indexed: bool,
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub filter: BlockSearchFilter,
+    /// Invalid/oversized expressions preserve the last valid hits and index,
+    /// but activation is gated until the query compiles again.
+    pub query_error: Option<String>,
+    /// Bounded cache, oldest record first.
     pub cache: Vec<CachedBlockSearchRecord>,
     /// Session the current `hits` AND `cache` were computed against. A tab
     /// switch while the picker is open invalidates both.
     pub session_id: Option<String>,
+    pub record_version: Option<BlockSearchRecordVersion>,
     /// Query the current `hits` were computed for; `None` forces a recompute
     /// on the next rendered frame.
     pub computed_query: Option<String>,
@@ -48,7 +73,13 @@ impl BlockSearchState {
         self.selected_index = 0;
         self.hits.clear();
         self.capped = false;
+        self.older_not_indexed = false;
+        self.case_sensitive = false;
+        self.regex = false;
+        self.filter = BlockSearchFilter::All;
+        self.query_error = None;
         self.session_id = None;
+        self.record_version = None;
         self.computed_query = None;
     }
 
@@ -57,6 +88,18 @@ impl BlockSearchState {
         // The cache can hold a large slice of scrollback; release it while
         // the picker is closed (reopening rebuilds it anyway).
         self.cache = Vec::new();
+    }
+
+    /// Release every index/result allocation before a version rebuild starts.
+    /// Query/filter controls survive so the new index can immediately
+    /// reevaluate the user's current intent.
+    pub fn release_index_for_rebuild(&mut self) {
+        self.cache = Vec::new();
+        self.hits = Vec::new();
+        self.capped = false;
+        self.older_not_indexed = false;
+        self.query_error = None;
+        self.selected_index = 0;
     }
 
     /// Move the highlight down one row, wrapping (palette semantics).
@@ -79,13 +122,22 @@ impl BlockSearchState {
 
     /// The highlighted hit, if any.
     pub fn selected_hit(&self) -> Option<&BlockSearchHit> {
-        self.hits.get(self.selected_index)
+        self.query_error
+            .is_none()
+            .then(|| self.hits.get(self.selected_index))
+            .flatten()
     }
 
-    /// Whether `hits` are stale for (`active_session_id`, current query).
-    pub fn needs_refresh(&self, active_session_id: &str) -> bool {
+    /// Whether `hits` are stale for the active pane, finalized record set, or
+    /// current query.
+    pub fn needs_refresh(
+        &self,
+        active_session_id: &str,
+        record_version: BlockSearchRecordVersion,
+    ) -> bool {
         self.computed_query.as_deref() != Some(self.query.as_str())
             || self.session_id.as_deref() != Some(active_session_id)
+            || self.record_version != Some(record_version)
     }
 
     /// Result-count footer: `"N matches"` (`"1 match"`), plus
@@ -98,6 +150,9 @@ impl BlockSearchState {
         let mut label = format!("{count} {noun}");
         if self.capped {
             label.push_str(" · older blocks not searched");
+        }
+        if self.older_not_indexed {
+            label.push_str(" · older blocks not indexed");
         }
         label
     }
@@ -112,6 +167,7 @@ mod tests {
             record_id: record_id.to_string(),
             is_output_line: false,
             line_no: None,
+            match_span: None,
             line_text: String::new(),
             command_preview: String::new(),
         }
@@ -126,6 +182,11 @@ mod tests {
             capped: true,
             cache: vec![CachedBlockSearchRecord::new("a", Some("ls"), None)],
             session_id: Some("s".to_string()),
+            record_version: Some(BlockSearchRecordVersion {
+                len: 1,
+                oldest_sequence: Some(1),
+                newest_sequence: Some(1),
+            }),
             computed_query: Some("old".to_string()),
             ..Default::default()
         };
@@ -135,7 +196,7 @@ mod tests {
         assert_eq!(state.selected_index, 0);
         // session_id is cleared, which is also the cache-rebuild trigger.
         assert_eq!(state.session_id, None);
-        assert!(state.needs_refresh("s"));
+        assert!(state.needs_refresh("s", BlockSearchRecordVersion::default()));
         // Closing releases the (potentially large) extraction cache.
         state.close();
         assert!(!state.is_open && state.cache.is_empty());
@@ -161,21 +222,72 @@ mod tests {
             query: "q".to_string(),
             ..Default::default()
         };
-        assert!(state.needs_refresh("s1"));
+        let version = BlockSearchRecordVersion {
+            len: 1,
+            oldest_sequence: Some(1),
+            newest_sequence: Some(1),
+        };
+        assert!(state.needs_refresh("s1", version));
         state.computed_query = Some("q".to_string());
         state.session_id = Some("s1".to_string());
-        assert!(!state.needs_refresh("s1"));
-        assert!(state.needs_refresh("s2"));
+        state.record_version = Some(version);
+        assert!(!state.needs_refresh("s1", version));
+        assert!(state.needs_refresh("s2", version));
+        assert!(state.needs_refresh(
+            "s1",
+            BlockSearchRecordVersion {
+                newest_sequence: Some(2),
+                ..version
+            }
+        ));
         state.query.push('x');
-        assert!(state.needs_refresh("s1"));
+        assert!(state.needs_refresh("s1", version));
 
         assert_eq!(state.count_label(), "0 matches");
         state.hits = vec![hit("a")];
         assert_eq!(state.count_label(), "1 match");
         state.hits = vec![hit("a"), hit("b")];
         state.capped = true;
+        state.older_not_indexed = true;
         // The cap label says what `capped` means — the scan stopped early —
         // not that more matches exist.
-        assert_eq!(state.count_label(), "2 matches · older blocks not searched");
+        assert_eq!(
+            state.count_label(),
+            "2 matches · older blocks not searched · older blocks not indexed"
+        );
+    }
+
+    #[test]
+    fn invalid_query_gates_activation_without_dropping_valid_hits() {
+        let mut state = BlockSearchState::default();
+        state.hits.push(hit("a"));
+        assert!(state.selected_hit().is_some());
+        state.query_error = Some("bad regex".to_string());
+        assert!(state.selected_hit().is_none());
+        assert_eq!(state.hits.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_release_drops_vec_capacity_but_preserves_query_controls() {
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            filter: BlockSearchFilter::Failed,
+            query_error: Some("old".to_string()),
+            ..Default::default()
+        };
+        state.cache.reserve(2048);
+        state.hits.reserve(2048);
+        assert!(state.cache.capacity() > 0 && state.hits.capacity() > 0);
+
+        state.release_index_for_rebuild();
+
+        assert_eq!(state.cache.capacity(), 0);
+        assert_eq!(state.hits.capacity(), 0);
+        assert_eq!(state.query, "needle");
+        assert!(state.case_sensitive && state.regex);
+        assert_eq!(state.filter, BlockSearchFilter::Failed);
+        assert!(state.query_error.is_none());
     }
 }

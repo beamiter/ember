@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-21
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,32 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- Block Search 2.0 replaces Ember's former potentially hundreds-of-megabytes,
+  open-time-only cache. Completed records are sampled lazily newest-first under
+  an 8 MiB retained source budget and normalized into a 16 MiB retained cache; both
+  budgets count Vec storage, stable record-id capacity, original text, and
+  lowercase text. The UI says when older blocks were omitted. Finalized-record
+  identity is `(len, oldest sequence, newest sequence)`, so same-length deque
+  rotation rebuilds the cache and Enter refreshes that identity before acting;
+  an old hit cannot bind to replacement history. The picker adds
+  All/Failed/Slow/Bookmarked/Background browsing plus `Aa` case matching and a
+  bounded Rust-regex mode. Raw query state is rebuilt into a compact allocation
+  capped at 4 KiB (plus at most one complete UTF-8 overflow scalar), regex
+  compilation at 2 MiB; invalid regexes
+  retain the prior usable index/hits but hide and disable them until corrected.
+  Lowercase expansion and regex byte ranges map back to original Unicode scalar
+  spans, long previews surround the match, and accepted output hits validate the
+  complete cached span before revealing its exact physical soft-wrap row;
+  collapsed output expands only after that raw anchor proves its owner, with
+  stale span → logical-line start → already-revealed block header fallbacks.
+  Rebuild drops the prior cache/hit Vec allocations before source extraction,
+  preventing old+source+new coexistence. The first rejected source (bounded by
+  the 256 KiB per-record output cap) and one rejected lowercase candidate are
+  transient allocations outside those retained ceilings. Cache reconstruction
+  currently remains
+  synchronous on Ember's UI thread, but only on open/finalized-version changes
+  and under the two retained ceilings; keystrokes only scan the cache.
 
 - Font file inputs now read through a bounded descriptor boundary
   (`src/font_file.rs`). Every candidate named by `fc-match` output or the

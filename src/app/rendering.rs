@@ -1364,19 +1364,14 @@ impl TerminalApp {
         let mut clicked_hit_index = None;
         let mut hovered_hit_index = None;
         if self.block_search.is_open {
-            // Hits always describe the ACTIVE session and the current query:
-            // recompute on open, per keystroke, and after a tab switch. Only
-            // open/tab-switch rebuilds the extraction cache; keystrokes just
-            // rescan it (see refresh_block_search_hits).
-            let active_session_id = self
-                .session_manager
-                .get_active_session_mut()
-                .metadata
-                .session_id
-                .clone();
-            if self.block_search.needs_refresh(&active_session_id) {
-                self.refresh_block_search_hits();
-            }
+            // Hits always describe the active session, finalized-record
+            // version, query and filter. Query edits only rescan the cache;
+            // pane changes and new/evicted completed blocks rebuild it.
+            // This is cheap when current: it compares the stable finalized-
+            // record version and query, then returns without touching output
+            // text. A completed block (including same-length deque rotation)
+            // rebuilds the bounded index before any old hit can be accepted.
+            self.refresh_block_search_hits();
 
             let screen_rect = ctx.viewport_rect();
             let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
@@ -1408,6 +1403,10 @@ impl TerminalApp {
                         ui.label("🔍");
                         let search_response = ui.text_edit_singleline(&mut self.block_search.query);
                         if search_response.changed() {
+                            self.block_search.query =
+                                crate::block_mode::bounded_block_search_query(std::mem::take(
+                                    &mut self.block_search.query,
+                                ));
                             self.refresh_block_search_hits();
                         }
                         if self.block_search.needs_focus {
@@ -1417,18 +1416,68 @@ impl TerminalApp {
                         if search_response.has_focus() && self.block_search.query.is_empty() {
                             ui.label("Search block commands and output...");
                         }
+                        let case_button = ui
+                            .selectable_label(self.block_search.case_sensitive, "Aa")
+                            .on_hover_text("Match case");
+                        let regex_button = ui
+                            .selectable_label(self.block_search.regex, ".*")
+                            .on_hover_text("Regular expression");
+                        if case_button.clicked() {
+                            self.block_search.case_sensitive = !self.block_search.case_sensitive;
+                            self.block_search.computed_query = None;
+                            self.refresh_block_search_hits();
+                        }
+                        if regex_button.clicked() {
+                            self.block_search.regex = !self.block_search.regex;
+                            self.block_search.computed_query = None;
+                            self.refresh_block_search_hits();
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, filter) in [
+                            ("All", crate::block_search::BlockSearchFilter::All),
+                            ("Failed", crate::block_search::BlockSearchFilter::Failed),
+                            ("Slow", crate::block_search::BlockSearchFilter::Slow),
+                            (
+                                "Bookmarked",
+                                crate::block_search::BlockSearchFilter::Bookmarked,
+                            ),
+                            (
+                                "Background",
+                                crate::block_search::BlockSearchFilter::Background,
+                            ),
+                        ] {
+                            if ui
+                                .selectable_label(self.block_search.filter == filter, label)
+                                .clicked()
+                            {
+                                self.block_search.filter = filter;
+                                self.block_search.computed_query = None;
+                                self.refresh_block_search_hits();
+                            }
+                        }
                     });
 
                     ui.separator();
-                    ui.label(
-                        egui::RichText::new(self.block_search.count_label())
-                            .small()
-                            .color(ui.visuals().weak_text_color()),
-                    );
+                    let query_error = self.block_search.query_error.clone();
+                    if let Some(error) = &query_error {
+                        ui.label(egui::RichText::new(error).small().color(egui::Color32::RED));
+                    } else {
+                        ui.label(
+                            egui::RichText::new(self.block_search.count_label())
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
 
                     // Own a snapshot so pointer actions can be applied after
                     // the window closure (palette precedent).
-                    let hits = self.block_search.hits.clone();
+                    let hits = if query_error.is_none() {
+                        self.block_search.hits.clone()
+                    } else {
+                        Vec::new()
+                    };
                     let selected_index = self.block_search.selected_index;
                     let query_is_empty = self.block_search.query.trim().is_empty();
 
@@ -1464,18 +1513,29 @@ impl TerminalApp {
 
                                     ui.vertical(|ui| {
                                         ui.label(
-                                            egui::RichText::new(&hit.command_preview)
+                                            egui::RichText::new(&hit.line_text)
                                                 .monospace()
                                                 .strong(),
                                         );
-                                        if hit.is_output_line {
-                                            ui.label(
-                                                egui::RichText::new(&hit.line_text)
-                                                    .monospace()
-                                                    .size(10.0)
-                                                    .color(ui.visuals().weak_text_color()),
-                                            );
-                                        }
+                                        let context = if hit.is_output_line {
+                                            format!(
+                                                "{} · L{}",
+                                                if hit.command_preview.is_empty() {
+                                                    "(no command)"
+                                                } else {
+                                                    hit.command_preview.as_str()
+                                                },
+                                                hit.line_no.unwrap_or(0)
+                                            )
+                                        } else {
+                                            "command".to_string()
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(context)
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
                                     });
                                 });
 
@@ -1502,12 +1562,24 @@ impl TerminalApp {
                                 ui.separator();
                             }
 
-                            if hits.is_empty() {
+                            if hits.is_empty() && query_error.is_none() {
                                 ui.label(
                                     egui::RichText::new(if query_is_empty {
-                                        "Type to search every command block in this session"
+                                        if self.block_search.filter
+                                            == crate::block_search::BlockSearchFilter::All
+                                        {
+                                            "Type to search every command block in this session"
+                                        } else if self.block_search.older_not_indexed {
+                                            "No matching indexed blocks · older blocks not indexed"
+                                        } else {
+                                            "No matching blocks"
+                                        }
                                     } else {
-                                        "No matches"
+                                        if self.block_search.older_not_indexed {
+                                            "No matches in indexed blocks · older blocks not indexed"
+                                        } else {
+                                            "No matches"
+                                        }
                                     })
                                     .color(ui.visuals().weak_text_color()),
                                 );
