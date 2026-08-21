@@ -1444,9 +1444,17 @@ fn maybe_notify_long_command(
     config: &config::Config,
     window_started: &mut std::time::Instant,
     notifications_in_window: &mut usize,
-    completed: &crate::terminal::CompletedCommandOutput,
+    completed: &crate::terminal::CompletedCommandEvent,
     watched: bool,
 ) {
+    if !completed.is_trusted_completion() {
+        return;
+    }
+    let Some(exit_code) = completed.exit_code else {
+        // The notification API requires a concrete status. A bare `D` is an
+        // observed end with Unknown outcome, not permission to report success.
+        return;
+    };
     if !should_notify_long_command(
         config,
         completed.command.as_deref(),
@@ -1464,11 +1472,7 @@ fn maybe_notify_long_command(
     }
     *notifications_in_window += 1;
     let command = completed.command.as_deref().unwrap_or_default().trim();
-    jterm_core::notify::long_block_finished(
-        command,
-        completed.exit_code.unwrap_or(0),
-        completed.duration_ms.unwrap_or(0),
-    );
+    jterm_core::notify::long_block_finished(command, exit_code, completed.duration_ms.unwrap_or(0));
 }
 
 fn reported_capture_button(capture: Option<(bool, u8)>) -> Option<u8> {
@@ -3863,7 +3867,7 @@ impl eframe::App for TerminalApp {
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
         let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
-        for (session_idx, completed) in background_pump.completed_command_outputs.drain(..) {
+        for (session_idx, completed) in background_pump.completed_command_events.drain(..) {
             if let Some(session) = self.session_manager.sessions().get(session_idx) {
                 self.agent_panel
                     .handle_completed(&session.metadata.session_id, &completed);
@@ -4616,7 +4620,7 @@ impl eframe::App for TerminalApp {
                 terminal.check_sync_output_timeout();
                 terminal_parse_time += active_parse_started.elapsed();
                 active_processed_bytes = accumulated_data.len();
-                let completed_outputs = terminal.take_completed_command_outputs();
+                let completed_outputs = terminal.take_completed_command_events();
                 // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
                 // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
                 // 有输出时更新最后活动时间
@@ -5891,11 +5895,11 @@ mod tests {
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, kitty_graphics_payload, link_activation_dragged,
         link_activation_ready, link_activation_release_allowed, link_at_pointer,
-        mouse_capture_accepts_new_press, mouse_cell_for_current_dimensions,
-        mouse_lossy_reports_allowed, mouse_press_reports_to_app, mouse_protocol_input_is_blocked,
-        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
-        osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows, paste_policy,
-        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
+        maybe_notify_long_command, mouse_capture_accepts_new_press,
+        mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
+        mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
+        normalized_paste_body, osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows,
+        paste_policy, paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, take_tagged_cursor_move, workspace_drag_pointer_cancelled,
         ClipboardRequestGuard, DesktopNotification, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
@@ -6200,6 +6204,33 @@ mod tests {
             Some(60_000),
             true,
         ));
+
+        let degraded = crate::terminal::CompletedCommandEvent {
+            start_mark_seen: false,
+            completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
+            completed: crate::terminal::CompletedCommandOutput {
+                id: "bare-d".into(),
+                command: Some("cargo build".into()),
+                cwd: None,
+                exit_code: Some(0),
+                duration_ms: Some(60_000),
+                output: String::new(),
+                output_available: true,
+                truncated: false,
+                total_bytes: 0,
+                agent_generation: None,
+            },
+        };
+        let mut window_started = std::time::Instant::now();
+        let mut notifications_in_window = 0;
+        maybe_notify_long_command(
+            &config,
+            &mut window_started,
+            &mut notifications_in_window,
+            &degraded,
+            false,
+        );
+        assert_eq!(notifications_in_window, 0);
 
         let disabled = crate::config::Config {
             notify_long_blocks: false,

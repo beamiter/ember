@@ -269,6 +269,16 @@ blank/background record carrying a nonzero raw status is not a failed command,
 while a real command with no reported status remains unknown rather than
 success.
 
+Completion provenance is tracked separately from exit outcome. A matching
+OSC 133 `C`/`D` lifecycle is healthy; a command whose `D` is lost is closed at
+the next prompt boundary with an `inferred` badge, no invented exit code,
+duration, or finish time. Malformed or mismatched ids, plus retained/recent
+stale or duplicate execution ids, cannot close a different live block.
+Inferred events may release a locally correlated Agent wait, but are excluded
+from desktop completion notifications
+and the durable execution journal. Context menus explain degraded lifecycles,
+while Markdown and JSON copies expose completion provenance explicitly.
+
 Whole-block interaction applies only to completed records. A plain click on a
 command header selects that card; `Shift+Click` on any finished row extends a
 contiguous range and `Ctrl+Shift+Click` toggles one card. Plain output clicks,

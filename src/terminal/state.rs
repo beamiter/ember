@@ -371,6 +371,7 @@ impl super::TerminalState {
             command_marks: VecDeque::new(),
             command_records: VecDeque::new(),
             next_command_sequence: 1,
+            consumed_command_ids: VecDeque::new(),
             finished_output_provenance: HashMap::new(),
             finished_output_owners: HashMap::new(),
             finished_output_revision: 1,
@@ -1593,6 +1594,14 @@ impl super::TerminalState {
 
 impl super::TerminalState {
     pub(super) fn hard_reset(&mut self) {
+        self.record_reset_interrupted_agent_command();
+        // Completion events are application-owned once produced. RIS clears
+        // terminal history, but must not erase an already-finished event or
+        // the Agent interruption emitted immediately above before the app can
+        // drain it.
+        let pending_completed_command_outputs =
+            std::mem::take(&mut self.pending_completed_command_outputs);
+        let consumed_command_ids = std::mem::take(&mut self.consumed_command_ids);
         let cols = self.grid.row_len();
         let rows = self.grid.rows();
         let max_scrollback = self.max_scrollback;
@@ -1601,6 +1610,8 @@ impl super::TerminalState {
         let row_identity_revision = self.row_identity_revision;
         let next_command_sequence = self.next_command_sequence;
         *self = Self::new(cols, rows);
+        self.pending_completed_command_outputs = pending_completed_command_outputs;
+        self.consumed_command_ids = consumed_command_ids;
         // A reset replaces every physical row but must never restart the
         // allocator and let an old external origin retarget into the new grid.
         self.next_raw_row_id = next_raw_row_id;
@@ -2327,6 +2338,25 @@ impl super::TerminalState {
             .rposition(|record| record.id == id)
     }
 
+    pub(super) fn command_id_was_consumed(&self, id: &str) -> bool {
+        self.consumed_command_ids
+            .iter()
+            .any(|consumed| consumed == id)
+    }
+
+    pub(super) fn remember_consumed_command_id(&mut self, id: Option<&str>) {
+        let Some(id) = id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if self.command_id_was_consumed(id) {
+            return;
+        }
+        if self.consumed_command_ids.len() >= MAX_CONSUMED_COMMAND_IDS {
+            self.consumed_command_ids.pop_front();
+        }
+        self.consumed_command_ids.push_back(id.to_string());
+    }
+
     fn active_record_index(&self) -> Option<usize> {
         self.command_records
             .iter()
@@ -2337,6 +2367,9 @@ impl super::TerminalState {
         let Some(requested_id) = requested_id.and_then(Self::valid_osc_133_id) else {
             return;
         };
+        if self.command_id_was_consumed(&requested_id) {
+            return;
+        }
         if self
             .command_records
             .iter()
@@ -2391,6 +2424,7 @@ impl super::TerminalState {
         id: Option<&str>,
         command: Option<&str>,
         cwd: Option<&str>,
+        start_mark_seen: bool,
     ) -> Option<usize> {
         let (sequence, local_id) = self.next_command_identity()?;
         if self.command_records.len() >= MAX_COMMAND_MARKS {
@@ -2429,6 +2463,8 @@ impl super::TerminalState {
             duration_ms: None,
             state: CommandState::Prompt,
             complete: false,
+            start_mark_seen,
+            completion_provenance: crate::block_mode::CompletionProvenance::Unknown,
             started_at: None,
             finished_at: None,
             agent_generation: None,
@@ -2445,7 +2481,7 @@ impl super::TerminalState {
             return Some(index);
         }
         let anchor = self.current_buffer_anchor();
-        let index = self.push_command_record(anchor, None, None, None)?;
+        let index = self.push_command_record(anchor, None, None, None, false)?;
         if self.command_marks.len() >= MAX_COMMAND_MARKS {
             self.command_marks.pop_front();
         }
@@ -2470,7 +2506,7 @@ impl super::TerminalState {
         // A fresh shell prompt is the only unambiguous boundary that clears
         // local input and any approval that never reached command start.
         self.agent_prompt_input_tainted = false;
-        self.armed_agent_execution = None;
+        self.record_abandoned_armed_agent_command(true);
         let anchor = self.current_buffer_anchor();
 
         // Only coalesce truly duplicated A markers. A new A on the same row
@@ -2494,10 +2530,19 @@ impl super::TerminalState {
         // If a shell omitted D, preserve a closed semantic range rather than
         // leaving an earlier record permanently "running".
         if let Some(index) = self.active_record_index() {
-            self.finish_command_record(index, anchor, None, None);
+            self.finish_command_record(
+                index,
+                anchor,
+                None,
+                None,
+                crate::block_mode::CompletionProvenance::BoundaryInferred,
+            );
         }
 
-        if self.push_command_record(anchor, id, command, cwd).is_some() {
+        if self
+            .push_command_record(anchor, id, command, cwd, false)
+            .is_some()
+        {
             if self.command_marks.len() >= MAX_COMMAND_MARKS {
                 self.command_marks.pop_front();
             }
@@ -2564,6 +2609,7 @@ impl super::TerminalState {
                 initialize_provenance = true;
             }
             record.state = CommandState::Running;
+            record.start_mark_seen = true;
             record
                 .started_at
                 .get_or_insert_with(std::time::SystemTime::now);
@@ -2606,7 +2652,14 @@ impl super::TerminalState {
         if let Some(record) = self.command_records.get_mut(index) {
             record.agent_generation = armed_generation;
         }
-        self.armed_agent_execution = None;
+        if armed_generation.is_some() {
+            self.armed_agent_execution = None;
+        } else {
+            // C arrived for a different/tainted command. Release the approval
+            // generation now, but do not tombstone this record's id: it belongs
+            // to the unrelated command that is legitimately still running.
+            self.record_abandoned_armed_agent_command(false);
+        }
     }
 
     pub(super) fn store_captured_command_output(&mut self, index: usize, output: ExtractedText) {
@@ -2676,18 +2729,106 @@ impl super::TerminalState {
             self.pending_completed_command_outputs.pop_front();
         }
         self.pending_completed_command_outputs
-            .push_back(CompletedCommandOutput {
-                id: record.id,
-                command: record.command,
-                cwd: record.cwd,
-                exit_code: record.exit_code,
-                duration_ms: record.duration_ms,
-                output: extracted.text,
-                output_available,
-                truncated: extracted.truncated,
-                total_bytes: extracted.total_bytes,
-                agent_generation: record.agent_generation,
+            .push_back(CompletedCommandEvent {
+                start_mark_seen: record.start_mark_seen,
+                completion_provenance: record.completion_provenance,
+                completed: CompletedCommandOutput {
+                    id: record.id,
+                    command: record.command,
+                    cwd: record.cwd,
+                    exit_code: record.exit_code,
+                    duration_ms: record.duration_ms,
+                    output: extracted.text,
+                    output_available,
+                    truncated: extracted.truncated,
+                    total_bytes: extracted.total_bytes,
+                    agent_generation: record.agent_generation,
+                },
             });
+    }
+
+    fn queue_agent_termination(
+        &mut self,
+        id: String,
+        command: Option<String>,
+        cwd: Option<String>,
+        generation: u64,
+        start_mark_seen: bool,
+        remember_id: bool,
+    ) {
+        let completed = CompletedCommandEvent {
+            start_mark_seen,
+            completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
+            completed: CompletedCommandOutput {
+                id,
+                command,
+                cwd,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+                output_available: false,
+                truncated: false,
+                total_bytes: 0,
+                agent_generation: Some(generation),
+            },
+        };
+        let consumed_id = completed.completed.id.clone();
+        if self.pending_completed_command_outputs.len() >= MAX_PENDING_COMPLETED_COMMANDS {
+            self.pending_completed_command_outputs.pop_front();
+        }
+        self.pending_completed_command_outputs.push_back(completed);
+        if remember_id {
+            self.remember_consumed_command_id(Some(&consumed_id));
+        }
+    }
+
+    /// An approval can be locally armed before OSC 133 `C` arrives. A fresh
+    /// prompt proves that execution never entered the correlated lifecycle;
+    /// publish an explicit degraded event instead of silently dropping the
+    /// generation and leaving the Agent panel waiting forever.
+    fn record_abandoned_armed_agent_command(&mut self, remember_id: bool) {
+        let Some(armed) = self.armed_agent_execution.take() else {
+            return;
+        };
+        let record = self
+            .command_records
+            .iter()
+            .find(|record| record.sequence == armed.command_sequence);
+        let id = record
+            .map(|record| record.id.clone())
+            .unwrap_or_else(|| Self::local_command_id(armed.command_sequence));
+        let cwd = record.and_then(|record| record.cwd.clone());
+        self.queue_agent_termination(
+            id,
+            Some(armed.command),
+            cwd,
+            armed.generation,
+            false,
+            remember_id,
+        );
+    }
+
+    /// Publish a boundary-inferred termination before RIS replaces the whole
+    /// terminal. Prefer an execution already correlated at C; otherwise seal
+    /// an approval still armed at the prompt. Ordinary semantic history stays
+    /// subject to RIS clearing.
+    fn record_reset_interrupted_agent_command(&mut self) {
+        let active = self
+            .active_record_index()
+            .and_then(|index| self.command_records.get(index))
+            .and_then(|record| {
+                Some((
+                    record.id.clone(),
+                    record.command.clone(),
+                    record.cwd.clone(),
+                    record.agent_generation?,
+                ))
+            });
+        if let Some((id, command, cwd, generation)) = active {
+            self.queue_agent_termination(id, command, cwd, generation, true, true);
+        } else {
+            self.record_abandoned_armed_agent_command(true);
+        }
     }
 
     fn finish_command_record(
@@ -2696,7 +2837,14 @@ impl super::TerminalState {
         anchor: BufferAnchor,
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
+        completion_provenance: crate::block_mode::CompletionProvenance,
     ) {
+        let publish_completion = completion_provenance
+            == crate::block_mode::CompletionProvenance::ShellReported
+            || self
+                .command_records
+                .get(index)
+                .is_some_and(|record| record.start_mark_seen);
         let exact_output = self
             .command_records
             .get(index)
@@ -2715,17 +2863,33 @@ impl super::TerminalState {
                 record.end = Some(anchor);
             }
             record.exit_code = exit_code;
-            record.duration_ms = duration_ms.or_else(|| {
-                record
-                    .started_instant
-                    .map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64)
-            });
+            record.duration_ms = if completion_provenance
+                == crate::block_mode::CompletionProvenance::ShellReported
+            {
+                duration_ms.or_else(|| {
+                    record
+                        .started_instant
+                        .map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                })
+            } else {
+                None
+            };
             record.state = CommandState::Complete;
             record.complete = true;
-            record.finished_at = Some(std::time::SystemTime::now());
+            record.completion_provenance = completion_provenance;
+            record.finished_at = (completion_provenance
+                == crate::block_mode::CompletionProvenance::ShellReported)
+                .then(std::time::SystemTime::now);
             record.started_instant = None;
         }
-        self.capture_and_queue_completed_command_output(index);
+        if publish_completion {
+            self.capture_and_queue_completed_command_output(index);
+        }
+        let consumed_id = self
+            .command_records
+            .get(index)
+            .map(|record| record.id.clone());
+        self.remember_consumed_command_id(consumed_id.as_deref());
     }
 
     fn record_command_exit_with_metadata(
@@ -2741,16 +2905,40 @@ impl super::TerminalState {
             return;
         }
         let decoded_id = id.and_then(Self::valid_osc_133_id);
-        let by_id = decoded_id
+        // An explicitly malformed id is not the same as an omitted id. It
+        // cannot authorize a fallback close of whichever block happens to be
+        // current.
+        if id.is_some() && decoded_id.is_none() {
+            return;
+        }
+        if decoded_id
             .as_deref()
-            .and_then(|id| self.record_index_for_id(id))
-            .filter(|&index| {
-                self.command_records
+            .is_some_and(|id| self.command_id_was_consumed(id))
+        {
+            return;
+        }
+        let active = self.active_record_index();
+        let index = match decoded_id.as_deref() {
+            None => active,
+            Some(decoded_id) => match self.record_index_for_id(decoded_id) {
+                Some(index) => self
+                    .command_records
                     .get(index)
-                    .map(|record| !record.complete)
-                    .unwrap_or(false)
-            });
-        let index = by_id.or_else(|| self.active_record_index());
+                    .is_some_and(|record| !record.complete)
+                    .then_some(index),
+                None => {
+                    // Some integrations first supply the execution id on D. A
+                    // terminal-local placeholder may adopt it; an already
+                    // shell-named active record may not be closed by a stale
+                    // or out-of-order id belonging to another execution.
+                    active.filter(|&index| {
+                        self.command_records.get(index).is_some_and(|record| {
+                            record.id == Self::local_command_id(record.sequence)
+                        })
+                    })
+                }
+            },
+        };
         let Some(index) = index else {
             return;
         };
@@ -2780,7 +2968,13 @@ impl super::TerminalState {
             }
         }
         let anchor = self.current_buffer_anchor();
-        self.finish_command_record(index, anchor, exit_code, duration_ms);
+        self.finish_command_record(
+            index,
+            anchor,
+            exit_code,
+            duration_ms,
+            crate::block_mode::CompletionProvenance::ShellReported,
+        );
         if let Some(mark) = self.command_marks.back_mut() {
             mark.exit_code = exit_code;
         }
@@ -3024,7 +3218,22 @@ impl super::TerminalState {
         }
     }
 
+    #[allow(dead_code)] // Public library compatibility; the app consumes provenance-aware events.
     pub fn take_completed_command_outputs(&mut self) -> Vec<CompletedCommandOutput> {
+        self.pending_completed_command_outputs
+            .drain(..)
+            .filter(|event| {
+                event.completion_provenance
+                    == crate::block_mode::CompletionProvenance::ShellReported
+            })
+            .map(|event| event.completed)
+            .collect()
+    }
+
+    /// Provenance-aware completion drain for application consumers. The
+    /// source-compatible output-only API above remains available to library
+    /// users that do not yet distinguish inferred lifecycle termination.
+    pub fn take_completed_command_events(&mut self) -> Vec<CompletedCommandEvent> {
         self.pending_completed_command_outputs.drain(..).collect()
     }
 

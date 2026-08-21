@@ -17,6 +17,8 @@
 //!    observation when its reported command text matches the approved one.
 
 use crate::config::Config;
+use crate::terminal::CompletedCommandEvent;
+#[cfg(test)]
 use crate::terminal::CompletedCommandOutput;
 use jterm_core::agent::{
     is_dangerous, AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ModelOutcome,
@@ -914,7 +916,7 @@ impl AgentPanel {
     /// completion matching the approved proposal becomes an observation;
     /// anything else is remembered as the user's most recent manual command
     /// and attached to later model requests as untrusted block context.
-    pub fn handle_completed(&mut self, session_id: &str, completed: &CompletedCommandOutput) {
+    pub fn handle_completed(&mut self, session_id: &str, completed: &CompletedCommandEvent) {
         if !self.is_open || self.bound_session_id.as_deref() != Some(session_id) {
             return;
         }
@@ -931,6 +933,20 @@ impl AgentPanel {
                     self.execution_start_failed(
                         generation,
                         "Agent stopped: approved command completion failed strict correlation",
+                    );
+                    return;
+                }
+                if !completed.is_trusted_completion() {
+                    let generation = pending.generation;
+                    self.execution_start_failed(
+                        generation,
+                        format!(
+                            "Agent stopped: {}",
+                            crate::block_mode::lifecycle_detail(
+                                completed.start_mark_seen,
+                                completed.completion_provenance,
+                            )
+                        ),
                     );
                     return;
                 }
@@ -955,6 +971,9 @@ impl AgentPanel {
             }
         }
         if completed.agent_generation.is_some() {
+            return;
+        }
+        if !completed.is_trusted_completion() {
             return;
         }
         // A task created from an explicit command block keeps that immutable
@@ -1623,18 +1642,22 @@ mod tests {
         }
     }
 
-    fn completed(command: &str, exit: i32, output: &str) -> CompletedCommandOutput {
-        CompletedCommandOutput {
-            id: "test".into(),
-            command: Some(command.to_string()),
-            cwd: None,
-            exit_code: Some(exit),
-            duration_ms: Some(5),
-            output: output.to_string(),
-            output_available: true,
-            truncated: false,
-            total_bytes: output.len(),
-            agent_generation: None,
+    fn completed(command: &str, exit: i32, output: &str) -> CompletedCommandEvent {
+        CompletedCommandEvent {
+            start_mark_seen: true,
+            completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
+            completed: CompletedCommandOutput {
+                id: "test".into(),
+                command: Some(command.to_string()),
+                cwd: None,
+                exit_code: Some(exit),
+                duration_ms: Some(5),
+                output: output.to_string(),
+                output_available: true,
+                truncated: false,
+                total_bytes: output.len(),
+                agent_generation: None,
+            },
         }
     }
 
@@ -2633,6 +2656,23 @@ mod tests {
     }
 
     #[test]
+    fn boundary_inferred_manual_completion_is_never_attached() {
+        let mut panel = AgentPanel::new();
+        panel.open(&ai_config(), "session-three".into());
+        let mut inferred = completed("mystery", 9, "partial output");
+        inferred.completion_provenance = crate::block_mode::CompletionProvenance::BoundaryInferred;
+
+        panel.handle_completed("session-three", &inferred);
+
+        assert!(panel.last_manual_completed.is_none());
+
+        let mut degraded = completed("reported without C", 0, "output");
+        degraded.start_mark_seen = false;
+        panel.handle_completed("session-three", &degraded);
+        assert!(panel.last_manual_completed.is_none());
+    }
+
+    #[test]
     fn stale_run_effect_epoch_is_rejected_after_session_replacement() {
         let mut panel = AgentPanel::new();
         panel.open(&ai_config(), "session-three".into());
@@ -2690,6 +2730,39 @@ mod tests {
             AgentState::Cancelled
         );
         assert!(panel.status.contains("no exit status"));
+    }
+
+    #[test]
+    fn inferred_completion_releases_a_correlated_agent_wait_with_diagnostic() {
+        let mut panel = AgentPanel::new();
+        panel.open(&ai_config(), "session-three".into());
+        let session = panel.session.as_mut().unwrap();
+        session.submit_user("list files").unwrap();
+        let outcome = session
+            .accept_model_reply(r#"{"action":"run","command":"ls -la"}"#)
+            .unwrap();
+        let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
+            panic!("expected proposal");
+        };
+        let AgentEffect::RunCommand { generation, .. } =
+            panel.approve(id, None).expect("approval must yield effect")
+        else {
+            panic!("expected command effect");
+        };
+        let mut completion = completed("ls -la", 0, "partial");
+        completion.exit_code = None;
+        completion.agent_generation = Some(generation);
+        completion.completion_provenance =
+            crate::block_mode::CompletionProvenance::BoundaryInferred;
+
+        panel.handle_completed("session-three", &completion);
+
+        assert!(panel.awaiting.is_none());
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+        assert!(panel.status.contains("inferred"));
     }
 
     #[test]

@@ -3425,6 +3425,38 @@ fn osc_133_d_without_exit_code_leaves_none() {
 }
 
 #[test]
+fn shell_reported_d_without_c_is_degraded_for_new_consumers_but_legacy_visible() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;D;0\x07");
+    let events = terminal.take_completed_command_events();
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].start_mark_seen);
+    assert_eq!(
+        events[0].completion_provenance,
+        crate::block_mode::CompletionProvenance::ShellReported
+    );
+    assert_eq!(
+        events[0].lifecycle_health(),
+        crate::block_mode::BlockLifecycleHealth::Degraded
+    );
+    assert!(!events[0].is_trusted_completion());
+
+    let mut compatible = TerminalState::new(24, 4);
+    compatible.process_input(b"\x1b]133;A\x07\x1b]133;D;0\x07");
+    assert_eq!(compatible.take_completed_command_outputs().len(), 1);
+
+    let mut editing = TerminalState::new(24, 4);
+    editing.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;B\x07echo safe\x1b]133;D;1;cmdline_url=echo%20safe\x07",
+    );
+    let events = editing.take_completed_command_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].command.as_deref(), Some("echo safe"));
+    assert!(!events[0].start_mark_seen);
+    assert!(!events[0].is_trusted_completion());
+}
+
+#[test]
 fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
     let mut terminal = TerminalState::new(16, 5);
 
@@ -3449,6 +3481,11 @@ fn osc_133_records_full_lifecycle_metadata_and_completed_output() {
     assert_eq!(record.duration_ms, Some(12));
     assert_eq!(record.state, CommandState::Complete);
     assert!(record.complete);
+    assert!(record.start_mark_seen);
+    assert_eq!(
+        record.completion_provenance,
+        crate::block_mode::CompletionProvenance::ShellReported
+    );
     assert_eq!(terminal.current_working_dir.as_deref(), Some("/tmp/after"));
     assert_eq!(record.prompt_start.column, 0);
     assert_eq!(record.command_start.expect("B anchor").column, 2);
@@ -3730,11 +3767,79 @@ fn implicit_next_prompt_finalizes_the_exact_output_range() {
     let sequence = terminal.command_record("implicit").unwrap().sequence;
     terminal.process_input(b"\x1b]133;A\x07");
 
-    assert!(terminal.command_record("implicit").unwrap().complete);
+    let record = terminal.command_record("implicit").unwrap();
+    assert!(record.complete);
+    assert!(record.start_mark_seen);
+    assert_eq!(record.duration_ms, None);
+    assert_eq!(record.finished_at, None);
+    assert_eq!(
+        record.completion_provenance,
+        crate::block_mode::CompletionProvenance::BoundaryInferred
+    );
     let range = terminal
         .finished_output_range(sequence)
         .expect("implicit A binds retained output");
     assert_eq!((range.start.col, range.end.col), (0, 5));
+    let inferred = terminal.take_completed_command_events();
+    assert_eq!(inferred.len(), 1);
+    assert_eq!(inferred[0].exit_code, None);
+    assert_eq!(
+        inferred[0].completion_provenance,
+        crate::block_mode::CompletionProvenance::BoundaryInferred
+    );
+
+    let mut compatible = TerminalState::new(16, 4);
+    compatible.process_input(b"\x1b]133;A\x07\x1b]133;C;id=implicit-compat\x07hello");
+    compatible.process_input(b"\x1b]133;A\x07");
+    assert!(
+        compatible.take_completed_command_outputs().is_empty(),
+        "the legacy provenance-free drain must not expose inferred completions"
+    );
+}
+
+#[test]
+fn osc_133_d_identity_never_falls_back_across_named_lifecycles() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(
+        b"\x1b]133;A;id=run-1\x07$ \x1b]133;B;id=run-1\x07echo one\r\n\x1b]133;C;id=run-1;cmdline_url=echo%20one\x07one",
+    );
+
+    terminal.process_input(b"\x1b]133;D;0;id=other\x07");
+    terminal.process_input(b"\x1b]133;D;0;id=bad%ZZ\x07");
+    let live = terminal.command_record("run-1").expect("named live record");
+    assert!(!live.complete);
+    assert_eq!(live.state, CommandState::Running);
+    assert!(terminal.take_completed_command_outputs().is_empty());
+
+    terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+    assert!(terminal.command_record("run-1").unwrap().complete);
+    assert_eq!(terminal.take_completed_command_outputs().len(), 1);
+
+    terminal.process_input(
+        b"\x1b]133;A;id=run-2\x07$ \x1b]133;B;id=run-2\x07echo two\r\n\x1b]133;C;id=run-2;cmdline_url=echo%20two\x07two",
+    );
+    // A duplicate/stale D for the prior completed id must not consume run-2.
+    terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+    assert!(!terminal.command_record("run-2").unwrap().complete);
+    assert!(terminal.take_completed_command_outputs().is_empty());
+
+    terminal.process_input(b"\x1b]133;D;0;id=run-2\x07");
+    assert!(terminal.command_record("run-2").unwrap().complete);
+    assert_eq!(terminal.take_completed_command_outputs().len(), 1);
+}
+
+#[test]
+fn consumed_command_id_authority_is_bounded_to_the_recent_window() {
+    let mut terminal = TerminalState::new(8, 2);
+    for index in 0..=super::MAX_CONSUMED_COMMAND_IDS {
+        terminal.remember_consumed_command_id(Some(&format!("run-{index}")));
+    }
+    assert_eq!(
+        terminal.consumed_command_ids.len(),
+        super::MAX_CONSUMED_COMMAND_IDS
+    );
+    assert!(!terminal.command_id_was_consumed("run-0"));
+    assert!(terminal.command_id_was_consumed(&format!("run-{}", super::MAX_CONSUMED_COMMAND_IDS)));
 }
 
 #[test]
@@ -3976,7 +4081,7 @@ fn agent_generation_is_local_one_shot_and_requires_a_fresh_empty_prompt() {
     terminal.process_input(b"ls -la\r\n\x1b]133;C;cmdline_url=ls%20-la\x07ok\r\n");
     terminal.process_input(b"\x1b]133;D;0\x07");
 
-    let completed = terminal.take_completed_command_outputs();
+    let completed = terminal.take_completed_command_events();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].command.as_deref(), Some("ls -la"));
     assert_eq!(completed[0].agent_generation, Some(41));
@@ -3988,6 +4093,107 @@ fn agent_generation_is_local_one_shot_and_requires_a_fresh_empty_prompt() {
         terminal.take_completed_command_outputs()[0].agent_generation,
         None
     );
+}
+
+#[test]
+fn ris_releases_an_active_agent_generation_and_preserves_the_event() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    terminal
+        .arm_agent_execution(51, "printf '\\ec'")
+        .expect("fresh empty prompt can be armed");
+    terminal.process_input(
+        b"printf '\\ec'\r\n\x1b]133;C;id=ris-51;cmdline_url=printf%20%27%5Cec%27\x07",
+    );
+
+    terminal.process_input(b"\x1bc");
+
+    assert!(
+        terminal.command_records().is_empty(),
+        "RIS still clears history"
+    );
+    let completed = terminal.take_completed_command_events();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, "ris-51");
+    assert_eq!(completed[0].command.as_deref(), Some("printf '\\ec'"));
+    assert_eq!(completed[0].agent_generation, Some(51));
+    assert_eq!(completed[0].exit_code, None);
+    assert!(!completed[0].output_available);
+    assert_eq!(
+        completed[0].completion_provenance,
+        crate::block_mode::CompletionProvenance::BoundaryInferred
+    );
+
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo next\r\n\x1b]133;C\x07next");
+    terminal.process_input(b"\x1b]133;D;0;id=ris-51\x07");
+    assert!(terminal.running_command().is_some());
+    assert!(terminal.take_completed_command_events().is_empty());
+    terminal.process_input(b"\x1b]133;D;0\x07");
+    let next = terminal.take_completed_command_events();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].command.as_deref(), Some("echo next"));
+}
+
+#[test]
+fn fresh_prompt_releases_an_agent_approval_that_never_reached_c() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A;id=armed-61\x07$ \x1b]133;B;id=armed-61\x07");
+    terminal
+        .arm_agent_execution(61, "echo safe")
+        .expect("fresh empty prompt can be armed");
+
+    terminal.process_input(b"\x1b]133;A;id=next\x07$ ");
+
+    let completed = terminal.take_completed_command_events();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, "armed-61");
+    assert_eq!(completed[0].command.as_deref(), Some("echo safe"));
+    assert_eq!(completed[0].agent_generation, Some(61));
+    assert!(!completed[0].start_mark_seen);
+    assert!(!completed[0].is_trusted_completion());
+    assert_eq!(completed[0].exit_code, None);
+}
+
+#[test]
+fn ris_releases_an_agent_approval_that_never_reached_c() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A;id=armed-62\x07$ \x1b]133;B;id=armed-62\x07");
+    terminal
+        .arm_agent_execution(62, "echo safe")
+        .expect("fresh empty prompt can be armed");
+
+    terminal.process_input(b"\x1bc");
+
+    let completed = terminal.take_completed_command_events();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, "armed-62");
+    assert_eq!(completed[0].agent_generation, Some(62));
+    assert!(!completed[0].start_mark_seen);
+    assert!(!completed[0].is_trusted_completion());
+}
+
+#[test]
+fn mismatched_c_releases_armed_agent_without_consuming_the_real_command_id() {
+    let mut terminal = TerminalState::new(24, 5);
+    terminal.process_input(b"\x1b]133;A;id=actual-63\x07$ \x1b]133;B;id=actual-63\x07");
+    terminal
+        .arm_agent_execution(63, "echo approved")
+        .expect("fresh empty prompt can be armed");
+    terminal
+        .process_input(b"echo other\r\n\x1b]133;C;id=actual-63;cmdline_url=echo%20other\x07other");
+
+    let abandoned = terminal.take_completed_command_events();
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].command.as_deref(), Some("echo approved"));
+    assert_eq!(abandoned[0].agent_generation, Some(63));
+    assert!(!abandoned[0].start_mark_seen);
+
+    terminal.process_input(b"\x1b]133;D;0;id=actual-63\x07");
+    let actual = terminal.take_completed_command_events();
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].command.as_deref(), Some("echo other"));
+    assert_eq!(actual[0].agent_generation, None);
+    assert!(actual[0].is_trusted_completion());
 }
 
 #[test]

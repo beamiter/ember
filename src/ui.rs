@@ -566,6 +566,8 @@ struct BlockChromeEntry {
     projected_header_range: Option<(DisplayPoint, DisplayPoint)>,
     projected_geometry: bool,
     outcome: crate::block_mode::BlockOutcome,
+    start_mark_seen: bool,
+    completion_provenance: crate::block_mode::CompletionProvenance,
     /// The newest incomplete semantic record owns the live input/running
     /// surface. It receives the accent card independently of block selection.
     live: bool,
@@ -1668,6 +1670,8 @@ impl TerminalRenderer {
                 projected_header_range: None,
                 projected_geometry: false,
                 outcome,
+                start_mark_seen: record.start_mark_seen,
+                completion_provenance: record.completion_provenance,
                 duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
                     running_duration_ms
                 } else {
@@ -1893,6 +1897,8 @@ impl TerminalRenderer {
                 projected_header_range,
                 projected_geometry: true,
                 outcome,
+                start_mark_seen: record.start_mark_seen,
+                completion_provenance: record.completion_provenance,
                 duration_ms: if outcome == crate::block_mode::BlockOutcome::Running {
                     running_duration_ms
                 } else {
@@ -2433,10 +2439,37 @@ impl TerminalRenderer {
             .requested_collapsed_zone_ids
             .contains(&clicked.sequence);
         let collapse_available = terminal.finished_output_range(clicked.sequence).is_some();
+        let clicked_outcome = crate::block_mode::classify_outcome(
+            clicked.command.as_deref(),
+            clicked.command_truncated,
+            clicked.exit_code,
+            clicked.state,
+            clicked.complete,
+            clicked_index + 1 == records.len(),
+        );
+        let lifecycle_warning =
+            (!matches!(clicked_outcome, crate::block_mode::BlockOutcome::Background)
+                && crate::block_mode::assess_lifecycle(
+                    clicked.start_mark_seen,
+                    clicked.completion_provenance,
+                ) != crate::block_mode::BlockLifecycleHealth::Healthy)
+                .then(|| {
+                    crate::block_mode::lifecycle_detail(
+                        clicked.start_mark_seen,
+                        clicked.completion_provenance,
+                    )
+                });
         let mut chosen = None;
 
         response.context_menu(|ui| {
             ui.set_min_width(220.0);
+            if let Some(detail) = lifecycle_warning {
+                ui.colored_label(
+                    self.block_outcome_color(crate::block_mode::BlockOutcome::Unknown),
+                    detail,
+                );
+                ui.separator();
+            }
             if block_menu_button(
                 ui,
                 if plural {
@@ -2785,7 +2818,12 @@ impl TerminalRenderer {
             if !entry.span.starts_in_viewport {
                 continue;
             }
-            let Some(text) = block_mode::badge_text(entry.outcome, entry.duration_ms) else {
+            let Some(text) = block_mode::badge_text_with_lifecycle(
+                entry.outcome,
+                entry.duration_ms,
+                entry.start_mark_seen,
+                entry.completion_provenance,
+            ) else {
                 continue;
             };
             // 选中块的徽章附带完成时刻(本地时间)。带后缀的徽章放不下时,

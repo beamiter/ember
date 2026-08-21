@@ -2,7 +2,8 @@ use crate::session::{Session, SessionPurpose};
 use crate::session_persistence;
 use crate::shell::{ShellEvent, ShellSession, ShellWriteError};
 use crate::terminal::{
-    clamp_terminal_dimensions, ClipboardReadRequest, CompletedCommandOutput, TerminalState,
+    clamp_terminal_dimensions, ClipboardReadRequest, CompletedCommandEvent, CompletedCommandOutput,
+    TerminalState,
 };
 use eframe::egui;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
@@ -328,9 +329,14 @@ pub struct BackgroundPumpResult {
     pub osc52_writes: Vec<(usize, String)>,
     pub osc52_queries: Vec<usize>,
     pub notifications: Vec<(usize, String, String)>,
-    /// Completed OSC 133 output snapshots. The caller forwards these to the
-    /// asynchronous journal writer after all terminal locks have been dropped.
+    /// Source-compatible shell-reported OSC 133 output snapshots. New app code
+    /// consumes the provenance-aware field below; this one remains available
+    /// to integrations compiled against the original public payload.
     pub completed_command_outputs: Vec<(usize, CompletedCommandOutput)>,
+    /// Provenance-aware additive completion stream. Boundary-inferred Agent
+    /// termination appears only here; the compatibility field above retains
+    /// its historical shell-reported-only behavior.
+    pub completed_command_events: Vec<(usize, CompletedCommandEvent)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -647,12 +653,16 @@ impl SessionManager {
             for (title, body) in terminal.pending_notifications.drain(..) {
                 result.notifications.push((session_idx, title, body));
             }
-            result.completed_command_outputs.extend(
-                terminal
-                    .take_completed_command_outputs()
-                    .into_iter()
-                    .map(|completed| (session_idx, completed)),
-            );
+            for event in terminal.take_completed_command_events() {
+                if event.completion_provenance
+                    == crate::block_mode::CompletionProvenance::ShellReported
+                {
+                    result
+                        .completed_command_outputs
+                        .push((session_idx, event.completed.clone()));
+                }
+                result.completed_command_events.push((session_idx, event));
+            }
             drop(terminal);
             if let Err(error) = protocol_responses.flush(&session.shell) {
                 if !error.is_backpressure() {

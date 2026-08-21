@@ -90,6 +90,7 @@ pub const MAX_COMMAND_MARKS: usize = 1024;
 const MAX_OSC_133_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_OSC_133_ID_BYTES: usize = 256;
 const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
+const MAX_CONSUMED_COMMAND_IDS: usize = MAX_COMMAND_MARKS;
 pub const MAX_COMPLETED_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_CAPTURED_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -155,6 +156,12 @@ pub struct CommandRecord {
     pub duration_ms: Option<u64>,
     pub state: CommandState,
     pub complete: bool,
+    /// Whether the matching OSC 133 `C` execution-start mark was observed.
+    /// This survives scrollback eviction independently of row anchors.
+    pub start_mark_seen: bool,
+    /// Evidence that closed the lifecycle. Outcome (`exit_code`) remains a
+    /// separate fact and is never synthesized from this value.
+    pub completion_provenance: crate::block_mode::CompletionProvenance,
     pub started_at: Option<std::time::SystemTime>,
     pub finished_at: Option<std::time::SystemTime>,
     /// Locally armed Agent approval associated with this exact command
@@ -192,6 +199,45 @@ pub struct CompletedCommandOutput {
     /// One-shot local Agent approval generation. `None` for every command
     /// that was not armed by the application before its bytes were queued.
     pub agent_generation: Option<u64>,
+}
+
+/// Additive lifecycle envelope around the source-compatible completed-output
+/// payload. Existing integrations may keep constructing and draining
+/// [`CompletedCommandOutput`]; provenance-aware consumers use this event so a
+/// boundary-inferred termination cannot masquerade as shell-reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedCommandEvent {
+    pub completed: CompletedCommandOutput,
+    pub start_mark_seen: bool,
+    pub completion_provenance: crate::block_mode::CompletionProvenance,
+}
+
+impl CompletedCommandEvent {
+    pub fn lifecycle_health(&self) -> crate::block_mode::BlockLifecycleHealth {
+        crate::block_mode::assess_lifecycle(self.start_mark_seen, self.completion_provenance)
+    }
+
+    pub fn is_trusted_completion(&self) -> bool {
+        matches!(
+            self.lifecycle_health(),
+            crate::block_mode::BlockLifecycleHealth::Healthy
+                | crate::block_mode::BlockLifecycleHealth::Recovered
+        )
+    }
+}
+
+impl std::ops::Deref for CompletedCommandEvent {
+    type Target = CompletedCommandOutput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.completed
+    }
+}
+
+impl std::ops::DerefMut for CompletedCommandEvent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.completed
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -565,13 +611,17 @@ pub struct TerminalState {
 
     command_records: VecDeque<CommandRecord>,
     next_command_sequence: u64,
+    /// Recently closed OSC execution ids. Records can be evicted or cleared
+    /// by RIS, so this bounded authority prevents a delayed duplicate D from
+    /// being adopted by a later terminal-local placeholder.
+    consumed_command_ids: VecDeque<String>,
     finished_output_provenance: HashMap<u64, FinishedOutputProvenance>,
     finished_output_owners: HashMap<RawRowId, Vec<FinishedOutputOwner>>,
     /// Monotonic structural revision for completed-range ownership. This is
     /// independent from ordinary cell paint changes.
     finished_output_revision: u64,
     active_output_provenance: Option<ActiveOutputProvenance>,
-    pending_completed_command_outputs: VecDeque<CompletedCommandOutput>,
+    pending_completed_command_outputs: VecDeque<CompletedCommandEvent>,
     captured_command_output_bytes: usize,
     agent_prompt_input_tainted: bool,
     armed_agent_execution: Option<ArmedAgentExecution>,

@@ -1061,6 +1061,33 @@ impl TerminalApp {
             );
             return;
         }
+        let lifecycle_health = self
+            .session_manager
+            .sessions()
+            .iter()
+            .find(|session| session.metadata.session_id == target.session_id)
+            .and_then(|session| {
+                let terminal = session.terminal.lock();
+                terminal.command_record(&target.execution_id).map(|record| {
+                    crate::block_mode::assess_lifecycle(
+                        record.start_mark_seen,
+                        record.completion_provenance,
+                    )
+                })
+            });
+        if !matches!(
+            lifecycle_health,
+            Some(
+                crate::block_mode::BlockLifecycleHealth::Healthy
+                    | crate::block_mode::BlockLifecycleHealth::Recovered
+            )
+        ) {
+            self.set_status_for(
+                "Agent execution actions require a trusted command lifecycle",
+                Duration::from_secs(6),
+            );
+            return;
+        }
         let semantic = match self.semantic_context_for_command(target) {
             Ok(context) => context,
             Err(error) => {
@@ -1941,7 +1968,7 @@ impl TerminalApp {
             return Err("Command block is no longer available");
         };
         let background = captured.is_background();
-        let (exit_code, duration_ms, finished_secs, cwd) = self
+        let (exit_code, duration_ms, finished_secs, cwd, start_mark_seen, provenance) = self
             .session_manager
             .sessions()
             .iter()
@@ -1954,6 +1981,8 @@ impl TerminalApp {
                         record.duration_ms,
                         record.finished_at.and_then(crate::block_mode::epoch_secs),
                         record.cwd.clone(),
+                        record.start_mark_seen,
+                        record.completion_provenance,
                     )
                 })
             })
@@ -1964,10 +1993,19 @@ impl TerminalApp {
                         record.duration_ms,
                         record.ended_at_ms.map(|ms| ms / 1000),
                         (!record.cwd.is_empty()).then(|| record.cwd.clone()),
+                        false,
+                        crate::block_mode::CompletionProvenance::JournalRecovered,
                     )
                 })
             })
-            .unwrap_or((None, None, None, None));
+            .unwrap_or((
+                None,
+                None,
+                None,
+                None,
+                false,
+                crate::block_mode::CompletionProvenance::Unknown,
+            ));
         let finished = finished_secs.map(|secs| {
             crate::block_mode::format_local_datetime(
                 secs,
@@ -1978,7 +2016,7 @@ impl TerminalApp {
         let command = (!captured.command_truncated)
             .then_some(captured.command.as_deref())
             .flatten();
-        Ok(crate::block_mode::block_markdown(
+        Ok(crate::block_mode::block_markdown_with_lifecycle(
             &crate::block_mode::MarkdownBlock {
                 command,
                 command_exact: captured.command_exact,
@@ -1991,6 +2029,8 @@ impl TerminalApp {
                 finished: finished.as_deref(),
                 cwd: cwd.as_deref(),
             },
+            start_mark_seen,
+            provenance,
         ))
     }
 
@@ -2020,6 +2060,8 @@ impl TerminalApp {
                             .and_then(crate::block_mode::epoch_secs)
                             .map(|seconds| seconds.saturating_mul(1_000)),
                         terminal.grid.row_len(),
+                        record.start_mark_seen,
+                        record.completion_provenance,
                     )
                 })
             })
@@ -2048,6 +2090,8 @@ impl TerminalApp {
             "end_time_ms": metadata.5,
             "cwd": metadata.1,
             "cols": metadata.6,
+            "completion_provenance": metadata.8.schema_name(),
+            "lifecycle_health": crate::block_mode::assess_lifecycle(metadata.7, metadata.8).schema_name(),
         });
         serde_json::to_string_pretty(&value).map_err(|_| "Could not serialize command block")
     }
