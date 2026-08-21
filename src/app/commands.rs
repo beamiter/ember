@@ -2090,8 +2090,10 @@ impl TerminalApp {
             "end_time_ms": metadata.5,
             "cwd": metadata.1,
             "cols": metadata.6,
-            "completion_provenance": metadata.8.schema_name(),
-            "lifecycle_health": crate::block_mode::assess_lifecycle(metadata.7, metadata.8).schema_name(),
+            "completion_provenance": crate::block_mode::completion_provenance_schema_name(metadata.8),
+            "lifecycle_health": crate::block_mode::lifecycle_health_schema_name(
+                crate::block_mode::assess_lifecycle(metadata.7, metadata.8),
+            ),
         });
         serde_json::to_string_pretty(&value).map_err(|_| "Could not serialize command block")
     }
