@@ -4,7 +4,7 @@
 //! The entries themselves are the family-shared
 //! [`jterm_core::jsh_remote::RemoteHostConfig`] — grammar, validation and the
 //! argv a tab runs all live in the shared crate, so this file is only the
-//! choosing. A host that fails validation is shown greyed out with its
+//! choosing. A host that fails the application gate is shown greyed out with its
 //! reason rather than hidden: a typo in the config should be readable in the
 //! picker, not silently absent from it.
 
@@ -24,13 +24,15 @@ impl RemotePicker {
         self.is_open = !self.is_open;
     }
 
-    /// Draw the picker and return the host the user chose, if any.
+    /// Draw the picker and return the index of the host the user chose, if any.
+    /// Returning the stable config index lets the connection path re-run the
+    /// same application gate immediately before it builds argv.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         hosts: &[RemoteHostConfig],
         theme: &Theme,
-    ) -> Option<RemoteHostConfig> {
+    ) -> Option<usize> {
         if !self.is_open {
             return None;
         }
@@ -56,36 +58,57 @@ impl RemotePicker {
             })
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for host in hosts {
-                        let transport = if host.docker { "docker" } else { "ssh" };
-                        let deploy = if host.deploy.is_empty() {
-                            "off".to_string()
-                        } else {
-                            host.deploy.clone()
-                        };
-                        match host.validate() {
-                            Ok(()) => {
+                    for (index, host) in hosts
+                        .iter()
+                        .take(crate::config::MAX_REMOTE_HOST_UI_ROWS)
+                        .enumerate()
+                    {
+                        // Run the complete app gate before deriving any UI text.
+                        // In particular, do not clone a hostile oversized deploy
+                        // draft once per egui frame before discovering it is
+                        // invalid.
+                        let validation = crate::config::validate_remote_host_at(hosts, index);
+                        let display_name = crate::config::remote_host_display_name(host, index);
+                        match validation {
+                            Ok(_) => {
+                                let transport = if host.docker { "docker" } else { "ssh" };
+                                let deploy = jterm_core::review_input::safe_inline_display(
+                                    if host.deploy.is_empty() {
+                                        "off"
+                                    } else {
+                                        host.deploy.as_str()
+                                    },
+                                    64,
+                                );
                                 let label = RichText::new(format!(
                                     "{}  —  {} · deploy {}",
-                                    host.display_name(),
-                                    transport,
-                                    deploy
+                                    display_name, transport, deploy
                                 ))
                                 .color(text_color);
                                 if ui.button(label).clicked() {
-                                    chosen = Some(host.clone());
+                                    chosen = Some(index);
                                 }
                             }
                             Err(problem) => {
                                 // Readable, not clickable: the picker is where
                                 // a config typo gets discovered.
                                 ui.label(
-                                    RichText::new(format!("{}  —  {problem}", host.display_name()))
+                                    RichText::new(format!("{display_name}  —  {problem}"))
                                         .color(dim_color)
                                         .strikethrough(),
                                 );
                             }
                         }
+                    }
+                    if hosts.len() > crate::config::MAX_REMOTE_HOST_UI_ROWS {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} additional drafts are retained in config.toml but omitted from this bounded view.",
+                                hosts.len() - crate::config::MAX_REMOTE_HOST_UI_ROWS
+                            ))
+                            .color(dim_color)
+                            .small(),
+                        );
                     }
                     if hosts.is_empty() {
                         ui.label(

@@ -448,8 +448,18 @@ impl TerminalApp {
             .config
             .remote_hosts
             .iter()
+            .take(crate::config::MAX_REMOTE_HOSTS)
             .enumerate()
-            .map(|(index, host)| (index, host.display_name().to_string()))
+            .map(|(index, host)| {
+                let unavailable =
+                    crate::config::validate_remote_host_at(&self.config.remote_hosts, index)
+                        .is_err();
+                let mut label = crate::config::remote_host_display_name(host, index);
+                if unavailable {
+                    label.push_str(" (unavailable)");
+                }
+                (index, label)
+            })
             .collect();
 
         let mut switch_to: Option<usize> = None;
@@ -892,11 +902,11 @@ impl TerminalApp {
                 self.close_tabs(targets, "已标记标签页");
             }
             SidebarTabAction::ConnectRemote(index) => {
-                let Some(host) = self.config.remote_hosts.get(index).cloned() else {
+                if self.config.remote_hosts.get(index).is_none() {
                     self.set_status("Remote host is no longer configured");
                     return;
-                };
-                self.connect_remote_host(&host);
+                }
+                self.connect_remote_host(index);
             }
         }
     }
@@ -1659,8 +1669,18 @@ impl TerminalApp {
             .config
             .remote_hosts
             .iter()
+            .take(crate::config::MAX_REMOTE_HOSTS)
             .enumerate()
-            .map(|(index, host)| (index, host.display_name().to_string()))
+            .map(|(index, host)| {
+                let unavailable =
+                    crate::config::validate_remote_host_at(&self.config.remote_hosts, index)
+                        .is_err();
+                let mut label = crate::config::remote_host_display_name(host, index);
+                if unavailable {
+                    label.push_str(" (unavailable)");
+                }
+                (index, label)
+            })
             .collect();
         let mut top_menu_action: Option<SidebarTabAction> = None;
 

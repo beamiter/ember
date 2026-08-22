@@ -9,11 +9,17 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
+DESTDIR_ACTIVE=0
+if [[ -n "${DESTDIR}" ]]; then
+    DESTDIR_ACTIVE=1
+fi
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
 PREBUILT_BINARY=""
+PREBUILT_FD=""
 INSTALL_DESKTOP=1
 DRY_RUN=0
+INSTALL_TEMP=""
 
 usage() {
     cat <<'USAGE'
@@ -37,6 +43,15 @@ die() {
     printf 'ember install: %s\n' "$*" >&2
     exit 1
 }
+
+cleanup_install_temp() {
+    if [[ -n "${INSTALL_TEMP:-}" ]]; then
+        rm -f -- "${INSTALL_TEMP}"
+        INSTALL_TEMP=""
+    fi
+}
+
+trap cleanup_install_temp EXIT
 
 print_command() {
     printf '  '
@@ -85,8 +100,164 @@ require_command() {
     ((DRY_RUN == 1)) || die "required command not found: $1"
 }
 
+# Staging and uninstall paths are assembled by string concatenation. Reject a
+# lexical parent component before doing so: `/opt/../etc` is absolute, but when
+# prefixed with DESTDIR it can escape the package root. Spaces, repeated slashes
+# and non-ASCII names remain valid.
+validate_absolute_path() {
+    local label="$1" path="$2"
+    [[ -n "${path}" ]] || die "${label} must not be empty"
+    [[ "${path}" == /* ]] || die "${label} must be an absolute path"
+    if [[ "${path}" =~ [[:cntrl:]] ]]; then
+        die "${label} must not contain control characters"
+    fi
+    case "/${path#/}/" in
+        */../*) die "${label} must not contain '..' path components" ;;
+    esac
+}
+
+normalize_absolute_path() {
+    local path="$1" normalized="" component
+    local -a components=()
+    IFS='/' read -r -a components <<<"${path}"
+    for component in "${components[@]}"; do
+        [[ -n "${component}" && "${component}" != . ]] || continue
+        normalized="${normalized}/${component}"
+    done
+    printf '%s' "${normalized:-/}"
+}
+
+# Walk the normalized staging root from `/` and reject every existing symlink
+# component. This is an existing-state preflight, not a concurrent-race claim.
+validate_destdir_root() {
+    local suffix current="" component
+    local -a components=()
+    ((DESTDIR_ACTIVE == 1)) || return 0
+    [[ -n "${DESTDIR}" && "${DESTDIR}" != / ]] || return 0
+    suffix="${DESTDIR#/}"
+    IFS='/' read -r -a components <<<"${suffix}"
+    for component in "${components[@]}"; do
+        [[ -n "${component}" ]] || continue
+        current="${current}/${component}"
+        [[ ! -L "${current}" ]] \
+            || die "DESTDIR path contains a symbolic-link component: ${current}"
+        [[ -e "${current}" ]] || break
+    done
+}
+
+require_source_file() {
+    local source="$1"
+    [[ ! -L "${source}" && -f "${source}" && -r "${source}" ]] \
+        || die "required install source is not a readable regular file: ${source}"
+}
+
+# DESTDIR is the packaging boundary under the caller's control. Reject an
+# already-present symlink in that staged path before the build starts; normal
+# host installs are intentionally not subjected to this policy because system
+# prefixes commonly contain legitimate compatibility symlinks.
+validate_staging_target() {
+    local target="$1" suffix current component
+    local -a components=()
+    ((DESTDIR_ACTIVE == 1)) || return 0
+    [[ -n "${DESTDIR}" ]] || return 0
+    validate_destdir_root
+    suffix="${target#"${DESTDIR}"}"
+    suffix="${suffix#/}"
+    current="${DESTDIR}"
+    IFS='/' read -r -a components <<<"${suffix}"
+    for component in "${components[@]}"; do
+        [[ -n "${component}" && "${component}" != . ]] || continue
+        current="${current}/${component}"
+        [[ ! -L "${current}" ]] \
+            || die "staged install path contains a symbolic-link ancestor: ${current}"
+        [[ -e "${current}" ]] || break
+    done
+}
+
+# Public resources use the same same-directory commit discipline as the main
+# executable. Explicit modes are applied to the temp before rename, so the
+# restrictive process umask cannot accidentally publish owner-only assets.
+install_file_atomic() {
+    local mode="$1" source="$2" dest="$3" directory basename
+    printf '  install -m %q %q %q && mv -fT -- %q %q\n' \
+        "${mode}" "${source}" "${dest}.<temporary>" "${dest}.<temporary>" "${dest}"
+    ((DRY_RUN == 0)) || return 0
+    directory="${dest%/*}"
+    basename="${dest##*/}"
+    install -d -m 0755 "${directory}"
+    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
+        || die "cannot create temporary file beside ${dest}"
+    if ! install -m "${mode}" "${source}" "${INSTALL_TEMP}"; then
+        cleanup_install_temp
+        die "cannot stage ${dest}"
+    fi
+    if ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
+        cleanup_install_temp
+        die "cannot atomically replace ${dest}"
+    fi
+    INSTALL_TEMP=""
+}
+
+# Build the replacement beside its destination so rename is atomic and cannot
+# cross filesystems. A failed copy or rename leaves the previous executable in
+# place and removes the private temporary file.
+install_binary_atomic() {
+    local source="$1" dest="$2"
+    printf '  install -m 0755 %q %q && mv -fT -- %q %q\n' \
+        "${source}" "${dest}.<temporary>" "${dest}.<temporary>" "${dest}"
+    ((DRY_RUN == 0)) || return 0
+
+    INSTALL_TEMP="$(mktemp "${dest}.install.XXXXXX")" \
+        || die "cannot create temporary binary beside ${dest}"
+    if ! install -m 0755 "${source}" "${INSTALL_TEMP}"; then
+        cleanup_install_temp
+        die "cannot stage binary for ${dest}"
+    fi
+    if ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
+        cleanup_install_temp
+        die "cannot atomically replace ${dest}"
+    fi
+    INSTALL_TEMP=""
+}
+
+# Bash cannot make the initial no-symlink check and open atomic. Once the open
+# succeeds and pathname/descriptor identity verification succeeds, copy via the
+# inherited /proc descriptor so a later pathname replacement cannot change the
+# inode being copied.
+pin_prebuilt_binary() {
+    local requested="$1" fd_path fd_identity path_identity
+    [[ -d /proc/self/fd && -r /proc/self/fd ]] \
+        || die "cannot pin prebuilt binary: /proc/self/fd is unavailable"
+    [[ ! -L "${requested}" ]] \
+        || die "prebuilt binary must not be a symbolic link: ${requested}"
+    [[ -f "${requested}" ]] \
+        || die "prebuilt binary is not a regular file: ${requested}"
+    [[ -r "${requested}" ]] \
+        || die "prebuilt binary is not readable: ${requested}"
+
+    exec {PREBUILT_FD}<"${requested}" \
+        || die "cannot open prebuilt binary: ${requested}"
+    fd_path="/proc/self/fd/${PREBUILT_FD}"
+    [[ -e "${fd_path}" ]] \
+        || die "cannot pin prebuilt binary: /proc/self/fd is unavailable"
+    [[ -f "${fd_path}" ]] \
+        || die "opened prebuilt binary is not a regular file: ${requested}"
+    [[ -s "${fd_path}" ]] \
+        || die "prebuilt binary must not be empty: ${requested}"
+    fd_identity="$(stat -Lc '%d:%i' -- "${fd_path}")" \
+        || die "cannot identify opened prebuilt binary (GNU stat required): ${requested}"
+    [[ ! -L "${requested}" && -f "${requested}" ]] \
+        || die "prebuilt binary changed while being opened: ${requested}"
+    path_identity="$(stat -Lc '%d:%i' -- "${requested}")" \
+        || die "cannot identify prebuilt binary (GNU stat required): ${requested}"
+    [[ ! -L "${requested}" && "${path_identity}" == "${fd_identity}" ]] \
+        || die "prebuilt binary changed while being opened: ${requested}"
+
+    BINARY="${fd_path}"
+}
+
 bin_dir_on_path() {
-    case ":${PATH}:" in
+    case ":${PATH:-}:" in
         *":${BIN_DIR}:"*) return 0 ;;
         *) return 1 ;;
     esac
@@ -151,45 +322,60 @@ validate_desktop_exec_path() {
     # creates entries that validate yet fail to launch in common GLib desktops.
     [[ "${path}" != *'%'* ]] \
         || die "desktop executable path must not contain '%': ${path}"
-    if LC_ALL=C grep -q '[[:cntrl:]]' <<<"${path}"; then
+    if [[ "${path}" =~ [[:cntrl:]] ]]; then
         die "desktop executable path must not contain control characters"
     fi
 }
 
 install_desktop_entry() {
-    local source="$1" dest="$2" exec_path exec_value try_exec_value
+    local source="$1" dest="$2" exec_path exec_value try_exec_value desktop_dir
     exec_path="$(desktop_exec_path)"
     validate_desktop_exec_path "${exec_path}"
     exec_value="$(desktop_exec_value "${exec_path}")"
     try_exec_value="$(desktop_try_exec_value "${exec_path}")"
     printf '  install -Dm0644 (Exec=%s) %q %q\n' "${exec_path}" "${source}" "${dest}"
     ((DRY_RUN == 0)) || return 0
-    install -d -m 0755 "$(dirname -- "${dest}")"
-    EMBER_DESKTOP_EXEC_VALUE="${exec_value}" \
+    desktop_dir="${dest%/*}"
+    install -d -m 0755 "${desktop_dir}"
+    INSTALL_TEMP="$(mktemp "${desktop_dir}/.${APP_ID}.desktop.install.XXXXXX")" \
+        || die "cannot create temporary desktop entry beside ${dest}"
+    if ! EMBER_DESKTOP_EXEC_VALUE="${exec_value}" \
         EMBER_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
         awk '
+        BEGIN { exec_count = 0; try_exec_count = 0 }
         /^Exec=ember([[:space:]]|$)/ {
+            exec_count++
             eq = index($0, "=")
             print substr($0, 1, eq) ENVIRON["EMBER_DESKTOP_EXEC_VALUE"] \
                 substr($0, eq + 6)
             next
         }
+        /^Exec=/ { exit 42 }
         /^TryExec=ember([[:space:]]|$)/ {
+            try_exec_count++
             eq = index($0, "=")
             print substr($0, 1, eq) ENVIRON["EMBER_DESKTOP_TRY_EXEC_VALUE"] \
                 substr($0, eq + 6)
             next
         }
+        /^TryExec=/ { exit 43 }
         { print }
-    ' "${source}" >"${dest}.new"
-    chmod 0644 "${dest}.new"
-    mv -f -- "${dest}.new" "${dest}"
+        END {
+            if (exec_count < 1 || try_exec_count != 1) exit 44
+        }
+    ' "${source}" >"${INSTALL_TEMP}" \
+        || ! chmod 0644 "${INSTALL_TEMP}" \
+        || ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
+        cleanup_install_temp
+        die "cannot atomically install desktop entry at ${dest}"
+    fi
+    INSTALL_TEMP=""
 }
 
 # Freshly installed entries and icons stay invisible until the shell's caches
 # are rebuilt; a stale icon cache can even shadow icons that are already there.
 refresh_desktop_caches() {
-    if [[ -n "${DESTDIR}" ]]; then
+    if ((DESTDIR_ACTIVE == 1)); then
         printf 'Staged install (DESTDIR set); skipping desktop cache refresh.\n'
         return 0
     fi
@@ -210,19 +396,23 @@ while (($# > 0)); do
         --prefix)
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
+            [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
+            [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
             shift
             ;;
         --bin-dir)
             (($# >= 2)) || die "--bin-dir requires a path"
             BIN_DIR="$2"
+            [[ -n "${BIN_DIR}" ]] || die "--bin-dir must not be empty"
             shift 2
             ;;
         --bin-dir=*)
             BIN_DIR="${1#*=}"
+            [[ -n "${BIN_DIR}" ]] || die "--bin-dir must not be empty"
             shift
             ;;
         --binary)
@@ -259,25 +449,48 @@ while (($# > 0)); do
 done
 
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
-[[ -n "${PREFIX}" ]] || die "prefix must not be empty"
-[[ "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
+validate_absolute_path "--prefix" "${PREFIX}"
 if [[ -z "${BIN_DIR}" ]]; then
     BIN_DIR="${PREFIX}/bin"
 fi
-[[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
-if [[ -n "${DESTDIR}" ]]; then
-    [[ "${DESTDIR}" == /* ]] || die "DESTDIR must be an absolute path"
-    DESTDIR="${DESTDIR%/}"
+validate_absolute_path "--bin-dir" "${BIN_DIR}"
+if ((DESTDIR_ACTIVE == 1)); then
+    validate_absolute_path "DESTDIR" "${DESTDIR}"
+    DESTDIR="$(normalize_absolute_path "${DESTDIR}")"
+    validate_destdir_root
+    if [[ "${DESTDIR}" == / ]]; then
+        DESTDIR=""
+    fi
+fi
+
+validate_staging_target "${DESTDIR}${BIN_DIR}"
+validate_staging_target "${DESTDIR}${PREFIX}/share"
+if ((INSTALL_DESKTOP == 1)); then
+    require_source_file "${REPO_ROOT}/data/${APP_ID}.desktop"
+    require_source_file "${REPO_ROOT}/data/${APP_ID}.metainfo.xml"
+    require_source_file "${REPO_ROOT}/data/${APP_ID}.svg"
+    require_source_file "${REPO_ROOT}/data/${APP_ID}-128.png"
+    require_source_file "${REPO_ROOT}/data/${APP_ID}-256.png"
+fi
+
+# Fail before building or modifying a target if the transactional install
+# primitives needed later are unavailable.
+require_command install
+require_command mktemp
+require_command mv
+require_command rm
+if ((INSTALL_DESKTOP == 1)); then
+    require_command awk
+    require_command chmod
+    validate_desktop_exec_path "$(desktop_exec_path)"
 fi
 
 if [[ -n "${PREBUILT_BINARY}" ]]; then
     BINARY="${PREBUILT_BINARY}"
     printf 'Using prebuilt ember binary: %s\n' "${BINARY}"
-    if ((DRY_RUN == 0)) && [[ ! -f "${BINARY}" ]]; then
-        die "prebuilt binary is not a regular file: ${BINARY}"
-    fi
-    if ((DRY_RUN == 0)) && [[ ! -r "${BINARY}" ]]; then
-        die "prebuilt binary is not readable: ${BINARY}"
+    if ((DRY_RUN == 0)); then
+        require_command stat
+        pin_prebuilt_binary "${PREBUILT_BINARY}"
     fi
 else
     TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
@@ -296,10 +509,12 @@ else
     fi
 fi
 
-require_command install
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
-run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/ember"
+install_binary_atomic "${BINARY}" "${STAGED_BIN_DIR}/ember"
+if [[ -n "${PREBUILT_FD}" ]]; then
+    exec {PREBUILT_FD}<&-
+fi
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
 if ((INSTALL_DESKTOP == 1)); then
@@ -308,12 +523,12 @@ if ((INSTALL_DESKTOP == 1)); then
     # Launcher left by installs from before the jterm2 -> ember rename; left in
     # place it shows up as a second "jterm2" entry beside the new one.
     run rm -f -- "${SHARE_DIR}/applications/io.github.beamiter.jterm2.desktop"
-    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
+    install_file_atomic 0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
         "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
-    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
+    install_file_atomic 0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
         "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
     for size in 128 256; do
-        run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}-${size}.png" \
+        install_file_atomic 0644 "${REPO_ROOT}/data/${APP_ID}-${size}.png" \
             "${SHARE_DIR}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
     done
     refresh_desktop_caches
@@ -325,10 +540,10 @@ if ((INSTALL_DESKTOP == 1)); then
     printf 'Launcher entry: %s (Exec=%s)\n' \
         "${SHARE_DIR}/applications/${APP_ID}.desktop" "$(desktop_exec_path)"
 fi
-if [[ -n "${DESTDIR}" ]]; then
+if ((DESTDIR_ACTIVE == 1)); then
     printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/ember"
 fi
-if [[ -z "${DESTDIR}" ]]; then
+if ((DESTDIR_ACTIVE == 0)); then
     if ! bin_dir_on_path; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"

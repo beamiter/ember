@@ -2597,7 +2597,9 @@ impl TerminalApp {
                                 {
                                     location_changed = Some(remote_fs::FsLocation::Local);
                                 }
-                                for (index, _host) in hosts.iter().enumerate() {
+                                for (index, _host) in
+                                    hosts.iter().take(config::MAX_REMOTE_HOSTS).enumerate()
+                                {
                                     let location = remote_fs::FsLocation::Remote(index);
                                     if ui
                                         .selectable_label(

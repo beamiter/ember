@@ -165,11 +165,21 @@ impl TerminalApp {
     /// comes from the shared family builder: the deploy launcher when the
     /// entry asks for it — lending the local jsh when that one is static —
     /// and a plain ssh / `docker exec` otherwise.
-    pub fn connect_remote_host(&mut self, host: &jterm_core::jsh_remote::RemoteHostConfig) {
-        if let Err(problem) = host.validate() {
-            self.set_status(format!("Remote host {}: {problem}", host.display_name()));
-            return;
-        }
+    pub fn connect_remote_host(&mut self, index: usize) {
+        let host = match crate::config::validate_remote_host_at(&self.config.remote_hosts, index) {
+            Ok(host) => host.clone(),
+            Err(problem) => {
+                let name = self
+                    .config
+                    .remote_hosts
+                    .get(index)
+                    .map(|host| crate::config::remote_host_display_name(host, index))
+                    .unwrap_or_else(|| format!("remote host #{}", index + 1));
+                self.set_status(format!("Remote host {name}: {problem}"));
+                return;
+            }
+        };
+        let display_name = crate::config::remote_host_display_name(&host, index);
         let (argv, degraded) = host.tab_argv();
         if let Some(error) = degraded {
             // The tab still opens — a plain connection beats no connection —
@@ -178,16 +188,16 @@ impl TerminalApp {
             log::warn!("cannot publish jsh-remote.sh: {error}; connecting without deployment");
             self.set_status(format!(
                 "Deploy unavailable ({error}); connecting to {} plainly",
-                host.display_name()
+                display_name
             ));
         } else {
-            self.set_status(format!("Connecting to {}", host.display_name()));
+            self.set_status(format!("Connecting to {display_name}"));
         }
 
         let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
         let old_len = self.session_manager.len();
         let index = self.session_manager.new_command_session(
-            host.display_name().to_string(),
+            display_name,
             argv,
             cols,
             rows,

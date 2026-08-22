@@ -2132,16 +2132,16 @@ mod tests {
         assert_eq!(sidebar.cancel_transfers(), 1);
         assert_eq!(sidebar.cancel_transfers(), 0);
         // 与完成竞争的取消是 no-op：worker 的 Done 到达后在途条目被摘除。
-        let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.transfer_status().is_some());
-        assert!(!sidebar.transfer_status().is_some());
+        let _ = poll_ops_until(&mut sidebar, |sidebar| sidebar.transfer_status().is_none());
+        assert!(sidebar.transfer_status().is_none());
 
         // 切换位置即放弃在途传输：条目立即清空，迟到的结果被 generation 丢弃。
         assert!(sidebar.request_transfer(make_transfer(), false).is_none());
         assert!(sidebar.transfer_status().is_some());
         assert!(sidebar.set_location(FsLocation::Remote(0)).is_none());
-        assert!(!sidebar.transfer_status().is_some());
+        assert!(sidebar.transfer_status().is_none());
         let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
-        assert!(!sidebar.transfer_status().is_some());
+        assert!(sidebar.transfer_status().is_none());
         assert!(sidebar.set_location(FsLocation::Local).is_none());
     }
 

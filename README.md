@@ -145,9 +145,28 @@ RUST_LOG=ember=debug cargo run
 `--binary` suits release archives, CI artifacts, and distro staging: the
 installer never invokes the Rust toolchain, yet still installs the binary,
 desktop entry, AppStream metadata, and icons through the same tested paths.
-The input must be a readable regular file; the installed binary mode is always
-`0755`. It composes with `--prefix`, `--bin-dir`, `--no-desktop`, and
-`DESTDIR`.
+The input must be a readable, non-symlink regular file. This path requires
+Linux with `/proc/self/fd` mounted and GNU `stat`; the installer fails with a
+diagnostic when descriptor pinning is unavailable. Bash does not provide an
+atomic no-follow open here. After the file is successfully opened and the
+pathname and descriptor are verified to identify the same inode, a later
+pathname replacement cannot change the inode copied through that descriptor.
+The installed binary mode is always `0755`. A private temporary file is created
+beside the destination and GNU `mv -T` replaces it atomically; copy failures or
+exit before rename clean up that uncommitted temp and retain the previous
+binary. Rename is the binary commit point; a later resource failure does not
+roll it back. This requires GNU coreutils `mktemp`/`mv` in addition to the
+prerequisites above. It composes
+with `--prefix`, `--bin-dir`, `--no-desktop`, and `DESTDIR`.
+Zero-byte prebuilt files are rejected before the old target changes. Desktop,
+AppStream, SVG, and PNG sources are all preflighted before build/write; public
+assets use mode-correct same-directory temps and atomic rename too. Under a
+non-root packaging `DESTDIR`, repeated separators and lexical `.` components
+are collapsed before every existing component from `/` through the staging
+root is checked for symlinks. A disguised root link is therefore rejected
+before either an install write or uninstall removal, while normal host prefixes
+keep their usual symlink behavior. This is an existing-state preflight, not a
+guarantee against a component replaced concurrently after the check.
 
 Install and uninstall derive their targets from the same runtime paths: the
 binary defaults to `PREFIX/bin/ember`, and the desktop entry and icons live
@@ -156,6 +175,9 @@ under `PREFIX/share`. Re-running the installer updates the same targets.
 when uninstalling later. `DESTDIR` merely prepends a packaging root to these
 absolute runtime paths — the desktop entry's `Exec=` still points at the
 runtime path without `DESTDIR`.
+Those absolute runtime paths may contain spaces, Unicode and `.` components;
+empty values, control characters, and lexical `..` components are rejected.
+Only the `DESTDIR` spelling is lexically normalized as described above.
 
 This installs into `~/.local` by default (override with `--prefix`/`--bin-dir`,
 and `DESTDIR` for packaging):
@@ -593,6 +615,23 @@ without editing the file by hand; the less common fields (`ssh_args`,
 `session`, `remote_shell`, `deploy_artifact`) stay config-file only and survive
 the panel untouched.
 
+Invalid or temporarily incomplete entries are preserved when Settings saves,
+so correcting a field never destroys the rest of that host. A single
+application-level gate combines the shared connection grammar with bounded,
+visually safe text and is rechecked by the picker, connection launcher, and
+remote Files backend before any process is started. App-owned length, control,
+and visual-format checks run before shared semantic validation, so an unknown
+`deploy` draft cannot inject its raw, oversized, or direction-changing value
+into an error shown by the UI. The first 128 entries may
+be active; later entries still round-trip and remain editable but are shown as
+unavailable, and Settings disables Add until the count is back below 128.
+Picker and Settings render at most 256 rows at once (so entry 129 remains
+visible with its inactive diagnosis); any further drafts stay byte-for-byte in
+memory and on disk and the UI reports how many were omitted from that bounded
+view. Save feedback separately counts invalid active drafts and retained
+over-limit drafts. Runtime-only errors use a neutral bounded host label rather
+than inventing an index.
+
 `deploy = "off"` (the default) connects plainly and runs `remote_shell`
 (default `jsh`) as found on the destination. `"persist"` and `"incognito"`
 bring jsh along through the family's `jsh-remote.sh`: when the local jsh is a
@@ -710,6 +749,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo build --workspace --release --all-features
+bash scripts/test-install-paths.sh
 ```
 
 Criterion benchmarks, including deep-scrollback resize/reflow with a forced

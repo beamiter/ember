@@ -15,6 +15,13 @@ pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_NAME_BYTES: usize = 256;
 const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
+const MAX_REMOTE_SSH_ARGS: usize = 64;
+const MAX_REMOTE_PROFILE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
+/// UI surfaces render a bounded prefix without mutating or truncating the
+/// persisted draft list. Deliberately above the active limit so entry 129 is
+/// visible with its retained-but-unavailable diagnosis.
+pub(crate) const MAX_REMOTE_HOST_UI_ROWS: usize = 256;
 
 // Nerd Font priority list
 const NERD_FONT_CANDIDATES: &[&str] = &[
@@ -890,7 +897,8 @@ impl Config {
             default_ai_provider,
         ) {
             warnings.push(
-                "ai_provider is empty, oversized, or contains controls; using default".into(),
+                "ai_provider is empty, oversized, or contains controls or invisible formatting; using default"
+                    .into(),
             );
         }
         if normalize_required_text(
@@ -899,16 +907,20 @@ impl Config {
             default_ai_base_url,
         ) {
             warnings.push(
-                "ai_base_url is empty, oversized, or contains controls; using default".into(),
+                "ai_base_url is empty, oversized, or contains controls or invisible formatting; using default"
+                    .into(),
             );
         }
         if normalize_required_text(&mut self.ai_model, MAX_CONFIG_NAME_BYTES, default_ai_model) {
-            warnings
-                .push("ai_model is empty, oversized, or contains controls; using default".into());
+            warnings.push(
+                "ai_model is empty, oversized, or contains controls or invisible formatting; using default"
+                    .into(),
+            );
         }
         if normalize_optional_text(&mut self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES) {
             warnings.push(
-                "ai_api_key_file is empty, oversized, or contains controls; ignoring it".into(),
+                "ai_api_key_file is empty, oversized, or contains controls or invisible formatting; ignoring it"
+                    .into(),
             );
         }
         if normalize_required_text(
@@ -917,15 +929,20 @@ impl Config {
             default_font_family,
         ) {
             warnings.push(
-                "font_family is empty, oversized, or contains controls; using default".into(),
+                "font_family is empty, oversized, or contains controls or invisible formatting; using default"
+                    .into(),
             );
         }
         if normalize_required_text(&mut self.theme, MAX_CONFIG_NAME_BYTES, default_theme) {
-            warnings.push("theme is empty, oversized, or contains controls; using default".into());
+            warnings.push(
+                "theme is empty, oversized, or contains controls or invisible formatting; using default"
+                    .into(),
+            );
         }
         if normalize_optional_text(&mut self.shell, MAX_CONFIG_VALUE_BYTES) {
             warnings.push(
-                "shell is empty, oversized, or contains controls; using automatic detection".into(),
+                "shell is empty, oversized, or contains controls or invisible formatting; using automatic detection"
+                    .into(),
             );
         }
         if self
@@ -935,9 +952,25 @@ impl Config {
         {
             self.session_history_file = None;
             warnings.push(
-                "session_history_file is empty, oversized, or contains controls; using default"
+                "session_history_file is empty, oversized, or contains controls or invisible formatting; using default"
                     .into(),
             );
+        }
+        let (invalid_remote_hosts, inactive) = remote_host_problem_counts(&self.remote_hosts);
+        if invalid_remote_hosts > 0 {
+            let noun = if invalid_remote_hosts == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            warnings.push(format!(
+                "remote_hosts retained {invalid_remote_hosts} unsafe or invalid {noun}; they remain editable but cannot be used"
+            ));
+        }
+        if inactive > 0 {
+            warnings.push(format!(
+                "remote_hosts retained {inactive} entries beyond the {MAX_REMOTE_HOSTS}-host active limit; they remain editable but cannot be used"
+            ));
         }
         let normalized_update_check =
             jterm_core::jsh_install::UpdateCheck::parse(&self.jsh_update_check)
@@ -961,7 +994,170 @@ impl Config {
 }
 
 fn valid_config_text(value: &str, max_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && !jterm_core::review_input::contains_visual_spoofing(value)
+}
+
+fn validate_remote_host_text(value: &str, field: &str, max_bytes: usize) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!("{field} exceeds the {max_bytes}-byte limit"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    if jterm_core::review_input::contains_visual_spoofing(value) {
+        return Err(format!(
+            "{field} must not contain invisible or direction-changing formatting"
+        ));
+    }
+    Ok(())
+}
+
+/// The single application-level safety gate for a configured remote host.
+///
+/// Invalid entries deliberately remain in the user's configuration so the
+/// settings editor can repair them. Every path that can display one outside
+/// that editor or turn one into process argv must call this gate (or
+/// [`validate_remote_host_at`]) before use.
+fn precheck_remote_host_app_fields(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+    effective_user: Option<&str>,
+) -> Result<(), String> {
+    validate_remote_host_text(&host.name, "name", MAX_CONFIG_NAME_BYTES)?;
+    validate_remote_host_text(&host.host, "host", MAX_CONFIG_VALUE_BYTES)?;
+    if let Some(user) = effective_user {
+        validate_remote_host_text(user, "user", MAX_CONFIG_VALUE_BYTES)?;
+    }
+    validate_remote_host_text(&host.remote_shell, "remote_shell", MAX_CONFIG_VALUE_BYTES)?;
+    if let Some(session) = &host.session {
+        validate_remote_host_text(session, "session", MAX_CONFIG_VALUE_BYTES)?;
+    }
+    // Bound the collection before walking it.  Besides keeping validation
+    // work deterministic for a hostile in-memory draft, this guarantees the
+    // later owning clone only ever sees a small argv vector.
+    if host.ssh_args.len() > MAX_REMOTE_SSH_ARGS {
+        return Err(format!(
+            "ssh_args must not contain more than {MAX_REMOTE_SSH_ARGS} entries"
+        ));
+    }
+    for argument in &host.ssh_args {
+        validate_remote_host_text(argument, "ssh_args entry", MAX_CONFIG_VALUE_BYTES)?;
+    }
+    if let Some(artifact) = &host.deploy_artifact {
+        validate_remote_host_text(artifact, "deploy_artifact", MAX_CONFIG_VALUE_BYTES)?;
+    }
+    validate_remote_host_text(&host.deploy, "deploy", MAX_CONFIG_NAME_BYTES)?;
+
+    if !matches!(host.deploy.as_str(), "" | "off" | "persist" | "incognito") {
+        return Err("deploy must be off, persist, or incognito".to_string());
+    }
+
+    let total = host
+        .ssh_args
+        .iter()
+        .try_fold(
+            host.name
+                .len()
+                .saturating_add(host.host.len())
+                .saturating_add(effective_user.map_or(0, str::len))
+                .saturating_add(host.remote_shell.len())
+                .saturating_add(host.session.as_deref().map_or(0, str::len))
+                .saturating_add(host.deploy.len())
+                .saturating_add(host.deploy_artifact.as_deref().map_or(0, str::len)),
+            |sum, argument| sum.checked_add(argument.len()),
+        )
+        .unwrap_or(usize::MAX);
+    if total > MAX_REMOTE_PROFILE_BYTES {
+        return Err(format!(
+            "remote profile exceeds the {MAX_REMOTE_PROFILE_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
+/// Preflight a Settings draft without allocating an owning clone.  The user
+/// text lives in a separate editor buffer, so it is supplied independently.
+/// Passing this gate bounds the later trim-and-clone validation path.
+// This module is compiled into both ember's library and binary targets; only
+// the binary target contains the Settings panel that consumes this helper.
+#[allow(dead_code)]
+pub(crate) fn precheck_remote_host_draft(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+    user: &str,
+) -> Result<(), String> {
+    precheck_remote_host_app_fields(host, Some(user))
+}
+
+pub(crate) fn validate_remote_host(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> Result<(), String> {
+    precheck_remote_host_app_fields(host, host.user.as_deref())?;
+
+    // The shared semantic validator may quote a rejected value in its error.
+    // Run every app-owned size/control/spoof check first so untrusted draft
+    // bytes cannot become an unbounded or direction-changing diagnostic.
+    host.validate()
+}
+
+/// Resolve one active host while enforcing both the per-entry gate and the
+/// first-128 runtime resource boundary. Entries past the boundary are retained
+/// for editing and round trips, but never become process argv.
+pub(crate) fn validate_remote_host_at(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    index: usize,
+) -> Result<&jterm_core::jsh_remote::RemoteHostConfig, String> {
+    if index >= MAX_REMOTE_HOSTS {
+        return Err(format!(
+            "entry #{} exceeds the {MAX_REMOTE_HOSTS}-host active limit; it is retained but unavailable",
+            index.saturating_add(1)
+        ));
+    }
+    let host = hosts
+        .get(index)
+        .ok_or_else(|| format!("remote host #{} is not configured", index + 1))?;
+    validate_remote_host(host)?;
+    Ok(host)
+}
+
+pub(crate) fn remote_host_problem_counts(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> (usize, usize) {
+    let invalid_active = hosts
+        .iter()
+        .take(MAX_REMOTE_HOSTS)
+        .filter(|host| validate_remote_host(host).is_err())
+        .count();
+    let inactive_retained = hosts.len().saturating_sub(MAX_REMOTE_HOSTS);
+    (invalid_active, inactive_retained)
+}
+
+/// A bounded, formatting-safe label for runtime surfaces. The settings text
+/// fields keep the original bytes so an invalid draft can still be repaired.
+pub(crate) fn remote_host_display_name(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+    index: usize,
+) -> String {
+    let label =
+        jterm_core::review_input::safe_inline_display(host.display_name(), MAX_CONFIG_NAME_BYTES);
+    if label.trim().is_empty() {
+        format!("remote host #{}", index + 1)
+    } else {
+        label
+    }
+}
+
+/// Runtime helpers that have a host reference but no stable config index use
+/// a neutral fallback, never a fabricated "#1" identity.
+pub(crate) fn remote_host_runtime_label(host: &jterm_core::jsh_remote::RemoteHostConfig) -> String {
+    let label =
+        jterm_core::review_input::safe_inline_display(host.display_name(), MAX_CONFIG_NAME_BYTES);
+    if label.trim().is_empty() {
+        "remote host".to_string()
+    } else {
+        label
+    }
 }
 
 fn normalize_required_text(value: &mut String, max_bytes: usize, fallback: fn() -> String) -> bool {
@@ -990,6 +1186,7 @@ fn valid_config_path(path: &std::path::Path) -> bool {
     !value.is_empty()
         && value.len() <= MAX_CONFIG_VALUE_BYTES
         && !value.chars().any(char::is_control)
+        && !jterm_core::review_input::contains_visual_spoofing(&value)
 }
 
 #[cfg(test)]
@@ -1129,6 +1326,255 @@ mod tests {
         assert_eq!(config.shell, None);
         assert_eq!(config.session_history_file, None);
         assert_eq!(config.jsh_update_check, "daily");
+    }
+
+    #[test]
+    fn normalize_rejects_visual_spoofing_in_labels_and_paths() {
+        let mut config = Config {
+            ai_model: "safe-model\u{202e}gpj".to_string(),
+            font_family: "Monospace\u{2066}hidden".to_string(),
+            shell: Some("/bin/sh\u{200b}".to_string()),
+            session_history_file: Some(PathBuf::from("/tmp/session\u{202d}.json")),
+            ..Config::default()
+        };
+
+        let warnings = config.normalize();
+
+        assert!(!warnings.is_empty());
+        assert_eq!(config.ai_model, default_ai_model());
+        assert_eq!(config.font_family, default_font_family());
+        assert_eq!(config.shell, None);
+        assert_eq!(config.session_history_file, None);
+        assert!(warnings
+            .iter()
+            .all(|warning| !warning.contains("contains controls;")));
+    }
+
+    #[test]
+    fn normalize_preserves_remote_hosts_with_spoofing_but_gate_rejects_them() {
+        let safe = default_remote_hosts()[0].clone();
+        let mut unsafe_hosts = Vec::new();
+
+        let mut host = safe.clone();
+        host.name.push('\u{202e}');
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.host.push('\u{200b}');
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.user = Some("root\u{2066}hidden".to_string());
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.remote_shell.push('\u{2069}');
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.session = Some("session\u{202d}hidden".to_string());
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.ssh_args
+            .push("ProxyJump=safe\u{200b}hidden".to_string());
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.deploy_artifact = Some("/tmp/jsh\u{202e}hidden".to_string());
+        unsafe_hosts.push(host);
+        let mut host = safe.clone();
+        host.deploy.push('\u{2067}');
+        unsafe_hosts.push(host);
+
+        let original: Vec<_> = std::iter::once(safe.clone()).chain(unsafe_hosts).collect();
+        let mut config = Config {
+            remote_hosts: original.clone(),
+            ..Config::default()
+        };
+        let warnings = config.normalize();
+
+        assert_eq!(config.remote_hosts, original);
+        assert!(validate_remote_host(&config.remote_hosts[0]).is_ok());
+        assert!(config.remote_hosts[1..]
+            .iter()
+            .all(|host| validate_remote_host(host).is_err()));
+        let displayed = remote_host_display_name(&config.remote_hosts[1], 1);
+        assert!(!jterm_core::review_input::contains_visual_spoofing(
+            &displayed
+        ));
+        assert!(displayed.len() <= MAX_CONFIG_NAME_BYTES);
+        assert!(warnings
+            .iter()
+            .any(|warning| { warning.contains("retained 8 unsafe or invalid entries") }));
+    }
+
+    #[test]
+    fn normalize_preserves_semantically_invalid_remote_hosts_but_gate_rejects_them() {
+        let safe = default_remote_hosts()[0].clone();
+        let mut option_like_host = safe.clone();
+        option_like_host.host = "-oProxyCommand=bad".to_string();
+        let mut invalid_user = safe.clone();
+        invalid_user.user = Some("root@other".to_string());
+        let mut unknown_deploy = safe.clone();
+        unknown_deploy.deploy = "sometimes".to_string();
+        let mut relative_artifact = safe.clone();
+        relative_artifact.deploy_artifact = Some("relative/jsh".to_string());
+        let mut oversized_name = safe.clone();
+        oversized_name.name = "n".repeat(MAX_CONFIG_NAME_BYTES + 1);
+        let mut oversized_artifact = safe.clone();
+        oversized_artifact.deploy_artifact =
+            Some(format!("/tmp/{}", "a".repeat(MAX_CONFIG_VALUE_BYTES)));
+
+        let original = vec![
+            safe.clone(),
+            option_like_host,
+            invalid_user,
+            unknown_deploy,
+            relative_artifact,
+            oversized_name,
+            oversized_artifact,
+        ];
+        let mut config = Config {
+            remote_hosts: original.clone(),
+            ..Config::default()
+        };
+        let warnings = config.normalize();
+
+        assert_eq!(config.remote_hosts, original);
+        assert!(validate_remote_host(&config.remote_hosts[0]).is_ok());
+        assert!(config.remote_hosts[1..]
+            .iter()
+            .all(|host| validate_remote_host(host).is_err()));
+        assert!(
+            remote_host_display_name(&config.remote_hosts[5], 5).len() <= MAX_CONFIG_NAME_BYTES
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("retained 6 unsafe or invalid entries")));
+    }
+
+    #[test]
+    fn remote_gate_redacts_unsafe_deploy_values_before_shared_validation() {
+        let safe = default_remote_hosts()[0].clone();
+
+        let mut oversized = safe.clone();
+        oversized.deploy = format!("secret-marker-{}", "x".repeat(MAX_CONFIG_NAME_BYTES));
+        let oversized_error = validate_remote_host(&oversized).unwrap_err();
+        assert_eq!(
+            oversized_error,
+            format!("deploy exceeds the {MAX_CONFIG_NAME_BYTES}-byte limit")
+        );
+        assert!(!oversized_error.contains("secret-marker"));
+        assert!(oversized_error.len() < 128);
+
+        let mut spoofed = safe;
+        spoofed.deploy = "unknown\u{202e}secret-marker".to_string();
+        let spoofed_error = validate_remote_host(&spoofed).unwrap_err();
+        assert_eq!(
+            spoofed_error,
+            "deploy must not contain invisible or direction-changing formatting"
+        );
+        assert!(!spoofed_error.contains("unknown"));
+        assert!(!spoofed_error.contains("secret-marker"));
+        assert!(spoofed_error.len() < 128);
+        assert!(!jterm_core::review_input::contains_visual_spoofing(
+            &spoofed_error
+        ));
+
+        let mut unknown = default_remote_hosts()[0].clone();
+        unknown.deploy = "unknown-secret-marker".to_string();
+        let unknown_error = validate_remote_host(&unknown).unwrap_err();
+        assert_eq!(unknown_error, "deploy must be off, persist, or incognito");
+        assert!(!unknown_error.contains("secret-marker"));
+    }
+
+    #[test]
+    fn normalization_and_serialization_preserve_the_129th_remote_host() {
+        let hosts: Vec<_> = (0..MAX_REMOTE_HOSTS + 3)
+            .map(|index| {
+                let mut host = default_remote_hosts()[0].clone();
+                host.name = format!("host-{index}");
+                host.host = format!("host-{index}.example.test");
+                host
+            })
+            .collect();
+        let expected = hosts.clone();
+        let mut config = Config {
+            remote_hosts: hosts,
+            ..Config::default()
+        };
+
+        let warnings = config.normalize();
+
+        assert_eq!(config.remote_hosts, expected);
+        assert!(validate_remote_host_at(&config.remote_hosts, MAX_REMOTE_HOSTS - 1).is_ok());
+        assert!(validate_remote_host_at(&config.remote_hosts, MAX_REMOTE_HOSTS).is_err());
+        assert!(validate_remote_host_at(&config.remote_hosts, usize::MAX).is_err());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("retained 3 entries beyond the 128-host active limit"))
+        );
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize all host drafts");
+        let mut reparsed: Config = toml::from_str(&serialized).expect("reparse all host drafts");
+        reparsed.normalize();
+        assert_eq!(reparsed.remote_hosts, expected);
+    }
+
+    #[test]
+    fn disk_save_preserves_invalid_and_129th_remote_drafts() {
+        let mut hosts: Vec<_> = (0..MAX_REMOTE_HOSTS + 1)
+            .map(|index| {
+                let mut host = default_remote_hosts()[0].clone();
+                host.name = format!("host-{index}");
+                host.host = format!("host-{index}.example.test");
+                host
+            })
+            .collect();
+        hosts[0].name.clear();
+        hosts[0].host.clear();
+        let expected = hosts.clone();
+        let root =
+            std::env::temp_dir().join(format!("ember-remote-roundtrip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &root,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let path = root.join("config.toml");
+        let mut config = Config {
+            remote_hosts: hosts,
+            revision: None,
+            ..Config::default()
+        };
+
+        config.save_path(&path).expect("save retained drafts");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&saved).expect("reload retained drafts");
+        assert_eq!(reloaded.remote_hosts, expected);
+        assert_eq!(remote_host_problem_counts(&reloaded.remote_hosts), (1, 1));
+        assert_eq!(
+            remote_host_runtime_label(&reloaded.remote_hosts[0]),
+            "remote host"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporary_empty_remote_host_draft_survives_normalization() {
+        let mut draft = default_remote_hosts()[0].clone();
+        draft.host.clear();
+        let mut config = Config {
+            remote_hosts: vec![draft.clone()],
+            ..Config::default()
+        };
+
+        let warnings = config.normalize();
+
+        assert_eq!(config.remote_hosts, [draft]);
+        assert!(validate_remote_host(&config.remote_hosts[0]).is_err());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("retained 1 unsafe or invalid entry")));
     }
 
     #[test]

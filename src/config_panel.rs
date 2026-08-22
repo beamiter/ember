@@ -47,12 +47,27 @@ impl RemoteHostDraft {
     /// None. Validation runs on this form so the label matches what Save
     /// actually persists.
     fn applied(&self) -> RemoteHostConfig {
-        let mut host = self.host.clone();
-        host.name = host.name.trim().to_string();
-        host.host = host.host.trim().to_string();
         let user = self.user.trim();
-        host.user = (!user.is_empty()).then(|| user.to_string());
-        host
+        // Do not clone `self.host.user`: the Settings buffer is authoritative
+        // for visible rows, and the embedded copy may still contain a hostile
+        // oversized value that the user has just repaired. Every field cloned
+        // below was bounded by `precheck_remote_host_draft` first.
+        RemoteHostConfig {
+            name: self.host.name.trim().to_string(),
+            host: self.host.host.trim().to_string(),
+            user: (!user.is_empty()).then(|| user.to_string()),
+            docker: self.host.docker,
+            remote_shell: self.host.remote_shell.clone(),
+            session: self.host.session.clone(),
+            ssh_args: self.host.ssh_args.clone(),
+            deploy: self.host.deploy.clone(),
+            deploy_artifact: self.host.deploy_artifact.clone(),
+        }
+    }
+
+    fn validate_for_apply(&self) -> Result<(), String> {
+        crate::config::precheck_remote_host_draft(&self.host, &self.user)?;
+        crate::config::validate_remote_host(&self.applied())
     }
 
     fn template() -> Self {
@@ -339,7 +354,17 @@ impl ConfigPanel {
         config.remote_hosts = self
             .edit_remote_hosts
             .iter()
-            .map(RemoteHostDraft::applied)
+            .enumerate()
+            .map(|(index, draft)| {
+                if index < crate::config::MAX_REMOTE_HOST_UI_ROWS {
+                    draft.applied()
+                } else {
+                    // Off-view drafts have no editable widgets.  Preserve their
+                    // exact owning strings instead of silently trimming them
+                    // when an unrelated visible setting is saved.
+                    draft.host.clone()
+                }
+            })
             .collect();
     }
 
@@ -1503,8 +1528,24 @@ impl ConfigPanel {
 
         let mut changed = false;
         let mut delete_index = None;
-        for (index, draft) in self.edit_remote_hosts.iter_mut().enumerate() {
+        for (index, draft) in self
+            .edit_remote_hosts
+            .iter_mut()
+            .take(crate::config::MAX_REMOTE_HOST_UI_ROWS)
+            .enumerate()
+        {
             egui::Frame::group(ui.style()).show(ui, |ui| {
+                // Preflight before deriving labels or constructing the
+                // bounded owning value used by shared semantic validation.
+                let validation = if index >= crate::config::MAX_REMOTE_HOSTS {
+                    Err(format!(
+                        "entry #{} exceeds the {}-host active limit; it is retained but unavailable",
+                        index + 1,
+                        crate::config::MAX_REMOTE_HOSTS
+                    ))
+                } else {
+                    draft.validate_for_apply()
+                };
                 ui.horizontal(|ui| {
                     ui.label("Name:");
                     if ui
@@ -1558,41 +1599,77 @@ impl ConfigPanel {
                     // The empty spelling means Off ([`Deploy::parse`]); the
                     // combo writes it back explicitly so the saved file reads
                     // the way the picker displays it.
-                    let current = if draft.host.deploy.is_empty() {
-                        "off".to_string()
-                    } else {
-                        draft.host.deploy.clone()
-                    };
+                    let current_label = jterm_core::review_input::safe_inline_display(
+                        if draft.host.deploy.is_empty() {
+                            "off"
+                        } else {
+                            draft.host.deploy.as_str()
+                        },
+                        64,
+                    );
                     egui::ComboBox::from_id_salt(("remote_host_deploy", index))
-                        .selected_text(current.clone())
+                        .selected_text(current_label)
                         .width(110.0)
                         .show_ui(ui, |ui| {
                             for mode in ["off", "persist", "incognito"] {
-                                if ui.selectable_label(current == mode, mode).clicked()
-                                    && current != mode
-                                {
+                                let selected = if draft.host.deploy.is_empty() {
+                                    mode == "off"
+                                } else {
+                                    draft.host.deploy == mode
+                                };
+                                if ui.selectable_label(selected, mode).clicked() && !selected {
                                     draft.host.deploy = mode.to_string();
                                     changed = true;
                                 }
                             }
                         });
                 });
-                // Save is never blocked on this: an invalid entry persists and
-                // the picker shows it struck through with the same reason.
-                if let Err(problem) = draft.applied().validate() {
+                // Invalid drafts persist so they can be repaired. The picker,
+                // connection path, and remote filesystem all apply this same
+                // gate again immediately before use.
+                if let Err(problem) = validation {
                     ui.colored_label(warning_color(theme), problem);
                 }
             });
             ui.add_space(4.0);
+        }
+        if self.edit_remote_hosts.len() > crate::config::MAX_REMOTE_HOST_UI_ROWS {
+            ui.colored_label(
+                warning_color(theme),
+                format!(
+                    "{} additional drafts remain in config.toml and will be saved unchanged; this panel renders only the first {}.",
+                    self.edit_remote_hosts.len() - crate::config::MAX_REMOTE_HOST_UI_ROWS,
+                    crate::config::MAX_REMOTE_HOST_UI_ROWS
+                ),
+            );
         }
         if let Some(index) = delete_index {
             self.edit_remote_hosts.remove(index);
             changed = true;
         }
 
-        if ui.button("+ Add host").clicked() {
+        let at_capacity = self.edit_remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS;
+        if ui
+            .add_enabled(!at_capacity, egui::Button::new("+ Add host"))
+            .clicked()
+        {
             self.edit_remote_hosts.push(RemoteHostDraft::template());
             changed = true;
+        }
+        if at_capacity {
+            let message = if self.edit_remote_hosts.len() == crate::config::MAX_REMOTE_HOSTS {
+                format!(
+                    "The {}-host active limit is reached; remove an entry before adding another.",
+                    crate::config::MAX_REMOTE_HOSTS
+                )
+            } else {
+                format!(
+                    "All {} entries are retained, but only the first {} can be used; remove entries to re-enable Add.",
+                    self.edit_remote_hosts.len(),
+                    crate::config::MAX_REMOTE_HOSTS
+                )
+            };
+            ui.colored_label(warning_color(theme), message);
         }
         if changed {
             self.has_changes = true;
@@ -1839,12 +1916,72 @@ deploy = "persist"
         assert_eq!(applied.remote_hosts[1].deploy, "persist");
         assert_eq!(applied.remote_hosts[2].user, None);
         assert!(applied.remote_hosts[2].docker);
-        assert!(applied.remote_hosts.iter().all(|h| h.validate().is_ok()));
+        assert!(applied
+            .remote_hosts
+            .iter()
+            .all(|host| crate::config::validate_remote_host(host).is_ok()));
 
         // The same serialization Config::save() performs must bring the
         // entries back intact.
         let serialized = toml::to_string_pretty(&applied).expect("serialize");
         let reparsed: Config = toml::from_str(&serialized).expect("reparse");
         assert_eq!(reparsed.remote_hosts, applied.remote_hosts);
+    }
+
+    #[test]
+    fn off_view_remote_drafts_remain_byte_exact_when_other_settings_are_applied() {
+        let remote_hosts = (0..=crate::config::MAX_REMOTE_HOST_UI_ROWS)
+            .map(|index| {
+                let mut host = crate::config::default_remote_hosts()[0].clone();
+                host.name = format!("host-{index}");
+                host.host = format!("host-{index}.example.test");
+                host
+            })
+            .collect();
+        let mut source = Config {
+            remote_hosts,
+            ..Config::default()
+        };
+        let hidden = source
+            .remote_hosts
+            .last_mut()
+            .expect("one draft beyond the UI prefix");
+        hidden.name = "  hidden name  ".to_string();
+        hidden.host = "  hidden.example.test  ".to_string();
+        hidden.user = Some("  hidden user  ".to_string());
+        hidden.deploy = "  invalid deploy draft  ".to_string();
+        let expected = hidden.clone();
+
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+        panel.edit_font_size += 1.0;
+        panel.apply_to_config(&mut source);
+
+        assert_eq!(
+            source.remote_hosts[crate::config::MAX_REMOTE_HOST_UI_ROWS],
+            expected
+        );
+    }
+
+    #[test]
+    fn hostile_remote_drafts_fail_borrowed_preflight_before_apply_clone() {
+        let mut draft = RemoteHostDraft::from_config(&crate::config::default_remote_hosts()[0]);
+        draft.host.deploy = format!("secret-marker-{}", "x".repeat(256));
+        let error = draft.validate_for_apply().unwrap_err();
+        assert_eq!(error, "deploy exceeds the 256-byte limit");
+        assert!(!error.contains("secret-marker"));
+
+        draft.host.deploy = "persist".to_string();
+        draft.user = format!("secret-user-{}", "x".repeat(4 * 1024));
+        let error = draft.validate_for_apply().unwrap_err();
+        assert_eq!(error, "user exceeds the 4096-byte limit");
+        assert!(!error.contains("secret-user"));
+
+        // Repairing the separate user buffer must not clone the stale owning
+        // value before replacing it.
+        draft.host.user = Some(format!("stale-secret-{}", "x".repeat(256 * 1024)));
+        draft.user = "repaired-user".to_string();
+        assert!(draft.validate_for_apply().is_ok());
+        assert_eq!(draft.applied().user.as_deref(), Some("repaired-user"));
     }
 }

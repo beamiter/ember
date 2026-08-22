@@ -1606,11 +1606,11 @@ impl TerminalApp {
         }
 
         // 远程主机选择器（浮动窗口）
-        if let Some(host) =
+        if let Some(index) =
             self.remote_picker
-                .show(ctx, &self.config.remote_hosts.clone(), &self.current_theme)
+                .show(ctx, &self.config.remote_hosts, &self.current_theme)
         {
-            self.connect_remote_host(&host);
+            self.connect_remote_host(index);
         }
 
         // 文件树文件操作对话框（新建/重命名/删除确认，浮动窗口）
@@ -1662,7 +1662,26 @@ impl TerminalApp {
                     // Save to file
                     match self.config.save() {
                         Ok(()) => {
-                            self.set_status("Settings saved");
+                            let (invalid, inactive) = crate::config::remote_host_problem_counts(
+                                &self.config.remote_hosts,
+                            );
+                            if invalid > 0 || inactive > 0 {
+                                let mut details = Vec::new();
+                                if invalid > 0 {
+                                    details.push(format!(
+                                        "{invalid} active remote draft(s) are invalid and cannot run"
+                                    ));
+                                }
+                                if inactive > 0 {
+                                    details.push(format!(
+                                        "{inactive} remote draft(s) beyond the {}-host limit remain retained",
+                                        crate::config::MAX_REMOTE_HOSTS
+                                    ));
+                                }
+                                self.set_status(format!("Settings saved; {}", details.join("; ")));
+                            } else {
+                                self.set_status("Settings saved");
+                            }
                         }
                         Err(error) => {
                             eprintln!("[Config] Failed to save: {}", error);

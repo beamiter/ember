@@ -60,11 +60,19 @@ impl FsLocation {
         match self {
             FsLocation::Local => "Local".to_string(),
             FsLocation::Remote(index) => match hosts.get(*index) {
-                Some(host) => format!(
-                    "{}: {}",
-                    if host.docker { "docker" } else { "ssh" },
-                    host.display_name()
-                ),
+                Some(host) => {
+                    let unavailable =
+                        crate::config::validate_remote_host_at(hosts, *index).is_err();
+                    let mut label = format!(
+                        "{}: {}",
+                        if host.docker { "docker" } else { "ssh" },
+                        crate::config::remote_host_display_name(host, *index)
+                    );
+                    if unavailable {
+                        label.push_str(" (unavailable)");
+                    }
+                    label
+                }
                 None => format!("remote #{index}（已从配置移除）"),
             },
         }
@@ -429,6 +437,11 @@ fn probe_argv(host: &RemoteHostConfig, op: &str, args: &[&str]) -> Vec<String> {
     }
 }
 
+fn checked_probe_argv(host: &RemoteHostConfig, op: &str, args: &[&str]) -> io::Result<Vec<String>> {
+    validate_host_for_execution(host)?;
+    Ok(probe_argv(host, op, args))
+}
+
 /// 脚本内联的探针 argv（`sh -c`）：put/untar 专用，stdin 整个留给上传载荷。
 fn sh_c_probe_argv(host: &RemoteHostConfig, op: &str, args: &[&str]) -> Vec<String> {
     if host.docker {
@@ -445,6 +458,15 @@ fn sh_c_probe_argv(host: &RemoteHostConfig, op: &str, args: &[&str]) -> Vec<Stri
         argv.push(sh_c_probe_command(op, args));
         argv
     }
+}
+
+fn checked_sh_c_probe_argv(
+    host: &RemoteHostConfig,
+    op: &str,
+    args: &[&str],
+) -> io::Result<Vec<String>> {
+    validate_host_for_execution(host)?;
+    Ok(sh_c_probe_argv(host, op, args))
 }
 
 fn spawn_piped(argv: &[String]) -> io::Result<Child> {
@@ -802,14 +824,8 @@ fn run_probe(
     timeout: Duration,
     max_out: u64,
 ) -> io::Result<Capture> {
-    host.validate().map_err(|problem| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("remote host {}: {problem}", host.display_name()),
-        )
-    })?;
     run_capture(
-        &probe_argv(host, op, args),
+        &checked_probe_argv(host, op, args)?,
         PROBE_SCRIPT.as_bytes(),
         timeout,
         max_out,
@@ -930,10 +946,22 @@ fn local_list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
 }
 
 fn host_at(hosts: &[RemoteHostConfig], index: usize) -> io::Result<&RemoteHostConfig> {
-    hosts.get(index).ok_or_else(|| {
+    crate::config::validate_remote_host_at(hosts, index)
+        .map_err(|problem| io::Error::new(io::ErrorKind::InvalidInput, problem))
+}
+
+/// Defense-in-depth for private helpers that receive a host reference instead
+/// of its config index. Public remote-fs entry points first use [`host_at`] so
+/// the 128-entry boundary is enforced; this second check guarantees a future
+/// internal caller still cannot turn an invalid draft into process argv.
+fn validate_host_for_execution(host: &RemoteHostConfig) -> io::Result<()> {
+    crate::config::validate_remote_host(host).map_err(|problem| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("remote host #{index} is no longer configured"),
+            format!(
+                "remote host {}: {problem}",
+                crate::config::remote_host_runtime_label(host)
+            ),
         )
     })
 }
@@ -1352,18 +1380,19 @@ fn download(
     dst: &Path,
     control: TransferControl,
 ) -> io::Result<()> {
+    validate_host_for_execution(host)?;
     require_absolute(src)?;
     let arg = path_str(src)?;
     if src_is_dir {
         download_dir(
-            &probe_argv(host, "tar", &[arg]),
+            &checked_probe_argv(host, "tar", &[arg])?,
             dst,
             MAX_TRANSFER_BYTES,
             control,
         )
     } else {
         download_file(
-            &probe_argv(host, "cat", &[arg]),
+            &checked_probe_argv(host, "cat", &[arg])?,
             dst,
             MAX_TRANSFER_BYTES,
             control,
@@ -1451,19 +1480,14 @@ fn upload(
     dst: &Path,
     control: TransferControl,
 ) -> io::Result<()> {
+    validate_host_for_execution(host)?;
     require_absolute(dst_dir)?;
-    host.validate().map_err(|problem| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("remote host {}: {problem}", host.display_name()),
-        )
-    })?;
     if src_is_dir {
         upload_dir(host, src, dst_dir, dst, MAX_TRANSFER_BYTES, control)
     } else {
         // put 在远端读流之前就检查 [ -e "$p" ] → 17，不浪费字节；
         // mv 就位前再查一次，存在性检查天然原子。
-        let argv = sh_c_probe_argv(host, "put", &[path_str(dst)?]);
+        let argv = checked_sh_c_probe_argv(host, "put", &[path_str(dst)?])?;
         upload_file(&argv, src, MAX_TRANSFER_BYTES, control)
     }
 }
@@ -1527,7 +1551,7 @@ fn upload_dir(
         // 已存在的 <dir>/<name>（检查与解包之间仍有微秒级 TOCTOU 窗口，
         // 这是 tar 合并语义的协议极限，Friendly 错误由 17 映射给出）。
         let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
-        let untar_argv = sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?, name]);
+        let untar_argv = checked_sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?, name])?;
         run_stream_from_file(
             &untar_argv,
             &temp,
@@ -1551,6 +1575,8 @@ fn relay(
     dst: &Path,
     control: TransferControl,
 ) -> io::Result<()> {
+    validate_host_for_execution(src_host)?;
+    validate_host_for_execution(dst_host)?;
     require_absolute(src)?;
     require_absolute(dst_dir)?;
     // 下载腿会先烧掉流量，所以存在性预检提前做（文件靠 put 的 17 兜底
@@ -1562,7 +1588,7 @@ fn relay(
     let src_arg = path_str(src)?;
     let download_op = if src_is_dir { "tar" } else { "cat" };
     let outcome = run_stream_to_file(
-        &probe_argv(src_host, download_op, &[src_arg]),
+        &checked_probe_argv(src_host, download_op, &[src_arg])?,
         PROBE_SCRIPT.as_bytes(),
         &temp,
         TRANSFER_TIMEOUT,
@@ -1581,9 +1607,9 @@ fn relay(
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "source has no UTF-8 file name")
                 })?;
-            sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?, name])
+            checked_sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?, name])?
         } else {
-            sh_c_probe_argv(dst_host, "put", &[path_str(dst)?])
+            checked_sh_c_probe_argv(dst_host, "put", &[path_str(dst)?])?
         };
         run_stream_from_file(
             &upload_argv,
@@ -1858,6 +1884,35 @@ docker = true
         let error = list_dir(&FsLocation::Remote(9), &hosts, Path::new("/"))
             .expect_err("unknown host index");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let mut visually_deceptive = ssh_host();
+        visually_deceptive.name.push('\u{202e}');
+        let error = run_probe(
+            &visually_deceptive,
+            "home",
+            &[],
+            Duration::from_secs(1),
+            MAX_SMALL_OUTPUT,
+        )
+        .expect_err("private probe boundary must recheck the app gate");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = list_dir(
+            &FsLocation::Remote(0),
+            &[visually_deceptive],
+            Path::new("/"),
+        )
+        .expect_err("visual-spoofing host must fail before spawning ssh");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let over_limit = vec![ssh_host(); crate::config::MAX_REMOTE_HOSTS + 1];
+        let error = list_dir(
+            &FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS),
+            &over_limit,
+            Path::new("/"),
+        )
+        .expect_err("129th host must remain inactive before spawning ssh");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("active limit"));
     }
 
     #[test]

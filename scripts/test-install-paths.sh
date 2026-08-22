@@ -222,6 +222,126 @@ for removed_file in \
 done
 assert_regular_file "prebuilt source after uninstall" "${prebuilt_binary}"
 
+# Atomic replacement must replace a destination symlink itself, never follow it
+# and overwrite an unrelated target. It must also leave no staging artifacts.
+symlink_victim="${TEST_ROOT}/must-not-change"
+printf 'victim\n' >"${symlink_victim}"
+mkdir -p "$(dirname -- "${installed_binary}")"
+ln -s -- "${symlink_victim}" "${installed_binary}"
+env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${roundtrip_prefix}" \
+    --no-desktop >/dev/null
+assert_regular_file "atomically replaced destination" "${installed_binary}"
+[[ ! -L "${installed_binary}" ]] \
+    || fail "binary install followed or retained the destination symlink"
+[[ "$(<"${symlink_victim}")" == victim ]] \
+    || fail "binary install overwrote the destination symlink target"
+cmp -- "${prebuilt_binary}" "${installed_binary}" \
+    || fail "atomically replaced binary differs from its source"
+shopt -s nullglob
+binary_temps=("${installed_binary}.install."*)
+desktop_temps=("${roundtrip_stage}${roundtrip_share}/applications/.${app_id}.desktop.install."*)
+shopt -u nullglob
+(( ${#binary_temps[@]} == 0 )) || fail "binary install left temporary files"
+(( ${#desktop_temps[@]} == 0 )) || fail "desktop install left temporary files"
+env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
+    "${UNINSTALLER}" --prefix "${roundtrip_prefix}" >/dev/null
+
+# The pinned descriptor must name a non-empty artifact. Fail before creating
+# the staged binary directory so a typo cannot leave a partial installation.
+empty_prebuilt="${prebuilt_dir}/empty-ember"
+: >"${empty_prebuilt}"
+empty_stage="${TEST_ROOT}/empty-stage"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${empty_stage}" \
+    "${INSTALLER}" --binary "${empty_prebuilt}" --prefix /opt/empty-ember \
+    --no-desktop >"${TEST_ROOT}/empty-prebuilt.log" 2>&1; then
+    fail "installer accepted an empty prebuilt binary"
+fi
+assert_contains "empty prebuilt file diagnostic" \
+    "$(<"${TEST_ROOT}/empty-prebuilt.log")" "prebuilt binary must not be empty"
+assert_absent "empty prebuilt staged target" \
+    "${empty_stage}/opt/empty-ember/bin/ember"
+
+# Existing symlink ancestors are forbidden only inside a non-root DESTDIR.
+# This catches staging escape attempts before the binary commit.
+ancestor_stage="${TEST_ROOT}/ancestor-stage"
+ancestor_victim="${TEST_ROOT}/ancestor-victim"
+mkdir -p "${ancestor_stage}" "${ancestor_victim}"
+ln -s -- "${ancestor_victim}" "${ancestor_stage}/opt"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${ancestor_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" --prefix /opt/escaped-ember \
+    --no-desktop >"${TEST_ROOT}/ancestor.log" 2>&1; then
+    fail "installer accepted a symbolic-link ancestor below DESTDIR"
+fi
+assert_contains "staging ancestor diagnostic" "$(<"${TEST_ROOT}/ancestor.log")" \
+    "symbolic-link ancestor"
+[[ -z "$(find "${ancestor_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "staging ancestor validation wrote outside DESTDIR"
+
+# Public resources use the same atomic replacement rule as the binary: replace
+# a hostile destination link itself and never touch its target.
+resource_stage="${TEST_ROOT}/resource-stage"
+resource_prefix="/opt/ember-resource"
+resource_victim="${TEST_ROOT}/resource-victim"
+resource_metainfo="${resource_stage}${resource_prefix}/share/metainfo/${app_id}.metainfo.xml"
+printf 'resource victim\n' >"${resource_victim}"
+mkdir -p "$(dirname -- "${resource_metainfo}")"
+ln -s -- "${resource_victim}" "${resource_metainfo}"
+env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${resource_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${resource_prefix}" >/dev/null
+assert_regular_file "atomically replaced metainfo" "${resource_metainfo}"
+[[ ! -L "${resource_metainfo}" ]] || fail "metainfo destination remained a symlink"
+[[ "$(<"${resource_victim}")" == "resource victim" ]] \
+    || fail "metainfo install overwrote a symlink target"
+env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${resource_stage}" \
+    "${UNINSTALLER}" --prefix "${resource_prefix}" >/dev/null
+
+# Force a signal after the same-directory temporary has been populated but
+# before rename. EXIT cleanup must remove the temp and leave the old target.
+interrupt_tools="${TEST_ROOT}/interrupt-tools"
+interrupt_stage="${TEST_ROOT}/interrupt-stage"
+interrupt_prefix="/opt/ember-interrupt"
+interrupt_binary="${interrupt_stage}${interrupt_prefix}/bin/ember"
+mkdir -p "${interrupt_tools}" "$(dirname -- "${interrupt_binary}")"
+printf 'old interrupt ember\n' >"${interrupt_binary}"
+# The single-quoted parameter references belong to the generated helper.
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=""' \
+    'for argument do last="${argument}"; done' \
+    '/usr/bin/install "$@"' \
+    'case "${last}" in *.install.*) kill -TERM "${PPID}" ;; esac' \
+    >"${interrupt_tools}/install"
+chmod 0755 "${interrupt_tools}/install"
+if {
+    env HOME="${TEST_HOME}" PATH="${interrupt_tools}:${TEST_PATH}" \
+        DESTDIR="${interrupt_stage}" "${INSTALLER}" --binary "${prebuilt_binary}" \
+        --prefix "${interrupt_prefix}" --no-desktop
+} >"${TEST_ROOT}/interrupt.log" 2>&1; then
+    fail "interrupted installer unexpectedly succeeded"
+fi
+[[ "$(<"${interrupt_binary}")" == 'old interrupt ember' ]] \
+    || fail "pre-rename interruption replaced the old binary"
+shopt -s nullglob
+interrupt_temps=("${interrupt_binary}.install."*)
+shopt -u nullglob
+(( ${#interrupt_temps[@]} == 0 )) \
+    || fail "pre-rename interruption left a binary temporary"
+
+prebuilt_symlink="${prebuilt_dir}/ember-link"
+ln -s -- "${prebuilt_binary}" "${prebuilt_symlink}"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_symlink}" --prefix "${roundtrip_prefix}" \
+    >"${TEST_ROOT}/symlink-binary.log" 2>&1; then
+    fail "installer accepted a symlinked prebuilt binary"
+fi
+assert_contains "symlinked prebuilt diagnostic" \
+    "$(<"${TEST_ROOT}/symlink-binary.log")" \
+    "prebuilt binary must not be a symbolic link: ${prebuilt_symlink}"
+assert_regular_file "symlink target after rejection" "${prebuilt_binary}"
+
 missing_binary="${TEST_ROOT}/does-not-exist/ember"
 if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
     "${INSTALLER}" --binary "${missing_binary}" --prefix "${roundtrip_prefix}" \
@@ -254,5 +374,113 @@ fi
 assert_contains "invalid percent executable diagnostic" \
     "$(<"${TEST_ROOT}/percent-desktop-path.log")" \
     "desktop executable path must not contain '%'"
+
+invalid_stage="${TEST_ROOT}/invalid-desktop-stage"
+invalid_prefix='/opt/ember=invalid'
+sentinel_binary="${invalid_stage}${invalid_prefix}/bin/ember"
+mkdir -p "$(dirname -- "${sentinel_binary}")"
+printf 'old ember\n' >"${sentinel_binary}"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${invalid_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${invalid_prefix}" \
+    >"${TEST_ROOT}/desktop-preflight.log" 2>&1; then
+    fail "installer accepted an invalid desktop executable path"
+fi
+[[ "$(<"${sentinel_binary}")" == 'old ember' ]] \
+    || fail "desktop preflight failure replaced the old binary"
+
+for bad_path in '/opt/ember/../escape' '/opt/ember/'$'bad\npath'; do
+    if install_dry_run "${stage_root}" --prefix "${bad_path}" \
+        >"${TEST_ROOT}/bad-install-path.log" 2>&1; then
+        fail "installer accepted unsafe prefix ${bad_path@Q}"
+    fi
+    if uninstall_dry_run "${stage_root}" --prefix "${bad_path}" \
+        >"${TEST_ROOT}/bad-uninstall-path.log" 2>&1; then
+        fail "uninstaller accepted unsafe prefix ${bad_path@Q}"
+    fi
+done
+assert_contains "parent path diagnostic" \
+    "$(install_dry_run "${stage_root}" --prefix '/opt/ember/../escape' 2>&1 || true)" \
+    "--prefix must not contain '..' path components"
+
+if install_dry_run "${stage_root}/../escape" --prefix /opt/ember \
+    >"${TEST_ROOT}/bad-destdir.log" 2>&1; then
+    fail "installer accepted a DESTDIR with a parent component"
+fi
+assert_contains "DESTDIR parent diagnostic" "$(<"${TEST_ROOT}/bad-destdir.log")" \
+    "DESTDIR must not contain '..' path components"
+
+for command in install_dry_run uninstall_dry_run; do
+    if "${command}" "" --bin-dir= >"${TEST_ROOT}/empty-bin.log" 2>&1; then
+        fail "${command} accepted an empty --bin-dir"
+    fi
+    assert_contains "empty bin diagnostic" "$(<"${TEST_ROOT}/empty-bin.log")" \
+        "--bin-dir must not be empty"
+done
+
+# `/` is a meaningful, explicitly supplied staging root even though removing
+# its trailing slash yields an empty concatenation prefix.
+root_stage_install="$(install_dry_run / --prefix /opt/ember-root)"
+assert_contains "root DESTDIR cache policy" "${root_stage_install}" \
+    "Staged install (DESTDIR set); skipping desktop cache refresh."
+assert_contains "root DESTDIR summary" "${root_stage_install}" \
+    "Staged file: /opt/ember-root/bin/ember"
+
+# Lexically harmless dot components and Unicode remain valid path spellings.
+portable_path='/opt/./火焰 terminal'
+assert_contains "Unicode path accepted" \
+    "$(install_dry_run "${stage_root}" --prefix "${portable_path}")" \
+    "Installed ember to ${portable_path}/bin/ember"
+
+uninstall_link_stage="${TEST_ROOT}/uninstall-link-stage"
+uninstall_link_victim="${TEST_ROOT}/uninstall-link-victim"
+uninstall_link_prefix="/opt/ember-uninstall-link"
+mkdir -p "${uninstall_link_stage}" \
+    "${uninstall_link_victim}/ember-uninstall-link/bin"
+printf 'outside ember\n' \
+    >"${uninstall_link_victim}/ember-uninstall-link/bin/ember"
+ln -s -- "${uninstall_link_victim}" "${uninstall_link_stage}/opt"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" \
+    DESTDIR="${uninstall_link_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_link_prefix}" >"${TEST_ROOT}/uninstall-link.log" 2>&1; then
+    fail "uninstaller followed a symbolic-link ancestor below DESTDIR"
+fi
+assert_contains "uninstall ancestor diagnostic" \
+    "$(<"${TEST_ROOT}/uninstall-link.log")" \
+    "staged uninstall path contains a symbolic-link ancestor"
+[[ "$(<"${uninstall_link_victim}/ember-uninstall-link/bin/ember")" == \
+    'outside ember' ]] || fail "uninstaller removed a file outside DESTDIR"
+
+# A symlinked DESTDIR root used to evade `-L` when spelled as `link/.` or with
+# repeated trailing separators. Normalize that spelling and inspect the full
+# existing root chain before install or uninstall can touch the victim.
+root_link="${TEST_ROOT}/destdir-root-link"
+root_victim="${TEST_ROOT}/destdir-root-victim"
+root_prefix="/opt/ember-destdir-root"
+root_binary="${root_victim}${root_prefix}/bin/ember"
+mkdir -p "${root_victim}"
+ln -s -- "${root_victim}" "${root_link}"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${root_link}/." \
+    "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${root_prefix}" \
+    --no-desktop >"${TEST_ROOT}/root-link-install.log" 2>&1; then
+    fail "installer accepted a symlinked DESTDIR root disguised with /."
+fi
+assert_contains "symlinked DESTDIR install diagnostic" \
+    "$(<"${TEST_ROOT}/root-link-install.log")" \
+    "DESTDIR path contains a symbolic-link component"
+[[ -z "$(find "${root_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "symlinked DESTDIR install wrote outside its staging boundary"
+
+mkdir -p "$(dirname -- "${root_binary}")"
+printf 'outside root ember\n' >"${root_binary}"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${root_link}//" \
+    "${UNINSTALLER}" --prefix "${root_prefix}" \
+    >"${TEST_ROOT}/root-link-uninstall.log" 2>&1; then
+    fail "uninstaller accepted a symlinked DESTDIR root with trailing separators"
+fi
+assert_contains "symlinked DESTDIR uninstall diagnostic" \
+    "$(<"${TEST_ROOT}/root-link-uninstall.log")" \
+    "DESTDIR path contains a symbolic-link component"
+[[ "$(<"${root_binary}")" == 'outside root ember' ]] \
+    || fail "symlinked DESTDIR uninstall removed an outside binary"
 
 printf 'install/uninstall path contract: ok\n'
