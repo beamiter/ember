@@ -346,6 +346,10 @@ pub fn key_to_string(key: egui::Key) -> Option<&'static str> {
         egui::Key::Quote => Some("'"),
         egui::Key::OpenBracket => Some("["),
         egui::Key::CloseBracket => Some("]"),
+        // egui 把 Shift+[ 报成独立的 OpenCurlyBracket,而不是带 shift 的
+        // OpenBracket。不映射它,`ctrl+shift+[` 这类绑定就永远不会触发。
+        egui::Key::OpenCurlyBracket => Some("{"),
+        egui::Key::CloseCurlyBracket => Some("}"),
         egui::Key::Equals => Some("="),
         egui::Key::Backtick => Some("`"),
         _ => None,
@@ -469,6 +473,51 @@ mod tests {
                     "build_keybinding_string output must be a canonical fixed point"
                 );
             }
+        }
+    }
+
+    /// egui 把 Shift+[ 报成独立的 `OpenCurlyBracket`,不是带 shift 的
+    /// `OpenBracket`。漏掉这个映射会让 `ctrl+shift+[` 这类默认绑定变成
+    /// 永远不触发的死键位,而且编译和绑定表测试都发现不了。
+    #[test]
+    fn shifted_bracket_chords_reach_their_default_block_commands() {
+        let bindings = crate::keybindings::KeyBindings::default_bindings();
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        for (key, expected) in [
+            (
+                egui::Key::OpenBracket,
+                crate::keybindings::Command::BlockSelectPrev,
+            ),
+            (
+                egui::Key::OpenCurlyBracket,
+                crate::keybindings::Command::BlockSelectPrev,
+            ),
+            (
+                egui::Key::CloseBracket,
+                crate::keybindings::Command::BlockSelectNext,
+            ),
+            (
+                egui::Key::CloseCurlyBracket,
+                crate::keybindings::Command::BlockSelectNext,
+            ),
+        ] {
+            let chord = build_keybinding_string(key, ctrl_shift)
+                .unwrap_or_else(|| panic!("{key:?} must produce a chord"));
+            assert_eq!(
+                bindings.get_command(&chord),
+                Some(expected),
+                "chord {chord:?} from {key:?}"
+            );
+        }
+        // Both spellings are printable, so the paired text event must also be
+        // consumed — otherwise the shortcut would additionally type a brace.
+        for key in [egui::Key::OpenCurlyBracket, egui::Key::CloseCurlyBracket] {
+            assert!(crate::app::input::is_printable_key_for_test(key));
         }
     }
 

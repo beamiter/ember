@@ -201,13 +201,13 @@ impl CommandPalette {
             CommandInfo::new(
                 "Scroll Up",
                 CommandCategory::Terminal,
-                "Scroll terminal output up",
+                "Scroll terminal output up; with Ctrl, start selecting command blocks from the newest one",
                 crate::keybindings::Command::TerminalScrollUp,
             ),
             CommandInfo::new(
                 "Scroll Down",
                 CommandCategory::Terminal,
-                "Scroll terminal output down",
+                "Scroll terminal output down; with Ctrl, move or leave the block selection",
                 crate::keybindings::Command::TerminalScrollDown,
             ),
             CommandInfo::new(

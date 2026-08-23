@@ -158,6 +158,17 @@ struct ReplayGuardSnapshot {
     pending_input: bool,
 }
 
+/// How far a block reveal may move the viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockReveal {
+    /// Explicit "take me there" gesture (a Commands-sidebar row click): always
+    /// re-pin the block at the top of the viewport.
+    Force,
+    /// Selection movement: keep the reader's viewport when the block header is
+    /// already on screen, and only scroll for an off-screen target.
+    IfOffscreen,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CommandActionKind {
     Jump,
@@ -860,7 +871,35 @@ impl TerminalApp {
         self.command_sidebar.history.get(index)
     }
 
+    /// Whether a stable buffer anchor is already painted somewhere in the
+    /// currently rendered projected viewport. `origins` only ever describe the
+    /// rendered window, so `display_point_for` answering `Some` is exactly the
+    /// "already on screen" question — no document-row arithmetic, and it fails
+    /// closed to `false` whenever the anchor cannot be resolved.
+    fn projected_anchor_is_displayed(
+        terminal: &crate::terminal::TerminalState,
+        viewport: &crate::terminal::ProjectedViewport,
+        anchor: crate::terminal::BufferAnchor,
+    ) -> bool {
+        terminal
+            .buffer_anchor_to_absolute(anchor)
+            .and_then(|(row, column)| {
+                terminal
+                    .raw_row_id_at_absolute(row)
+                    .map(|row_id| crate::terminal::RawCellAnchor { row_id, column })
+            })
+            .and_then(|raw| viewport.display_point_for(raw))
+            .is_some()
+    }
+
+    /// Explicit "take me there": activate the owning pane and re-pin the block
+    /// at the top of the viewport. This is the Commands-sidebar row gesture.
     fn jump_to_sidebar_command(&mut self, target: &CommandTarget) {
+        self.reveal_sidebar_command(target, BlockReveal::Force);
+    }
+
+    /// Activate the owning pane and bring `target` into view under `reveal`.
+    fn reveal_sidebar_command(&mut self, target: &CommandTarget, reveal: BlockReveal) {
         let Some(index) = self.target_session_index(target) else {
             self.set_status("Command session is no longer available");
             return;
@@ -895,11 +934,28 @@ impl TerminalApp {
                 policy,
                 view_state,
             );
+            // 块导航应该移动选择,而不是重新钉住视口:命令头已经在屏幕上时
+            // 保留用户正在读的位置,与 `scroll_to_buffer_anchor` 的最小移动
+            // 语义(以及 search reveal)一致。侧边栏点击行是明确的"带我过去"
+            // 手势,仍然强制重新钉住。
+            let minimal = reveal == BlockReveal::IfOffscreen;
             if viewport.is_transformed() {
-                matches!(
-                    terminal.reveal_buffer_anchor_in_projection(policy, view_state, anchor),
-                    crate::terminal::ProjectedBufferAnchorLocation::Visible { .. }
-                )
+                if minimal && Self::projected_anchor_is_displayed(&terminal, &viewport, anchor) {
+                    true
+                } else {
+                    matches!(
+                        terminal.reveal_buffer_anchor_in_projection(policy, view_state, anchor),
+                        crate::terminal::ProjectedBufferAnchorLocation::Visible { .. }
+                    )
+                }
+            } else if terminal.is_alt_buffer_active() {
+                // `scroll_to_command` 的 alt-buffer 拒绝在这里显式保留。
+                false
+            } else if minimal && terminal.viewport_buffer_mapping_is_exact() {
+                // `scroll_to_buffer_anchor` 的"已可见就不动"短路走的是原始行
+                // 算术;reflow 之后可见行不再等于 scrollback 索引,那时它可能
+                // 误判为"已经可见"而一动不动。映射不精确时退回强制跳转。
+                terminal.scroll_to_buffer_anchor(anchor)
             } else {
                 terminal.scroll_to_command(&target.execution_id)
             }
@@ -1469,6 +1525,12 @@ impl TerminalApp {
                 self.copy_block_context_markdown(&target)
             }
             crate::block_mode::BlockMenuAction::Reinput => self.block_reinput_selected_commands(),
+            // 与 Commands 侧边栏的 "Run again" 共用同一条重放路径:命令
+            // 权威性、只读任务终端、提示符/括号粘贴守卫和状态反馈都已经在
+            // 那里实现,这里不重复判断。
+            crate::block_mode::BlockMenuAction::Rerun => {
+                self.replay_sidebar_command(&target, true, false)
+            }
             crate::block_mode::BlockMenuAction::ScrollTop => {
                 self.block_scroll_target_edge(&target, false)
             }
@@ -2229,7 +2291,7 @@ impl TerminalApp {
         };
         self.block_selection = Some(selection);
         self.sync_block_selection_to_sidebar(&target);
-        self.jump_to_sidebar_command(&target);
+        self.reveal_sidebar_command(&target, BlockReveal::IfOffscreen);
         self.set_status(format!("Selected {count} command blocks"));
     }
 
@@ -2393,7 +2455,9 @@ impl TerminalApp {
     /// Ctrl+Up starts at the newest block when no range exists; Ctrl+Down with
     /// no range keeps its legacy small-scroll behavior. Once selected, either
     /// direction moves/collapses the active edge, and moving newer past the
-    /// newest block exits selection so a subsequent Ctrl+Down can scroll.
+    /// newest block exits selection so a subsequent Ctrl+Down can scroll — but
+    /// a multi-block range collapses onto the newest block first, so one stray
+    /// step never discards the whole range (see `block_mode::block_step`).
     pub(crate) fn block_context_scroll(&mut self, step: crate::block_mode::SelectStep) -> bool {
         if !self.config.block_mode {
             self.clear_block_selection();
@@ -2442,21 +2506,31 @@ impl TerminalApp {
             return false;
         };
 
-        let target_index = match step {
-            crate::block_mode::SelectStep::Older => current.saturating_sub(1),
-            crate::block_mode::SelectStep::Newer if current + 1 < ordered_ids.len() => current + 1,
-            crate::block_mode::SelectStep::Newer => {
-                if extend {
-                    current
-                } else {
-                    self.clear_block_selection();
-                    return true;
-                }
+        let target_index = match crate::block_mode::block_step(
+            current,
+            ordered_ids.len(),
+            selection.selected_ids.len(),
+            step,
+            extend,
+        ) {
+            crate::block_mode::BlockStep::To(index) => index,
+            crate::block_mode::BlockStep::Exit => {
+                self.clear_block_selection();
+                // 这个按键被消费掉了:不给反馈的话,用户只会看到选择凭空消失。
+                self.set_status("Block selection cleared");
+                return true;
             }
         };
         let target_id = ordered_ids[target_index].clone();
+        let mut extended_count = None;
         if extend {
             selection.extend_to(&ordered_ids, &target_id);
+            // 卡片轮廓已经画出了范围,但一次 Shift 步进只改变一条边;把总数
+            // 说出来,用户才知道 Enter/复制到底会作用在几个块上。单块时不
+            // 提示——那会让每一次 Ctrl+↑ 都变成噪音。
+            if selection.selected_ids.len() > 1 {
+                extended_count = Some(selection.selected_ids.len());
+            }
         } else {
             selection =
                 crate::block_mode::BlockSelection::single(session_id.clone(), target_id.clone());
@@ -2467,7 +2541,11 @@ impl TerminalApp {
         };
         self.block_selection = Some(selection);
         self.sync_block_selection_to_sidebar(&target);
-        self.jump_to_sidebar_command(&target);
+        if let Some(count) = extended_count {
+            self.set_status(format!("Selected {count} command blocks"));
+        }
+        // 放在计数提示之后:跳转失败的告警必须盖住"选中了 N 个块"。
+        self.reveal_sidebar_command(&target, BlockReveal::IfOffscreen);
         true
     }
 
@@ -2647,7 +2725,7 @@ impl TerminalApp {
             target.execution_id.clone(),
         ));
         self.sync_block_selection_to_sidebar(&target);
-        self.jump_to_sidebar_command(&target);
+        self.reveal_sidebar_command(&target, BlockReveal::IfOffscreen);
     }
 
     /// Highlight the newly selected block's row in the Commands sidebar.
@@ -2709,6 +2787,19 @@ impl TerminalApp {
     /// gate activation until the expression compiles again.
     pub(crate) fn refresh_block_search_hits(&mut self) {
         let query = self.block_search.query.clone();
+        // 只有“记录版本变了”(后台命令刚结束)才保留高亮行。查询、大小写、
+        // 正则和过滤芯片改变时 computed_query 已被置 None,那是新意图,回到
+        // 第一行。锚点必须在 rebuild 之前取:release_index_for_rebuild 会清空
+        // hits 并把 selected_index 归零。
+        let query_changed = self.block_search.computed_query.as_deref() != Some(query.as_str());
+        let mut retained_anchor = if query_changed {
+            None
+        } else {
+            self.block_search.selected_hit_anchor()
+        };
+        // 记录 id 只在单个 session 内唯一(`local:{sequence}` 每个终端都从 1
+        // 开始),所以锚点必须记住它来自哪个 pane。
+        let anchor_session_id = self.block_search.session_id.clone();
         let (session_id, record_version) = {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
@@ -2732,6 +2823,11 @@ impl TerminalApp {
                 },
             )
         };
+        // 切换 tab/pane 后旧的高亮行不再有任何意义:同名 id 会指向另一个
+        // pane 里完全无关的块。回到第一行。
+        if anchor_session_id.as_deref() != Some(session_id.as_str()) {
+            retained_anchor = None;
+        }
         if !self.block_search.needs_refresh(&session_id, record_version) {
             return;
         }
@@ -2846,10 +2942,12 @@ impl TerminalApp {
         };
         match results {
             Ok(results) => {
-                self.block_search.hits = results.hits;
-                self.block_search.capped = results.capped;
-                self.block_search.query_error = None;
-                self.block_search.selected_index = 0;
+                self.block_search.adopt_hits(
+                    results.hits,
+                    results.capped,
+                    &session_id,
+                    retained_anchor.as_ref(),
+                );
             }
             Err(error) => {
                 self.block_search.query_error = Some(error.to_string());

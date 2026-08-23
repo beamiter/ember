@@ -456,14 +456,37 @@ impl KeyBindings {
             "terminal:jump_next_command".to_string(),
         );
         // 跳到最早的失败命令块,与 anvil/forge 的 filter_failed_blocks
-        // 同键位。其余 block:* 命令默认不绑定,走命令面板——包括
-        // block:select_prev/next 与 block:jump_prev/next_failed:它们想要
-        // 的 ctrl+alt+up/down 和 ctrl+alt+left/right 已被 pane:focus_*
-        // 占用。
+        // 同键位。这条保持"最早的失败块"语义(与滚动条标记分类共享),
+        // 不要改成步进。
         bindings.bindings.insert(
             "ctrl+shift+x".to_string(),
             "block:jump_first_failed".to_string(),
         );
+        // 失败块步进。ctrl+alt+up/down 和 ctrl+alt+left/right 被
+        // pane:focus_* 占用,所以这里选择与书签对 ctrl+,/ctrl+. 同形的
+        // Shift 变体:Shift = "只在失败块之间走"。
+        bindings.bindings.insert(
+            "ctrl+shift+,".to_string(),
+            "block:jump_prev_failed".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+.".to_string(),
+            "block:jump_next_failed".to_string(),
+        );
+        // 逐块移动选择。方括号是"上一个/下一个同类项"的通用记法。
+        // 两种拼写都要绑:egui 在 US 布局上把 Shift+[ 报成 OpenCurlyBracket
+        // (即 `{`),其他布局则可能直接给出 `[`。与字体缩放绑定
+        // ctrl+= / ctrl++ / ctrl+shift++ 的处理方式一致。
+        for chord in ["ctrl+shift+[", "ctrl+shift+{"] {
+            bindings
+                .bindings
+                .insert(chord.to_string(), "block:select_prev".to_string());
+        }
+        for chord in ["ctrl+shift+]", "ctrl+shift+}"] {
+            bindings
+                .bindings
+                .insert(chord.to_string(), "block:select_next".to_string());
+        }
         // 跨块搜索,与 anvil 的 cross-block search 同键位(ember 的默认
         // 表里 ctrl+shift+g 空闲)。
         bindings
@@ -905,6 +928,12 @@ mod tests {
             ("f12", Command::DebugToggle),
             ("ctrl+shift+x", Command::BlockJumpFirstFailed),
             ("ctrl+shift+g", Command::BlockSearchToggle),
+            ("ctrl+shift+,", Command::BlockJumpPrevFailed),
+            ("ctrl+shift+.", Command::BlockJumpNextFailed),
+            ("ctrl+shift+[", Command::BlockSelectPrev),
+            ("ctrl+shift+{", Command::BlockSelectPrev),
+            ("ctrl+shift+]", Command::BlockSelectNext),
+            ("ctrl+shift+}", Command::BlockSelectNext),
         ];
         for (key, command) in expected {
             assert_eq!(
@@ -923,13 +952,9 @@ mod tests {
             );
         }
 
-        for removed in [
-            "ctrl+shift+,",
-            "ctrl+shift+r",
-            "ctrl+shift+q",
-            "alt+left",
-            "alt+right",
-        ] {
+        // NOTE: "ctrl+shift+," left this list deliberately — it used to be
+        // config:toggle and is now block:jump_prev_failed (asserted above).
+        for removed in ["ctrl+shift+r", "ctrl+shift+q", "alt+left", "alt+right"] {
             assert_eq!(
                 bindings.get_command(removed),
                 None,

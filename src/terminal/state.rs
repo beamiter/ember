@@ -5050,18 +5050,40 @@ impl super::TerminalState {
     /// `get_visible_cells`. This mirrors the existing lazy reflow window but
     /// never changes it: retained content gets an affine origin span and the
     /// blank cells introduced only to pad a projected row remain unmapped.
-    fn identity_projection_origins(
+    ///
+    /// Returns cell origins AND per-display-row provenance. `row_sources` is
+    /// reflow-aware: it names the raw row that OWNS each display row, which is
+    /// what `ProjectedViewport::view_row_absolute` — and therefore block
+    /// chrome — needs. The legacy
+    /// `scrollback.len() - scroll_offset + display_row` arithmetic is only
+    /// correct while every retained line is full width and unwrapped, so
+    /// deriving it here is what lets command cards survive scrolling back over
+    /// ordinary soft-wrapped output.
+    fn identity_projection_geometry(
         &self,
         viewport_rows: usize,
         cols: usize,
-    ) -> Vec<super::projection::OriginSpan> {
+    ) -> (
+        Vec<super::projection::OriginSpan>,
+        Vec<Option<super::projection::RawRowSource>>,
+    ) {
         if viewport_rows == 0 || cols == 0 {
-            return Vec::new();
+            return (Vec::new(), vec![None; viewport_rows]);
         }
 
         let mut origins = Vec::with_capacity(viewport_rows);
+        let mut row_sources: Vec<Option<super::projection::RawRowSource>> =
+            vec![None; viewport_rows];
+        let grid_source = |grid_row: usize| super::projection::RawRowSource {
+            raw_row: self.grid.row_id(grid_row),
+            raw_absolute_row: self.scrollback.len().saturating_add(grid_row),
+        };
         if self.scroll_offset == 0 {
-            for row in 0..viewport_rows.min(self.grid.rows()) {
+            for (row, slot) in row_sources
+                .iter_mut()
+                .enumerate()
+                .take(viewport_rows.min(self.grid.rows()))
+            {
                 Self::append_projected_origin_span(
                     &mut origins,
                     DisplayPoint::new(row, 0),
@@ -5071,8 +5093,9 @@ impl super::TerminalState {
                     },
                     cols.min(self.grid[row].len()),
                 );
+                *slot = Some(grid_source(row));
             }
-            return origins;
+            return (origins, row_sources);
         }
 
         let start_idx = self
@@ -5110,9 +5133,22 @@ impl super::TerminalState {
                     let chunk_start = chunk_index.saturating_mul(cols);
                     let chunk_end = chunk_start.saturating_add(cols);
                     let mut logical_start = 0usize;
+                    // The raw row that owns this display row. An entirely
+                    // empty logical line produces no origin span at all
+                    // (`reflow_span` still gives it one visual row), so
+                    // provenance cannot be derived from `origins` alone — that
+                    // row still belongs to its command card. Default to the
+                    // span's FIRST row and upgrade to the first row whose
+                    // content actually reaches this chunk.
+                    let mut owner = source;
+                    let mut owner_found = false;
                     for raw_index in source..next {
                         let raw_len = self.scrollback[raw_index].reflow_content_len();
                         let raw_end = logical_start.saturating_add(raw_len);
+                        if !owner_found && raw_end > chunk_start {
+                            owner = raw_index;
+                            owner_found = true;
+                        }
                         let intersection_start = chunk_start.max(logical_start);
                         let intersection_end = chunk_end.min(raw_end);
                         if intersection_start < intersection_end {
@@ -5127,6 +5163,12 @@ impl super::TerminalState {
                             );
                         }
                         logical_start = raw_end;
+                    }
+                    if let Some(slot) = row_sources.get_mut(display_row) {
+                        *slot = Some(super::projection::RawRowSource {
+                            raw_row: self.scrollback[owner].raw_row_id(),
+                            raw_absolute_row: owner,
+                        });
                     }
                     display_row = display_row.saturating_add(1);
                 }
@@ -5151,10 +5193,13 @@ impl super::TerminalState {
                 },
                 cols.min(self.grid[grid_row].len()),
             );
+            if let Some(slot) = row_sources.get_mut(display_row) {
+                *slot = Some(grid_source(grid_row));
+            }
             display_row = display_row.saturating_add(1);
         }
 
-        origins
+        (origins, row_sources)
     }
 
     /// Materialize the current viewport through the versioned history
@@ -5206,12 +5251,13 @@ impl super::TerminalState {
         // owns the legacy incremental/live and lazy historical caches.
         let cells = self.get_visible_cells();
         let row_wrapped = self.get_visible_row_wrapped();
-        let origins = self.identity_projection_origins(cells.len(), columns);
+        let (origins, row_sources) = self.identity_projection_geometry(cells.len(), columns);
         let viewport = ProjectedViewport::new(
             key,
             cells,
             row_wrapped,
             origins,
+            row_sources,
             DisplayPoint::new(self.cursor_row, self.cursor_col),
         );
         self.projected_viewport_cache = Some(viewport.clone());

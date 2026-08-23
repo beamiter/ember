@@ -211,6 +211,126 @@ pub fn badge_text_with_lifecycle(
     Some(text)
 }
 
+/// The context-sensitive block keys, which are NOT `Command`s and therefore
+/// cannot appear on any binding-driven surface.
+///
+/// `Ctrl+Up` is the real entry point into block selection, and once a range
+/// exists plain arrows, `Enter` and `Escape` change meaning — none of which a
+/// user can discover from the keybinding table, the command palette, or
+/// `keybindings.toml`, because these are hard-coded in the input router
+/// rather than bound commands. The help panel renders this list verbatim.
+pub const BLOCK_MODE_KEY_HINTS: &[(&str, &str)] = &[
+    ("Ctrl+↑", "从最新的已完成块开始选块"),
+    ("↑ / ↓", "移动活动边(收起当前范围)"),
+    ("Shift+↑ / Shift+↓", "以锚点为基准扩展/收缩范围"),
+    ("Enter", "把选中的命令回填到提示符(不执行)"),
+    ("Esc", "清除块选择"),
+    (
+        "单击卡片头 / Shift+单击 / Ctrl+Shift+单击",
+        "选中 / 扩展 / 切换单块",
+    ),
+];
+
+/// Whether a card's HOVER tint should be drawn in its outcome color instead
+/// of the neutral foreground.
+///
+/// The shared anvil/forge emphasis priority (hover outranks outcome) is a
+/// cross-frontend contract and stays exactly as it is; this moves only the
+/// color SOURCE. Without it, pointing at a failed block swapped its red wash
+/// for a dimmer neutral one — hovering was the reason a failure stopped
+/// looking like a failure. `Unknown` is included because an unreported exit
+/// status is the other outcome whose warning color carries real information.
+pub const fn card_tint_prefers_outcome(outcome: BlockOutcome) -> bool {
+    matches!(outcome, BlockOutcome::Failed(_) | BlockOutcome::Unknown)
+}
+
+/// Vertical padding the painter adds above AND below the badge text. Kept
+/// here so the pure font ladder and the painter cannot disagree about fit.
+pub const BADGE_PAD_Y: f32 = 1.0;
+/// Smallest badge font worth painting. Below this the text stops being
+/// readable, so dropping the badge is honest.
+pub const BADGE_FONT_MIN: f32 = 8.0;
+
+/// Descending badge font sizes that can fit inside one terminal row.
+///
+/// The painter used to try exactly one size and give up when the resulting box
+/// was taller than a row — which silently dropped EVERY badge at small font
+/// sizes or tight `line_spacing` (an 11pt badge box is ~15px, taller than the
+/// ~14px row of a 12pt terminal font). Stepping down keeps the outcome
+/// visible instead. The largest size is always offered so a roomy row is
+/// unaffected; sizes below [`BADGE_FONT_MIN`] are never offered.
+pub fn badge_font_ladder(line_height: f32, compact: bool) -> smallvec::SmallVec<[f32; 4]> {
+    let largest = if compact { 10.0 } else { 11.0 };
+    let mut ladder: smallvec::SmallVec<[f32; 4]> = smallvec::SmallVec::new();
+    let mut size = largest;
+    while size >= BADGE_FONT_MIN {
+        ladder.push(size);
+        size -= 1.0;
+    }
+    // Keep the first rung unconditionally: a row that fits nothing still gets
+    // one honest attempt, and the painter measures the real galley anyway.
+    let fits = |size: &f32| size + 2.0 * BADGE_PAD_Y <= line_height;
+    if ladder.iter().any(fits) {
+        ladder.retain(|size| fits(size));
+    } else {
+        ladder.truncate(1);
+    }
+    ladder
+}
+
+/// Progressively shorter badge spellings, longest first.
+///
+/// The painter walks this list until one fits the blank tail of the block's
+/// row. Previously it had only two rungs (with and without the completion
+/// clock), so a long badge — `✗ exit:2 SIGINT · 1.2s · inferred` — was
+/// dropped whole, taking the exit code with it. The exit code survives to the
+/// second-to-last rung; only the bare glyph is shorter.
+pub fn badge_text_candidates(
+    outcome: BlockOutcome,
+    duration_ms: Option<u64>,
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+    clock: Option<&str>,
+) -> smallvec::SmallVec<[String; 5]> {
+    let mut candidates: smallvec::SmallVec<[String; 5]> = smallvec::SmallVec::new();
+    let Some(full) = badge_text_with_lifecycle(outcome, duration_ms, start_mark_seen, provenance)
+    else {
+        return candidates;
+    };
+    let mut push = |candidate: String| {
+        if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    };
+    if let Some(clock) = clock {
+        push(format!("{full} · {clock}"));
+    }
+    push(full);
+    // Drop the lifecycle qualifier, then the duration, then everything but the
+    // outcome glyph (and, for a failure, its exit code).
+    if let Some(plain) = badge_text(outcome, duration_ms) {
+        push(plain);
+    }
+    if let Some(without_duration) = badge_text(outcome, None) {
+        push(without_duration);
+    }
+    push(badge_glyph(outcome).to_string());
+    candidates
+}
+
+/// One-character outcome marker: the shortest honest badge. `Failed` keeps its
+/// glyph only — the exit code lives on the rung above.
+pub const fn badge_glyph(outcome: BlockOutcome) -> &'static str {
+    match outcome {
+        BlockOutcome::Success => "✓",
+        BlockOutcome::Failed(_) => "✗",
+        BlockOutcome::Unknown => "?",
+        BlockOutcome::Running => "▶",
+        BlockOutcome::Background => "↻",
+        BlockOutcome::Prompt => "",
+    }
+}
+
 /// Full lifecycle explanation for context menus and export metadata.
 pub const fn lifecycle_detail(
     start_mark_seen: bool,
@@ -278,7 +398,9 @@ pub struct VisibleBlockSpan {
     /// Last visible viewport row of the block (inclusive, clamped).
     pub last_row: usize,
     /// Whether the block's own first row (the prompt row) is inside the
-    /// viewport. Separator and badge are only drawn when it is.
+    /// viewport. The separator is only drawn when it is; the outcome badge
+    /// falls back to `first_row` so a long block keeps its status on screen
+    /// while its prompt row is scrolled away.
     pub starts_in_viewport: bool,
     /// Whether the block's target end is in the viewport. For finished blocks
     /// this is the row before the next prompt; for the newest live block it is
@@ -521,6 +643,10 @@ pub enum BlockMenuAction {
     CopyBlocks,
     CopyMarkdown,
     Reinput,
+    /// Re-execute the target block's exact command in its own pane. Only ever
+    /// offered for a SINGLE block whose command the shell reported exactly;
+    /// batch replay stays `Reinput`, which never runs anything.
+    Rerun,
     ScrollTop,
     ScrollBottom,
     Search,
@@ -534,6 +660,42 @@ pub enum BlockMenuAction {
 pub struct BlockMenuRequest {
     pub record_id: String,
     pub action: BlockMenuAction,
+}
+
+/// Card-menu label for re-executing a block. A failure is a "Retry"; anything
+/// else is a "Run Again". Same vocabulary as the Commands sidebar, so the two
+/// surfaces cannot drift.
+pub const fn rerun_menu_label(outcome: BlockOutcome) -> &'static str {
+    match outcome {
+        BlockOutcome::Failed(_) => "Retry",
+        _ => "Run Again",
+    }
+}
+
+/// Why re-execution is unavailable for the current card-menu target, or
+/// `None` when the renderer may offer it.
+///
+/// This deliberately answers only from facts the renderer owns. Prompt
+/// readiness, bracketed paste, pending input and multiline refusals belong to
+/// the replay guard, which runs in the app and reports through the ordinary
+/// status line — mirroring them here would let the menu claim an item works
+/// when the guard is about to refuse it, or vice versa.
+pub const fn rerun_disabled_reason(
+    command_exact: bool,
+    command_truncated: bool,
+    plural: bool,
+) -> Option<&'static str> {
+    if plural {
+        // Running a range would execute commands the user reviewed only as a
+        // list. Reinput stays the batch path.
+        Some("Select a single block to run it again")
+    } else if command_truncated {
+        Some("The recorded command was shortened and cannot be re-run")
+    } else if !command_exact {
+        Some("The shell did not provide exact command metadata")
+    } else {
+        None
+    }
 }
 
 /// Inclusive terminal-order range used by Shift+Up/Down. Missing endpoints
@@ -581,6 +743,40 @@ pub fn next_selected_index(
             SelectStep::Older => position.checked_sub(1).map(|older| selectable[older]),
             SelectStep::Newer => selectable.get(position + 1).copied(),
         },
+    }
+}
+
+/// Where one Up/Down step lands when a block range is already selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockStep {
+    /// Make this index the new active edge.
+    To(usize),
+    /// Leave block selection entirely so the key resumes ordinary scrolling.
+    Exit,
+}
+
+/// Move the active edge of an existing selection by one block.
+///
+/// `current` is the active edge's index in the ordered selectable ids,
+/// `len` their count and `selected` how many blocks the range currently
+/// holds. Stepping newer past the newest block is the documented exit hatch
+/// back to scrolling, but it only fires for a SINGLE selected block: a
+/// multi-block range first collapses onto the newest block, so one stray
+/// `Down` after `Ctrl+Shift+A` can no longer silently destroy the whole
+/// range. Shift-extension never exits — it pins to the newest block, as
+/// before.
+pub fn block_step(
+    current: usize,
+    len: usize,
+    selected: usize,
+    step: SelectStep,
+    extend: bool,
+) -> BlockStep {
+    match step {
+        SelectStep::Older => BlockStep::To(current.saturating_sub(1)),
+        SelectStep::Newer if current + 1 < len => BlockStep::To(current + 1),
+        SelectStep::Newer if extend || selected > 1 => BlockStep::To(current),
+        SelectStep::Newer => BlockStep::Exit,
     }
 }
 
@@ -1643,6 +1839,139 @@ mod tests {
     }
 
     #[test]
+    fn rerun_is_offered_only_for_one_exactly_recorded_command() {
+        assert_eq!(rerun_menu_label(BlockOutcome::Failed(2)), "Retry");
+        assert_eq!(rerun_menu_label(BlockOutcome::Success), "Run Again");
+        assert_eq!(rerun_menu_label(BlockOutcome::Unknown), "Run Again");
+        assert_eq!(rerun_menu_label(BlockOutcome::Background), "Run Again");
+
+        // The happy path: one block, exact shell metadata.
+        assert_eq!(rerun_disabled_reason(true, false, false), None);
+        // A range never runs — Reinput stays the batch path.
+        assert!(rerun_disabled_reason(true, false, true).is_some());
+        // Screen-reconstructed or shortened commands must not authorize a run,
+        // and truncation is reported ahead of inexactness because it is the
+        // more specific fact.
+        assert_eq!(
+            rerun_disabled_reason(false, false, false),
+            Some("The shell did not provide exact command metadata")
+        );
+        assert_eq!(
+            rerun_disabled_reason(true, true, false),
+            Some("The recorded command was shortened and cannot be re-run")
+        );
+        assert_eq!(
+            rerun_disabled_reason(false, true, false),
+            Some("The recorded command was shortened and cannot be re-run")
+        );
+    }
+
+    #[test]
+    fn only_warning_outcomes_take_over_the_hover_tint() {
+        assert!(card_tint_prefers_outcome(BlockOutcome::Failed(1)));
+        assert!(card_tint_prefers_outcome(BlockOutcome::Failed(130)));
+        assert!(card_tint_prefers_outcome(BlockOutcome::Unknown));
+        // Success, background and the live card keep the neutral/accent wash:
+        // hover must stay legible as hover where nothing is wrong.
+        assert!(!card_tint_prefers_outcome(BlockOutcome::Success));
+        assert!(!card_tint_prefers_outcome(BlockOutcome::Background));
+        assert!(!card_tint_prefers_outcome(BlockOutcome::Running));
+        assert!(!card_tint_prefers_outcome(BlockOutcome::Prompt));
+    }
+
+    #[test]
+    fn badge_candidates_shorten_monotonically_and_keep_the_exit_code_late() {
+        let candidates = badge_text_candidates(
+            BlockOutcome::Failed(130),
+            Some(2_300),
+            true,
+            CompletionProvenance::BoundaryInferred,
+            Some("09:41"),
+        );
+        assert_eq!(
+            candidates.as_slice(),
+            [
+                "✗ exit:130 SIGINT · 2.3s · inferred · 09:41".to_string(),
+                "✗ exit:130 SIGINT · 2.3s · inferred".to_string(),
+                "✗ exit:130 SIGINT · 2.3s".to_string(),
+                "✗ exit:130 SIGINT".to_string(),
+                "✗".to_string(),
+            ]
+        );
+        // Strictly shortening, so the painter's first fit is also its longest.
+        for pair in candidates.windows(2) {
+            assert!(pair[0].chars().count() > pair[1].chars().count());
+        }
+        // The exit code survives to the second-to-last rung.
+        assert!(candidates[candidates.len() - 2].contains("exit:130"));
+
+        // No clock (an unselected card) simply drops that first rung.
+        let unselected = badge_text_candidates(
+            BlockOutcome::Success,
+            Some(1_200),
+            true,
+            CompletionProvenance::ShellReported,
+            None,
+        );
+        assert_eq!(
+            unselected.as_slice(),
+            ["✓ 1.2s".to_string(), "✓".to_string()]
+        );
+
+        // Duplicate spellings collapse; Prompt still yields nothing to paint.
+        let background = badge_text_candidates(
+            BlockOutcome::Background,
+            Some(10),
+            false,
+            CompletionProvenance::Unknown,
+            None,
+        );
+        assert_eq!(
+            background.as_slice(),
+            ["↻ Background".to_string(), "↻".to_string()]
+        );
+        assert!(badge_text_candidates(
+            BlockOutcome::Prompt,
+            None,
+            true,
+            CompletionProvenance::ShellReported,
+            None
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn badge_font_ladder_steps_down_until_a_badge_fits_one_row() {
+        // A roomy row (14pt monospace ≈ 16.3px) keeps the full-size badge.
+        assert_eq!(badge_font_ladder(16.31, false)[0], 11.0);
+        assert_eq!(badge_font_ladder(16.31, true)[0], 10.0);
+        // A 12pt terminal row (≈13.97px) cannot fit an 11pt badge box
+        // (11 + 2*1 = 13 fits, 12pt would not) — the old painter dropped the
+        // badge entirely here.
+        let tight = badge_font_ladder(13.97, false);
+        assert_eq!(tight[0], 11.0);
+        assert!(tight.iter().all(|size| size + 2.0 * BADGE_PAD_Y <= 13.97));
+        // Tighter still: only the smallest rungs survive, but never below the
+        // readability floor.
+        let tighter = badge_font_ladder(10.5, false);
+        assert_eq!(tighter.as_slice(), [8.0]);
+        assert!(tighter.iter().all(|size| *size >= BADGE_FONT_MIN));
+        // A row that fits nothing still gets exactly one honest attempt; the
+        // painter measures the real galley and gives up there.
+        let hopeless = badge_font_ladder(4.0, false);
+        assert_eq!(hopeless.len(), 1);
+        assert_eq!(hopeless[0], 11.0);
+        // Every ladder is non-empty and strictly descending.
+        for line_height in [4.0_f32, 10.5, 13.97, 16.31, 40.0] {
+            let ladder = badge_font_ladder(line_height, false);
+            assert!(!ladder.is_empty());
+            for pair in ladder.windows(2) {
+                assert!(pair[0] > pair[1]);
+            }
+        }
+    }
+
+    #[test]
     fn running_badge_is_compact_and_uses_bounded_refresh_cadence() {
         assert_eq!(running_badge_text(0), "▶ 0ms");
         assert_eq!(running_badge_text(92_000), "▶ 1m32s");
@@ -1917,6 +2246,30 @@ mod tests {
             next_selected_index(&with_gap, Some(0), SelectStep::Newer),
             Some(2)
         );
+    }
+
+    #[test]
+    fn stepping_newer_past_the_newest_block_collapses_a_range_before_exiting() {
+        use BlockStep::{Exit, To};
+        // Ordinary movement is unchanged in both directions.
+        assert_eq!(block_step(2, 4, 1, SelectStep::Older, false), To(1));
+        assert_eq!(block_step(2, 4, 3, SelectStep::Older, true), To(1));
+        assert_eq!(block_step(1, 4, 1, SelectStep::Newer, false), To(2));
+        // Older clamps at the oldest block rather than exiting.
+        assert_eq!(block_step(0, 4, 1, SelectStep::Older, false), To(0));
+        assert_eq!(block_step(0, 4, 3, SelectStep::Older, false), To(0));
+        // The documented single-block exit hatch back to scrolling survives.
+        assert_eq!(block_step(3, 4, 1, SelectStep::Newer, false), Exit);
+        assert_eq!(block_step(0, 1, 1, SelectStep::Newer, false), Exit);
+        // A multi-block range collapses onto the newest block instead, so one
+        // stray Down after Select-all cannot discard the whole range.
+        assert_eq!(block_step(3, 4, 4, SelectStep::Newer, false), To(3));
+        assert_eq!(block_step(3, 4, 2, SelectStep::Newer, false), To(3));
+        // ...and a second step from the collapsed single block then exits.
+        assert_eq!(block_step(3, 4, 1, SelectStep::Newer, false), Exit);
+        // Shift-extension never exits, at any range size.
+        assert_eq!(block_step(3, 4, 1, SelectStep::Newer, true), To(3));
+        assert_eq!(block_step(3, 4, 4, SelectStep::Newer, true), To(3));
     }
 
     #[test]

@@ -275,6 +275,14 @@ bottom_bar = true
 # Command-card chrome (Warp-style): theme-relative cards, a colored outcome
 # stripe and a status badge per OSC 133 command block. Running blocks show a
 # compact live elapsed-time badge when it fits without covering terminal text.
+# A badge that does not fit steps down through shorter spellings (dropping the
+# finish clock, then the lifecycle qualifier, then the duration, finally to the
+# bare outcome glyph) and then through smaller font sizes, so a small font or
+# tight line_spacing no longer drops the outcome — and the exit code — whole.
+# When a long block's own prompt row scrolls above the viewport the badge
+# retries on that block's first visible row. Hovering a failed or
+# unknown-status card keeps its outcome color and only brightens it; hover
+# never repaints a failure in the neutral wash.
 # Block Mode reserves an 8px card gutter before column zero (which can reduce
 # a pane by one column). Compact only tightens visual chrome and never changes
 # the PTY/cell geometry relative to non-compact Block Mode.
@@ -307,7 +315,14 @@ contiguous range and `Ctrl+Shift+Click` toggles one card. Plain output clicks,
 drags, double-clicks, and triple-clicks remain native terminal text selection,
 and text selection takes precedence over whole-card copying. Right-click uses
 the pressed card as a stable target and exposes selection-aware copy/reinput,
-search, bookmark, Agent, JSON-copy, navigation, and **Collapse Output** actions.
+**Run Again** / **Retry**, search, bookmark, Agent, JSON-copy, navigation, and
+**Collapse Output** actions. Re-execution is offered only for a single block
+whose exact command the shell reported (`command_exact`, not shortened);
+reconstructed or truncated commands are display-only and never authorize a
+run, and a range keeps Reinput as its batch path because running a reviewed
+list is not the same as reviewing a run. Prompt readiness, bracketed paste,
+pending input and multiline refusals are reported by the shared replay guard
+through the status line, exactly as the Commands sidebar's "Run again" does.
 Collapsing a finished block replaces only its projected output rows with one
 expandable summary row; the raw terminal history, search index, captured output,
 and PTY bytes remain unchanged. Per-card filtering, deletion, and file export
@@ -334,7 +349,12 @@ regex compiler limit bound pasted expressions. Search hits retain Unicode-scalar
 spans, reveal the physical soft-wrap row containing the match when possible
 (expanding only the proven owning collapse), and are
 revalidated against the pane plus oldest/newest record sequence before Enter,
-so deque rotation cannot retarget an old hit.
+so deque rotation cannot retarget an old hit. A refresh caused only by a
+finalized-record change — a background command completing while the picker is
+open — keeps the highlight on the same `(record, line)` row instead of
+snapping back to the first result, so Enter cannot fire at a block the user
+never chose; editing the query or flipping a case/regex/filter control is a
+new intent and deliberately restarts at the top.
 
 Select a failed row in the **Commands** sidebar (or use its context menu) to
 start a fresh Agent task with **Fix**, **Explain**, or **Create task**. The task
@@ -509,6 +529,9 @@ Defaults include:
 | Window opacity increase / decrease | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
 | Select all completed command blocks | `Ctrl+Shift+A` |
 | Reinput selected block commands (without running) | `Ctrl+Shift+I` |
+| Select previous / next command block | `Ctrl+Shift+[` / `Ctrl+Shift+]` (also bound as `{` / `}`, since layouts report the shifted bracket either way) |
+| Jump to the oldest failed block | `Ctrl+Shift+X` |
+| Previous / next failed block | `Ctrl+Shift+,` / `Ctrl+Shift+.` |
 | Toggle bookmark on the active completed block | `Ctrl+Shift+B` |
 | Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
@@ -518,11 +541,26 @@ Defaults include:
 
 Block selection is context-sensitive. `Ctrl+Up` starts at the newest block;
 once a block is selected, plain `Up` / `Down` collapses and moves the active
-edge, while `Shift+Up` / `Shift+Down` expands or contracts the anchored range.
-`Enter` reinputs every selected real command in terminal order as editable
-bracketed-paste text, background-output blocks are skipped, and `Escape` clears
-the range. Enter continues to the child unchanged while a command or
-alternate-screen program owns the PTY.
+edge, while `Shift+Up` / `Shift+Down` expands or contracts the anchored range
+and reports the resulting block count. `Enter` reinputs every selected real
+command in terminal order as editable bracketed-paste text, background-output
+blocks are skipped, and `Escape` clears the range. Enter continues to the child
+unchanged while a command or alternate-screen program owns the PTY.
+
+Selection movement is deliberately minimal — it keeps the viewport where the
+reader left it whenever the target block header is already on screen. Clicking
+a row in the **Commands** sidebar stays an explicit "take me there" gesture and
+still re-pins the block at the top.
+
+Stepping newer past the newest block still exits block selection so the next
+`Ctrl+Down` scrolls again, but a multi-block range collapses onto the newest
+block first — one stray step can no longer discard a whole range — and the
+exit is announced instead of happening silently. Selection movement no longer
+re-pins the viewport. Because these context keys
+are not bindable commands, they are also listed verbatim in the `Ctrl+Shift+/`
+help panel, and every unbound command there (and in the command palette) now
+shows the `block:*`-style id to write in `keybindings.toml` instead of the
+word “unbound”.
 
 Bindings in `~/.config/ember/keybindings.toml` override defaults. The file is
 a flat TOML table:
@@ -560,6 +598,32 @@ Search results are capped at 20,000 matches to keep broad queries bounded.
 When old scrollback must be reflowed after a width change, ember keeps the
 results and navigation but suppresses any historical highlight whose raw
 coordinate cannot yet be mapped exactly, rather than painting the wrong cell.
+Block Mode chrome no longer shares that suppression: the identity viewport now
+carries exact per-display-row provenance, so cards, stripes and badges survive
+scrolling back over ordinary soft-wrapped output instead of disappearing
+exactly when history is being read. Painting and every pointer hit test choose
+their chrome through one rule, and both chrome sources agree on card
+ownership — which rows belong to which block, and therefore which card a click
+selects — including the awkward row a command shares with the next prompt when
+its output ended without a newline. The newest input card's six-row floor stays where
+it belongs — in the block model's line-id space, shared with the raw path —
+and the projected path resolves that end through the viewport rather than
+re-deriving a floor in display rows, which collapsed rows and reflow make
+meaningless. An end that does not resolve means the card is genuinely clipped,
+so it covers the rows it owns and declines to draw a finished bottom edge
+rather than guessing one. Three sweeps guard this: a differential comparing
+both chrome sources (card ownership, plus the live card's bottom edge) across
+a grid of widths, heights, output shapes, screen repaints and scroll offsets
+wherever both can answer; an invariant on collapsed projections, where only
+one source answers, that the newest card never extends past its own content;
+and a top-clipped repro for a running command that repaints the screen.
+Restoring chrome here also closes a mouse-routing leak: with no chrome the
+pointer path treated the whole grid as application-owned, so mouse events went
+to the child program while the user was reading scrollback. One decorative difference is deliberate: a card whose successor's
+prompt begins mid-row keeps its closed bottom edge on the raw path but not on
+the projected one, which refuses to draw a boundary through output it cannot
+prove has ended. That shifts such a card's painted bottom by one gap; row
+ownership, and therefore which card a click selects, is identical either way.
 
 ## Installing and updating jsh
 

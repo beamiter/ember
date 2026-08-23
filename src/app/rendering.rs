@@ -1290,20 +1290,28 @@ impl TerminalApp {
                                     let pretty = self
                                         .keybindings
                                         .pretty_bindings_for(&cmd_info.command.to_string());
-                                    let keybinding_str = if pretty.is_empty() {
-                                        "No binding".to_string()
-                                    } else {
+                                    // 未绑定的命令显示它的 `id`,而不是无用的
+                                    // "No binding":这正是用户要写进
+                                    // keybindings.toml 的那个字符串。用等宽
+                                    // 弱色渲染,免得 id 被误读成一个键位。
+                                    let bound = !pretty.is_empty();
+                                    let keybinding_str = if bound {
                                         pretty.join(" / ")
+                                    } else {
+                                        cmd_info.command.to_string()
                                     };
 
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            ui.label(
-                                                egui::RichText::new(keybinding_str)
-                                                    .size(10.0)
-                                                    .color(egui::Color32::from_rgb(100, 150, 200)),
-                                            );
+                                            let text =
+                                                egui::RichText::new(keybinding_str).size(10.0);
+                                            ui.label(if bound {
+                                                text.color(egui::Color32::from_rgb(100, 150, 200))
+                                            } else {
+                                                text.monospace()
+                                                    .color(ui.visuals().weak_text_color())
+                                            });
                                         },
                                     );
                                 });

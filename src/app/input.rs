@@ -339,6 +339,13 @@ fn dispatch_ordered_key_presses(
     result
 }
 
+/// Test-only view of [`is_printable_key`], so the events-layer chord test can
+/// assert that a new bindable key also consumes its paired text event.
+#[cfg(test)]
+pub(crate) fn is_printable_key_for_test(key: egui::Key) -> bool {
+    is_printable_key(key)
+}
+
 fn is_printable_key(key: egui::Key) -> bool {
     matches!(
         key,
@@ -388,6 +395,8 @@ fn is_printable_key(key: egui::Key) -> bool {
             | egui::Key::Quote
             | egui::Key::OpenBracket
             | egui::Key::CloseBracket
+            | egui::Key::OpenCurlyBracket
+            | egui::Key::CloseCurlyBracket
             | egui::Key::Equals
             | egui::Key::Backtick
     )

@@ -105,15 +105,18 @@ impl HelpPanel {
                     // 让用户也能发现"可通过命令面板执行的能力",而不是被快捷键
                     // 配置筛掉。
                     let mut bound: Vec<(String, String)> = Vec::new();
-                    let mut unbound: Vec<String> = Vec::new();
+                    let mut unbound: Vec<(String, String)> = Vec::new();
                     for c in palette
                         .all_commands()
                         .iter()
                         .filter(|c| c.category == category)
                     {
-                        let binds = keybindings.pretty_bindings_for(&c.command.to_string());
+                        let id = c.command.to_string();
+                        let binds = keybindings.pretty_bindings_for(&id);
                         if binds.is_empty() {
-                            unbound.push(c.name.clone());
+                            // 显示命令 id 而不是"(未绑定)":这就是用户要写进
+                            // keybindings.toml 左边那一列的字符串。
+                            unbound.push((c.name.clone(), id));
                         } else {
                             bound.push((c.name.clone(), binds.join(" / ")));
                         }
@@ -143,17 +146,36 @@ impl HelpPanel {
                             ui.label(RichText::new(name).color(text_color));
                         });
                     }
-                    for name in unbound {
+                    for (name, id) in unbound {
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 [210.0, 18.0],
-                                egui::Label::new(
-                                    RichText::new("(未绑定)").monospace().color(dim_color),
-                                ),
+                                egui::Label::new(RichText::new(id).monospace().color(dim_color)),
                             );
                             ui.label(RichText::new(name).color(dim_color));
                         });
                     }
+                }
+
+                // 块选择的上下文键不是 `Command`,不会出现在上面的分类表里
+                // ——它们硬编码在输入路由中,所以只能在这里显式教给用户。
+                let block_color = Self::category_color(CommandCategory::Terminal, theme);
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("命令块选择（上下文键）")
+                        .size(13.0)
+                        .strong()
+                        .color(block_color),
+                );
+                ui.separator();
+                for (keys, description) in crate::block_mode::BLOCK_MODE_KEY_HINTS {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [210.0, 18.0],
+                            egui::Label::new(RichText::new(*keys).monospace().color(block_color)),
+                        );
+                        ui.label(RichText::new(*description).color(text_color));
+                    });
                 }
 
                 ui.add_space(10.0);

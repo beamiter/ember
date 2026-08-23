@@ -144,15 +144,23 @@ pub(crate) fn grid_position_from_content(
     (row, col)
 }
 
+/// Normalize a semantic anchor onto the physical row that actually holds it.
+///
+/// `column == cols` is a PENDING-WRAP sentinel recorded at the width in effect
+/// at the time, not a real column, so the row half must be resolved by the one
+/// shared rule the raw chrome path uses — [`crate::block_mode::prompt_row_line_id`].
+/// Dividing by the CURRENT `cols` instead made the two paths disagree about
+/// which row owns a card as soon as the pane was resized, which the projected
+/// path now reaches on the first scrolled-back line.
+///
+/// A residual ambiguity is out of scope here and predates block chrome: after
+/// the pane WIDENS, a sentinel recorded at the old width is indistinguishable
+/// from a real mid-row column, so both paths place such an anchor one row
+/// early. Fixing that needs the recording width on `CommandRecord`.
 fn normalized_block_anchor(line_id: u64, column: usize, cols: usize) -> (u64, usize) {
-    if cols > 0 && column >= cols {
-        (
-            line_id.saturating_add(u64::try_from(column / cols).unwrap_or(u64::MAX)),
-            column % cols,
-        )
-    } else {
-        (line_id, column)
-    }
+    let row = crate::block_mode::prompt_row_line_id(line_id, column, cols);
+    let normalized_column = if row == line_id { column } else { 0 };
+    (row, normalized_column)
 }
 
 fn block_header_contains(range: Option<((u64, usize), (u64, usize))>, point: (u64, usize)) -> bool {
@@ -565,6 +573,12 @@ struct BlockChromeEntry {
     /// fail-closed answer, not permission to fall back to raw scroll geometry.
     projected_header_range: Option<(DisplayPoint, DisplayPoint)>,
     projected_geometry: bool,
+    /// Whether `span.first_row` is a real terminal row rather than a synthetic
+    /// projected row (a collapsed summary or padding). The badge fallback onto
+    /// a block's first VISIBLE row is only honest on a real row: a synthetic
+    /// row's cells are all blank, so the blank-cell guard cannot see the
+    /// summary label that `draw_collapsed_summaries` paints there afterwards.
+    first_row_is_raw: bool,
     outcome: crate::block_mode::BlockOutcome,
     start_mark_seen: bool,
     completion_provenance: crate::block_mode::CompletionProvenance,
@@ -610,6 +624,15 @@ fn projected_span_edge_flags(
     last_row: usize,
 ) -> (bool, bool) {
     let starts = prompt.is_some_and(|point| point.row == first_row);
+    // `next.column == 0` is deliberate and pinned by
+    // `projected_header_and_edge_geometry_fail_closed_when_clipped`: a next
+    // prompt that begins mid-row means the previous block's own output
+    // continues into that row, so capping the card above it would draw a
+    // boundary through that block's content. The raw path does cap there (its
+    // `prompt_row_line_id` normalizes a mid-row prompt to its row), so the two
+    // sources can differ on this ONE decorative flag. Ownership — which card
+    // a row belongs to, and therefore which card a click selects — stays
+    // identical, which is what `block_chrome_snapshot` actually promises.
     let ends = next_prompt
         .is_some_and(|next| next.column == 0 && last_row.checked_add(1) == Some(next.row));
     (starts, ends)
@@ -1669,6 +1692,7 @@ impl TerminalRenderer {
                 header_range,
                 projected_header_range: None,
                 projected_geometry: false,
+                first_row_is_raw: true,
                 outcome,
                 start_mark_seen: record.start_mark_seen,
                 completion_provenance: record.completion_provenance,
@@ -1734,6 +1758,49 @@ impl TerminalRenderer {
         )
     }
 
+    /// Display row of the newest card's own visual END — the same quantity the
+    /// raw path computes, resolved through this viewport.
+    ///
+    /// Resolving the CONTENT extent instead and applying the six-row input
+    /// floor in display rows was the source of three separate defects: the
+    /// floor belongs to the block model and is expressed in line ids
+    /// (`live_block_end_exclusive`), and measuring it in display rows is
+    /// simply wrong once collapsed rows or reflow change the spacing.
+    /// Resolving the model's end directly also gives `None` its correct
+    /// meaning — "this card's end is off screen" — so the caller can withhold
+    /// a bottom edge instead of inventing one.
+    ///
+    /// `rows_by_record` cannot answer this: every trailing blank live-grid row
+    /// carries row provenance, so the newest record would "own" the rest of
+    /// the viewport.
+    fn projected_live_card_last_row(
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        record: &crate::terminal::CommandRecord,
+        cols: usize,
+    ) -> Option<usize> {
+        let cursor_line_id = terminal
+            .total_lines_scrolled
+            .saturating_add(terminal.get_cursor_pos().0 as u64);
+        let content = record
+            .output_start
+            .and_then(|start| terminal.primary_content_extent_from(start))
+            .map_or(cursor_line_id, |extent| extent.max(cursor_line_id));
+        let prompt_line = crate::block_mode::prompt_row_line_id(
+            record.prompt_start.line_id,
+            record.prompt_start.column,
+            cols,
+        );
+        let end =
+            crate::block_mode::live_block_end_exclusive(prompt_line, content).saturating_sub(1);
+        // `end` is always a LIVE-GRID line — it is at least `content`, which is
+        // at least the cursor line — so it can never sit inside a collapsed
+        // zone (zones only cover complete records) and its column-0 cell is
+        // always origin-mapped while the row is on screen. `None` therefore
+        // means exactly one thing: this card's end is off screen.
+        Self::projected_buffer_point(terminal, viewport, (end, 0)).map(|point| point.row)
+    }
+
     fn projected_header_range(
         terminal: &TerminalState,
         viewport: &ProjectedViewport,
@@ -1758,6 +1825,33 @@ impl TerminalRenderer {
             end_anchor = previous_buffer_cell((end_anchor.line_id, end_anchor.column), cols)?;
         }
         None
+    }
+
+    /// The one rule for choosing this frame's chrome source, shared by
+    /// painting and every hit test so the two cannot disagree about which card
+    /// owns a row — and therefore which card a click selects.
+    ///
+    /// (The two sources can still differ on `ends_in_viewport`, a decorative
+    /// bottom-edge cap; see `projected_span_edge_flags`. That shifts a card's
+    /// painted bottom by one gap, not its row ownership.)
+    ///
+    /// `compute_block_chrome` reads raw viewport rows directly and therefore
+    /// refuses to answer unless the viewport↔buffer mapping is exact — which
+    /// ordinary soft wrapping makes false the moment you scroll back, taking
+    /// every card, stripe and badge with it. The projected path carries exact
+    /// per-display-row provenance (`view_row_absolute`) and is fail-closed per
+    /// row, so it is the correct answer in precisely that case.
+    fn block_chrome_snapshot(
+        &self,
+        terminal: &TerminalState,
+        viewport: &ProjectedViewport,
+        rows: usize,
+    ) -> Option<Vec<BlockChromeEntry>> {
+        if viewport.is_transformed() || !terminal.viewport_buffer_mapping_is_exact() {
+            self.compute_projected_block_chrome(terminal, viewport)
+        } else {
+            self.compute_block_chrome(terminal, rows)
+        }
     }
 
     fn compute_projected_block_chrome(
@@ -1821,7 +1915,33 @@ impl TerminalRenderer {
                             cols,
                         ) <= (anchor.line_id, anchor.column)
                     });
-                    after.checked_sub(1)
+                    // One display row can carry the tail of one block AND the
+                    // prompt of the next — a command whose output ended
+                    // without a newline, or two raw rows rejoined by reflow.
+                    // The first origin span names the OLDER block, but the raw
+                    // path gives such a row to the NEWER one (its
+                    // `prompt_row_line_id` normalizes a mid-row prompt to that
+                    // row). Follow the raw path so the two chrome sources can
+                    // never disagree about which card owns the row.
+                    after.checked_sub(1).map(|mut index| {
+                        while let Some(next) = records.get(index + 1) {
+                            let starts_here = Self::projected_buffer_point(
+                                terminal,
+                                viewport,
+                                normalized_block_anchor(
+                                    next.prompt_start.line_id,
+                                    next.prompt_start.column,
+                                    cols,
+                                ),
+                            )
+                            .is_some_and(|point| point.row == row);
+                            if !starts_here {
+                                break;
+                            }
+                            index += 1;
+                        }
+                        index
+                    })
                 }
                 crate::terminal::ProjectedRowKind::Padding => None,
             };
@@ -1884,6 +2004,23 @@ impl TerminalRenderer {
                 .and_then(|next| Self::projected_buffer_point(terminal, viewport, next));
             let (starts_in_viewport, ends_in_viewport) =
                 projected_span_edge_flags(prompt, next_prompt, first_row, last_row);
+            // The newest card has no next prompt to cap it, and its idle input
+            // surface has a six-row floor. Route it through the same pure rule
+            // the raw path uses, on a real content extent rather than on
+            // `rows_by_record` — which counts every trailing blank live-grid
+            // row and would let the card swallow the viewport.
+            // The newest card has no next prompt to cap it. Resolve the block
+            // model's own end through this viewport: when it lands on screen
+            // that IS the card's end, and when it does not the card is genuinely
+            // clipped, so it covers the rows it owns and claims no bottom edge.
+            let (last_row, ends_in_viewport) = if live {
+                match Self::projected_live_card_last_row(terminal, viewport, record, cols) {
+                    Some(end_row) => (end_row.clamp(first_row, last_row.max(end_row)), true),
+                    None => (last_row, false),
+                }
+            } else {
+                (last_row, ends_in_viewport)
+            };
             entries.push(BlockChromeEntry {
                 selected: self.selected_block_id_set.contains(record.id.as_str()),
                 active: self.active_block_id.as_deref() == Some(record.id.as_str()),
@@ -1896,6 +2033,10 @@ impl TerminalRenderer {
                 header_range,
                 projected_header_range,
                 projected_geometry: true,
+                first_row_is_raw: matches!(
+                    viewport.row_kind(first_row),
+                    Some(crate::terminal::ProjectedRowKind::Raw)
+                ),
                 outcome,
                 start_mark_seen: record.start_mark_seen,
                 completion_provenance: record.completion_provenance,
@@ -1996,11 +2137,18 @@ impl TerminalRenderer {
         ) {
             BlockCardEmphasis::ActiveSelection => (accent, 36), // 0.14
             BlockCardEmphasis::Selected => (accent, 20),        // 0.08
-            BlockCardEmphasis::Hovered => (foreground, 13),     // 0.05
-            BlockCardEmphasis::Live => (accent, 9),             // 0.035
+            // 悬停绝不能把失败/未知块的结果色抹掉:保持结果色,并且比未悬停
+            // 时更亮,这样"悬停"仍然可读,而"失败"不会消失。
+            BlockCardEmphasis::Hovered
+                if crate::block_mode::card_tint_prefers_outcome(entry.outcome) =>
+            {
+                (self.block_outcome_color(entry.outcome), 40) // 0.16
+            }
+            BlockCardEmphasis::Hovered => (foreground, 13), // 0.05
+            BlockCardEmphasis::Live => (accent, 9),         // 0.035
             BlockCardEmphasis::Failed => (self.block_outcome_color(entry.outcome), 28), // 0.11
-            BlockCardEmphasis::Background => (accent, 18),      // 0.07
-            BlockCardEmphasis::Neutral => (foreground, 8),      // 0.03
+            BlockCardEmphasis::Background => (accent, 18),  // 0.07
+            BlockCardEmphasis::Neutral => (foreground, 8),  // 0.03
         };
         let alpha = (f32::from(alpha) * self.opacity.clamp(0.0, 1.0)).round() as u8;
         Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
@@ -2018,9 +2166,14 @@ impl TerminalRenderer {
         ) {
             BlockCardEmphasis::ActiveSelection => (2.0, accent, 235), // 0.92
             BlockCardEmphasis::Selected => (1.0, accent, 122),        // 0.48
-            BlockCardEmphasis::Hovered => (1.0, foreground, 41),      // 0.16
-            BlockCardEmphasis::Live => (1.0, accent, 82),             // 0.32
-            BlockCardEmphasis::Background => (1.0, accent, 61),       // 0.24
+            BlockCardEmphasis::Hovered
+                if crate::block_mode::card_tint_prefers_outcome(entry.outcome) =>
+            {
+                (1.0, self.block_outcome_color(entry.outcome), 61) // 0.24
+            }
+            BlockCardEmphasis::Hovered => (1.0, foreground, 41), // 0.16
+            BlockCardEmphasis::Live => (1.0, accent, 82),        // 0.32
+            BlockCardEmphasis::Background => (1.0, accent, 61),  // 0.24
             BlockCardEmphasis::Failed | BlockCardEmphasis::Neutral => {
                 (1.0, foreground, 20) // 0.08
             }
@@ -2109,7 +2262,7 @@ impl TerminalRenderer {
     /// content is wholly app-owned.
     #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_app_mouse_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
-        self.pointer_app_mouse_eligible_for_rows(terminal, pos, terminal.grid.rows())
+        self.pointer_app_mouse_eligible_for_rows(terminal, None, pos, terminal.grid.rows())
     }
 
     pub fn pointer_app_mouse_eligible_projected(
@@ -2178,12 +2331,13 @@ impl TerminalRenderer {
                 && raw_grid_row <= span.last_row
                 && raw_line >= start;
         }
-        self.pointer_app_mouse_eligible_for_rows(terminal, pos, viewport.rows())
+        self.pointer_app_mouse_eligible_for_rows(terminal, Some(viewport), pos, viewport.rows())
     }
 
     fn pointer_app_mouse_eligible_for_rows(
         &self,
         terminal: &TerminalState,
+        viewport: Option<&ProjectedViewport>,
         pos: egui::Pos2,
         rows: usize,
     ) -> bool {
@@ -2206,13 +2360,18 @@ impl TerminalRenderer {
             .floor()
             .max(0.0) as usize)
             .min(rows.saturating_sub(1));
-        self.compute_block_chrome(terminal, rows)
-            .as_deref()
-            .is_none_or(|entries| {
-                entries.iter().any(|entry| {
-                    entry.live && entry.span.first_row <= row && row <= entry.span.last_row
-                })
+        // Same chrome the frame painted, so app-mouse ownership cannot
+        // disagree with the visible cards.
+        match viewport {
+            Some(viewport) => self.block_chrome_snapshot(terminal, viewport, rows),
+            None => self.compute_block_chrome(terminal, rows),
+        }
+        .as_deref()
+        .is_none_or(|entries| {
+            entries.iter().any(|entry| {
+                entry.live && entry.span.first_row <= row && row <= entry.span.last_row
             })
+        })
     }
 
     /// Host-side Ctrl-link ownership is broader than application mouse
@@ -2221,7 +2380,7 @@ impl TerminalRenderer {
     /// selection. Gutter, padding, and scrollbar remain outside this surface.
     #[allow(dead_code)] // Public/test compatibility; application uses projected ownership.
     pub fn pointer_link_eligible(&self, terminal: &TerminalState, pos: egui::Pos2) -> bool {
-        self.pointer_link_eligible_for_rows(terminal, pos, terminal.grid.rows())
+        self.pointer_link_eligible_for_rows(terminal, None, pos, terminal.grid.rows())
     }
 
     pub fn pointer_link_eligible_projected(
@@ -2269,12 +2428,13 @@ impl TerminalRenderer {
                 })
                 .is_some_and(|(_, header)| header);
         }
-        self.pointer_link_eligible_for_rows(terminal, pos, viewport.rows())
+        self.pointer_link_eligible_for_rows(terminal, Some(viewport), pos, viewport.rows())
     }
 
     fn pointer_link_eligible_for_rows(
         &self,
         terminal: &TerminalState,
+        viewport: Option<&ProjectedViewport>,
         pos: egui::Pos2,
         rows: usize,
     ) -> bool {
@@ -2287,13 +2447,17 @@ impl TerminalRenderer {
         if terminal.is_alt_buffer_active() || !self.block_mode {
             return true;
         }
-        !self
-            .compute_block_chrome(terminal, rows)
-            .as_deref()
-            .and_then(|entries| {
-                self.finished_block_at_position(entries, pos, content_rect, self.line_height, rows)
-            })
-            .is_some_and(|(_, header)| header)
+        // Same chrome the frame painted: a header that is visibly a card
+        // header must reserve the click for whole-card selection.
+        !match viewport {
+            Some(viewport) => self.block_chrome_snapshot(terminal, viewport, rows),
+            None => self.compute_block_chrome(terminal, rows),
+        }
+        .as_deref()
+        .and_then(|entries| {
+            self.finished_block_at_position(entries, pos, content_rect, self.line_height, rows)
+        })
+        .is_some_and(|(_, header)| header)
     }
 
     #[cfg(test)]
@@ -2540,6 +2704,25 @@ impl TerminalRenderer {
                 chosen = Some(crate::block_mode::BlockMenuAction::Reinput);
                 ui.close();
             }
+            // Re-execute. Deliberately single-target and gated on exact shell
+            // metadata; every other refusal (no prompt, no bracketed paste,
+            // pending input, multiline) belongs to the replay guard and is
+            // reported through the status line, exactly as the sidebar's
+            // "Run again" does.
+            let rerun_disabled_reason = crate::block_mode::rerun_disabled_reason(
+                clicked.command_exact,
+                clicked.command_truncated,
+                plural,
+            );
+            if block_menu_button(
+                ui,
+                crate::block_mode::rerun_menu_label(clicked_outcome),
+                has_commands && rerun_disabled_reason.is_none(),
+                rerun_disabled_reason.unwrap_or("The selected block has no command"),
+            ) {
+                chosen = Some(crate::block_mode::BlockMenuAction::Rerun);
+                ui.close();
+            }
             let collapse_label = crate::block_mode::output_collapse_menu_label(collapse_requested);
             if block_menu_button(
                 ui,
@@ -2748,14 +2931,15 @@ impl TerminalRenderer {
     ) {
         use crate::block_mode::{self, BlockOutcome};
         const BADGE_PAD_X: f32 = 4.0;
-        const BADGE_PAD_Y: f32 = 1.0;
+        // Shared with `block_mode::badge_font_ladder` so the pure fit test and
+        // the painter cannot disagree about how tall a badge box really is.
+        const BADGE_PAD_Y: f32 = block_mode::BADGE_PAD_Y;
         const BADGE_RIGHT_MARGIN: f32 = 8.0;
 
         let badge_bg = {
             let [r, g, b] = self.theme.ui.panel_bg;
             Color32::from_rgba_unmultiplied(r, g, b, 235)
         };
-        let badge_font = FontId::proportional(if self.block_compact { 10.0 } else { 11.0 });
         let viewport_rows = grid.len();
 
         for entry in entries {
@@ -2813,33 +2997,42 @@ impl TerminalRenderer {
                 );
             }
 
-            // Right-aligned outcome badge on the first row, drawn only when
-            // every cell it would cover is blank — never over prompt text.
-            if !entry.span.starts_in_viewport {
+            // Right-aligned outcome badge, drawn only where every cell it
+            // would cover is blank — never over prompt or output text.
+            // Normally it sits on the block's own prompt row; once that row
+            // scrolls above the viewport the badge retries on the block's
+            // first VISIBLE row, so a long block keeps its outcome on screen
+            // while you read its output. A synthetic collapsed-summary row is
+            // excluded: its cells are blank, so the guard below would happily
+            // paint under the summary label drawn later in the frame — and
+            // that row already states the block's state anyway.
+            if !entry.span.starts_in_viewport && !entry.first_row_is_raw {
                 continue;
             }
-            let Some(text) = block_mode::badge_text_with_lifecycle(
+            let color = status;
+            // 选中块的徽章附带完成时刻(本地时间)。放不下时逐级退回更短的
+            // 拼写(去掉时刻/生命周期后缀/时长,最后只剩字形),再逐级退回
+            // 更小的字号,避免"放不下"把结果整个吞掉。
+            let clock = entry
+                .active
+                .then(|| entry.finished_at.and_then(block_mode::epoch_secs))
+                .flatten()
+                .map(|secs| {
+                    block_mode::format_local_time_of_day(
+                        secs,
+                        block_mode::local_utc_offset_secs(secs),
+                    )
+                });
+            let candidates = block_mode::badge_text_candidates(
                 entry.outcome,
                 entry.duration_ms,
                 entry.start_mark_seen,
                 entry.completion_provenance,
-            ) else {
+                clock.as_deref(),
+            );
+            if candidates.is_empty() {
                 continue;
-            };
-            // 选中块的徽章附带完成时刻(本地时间)。带后缀的徽章放不下时,
-            // 先退回无后缀徽章再放弃,避免选中反而让徽章整个消失。
-            let mut candidates: Vec<String> = Vec::new();
-            if entry.active {
-                if let Some(secs) = entry.finished_at.and_then(block_mode::epoch_secs) {
-                    let clock = block_mode::format_local_time_of_day(
-                        secs,
-                        block_mode::local_utc_offset_secs(secs),
-                    );
-                    candidates.push(format!("{text} · {clock}"));
-                }
             }
-            candidates.push(text);
-            let color = status;
             // Map wide-char continuation cells to a non-blank marker so the
             // badge never paints over half a glyph.
             let row_chars: Vec<char> = grid
@@ -2856,51 +3049,59 @@ impl TerminalRenderer {
                         .collect()
                 })
                 .unwrap_or_default();
-            for text in candidates {
-                let galley = painter.layout_no_wrap(text, badge_font.clone(), color);
-                let text_size = galley.size();
-                let bg_size = egui::vec2(
-                    text_size.x + 2.0 * BADGE_PAD_X,
-                    text_size.y + 2.0 * BADGE_PAD_Y,
-                );
-                if bg_size.y > line_height {
-                    break; // 小字号下徽章会溢出到下一行;高度与后缀无关,直接放弃。
-                }
-                let bg_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        content_rect.right() - BADGE_RIGHT_MARGIN - bg_size.x,
-                        top_y + ((line_height - bg_size.y).max(0.0)) / 2.0,
-                    ),
-                    bg_size,
-                );
-                let bg_rect = bg_rect.translate(egui::vec2(
-                    geometry.rect.right() - content_rect.right(),
-                    0.0,
-                ));
-                if bg_rect.left() < geometry.rect.left() || char_width <= 0.0 {
-                    continue; // 内容区放不下这个候选,试更短的。
-                }
-                let start_col =
-                    ((bg_rect.left() - content_rect.left()) / char_width).floor() as usize;
-                if block_mode::badge_covers_only_blank_cells(&row_chars, start_col) {
-                    painter.rect_filled(bg_rect, 3.0, badge_bg);
-                    painter.galley(
-                        bg_rect.min + egui::vec2(BADGE_PAD_X, BADGE_PAD_Y),
-                        galley,
-                        color,
+            'badge: for font_size in block_mode::badge_font_ladder(line_height, self.block_compact)
+            {
+                let badge_font = FontId::proportional(font_size);
+                for text in &candidates {
+                    let galley = painter.layout_no_wrap(text.clone(), badge_font.clone(), color);
+                    let text_size = galley.size();
+                    let bg_size = egui::vec2(
+                        text_size.x + 2.0 * BADGE_PAD_X,
+                        text_size.y + 2.0 * BADGE_PAD_Y,
                     );
-                    // Register a timer only after the running badge actually
-                    // paints. Hidden panes are not rendered; alt-screen,
-                    // reflow, an offscreen prompt, overlap and insufficient
-                    // height/width all exit before this point.
-                    if entry.outcome == BlockOutcome::Running {
-                        if let Some(elapsed_ms) = entry.duration_ms {
-                            painter.ctx().request_repaint_after(
-                                block_mode::running_badge_refresh_interval(elapsed_ms),
-                            );
-                        }
+                    if bg_size.y > line_height {
+                        // 这个字号整体溢出到下一行;高度与拼写无关,直接换更小的字号。
+                        break;
                     }
-                    break;
+                    let bg_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            content_rect.right() - BADGE_RIGHT_MARGIN - bg_size.x,
+                            top_y + ((line_height - bg_size.y).max(0.0)) / 2.0,
+                        ),
+                        bg_size,
+                    );
+                    let bg_rect = bg_rect.translate(egui::vec2(
+                        geometry.rect.right() - content_rect.right(),
+                        0.0,
+                    ));
+                    if bg_rect.left() < geometry.rect.left() || char_width <= 0.0 {
+                        continue; // 内容区放不下这个候选,试更短的。
+                    }
+                    let start_col =
+                        ((bg_rect.left() - content_rect.left()) / char_width).floor() as usize;
+                    if block_mode::badge_covers_only_blank_cells(&row_chars, start_col) {
+                        painter.rect_filled(bg_rect, 3.0, badge_bg);
+                        painter.galley(
+                            bg_rect.min + egui::vec2(BADGE_PAD_X, BADGE_PAD_Y),
+                            galley,
+                            color,
+                        );
+                        // Register a timer only after the running badge actually
+                        // paints. Hidden panes are not rendered; alt-screen,
+                        // reflow, overlap and an exhausted font ladder all
+                        // exit before this point. (An offscreen prompt row no
+                        // longer does: the badge falls back to the block's
+                        // first visible row, and a live badge there is still a
+                        // painted badge.)
+                        if entry.outcome == BlockOutcome::Running {
+                            if let Some(elapsed_ms) = entry.duration_ms {
+                                painter.ctx().request_repaint_after(
+                                    block_mode::running_badge_refresh_interval(elapsed_ms),
+                                );
+                            }
+                        }
+                        break 'badge;
+                    }
                 }
             }
         }
@@ -3134,11 +3335,7 @@ impl TerminalRenderer {
         // gutter hit test below and the chrome painting after the grid.
         // `None` while chrome is gated off (config, alt screen, reflow).
         let summaries = Self::projected_summary_rows(terminal, &viewport);
-        let mut block_chrome = if viewport.is_transformed() {
-            self.compute_projected_block_chrome(terminal, &viewport)
-        } else {
-            self.compute_block_chrome(terminal, rows)
-        };
+        let mut block_chrome = self.block_chrome_snapshot(terminal, &viewport, rows);
         if let Some(entries) = block_chrome.as_deref_mut() {
             self.update_block_hover(
                 entries,
@@ -5195,6 +5392,680 @@ mod tests {
         assert_eq!(kitty_absolute_row(usize::MAX, 0), None);
     }
 
+    /// Ordinary soft wrapping makes `viewport_buffer_mapping_is_exact` false
+    /// as soon as the user scrolls back, and the raw chrome path refuses to
+    /// answer in that state — which used to delete every card, stripe and
+    /// badge exactly when the user was reading history. The projected path
+    /// carries exact per-row provenance, so the shared snapshot rule must
+    /// switch to it there.
+    /// The rows a record "owns" in the projected path include every trailing
+    /// blank live-grid row, so deriving the newest card's extent from them let
+    /// the idle input card swallow the whole viewport (with a fake closed
+    /// bottom edge) the moment scrolling back switched chrome sources.
+    #[test]
+    fn the_idle_input_card_keeps_its_height_when_the_chrome_source_switches() {
+        let mut terminal = TerminalState::new(16, 12);
+        let wide = "x".repeat(40);
+        for index in 0..4 {
+            terminal.process_input(
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07{wide}\r\n\x1b]133;D;0\x07")
+                    .as_bytes(),
+            );
+        }
+        // Home + erase so the idle prompt sits at grid row 0 with blank live
+        // rows beneath it — the state that exposed the defect.
+        terminal.process_input(b"\x1b[H\x1b[2J\x1b]133;A\x07$ ");
+
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        let rows = terminal.grid.rows();
+        let live_span = |entries: &[BlockChromeEntry]| {
+            entries
+                .iter()
+                .find(|entry| entry.live)
+                .map(|entry| entry.span)
+                .expect("the newest record owns the live card")
+        };
+
+        let raw = live_span(&renderer.compute_block_chrome(&terminal, rows).unwrap());
+        let raw_height = raw.last_row - raw.first_row + 1;
+        assert_eq!(
+            raw_height,
+            crate::block_mode::MIN_INPUT_ROWS,
+            "an idle prompt gets exactly the input floor on the raw path"
+        );
+        assert!(raw.starts_in_viewport && raw.ends_in_viewport);
+
+        for offset in 1..=3usize {
+            terminal.scroll_offset = offset;
+            assert!(!terminal.viewport_buffer_mapping_is_exact());
+            let viewport =
+                terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+            let projected = live_span(
+                &renderer
+                    .block_chrome_snapshot(&terminal, &viewport, rows)
+                    .unwrap(),
+            );
+            assert_eq!(
+                projected.last_row - projected.first_row + 1,
+                raw_height,
+                "scrolled back by {offset}, the live card must keep the same height, \
+                 not grow into the trailing blank rows ({projected:?})"
+            );
+            assert!(
+                projected.last_row + 1 < rows,
+                "the live card must not reach the viewport bottom at offset {offset}"
+            );
+        }
+    }
+
+    /// `block_chrome_snapshot` promises a click can never disagree with what
+    /// was drawn, which requires the two chrome sources to describe the SAME
+    /// cards wherever both can answer. The hard case is a command whose output
+    /// ended without a newline: the next prompt then shares that physical row,
+    /// and the raw path normalizes it to that row while the projected path
+    /// reads the row's first origin span — which names the older block.
+    /// Broad differential: wherever the raw mapping stays exact BOTH chrome
+    /// sources answer, and they must describe the same card ownership. This is
+    /// the guard that caught the live card first swallowing the viewport and
+    /// then collapsing to its input floor — both were single-fixture-invisible
+    /// but show up immediately across a grid of shapes.
+    /// The ownership differential only ever builds IDENTITY viewports, which
+    /// is exactly why a swallow that needs a collapsed block to trigger stayed
+    /// invisible. Collapsing a block whose output ended without a newline
+    /// hides the leading columns of the row the next prompt shares, so the
+    /// live card's extent anchor became unresolvable and the card grew to the
+    /// bottom of the pane. Pin the invariant directly on transformed
+    /// viewports: the newest card never extends past its own content, beyond
+    /// the six-row input floor.
+    /// A running command that repaints the screen (`clear`, `watch`, any
+    /// progress UI) scrolls its own prompt row above the window, so the live
+    /// card is clipped at the TOP. The card's six-row input surface lives in
+    /// the block model's line space; measuring it in display rows collapsed
+    /// the card onto whatever row last held text — sometimes a single row —
+    /// and stamped a finished-looking bottom edge under it.
+    /// `prompt_start.column == cols` is a pending-wrap SENTINEL recorded at the
+    /// width in effect at the time, not a real column. The projected path used
+    /// to divide it by the CURRENT width while the raw path treated it as "one
+    /// row down", so after a resize the two disagreed about which row owns the
+    /// live card — and the projected path is what runs on the first
+    /// scrolled-back line.
+    /// `bool::then_some` evaluates its value eagerly, so `application_cell`'s
+    /// scrollback subtraction ran BEFORE the guard meant to protect it. Any
+    /// hovered cell whose owning raw row lives in scrollback rather than the
+    /// live grid underflowed — an ordinary hover while a block is collapsed
+    /// and the view is scrolled. Release builds discarded the wrapped value;
+    /// debug builds panicked.
+    #[test]
+    fn hovering_a_scrolled_collapsed_projection_does_not_underflow() {
+        let mut terminal = TerminalState::new(16, 8);
+        for index in 0..5 {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        let sequence = terminal
+            .command_records()
+            .iter()
+            .find(|record| record.complete)
+            .expect("a completed block")
+            .sequence;
+
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(sequence));
+        let mut view_state = crate::terminal::ProjectionViewState::new();
+        let viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut view_state,
+        );
+        assert!(viewport.is_transformed());
+        view_state.set_offset(1, &viewport);
+        let viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut view_state,
+        );
+
+        // Every cell the pointer path can ask about must answer without
+        // panicking, and a scrollback-sourced row must answer `None` rather
+        // than a wrapped row index.
+        for row in 0..viewport.rows() {
+            for column in 0..viewport.columns() {
+                if let Some((grid_row, _)) =
+                    viewport.application_cell(DisplayPoint::new(row, column))
+                {
+                    assert!(
+                        grid_row < terminal.grid.rows(),
+                        "row {row} col {column} produced grid row {grid_row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_resized_pane_keeps_the_live_card_on_its_own_output() {
+        // The sentinel resolves to the next row at ANY width, exactly as the
+        // raw path's `prompt_row_line_id` does.
+        assert_eq!(normalized_block_anchor(35, 80, 80), (36, 0));
+        assert_eq!(normalized_block_anchor(35, 80, 40), (36, 0));
+        assert_eq!(normalized_block_anchor(35, 80, 20), (36, 0));
+        for cols in [1usize, 8, 20, 40, 80] {
+            assert_eq!(
+                normalized_block_anchor(35, 80, cols).0,
+                crate::block_mode::prompt_row_line_id(35, 80, cols),
+                "cols={cols}"
+            );
+        }
+
+        // After a width change the raw path refuses to answer at every
+        // scrolled-back offset, so a raw-vs-projected differential cannot
+        // reach this case. Use non-circular ground truth instead: wherever the
+        // running command's own output is on screen, its live card must exist
+        // and must cover that row.
+        let renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut checked = 0usize;
+        for new_cols in [16usize, 20, 24, 40, 60] {
+            let mut terminal = TerminalState::new(80, 24);
+            for index in 0..12 {
+                // Output that exactly fills whole rows and ends WITHOUT a
+                // newline records the prompt as a pending-wrap sentinel.
+                terminal.process_input(
+                    format!(
+                        "\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07{}\x1b]133;D;0\x07",
+                        "#".repeat(160)
+                    )
+                    .as_bytes(),
+                );
+            }
+            terminal.process_input(b"\x1b]133;A\x07$ tail\r\n\x1b]133;C\x07zzmarker\r\n");
+            terminal.on_resize(new_cols, 24);
+
+            for offset in 0..=terminal.scrollback.len().min(12) {
+                terminal.scroll_offset = offset;
+                let viewport = terminal
+                    .projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+                let Some(marker_row) = (0..viewport.rows()).find(|row| {
+                    viewport.cells().get(*row).is_some_and(|line| {
+                        line.iter()
+                            .map(|cell| cell.character)
+                            .collect::<String>()
+                            .contains("zz")
+                    })
+                }) else {
+                    continue;
+                };
+                let entries = renderer
+                    .compute_projected_block_chrome(&terminal, &viewport)
+                    .expect("projected chrome");
+                let live = entries.iter().find(|entry| entry.live).unwrap_or_else(|| {
+                    panic!(
+                        "new_cols={new_cols} offset={offset}: the running command's output is on \
+                         display row {marker_row} but no live card was produced"
+                    )
+                });
+                checked += 1;
+                assert!(
+                    live.span.first_row <= marker_row && marker_row <= live.span.last_row,
+                    "new_cols={new_cols} offset={offset}: live card {:?} does not cover its own \
+                     output on row {marker_row}",
+                    live.span
+                );
+                assert!(
+                    !entries.iter().any(|entry| {
+                        !entry.live
+                            && entry.span.first_row <= marker_row
+                            && marker_row <= entry.span.last_row
+                    }),
+                    "new_cols={new_cols} offset={offset}: a finished card stole row {marker_row}"
+                );
+            }
+        }
+        assert!(
+            checked > 8,
+            "sweep must exercise real viewports, got {checked}"
+        );
+    }
+
+    #[test]
+    fn a_top_clipped_live_card_keeps_the_extent_the_block_model_gives_it() {
+        let mut terminal = TerminalState::new(20, 8);
+        for index in 0..7 {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07{}\r\n\x1b]133;D;0\x07",
+                    "y".repeat(25)
+                )
+                .as_bytes(),
+            );
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ run\r\n\x1b]133;C\x07");
+        // ED-2 scrolls the old screen away: the live prompt row is now above
+        // the window while the fresh frame is on screen.
+        terminal.process_input(b"\x1b[2J\x1b[Hframe 1");
+
+        let renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let live_of = |entries: &[BlockChromeEntry]| {
+            entries
+                .iter()
+                .find(|entry| entry.live)
+                .map(|entry| entry.span)
+                .expect("a running command owns the live card")
+        };
+        let raw = live_of(
+            &renderer
+                .compute_block_chrome(&terminal, terminal.grid.rows())
+                .expect("raw chrome"),
+        );
+        assert!(!raw.starts_in_viewport, "the fixture must clip the top");
+
+        let viewport =
+            terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+        let projected = live_of(
+            &renderer
+                .compute_projected_block_chrome(&terminal, &viewport)
+                .expect("projected chrome"),
+        );
+        assert_eq!(
+            (
+                projected.first_row,
+                projected.last_row,
+                projected.ends_in_viewport
+            ),
+            (raw.first_row, raw.last_row, raw.ends_in_viewport),
+            "a top-clipped live card must describe the same extent on both paths"
+        );
+
+        // A pane too small to hold the whole input surface must not claim a
+        // closed bottom edge on either path.
+        let mut small = TerminalState::new(8, 4);
+        small.process_input(b"\x1b]133;A\x07$ run\r\n\x1b]133;C\x07r0\r\nr1\r\nr2\r\n");
+        let small_raw = live_of(
+            &renderer
+                .compute_block_chrome(&small, small.grid.rows())
+                .expect("raw chrome"),
+        );
+        let small_viewport =
+            small.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+        let small_projected = live_of(
+            &renderer
+                .compute_projected_block_chrome(&small, &small_viewport)
+                .expect("projected chrome"),
+        );
+        assert!(!small_raw.ends_in_viewport);
+        assert_eq!(
+            small_projected.ends_in_viewport, small_raw.ends_in_viewport,
+            "a card clipped by the pane bottom must not gain a finished edge"
+        );
+    }
+
+    #[test]
+    fn the_live_card_never_swallows_blank_rows_in_a_collapsed_projection() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut checked = 0usize;
+        for cols in [10usize, 24, 40] {
+            for rows in [6usize, 12, 16] {
+                for trailing_newline in [true, false] {
+                    let mut terminal = TerminalState::new(cols, rows);
+                    for index in 0..3 {
+                        let tail = if trailing_newline { "\r\n" } else { "" };
+                        terminal.process_input(
+                            format!(
+                                "\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07hi{tail}\x1b]133;D;0\x07"
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    terminal.process_input(b"\x1b]133;A\x07$ ");
+                    let sequences: Vec<u64> = terminal
+                        .command_records()
+                        .iter()
+                        .filter(|record| record.complete)
+                        .map(|record| record.sequence)
+                        .collect();
+
+                    for sequence in sequences {
+                        let mut policy = crate::terminal::ProjectionPolicy::new();
+                        if !policy.collapse(sequence) {
+                            continue;
+                        }
+                        let mut view_state = crate::terminal::ProjectionViewState::new();
+                        let viewport = terminal.projected_viewport_with_state(
+                            HistoryProjection::identity(),
+                            true,
+                            &policy,
+                            &mut view_state,
+                        );
+                        if !viewport.is_transformed() {
+                            continue;
+                        }
+                        let Some(entries) =
+                            renderer.compute_projected_block_chrome(&terminal, &viewport)
+                        else {
+                            continue;
+                        };
+                        let Some(live) = entries.iter().find(|entry| entry.live) else {
+                            continue;
+                        };
+                        // Last row inside the card that actually holds text.
+                        let last_content_row = (live.span.first_row..=live.span.last_row)
+                            .rev()
+                            .find(|row| {
+                                viewport.cells().get(*row).is_some_and(|line| {
+                                    line.iter()
+                                        .any(|cell| !matches!(cell.character, ' ' | '\0'))
+                                })
+                            })
+                            .unwrap_or(live.span.first_row);
+                        let floor = live
+                            .span
+                            .first_row
+                            .saturating_add(crate::block_mode::MIN_INPUT_ROWS - 1);
+                        checked += 1;
+                        assert!(
+                            live.span.last_row <= floor.max(last_content_row),
+                            "cols={cols} rows={rows} trailing_newline={trailing_newline} \
+                             sequence={sequence}: live card {:?} extends past its content \
+                             (last content row {last_content_row}, floor {floor})",
+                            live.span
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 20,
+            "sweep must exercise real cases, got {checked}"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Tail {
+        Idle,
+        Running,
+        RunningRepaint,
+    }
+
+    #[test]
+    fn raw_and_projected_chrome_agree_on_ownership_across_many_shapes() {
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        // Ownership, plus the LIVE card's bottom-edge flag. `ends_in_viewport`
+        // is only exempt for finished cards whose successor's prompt begins
+        // mid-row (see `projected_span_edge_flags`); the live card has no
+        // successor, so it has no excuse to differ.
+        let ownership = |entries: &[BlockChromeEntry]| {
+            let mut owned: Vec<(String, usize, usize, bool, Option<bool>)> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        entry.span.first_row,
+                        entry.span.last_row,
+                        entry.span.starts_in_viewport,
+                        entry.live.then_some(entry.span.ends_in_viewport),
+                    )
+                })
+                .collect();
+            owned.sort_by(|left, right| left.0.cmp(&right.0));
+            owned
+        };
+
+        let mut compared = 0usize;
+        for cols in [8usize, 16, 28] {
+            for rows in [4usize, 8, 12] {
+                for output_lines in [0usize, 1, 3, 9] {
+                    for trailing_newline in [true, false] {
+                        for tail in [Tail::Idle, Tail::Running, Tail::RunningRepaint] {
+                            let mut terminal = TerminalState::new(cols, rows);
+                            for index in 0..3 {
+                                let mut input = format!(
+                                    "\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07"
+                                );
+                                for line in 0..output_lines {
+                                    input.push_str(&format!("out{line}"));
+                                    if line + 1 < output_lines || trailing_newline {
+                                        input.push_str("\r\n");
+                                    }
+                                }
+                                input.push_str("\x1b]133;D;0\x07");
+                                terminal.process_input(input.as_bytes());
+                            }
+                            match tail {
+                                // A command still between C and D, producing
+                                // output: the case where the card's end can
+                                // fall outside the visible window.
+                                Tail::Running => terminal.process_input(
+                                    b"\x1b]133;A\x07$ run\r\n\x1b]133;C\x07a\r\nb\r\nc\r\nd\r\n",
+                                ),
+                                // A running command that repaints the screen
+                                // scrolls its own prompt row above the window,
+                                // clipping the live card at the TOP.
+                                Tail::RunningRepaint => terminal.process_input(
+                                    b"\x1b]133;A\x07$ run\r\n\x1b]133;C\x07\x1b[2J\x1b[Hframe",
+                                ),
+                                Tail::Idle => terminal.process_input(b"\x1b]133;A\x07$ "),
+                            }
+
+                            let limit = terminal.scrollback.len().min(24);
+                            for offset in 0..=limit {
+                                terminal.scroll_offset = offset;
+                                if !terminal.viewport_buffer_mapping_is_exact() {
+                                    // Only the projected source answers here;
+                                    // there is nothing to compare against.
+                                    continue;
+                                }
+                                let Some(raw) = renderer.compute_block_chrome(&terminal, rows)
+                                else {
+                                    continue;
+                                };
+                                let viewport = terminal.projected_viewport(
+                                    crate::terminal::HistoryProjection::identity(),
+                                    true,
+                                );
+                                let projected = renderer
+                                    .compute_projected_block_chrome(&terminal, &viewport)
+                                    .expect("projected chrome answers whenever raw does");
+                                compared += 1;
+                                assert_eq!(
+                                    ownership(&raw),
+                                    ownership(&projected),
+                                    "cols={cols} rows={rows} output_lines={output_lines} \
+                                     trailing_newline={trailing_newline} tail={tail:?} \
+                                     offset={offset}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 200,
+            "the sweep must actually compare a meaningful number of viewports, got {compared}"
+        );
+    }
+
+    #[test]
+    fn both_chrome_paths_describe_the_same_cards_when_a_row_is_shared() {
+        let mut terminal = TerminalState::new(16, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo a\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07",
+        );
+        // Output with NO trailing newline: the next prompt lands mid-row.
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo b\r\n\x1b]133;C\x07abc\x1b]133;D;0\x07",
+        );
+        terminal.process_input(b"\x1b]133;A\x07$ c\r\n");
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+
+        let shared = terminal
+            .command_records()
+            .iter()
+            .find(|record| record.prompt_start.column > 0)
+            .expect("fixture must produce a prompt that shares a row with earlier output");
+        assert!(!shared.prompt_start.column.is_multiple_of(16));
+
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        let rows = terminal.grid.rows();
+        // Ownership only. `ends_in_viewport` is a decorative bottom-edge cap
+        // that the projected path deliberately withholds for a mid-row next
+        // prompt (see `projected_span_edge_flags`); it never decides which
+        // card a click selects.
+        let describe = |entries: &[BlockChromeEntry]| {
+            let mut described: Vec<(String, usize, usize, bool)> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        entry.span.first_row,
+                        entry.span.last_row,
+                        entry.span.starts_in_viewport,
+                    )
+                })
+                .collect();
+            described.sort_by(|left, right| left.0.cmp(&right.0));
+            described
+        };
+
+        // No soft wrapping here, so the raw mapping stays exact at every
+        // offset and BOTH sources answer — which is what makes them
+        // comparable.
+        for offset in 0..=2usize {
+            terminal.scroll_offset = offset;
+            assert!(terminal.viewport_buffer_mapping_is_exact());
+            let raw = renderer
+                .compute_block_chrome(&terminal, rows)
+                .expect("raw chrome");
+            let viewport =
+                terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+            let projected = renderer
+                .compute_projected_block_chrome(&terminal, &viewport)
+                .expect("projected chrome");
+            assert_eq!(
+                describe(&raw),
+                describe(&projected),
+                "chrome sources disagree at scroll offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_chrome_survives_scrolling_back_over_soft_wrapped_output() {
+        let mut terminal = TerminalState::new(16, 6);
+        let wide = "x".repeat(40);
+        for index in 0..4 {
+            terminal.process_input(
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07{wide}\r\n\x1b]133;D;0\x07")
+                    .as_bytes(),
+            );
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        let completed: Vec<String> = terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete)
+            .map(|record| record.id.clone())
+            .collect();
+        assert!(
+            completed.len() >= 2,
+            "fixture must retain several finished blocks"
+        );
+        assert!(
+            terminal.scrollback.iter().any(|line| line.is_wrapped),
+            "fixture must actually soft-wrap"
+        );
+
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        let rows = terminal.grid.rows();
+
+        // Unscrolled, the raw path is exact and still owns the frame.
+        assert!(terminal.viewport_buffer_mapping_is_exact());
+        assert!(renderer.compute_block_chrome(&terminal, rows).is_some());
+
+        terminal.scroll_offset = 3;
+        assert!(
+            !terminal.viewport_buffer_mapping_is_exact(),
+            "scrolling back over wrapped scrollback must make the raw mapping inexact"
+        );
+        assert!(
+            renderer.compute_block_chrome(&terminal, rows).is_none(),
+            "the raw path still fails closed — that is exactly why the snapshot rule exists"
+        );
+
+        let viewport =
+            terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), true);
+        assert!(!viewport.is_transformed(), "no collapse policy is active");
+        let entries = renderer
+            .block_chrome_snapshot(&terminal, &viewport, rows)
+            .expect("chrome must survive an inexact raw mapping");
+        assert!(
+            !entries.is_empty(),
+            "at least one command block is on screen"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.projected_geometry && entry.span.first_row < rows),
+            "scrolled-back chrome must use projected geometry inside the viewport"
+        );
+        assert!(
+            entries.iter().any(|entry| completed.contains(&entry.id)),
+            "a finished block must still be identified while scrolled back"
+        );
+    }
+
     #[test]
     fn transformed_header_owns_ctrl_link_and_dirty_rows_follow_raw_ids() {
         let mut terminal = TerminalState::new(16, 8);
@@ -6219,6 +7090,86 @@ mod tests {
         // a conventional 5px window-resize grip and remains fully clickable.
         assert_eq!(selected.left(), 6.0);
         assert!(selected.left() > 5.0);
+    }
+
+    fn chrome_entry(outcome: crate::block_mode::BlockOutcome, hovered: bool) -> BlockChromeEntry {
+        BlockChromeEntry {
+            id: "record".to_string(),
+            span: crate::block_mode::VisibleBlockSpan {
+                record_index: 0,
+                first_row: 0,
+                last_row: 1,
+                starts_in_viewport: true,
+                ends_in_viewport: true,
+            },
+            viewport_top_line_id: 0,
+            cols: 80,
+            header_range: None,
+            projected_header_range: None,
+            projected_geometry: false,
+            first_row_is_raw: true,
+            outcome,
+            start_mark_seen: true,
+            completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
+            live: false,
+            selected: false,
+            active: false,
+            bookmarked: false,
+            hovered,
+            duration_ms: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn hovering_never_dims_a_failed_or_unknown_cards_outcome_color() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        // Color32 stores PREMULTIPLIED bytes, so compare the unmultiplied
+        // source hue the painter was actually asked for.
+        let hue = |color: Color32| {
+            let [r, g, b, _] = color.to_srgba_unmultiplied();
+            (r, g, b)
+        };
+        let close = |left: (u8, u8, u8), right: (u8, u8, u8)| {
+            left.0.abs_diff(right.0) <= 2
+                && left.1.abs_diff(right.1) <= 2
+                && left.2.abs_diff(right.2) <= 2
+        };
+        for outcome in [
+            crate::block_mode::BlockOutcome::Failed(1),
+            crate::block_mode::BlockOutcome::Unknown,
+        ] {
+            let expected = hue(renderer.block_outcome_color(outcome));
+            let resting = renderer.block_card_overlay(&chrome_entry(outcome, false));
+            let hovered = renderer.block_card_overlay(&chrome_entry(outcome, true));
+            // Same hue as the resting outcome wash...
+            assert!(close(hue(hovered), expected), "{:?}", hue(hovered));
+            // ...and hover only ever adds emphasis, never removes it.
+            assert!(hovered.a() >= resting.a());
+
+            let (_, resting_border) = renderer.block_card_border(&chrome_entry(outcome, false));
+            let (_, hovered_border) = renderer.block_card_border(&chrome_entry(outcome, true));
+            assert!(close(hue(hovered_border), expected));
+            assert!(hovered_border.a() > resting_border.a());
+        }
+
+        // Outcomes that carry no warning keep the untouched neutral hover
+        // wash — the gate, not just the color, is what this pins.
+        let foreground = crate::theme::Theme::default().terminal_foreground();
+        let neutral = renderer.block_card_overlay(&chrome_entry(
+            crate::block_mode::BlockOutcome::Success,
+            true,
+        ));
+        assert_eq!(
+            neutral,
+            Color32::from_rgba_unmultiplied(foreground.r(), foreground.g(), foreground.b(), 13)
+        );
     }
 
     #[test]

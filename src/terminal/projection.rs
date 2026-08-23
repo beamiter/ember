@@ -1696,13 +1696,19 @@ pub struct ProjectedViewport {
 }
 
 impl ProjectedViewport {
+    /// `row_sources` carries per-display-row provenance for the identity
+    /// viewport. It must be reflow-aware and `key.rows` long; a shorter or
+    /// absent vector is padded with `None`, which fails closed to "no
+    /// provenance" for those rows.
     pub(super) fn new(
         key: ProjectionCacheKey,
         cells: Arc<Vec<Vec<TerminalCell>>>,
         row_wrapped: Vec<bool>,
         origins: Vec<OriginSpan>,
+        mut row_sources: Vec<Option<RawRowSource>>,
         cursor: DisplayPoint,
     ) -> Self {
+        row_sources.resize(key.rows, None);
         let mut origins_by_raw = origins.clone();
         origins_by_raw.sort_unstable_by_key(|span| {
             (
@@ -1719,7 +1725,7 @@ impl ProjectedViewport {
             origins_by_display: Arc::new(origins),
             origins_by_raw: Arc::new(origins_by_raw),
             row_kinds: Arc::new(vec![ProjectedRowKind::Raw; key.rows]),
-            row_sources: Arc::new(vec![None; key.rows]),
+            row_sources: Arc::new(row_sources),
             cursor,
             document_rows: key.scrollback_len.saturating_add(key.rows),
             document_start: key.scrollback_len.saturating_sub(key.scroll_offset),
@@ -1979,11 +1985,19 @@ impl ProjectedViewport {
         }
         let anchor = self.raw_anchor_at(point)?;
         let source = self.row_sources.get(point.row)?.as_ref()?;
+        // `then`, not `then_some`: the latter takes its value BY VALUE, so the
+        // subtraction ran before the guard that protects it and underflowed on
+        // any row sourced from scrollback rather than the live grid — an
+        // ordinary hover while a block is collapsed and the view is scrolled.
+        // Release builds discarded the wrapped value, but debug builds
+        // panicked.
         (source.raw_row == anchor.row_id && source.raw_absolute_row >= self.key.scrollback_len)
-            .then_some((
-                source.raw_absolute_row - self.key.scrollback_len,
-                anchor.column,
-            ))
+            .then(|| {
+                (
+                    source.raw_absolute_row - self.key.scrollback_len,
+                    anchor.column,
+                )
+            })
     }
 
     /// Preserve Kitty's existing live-viewport-relative placement contract.

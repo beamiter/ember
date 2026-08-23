@@ -32,6 +32,23 @@ pub struct BlockSearchRecordVersion {
     pub newest_sequence: Option<u64>,
 }
 
+/// Stable identity of the highlighted result row, used to keep the highlight
+/// on the SAME hit across a refresh that only gained or lost whole records.
+/// `(record_id, line_no, is_output_line)` is unique inside one record: a
+/// record contributes at most one command row, and output rows carry their
+/// 1-based logical line number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSearchHitAnchor {
+    /// The pane the anchored row belongs to. Record ids are only unique inside
+    /// one session (`local:{sequence}` restarts at 1 per terminal), so without
+    /// this a tab switch could re-bind the highlight to an unrelated block
+    /// that merely happens to share an id.
+    pub session_id: String,
+    pub record_id: String,
+    pub line_no: Option<usize>,
+    pub is_output_line: bool,
+}
+
 #[derive(Default)]
 pub struct BlockSearchState {
     pub is_open: bool,
@@ -128,6 +145,49 @@ impl BlockSearchState {
             .flatten()
     }
 
+    /// The highlighted row's stable identity. Captured BEFORE a refresh so it
+    /// survives `release_index_for_rebuild`, which empties `hits`. `None` when
+    /// no row is highlighted, or when the current hits have no owning session
+    /// to anchor against.
+    pub fn selected_hit_anchor(&self) -> Option<BlockSearchHitAnchor> {
+        let hit = self.hits.get(self.selected_index)?;
+        Some(BlockSearchHitAnchor {
+            session_id: self.session_id.clone()?,
+            record_id: hit.record_id.clone(),
+            line_no: hit.line_no,
+            is_output_line: hit.is_output_line,
+        })
+    }
+
+    /// Install a fresh result set for `session_id`. When `anchor` came from
+    /// that same pane and its row is still present, the highlight stays on
+    /// that row — so a background command finishing while the picker is open
+    /// no longer yanks the list back to the top and re-points Enter at a block
+    /// the user never chose. Callers pass `None` whenever the query, case,
+    /// regex or filter changed: that is a new intent and must start at the
+    /// first row. An anchor from a different pane is likewise ignored.
+    pub fn adopt_hits(
+        &mut self,
+        hits: Vec<BlockSearchHit>,
+        capped: bool,
+        session_id: &str,
+        anchor: Option<&BlockSearchHitAnchor>,
+    ) {
+        self.selected_index = anchor
+            .filter(|anchor| anchor.session_id == session_id)
+            .and_then(|anchor| {
+                hits.iter().position(|hit| {
+                    hit.record_id == anchor.record_id
+                        && hit.line_no == anchor.line_no
+                        && hit.is_output_line == anchor.is_output_line
+                })
+            })
+            .unwrap_or(0);
+        self.hits = hits;
+        self.capped = capped;
+        self.query_error = None;
+    }
+
     /// Whether `hits` are stale for the active pane, finalized record set, or
     /// current query.
     pub fn needs_refresh(
@@ -214,6 +274,83 @@ mod tests {
         state.select_next();
         assert_eq!(state.selected_index, 0);
         assert_eq!(state.selected_hit().unwrap().record_id, "a");
+    }
+
+    #[test]
+    fn adopt_hits_keeps_the_highlight_on_the_same_row_when_a_record_is_added() {
+        let mut state = BlockSearchState {
+            hits: vec![hit("newest"), hit("middle"), hit("oldest")],
+            selected_index: 1,
+            session_id: Some("pane-a".to_string()),
+            ..Default::default()
+        };
+        let anchor = state.selected_hit_anchor().expect("a highlighted row");
+        assert_eq!(anchor.record_id, "middle");
+        assert_eq!(anchor.session_id, "pane-a");
+
+        // A background command finishes: the newest-first list gains a row.
+        state.adopt_hits(
+            vec![
+                hit("brand-new"),
+                hit("newest"),
+                hit("middle"),
+                hit("oldest"),
+            ],
+            false,
+            "pane-a",
+            Some(&anchor),
+        );
+        assert_eq!(state.selected_index, 2);
+        assert_eq!(state.selected_hit().unwrap().record_id, "middle");
+
+        // The anchored row disappearing falls back to the first row.
+        state.adopt_hits(
+            vec![hit("newest"), hit("oldest")],
+            false,
+            "pane-a",
+            Some(&anchor),
+        );
+        assert_eq!(state.selected_index, 0);
+
+        // Record ids repeat across panes (`local:{sequence}` restarts at 1),
+        // so an anchor from another pane must never re-bind the highlight.
+        state.selected_index = 1;
+        state.adopt_hits(
+            vec![hit("newest"), hit("middle"), hit("oldest")],
+            false,
+            "pane-b",
+            Some(&anchor),
+        );
+        assert_eq!(state.selected_index, 0);
+
+        // A new intent (query/case/regex/filter change) passes None and
+        // deliberately restarts at the top.
+        state.selected_index = 1;
+        state.adopt_hits(vec![hit("newest"), hit("oldest")], true, "pane-a", None);
+        assert_eq!(state.selected_index, 0);
+        assert!(state.capped);
+
+        // Output rows in one record are distinguished by their line number.
+        let output_hit = |record: &str, line: usize| {
+            let mut value = hit(record);
+            value.is_output_line = true;
+            value.line_no = Some(line);
+            value
+        };
+        state.hits = vec![output_hit("r", 1), output_hit("r", 9)];
+        state.selected_index = 1;
+        let line_anchor = state.selected_hit_anchor().expect("a highlighted row");
+        state.adopt_hits(
+            vec![output_hit("r", 1), output_hit("r", 4), output_hit("r", 9)],
+            false,
+            "pane-a",
+            Some(&line_anchor),
+        );
+        assert_eq!(state.selected_index, 2);
+
+        // With no owning session there is nothing to anchor against.
+        state.session_id = None;
+        assert!(state.selected_hit_anchor().is_none());
     }
 
     #[test]
