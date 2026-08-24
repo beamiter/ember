@@ -289,6 +289,76 @@ fn transformed_wide_selection_normalizes_continuation_and_highlights_whole_glyph
 }
 
 #[test]
+fn transformed_text_selection_reanchors_across_output_plan_updates() {
+    let mut terminal = TerminalState::new(24, 8);
+    for (command, output) in [("one", "LEFT"), ("two", "SECRET"), ("three", "RIGHT")] {
+        terminal.process_input(
+            format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+            )
+            .as_bytes(),
+        );
+    }
+    let hidden_id = terminal.command_records()[1].sequence;
+    for index in 0..12 {
+        terminal.process_input(format!("F{index} filler\r\n").as_bytes());
+    }
+    terminal.process_input(b"MARKONE\r\nMARKTWO\r\n");
+
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.collapse(hidden_id));
+    let mut state = ProjectionViewState::new();
+    let viewport = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    let locate = |needle: char| {
+        viewport
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .position(|cell| cell.character == needle)
+                    .map(|column| (row, column))
+            })
+            .expect("visible selection endpoint")
+    };
+    terminal.start_selection_projected(&viewport, locate('M'));
+    terminal.update_selection_projected(&viewport, locate('W'));
+    let before = terminal.copy_selection().expect("selection copies");
+    assert!(before.contains("MARKONE"));
+    assert!(!before.contains("SECRET"));
+    drop(viewport);
+
+    // An ordinary scrolling line advances/rebuilds the transformed plan. The
+    // selection must follow its retained raw endpoints instead of vanishing.
+    terminal.process_input(b"tick\r\n");
+    let after_view = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        true,
+        &policy,
+        &mut state,
+    );
+    assert!(terminal.has_text_selection());
+    let after = terminal
+        .copy_selection()
+        .expect("selection remains copyable");
+    assert!(
+        after
+            .lines()
+            .map(str::trim_end)
+            .eq(before.lines().map(str::trim_end)),
+        "selection retargeted: {before:?} -> {after:?}"
+    );
+    assert!(!after.contains("SECRET"));
+    assert!(after_view.is_transformed());
+}
+
+#[test]
 fn transformed_block_selection_expands_a_middle_row_wide_continuation() {
     let mut terminal = TerminalState::new(12, 10);
     terminal.process_input(
@@ -3400,6 +3470,17 @@ fn osc_133_a_records_command_mark_at_cursor_row() {
     assert_eq!(mark.exit_code, None);
     // Cursor is on row 1 (after the LF) so line_id == 1.
     assert_eq!(mark.line_id, 1);
+}
+
+#[test]
+fn prompt_mark_presence_distinguishes_plain_shell_output_from_shell_integration() {
+    let mut plain = TerminalState::new(8, 4);
+    plain.process_input(b"$ printf ok\r\nok\r\n");
+    assert!(!plain.has_prompt_marks());
+
+    let mut marked = TerminalState::new(8, 4);
+    marked.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    assert!(marked.has_prompt_marks());
 }
 
 #[test]

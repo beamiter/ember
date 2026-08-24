@@ -57,6 +57,10 @@ pub struct BlockSearchState {
     pub selected_index: usize,
     /// One-shot: focus the query field on the frame after opening.
     pub needs_focus: bool,
+    /// One-shot: center the highlighted result in the virtual result list.
+    /// Keyboard/query-driven moves set this; pointer hover deliberately does
+    /// not, so wheel and scrollbar movement remain under the user's control.
+    pub scroll_to_selected: bool,
     pub hits: Vec<BlockSearchHit>,
     /// True when the last run stopped at the hit cap (older blocks were left
     /// unscanned).
@@ -86,6 +90,7 @@ impl BlockSearchState {
     pub fn open(&mut self) {
         self.is_open = true;
         self.needs_focus = true;
+        self.scroll_to_selected = true;
         self.query.clear();
         self.selected_index = 0;
         self.hits.clear();
@@ -123,6 +128,7 @@ impl BlockSearchState {
     pub fn select_next(&mut self) {
         if !self.hits.is_empty() {
             self.selected_index = (self.selected_index + 1) % self.hits.len();
+            self.scroll_to_selected = true;
         }
     }
 
@@ -134,6 +140,16 @@ impl BlockSearchState {
             } else {
                 self.selected_index - 1
             };
+            self.scroll_to_selected = true;
+        }
+    }
+
+    /// Let pointer hover take ownership only after real pointer movement.
+    /// A stationary cursor must not overwrite a keyboard selection on every
+    /// rendered frame merely because the virtual list moved underneath it.
+    pub fn select_hovered(&mut self, index: usize, pointer_moved: bool) {
+        if pointer_moved && index < self.hits.len() {
+            self.selected_index = index;
         }
     }
 
@@ -173,7 +189,7 @@ impl BlockSearchState {
         session_id: &str,
         anchor: Option<&BlockSearchHitAnchor>,
     ) {
-        self.selected_index = anchor
+        let anchored_index = anchor
             .filter(|anchor| anchor.session_id == session_id)
             .and_then(|anchor| {
                 hits.iter().position(|hit| {
@@ -181,11 +197,18 @@ impl BlockSearchState {
                         && hit.line_no == anchor.line_no
                         && hit.is_output_line == anchor.is_output_line
                 })
-            })
-            .unwrap_or(0);
+            });
+        self.selected_index = anchored_index.unwrap_or(0);
         self.hits = hits;
         self.capped = capped;
         self.query_error = None;
+        // A background record-version refresh that retained the exact row
+        // must not yank a pointer user away from the scroll position they are
+        // inspecting. Preserve any already-pending keyboard request, while a
+        // new intent or vanished anchor deliberately reveals the fallback row.
+        if anchored_index.is_none() {
+            self.scroll_to_selected = true;
+        }
     }
 
     /// Whether `hits` are stale for the active pane, finalized record set, or
@@ -277,6 +300,25 @@ mod tests {
     }
 
     #[test]
+    fn stationary_hover_never_steals_keyboard_selection_or_requests_scroll() {
+        let mut state = BlockSearchState {
+            hits: vec![hit("a"), hit("b"), hit("c")],
+            ..Default::default()
+        };
+        state.select_next();
+        assert_eq!(state.selected_index, 1);
+        assert!(state.scroll_to_selected);
+
+        state.select_hovered(2, false);
+        assert_eq!(state.selected_index, 1);
+
+        state.scroll_to_selected = false;
+        state.select_hovered(2, true);
+        assert_eq!(state.selected_index, 2);
+        assert!(!state.scroll_to_selected);
+    }
+
+    #[test]
     fn adopt_hits_keeps_the_highlight_on_the_same_row_when_a_record_is_added() {
         let mut state = BlockSearchState {
             hits: vec![hit("newest"), hit("middle"), hit("oldest")],
@@ -302,6 +344,10 @@ mod tests {
         );
         assert_eq!(state.selected_index, 2);
         assert_eq!(state.selected_hit().unwrap().record_id, "middle");
+        assert!(
+            !state.scroll_to_selected,
+            "a retained background-refresh anchor preserves pointer scroll"
+        );
 
         // The anchored row disappearing falls back to the first row.
         state.adopt_hits(
@@ -311,6 +357,7 @@ mod tests {
             Some(&anchor),
         );
         assert_eq!(state.selected_index, 0);
+        assert!(state.scroll_to_selected);
 
         // Record ids repeat across panes (`local:{sequence}` restarts at 1),
         // so an anchor from another pane must never re-bind the highlight.

@@ -901,6 +901,28 @@ pub struct BlockSearchHit {
     pub command_preview: String,
 }
 
+/// Scroll offset that centers one keyboard-selected row in a fixed-height
+/// virtual result list while preserving the list's complete scroll range.
+pub fn block_search_centered_scroll_offset(
+    len: usize,
+    selected: usize,
+    row_stride: f32,
+    viewport_height: f32,
+) -> f32 {
+    if len == 0
+        || !row_stride.is_finite()
+        || row_stride <= 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
+        return 0.0;
+    }
+    let selected = selected.min(len - 1);
+    let total_height = row_stride * len as f32;
+    let selected_center = row_stride * (selected as f32 + 0.5);
+    (selected_center - viewport_height / 2.0).clamp(0.0, (total_height - viewport_height).max(0.0))
+}
+
 /// Owned newest-first source moved into the bounded index builder.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockSearchSource {
@@ -2473,6 +2495,34 @@ mod tests {
         let uncapped = search_blocks(&records, "match");
         assert_eq!(uncapped.hits.len(), 1);
         assert!(!uncapped.capped);
+    }
+
+    #[test]
+    fn block_search_virtual_scroll_centers_keyboard_selection_and_keeps_full_extent() {
+        assert_eq!(block_search_centered_scroll_offset(0, 0, 44.0, 400.0), 0.0);
+        assert_eq!(block_search_centered_scroll_offset(8, 7, 44.0, 400.0), 0.0);
+        assert_eq!(
+            block_search_centered_scroll_offset(500, 0, 44.0, 400.0),
+            0.0
+        );
+        assert_eq!(
+            block_search_centered_scroll_offset(500, 250, 44.0, 400.0),
+            10_822.0
+        );
+        assert_eq!(
+            block_search_centered_scroll_offset(500, 499, 44.0, 400.0),
+            21_600.0
+        );
+        // A stale selected index clamps to the final row, never beyond the
+        // virtual document's maximum scroll offset.
+        assert_eq!(
+            block_search_centered_scroll_offset(500, usize::MAX, 44.0, 400.0),
+            21_600.0
+        );
+        assert_eq!(
+            block_search_centered_scroll_offset(500, 250, f32::NAN, 400.0),
+            0.0
+        );
     }
 
     #[test]

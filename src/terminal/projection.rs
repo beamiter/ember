@@ -309,6 +309,17 @@ struct HideSegment {
     view_end: usize,
 }
 
+/// Per-logical-group geometry reused for a complete cold plan build.
+///
+/// An ordinary unwrapped scrollback row is a group by itself. Allocating both
+/// scratch vectors afresh in every call therefore meant two heap allocations
+/// per retained row whenever a transformed projection needed a full rebuild.
+#[derive(Default)]
+struct GroupScratch {
+    logical_sources: Vec<(usize, RawSlice)>,
+    logical_wide_continuations: Vec<usize>,
+}
+
 #[allow(dead_code)] // Dormant P1 plan core; state wiring lands in a later slice.
 impl ProjectionPlan {
     /// Plan the current identity document without materializing any cells.
@@ -322,50 +333,57 @@ impl ProjectionPlan {
         cols: usize,
     ) -> Self {
         debug_assert!(cols > 0);
-        let history_layouts: Vec<_> = history_layouts.into_iter().collect();
-        let grid_layouts: Vec<_> = grid_layouts.into_iter().collect();
-        let mut rows = VecDeque::new();
+        // Consume layouts once and construct raw placements in that same
+        // pass. The old path collected both streams, cloned them back out,
+        // then walked both collections a third time to build `raw_rows`.
+        let history_layouts = history_layouts.into_iter();
+        let grid_layouts = grid_layouts.into_iter();
+        let capacity = history_layouts
+            .size_hint()
+            .0
+            .saturating_add(grid_layouts.size_hint().0);
+        let mut rows = VecDeque::with_capacity(capacity);
+        let mut raw_rows = VecDeque::with_capacity(capacity);
         let mut group = Vec::new();
+        let mut scratch = GroupScratch::default();
+        let mut history_rows = 0usize;
+        let mut raw_absolute_base = None;
+        let placement = |layout: &RawRowLayout| RawRowPlacement {
+            absolute_row: layout.absolute_row,
+            raw_row: layout.raw_row,
+            first_view_row: None,
+            last_view_row: None,
+        };
 
-        for layout in history_layouts.iter().cloned() {
+        for layout in history_layouts {
+            history_rows = history_rows.saturating_add(1);
+            raw_absolute_base.get_or_insert(layout.absolute_row);
+            raw_rows.push_back(placement(&layout));
             let wrapped = layout.wrapped;
             group.push(layout);
             if !wrapped {
-                Self::append_identity_group(&mut rows, &group, cols);
+                Self::append_identity_group(&mut rows, &group, cols, &mut scratch);
                 group.clear();
             }
         }
         if !group.is_empty() {
-            Self::append_identity_group(&mut rows, &group, cols);
+            Self::append_identity_group(&mut rows, &group, cols, &mut scratch);
         }
 
         // Never join the live grid onto a trailing wrapped history group, or
         // one grid row onto the next. The grid already has display geometry.
-        for layout in grid_layouts.iter().cloned() {
+        for layout in grid_layouts {
+            raw_absolute_base.get_or_insert(layout.absolute_row);
+            raw_rows.push_back(placement(&layout));
             Self::append_grid_row(&mut rows, layout, cols);
         }
 
-        let history_rows = history_layouts.len();
-        let raw_absolute_base = history_layouts
-            .first()
-            .or_else(|| grid_layouts.first())
-            .map_or(0, |layout| layout.absolute_row);
-        let raw_rows = history_layouts
-            .iter()
-            .chain(&grid_layouts)
-            .map(|layout| RawRowPlacement {
-                absolute_row: layout.absolute_row,
-                raw_row: layout.raw_row,
-                first_view_row: None,
-                last_view_row: None,
-            })
-            .collect();
         let raw_slice_count = rows.iter().map(|row| row.raw_slices.len()).sum();
         let mut plan = Self {
             cols,
             rows,
             raw_rows,
-            raw_absolute_base,
+            raw_absolute_base: raw_absolute_base.unwrap_or(0),
             display_row_base: 0,
             history_rows,
             raw_slice_count,
@@ -407,9 +425,15 @@ impl ProjectionPlan {
             self.raw_slice_count = self.raw_slice_count.saturating_sub(row.raw_slices.len());
             self.raw_rows.pop_back();
         }
+        let mut scratch = GroupScratch::default();
         for layout in appended_history.iter().cloned() {
             let first_view_row = self.display_row_base.saturating_add(self.rows.len());
-            Self::append_identity_group(&mut self.rows, std::slice::from_ref(&layout), self.cols);
+            Self::append_identity_group(
+                &mut self.rows,
+                std::slice::from_ref(&layout),
+                self.cols,
+                &mut scratch,
+            );
             let last_view_row = self
                 .display_row_base
                 .saturating_add(self.rows.len().saturating_sub(1));
@@ -525,6 +549,7 @@ impl ProjectionPlan {
         output: &mut VecDeque<ProjectionPlanRow>,
         group: &[RawRowLayout],
         cols: usize,
+        scratch: &mut GroupScratch,
     ) {
         let group_first_source = group.first().and_then(|layout| {
             layout.raw_row.is_tracked().then_some(RawRowSource {
@@ -592,8 +617,12 @@ impl ProjectionPlan {
         // These temporary indices are linear in physical rows and wide cells.
         // Advancing monotonic cursors below keeps planning O(H + P + S), where
         // H is raw history, P planned rows, and S emitted raw slices.
-        let mut logical_sources = Vec::with_capacity(group.len());
-        let mut logical_wide_continuations = Vec::new();
+        let GroupScratch {
+            logical_sources,
+            logical_wide_continuations,
+        } = scratch;
+        logical_sources.clear();
+        logical_wide_continuations.clear();
         let mut source_start = 0usize;
         for layout in group {
             logical_wide_continuations.extend(
@@ -1051,6 +1080,56 @@ impl ProjectionPlan {
         })
     }
 
+    /// Resolve one stable selection identity into this exact plan.
+    /// Synthetic summaries deliberately have no fallback: placing a selection
+    /// endpoint on one would either copy nothing or silently change its range.
+    pub(super) fn selection_point_for_anchor(
+        &self,
+        anchor: super::ProjectedSelectionAnchor,
+    ) -> Option<(usize, usize)> {
+        match anchor {
+            super::ProjectedSelectionAnchor::Cell(anchor) => {
+                for (row_index, row) in self.rows.iter().enumerate() {
+                    for slice in &row.raw_slices {
+                        let Some(origin) = slice.origin else {
+                            continue;
+                        };
+                        if origin.row == anchor.row_id
+                            && anchor.column >= origin.col_start
+                            && anchor.column < origin.col_start.saturating_add(slice.len)
+                        {
+                            return Some((
+                                row_index,
+                                slice
+                                    .view_col_start
+                                    .saturating_add(anchor.column.saturating_sub(origin.col_start)),
+                            ));
+                        }
+                    }
+                }
+
+                // A live-grid row carries origins through its trailing blank
+                // cells. History compression retains only the row's active
+                // text, so one of those exact cell identities can disappear
+                // when the row scrolls out of the grid. Falling back to the
+                // row would keep a visible selection whose copied byte changed
+                // from a space to nothing; exact cell loss must fail closed.
+                None
+            }
+            super::ProjectedSelectionAnchor::Row { row, column } => {
+                let document_row = self.raw_row_document_row(row)?;
+                self.row_is_raw(document_row)
+                    .then(|| (document_row, column.min(self.cols.saturating_sub(1))))
+            }
+        }
+    }
+
+    fn row_is_raw(&self, document_row: usize) -> bool {
+        self.rows
+            .get(document_row)
+            .is_some_and(|row| matches!(row.kind, ProjectedRowKind::Raw))
+    }
+
     pub(super) fn raw_row_document_row(&self, row: RawRowId) -> Option<usize> {
         self.raw_rows
             .iter()
@@ -1320,6 +1399,7 @@ impl ProjectionCacheKey {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{ProjectedSelectionAnchor, RawCellAnchor};
     use super::{
         FinishedOutputRange, ProjectedRowKind, ProjectionCacheKey, ProjectionMode, ProjectionPlan,
         ProjectionPolicy, RawCellBoundary, RawRowId, RawRowLayout, RawRowSource, RawSliceOrigin,
@@ -1443,6 +1523,34 @@ mod tests {
         assert_eq!(plan.raw_rows[2].last_view_row, Some(2));
         assert_eq!(plan.raw_rows[3].first_view_row, Some(3));
         assert_eq!(plan.raw_rows[3].last_view_row, Some(3));
+    }
+
+    #[test]
+    fn selection_cell_anchor_fails_closed_when_live_trailing_blank_is_trimmed() {
+        let row_id = RawRowId::new(44);
+        let trailing_blank = ProjectedSelectionAnchor::Cell(RawCellAnchor { row_id, column: 10 });
+
+        // Live grid rows expose stable origins through the full terminal
+        // width, including trailing blank cells.
+        let live = ProjectionPlan::identity(
+            std::iter::empty(),
+            [RawRowLayout::new(0, row_id, 4, [], false)],
+            12,
+        );
+        assert_eq!(
+            live.selection_point_for_anchor(trailing_blank),
+            Some((0, 10))
+        );
+
+        // Once the same physical row enters compressed history, only its four
+        // active cells remain. Reusing row identity here would silently change
+        // a selected space into an empty string.
+        let history = ProjectionPlan::identity(
+            [RawRowLayout::new(0, row_id, 4, [], false)],
+            std::iter::empty(),
+            12,
+        );
+        assert_eq!(history.selection_point_for_anchor(trailing_blank), None);
     }
 
     #[test]

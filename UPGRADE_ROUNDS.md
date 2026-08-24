@@ -73,5 +73,29 @@ are numbered 11–30.
 30. **Documented repair contract** — README now specifies bounded rendering,
     active limits, retained drafts, and atomic public-resource installation.
 
+Block Mode convergence continues with rounds 31–37:
+
+31. **Stable projected endpoints** — normal text selections retain exact
+    raw-cell or empty-row identity and re-resolve after a compatible
+    collapsed-plan update; a trimmed trailing-blank cell fails closed.
+32. **Selection fail-closed matrix** — column selection, width changes,
+    effective-collapse changes, evicted identities and ambiguous reflow still
+    clear instead of silently selecting different terminal bytes.
+33. **Walkable block search** — `Shift+Enter` reveals a hit, selects the next,
+    and keeps the query open; plain Enter remains reveal-and-close.
+34. **Virtual result widgets** — fixed-height virtualization renders only the
+    visible result rows while keyboard, wheel and scrollbar navigation still
+    span all 500 hits; stationary hover cannot steal keyboard selection, and a
+    retained background-refresh anchor does not recenter pointer browsing.
+35. **Actionable integration diagnosis** — empty block actions and search tell
+    a marked-but-empty pane from a shell that never emitted OSC 133, and only
+    the latter points to the jsh installer.
+36. **Single-pass cold planning** — history/grid layouts now stream directly
+    into placements and reuse logical-group scratch without changing the
+    incremental projection or cache identity contracts.
+37. **Current shared security pin** — the exact `jterm_core` revision advances
+    to `0f47569`, adopting AI origin/credential/no-proxy validation while retaining the
+    established block lifecycle API.
+
 Verification: `bash scripts/test-install-paths.sh`, Ember config tests, and the
 full workspace formatting/check/Clippy/test gates.

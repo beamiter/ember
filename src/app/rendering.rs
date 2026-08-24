@@ -1371,6 +1371,8 @@ impl TerminalApp {
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
         let mut clicked_hit_index = None;
         let mut hovered_hit_index = None;
+        let block_search_pointer_moved =
+            ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
         if self.block_search.is_open {
             // Hits always describe the active session, finalized-record
             // version, query and filter. Query edits only rescan the cache;
@@ -1380,6 +1382,17 @@ impl TerminalApp {
             // text. A completed block (including same-length deque rotation)
             // rebuilds the bounded index before any old hit can be accepted.
             self.refresh_block_search_hits();
+
+            let active_index = self.session_manager.active_index();
+            let pane_has_prompt_marks = self
+                .session_manager
+                .sessions()
+                .get(active_index)
+                .is_some_and(|session| session.terminal.lock().has_prompt_marks());
+            let pane_has_completed_blocks = self
+                .block_search
+                .record_version
+                .is_some_and(|version| version.len > 0);
 
             let screen_rect = ctx.viewport_rect();
             let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
@@ -1479,100 +1492,151 @@ impl TerminalApp {
                         );
                     }
 
-                    // Own a snapshot so pointer actions can be applied after
-                    // the window closure (palette precedent).
-                    let hits = if query_error.is_none() {
-                        self.block_search.hits.clone()
+                    // Give ScrollArea the complete row count while it builds
+                    // widgets only for the visible range. Pre-slicing around
+                    // the keyboard highlight made the scrollbar describe just
+                    // that slice, so pointer users could not jump to later
+                    // results in a broad query.
+                    const BLOCK_SEARCH_ROW_HEIGHT: f32 = 40.0;
+                    let hit_count = if query_error.is_none() {
+                        self.block_search.hits.len()
                     } else {
-                        Vec::new()
+                        0
                     };
                     let selected_index = self.block_search.selected_index;
                     let query_is_empty = self.block_search.query.trim().is_empty();
+                    let list_height = picker_height - 120.0;
+                    let scroll_to_selected =
+                        std::mem::take(&mut self.block_search.scroll_to_selected);
 
-                    egui::ScrollArea::vertical()
-                        .max_height(picker_height - 120.0)
-                        .show(ui, |ui| {
-                            for (idx, hit) in hits.iter().enumerate() {
-                                let is_selected = idx == selected_index;
-                                let bg_color = if is_selected {
-                                    crate::theme::Theme::rgb_to_color32(
-                                        self.current_theme.tabbar.active_border,
-                                    )
-                                    .gamma_multiply(0.18)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-
-                                let item_response = ui.horizontal(|ui| {
-                                    let item_rect = ui.available_rect_before_wrap();
-                                    ui.painter().rect_filled(item_rect, 2.0, bg_color);
-
-                                    let (marker, marker_color) = match hit.line_no {
-                                        Some(line_no) => (
-                                            format!("L{line_no}"),
-                                            egui::Color32::from_rgb(255, 200, 100),
-                                        ),
-                                        None => (
-                                            "cmd".to_string(),
-                                            egui::Color32::from_rgb(150, 150, 255),
-                                        ),
+                    if hit_count > 0 {
+                        let mut scroll = egui::ScrollArea::vertical().max_height(list_height);
+                        // Pointer movement wins if both devices act in one
+                        // frame. A stationary cursor cannot cancel keyboard
+                        // traversal simply because recentering moved a row
+                        // underneath it.
+                        if scroll_to_selected && !block_search_pointer_moved {
+                            let stride =
+                                BLOCK_SEARCH_ROW_HEIGHT + ui.spacing().item_spacing.y;
+                            scroll = scroll.vertical_scroll_offset(
+                                crate::block_mode::block_search_centered_scroll_offset(
+                                    hit_count,
+                                    selected_index,
+                                    stride,
+                                    list_height,
+                                ),
+                            );
+                        }
+                        scroll.show_rows(
+                            ui,
+                            BLOCK_SEARCH_ROW_HEIGHT,
+                            hit_count,
+                            |ui, row_range| {
+                                for idx in row_range {
+                                    let Some(hit) = self.block_search.hits.get(idx) else {
+                                        continue;
                                     };
-                                    ui.colored_label(marker_color, marker);
-
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&hit.line_text)
-                                                .monospace()
-                                                .strong(),
-                                        );
-                                        let context = if hit.is_output_line {
-                                            format!(
-                                                "{} · L{}",
-                                                if hit.command_preview.is_empty() {
-                                                    "(no command)"
-                                                } else {
-                                                    hit.command_preview.as_str()
-                                                },
-                                                hit.line_no.unwrap_or(0)
-                                            )
-                                        } else {
-                                            "command".to_string()
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(context)
-                                                .monospace()
-                                                .size(10.0)
-                                                .color(ui.visuals().weak_text_color()),
-                                        );
-                                    });
-                                });
-
-                                if is_selected {
-                                    item_response
-                                        .response
-                                        .scroll_to_me(Some(egui::Align::Center));
-                                }
-
-                                let click_response = ui
-                                    .interact(
-                                        item_response.response.rect,
-                                        item_response.response.id.with("block_search_click"),
+                                    let is_selected = idx == selected_index;
+                                    let width = ui.available_width();
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(width, BLOCK_SEARCH_ROW_HEIGHT),
                                         egui::Sense::click(),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if click_response.hovered() {
-                                    hovered_hit_index = Some(idx);
-                                }
-                                if click_response.clicked() {
-                                    clicked_hit_index = Some(idx);
-                                }
+                                    );
+                                    if is_selected {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            2.0,
+                                            crate::theme::Theme::rgb_to_color32(
+                                                self.current_theme.tabbar.active_border,
+                                            )
+                                            .gamma_multiply(0.18),
+                                        );
+                                    }
 
-                                ui.separator();
-                            }
+                                    let content_rect = rect.shrink2(egui::vec2(4.0, 2.0));
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .max_rect(content_rect)
+                                            .layout(egui::Layout::left_to_right(
+                                                egui::Align::Center,
+                                            )),
+                                        |ui| {
+                                            let (marker, marker_color) = match hit.line_no {
+                                                Some(line_no) => (
+                                                    format!("L{line_no}"),
+                                                    egui::Color32::from_rgb(255, 200, 100),
+                                                ),
+                                                None => (
+                                                    "cmd".to_string(),
+                                                    egui::Color32::from_rgb(150, 150, 255),
+                                                ),
+                                            };
+                                            ui.colored_label(marker_color, marker);
 
-                            if hits.is_empty() && query_error.is_none() {
+                                            let text_width = ui.available_width();
+                                            ui.vertical(|ui| {
+                                                ui.add_sized(
+                                                    [text_width, 18.0],
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&hit.line_text)
+                                                            .monospace()
+                                                            .strong(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                let context = if hit.is_output_line {
+                                                    format!(
+                                                        "{} · L{}",
+                                                        if hit.command_preview.is_empty() {
+                                                            "(no command)"
+                                                        } else {
+                                                            hit.command_preview.as_str()
+                                                        },
+                                                        hit.line_no.unwrap_or(0)
+                                                    )
+                                                } else {
+                                                    "command".to_string()
+                                                };
+                                                let weak = ui.visuals().weak_text_color();
+                                                ui.add_sized(
+                                                    [text_width, 14.0],
+                                                    egui::Label::new(
+                                                        egui::RichText::new(context)
+                                                            .monospace()
+                                                            .size(10.0)
+                                                            .color(weak),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                        },
+                                    );
+                                    ui.painter().line_segment(
+                                        [rect.left_bottom(), rect.right_bottom()],
+                                        ui.visuals().widgets.noninteractive.bg_stroke,
+                                    );
+
+                                    let response = response
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    if response.hovered() {
+                                        hovered_hit_index = Some(idx);
+                                    }
+                                    if response.clicked() {
+                                        clicked_hit_index = Some(idx);
+                                    }
+                                }
+                            },
+                        );
+                    } else if query_error.is_none() {
+                        egui::ScrollArea::vertical()
+                            .max_height(list_height)
+                            .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(if query_is_empty {
+                                    egui::RichText::new(if !pane_has_prompt_marks {
+                                        "This pane has no command blocks: the shell is not reporting commands (OSC 133). Run “Install or update jsh” from the command palette."
+                                    } else if !pane_has_completed_blocks {
+                                        "This pane has no completed command blocks yet"
+                                    } else if query_is_empty {
                                         if self.block_search.filter
                                             == crate::block_search::BlockSearchFilter::All
                                         {
@@ -1591,13 +1655,15 @@ impl TerminalApp {
                                     })
                                     .color(ui.visuals().weak_text_color()),
                                 );
-                            }
-                        });
+                            });
+                    }
 
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("↑↓ Navigate  Enter Jump  Esc Close")
+                            egui::RichText::new(
+                                "↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Esc Close",
+                            )
                                 .size(10.0)
                                 .color(ui.visuals().weak_text_color()),
                         );
@@ -1606,7 +1672,8 @@ impl TerminalApp {
         }
 
         if let Some(index) = hovered_hit_index {
-            self.block_search.selected_index = index;
+            self.block_search
+                .select_hovered(index, block_search_pointer_moved);
         }
         if let Some(index) = clicked_hit_index {
             self.block_search.selected_index = index;

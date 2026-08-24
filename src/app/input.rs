@@ -1603,10 +1603,13 @@ impl TerminalApp {
         }
 
         let events_copy = self.frame_events.clone();
-        let mut confirm = false;
+        let mut confirm = None;
         for evt in &events_copy {
             let egui::Event::Key {
-                key, pressed: true, ..
+                key,
+                pressed: true,
+                modifiers,
+                ..
             } = evt
             else {
                 continue;
@@ -1616,14 +1619,17 @@ impl TerminalApp {
                 egui::Key::ArrowUp => self.block_search.select_prev(),
                 egui::Key::ArrowDown => self.block_search.select_next(),
                 egui::Key::Enter => {
-                    confirm = true;
+                    // Plain Enter keeps the accept-and-close contract.
+                    // Shift+Enter reveals this hit, advances to the next one,
+                    // and leaves the query open for walk-through review.
+                    confirm = Some(modifiers.shift);
                     break;
                 }
                 _ => {}
             }
         }
-        if confirm {
-            self.block_search_confirm();
+        if let Some(keep_open) = confirm {
+            self.block_search_accept(keep_open);
         }
         true
     }

@@ -3144,6 +3144,14 @@ impl super::TerminalState {
             .unwrap_or(false)
     }
 
+    /// Whether this terminal has observed at least one OSC 133 prompt mark.
+    ///
+    /// Block actions use this to distinguish an ordinary empty result from a
+    /// pane whose shell is not reporting semantic command boundaries at all.
+    pub fn has_prompt_marks(&self) -> bool {
+        !self.command_records.is_empty() || !self.command_marks.is_empty()
+    }
+
     /// Record accepted non-Agent input before PTY echo arrives. Clearing the
     /// visible line does not silently re-authorize an approval; only a fresh
     /// OSC 133 prompt resets this bit.
@@ -4378,19 +4386,75 @@ impl super::TerminalState {
     }
 
     /// Raw and transformed document coordinates are intentionally exclusive.
-    /// A projected selection survives paint-only updates and viewport scrolling
-    /// while the exact cached plan instance remains the same.
-    fn enter_transformed_selection_space(&mut self, plan_revision: u64) {
+    /// A transformed selection is re-anchored through retained raw identities
+    /// when a compatible plan replaces the one it was created against.
+    fn enter_transformed_selection_space(&mut self, plan: &ProjectionPlan) {
         let raw_changed = self.selection.take().is_some();
-        let projected_changed = plan_revision == 0
-            || self
-                .projected_selection
-                .is_some_and(|selection| selection.plan_revision != plan_revision);
-        if projected_changed {
+        let previous = self.projected_selection.clone();
+        if plan.plan_revision == 0 {
             self.projected_selection = None;
+        } else if self
+            .projected_selection
+            .as_ref()
+            .is_some_and(|selection| selection.plan_revision != plan.plan_revision)
+        {
+            self.reanchor_projected_selection(plan);
         }
+        let projected_changed = self.projected_selection != previous;
         if raw_changed || projected_changed {
             self.bump_selection_revision();
+        }
+    }
+
+    /// Carry a normal transformed selection across a safe plan rebuild.
+    /// Width changes, column selections, hidden-set changes and lost/ambiguous
+    /// endpoint identities all fail closed to the previous clear behavior.
+    fn reanchor_projected_selection(&mut self, plan: &ProjectionPlan) {
+        let Some(selection) = self.projected_selection.clone() else {
+            return;
+        };
+        if selection.mode == SelectionMode::Block
+            || selection.plan_cols != plan.cols
+            || selection.hidden != plan.effective_collapsed
+        {
+            self.projected_selection = None;
+            return;
+        }
+        let (Some(anchor), Some(active)) = (
+            plan.selection_point_for_anchor(selection.anchor.anchor),
+            plan.selection_point_for_anchor(selection.active.anchor),
+        ) else {
+            self.projected_selection = None;
+            return;
+        };
+        self.projected_selection = Some(ProjectedSelection {
+            plan_revision: plan.plan_revision,
+            anchor: ProjectedSelectionEndpoint {
+                point: anchor,
+                ..selection.anchor
+            },
+            active: ProjectedSelectionEndpoint {
+                point: active,
+                ..selection.active
+            },
+            ..selection
+        });
+    }
+
+    fn new_projected_selection(
+        viewport: &ProjectedViewport,
+        plan_revision: u64,
+        anchor: ProjectedSelectionEndpoint,
+        active: ProjectedSelectionEndpoint,
+        mode: SelectionMode,
+    ) -> ProjectedSelection {
+        ProjectedSelection {
+            plan_revision,
+            plan_cols: viewport.columns(),
+            hidden: viewport.effective_collapsed().clone(),
+            anchor,
+            active,
+            mode,
         }
     }
 
@@ -4588,7 +4652,7 @@ impl super::TerminalState {
             }
             return self.projected_viewport(projection, true);
         };
-        self.enter_transformed_selection_space(plan.plan_revision);
+        self.enter_transformed_selection_space(&plan);
         let viewport_rows = self.grid.rows();
         let max_offset = plan.document_rows().saturating_sub(viewport_rows);
         if view_state.last_plan_key.as_ref() != Some(&plan_key) {
@@ -5540,7 +5604,7 @@ impl super::TerminalState {
     fn projected_selection_point(
         viewport: &ProjectedViewport,
         display_pos: (usize, usize),
-    ) -> Option<(usize, usize)> {
+    ) -> Option<ProjectedSelectionEndpoint> {
         let mut point = DisplayPoint::new(display_pos.0, display_pos.1);
         if viewport
             .cells()
@@ -5552,18 +5616,28 @@ impl super::TerminalState {
         {
             point.column -= 1;
         }
-        if viewport.raw_anchor_at(point).is_none() {
-            if viewport.row_has_origin(point.row) {
-                return None;
+        let anchor = match viewport.raw_anchor_at(point) {
+            Some(anchor) => ProjectedSelectionAnchor::Cell(anchor),
+            None => {
+                if viewport.row_has_origin(point.row) {
+                    return None;
+                }
+                let source = viewport.row_source_at(point.row)?;
+                if !source.raw_row.is_tracked()
+                    || !matches!(viewport.row_kind(point.row), Some(ProjectedRowKind::Raw))
+                {
+                    return None;
+                }
+                ProjectedSelectionAnchor::Row {
+                    row: source.raw_row,
+                    column: point.column,
+                }
             }
-            let source = viewport.row_source_at(point.row)?;
-            if !source.raw_row.is_tracked()
-                || !matches!(viewport.row_kind(point.row), Some(ProjectedRowKind::Raw))
-            {
-                return None;
-            }
-        }
-        Some((viewport.view_document_row(point.row)?, point.column))
+        };
+        Some(ProjectedSelectionEndpoint {
+            point: (viewport.view_document_row(point.row)?, point.column),
+            anchor,
+        })
     }
 
     fn wide_atomic_selection_columns(
@@ -5684,12 +5758,13 @@ impl super::TerminalState {
                 self.clear_text_selection();
                 return;
             };
-            self.set_projected_selection(ProjectedSelection {
+            self.set_projected_selection(Self::new_projected_selection(
+                viewport,
                 plan_revision,
-                anchor: point,
-                active: point,
+                point,
+                point,
                 mode,
-            });
+            ));
             return;
         }
         let abs = (viewport.legacy_absolute_row(display_pos.0), display_pos.1);
@@ -5732,7 +5807,7 @@ impl super::TerminalState {
                 self.clear_text_selection();
                 return;
             }
-            if selection.active != point {
+            if selection.active.point != point.point {
                 selection.active = point;
                 self.bump_selection_revision();
             }
@@ -5782,12 +5857,13 @@ impl super::TerminalState {
                 self.clear_text_selection();
                 return;
             };
-            self.set_projected_selection(ProjectedSelection {
+            self.set_projected_selection(Self::new_projected_selection(
+                viewport,
                 plan_revision,
                 anchor,
                 active,
-                mode: SelectionMode::Normal,
-            });
+                SelectionMode::Normal,
+            ));
             return;
         }
         self.select_word_in_view(
@@ -5958,12 +6034,13 @@ impl super::TerminalState {
                 self.clear_text_selection();
                 return;
             };
-            self.set_projected_selection(ProjectedSelection {
+            self.set_projected_selection(Self::new_projected_selection(
+                viewport,
                 plan_revision,
                 anchor,
                 active,
-                mode: SelectionMode::Normal,
-            });
+                SelectionMode::Normal,
+            ));
             return;
         }
         self.select_line_in_view(viewport.cells(), row, |display_row| {
@@ -6095,7 +6172,7 @@ impl super::TerminalState {
     }
 
     fn copy_projected_selection(&self) -> Option<String> {
-        let selection = self.projected_selection?;
+        let selection = self.projected_selection.as_ref()?;
         let (plan_key, plan) = self.projection_plan_cache.as_ref()?;
         if selection.plan_revision == 0
             || plan.plan_revision != selection.plan_revision
@@ -6103,10 +6180,10 @@ impl super::TerminalState {
         {
             return None;
         }
-        let (start, end) = if selection.anchor <= selection.active {
-            (selection.anchor, selection.active)
+        let (start, end) = if selection.anchor.point <= selection.active.point {
+            (selection.anchor.point, selection.active.point)
         } else {
-            (selection.active, selection.anchor)
+            (selection.active.point, selection.anchor.point)
         };
         if start.0 >= plan.document_rows() || end.0 >= plan.document_rows() {
             return None;
@@ -6122,8 +6199,8 @@ impl super::TerminalState {
             let planned = plan.row(document_row)?;
             let (selected_left, selected_right) = if selection.mode == SelectionMode::Block {
                 (
-                    selection.anchor.1.min(selection.active.1),
-                    selection.anchor.1.max(selection.active.1),
+                    selection.anchor.point.1.min(selection.active.point.1),
+                    selection.anchor.point.1.max(selection.active.point.1),
                 )
             } else {
                 (
@@ -6521,25 +6598,25 @@ impl super::TerminalState {
         display_row: usize,
     ) -> Option<(usize, usize)> {
         if viewport.is_transformed() {
-            let selection = self.projected_selection?;
+            let selection = self.projected_selection.as_ref()?;
             if self.projected_selection_plan_revision(viewport)? != selection.plan_revision
                 || !matches!(viewport.row_kind(display_row), Some(ProjectedRowKind::Raw))
             {
                 return None;
             }
             let document_row = viewport.view_document_row(display_row)?;
-            let (start, end) = if selection.anchor <= selection.active {
-                (selection.anchor, selection.active)
+            let (start, end) = if selection.anchor.point <= selection.active.point {
+                (selection.anchor.point, selection.active.point)
             } else {
-                (selection.active, selection.anchor)
+                (selection.active.point, selection.anchor.point)
             };
             if document_row < start.0 || document_row > end.0 {
                 return None;
             }
             let (mut left, mut right) = if selection.mode == SelectionMode::Block {
                 (
-                    selection.anchor.1.min(selection.active.1),
-                    selection.anchor.1.max(selection.active.1),
+                    selection.anchor.point.1.min(selection.active.point.1),
+                    selection.anchor.point.1.max(selection.active.point.1),
                 )
             } else {
                 (

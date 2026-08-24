@@ -17,6 +17,17 @@ const COMMAND_DETAIL_OUTPUT_BYTES: usize = 16 * 1024;
 const DETAIL_TRUNCATION_MARKER: &str = "\n… preview truncated …\n";
 const MAX_BLOCK_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 
+fn block_absence_message(has_prompt_marks: bool, ordinary: &str) -> String {
+    if has_prompt_marks {
+        ordinary.to_string()
+    } else {
+        format!(
+            "{ordinary}: this shell is not reporting commands — run \"Install or update jsh\" \
+             from the command palette for shell integration"
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockClipboardBuildError {
     TooLarge,
@@ -287,6 +298,19 @@ fn prepare_selected_replay<T>(
 }
 
 impl TerminalApp {
+    fn active_pane_has_prompt_marks(&self) -> bool {
+        let index = self.session_manager.active_index();
+        self.session_manager
+            .sessions()
+            .get(index)
+            .is_some_and(|session| session.terminal.lock().has_prompt_marks())
+    }
+
+    /// Explain why a block action found no target without blaming shell
+    /// integration on panes that are already reporting OSC 133 correctly.
+    fn explain_block_absence(&self, ordinary: &str) -> String {
+        block_absence_message(self.active_pane_has_prompt_marks(), ordinary)
+    }
     /// Whether a direct, atomic UI write would overtake an older mouse edge or
     /// protocol reply for `session_id`. Callers still check the session's
     /// `pending_input`: this gate covers the independent producer FIFOs.
@@ -1378,7 +1402,8 @@ impl TerminalApp {
             return;
         };
         let Some(target) = navigation.target else {
-            self.set_status("No failed command in this session");
+            let message = self.explain_block_absence("No failed command in this session");
+            self.set_status(message);
             return;
         };
         self.apply_block_selection(target);
@@ -1736,7 +1761,9 @@ impl TerminalApp {
             bookmarks.retain(|id| valid_ids.iter().any(|valid| valid == id));
         }
         if bookmarked_indices.is_empty() {
-            self.set_status("No bookmarked command blocks in this session");
+            let message =
+                self.explain_block_absence("No bookmarked command blocks in this session");
+            self.set_status(message);
             return;
         }
         bookmarked_indices.sort_unstable();
@@ -1908,7 +1935,8 @@ impl TerminalApp {
         }
         let target = self.latest_block_target(wanted);
         if target.is_none() {
-            self.set_status(missing);
+            let message = self.explain_block_absence(missing);
+            self.set_status(message);
         }
         target.map(|target| vec![target])
     }
@@ -2282,7 +2310,8 @@ impl TerminalApp {
         let count = ids.len();
         let Some(selection) = crate::block_mode::BlockSelection::all(session_id.clone(), ids)
         else {
-            self.set_status("No completed command blocks to select");
+            let message = self.explain_block_absence("No completed command blocks to select");
+            self.set_status(message);
             return;
         };
         let target = CommandTarget {
@@ -2597,7 +2626,8 @@ impl TerminalApp {
         let Some(target) = navigation.target else {
             // 到达两端时静默保持当前选中;只有完全没有可选块才提示。
             if !navigation.had_selection {
-                self.set_status("No command block to select");
+                let message = self.explain_block_absence("No command block to select");
+                self.set_status(message);
             }
             return;
         };
@@ -2629,7 +2659,8 @@ impl TerminalApp {
         };
         let Some(target) = navigation.target else {
             if !navigation.any_failed {
-                self.set_status("No failed command in this session");
+                let message = self.explain_block_absence("No failed command in this session");
+                self.set_status(message);
             }
             return;
         };
@@ -3011,12 +3042,18 @@ impl TerminalApp {
         self.block_search.query_error = None;
     }
 
-    /// Enter (or a click) on a hit: close the picker, then select and reveal
-    /// the hit's block through the same path as select_prev/next. With no
-    /// hits Enter is a no-op and the picker stays open (palette precedent).
+    /// A click/plain Enter accepts and closes. Shift+Enter reveals one hit,
+    /// advances to the next, and keeps the picker open so several matches can
+    /// be reviewed without rebuilding the query.
+    pub(crate) fn block_search_confirm(&mut self) {
+        self.block_search_accept(false);
+    }
+
+    /// Select and reveal the highlighted hit. With no hits this is a no-op and
+    /// the picker stays open (palette precedent).
     /// A record that scrolled out of reach in the meantime degrades to the
     /// jump path's own toast.
-    pub(crate) fn block_search_confirm(&mut self) {
+    pub(crate) fn block_search_accept(&mut self, keep_open: bool) {
         // A PTY completion can rotate the bounded record deque between the
         // last paint and Enter. Refresh first so a hit built for an old
         // finalized-record version is never resolved against the new one.
@@ -3037,7 +3074,9 @@ impl TerminalApp {
         else {
             return;
         };
-        self.block_search.close();
+        if !keep_open {
+            self.block_search.close();
+        }
         self.apply_block_selection(target.clone());
         if let Some(line_no) = hit.line_no {
             if let Some(index) = self.session_manager.index_of(&target.session_id) {
@@ -3100,6 +3139,10 @@ impl TerminalApp {
                 }
             }
         }
+        if keep_open && self.block_search.is_open {
+            self.block_search.select_next();
+            self.block_search.needs_focus = true;
+        }
     }
 
     /// Shared targeting rule for every `block:*` copy/recall command: a
@@ -3133,7 +3176,8 @@ impl TerminalApp {
         } else {
             let target = self.latest_block_target(wanted);
             if target.is_none() {
-                self.set_status(missing.to_string());
+                let message = self.explain_block_absence(missing);
+                self.set_status(message);
             }
             target
         }
@@ -4974,5 +5018,17 @@ mod tests {
             "one ↵ two ↵ three"
         );
         assert_eq!(single_line_command_preview("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn block_absence_diagnosis_only_blames_missing_shell_integration_without_marks() {
+        assert_eq!(
+            block_absence_message(true, "No failed command in this session"),
+            "No failed command in this session"
+        );
+        let missing = block_absence_message(false, "No command block to copy");
+        assert!(missing.starts_with("No command block to copy:"));
+        assert!(missing.contains("not reporting commands"));
+        assert!(missing.contains("Install or update jsh"));
     }
 }

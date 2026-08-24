@@ -325,7 +325,13 @@ pending input and multiline refusals are reported by the shared replay guard
 through the status line, exactly as the Commands sidebar's "Run again" does.
 Collapsing a finished block replaces only its projected output rows with one
 expandable summary row; the raw terminal history, search index, captured output,
-and PTY bytes remain unchanged. Per-card filtering, deletion, and file export
+and PTY bytes remain unchanged. A normal text selection made while output is
+collapsed follows stable retained raw-cell identities across compatible
+projection rebuilds, so background output no longer erases the highlight.
+Column selections, width changes, effective-collapse changes, evicted endpoints,
+trimmed live-grid trailing blanks, and ambiguous reflow still discard it
+deliberately instead of silently selecting different bytes. Per-card filtering,
+deletion, and file export
 are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
@@ -354,7 +360,15 @@ finalized-record change — a background command completing while the picker is
 open — keeps the highlight on the same `(record, line)` row instead of
 snapping back to the first result, so Enter cannot fire at a block the user
 never chose; editing the query or flipping a case/regex/filter control is a
-new intent and deliberately restarts at the top.
+new intent and deliberately restarts at the top. `Shift+Enter` reveals the
+current hit, advances to the next, and keeps the picker open; plain `Enter`
+retains reveal-and-close behavior. The result list uses fixed-height virtual
+rows: only the visible rows are materialized while keyboard, wheel and scrollbar
+navigation retain the full result extent. Keyboard navigation cannot be stolen
+by a stationary hover, and a background record refresh that preserves the exact
+highlight also preserves the pointer user's current scroll position.
+An empty pane distinguishes “no completed blocks yet” from a shell that has
+never reported OSC 133 and points the latter to the jsh installer.
 
 Select a failed row in the **Commands** sidebar (or use its context menu) to
 start a fresh Agent task with **Fix**, **Explain**, or **Create task**. The task
@@ -624,6 +638,21 @@ prompt begins mid-row keeps its closed bottom edge on the raw path but not on
 the projected one, which refuses to draw a boundary through output it cannot
 prove has ended. That shifts such a card's painted bottom by one gap; row
 ownership, and therefore which card a click selects, is identical either way.
+
+## Shell integration (OSC 133)
+
+Block Mode, prompt navigation, semantic command history, completion badges and
+failed-command actions require the shell to report command boundaries with
+OSC 133. Ember prefers `jsh`, which emits those marks natively. A fallback shell
+without integration still works as an ordinary terminal, but it cannot produce
+command blocks; block actions and Block Search say so explicitly and point to
+**Install or update jsh** in the command palette instead of presenting an empty
+query as if nothing matched.
+
+A custom bash/zsh integration needs four marks: `A` before the prompt, `B` after
+the prompt, `C` when execution begins, and `D;<exit>` when it ends. Optional
+command/cwd/id fields improve replay and lifecycle diagnostics, but they never
+authorize execution unless Ember captured them exactly.
 
 ## Installing and updating jsh
 

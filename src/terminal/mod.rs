@@ -2,7 +2,7 @@ use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
@@ -339,12 +339,36 @@ pub struct Selection {
 /// Selection coordinates in a transformed projected document. These cannot
 /// be mixed with raw scrollback indices because collapse summaries introduce
 /// holes and synthetic rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectedSelection {
     plan_revision: u64,
-    anchor: (usize, usize),
-    active: (usize, usize),
+    /// Width at which endpoint columns were minted. Reflowing to another
+    /// width can change the characters between two otherwise-live anchors.
+    plan_cols: usize,
+    /// Effective hidden set, not merely requested collapse policy. A collapse
+    /// can become ineffective after history churn without a policy revision.
+    hidden: BTreeSet<u64>,
+    anchor: ProjectedSelectionEndpoint,
+    active: ProjectedSelectionEndpoint,
     mode: SelectionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectedSelectionAnchor {
+    Cell(RawCellAnchor),
+    /// A blank row or a column beyond retained text has row identity but no
+    /// exact raw-cell origin. The column is valid only at `plan_cols`.
+    Row {
+        row: RawRowId,
+        column: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectedSelectionEndpoint {
+    /// `(document row, projected column)` in `plan_revision`.
+    point: (usize, usize),
+    anchor: ProjectedSelectionAnchor,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

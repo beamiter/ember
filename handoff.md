@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-21
+Updated: 2026-08-24
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,24 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- Block Mode convergence closes the remaining interaction gaps with Frost.
+  Normal text selections in collapsed projections now carry stable raw-cell or
+  raw-row endpoint identities across compatible plan updates; width changes,
+  column selections, effective-collapse changes, ambiguous reflow and eviction
+  still fail closed, including a live-grid trailing blank that is trimmed when
+  its row enters history. Block Search adds `Shift+Enter` reveal-and-step without
+  closing, uses a fixed-height virtual list that preserves the complete mouse
+  scrollbar extent without constructing all 500 possible hit widgets, keeps a
+  stationary hover from stealing keyboard traversal, preserves pointer scroll
+  when a background refresh retains the exact highlighted row, and
+  diagnoses a pane with no OSC 133 marks with the actionable jsh installer path.
+  Cold projection planning
+  consumes layout streams once and reuses per-group scratch allocations while
+  preserving the existing incremental plan, cache-key and revision contracts.
+  The shared core exact pin advances to
+  `0f47569eb7501d52abeee4130f1735b6ada7dfe0`, adding current AI
+  origin/credential validation without changing `block_contract` semantics.
 
 - Block Search 2.0 replaces Ember's former potentially hundreds-of-megabytes,
   open-time-only cache. Completed records are sampled lazily newest-first under
@@ -200,8 +218,8 @@ fail closed.
   private claim path. An empty or rejected local session still leaves the
   public path alone, so one process exiting cannot delete a newer checkpoint
   published by another. `jterm_core` is pinned to
-  `3e09b161a36e2ec30f730eee8f8d6702b2bacc35` (transitively jagent
-  `d52002e4a18735e8cfec718da5fea8f0a5cfaaf8`). Claim-acquisition errors are
+  `0f47569eb7501d52abeee4130f1735b6ada7dfe0` (transitively jagent
+  `fcb9768bb832547988056baa38b2d4239341b361`). Claim-acquisition errors are
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
 - The in-flight model request records the task generation it was started for; a
