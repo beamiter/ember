@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (shared session-id and duration convergence)
+Updated: 2026-08-25 (single-interpretation native JSON boundaries)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,20 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Single-interpretation native JSON boundaries (2026-08-25)**: after their
+  existing raw byte ceilings, the private `auth.json` reader and every Codex
+  app-server JSONL record now run through
+  `jterm_core::bounded_json::validate_no_duplicate_members` before typed or
+  `Value` decoding. Duplicate object members are rejected recursively,
+  including escaped-equivalent names and duplicates inside ignored/future
+  extension objects. The private serde_json RawValue sentinel is also reserved,
+  so feature-unified `Value` decoding cannot reparse unchecked embedded JSON.
+  An app-server frame therefore cannot select one `id`,
+  `method`, or nested result for request correlation while another decoder or
+  audit surface sees a different value; credential parsing likewise has one
+  structural interpretation. The shared preflight retains no decoded value
+  tree and never reflects the untrusted member name in its error.
 
 - **Shared terminal metadata contracts (2026-08-25)**: jsh session ids now
   delegate to `jterm_core`'s exact grammar and byte bound instead of maintaining
@@ -30,7 +44,7 @@ fail closed.
   consumes layout streams once and reuses per-group scratch allocations while
   preserving the existing incremental plan, cache-key and revision contracts.
   The shared core exact pin advances to
-  `852d33d197d3a46becc76a3b85c13f981506a61c`, adding core-owned Agent
+  `21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d`, adding core-owned Agent
   claim durability and recursive duplicate-member rejection at jagent's JSON
   boundaries without changing `block_contract` semantics.
 
@@ -225,8 +239,8 @@ fail closed.
   public path alone, so one process exiting cannot delete a newer checkpoint
   published by another. Core now syncs retirement of the public name before it
   exposes a live session, so a crash cannot replay an already consumed approval.
-  `jterm_core` is pinned to `852d33d197d3a46becc76a3b85c13f981506a61c`
-  (transitively jagent `2570e5e9324d1fb6823e731b53e7ea9a6033177a`).
+  `jterm_core` is pinned to `21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d`
+  (transitively jagent `a462ec81f3a4c6ad85a455780ced232172f127ea`).
   Claim-acquisition errors are logged with the public path and leave that path
   untouched; there is no best-effort fallback read or delete.
 - The in-flight model request records the task generation it was started for; a

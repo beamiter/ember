@@ -828,6 +828,9 @@ impl JsonLineReader {
             if line.is_empty() {
                 continue;
             }
+            jterm_core::bounded_json::validate_no_duplicate_members(&line).map_err(|error| {
+                WorkerFailure::protocol(format!("invalid app-server JSONL record: {error}"))
+            })?;
             let message: Value = serde_json::from_slice(&line).map_err(|error| {
                 WorkerFailure::protocol(format!("invalid app-server JSONL record: {error}"))
             })?;
@@ -5447,6 +5450,55 @@ mod tests {
             }
         }
         assert!(rejected);
+    }
+
+    #[test]
+    fn jsonl_reader_rejects_duplicate_rpc_correlation_members_recursively() {
+        for encoded in [
+            br#"{"id":1,"id":2,"result":{}}
+"#
+            .as_slice(),
+            br#"{"method":"turn/completed","m\u0065thod":"item/completed","params":{}}
+"#
+            .as_slice(),
+            br#"{"id":1,"result":{"turn":{"id":"turn-1","id":"turn-2"}}}
+"#
+            .as_slice(),
+            br#"{"id":1,"result":{"future":[{"authority":"read","authority":"write"}]}}
+"#
+            .as_slice(),
+        ] {
+            let mut reader = JsonLineReader::default();
+            let error = reader
+                .read_available(&mut Cursor::new(encoded))
+                .unwrap_err();
+            assert_eq!(error.cause, CodexAppServerExitCause::ProtocolFailed);
+            assert!(
+                error.detail.contains("duplicate JSON object member"),
+                "{}",
+                error.detail
+            );
+            assert!(!error.detail.contains("\"id\""), "{}", error.detail);
+        }
+    }
+
+    #[test]
+    fn jsonl_reader_rejects_serde_json_raw_value_sentinel() {
+        let mut reader = JsonLineReader::default();
+        let error = reader
+            .read_available(&mut Cursor::new(
+                br#"{"$serde_json::private::RawValue":"{\"id\":1,\"id\":2,\"result\":{}}"}
+"#,
+            ))
+            .unwrap_err();
+        assert_eq!(error.cause, CodexAppServerExitCause::ProtocolFailed);
+        assert!(
+            error.detail.contains("reserved JSON object member"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.detail.contains("RawValue"), "{}", error.detail);
+        assert!(!error.detail.contains("\"id\""), "{}", error.detail);
     }
 
     #[test]

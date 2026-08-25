@@ -313,8 +313,12 @@ fn read_native_credentials(
             limit: NATIVE_CODEX_AUTH_MAX_BYTES,
         });
     }
-    let parsed = serde_json::from_slice::<NativeAuthDocument>(&encoded)
-        .map_err(|_| NativeCodexHomeError::CredentialsMalformed);
+    let parsed = jterm_core::bounded_json::validate_no_duplicate_members(&encoded)
+        .map_err(|_| NativeCodexHomeError::CredentialsMalformed)
+        .and_then(|()| {
+            serde_json::from_slice::<NativeAuthDocument>(&encoded)
+                .map_err(|_| NativeCodexHomeError::CredentialsMalformed)
+        });
     encoded.fill(0);
     let parsed = parsed?;
     if parsed.auth_mode != "chatgpt" {
@@ -1295,6 +1299,28 @@ mod tests {
         ));
         drop(prepared);
         assert!(!private_path.exists());
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn private_codex_home_rejects_duplicate_credential_members_at_every_depth() {
+        let source = source_codex_home();
+        let runtime = private_test_directory("runtime-duplicate-auth");
+        let auth = source.join("auth.json");
+        for encoded in [
+            br#"{"auth_mode":"chatgpt","auth_mode":"api_key","tokens":{"access_token":"secret-access-token","account_id":"account-1"}}"#.as_slice(),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"first","access_token":"second","account_id":"account-1"}}"#.as_slice(),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret-access-token","account_id":"account-1","future":{"scope":"read","scope":"write"}}}"#.as_slice(),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret-access-token","account_id":"account-1","future":[{"name":"plain","\u006eame":"escaped"}]}}"#.as_slice(),
+            br#"{"$serde_json::private::RawValue":"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"first\",\"access_token\":\"second\",\"account_id\":\"account-1\"}}"}"#.as_slice(),
+        ] {
+            std::fs::write(&auth, encoded).unwrap();
+            assert!(matches!(
+                PreparedNativeCodexHome::prepare_from(&source, &runtime),
+                Err(NativeCodexHomeError::CredentialsMalformed)
+            ));
+        }
         std::fs::remove_dir_all(source).unwrap();
         std::fs::remove_dir_all(runtime).unwrap();
     }
