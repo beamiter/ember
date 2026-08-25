@@ -3992,14 +3992,7 @@ fn abbreviate_home(cwd: &str) -> String {
 }
 
 fn format_duration(duration_ms: u64) -> String {
-    if duration_ms < 1_000 {
-        format!("{duration_ms}ms")
-    } else if duration_ms < 60_000 {
-        format!("{:.1}s", duration_ms as f64 / 1_000.0)
-    } else {
-        let seconds = duration_ms / 1_000;
-        format!("{}m{:02}s", seconds / 60, seconds % 60)
-    }
+    crate::block_mode::format_block_duration(duration_ms)
 }
 
 fn system_time_from_millis(milliseconds: u64) -> Option<SystemTime> {
@@ -4249,6 +4242,18 @@ fn combine_command_and_output(command: &str, output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_sidebar_uses_the_same_duration_contract_as_block_chrome() {
+        for duration_ms in [743, 12_345, 60_000, 92_000, 3_600_000, 7_500_000] {
+            assert_eq!(
+                format_duration(duration_ms),
+                crate::block_mode::format_block_duration(duration_ms)
+            );
+        }
+        assert_eq!(format_duration(3_600_000), "1h");
+        assert_eq!(format_duration(7_500_000), "2h05m");
+    }
 
     fn persisted_test_record() -> PersistedExecution {
         PersistedExecution {

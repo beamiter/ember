@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-24
+Updated: 2026-08-25 (shared session-id and duration convergence)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,11 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Shared terminal metadata contracts (2026-08-25)**: jsh session ids now
+  delegate to `jterm_core`'s exact grammar and byte bound instead of maintaining
+  a local mirror. The Commands sidebar also reuses Block chrome's duration
+  formatter, keeping millisecond, second, minute, and hour labels identical.
 
 - Block Mode convergence closes the remaining interaction gaps with Frost.
   Normal text selections in collapsed projections now carry stable raw-cell or
@@ -25,8 +30,9 @@ fail closed.
   consumes layout streams once and reuses per-group scratch allocations while
   preserving the existing incremental plan, cache-key and revision contracts.
   The shared core exact pin advances to
-  `0f47569eb7501d52abeee4130f1735b6ada7dfe0`, adding current AI
-  origin/credential validation without changing `block_contract` semantics.
+  `852d33d197d3a46becc76a3b85c13f981506a61c`, adding core-owned Agent
+  claim durability and recursive duplicate-member rejection at jagent's JSON
+  boundaries without changing `block_contract` semantics.
 
 - Block Search 2.0 replaces Ember's former potentially hundreds-of-megabytes,
   open-time-only cache. Completed records are sampled lazily newest-first under
@@ -217,11 +223,12 @@ fail closed.
   oversized, and semantically invalid evidence remains byte-identical at its
   private claim path. An empty or rejected local session still leaves the
   public path alone, so one process exiting cannot delete a newer checkpoint
-  published by another. `jterm_core` is pinned to
-  `0f47569eb7501d52abeee4130f1735b6ada7dfe0` (transitively jagent
-  `fcb9768bb832547988056baa38b2d4239341b361`). Claim-acquisition errors are
-  logged with the public path and leave that path untouched; there is no
-  best-effort fallback read or delete.
+  published by another. Core now syncs retirement of the public name before it
+  exposes a live session, so a crash cannot replay an already consumed approval.
+  `jterm_core` is pinned to `852d33d197d3a46becc76a3b85c13f981506a61c`
+  (transitively jagent `2570e5e9324d1fb6823e731b53e7ea9a6033177a`).
+  Claim-acquisition errors are logged with the public path and leave that path
+  untouched; there is no best-effort fallback read or delete.
 - The in-flight model request records the task generation it was started for; a
   reply that lands after New Task, a restore, or a session replacement is
   dropped instead of being applied to a transcript that no longer exists.

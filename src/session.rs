@@ -9,7 +9,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// forever. Clipboard payloads that cannot fit remain in the paste-confirm
 /// flow instead of entering this queue.
 pub const PENDING_INPUT_BYTE_CAP: usize = 8 * 1024 * 1024;
-const MAX_JSH_SESSION_ID_BYTES: usize = 128;
 
 fn append_bounded_input(buffer: &mut Vec<u8>, input: &[u8], cap: usize) -> bool {
     let Some(total) = buffer.len().checked_add(input.len()) else {
@@ -39,11 +38,7 @@ pub fn generate_session_id() -> String {
 /// is user-editable, so callers must validate restored IDs before putting one
 /// on an argv or using it as a cross-process routing key.
 pub fn is_valid_jsh_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_JSH_SESSION_ID_BYTES
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    jterm_core::execution_journal::is_valid_jsh_session_id(id)
 }
 
 /// Session metadata - 会话元数据
@@ -256,6 +251,9 @@ mod tests {
         for invalid in ["", "has.dot", "has space", "../escape", "雪"] {
             assert!(!is_valid_jsh_session_id(invalid), "{invalid}");
         }
+        let max = jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES;
+        assert!(is_valid_jsh_session_id(&"s".repeat(max)));
+        assert!(!is_valid_jsh_session_id(&"s".repeat(max + 1)));
     }
 
     #[test]
