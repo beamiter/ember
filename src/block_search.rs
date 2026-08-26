@@ -104,6 +104,18 @@ impl BlockSearchState {
         self.needs_focus = true;
     }
 
+    /// Invalidate only the source/index version for an explicit F5 refresh.
+    /// Query intent and the current hit anchor remain intact. An invalid query
+    /// refuses the request so rebuilding cannot discard the last valid result
+    /// set merely to rediscover the same expression error.
+    pub fn request_manual_refresh(&mut self) -> bool {
+        if self.query_error.is_some() {
+            return false;
+        }
+        self.record_version = None;
+        true
+    }
+
     /// Open with the last process-lifetime matching intent. Hits, cache,
     /// selection and pane identity are always rebuilt fresh; query/options,
     /// scope and metadata filter are intentionally not serialized anywhere.
@@ -585,6 +597,33 @@ mod tests {
             state.count_label(),
             "2 of 2 matches · older blocks not searched · older blocks not indexed"
         );
+    }
+
+    #[test]
+    fn manual_refresh_invalidates_only_the_cache_version() {
+        let version = BlockSearchRecordVersion {
+            len: 2,
+            oldest_sequence: Some(1),
+            newest_sequence: Some(2),
+        };
+        let mut state = BlockSearchState {
+            query: "q".to_string(),
+            computed_query: Some("q".to_string()),
+            session_id: Some("s1".to_string()),
+            record_version: Some(version),
+            hits: vec![hit("a"), hit("b")],
+            selected_index: 1,
+            ..Default::default()
+        };
+        assert!(state.request_manual_refresh());
+        assert_eq!(state.record_version, None);
+        assert_eq!(state.computed_query.as_deref(), Some("q"));
+        assert_eq!(state.selected_hit().unwrap().record_id, "b");
+
+        state.record_version = Some(version);
+        state.query_error = Some("bad regex".to_string());
+        assert!(!state.request_manual_refresh());
+        assert_eq!(state.record_version, Some(version));
     }
 
     #[test]

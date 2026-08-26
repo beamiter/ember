@@ -1697,7 +1697,7 @@ impl TerminalApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(
-                                "↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close",
+                                "F5 Refresh  ↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close",
                             )
                                 .size(10.0)
                                 .color(ui.visuals().weak_text_color()),

@@ -1622,6 +1622,11 @@ impl TerminalApp {
                 egui::Key::End => self.block_search.select_last(),
                 egui::Key::PageUp => self.block_search.select_page(false),
                 egui::Key::PageDown => self.block_search.select_page(true),
+                egui::Key::F5 => {
+                    if self.block_search.request_manual_refresh() {
+                        self.refresh_block_search_hits();
+                    }
+                }
                 egui::Key::I if modifiers.ctrl => {
                     self.block_search.case_sensitive = !self.block_search.case_sensitive;
                     self.block_search.computed_query = None;
