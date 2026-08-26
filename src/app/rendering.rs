@@ -72,6 +72,106 @@ fn block_search_record_is_bookmarked(
         .is_some_and(|sequence| bookmarked_sequences.contains(sequence))
 }
 
+fn block_search_bookmarks_have_indexed_text(
+    cache: &[crate::block_mode::CachedBlockSearchRecord],
+    live_record_sequences: &std::collections::HashMap<String, u64>,
+    bookmarked_sequences: &std::collections::HashSet<u64>,
+    scope: crate::block_mode::BlockSearchScope,
+) -> bool {
+    cache.iter().any(|record| {
+        live_record_sequences
+            .get(&record.record_id)
+            .is_some_and(|sequence| bookmarked_sequences.contains(sequence))
+            && super::commands::metadata_browse_display(record, scope).is_some()
+    })
+}
+
+fn block_search_bookmark_accessible_label(
+    hit: &crate::block_mode::BlockSearchHit,
+    index: usize,
+    hit_count: usize,
+    bookmarked: bool,
+) -> String {
+    let action = if bookmarked {
+        "Remove bookmark from"
+    } else {
+        "Bookmark"
+    };
+    let context = if hit.is_output_line {
+        let owner = if hit.command_preview.is_empty() {
+            "a commandless block"
+        } else {
+            hit.command_preview.as_str()
+        };
+        hit.line_no.map_or_else(
+            || format!("output for {owner}"),
+            |line_no| format!("output line {line_no} for {owner}"),
+        )
+    } else {
+        format!("command {}", hit.line_text)
+    };
+    format!(
+        "{action} result {} of {hit_count}; {context}",
+        index.saturating_add(1).min(hit_count)
+    )
+}
+
+/// Paint the compact star while registering one authoritative semantic button
+/// node. Using `interact` directly avoids the otherwise duplicated AccessKit
+/// click event from a glyph-labelled `Button` followed by a second semantic
+/// override.
+fn block_search_bookmark_button(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    bookmarked: bool,
+    accessible_label: &str,
+) -> egui::Response {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&response, bookmarked);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if bookmarked { "★" } else { "☆" },
+        egui::TextStyle::Button.resolve(ui.style()),
+        visuals.text_color(),
+    );
+    if response.has_focus() {
+        ui.painter()
+            .rect_stroke(rect, 2.0, visuals.fg_stroke, egui::StrokeKind::Inside);
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            bookmarked,
+            accessible_label,
+        )
+    });
+    response
+}
+
+fn block_search_bookmark_owns_selection(response: &egui::Response) -> bool {
+    response.has_focus()
+        || (response.clicked() && !response.clicked_by(egui::PointerButton::Primary))
+}
+
+/// Result Enter/Shift+Enter is owned by the app input prepass. `Response::clicked`
+/// also reports egui's keyboard fake click for a focused button, so accepting it
+/// here would reveal twice (and Shift+Enter would close on the second reveal).
+/// Render owns genuine primary-pointer activation, standard focused-button
+/// Space, and a targeted AccessKit Click action; all still flow through the
+/// stable hit revalidation path.
+fn block_search_result_render_activation(response: &egui::Response) -> bool {
+    response.clicked_by(egui::PointerButton::Primary)
+        || (response.clicked()
+            && response.ctx.input(|input| {
+                input.key_pressed(egui::Key::Space)
+                    || input
+                        .has_accesskit_action_request(response.id, egui::accesskit::Action::Click)
+            }))
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct BlockSearchRowWidgetIdentity<'a> {
     session_id: &'a str,
@@ -1404,8 +1504,10 @@ impl TerminalApp {
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
         let mut clicked_hit_index = None;
         let mut clicked_bookmark_target = None;
+        let mut clicked_bookmark_preserve_focus = false;
         let mut hovered_hit_index = None;
         let mut focused_hit_index = None;
+        let mut restored_bookmark_focus = false;
         let block_search_pointer_moved =
             ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
         if self.block_search.is_open {
@@ -1449,6 +1551,12 @@ impl TerminalApp {
             let has_live_bookmarks = live_record_sequences
                 .values()
                 .any(|sequence| bookmarked_sequences.contains(sequence));
+            let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
+                &self.block_search.cache,
+                &live_record_sequences,
+                &bookmarked_sequences,
+                self.block_search.scope,
+            );
             let pane_has_completed_blocks = self
                 .block_search
                 .record_version
@@ -1494,6 +1602,7 @@ impl TerminalApp {
                         if self.block_search.needs_focus {
                             search_response.request_focus();
                             self.block_search.needs_focus = false;
+                            self.block_search.needs_bookmark_focus = false;
                         }
                         if search_response.has_focus() && self.block_search.query.is_empty() {
                             ui.label("Search block commands and output...");
@@ -1731,14 +1840,14 @@ impl TerminalApp {
                                         record_version,
                                         hit,
                                     );
-                                    let response = ui
-                                        .push_id(("block-search-result", stable_row_identity), |ui| {
-                                            ui.put(
-                                                row_rect,
-                                                egui::Button::new("").frame(false),
-                                            )
-                                        })
-                                        .inner;
+                                    let response = ui.interact(
+                                        row_rect,
+                                        ui.make_persistent_id((
+                                            "block-search-result",
+                                            stable_row_identity,
+                                        )),
+                                        egui::Sense::click(),
+                                    );
                                     if is_selected {
                                         ui.painter().rect_filled(
                                             rect,
@@ -1782,14 +1891,14 @@ impl TerminalApp {
                                                     .truncate(),
                                                 );
                                                 let context = if hit.is_output_line {
-                                                    format!(
-                                                        "{} · L{}",
-                                                        if hit.command_preview.is_empty() {
-                                                            "(no command)"
-                                                        } else {
-                                                            hit.command_preview.as_str()
-                                                        },
-                                                        hit.line_no.unwrap_or(0)
+                                                    let owner = if hit.command_preview.is_empty() {
+                                                        "(no command)"
+                                                    } else {
+                                                        hit.command_preview.as_str()
+                                                    };
+                                                    hit.line_no.map_or_else(
+                                                        || owner.to_string(),
+                                                        |line_no| format!("{owner} · L{line_no}"),
                                                     )
                                                 } else {
                                                     "command".to_string()
@@ -1818,58 +1927,74 @@ impl TerminalApp {
                                         &live_record_sequences,
                                         &bookmarked_sequences,
                                     );
-                                    let bookmark_label = if bookmarked {
+                                    let bookmark_hover_label = if bookmarked {
                                         "Remove bookmark from this block"
                                     } else {
                                         "Bookmark this block for this running session"
                                     };
-                                    let bookmark_response = ui
-                                        .push_id(
-                                            ("block-search-bookmark", stable_row_identity),
-                                            |ui| {
-                                                ui.put(
-                                                    bookmark_rect
-                                                        .shrink2(egui::vec2(2.0, 4.0)),
-                                                    egui::Button::new(if bookmarked {
-                                                        "★"
-                                                    } else {
-                                                        "☆"
-                                                    })
-                                                    .selected(bookmarked)
-                                                    .frame(false),
-                                                )
-                                            },
-                                        )
-                                        .inner
-                                        .on_hover_text(bookmark_label);
-                                    bookmark_response.widget_info(|| {
-                                        egui::WidgetInfo::selected(
-                                            egui::WidgetType::Button,
-                                            true,
+                                    let bookmark_accessible_label =
+                                        block_search_bookmark_accessible_label(
+                                            hit,
+                                            idx,
+                                            hit_count,
                                             bookmarked,
-                                            bookmark_label,
-                                        )
-                                    });
-                                    intent_control_focused |= bookmark_response.has_focus();
+                                        );
+                                    let bookmark_response = block_search_bookmark_button(
+                                        ui,
+                                        ui.make_persistent_id((
+                                            "block-search-bookmark",
+                                            stable_row_identity,
+                                        )),
+                                        bookmark_rect.shrink2(egui::vec2(2.0, 4.0)),
+                                        bookmarked,
+                                        &bookmark_accessible_label,
+                                    )
+                                    .on_hover_text(bookmark_hover_label);
+                                    if self.block_search.needs_bookmark_focus && is_selected {
+                                        bookmark_response.request_focus();
+                                        restored_bookmark_focus = true;
+                                    }
+                                    let bookmark_has_focus = bookmark_response.has_focus();
+                                    intent_control_focused |= bookmark_has_focus;
+                                    if block_search_bookmark_owns_selection(&bookmark_response) {
+                                        // Tab focus and AccessKit focus/Click are
+                                        // explicit row choices. Keep picker-wide
+                                        // shortcuts, count text and refresh anchors
+                                        // aligned with the star being operated.
+                                        focused_hit_index = Some(idx);
+                                    }
                                     if bookmark_response.clicked() {
                                         clicked_bookmark_target =
                                             Some(self.block_search.bookmark_target(idx));
+                                        clicked_bookmark_preserve_focus = !bookmark_response
+                                            .clicked_by(egui::PointerButton::Primary);
                                     }
 
                                     let response = response
                                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                                     let row_accessible_label = if hit.is_output_line {
-                                        format!(
-                                            "Result {} of {}; {}; output line {} for {}",
-                                            idx + 1,
-                                            hit_count,
-                                            hit.line_text,
-                                            hit.line_no.unwrap_or(0),
-                                            if hit.command_preview.is_empty() {
-                                                "a commandless block"
-                                            } else {
-                                                hit.command_preview.as_str()
-                                            }
+                                        let owner = if hit.command_preview.is_empty() {
+                                            "a commandless block"
+                                        } else {
+                                            hit.command_preview.as_str()
+                                        };
+                                        hit.line_no.map_or_else(
+                                            || {
+                                                format!(
+                                                    "Result {} of {}; {}; output for {owner}",
+                                                    idx + 1,
+                                                    hit_count,
+                                                    hit.line_text,
+                                                )
+                                            },
+                                            |line_no| {
+                                                format!(
+                                                    "Result {} of {}; {}; output line {line_no} for {owner}",
+                                                    idx + 1,
+                                                    hit_count,
+                                                    hit.line_text,
+                                                )
+                                            },
                                         )
                                     } else {
                                         format!(
@@ -1893,7 +2018,7 @@ impl TerminalApp {
                                     if response.has_focus() {
                                         focused_hit_index = Some(idx);
                                     }
-                                    if response.clicked() {
+                                    if block_search_result_render_activation(&response) {
                                         clicked_hit_index = Some(idx);
                                     }
                                 }
@@ -1912,9 +2037,9 @@ impl TerminalApp {
                                 {
                                     crate::block_search::bookmarked_empty_message(
                                         has_live_bookmarks,
-                                        query_is_empty,
+                                        has_bookmarked_indexed_text,
+                                        self.block_search.scope,
                                     )
-                                    .to_string()
                                 } else if query_is_empty {
                                     if self.block_search.filter
                                         == crate::block_search::BlockSearchFilter::All
@@ -1948,6 +2073,9 @@ impl TerminalApp {
                         );
                     });
                 });
+            if restored_bookmark_focus {
+                self.block_search.needs_bookmark_focus = false;
+            }
             self.block_search.intent_control_focused = intent_control_focused;
         }
 
@@ -1959,7 +2087,16 @@ impl TerminalApp {
                 .select_hovered(index, block_search_pointer_moved);
         }
         if let Some(target) = clicked_bookmark_target {
-            if self.block_search_toggle_bookmark(target) {
+            let toggled = self.block_search_toggle_bookmark(target);
+            if clicked_bookmark_preserve_focus {
+                // Keyboard and AccessKit activation stay on the operated star
+                // after both success and a stale-target refresh. Under
+                // Bookmarked, the stable anchor has already moved to the
+                // nearest surviving row; an empty result set falls back to the
+                // query editor.
+                self.block_search.restore_focus_after_bookmark_activation();
+            }
+            if toggled || clicked_bookmark_preserve_focus {
                 ctx.request_repaint();
             }
         } else if let Some(index) = clicked_hit_index {
@@ -2691,6 +2828,45 @@ mod tests {
     }
 
     #[test]
+    fn bookmarked_scope_text_is_independent_of_query_matches() {
+        let cache = vec![
+            crate::block_mode::CachedBlockSearchRecord::new(
+                "command-only",
+                Some("build"),
+                Some("\n\n".to_string()),
+            ),
+            crate::block_mode::CachedBlockSearchRecord::new(
+                "with-output",
+                Some("test"),
+                Some("\nmeaningful output".to_string()),
+            ),
+        ];
+        let live = std::collections::HashMap::from([
+            ("command-only".to_string(), 41),
+            ("with-output".to_string(), 42),
+        ]);
+        let command_only = std::collections::HashSet::from([41]);
+        assert!(block_search_bookmarks_have_indexed_text(
+            &cache,
+            &live,
+            &command_only,
+            crate::block_mode::BlockSearchScope::Command,
+        ));
+        assert!(!block_search_bookmarks_have_indexed_text(
+            &cache,
+            &live,
+            &command_only,
+            crate::block_mode::BlockSearchScope::Output,
+        ));
+        assert!(block_search_bookmarks_have_indexed_text(
+            &cache,
+            &live,
+            &std::collections::HashSet::from([42]),
+            crate::block_mode::BlockSearchScope::Output,
+        ));
+    }
+
+    #[test]
     fn virtual_row_widget_identity_follows_hit_not_visual_index() {
         let hit = |record_id: &str, line_no: Option<usize>| crate::block_mode::BlockSearchHit {
             record_id: record_id.to_string(),
@@ -2729,6 +2905,238 @@ mod tests {
                 &first,
             ),
             "a retained-record generation change cancels an in-flight click"
+        );
+    }
+
+    #[test]
+    fn bookmark_accessible_labels_identify_their_result_and_real_context() {
+        let output = crate::block_mode::BlockSearchHit {
+            record_id: "record-a".to_string(),
+            is_output_line: true,
+            line_no: Some(3),
+            match_span: None,
+            line_text: "failed assertion".to_string(),
+            command_preview: "cargo test".to_string(),
+        };
+        assert_eq!(
+            block_search_bookmark_accessible_label(&output, 1, 5, false),
+            "Bookmark result 2 of 5; output line 3 for cargo test"
+        );
+        assert_eq!(
+            block_search_bookmark_accessible_label(&output, 1, 5, true),
+            "Remove bookmark from result 2 of 5; output line 3 for cargo test"
+        );
+
+        let missing_line = crate::block_mode::BlockSearchHit {
+            line_no: None,
+            ..output
+        };
+        assert_eq!(
+            block_search_bookmark_accessible_label(&missing_line, 0, 1, false),
+            "Bookmark result 1 of 1; output for cargo test",
+            "defensive malformed output metadata must never announce line zero"
+        );
+    }
+
+    #[test]
+    fn bookmark_control_exposes_and_executes_real_accesskit_semantics() {
+        use std::cell::Cell;
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let widget_id = Cell::new(None);
+        let clicked = Cell::new(false);
+        let focused = Cell::new(false);
+        let owns_selection = Cell::new(false);
+        let render = |ui: &mut egui::Ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 24.0), egui::Sense::hover());
+            let response = block_search_bookmark_button(
+                ui,
+                ui.make_persistent_id("block-search-accesskit-bookmark"),
+                rect,
+                false,
+                "Bookmark result 2 of 5; output line 3 for cargo test",
+            );
+            widget_id.set(Some(response.id));
+            clicked.set(response.clicked());
+            focused.set(response.has_focus());
+            owns_selection.set(block_search_bookmark_owns_selection(&response));
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 80.0),
+            )),
+            ..Default::default()
+        };
+        let first = ctx.run_ui(input.clone(), render);
+        let id = widget_id.get().expect("stable bookmark widget id");
+        let update = first
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit tree update");
+        let node = update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| (*node_id == id.accesskit_id()).then_some(node))
+            .expect("bookmark node in AccessKit tree");
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            node.label(),
+            Some("Bookmark result 2 of 5; output line 3 for cargo test")
+        );
+        assert_eq!(node.toggled(), Some(egui::accesskit::Toggled::False));
+        assert!(node.supports_action(egui::accesskit::Action::Focus));
+        assert!(node.supports_action(egui::accesskit::Action::Click));
+
+        let mut activated_input = input.clone();
+        activated_input.events = vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: id.accesskit_id(),
+                data: None,
+            },
+        )];
+        let activated = ctx.run_ui(activated_input, render);
+        assert!(
+            !focused.get(),
+            "a direct AccessKit Click need not synthesize Focus"
+        );
+        assert!(
+            clicked.get(),
+            "AccessKit Click must activate the real control"
+        );
+        assert!(
+            owns_selection.get(),
+            "a direct AccessKit Click must still select its stable result before refresh"
+        );
+        assert_eq!(activated.platform_output.events.len(), 1);
+        assert!(matches!(
+            &activated.platform_output.events[0],
+            egui::output::OutputEvent::Clicked(info)
+                if info.label.as_deref()
+                    == Some("Bookmark result 2 of 5; output line 3 for cargo test")
+                    && info.selected == Some(false)
+        ));
+
+        let mut focus_input = input;
+        focus_input.events = vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: id.accesskit_id(),
+                data: None,
+            },
+        )];
+        let focused_output = ctx.run_ui(focus_input, render);
+        assert!(focused.get(), "AccessKit Focus must focus the real control");
+        assert_eq!(
+            focused_output
+                .platform_output
+                .accesskit_update
+                .expect("focused AccessKit update")
+                .focus,
+            id.accesskit_id()
+        );
+    }
+
+    #[test]
+    fn focused_result_shift_enter_is_prepass_only_and_accesskit_click_is_render_owned() {
+        use std::cell::Cell;
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let widget_id = Cell::new(None);
+        let request_initial_focus = Cell::new(true);
+        let raw_clicked = Cell::new(false);
+        let render_activated = Cell::new(false);
+        let render = |ui: &mut egui::Ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(160.0, 28.0), egui::Sense::hover());
+            let response = ui.interact(
+                rect,
+                ui.make_persistent_id("block-search-accesskit-result"),
+                egui::Sense::click(),
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    true,
+                    true,
+                    "Result 1 of 2; cargo test; command",
+                )
+            });
+            if request_initial_focus.replace(false) {
+                response.request_focus();
+            }
+            widget_id.set(Some(response.id));
+            raw_clicked.set(response.clicked());
+            render_activated.set(block_search_result_render_activation(&response));
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(240.0, 80.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input.clone(), render);
+        let id = widget_id.get().expect("stable result widget id");
+
+        let mut shift_enter = input.clone();
+        shift_enter.modifiers = egui::Modifiers::SHIFT;
+        shift_enter.events = vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        }];
+        let _ = ctx.run_ui(shift_enter, render);
+        assert!(
+            raw_clicked.get(),
+            "egui exposes focused Shift+Enter as a keyboard fake click"
+        );
+        assert!(
+            !render_activated.get(),
+            "render must not accept the same Shift+Enter owned by the prepass"
+        );
+        let prepass_accept_count = 1usize;
+        let render_accept_count = usize::from(render_activated.get());
+        assert_eq!(prepass_accept_count + render_accept_count, 1);
+
+        let mut space = input.clone();
+        space.events = vec![egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: Some(egui::Key::Space),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let _ = ctx.run_ui(space, render);
+        assert!(raw_clicked.get());
+        assert!(
+            render_activated.get(),
+            "focused Space remains a standard single button activation"
+        );
+        let prepass_accept_count = 0usize;
+        let render_accept_count = usize::from(render_activated.get());
+        assert_eq!(prepass_accept_count + render_accept_count, 1);
+
+        let mut accesskit_click = input;
+        accesskit_click.events = vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: id.accesskit_id(),
+                data: None,
+            },
+        )];
+        let _ = ctx.run_ui(accesskit_click, render);
+        assert!(raw_clicked.get());
+        assert!(
+            render_activated.get(),
+            "a targeted AccessKit Click remains a render-owned activation"
         );
     }
 

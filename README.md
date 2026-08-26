@@ -336,7 +336,7 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
-`Ctrl+Shift+G` opens Block Search 4.3. `Aa` selects case-sensitive matching,
+`Ctrl+Shift+G` opens Block Search 4.4. `Aa` selects case-sensitive matching,
 `.*` selects Rust-regex matching, and `W` requires Unicode whole-word matches;
 `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle the same controls without leaving the
 query. `All / Cmd / Out` restricts matching to all text, commands, or output;
@@ -347,8 +347,12 @@ category with an empty query. Results report the current position and support
 wrapping `↑/↓`, `Home/End`, and ten-row `PageUp/PageDown` navigation while
 keeping the virtual list aligned. `Enter` reveals and closes; `Shift+Enter`
 reveals, keeps the picker focused, and advances only after the record is
-revalidated. An evicted result stays open, refreshes, and reports the stale
-target instead of silently stepping.
+revalidated. Even when a result row itself owns keyboard focus, those keys are
+accepted only by the picker input pass; the row render path accepts a real
+primary-pointer click, standard focused-button `Space`, or a targeted AccessKit
+Click, preventing Shift+Enter from revealing twice and then closing without
+discarding normal button keyboard behavior. An evicted result stays open,
+refreshes, and reports the stale target instead of silently stepping.
 Each virtual result row has its own `☆` / `★` bookmark button. Clicking the
 star never jumps or closes the picker; exact `Ctrl+Shift+B` toggles the
 highlighted hit instead. Both paths validate the current pane, completed-record
@@ -363,11 +367,20 @@ removing the current record retains the nearest surviving result. Bookmarks are
 pane-local and process-lifetime only: session close clears them, while real
 `command_records` retirement prunes them behind a deque-version gate. Output
 snapshot or scrollback eviction alone never removes one. Accessible result rows
-report selected state, bookmark buttons report pressed state and action, and
-the picker distinguishes no retained bookmarks from bookmarks with no real text
-in the chosen scope. Empty-query metadata browsing never invents command or
-output text: `All` / `Out` use the first nonblank retained output line when no
-real command is available, and `Cmd` produces no hit for a commandless record.
+report selected state; every bookmark button is one real focusable AccessKit
+control whose name includes its result position and bounded command/output
+context as well as its pressed state and action. Tab or AccessKit focus on a
+star also selects that row. Keyboard and assistive-tech activation keeps focus
+on the same stable star (or the nearest surviving star after a Bookmarked
+re-filter), and falls back to the query only when no result remains. Every stale
+activation path, including `Ctrl+Shift+B`, recovers that focus after its
+anchor-preserving refresh; successful pointer activation retains the established
+query-refocus behavior. The picker distinguishes no retained bookmarks from
+bookmarks with no indexed command/output text in the chosen scope, independently
+of whether the current non-empty query matched. Empty-query metadata browsing
+never invents command or output text: `All` / `Out` use the first nonblank
+retained output line when no real command is available, and `Cmd` produces no
+hit for a commandless record.
 Reopening restores the last valid query, matching controls, scope, and
 metadata filter for this process only; it is never written to config or a
 session snapshot. `Ctrl+U` clears only the query; **Reset** or `Ctrl+Shift+U`

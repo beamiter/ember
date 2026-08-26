@@ -51,7 +51,7 @@ fn route_block_search_bookmark_key_event(
             repeat,
             modifiers,
             ..
-        } if *key == egui::Key::B => Some(state.bookmark_key_press(
+        } if *key == egui::Key::B => Some(state.bookmark_logical_b_press(
             is_exact_block_search_bookmark_chord(*key, *modifiers),
             *repeat,
         )),

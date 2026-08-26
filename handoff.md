@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.3)
+Updated: 2026-08-26 (Block Search 4.4)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,29 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.4 (2026-08-26)**: virtual result rows and stars now use
+  direct stable egui interactions, so each exposes one authoritative AccessKit
+  button node and one activation event instead of layering a glyph/empty button
+  semantic beneath its explicit label. Each star's accessible name includes
+  result rank plus bounded real command/output context, allowing repeated star
+  controls to be distinguished. Tab or AccessKit focus on a star synchronizes
+  the picker selection before the same stable target is toggled; keyboard and
+  assistive-tech activation restores focus to that star or the nearest surviving
+  Bookmarked row, with the query as the empty-result fallback. A headless egui
+  regression now verifies the emitted Button role, label, toggled state,
+  Focus/Click actions, focus transfer, and exactly-once click event. Logical-B
+  latch names and comments now match the non-QWERTY behavior shipped in 4.3.
+  Focused result-row Enter/Shift+Enter is now exclusively accepted by the input
+  prepass; render accepts primary-pointer, standard focused-button Space, or
+  targeted AccessKit Click, with a headless exactly-once regression covering
+  each keyboard route and egui's Enter fake-click edge.
+  A stale star target now rebuilds without discarding the selection anchor and
+  restores focus from the shared action after rejection, including the
+  picker-local `Ctrl+Shift+B` route. Finally, Bookmarked empty-state
+  diagnosis independently checks whether bookmarked records have real indexed
+  text in the selected scope, so a non-empty query no longer masks a scope-text
+  absence as an ordinary query miss.
 
 - **Block Search 4.3 (2026-08-26)**: each virtual result row now exposes an
   independent, selected-state `☆` / `★` button; activating it changes only the

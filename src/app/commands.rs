@@ -100,14 +100,15 @@ fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
         .find(|(_, line)| !line.trim().is_empty())
 }
 
-fn metadata_browse_display(
+pub(super) fn metadata_browse_display(
     record: &crate::block_mode::CachedBlockSearchRecord,
     scope: crate::block_mode::BlockSearchScope,
 ) -> Option<(&str, bool, Option<usize>)> {
     let command = record
         .command
         .as_deref()
-        .map(|command| (command, false, None));
+        .and_then(first_meaningful_line)
+        .map(|(_, line)| (line, false, None));
     let output = record
         .output
         .as_deref()
@@ -1857,7 +1858,10 @@ impl TerminalApp {
             return false;
         }
         let Some(target) = target else {
-            self.block_search.computed_query = None;
+            // Force an anchor-preserving source rebuild. Clearing
+            // `computed_query` would misclassify this as new query intent and
+            // reset the nearest surviving row to index zero.
+            self.block_search.record_version = None;
             self.refresh_block_search_hits();
             self.set_status(if self.block_search.hits.is_empty() {
                 "No search result is selected"
@@ -1894,8 +1898,14 @@ impl TerminalApp {
             None
         };
         let Some((sequence, version)) = identity else {
-            self.block_search.computed_query = None;
+            // The click target can retire between paint and activation. Keep
+            // the current query/anchor while rebuilding so keyboard/AT focus
+            // can recover on the nearest surviving stable row. This recovery
+            // lives in the shared action rather than the render caller so the
+            // picker-local Ctrl+Shift+B route receives the same guarantee.
+            self.block_search.record_version = None;
             self.refresh_block_search_hits();
+            self.block_search.restore_focus_after_bookmark_activation();
             self.set_status("That search result is no longer retained");
             return false;
         };
@@ -5392,7 +5402,8 @@ mod tests {
         );
         assert_eq!(
             metadata_browse_display(&command_only, crate::block_mode::BlockSearchScope::All),
-            Some(("  printf hi  \necho done", false, None))
+            Some(("  printf hi  ", false, None)),
+            "metadata browsing uses the first real command line"
         );
         assert_eq!(
             metadata_browse_display(&command_only, crate::block_mode::BlockSearchScope::Output),
@@ -5402,7 +5413,7 @@ mod tests {
 
         let blank = crate::block_mode::CachedBlockSearchRecord::new(
             "blank",
-            None,
+            Some(" \t\n"),
             Some("\n \t\n".to_string()),
         );
         for scope in [

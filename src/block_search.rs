@@ -129,13 +129,22 @@ impl BlockBookmarkState {
 /// Honest empty-state detail for the Bookmarked filter. The picker has a
 /// single metadata-filter axis, so there is no additional AND-filter case on
 /// this frontend.
-pub fn bookmarked_empty_message(has_live_bookmarks: bool, query_is_empty: bool) -> &'static str {
+pub fn bookmarked_empty_message(
+    has_live_bookmarks: bool,
+    has_bookmarked_indexed_text: bool,
+    scope: BlockSearchScope,
+) -> String {
     if !has_live_bookmarks {
-        "No bookmarked command blocks in retained history"
-    } else if query_is_empty {
-        "No bookmarked blocks with retained text in this scope"
+        "No bookmarked command blocks in retained history".to_string()
+    } else if !has_bookmarked_indexed_text {
+        let surface = match scope {
+            BlockSearchScope::All => "command or output",
+            BlockSearchScope::Command => "command",
+            BlockSearchScope::Output => "output",
+        };
+        format!("Bookmarked blocks have no indexed {surface} text")
     } else {
-        "No matches in bookmarked blocks"
+        "No matches in bookmarked blocks".to_string()
     }
 }
 
@@ -149,10 +158,10 @@ pub enum BlockSearchFilter {
     Background,
 }
 
-/// Result of routing one physical `B` press while the picker is open. The
-/// first edge owns the whole physical-key lifetime: an exact bookmark chord
-/// keeps suppressing repeats even if Ctrl/Shift is released before `B`, while
-/// an ordinary text press keeps propagating even if modifiers later change.
+/// Result of routing one logical `B` press while the picker is open. The first
+/// edge owns that logical-key lifetime: an exact bookmark chord keeps
+/// suppressing repeats even if Ctrl/Shift is released before `B`, while an
+/// ordinary text press keeps propagating even if modifiers later change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockSearchBookmarkKeyRoute {
     Toggle,
@@ -211,14 +220,18 @@ pub struct BlockSearchState {
     /// One-shot: focus the query field on the frame after opening.
     pub needs_focus: bool,
     /// Set by the previous render pass when one of the matching, scope, filter,
-    /// Refresh, or Reset controls owns keyboard focus. The input pass runs
-    /// before widgets render, so this lets Enter reach the focused button
+    /// Refresh, Reset, or bookmark controls owns keyboard focus. The input pass
+    /// runs before widgets render, so this lets Enter reach the focused button
     /// instead of being preempted by picker-wide result confirmation.
     pub intent_control_focused: bool,
     /// One-shot: center the highlighted result in the virtual result list.
     /// Keyboard/query-driven moves set this; pointer hover deliberately does
     /// not, so wheel and scrollbar movement remain under the user's control.
     pub scroll_to_selected: bool,
+    /// One-shot: restore keyboard/AccessKit focus to the selected row's star
+    /// after that activation re-filters the virtual result list. Pointer
+    /// activation deliberately keeps the established query-refocus behavior.
+    pub needs_bookmark_focus: bool,
     pub hits: Vec<BlockSearchHit>,
     /// True when the last run stopped at the hit cap (older blocks were left
     /// unscanned).
@@ -245,11 +258,11 @@ pub struct BlockSearchState {
     /// Query the current `hits` were computed for; `None` forces a recompute
     /// on the next rendered frame.
     pub computed_query: Option<String>,
-    /// Physical-key latch for picker-local Ctrl+Shift+B. App code transitions
-    /// it only through the tested routing helpers; crate visibility keeps
+    /// Logical-key latch for picker-local Ctrl+Shift+B. App code transitions it
+    /// only through the tested routing helpers; crate visibility keeps
     /// struct-update syntax available to sibling-module tests.
-    pub(crate) bookmark_b_held: bool,
-    pub(crate) bookmark_b_claimed: bool,
+    pub(crate) bookmark_logical_b_held: bool,
+    pub(crate) bookmark_logical_b_claimed: bool,
 }
 
 impl BlockSearchState {
@@ -264,6 +277,7 @@ impl BlockSearchState {
         self.computed_query = None;
         self.selected_index = 0;
         self.needs_focus = true;
+        self.needs_bookmark_focus = false;
         self.intent_control_focused = false;
     }
 
@@ -285,6 +299,7 @@ impl BlockSearchState {
     pub fn open(&mut self) {
         self.is_open = true;
         self.needs_focus = true;
+        self.needs_bookmark_focus = false;
         self.intent_control_focused = false;
         self.scroll_to_selected = true;
         self.selected_index = 0;
@@ -319,18 +334,19 @@ impl BlockSearchState {
         self.record_version = None;
         self.bookmark_revision = None;
         self.computed_query = None;
+        self.needs_bookmark_focus = false;
         self.reset_bookmark_key_latch();
     }
 
-    /// Route a physical `B` press. `repeat` is still checked on an unlatched
+    /// Route a logical `B` press. `repeat` is still checked on an unlatched
     /// edge so a stale repeat delivered after focus loss can never toggle.
-    pub fn bookmark_key_press(
+    pub fn bookmark_logical_b_press(
         &mut self,
         exact_ctrl_shift: bool,
         repeat: bool,
     ) -> BlockSearchBookmarkKeyRoute {
-        if self.bookmark_b_held {
-            return if self.bookmark_b_claimed {
+        if self.bookmark_logical_b_held {
+            return if self.bookmark_logical_b_claimed {
                 BlockSearchBookmarkKeyRoute::Suppress
             } else {
                 BlockSearchBookmarkKeyRoute::Propagate
@@ -339,8 +355,8 @@ impl BlockSearchState {
         if repeat {
             return BlockSearchBookmarkKeyRoute::Suppress;
         }
-        self.bookmark_b_held = true;
-        self.bookmark_b_claimed = exact_ctrl_shift;
+        self.bookmark_logical_b_held = true;
+        self.bookmark_logical_b_claimed = exact_ctrl_shift;
         if exact_ctrl_shift {
             BlockSearchBookmarkKeyRoute::Toggle
         } else {
@@ -353,8 +369,24 @@ impl BlockSearchState {
     }
 
     pub fn reset_bookmark_key_latch(&mut self) {
-        self.bookmark_b_held = false;
-        self.bookmark_b_claimed = false;
+        self.bookmark_logical_b_held = false;
+        self.bookmark_logical_b_claimed = false;
+    }
+
+    /// Preserve keyboard/AccessKit continuity after a star activation. If a
+    /// Bookmarked re-filter removed the final row, fall back to the query
+    /// editor instead of leaving focus on a virtual widget that no longer
+    /// exists.
+    pub fn restore_focus_after_bookmark_activation(&mut self) {
+        self.needs_bookmark_focus = !self.hits.is_empty();
+        self.needs_focus = self.hits.is_empty();
+        if !self.hits.is_empty() {
+            // An exact retained anchor deliberately preserves scroll during a
+            // normal refresh. Focus restoration is different: the stable star
+            // must be rendered by the virtual list before it can take focus,
+            // even when newly inserted hits pushed it outside the viewport.
+            self.scroll_to_selected = true;
+        }
     }
 
     /// Release every index/result allocation before a version rebuild starts.
@@ -904,29 +936,29 @@ mod tests {
     }
 
     #[test]
-    fn bookmark_key_latch_claims_until_physical_b_release() {
+    fn bookmark_key_latch_claims_until_logical_b_release() {
         let mut state = BlockSearchState::default();
         assert_eq!(
-            state.bookmark_key_press(true, false),
+            state.bookmark_logical_b_press(true, false),
             BlockSearchBookmarkKeyRoute::Toggle
         );
         assert_eq!(
-            state.bookmark_key_press(true, true),
+            state.bookmark_logical_b_press(true, true),
             BlockSearchBookmarkKeyRoute::Suppress
         );
         assert_eq!(
-            state.bookmark_key_press(false, true),
+            state.bookmark_logical_b_press(false, true),
             BlockSearchBookmarkKeyRoute::Suppress,
             "releasing modifiers before B must not leak a repeat into query text"
         );
         state.release_bookmark_key();
         assert_eq!(
-            state.bookmark_key_press(true, false),
+            state.bookmark_logical_b_press(true, false),
             BlockSearchBookmarkKeyRoute::Toggle
         );
         state.reset_bookmark_key_latch();
         assert_eq!(
-            state.bookmark_key_press(true, true),
+            state.bookmark_logical_b_press(true, true),
             BlockSearchBookmarkKeyRoute::Suppress,
             "a repeat received after focus loss is never a fresh toggle"
         );
@@ -936,17 +968,109 @@ mod tests {
     fn bookmark_key_latch_preserves_shift_b_text_repeats() {
         let mut state = BlockSearchState::default();
         assert_eq!(
-            state.bookmark_key_press(false, false),
+            state.bookmark_logical_b_press(false, false),
             BlockSearchBookmarkKeyRoute::Propagate
         );
         assert_eq!(
-            state.bookmark_key_press(false, true),
+            state.bookmark_logical_b_press(false, true),
             BlockSearchBookmarkKeyRoute::Propagate
         );
         assert_eq!(
-            state.bookmark_key_press(true, true),
+            state.bookmark_logical_b_press(true, true),
             BlockSearchBookmarkKeyRoute::Propagate,
-            "modifiers acquired midway through one physical B do not steal text input"
+            "modifiers acquired midway through one logical B do not steal text input"
+        );
+    }
+
+    #[test]
+    fn stale_shortcut_bookmark_focus_uses_nearest_live_star_or_query_fallback() {
+        let version = BlockSearchRecordVersion {
+            len: 3,
+            oldest_sequence: Some(1),
+            newest_sequence: Some(3),
+        };
+        let mut state = BlockSearchState {
+            is_open: true,
+            session_id: Some("pane".to_string()),
+            hits: vec![hit("a"), hit("removed"), hit("c")],
+            selected_index: 1,
+            needs_focus: true,
+            record_version: Some(version),
+            computed_query: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            state.bookmark_logical_b_press(true, false),
+            BlockSearchBookmarkKeyRoute::Toggle
+        );
+        let stale_target = state
+            .bookmark_target(state.selected_index)
+            .expect("shortcut captures the selected stable target");
+        state.release_bookmark_key();
+
+        // Model the shared action's anchor-preserving refresh after the
+        // shortcut target retires. The old target cannot be reused, while
+        // focus follows the nearest surviving stable row.
+        let removed_anchor = state.selected_hit_anchor().expect("focused star anchor");
+        state.record_version = None;
+        state.adopt_hits(
+            vec![hit("a"), hit("c")],
+            false,
+            "pane",
+            Some(&removed_anchor),
+        );
+        state.record_version = Some(BlockSearchRecordVersion {
+            len: 2,
+            oldest_sequence: Some(1),
+            newest_sequence: Some(3),
+        });
+        assert!(!state.contains_bookmark_target(&stale_target));
+        assert_eq!(state.selected_index, 1);
+        assert_eq!(state.selected_hit().unwrap().record_id, "c");
+        assert!(
+            state.scroll_to_selected,
+            "the nearest surviving star must be scrolled into the virtual viewport"
+        );
+        state.restore_focus_after_bookmark_activation();
+        assert!(state.needs_bookmark_focus);
+        assert!(!state.needs_focus);
+
+        state.hits.clear();
+        state.restore_focus_after_bookmark_activation();
+        assert!(!state.needs_bookmark_focus);
+        assert!(state.needs_focus);
+
+        state.close();
+        assert!(!state.needs_bookmark_focus);
+    }
+
+    #[test]
+    fn bookmark_focus_restoration_scrolls_a_retained_anchor_after_many_insertions() {
+        let mut state = BlockSearchState {
+            is_open: true,
+            session_id: Some("pane".to_string()),
+            hits: vec![hit("retained")],
+            ..Default::default()
+        };
+        let retained_anchor = state.selected_hit_anchor().expect("retained star anchor");
+        let mut refreshed_hits = (0..32)
+            .map(|index| hit(&format!("new-{index}")))
+            .collect::<Vec<_>>();
+        refreshed_hits.push(hit("retained"));
+        state.adopt_hits(refreshed_hits, false, "pane", Some(&retained_anchor));
+
+        assert_eq!(state.selected_index, 32);
+        assert_eq!(state.selected_hit().unwrap().record_id, "retained");
+        assert!(
+            !state.scroll_to_selected,
+            "an ordinary exact-anchor refresh preserves the inspected scroll position"
+        );
+
+        state.restore_focus_after_bookmark_activation();
+        assert!(state.needs_bookmark_focus);
+        assert!(
+            state.scroll_to_selected,
+            "focus restoration must render the selected virtual star before requesting focus"
         );
     }
 
@@ -1029,17 +1153,17 @@ mod tests {
     }
 
     #[test]
-    fn bookmarked_empty_state_distinguishes_truth_scope_and_query() {
+    fn bookmarked_empty_state_distinguishes_truth_and_indexed_scope_text() {
         assert_eq!(
-            bookmarked_empty_message(false, true),
+            bookmarked_empty_message(false, false, BlockSearchScope::All),
             "No bookmarked command blocks in retained history"
         );
         assert_eq!(
-            bookmarked_empty_message(true, true),
-            "No bookmarked blocks with retained text in this scope"
+            bookmarked_empty_message(true, false, BlockSearchScope::Output),
+            "Bookmarked blocks have no indexed output text"
         );
         assert_eq!(
-            bookmarked_empty_message(true, false),
+            bookmarked_empty_message(true, true, BlockSearchScope::Command),
             "No matches in bookmarked blocks"
         );
     }
