@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (single-interpretation native JSON boundaries)
+Updated: 2026-08-26 (Block Search 3.1)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,17 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.1 (2026-08-26)**: `All / Cmd / Out` surface scopes and a
+  `Ctrl+O` cycle now restrict matching before the result cap. The same scope
+  covers empty-query metadata browsing, and query/filter/index refresh safety
+  remains intact.
+
+- **Block Search 3.0 (2026-08-26)**: the bounded cache now combines `Aa`,
+  regex, and Unicode whole-word matching, exposed through both pointer controls
+  and `Ctrl+I` / `Ctrl+R` / `Ctrl+W`. Boundary filtering is allocation-free per
+  line, and case-insensitive whole-word literals use the linear regex engine so
+  a line full of rejected partial matches cannot cause quadratic remapping.
 
 - **Single-interpretation native JSON boundaries (2026-08-25)**: after their
   existing raw byte ceilings, the private `auth.json` reader and every Codex

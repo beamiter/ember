@@ -859,6 +859,38 @@ pub fn validated_block_search_query(query: &str) -> Result<&str, BlockSearchQuer
 pub struct BlockSearchOptions {
     pub case_sensitive: bool,
     pub regex: bool,
+    /// Require the complete match to be delimited by non-word characters or
+    /// a line edge. Word characters are Unicode alphanumeric scalars plus
+    /// underscore.
+    pub whole_word: bool,
+}
+
+/// Text surfaces included in one block-search pass. Scope is enforced before
+/// the hit cap so one surface cannot crowd the requested one out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockSearchScope {
+    #[default]
+    All,
+    Command,
+    Output,
+}
+
+impl BlockSearchScope {
+    pub fn includes_command(self) -> bool {
+        matches!(self, Self::All | Self::Command)
+    }
+
+    pub fn includes_output(self) -> bool {
+        matches!(self, Self::All | Self::Output)
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::All => Self::Command,
+            Self::Command => Self::Output,
+            Self::Output => Self::All,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1130,47 +1162,30 @@ pub fn single_line_clip(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn original_match_span(
-    text: &str,
-    lowercase: &str,
-    needle: &str,
-) -> Option<std::ops::Range<usize>> {
-    let lower_start = lowercase.find(needle)?;
-    let lower_end = lower_start.checked_add(needle.len())?;
-    let mut lower_cursor = 0usize;
-    let mut original_start = None;
-    let mut original_end = 0usize;
-    for (index, character) in text.chars().enumerate() {
-        let expanded_bytes: usize = character.to_lowercase().map(char::len_utf8).sum();
-        let next = lower_cursor.saturating_add(expanded_bytes);
-        if next > lower_start && lower_cursor < lower_end {
-            original_start.get_or_insert(index);
-            original_end = index + 1;
-        }
-        lower_cursor = next;
-        if lower_cursor >= lower_end && original_start.is_some() {
-            break;
-        }
-    }
-    original_start.map(|start| start..original_end)
-}
-
 fn byte_match_span(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
     let start = text[..range.start].chars().count();
     let end = start + text[range].chars().count();
     start..end
 }
 
-enum BlockSearchMatcher {
+enum BlockSearchEngine {
     LiteralSensitive(String),
     LiteralInsensitive(String),
     Regex(regex::Regex),
 }
 
+struct BlockSearchMatcher {
+    engine: BlockSearchEngine,
+    whole_word: bool,
+}
+
 impl BlockSearchMatcher {
     fn literal_insensitive(query: &str) -> Option<Self> {
         let query = query.trim();
-        (!query.is_empty()).then(|| Self::LiteralInsensitive(query.to_lowercase()))
+        (!query.is_empty()).then(|| Self {
+            engine: BlockSearchEngine::LiteralInsensitive(query.to_lowercase()),
+            whole_word: false,
+        })
     }
 
     fn compile(
@@ -1181,31 +1196,93 @@ impl BlockSearchMatcher {
         if query.is_empty() {
             return Ok(None);
         }
-        if options.regex {
-            let regex = regex::RegexBuilder::new(query)
+        if options.regex || (options.whole_word && !options.case_sensitive) {
+            let pattern = if options.regex {
+                query.to_string()
+            } else {
+                regex::escape(query)
+            };
+            let regex = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(!options.case_sensitive)
                 .size_limit(BLOCK_SEARCH_REGEX_SIZE_LIMIT)
                 .build()
                 .map_err(|error| BlockSearchQueryError::InvalidRegex(error.to_string()))?;
-            Ok(Some(Self::Regex(regex)))
+            Ok(Some(Self {
+                engine: BlockSearchEngine::Regex(regex),
+                whole_word: options.whole_word,
+            }))
         } else if options.case_sensitive {
-            Ok(Some(Self::LiteralSensitive(query.to_string())))
+            Ok(Some(Self {
+                engine: BlockSearchEngine::LiteralSensitive(query.to_string()),
+                whole_word: options.whole_word,
+            }))
         } else {
-            Ok(Some(Self::LiteralInsensitive(query.to_lowercase())))
+            Ok(Some(Self {
+                engine: BlockSearchEngine::LiteralInsensitive(query.to_lowercase()),
+                whole_word: options.whole_word,
+            }))
         }
     }
 
     fn find(&self, text: &str, lowercase: Option<&str>) -> Option<std::ops::Range<usize>> {
-        match self {
-            Self::LiteralSensitive(needle) => text
-                .find(needle)
-                .map(|start| byte_match_span(text, start..start + needle.len())),
-            Self::LiteralInsensitive(needle) => original_match_span(text, lowercase?, needle),
-            Self::Regex(regex) => regex
-                .find(text)
-                .map(|matched| byte_match_span(text, matched.range())),
+        match &self.engine {
+            BlockSearchEngine::LiteralSensitive(needle) => text
+                .match_indices(needle)
+                .map(|(start, matched)| start..start + matched.len())
+                .find(|range| !self.whole_word || is_whole_word_byte_match(text, range))
+                .map(|range| byte_match_span(text, range)),
+            BlockSearchEngine::LiteralInsensitive(needle) => {
+                let lowercase = lowercase?;
+                lowercase
+                    .match_indices(needle)
+                    .next()
+                    .and_then(|(start, matched)| {
+                        original_match_span_at(text, start..start.saturating_add(matched.len()))
+                    })
+            }
+            BlockSearchEngine::Regex(regex) => regex
+                .find_iter(text)
+                .map(|matched| matched.range())
+                .find(|range| !self.whole_word || is_whole_word_byte_match(text, range))
+                .map(|range| byte_match_span(text, range)),
         }
     }
+}
+
+/// Map a byte range in a precomputed lowercase string back to the original
+/// line. Unicode lowercasing can expand one scalar, so the range cannot be
+/// copied directly.
+fn original_match_span_at(
+    text: &str,
+    lowercase_range: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let mut lower_cursor = 0usize;
+    let mut original_start = None;
+    let mut original_end = 0usize;
+    for (index, character) in text.chars().enumerate() {
+        let expanded_bytes: usize = character.to_lowercase().map(char::len_utf8).sum();
+        let next = lower_cursor.saturating_add(expanded_bytes);
+        if next > lowercase_range.start && lower_cursor < lowercase_range.end {
+            original_start.get_or_insert(index);
+            original_end = index + 1;
+        }
+        lower_cursor = next;
+        if lower_cursor >= lowercase_range.end && original_start.is_some() {
+            break;
+        }
+    }
+    original_start.map(|start| start..original_end)
+}
+
+fn is_word_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn is_whole_word_byte_match(text: &str, range: &std::ops::Range<usize>) -> bool {
+    let before = text[..range.start].chars().next_back();
+    let after = text[range.end..].chars().next();
+    before.is_none_or(|character| !is_word_character(character))
+        && after.is_none_or(|character| !is_word_character(character))
 }
 
 fn clipped_around_match(
@@ -1266,6 +1343,7 @@ where
     search_blocks_with_matcher(
         records,
         BlockSearchMatcher::literal_insensitive(query),
+        BlockSearchScope::All,
         |_| true,
     )
 }
@@ -1279,6 +1357,7 @@ pub fn search_blocks_filtered(
     search_blocks_with_matcher(
         records.iter().rev(),
         BlockSearchMatcher::literal_insensitive(query),
+        BlockSearchScope::All,
         include_record,
     )
 }
@@ -1293,20 +1372,40 @@ pub fn search_blocks_with_options(
     Ok(search_blocks_with_matcher(
         records.iter().rev(),
         matcher,
+        BlockSearchScope::All,
         |_| true,
     ))
 }
 
+#[allow(dead_code)] // Compatibility/default scope; the app uses the scope-aware counterpart.
 pub fn search_blocks_with_options_filtered(
     records: &[CachedBlockSearchRecord],
     query: &str,
     options: BlockSearchOptions,
     include_record: impl FnMut(&str) -> bool,
 ) -> Result<BlockSearchResults, BlockSearchQueryError> {
+    search_blocks_with_options_filtered_in_scope(
+        records,
+        query,
+        options,
+        BlockSearchScope::All,
+        include_record,
+    )
+}
+
+/// Option-aware search whose surface scope is enforced before the result cap.
+pub fn search_blocks_with_options_filtered_in_scope(
+    records: &[CachedBlockSearchRecord],
+    query: &str,
+    options: BlockSearchOptions,
+    scope: BlockSearchScope,
+    include_record: impl FnMut(&str) -> bool,
+) -> Result<BlockSearchResults, BlockSearchQueryError> {
     let matcher = BlockSearchMatcher::compile(query, options)?;
     Ok(search_blocks_with_matcher(
         records.iter().rev(),
         matcher,
+        scope,
         include_record,
     ))
 }
@@ -1314,6 +1413,7 @@ pub fn search_blocks_with_options_filtered(
 fn search_blocks_with_matcher<'a, I>(
     records: I,
     matcher: Option<BlockSearchMatcher>,
+    scope: BlockSearchScope,
     mut include_record: impl FnMut(&str) -> bool,
 ) -> BlockSearchResults
 where
@@ -1344,29 +1444,33 @@ where
                 })
                 .clone()
         };
-        if let (Some(command), Some(lowercase)) = (
-            record.command.as_deref(),
-            record.command_lowercase.as_deref(),
-        ) {
-            if let Some(match_span) = matcher.find(command, Some(lowercase)) {
-                let command_preview = preview(Some(command));
-                results.hits.push(BlockSearchHit {
-                    record_id: record.record_id.clone(),
-                    is_output_line: false,
-                    line_no: None,
-                    match_span: Some(match_span.clone()),
-                    line_text: clipped_around_match(
-                        command,
-                        &match_span,
-                        BLOCK_SEARCH_LINE_TEXT_CHARS,
-                    ),
-                    command_preview,
-                });
+        if scope.includes_command() {
+            if let (Some(command), Some(lowercase)) = (
+                record.command.as_deref(),
+                record.command_lowercase.as_deref(),
+            ) {
+                if let Some(match_span) = matcher.find(command, Some(lowercase)) {
+                    let command_preview = preview(Some(command));
+                    results.hits.push(BlockSearchHit {
+                        record_id: record.record_id.clone(),
+                        is_output_line: false,
+                        line_no: None,
+                        match_span: Some(match_span.clone()),
+                        line_text: clipped_around_match(
+                            command,
+                            &match_span,
+                            BLOCK_SEARCH_LINE_TEXT_CHARS,
+                        ),
+                        command_preview,
+                    });
+                }
             }
         }
-        let (Some(output), Some(output_lowercase)) =
-            (record.output.as_deref(), record.output_lowercase.as_deref())
-        else {
+        let (true, Some(output), Some(output_lowercase)) = (
+            scope.includes_output(),
+            record.output.as_deref(),
+            record.output_lowercase.as_deref(),
+        ) else {
             continue;
         };
         for (line_index, (line, line_lowercase)) in
@@ -2622,6 +2726,7 @@ mod tests {
             BlockSearchOptions {
                 case_sensitive: true,
                 regex: false,
+                whole_word: false,
             },
         )
         .unwrap();
@@ -2632,6 +2737,7 @@ mod tests {
             BlockSearchOptions {
                 case_sensitive: true,
                 regex: false,
+                whole_word: false,
             },
         )
         .unwrap()
@@ -2644,11 +2750,43 @@ mod tests {
             BlockSearchOptions {
                 case_sensitive: false,
                 regex: true,
+                whole_word: false,
             },
         )
         .unwrap();
         assert_eq!(regex.hits.len(), 2);
         assert_eq!(regex.hits[0].match_span, Some(0..9));
+
+        let whole_word_records = vec![search_record(
+            "whole",
+            Some("contest test_testing (test)"),
+            Some("测试\n测试版\n(测试)\nİx i"),
+        )];
+        let whole = BlockSearchOptions {
+            whole_word: true,
+            ..BlockSearchOptions::default()
+        };
+        let latin = search_blocks_with_options(&whole_word_records, "test", whole).unwrap();
+        assert_eq!(latin.hits[0].match_span, Some(22..26));
+        let unicode = search_blocks_with_options(&whole_word_records, "测试", whole).unwrap();
+        assert_eq!(unicode.hits.len(), 2);
+        assert_eq!(unicode.hits[0].line_no, Some(1));
+        assert_eq!(unicode.hits[1].line_no, Some(3));
+        let folded = search_blocks_with_options(&whole_word_records, "i", whole).unwrap();
+        assert_eq!(folded.hits.len(), 1);
+        assert_eq!(folded.hits[0].line_no, Some(4));
+        assert_eq!(folded.hits[0].match_span, Some(3..4));
+        let regex_whole = search_blocks_with_options(
+            &whole_word_records,
+            "t.st",
+            BlockSearchOptions {
+                regex: true,
+                whole_word: true,
+                ..BlockSearchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(regex_whole.hits[0].match_span, Some(22..26));
 
         let unicode = search_blocks_with_options(
             &records,
@@ -2656,6 +2794,7 @@ mod tests {
             BlockSearchOptions {
                 case_sensitive: true,
                 regex: true,
+                whole_word: false,
             },
         )
         .unwrap();
@@ -2679,6 +2818,7 @@ mod tests {
                 BlockSearchOptions {
                     case_sensitive: false,
                     regex: true,
+                    whole_word: false,
                 },
             ),
             Err(BlockSearchQueryError::InvalidRegex(_))
@@ -2691,6 +2831,7 @@ mod tests {
                 BlockSearchOptions {
                     case_sensitive: false,
                     regex: true,
+                    whole_word: false,
                 },
             ),
             Err(BlockSearchQueryError::TooLong)
@@ -2723,6 +2864,42 @@ mod tests {
         assert!(compact.len() > BLOCK_SEARCH_QUERY_MAX_BYTES);
         assert_eq!(compact.capacity(), compact.len());
         assert!(validated_block_search_query(&compact).is_err());
+    }
+
+    #[test]
+    fn block_search_scope_filters_surfaces_before_hits_are_collected() {
+        let records = vec![search_record(
+            "scope",
+            Some("needle command"),
+            Some("needle output\nsecond needle"),
+        )];
+        let options = BlockSearchOptions::default();
+
+        let command = search_blocks_with_options_filtered_in_scope(
+            &records,
+            "needle",
+            options,
+            BlockSearchScope::Command,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(command.hits.len(), 1);
+        assert!(!command.hits[0].is_output_line);
+
+        let output = search_blocks_with_options_filtered_in_scope(
+            &records,
+            "needle",
+            options,
+            BlockSearchScope::Output,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(output.hits.len(), 2);
+        assert!(output.hits.iter().all(|hit| hit.is_output_line));
+
+        assert_eq!(BlockSearchScope::All.cycled(), BlockSearchScope::Command);
+        assert_eq!(BlockSearchScope::Command.cycled(), BlockSearchScope::Output);
+        assert_eq!(BlockSearchScope::Output.cycled(), BlockSearchScope::All);
     }
 
     #[test]

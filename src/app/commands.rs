@@ -2869,6 +2869,7 @@ impl TerminalApp {
         }
 
         let filter = self.block_search.filter;
+        let scope = self.block_search.scope;
         let eligible: std::collections::HashSet<String> = {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
@@ -2932,18 +2933,33 @@ impl TerminalApp {
                         capped = true;
                         break;
                     }
-                    let (line_text, is_output_line, line_no) =
-                        if let Some(command) = &record.command {
-                            (command.as_str(), false, None)
-                        } else if let Some(line) = record
+                    let display = match scope {
+                        crate::block_mode::BlockSearchScope::All => {
+                            if let Some(command) = &record.command {
+                                Some((command.as_str(), false, None))
+                            } else if let Some(line) = record
+                                .output
+                                .as_deref()
+                                .and_then(|text| text.lines().next())
+                            {
+                                Some((line, true, Some(1)))
+                            } else {
+                                Some(("Background output", false, None))
+                            }
+                        }
+                        crate::block_mode::BlockSearchScope::Command => record
+                            .command
+                            .as_deref()
+                            .map(|command| (command, false, None)),
+                        crate::block_mode::BlockSearchScope::Output => record
                             .output
                             .as_deref()
                             .and_then(|text| text.lines().next())
-                        {
-                            (line, true, Some(1))
-                        } else {
-                            ("Background output", false, None)
-                        };
+                            .map(|line| (line, true, Some(1))),
+                    };
+                    let Some((line_text, is_output_line, line_no)) = display else {
+                        continue;
+                    };
                     hits.push(crate::block_mode::BlockSearchHit {
                         record_id: record.record_id.clone(),
                         is_output_line,
@@ -2961,13 +2977,15 @@ impl TerminalApp {
                 }
                 Ok(crate::block_mode::BlockSearchResults { hits, capped })
             }
-            Ok(_) => crate::block_mode::search_blocks_with_options_filtered(
+            Ok(_) => crate::block_mode::search_blocks_with_options_filtered_in_scope(
                 &self.block_search.cache,
                 &query,
                 crate::block_mode::BlockSearchOptions {
                     case_sensitive: self.block_search.case_sensitive,
                     regex: self.block_search.regex,
+                    whole_word: self.block_search.whole_word,
                 },
+                scope,
                 |record_id| eligible.contains(record_id),
             ),
         };

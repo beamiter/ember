@@ -10,7 +10,7 @@
 //! it. Stable session + record versions prevent old hits from jumping into a
 //! replacement pane.
 
-use crate::block_mode::{BlockSearchHit, CachedBlockSearchRecord};
+use crate::block_mode::{BlockSearchHit, BlockSearchScope, CachedBlockSearchRecord};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockSearchFilter {
@@ -68,6 +68,9 @@ pub struct BlockSearchState {
     pub older_not_indexed: bool,
     pub case_sensitive: bool,
     pub regex: bool,
+    pub whole_word: bool,
+    /// Command/output surface restriction, applied before the hit cap.
+    pub scope: BlockSearchScope,
     pub filter: BlockSearchFilter,
     /// Invalid/oversized expressions preserve the last valid hits and index,
     /// but activation is gated until the query compiles again.
@@ -98,6 +101,8 @@ impl BlockSearchState {
         self.older_not_indexed = false;
         self.case_sensitive = false;
         self.regex = false;
+        self.whole_word = false;
+        self.scope = BlockSearchScope::All;
         self.filter = BlockSearchFilter::All;
         self.query_error = None;
         self.session_id = None;
@@ -276,6 +281,8 @@ mod tests {
         state.open();
         assert!(state.is_open && state.needs_focus);
         assert!(state.query.is_empty() && state.hits.is_empty() && !state.capped);
+        assert!(!state.case_sensitive && !state.regex && !state.whole_word);
+        assert_eq!(state.scope, BlockSearchScope::All);
         assert_eq!(state.selected_index, 0);
         // session_id is cleared, which is also the cache-rebuild trigger.
         assert_eq!(state.session_id, None);
@@ -457,6 +464,8 @@ mod tests {
             query: "needle".to_string(),
             case_sensitive: true,
             regex: true,
+            whole_word: true,
+            scope: BlockSearchScope::Output,
             filter: BlockSearchFilter::Failed,
             query_error: Some("old".to_string()),
             ..Default::default()
@@ -470,7 +479,8 @@ mod tests {
         assert_eq!(state.cache.capacity(), 0);
         assert_eq!(state.hits.capacity(), 0);
         assert_eq!(state.query, "needle");
-        assert!(state.case_sensitive && state.regex);
+        assert!(state.case_sensitive && state.regex && state.whole_word);
+        assert_eq!(state.scope, BlockSearchScope::Output);
         assert_eq!(state.filter, BlockSearchFilter::Failed);
         assert!(state.query_error.is_none());
     }

@@ -1618,6 +1618,26 @@ impl TerminalApp {
                 egui::Key::Escape => self.block_search.close(),
                 egui::Key::ArrowUp => self.block_search.select_prev(),
                 egui::Key::ArrowDown => self.block_search.select_next(),
+                egui::Key::I if modifiers.ctrl => {
+                    self.block_search.case_sensitive = !self.block_search.case_sensitive;
+                    self.block_search.computed_query = None;
+                    self.refresh_block_search_hits();
+                }
+                egui::Key::R if modifiers.ctrl => {
+                    self.block_search.regex = !self.block_search.regex;
+                    self.block_search.computed_query = None;
+                    self.refresh_block_search_hits();
+                }
+                egui::Key::W if modifiers.ctrl => {
+                    self.block_search.whole_word = !self.block_search.whole_word;
+                    self.block_search.computed_query = None;
+                    self.refresh_block_search_hits();
+                }
+                egui::Key::O if modifiers.ctrl => {
+                    self.block_search.scope = self.block_search.scope.cycled();
+                    self.block_search.computed_query = None;
+                    self.refresh_block_search_hits();
+                }
                 egui::Key::Enter => {
                     // Plain Enter keeps the accept-and-close contract.
                     // Shift+Enter reveals this hit, advances to the next one,

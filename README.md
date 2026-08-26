@@ -336,8 +336,11 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
-`Ctrl+Shift+G` opens Block Search 2.0. `Aa` selects case-sensitive matching and
-`.*` selects Rust-regex matching; invalid expressions stay visible as query
+`Ctrl+Shift+G` opens Block Search 3.1. `Aa` selects case-sensitive matching,
+`.*` selects Rust-regex matching, and `W` requires Unicode whole-word matches;
+`Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle the same controls without leaving the
+query. `All / Cmd / Out` restricts matching to all text, commands, or output;
+`Ctrl+O` cycles the scope, which is applied before the 500-hit cap. Invalid expressions stay visible as query
 errors and cannot activate an older result. `All / Failed / Slow / Bookmarked /
 Background` chips also browse their category with an empty query. Source
 extraction is newest-first with an 8 MiB retained ceiling; the finished

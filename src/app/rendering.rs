@@ -1443,6 +1443,9 @@ impl TerminalApp {
                         let regex_button = ui
                             .selectable_label(self.block_search.regex, ".*")
                             .on_hover_text("Regular expression");
+                        let whole_word_button = ui
+                            .selectable_label(self.block_search.whole_word, "W")
+                            .on_hover_text("Match whole words");
                         if case_button.clicked() {
                             self.block_search.case_sensitive = !self.block_search.case_sensitive;
                             self.block_search.computed_query = None;
@@ -1452,6 +1455,29 @@ impl TerminalApp {
                             self.block_search.regex = !self.block_search.regex;
                             self.block_search.computed_query = None;
                             self.refresh_block_search_hits();
+                        }
+                        if whole_word_button.clicked() {
+                            self.block_search.whole_word = !self.block_search.whole_word;
+                            self.block_search.computed_query = None;
+                            self.refresh_block_search_hits();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Scope").small());
+                        for (label, scope) in [
+                            ("All", crate::block_mode::BlockSearchScope::All),
+                            ("Cmd", crate::block_mode::BlockSearchScope::Command),
+                            ("Out", crate::block_mode::BlockSearchScope::Output),
+                        ] {
+                            if ui
+                                .selectable_label(self.block_search.scope == scope, label)
+                                .clicked()
+                            {
+                                self.block_search.scope = scope;
+                                self.block_search.computed_query = None;
+                                self.refresh_block_search_hits();
+                            }
                         }
                     });
 
