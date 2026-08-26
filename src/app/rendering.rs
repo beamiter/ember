@@ -1449,16 +1449,23 @@ impl TerminalApp {
                         if case_button.clicked() {
                             self.block_search.case_sensitive = !self.block_search.case_sensitive;
                             self.block_search.computed_query = None;
+                            self.block_search.needs_focus = true;
                             self.refresh_block_search_hits();
                         }
                         if regex_button.clicked() {
                             self.block_search.regex = !self.block_search.regex;
                             self.block_search.computed_query = None;
+                            self.block_search.needs_focus = true;
                             self.refresh_block_search_hits();
                         }
                         if whole_word_button.clicked() {
                             self.block_search.whole_word = !self.block_search.whole_word;
                             self.block_search.computed_query = None;
+                            self.block_search.needs_focus = true;
+                            self.refresh_block_search_hits();
+                        }
+                        if ui.button("Reset").on_hover_text("Reset search intent").clicked() {
+                            self.block_search.reset_intent();
                             self.refresh_block_search_hits();
                         }
                     });
@@ -1476,6 +1483,7 @@ impl TerminalApp {
                             {
                                 self.block_search.scope = scope;
                                 self.block_search.computed_query = None;
+                                self.block_search.needs_focus = true;
                                 self.refresh_block_search_hits();
                             }
                         }
@@ -1501,6 +1509,7 @@ impl TerminalApp {
                             {
                                 self.block_search.filter = filter;
                                 self.block_search.computed_query = None;
+                                self.block_search.needs_focus = true;
                                 self.refresh_block_search_hits();
                             }
                         }
@@ -1688,7 +1697,7 @@ impl TerminalApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(
-                                "↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Esc Close",
+                                "↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close",
                             )
                                 .size(10.0)
                                 .color(ui.visuals().weak_text_color()),

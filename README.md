@@ -336,7 +336,7 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
-`Ctrl+Shift+G` opens Block Search 3.2. `Aa` selects case-sensitive matching,
+`Ctrl+Shift+G` opens Block Search 3.5. `Aa` selects case-sensitive matching,
 `.*` selects Rust-regex matching, and `W` requires Unicode whole-word matches;
 `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle the same controls without leaving the
 query. `All / Cmd / Out` restricts matching to all text, commands, or output;
@@ -351,8 +351,10 @@ revalidated. An evicted result stays open, refreshes, and reports the stale
 target instead of silently stepping.
 Reopening restores the last valid query, matching controls, scope, and
 metadata filter for this process only; it is never written to config or a
-session snapshot. `Ctrl+U` clears the query, and invalid text above 4 KiB is
-not remembered. Source
+session snapshot. `Ctrl+U` clears only the query; **Reset** or `Ctrl+Shift+U`
+restores every intent control to defaults. Invalid text above 4 KiB is not
+remembered, and pointer activation of a control returns focus to the query.
+Source
 extraction is newest-first with an 8 MiB retained ceiling; the finished
 original/lowercase index has a 16 MiB retained ceiling, counting its Vec
 allocation, record ids, and every String capacity. Omitted history is reported

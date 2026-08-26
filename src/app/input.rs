@@ -1643,10 +1643,14 @@ impl TerminalApp {
                     self.refresh_block_search_hits();
                 }
                 egui::Key::U if modifiers.ctrl => {
-                    self.block_search.query.clear();
-                    self.block_search.computed_query = None;
+                    if modifiers.shift {
+                        self.block_search.reset_intent();
+                    } else {
+                        self.block_search.query.clear();
+                        self.block_search.computed_query = None;
+                        self.block_search.needs_focus = true;
+                    }
                     self.refresh_block_search_hits();
-                    self.block_search.needs_focus = true;
                 }
                 egui::Key::Enter => {
                     // Plain Enter keeps the accept-and-close contract.

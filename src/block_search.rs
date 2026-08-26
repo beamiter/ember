@@ -89,6 +89,19 @@ pub struct BlockSearchState {
 }
 
 impl BlockSearchState {
+    pub fn reset_intent(&mut self) {
+        self.query.clear();
+        self.case_sensitive = false;
+        self.regex = false;
+        self.whole_word = false;
+        self.scope = BlockSearchScope::default();
+        self.filter = BlockSearchFilter::default();
+        self.query_error = None;
+        self.computed_query = None;
+        self.selected_index = 0;
+        self.needs_focus = true;
+    }
+
     /// Open with the last process-lifetime matching intent. Hits, cache,
     /// selection and pane identity are always rebuilt fresh; query/options,
     /// scope and metadata filter are intentionally not serialized anywhere.
@@ -356,6 +369,32 @@ mod tests {
         state.close();
         assert!(state.query.is_empty());
         assert!(state.case_sensitive, "only invalid query text is discarded");
+    }
+
+    #[test]
+    fn reset_returns_every_intent_control_to_default() {
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: BlockSearchScope::Output,
+            filter: BlockSearchFilter::Bookmarked,
+            query_error: Some("old".to_string()),
+            computed_query: Some("needle".to_string()),
+            selected_index: 4,
+            hits: vec![hit("a")],
+            ..Default::default()
+        };
+        state.reset_intent();
+        assert!(state.query.is_empty());
+        assert!(!state.case_sensitive && !state.regex && !state.whole_word);
+        assert_eq!(state.scope, BlockSearchScope::All);
+        assert_eq!(state.filter, BlockSearchFilter::All);
+        assert!(state.query_error.is_none() && state.computed_query.is_none());
+        assert_eq!(state.selected_index, 0);
+        assert!(state.needs_focus);
+        assert_eq!(state.hits.len(), 1, "refresh owns result replacement");
     }
 
     #[test]
