@@ -348,7 +348,11 @@ wrapping `↑/↓`, `Home/End`, and ten-row `PageUp/PageDown` navigation while
 keeping the virtual list aligned. `Enter` reveals and closes; `Shift+Enter`
 reveals, keeps the picker focused, and advances only after the record is
 revalidated. An evicted result stays open, refreshes, and reports the stale
-target instead of silently stepping. Source
+target instead of silently stepping.
+Reopening restores the last valid query, matching controls, scope, and
+metadata filter for this process only; it is never written to config or a
+session snapshot. `Ctrl+U` clears the query, and invalid text above 4 KiB is
+not remembered. Source
 extraction is newest-first with an 8 MiB retained ceiling; the finished
 original/lowercase index has a 16 MiB retained ceiling, counting its Vec
 allocation, record ids, and every String capacity. Omitted history is reported

@@ -1642,6 +1642,12 @@ impl TerminalApp {
                     self.block_search.computed_query = None;
                     self.refresh_block_search_hits();
                 }
+                egui::Key::U if modifiers.ctrl => {
+                    self.block_search.query.clear();
+                    self.block_search.computed_query = None;
+                    self.refresh_block_search_hits();
+                    self.block_search.needs_focus = true;
+                }
                 egui::Key::Enter => {
                     // Plain Enter keeps the accept-and-close contract.
                     // Shift+Enter reveals this hit, advances to the next one,

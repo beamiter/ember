@@ -89,24 +89,19 @@ pub struct BlockSearchState {
 }
 
 impl BlockSearchState {
-    /// Open with a fresh query (palette precedent). Hits are recomputed by
-    /// the renderer on the next frame; clearing `session_id` also forces a
-    /// fresh extraction cache for that recompute.
+    /// Open with the last process-lifetime matching intent. Hits, cache,
+    /// selection and pane identity are always rebuilt fresh; query/options,
+    /// scope and metadata filter are intentionally not serialized anywhere.
     pub fn open(&mut self) {
         self.is_open = true;
         self.needs_focus = true;
         self.scroll_to_selected = true;
-        self.query.clear();
         self.selected_index = 0;
         self.hits.clear();
         self.capped = false;
         self.older_not_indexed = false;
-        self.case_sensitive = false;
-        self.regex = false;
-        self.whole_word = false;
-        self.scope = BlockSearchScope::All;
-        self.filter = BlockSearchFilter::All;
         self.query_error = None;
+        self.cache = Vec::new();
         self.session_id = None;
         self.record_version = None;
         self.computed_query = None;
@@ -114,9 +109,21 @@ impl BlockSearchState {
 
     pub fn close(&mut self) {
         self.is_open = false;
-        // The cache can hold a large slice of scrollback; release it while
-        // the picker is closed (reopening rebuilds it anyway).
+        if self.query.len() > crate::block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES {
+            // Do not reopen directly into the one-scalar TooLong sentinel.
+            self.query.clear();
+        }
+        // Retain only matching intent while closed. Results/cache can hold a
+        // large slice of scrollback and pane identities are stale on reopen.
         self.cache = Vec::new();
+        self.hits = Vec::new();
+        self.capped = false;
+        self.older_not_indexed = false;
+        self.query_error = None;
+        self.selected_index = 0;
+        self.session_id = None;
+        self.record_version = None;
+        self.computed_query = None;
     }
 
     /// Release every index/result allocation before a version rebuild starts.
@@ -307,9 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn open_resets_query_selection_and_stale_results() {
+    fn open_restores_matching_intent_but_resets_stale_results() {
         let mut state = BlockSearchState {
             query: "old".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: BlockSearchScope::Output,
+            filter: BlockSearchFilter::Bookmarked,
             selected_index: 3,
             hits: vec![hit("a")],
             capped: true,
@@ -325,16 +337,25 @@ mod tests {
         };
         state.open();
         assert!(state.is_open && state.needs_focus);
-        assert!(state.query.is_empty() && state.hits.is_empty() && !state.capped);
-        assert!(!state.case_sensitive && !state.regex && !state.whole_word);
-        assert_eq!(state.scope, BlockSearchScope::All);
+        assert_eq!(state.query, "old");
+        assert!(state.hits.is_empty() && !state.capped);
+        assert!(state.case_sensitive && state.regex && state.whole_word);
+        assert_eq!(state.scope, BlockSearchScope::Output);
+        assert_eq!(state.filter, BlockSearchFilter::Bookmarked);
         assert_eq!(state.selected_index, 0);
         // session_id is cleared, which is also the cache-rebuild trigger.
         assert_eq!(state.session_id, None);
         assert!(state.needs_refresh("s", BlockSearchRecordVersion::default()));
         // Closing releases the (potentially large) extraction cache.
         state.close();
-        assert!(!state.is_open && state.cache.is_empty());
+        assert!(!state.is_open && state.cache.is_empty() && state.hits.is_empty());
+        assert_eq!(state.session_id, None);
+
+        state.query = "x".repeat(crate::block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
+        state.case_sensitive = true;
+        state.close();
+        assert!(state.query.is_empty());
+        assert!(state.case_sensitive, "only invalid query text is discarded");
     }
 
     #[test]
