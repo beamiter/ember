@@ -552,6 +552,9 @@ mod tests {
         assert!(state.needs_refresh(
             "s1",
             BlockSearchRecordVersion {
+                // Same-length retention rotation must invalidate even when a
+                // count-only probe would claim nothing changed.
+                oldest_sequence: Some(2),
                 newest_sequence: Some(2),
                 ..version
             }

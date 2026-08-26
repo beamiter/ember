@@ -336,7 +336,7 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
-`Ctrl+Shift+G` opens Block Search 3.5. `Aa` selects case-sensitive matching,
+`Ctrl+Shift+G` opens Block Search 3.6. `Aa` selects case-sensitive matching,
 `.*` selects Rust-regex matching, and `W` requires Unicode whole-word matches;
 `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle the same controls without leaving the
 query. `All / Cmd / Out` restricts matching to all text, commands, or output;
@@ -381,7 +381,9 @@ retains reveal-and-close behavior. The result list uses fixed-height virtual
 rows: only the visible rows are materialized while keyboard, wheel and scrollbar
 navigation retain the full result extent. Keyboard navigation cannot be stolen
 by a stationary hover, and a background record refresh that preserves the exact
-highlight also preserves the pointer user's current scroll position.
+highlight also preserves the pointer user's current scroll position. Block
+Search 3.6 explicitly treats same-length oldest/newest record rotation as a
+version change, so count-stable retention can never leave stale results active.
 An empty pane distinguishes “no completed blocks yet” from a shell that has
 never reported OSC 133 and points the latter to the jsh installer.
 
