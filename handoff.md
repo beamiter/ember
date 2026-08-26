@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.2)
+Updated: 2026-08-26 (Block Search 3.3)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,11 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.3 (2026-08-26)**: continuous review now advances only
+  after the selected completed record is revalidated and revealed. Plain Enter
+  likewise closes only after success; a concurrently evicted target leaves the
+  picker open, reports the stale record, and forces a fresh hit computation.
 
 - **Block Search 3.2 (2026-08-26)**: the virtual result list now supports
   Home/End and bounded ten-row PageUp/PageDown moves in addition to wrapping

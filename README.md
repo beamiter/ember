@@ -345,7 +345,10 @@ expressions stay visible as query errors and cannot activate an older result.
 `All / Failed / Slow / Bookmarked / Background` chips also browse their
 category with an empty query. Results report the current position and support
 wrapping `↑/↓`, `Home/End`, and ten-row `PageUp/PageDown` navigation while
-keeping the virtual list aligned. Source
+keeping the virtual list aligned. `Enter` reveals and closes; `Shift+Enter`
+reveals, keeps the picker focused, and advances only after the record is
+revalidated. An evicted result stays open, refreshes, and reports the stale
+target instead of silently stepping. Source
 extraction is newest-first with an 8 MiB retained ceiling; the finished
 original/lowercase index has a 16 MiB retained ceiling, counting its Vec
 allocation, record ids, and every String capacity. Omitted history is reported

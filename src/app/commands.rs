@@ -66,6 +66,26 @@ pub struct CommandTarget {
     pub execution_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchActivation {
+    RejectStale,
+    Close,
+    Advance,
+}
+
+fn block_search_activation(
+    target_is_available: bool,
+    continuous_review: bool,
+) -> BlockSearchActivation {
+    if !target_is_available {
+        BlockSearchActivation::RejectStale
+    } else if continuous_review {
+        BlockSearchActivation::Advance
+    } else {
+        BlockSearchActivation::Close
+    }
+}
+
 /// Retire the terminal and sidebar views of one logical block selection.
 /// Taking the fields separately lets input routing call this while it holds a
 /// disjoint mutable borrow of the active session.
@@ -2732,10 +2752,10 @@ impl TerminalApp {
     /// Select `target` and reveal it: set `block_selection`, highlight the
     /// Commands-sidebar row, and scroll to the block (the same jump path as
     /// `block:jump_first_failed`).
-    fn apply_block_selection(&mut self, target: CommandTarget) {
+    fn apply_block_selection(&mut self, target: CommandTarget) -> bool {
         if !self.config.block_mode {
             self.clear_block_selection();
-            return;
+            return false;
         }
         let completed = self
             .target_session_index(&target)
@@ -2749,7 +2769,7 @@ impl TerminalApp {
             });
         if !completed {
             self.set_status("Command block is no longer available");
-            return;
+            return false;
         }
         self.block_selection = Some(crate::block_mode::BlockSelection::single(
             target.session_id.clone(),
@@ -2757,6 +2777,7 @@ impl TerminalApp {
         ));
         self.sync_block_selection_to_sidebar(&target);
         self.reveal_sidebar_command(&target, BlockReveal::IfOffscreen);
+        true
     }
 
     /// Highlight the newly selected block's row in the Commands sidebar.
@@ -3092,10 +3113,16 @@ impl TerminalApp {
         else {
             return;
         };
-        if !keep_open {
-            self.block_search.close();
+        let activation =
+            block_search_activation(self.apply_block_selection(target.clone()), keep_open);
+        if activation == BlockSearchActivation::RejectStale {
+            // `apply_block_selection` already reported the stale target. Keep
+            // the picker and selection in place; never advance from a result
+            // that was not actually revealed.
+            self.block_search.computed_query = None;
+            self.refresh_block_search_hits();
+            return;
         }
-        self.apply_block_selection(target.clone());
         if let Some(line_no) = hit.line_no {
             if let Some(index) = self.session_manager.index_of(&target.session_id) {
                 if let Some(session) = self.session_manager.sessions_mut().get_mut(index) {
@@ -3157,9 +3184,15 @@ impl TerminalApp {
                 }
             }
         }
-        if keep_open && self.block_search.is_open {
-            self.block_search.select_next();
-            self.block_search.needs_focus = true;
+        match activation {
+            BlockSearchActivation::RejectStale => unreachable!(),
+            BlockSearchActivation::Close => self.block_search.close(),
+            BlockSearchActivation::Advance => {
+                if self.block_search.is_open {
+                    self.block_search.select_next();
+                    self.block_search.needs_focus = true;
+                }
+            }
         }
     }
 
@@ -5053,5 +5086,25 @@ mod tests {
         assert!(missing.starts_with("No command block to copy:"));
         assert!(missing.contains("not reporting commands"));
         assert!(missing.contains("Install or update jsh"));
+    }
+
+    #[test]
+    fn block_search_continuous_review_advances_only_after_a_live_reveal() {
+        assert_eq!(
+            block_search_activation(true, false),
+            BlockSearchActivation::Close
+        );
+        assert_eq!(
+            block_search_activation(true, true),
+            BlockSearchActivation::Advance
+        );
+        assert_eq!(
+            block_search_activation(false, false),
+            BlockSearchActivation::RejectStale
+        );
+        assert_eq!(
+            block_search_activation(false, true),
+            BlockSearchActivation::RejectStale
+        );
     }
 }
