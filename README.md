@@ -336,7 +336,7 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
-`Ctrl+Shift+G` opens Block Search 3.8. `Aa` selects case-sensitive matching,
+`Ctrl+Shift+G` opens Block Search 3.9. `Aa` selects case-sensitive matching,
 `.*` selects Rust-regex matching, and `W` requires Unicode whole-word matches;
 `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle the same controls without leaving the
 query. `All / Cmd / Out` restricts matching to all text, commands, or output;
@@ -382,13 +382,29 @@ rows: only the visible rows are materialized while keyboard, wheel and scrollbar
 navigation retain the full result extent. Keyboard navigation cannot be stolen
 by a stationary hover, and a background record refresh that preserves the exact
 highlight also preserves the pointer user's current scroll position. Block
-Search 3.8 explicitly treats same-length oldest/newest record rotation as a
+Search 3.9 explicitly treats same-length oldest/newest record rotation as a
 version change, so count-stable retention can never leave stale results active.
 If retention removes the highlighted hit, the nearest surviving old rank is
 selected instead of jumping to the first row; a changed query or filter still
-starts from the top as a new intent. `F5` invalidates only the current cache
-version and rebuilds immediately while retaining query and selection identity;
-an invalid expression keeps its last valid results instead of forcing a rebuild.
+starts from the top as a new intent. The visible **Refresh** button and a plain,
+non-repeated `F5` share one immediate rebuild path while retaining query and
+selection identity; the currently configured `block:search` binding takes
+priority if it is remapped onto F5, while other modified F5 chords are not
+reinterpreted as refresh. An invalid expression keeps its last valid results
+instead of forcing a rebuild.
+If a completed record arrives while that expression is invalid, the same-pane
+version rebuild is deferred until the intent becomes valid; switching panes
+still releases the old pane's cache and result identities immediately.
+Matching and refresh controls use their own compact row, leaving the query
+editable at the picker's minimum width. When Tab, Shift+Tab, or an assistive
+technology moves focus to one of those controls, Enter activates that control
+even if the focus move and Enter arrive in the same low-frame-rate input batch;
+it cannot be mistaken for a result jump.
+Closing the picker with Escape or the current `block:search` binding also owns
+the rest of that input frame, so a queued F5 or Enter cannot repopulate or
+activate the released results. Holding the opening `block:search` chord does not
+flash the picker closed: repeat edges from that physical press are consumed,
+and a new non-repeat press still closes it normally.
 An empty pane distinguishes “no completed blocks yet” from a shell that has
 never reported OSC 133 and points the latter to the jsh installer.
 

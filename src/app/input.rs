@@ -13,6 +13,77 @@ fn transformed_next_command_returns_to_bottom(
     next && !target_found && offset_from_bottom > 0
 }
 
+/// F5 is the picker's refresh shortcut; modified function-key chords are not
+/// reinterpreted as refresh, and key auto-repeat must not run another bounded
+/// index rebuild for every repeated event.
+fn is_plain_block_search_refresh_key(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    repeat: bool,
+) -> bool {
+    key == egui::Key::F5 && modifiers == egui::Modifiers::NONE && !repeat
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchKeyRoute {
+    CloseToggle,
+    SuppressToggleRepeat,
+    ManualRefresh,
+    Confirm { keep_open: bool },
+    Other,
+}
+
+/// Classify picker-owned actions in original event order. The configured
+/// `block:search` chord wins even when a user binds it to F5 or Enter: while
+/// the picker is open a fresh press means close-and-claim-rest, not a refresh
+/// or activation that will be followed by a delayed toggle dispatch. A repeat
+/// from the press that opened the picker is consumed without closing it.
+fn block_search_key_route(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    repeat: bool,
+    intent_control_owns_enter: bool,
+    bindings: &keybindings::KeyBindings,
+) -> BlockSearchKeyRoute {
+    let command =
+        build_keybinding_string(key, modifiers).and_then(|chord| bindings.get_command(&chord));
+    if command == Some(keybindings::Command::BlockSearchToggle) {
+        if repeat {
+            BlockSearchKeyRoute::SuppressToggleRepeat
+        } else {
+            BlockSearchKeyRoute::CloseToggle
+        }
+    } else if is_plain_block_search_refresh_key(key, modifiers, repeat) {
+        BlockSearchKeyRoute::ManualRefresh
+    } else if key == egui::Key::Enter && !intent_control_owns_enter {
+        BlockSearchKeyRoute::Confirm {
+            keep_open: modifiers.shift,
+        }
+    } else {
+        BlockSearchKeyRoute::Other
+    }
+}
+
+/// Egui applies Tab traversal and AccessKit focus requests while widgets are
+/// rendered, after the app-level input prepass below. If either occurs before
+/// Enter in the same raw event batch, the previous frame's focus snapshot is
+/// stale and Enter must be left for egui to deliver to the newly focused
+/// control.
+fn block_search_event_may_change_focus(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::Key {
+            key: egui::Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } => !modifiers.any() || modifiers.shift_only(),
+        egui::Event::AccessKitActionRequest(request) => {
+            request.action == egui::accesskit::Action::Focus
+        }
+        _ => false,
+    }
+}
+
 /// Central input-routing decision for UI surfaces that own keyboard input.
 /// Keep this pure so regressions (especially Enter/Escape leaking into the PTY)
 /// can be covered without constructing a PTY-backed [`TerminalApp`].
@@ -1604,29 +1675,72 @@ impl TerminalApp {
 
         let events_copy = self.frame_events.clone();
         let mut confirm = None;
+        let mut focus_may_have_changed = false;
         for evt in &events_copy {
+            focus_may_have_changed |= block_search_event_may_change_focus(evt);
             let egui::Event::Key {
                 key,
                 pressed: true,
+                repeat,
                 modifiers,
                 ..
             } = evt
             else {
                 continue;
             };
+            // egui makes every button Tab-focusable and activates a focused
+            // button with Enter. Let that focused intent control see Enter;
+            // otherwise the picker-wide result confirmation below would run
+            // before the button is rendered and turn Refresh/Reset/Aa into an
+            // unrelated result jump. A pending query refocus already owns the
+            // next Enter as the normal picker confirmation.
+            let intent_control_owns_enter = focus_may_have_changed
+                || (self.block_search.intent_control_focused && !self.block_search.needs_focus);
+            match block_search_key_route(
+                *key,
+                *modifiers,
+                *repeat,
+                intent_control_owns_enter,
+                &self.keybindings,
+            ) {
+                BlockSearchKeyRoute::CloseToggle => {
+                    self.block_search.close();
+                    // Remove the chord before the global keybinding pass, so
+                    // it cannot reopen the picker or be dispatched twice.
+                    consume_bound_key_event(&mut self.frame_events, *key, *modifiers);
+                    return true;
+                }
+                BlockSearchKeyRoute::SuppressToggleRepeat => {
+                    // The first physical press opened this picker. Consume its
+                    // auto-repeat edge so holding the chord cannot immediately
+                    // toggle the newly opened picker closed.
+                    consume_bound_key_event(&mut self.frame_events, *key, *modifiers);
+                    continue;
+                }
+                BlockSearchKeyRoute::ManualRefresh => {
+                    self.block_search_manual_refresh();
+                    continue;
+                }
+                BlockSearchKeyRoute::Confirm { keep_open } => {
+                    confirm = Some(keep_open);
+                    break;
+                }
+                BlockSearchKeyRoute::Other => {}
+            }
             match key {
-                egui::Key::Escape => self.block_search.close(),
+                egui::Key::Escape => {
+                    self.block_search.close();
+                    // Closing releases the bounded cache and hit identities.
+                    // No later event from this same OS frame may repopulate or
+                    // act on that closed picker (for example Escape then F5).
+                    return true;
+                }
                 egui::Key::ArrowUp => self.block_search.select_prev(),
                 egui::Key::ArrowDown => self.block_search.select_next(),
                 egui::Key::Home => self.block_search.select_first(),
                 egui::Key::End => self.block_search.select_last(),
                 egui::Key::PageUp => self.block_search.select_page(false),
                 egui::Key::PageDown => self.block_search.select_page(true),
-                egui::Key::F5 => {
-                    if self.block_search.request_manual_refresh() {
-                        self.refresh_block_search_hits();
-                    }
-                }
                 egui::Key::I if modifiers.ctrl => {
                     self.block_search.case_sensitive = !self.block_search.case_sensitive;
                     self.block_search.computed_query = None;
@@ -1656,13 +1770,6 @@ impl TerminalApp {
                         self.block_search.needs_focus = true;
                     }
                     self.refresh_block_search_hits();
-                }
-                egui::Key::Enter => {
-                    // Plain Enter keeps the accept-and-close contract.
-                    // Shift+Enter reveals this hit, advances to the next one,
-                    // and leaves the query open for walk-through review.
-                    confirm = Some(modifiers.shift);
-                    break;
                 }
                 _ => {}
             }
@@ -2025,6 +2132,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn block_search_refresh_owns_only_plain_non_repeated_f5() {
+        assert!(is_plain_block_search_refresh_key(
+            egui::Key::F5,
+            egui::Modifiers::NONE,
+            false
+        ));
+        assert!(!is_plain_block_search_refresh_key(
+            egui::Key::F5,
+            egui::Modifiers::NONE,
+            true
+        ));
+        for mask in 1_u8..32 {
+            let modifiers = egui::Modifiers {
+                alt: mask & 1 != 0,
+                ctrl: mask & 2 != 0,
+                shift: mask & 4 != 0,
+                mac_cmd: mask & 8 != 0,
+                command: mask & 16 != 0,
+            };
+            assert!(!is_plain_block_search_refresh_key(
+                egui::Key::F5,
+                modifiers,
+                false
+            ));
+        }
+        assert!(!is_plain_block_search_refresh_key(
+            egui::Key::F4,
+            egui::Modifiers::NONE,
+            false
+        ));
+    }
+
+    #[test]
     fn transformed_next_after_last_mark_returns_to_live_bottom() {
         assert!(transformed_next_command_returns_to_bottom(true, false, 7));
         assert!(!transformed_next_command_returns_to_bottom(true, false, 0));
@@ -2065,6 +2205,221 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    fn key_repeat(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: true,
+            modifiers,
+        }
+    }
+
+    fn block_search_route_prefix(
+        events: &[egui::Event],
+        bindings: &keybindings::KeyBindings,
+    ) -> Vec<BlockSearchKeyRoute> {
+        let mut routes = Vec::new();
+        let mut focus_may_have_changed = false;
+        for event in events {
+            focus_may_have_changed |= block_search_event_may_change_focus(event);
+            let egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                repeat,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let route =
+                block_search_key_route(*key, *modifiers, *repeat, focus_may_have_changed, bindings);
+            if route != BlockSearchKeyRoute::Other {
+                routes.push(route);
+            }
+            if matches!(
+                route,
+                BlockSearchKeyRoute::CloseToggle | BlockSearchKeyRoute::Confirm { .. }
+            ) {
+                break;
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn block_search_toggle_claims_later_refresh_and_enter_in_the_same_frame() {
+        let bindings = keybindings::KeyBindings::default_bindings();
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let toggle = key_press(egui::Key::G, ctrl_shift);
+
+        for trailing in [
+            key_press(egui::Key::F5, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ] {
+            assert_eq!(
+                block_search_route_prefix(&[toggle.clone(), trailing], &bindings),
+                [BlockSearchKeyRoute::CloseToggle]
+            );
+        }
+        let mut remaining = vec![
+            toggle.clone(),
+            key_press(egui::Key::F5, egui::Modifiers::NONE),
+        ];
+        consume_bound_key_event(&mut remaining, egui::Key::G, ctrl_shift);
+        let delayed = ordered_key_presses(&remaining, &bindings);
+        assert!(delayed
+            .presses
+            .iter()
+            .all(|press| press.command != Some(keybindings::Command::BlockSearchToggle)));
+
+        // The binding is runtime-configurable; classification must consult
+        // the active table rather than hard-code Ctrl+Shift+G.
+        let mut custom = keybindings::KeyBindings::new();
+        custom
+            .bindings
+            .insert("alt+b".to_string(), "block:search".to_string());
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            block_search_route_prefix(
+                &[
+                    key_press(egui::Key::B, alt),
+                    key_press(egui::Key::Enter, egui::Modifiers::NONE),
+                ],
+                &custom,
+            ),
+            [BlockSearchKeyRoute::CloseToggle]
+        );
+    }
+
+    #[test]
+    fn block_search_toggle_repeat_is_consumed_without_closing_the_picker() {
+        let bindings = keybindings::KeyBindings::default_bindings();
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            block_search_key_route(egui::Key::G, ctrl_shift, true, false, &bindings),
+            BlockSearchKeyRoute::SuppressToggleRepeat
+        );
+
+        // Suppressing a held opening chord does not suppress a later,
+        // independent picker action in the same input batch.
+        assert_eq!(
+            block_search_route_prefix(
+                &[
+                    key_repeat(egui::Key::G, ctrl_shift),
+                    key_press(egui::Key::F5, egui::Modifiers::NONE),
+                ],
+                &bindings,
+            ),
+            [
+                BlockSearchKeyRoute::SuppressToggleRepeat,
+                BlockSearchKeyRoute::ManualRefresh,
+            ]
+        );
+
+        let mut custom = keybindings::KeyBindings::new();
+        custom
+            .bindings
+            .insert("alt+b".to_string(), "block:search".to_string());
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            block_search_key_route(egui::Key::B, alt, true, false, &custom),
+            BlockSearchKeyRoute::SuppressToggleRepeat,
+            "runtime-remapped toggle chords need the same repeat guard"
+        );
+    }
+
+    #[test]
+    fn block_search_focused_intent_control_owns_enter_activation() {
+        let bindings = keybindings::KeyBindings::default_bindings();
+        assert_eq!(
+            block_search_key_route(
+                egui::Key::Enter,
+                egui::Modifiers::NONE,
+                false,
+                true,
+                &bindings,
+            ),
+            BlockSearchKeyRoute::Other,
+            "egui must deliver Enter to the focused Refresh/Reset/toggle button"
+        );
+        assert_eq!(
+            block_search_key_route(
+                egui::Key::Enter,
+                egui::Modifiers::NONE,
+                false,
+                false,
+                &bindings,
+            ),
+            BlockSearchKeyRoute::Confirm { keep_open: false }
+        );
+        assert_eq!(
+            block_search_key_route(
+                egui::Key::Enter,
+                egui::Modifiers::SHIFT,
+                false,
+                false,
+                &bindings,
+            ),
+            BlockSearchKeyRoute::Confirm { keep_open: true }
+        );
+    }
+
+    #[test]
+    fn block_search_same_frame_focus_move_leaves_enter_for_egui() {
+        let bindings = keybindings::KeyBindings::default_bindings();
+        let enter = key_press(egui::Key::Enter, egui::Modifiers::NONE);
+        for focus_event in [
+            key_press(egui::Key::Tab, egui::Modifiers::NONE),
+            key_press(egui::Key::Tab, egui::Modifiers::SHIFT),
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: egui::accesskit::NodeId(42),
+                data: None,
+            }),
+        ] {
+            assert!(
+                block_search_route_prefix(&[focus_event, enter.clone()], &bindings).is_empty(),
+                "focus traversal followed by Enter must be rendered by egui"
+            );
+        }
+
+        // A runtime binding remains the highest-priority picker action even
+        // when focus traversal occurred earlier in the same event batch.
+        let mut f5_toggle = keybindings::KeyBindings::new();
+        f5_toggle
+            .bindings
+            .insert("f5".to_string(), "block:search".to_string());
+        assert_eq!(
+            block_search_route_prefix(
+                &[
+                    key_press(egui::Key::Tab, egui::Modifiers::NONE),
+                    key_press(egui::Key::F5, egui::Modifiers::NONE),
+                ],
+                &f5_toggle,
+            ),
+            [BlockSearchKeyRoute::CloseToggle]
+        );
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]

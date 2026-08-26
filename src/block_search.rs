@@ -61,6 +61,11 @@ pub struct BlockSearchState {
     pub selected_index: usize,
     /// One-shot: focus the query field on the frame after opening.
     pub needs_focus: bool,
+    /// Set by the previous render pass when one of the matching, scope, filter,
+    /// Refresh, or Reset controls owns keyboard focus. The input pass runs
+    /// before widgets render, so this lets Enter reach the focused button
+    /// instead of being preempted by picker-wide result confirmation.
+    pub intent_control_focused: bool,
     /// One-shot: center the highlighted result in the virtual result list.
     /// Keyboard/query-driven moves set this; pointer hover deliberately does
     /// not, so wheel and scrollbar movement remain under the user's control.
@@ -102,6 +107,7 @@ impl BlockSearchState {
         self.computed_query = None;
         self.selected_index = 0;
         self.needs_focus = true;
+        self.intent_control_focused = false;
     }
 
     /// Invalidate only the source/index version for an explicit F5 refresh.
@@ -122,6 +128,7 @@ impl BlockSearchState {
     pub fn open(&mut self) {
         self.is_open = true;
         self.needs_focus = true;
+        self.intent_control_focused = false;
         self.scroll_to_selected = true;
         self.selected_index = 0;
         self.hits.clear();
@@ -136,6 +143,7 @@ impl BlockSearchState {
 
     pub fn close(&mut self) {
         self.is_open = false;
+        self.intent_control_focused = false;
         if self.query.len() > crate::block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES {
             // Do not reopen directly into the one-scalar TooLong sentinel.
             self.query.clear();
@@ -355,6 +363,7 @@ mod tests {
             whole_word: true,
             scope: BlockSearchScope::Output,
             filter: BlockSearchFilter::Bookmarked,
+            intent_control_focused: true,
             selected_index: 3,
             hits: vec![hit("a")],
             capped: true,
@@ -370,6 +379,7 @@ mod tests {
         };
         state.open();
         assert!(state.is_open && state.needs_focus);
+        assert!(!state.intent_control_focused);
         assert_eq!(state.query, "old");
         assert!(state.hits.is_empty() && !state.capped);
         assert!(state.case_sensitive && state.regex && state.whole_word);
@@ -382,6 +392,7 @@ mod tests {
         // Closing releases the (potentially large) extraction cache.
         state.close();
         assert!(!state.is_open && state.cache.is_empty() && state.hits.is_empty());
+        assert!(!state.intent_control_focused);
         assert_eq!(state.session_id, None);
 
         state.query = "x".repeat(crate::block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
@@ -400,6 +411,7 @@ mod tests {
             whole_word: true,
             scope: BlockSearchScope::Output,
             filter: BlockSearchFilter::Bookmarked,
+            intent_control_focused: true,
             query_error: Some("old".to_string()),
             computed_query: Some("needle".to_string()),
             selected_index: 4,
@@ -414,6 +426,7 @@ mod tests {
         assert!(state.query_error.is_none() && state.computed_query.is_none());
         assert_eq!(state.selected_index, 0);
         assert!(state.needs_focus);
+        assert!(!state.intent_control_focused);
         assert_eq!(state.hits.len(), 1, "refresh owns result replacement");
     }
 

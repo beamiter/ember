@@ -1401,6 +1401,7 @@ impl TerminalApp {
                 screen_rect.center().x - picker_width / 2.0,
                 screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
             );
+            let mut intent_control_focused = false;
 
             egui::Window::new("Block Search")
                 .title_bar(false)
@@ -1437,6 +1438,13 @@ impl TerminalApp {
                         if search_response.has_focus() && self.block_search.query.is_empty() {
                             ui.label("Search block commands and output...");
                         }
+                    });
+
+                    // Keep the query usable at the picker's 360 px minimum.
+                    // The compact matching/actions row fits below it instead
+                    // of squeezing the text editor after Refresh was added.
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Match").small());
                         let case_button = ui
                             .selectable_label(self.block_search.case_sensitive, "Aa")
                             .on_hover_text("Match case");
@@ -1446,6 +1454,33 @@ impl TerminalApp {
                         let whole_word_button = ui
                             .selectable_label(self.block_search.whole_word, "W")
                             .on_hover_text("Match whole words");
+                        case_button.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                true,
+                                self.block_search.case_sensitive,
+                                "Match case (Ctrl+I)",
+                            )
+                        });
+                        regex_button.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                true,
+                                self.block_search.regex,
+                                "Regular expression (Ctrl+R)",
+                            )
+                        });
+                        whole_word_button.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                true,
+                                self.block_search.whole_word,
+                                "Match whole words (Ctrl+W)",
+                            )
+                        });
+                        intent_control_focused |= case_button.has_focus()
+                            || regex_button.has_focus()
+                            || whole_word_button.has_focus();
                         if case_button.clicked() {
                             self.block_search.case_sensitive = !self.block_search.case_sensitive;
                             self.block_search.computed_query = None;
@@ -1464,7 +1499,32 @@ impl TerminalApp {
                             self.block_search.needs_focus = true;
                             self.refresh_block_search_hits();
                         }
-                        if ui.button("Reset").on_hover_text("Reset search intent").clicked() {
+                        let refresh_button = ui
+                            .button("Refresh")
+                            .on_hover_text("Refresh block search results (F5)");
+                        refresh_button.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "Refresh block search results (F5)",
+                            )
+                        });
+                        intent_control_focused |= refresh_button.has_focus();
+                        if refresh_button.clicked() {
+                            self.block_search_manual_refresh();
+                        }
+                        let reset_button = ui
+                            .button("Reset")
+                            .on_hover_text("Reset query, matching options, scope, and filters");
+                        reset_button.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "Reset block search intent (Ctrl+Shift+U)",
+                            )
+                        });
+                        intent_control_focused |= reset_button.has_focus();
+                        if reset_button.clicked() {
                             self.block_search.reset_intent();
                             self.refresh_block_search_hits();
                         }
@@ -1477,10 +1537,18 @@ impl TerminalApp {
                             ("Cmd", crate::block_mode::BlockSearchScope::Command),
                             ("Out", crate::block_mode::BlockSearchScope::Output),
                         ] {
-                            if ui
-                                .selectable_label(self.block_search.scope == scope, label)
-                                .clicked()
-                            {
+                            let scope_button =
+                                ui.selectable_label(self.block_search.scope == scope, label);
+                            scope_button.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    self.block_search.scope == scope,
+                                    format!("Search scope: {label}"),
+                                )
+                            });
+                            intent_control_focused |= scope_button.has_focus();
+                            if scope_button.clicked() {
                                 self.block_search.scope = scope;
                                 self.block_search.computed_query = None;
                                 self.block_search.needs_focus = true;
@@ -1503,10 +1571,18 @@ impl TerminalApp {
                                 crate::block_search::BlockSearchFilter::Background,
                             ),
                         ] {
-                            if ui
-                                .selectable_label(self.block_search.filter == filter, label)
-                                .clicked()
-                            {
+                            let filter_button =
+                                ui.selectable_label(self.block_search.filter == filter, label);
+                            filter_button.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    self.block_search.filter == filter,
+                                    format!("Block filter: {label}"),
+                                )
+                            });
+                            intent_control_focused |= filter_button.has_focus();
+                            if filter_button.clicked() {
                                 self.block_search.filter = filter;
                                 self.block_search.computed_query = None;
                                 self.block_search.needs_focus = true;
@@ -1540,7 +1616,7 @@ impl TerminalApp {
                     };
                     let selected_index = self.block_search.selected_index;
                     let query_is_empty = self.block_search.query.trim().is_empty();
-                    let list_height = picker_height - 120.0;
+                    let list_height = picker_height - 148.0;
                     let scroll_to_selected =
                         std::mem::take(&mut self.block_search.scroll_to_selected);
 
@@ -1704,6 +1780,7 @@ impl TerminalApp {
                         );
                     });
                 });
+            self.block_search.intent_control_focused = intent_control_focused;
         }
 
         if let Some(index) = hovered_hit_index {

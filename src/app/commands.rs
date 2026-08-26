@@ -86,6 +86,47 @@ fn block_search_activation(
     }
 }
 
+/// Keep the last usable same-pane index/results when a query intent cannot be
+/// compiled. A completed-record version may change in the same frame as a
+/// regex toggle or query edit; validating against an empty cache before the
+/// destructive rebuild prevents that race from blanking the picker merely to
+/// rediscover the same error. A pane switch deliberately bypasses this gate so
+/// results from the previous terminal are still released immediately.
+fn defer_same_session_block_search_rebuild_if_invalid(
+    state: &mut crate::block_search::BlockSearchState,
+    active_session_id: &str,
+) -> bool {
+    if state.session_id.as_deref() != Some(active_session_id) {
+        return false;
+    }
+    // The current intent was already compiled and rejected. Record-version
+    // churn does not make an invalid expression valid, so avoid recompiling it
+    // on every rendered frame while the source refresh remains deferred.
+    if state.query_error.is_some() && state.computed_query.as_deref() == Some(state.query.as_str())
+    {
+        return true;
+    }
+    let options = crate::block_mode::BlockSearchOptions {
+        case_sensitive: state.case_sensitive,
+        regex: state.regex,
+        whole_word: state.whole_word,
+    };
+    match crate::block_mode::search_blocks_with_options_filtered_in_scope(
+        &[],
+        &state.query,
+        options,
+        state.scope,
+        |_| true,
+    ) {
+        Ok(_) => false,
+        Err(error) => {
+            state.query_error = Some(error.to_string());
+            state.computed_query = Some(state.query.clone());
+            true
+        }
+    }
+}
+
 /// Retire the terminal and sidebar views of one logical block selection.
 /// Taking the fields separately lets input routing call this while it holds a
 /// disjoint mutable borrow of the active session.
@@ -2831,6 +2872,19 @@ impl TerminalApp {
         self.block_search.open();
     }
 
+    /// Refresh through the same path for the F5 shortcut and the visible
+    /// button. The query regains focus after a pointer click, while invalid
+    /// expressions keep their last valid cache and results untouched.
+    pub(crate) fn block_search_manual_refresh(&mut self) {
+        if !self.block_search.is_open {
+            return;
+        }
+        self.block_search.needs_focus = true;
+        if self.block_search.request_manual_refresh() {
+            self.refresh_block_search_hits();
+        }
+    }
+
     /// Recompute the picker's hits for the active session and current query.
     ///
     /// Record text is not re-extracted per keystroke: it lives in a bounded
@@ -2883,9 +2937,18 @@ impl TerminalApp {
         if !self.block_search.needs_refresh(&session_id, record_version) {
             return;
         }
-        if self.block_search.session_id.as_deref() != Some(session_id.as_str())
-            || self.block_search.record_version != Some(record_version)
+        let cache_needs_rebuild = self.block_search.session_id.as_deref()
+            != Some(session_id.as_str())
+            || self.block_search.record_version != Some(record_version);
+        if cache_needs_rebuild
+            && defer_same_session_block_search_rebuild_if_invalid(
+                &mut self.block_search,
+                &session_id,
+            )
         {
+            return;
+        }
+        if cache_needs_rebuild {
             self.rebuild_block_search_cache(&session_id, record_version);
         }
 
@@ -5106,5 +5169,64 @@ mod tests {
             block_search_activation(false, true),
             BlockSearchActivation::RejectStale
         );
+    }
+
+    #[test]
+    fn invalid_query_defers_only_same_session_version_rebuilds() {
+        let version = crate::block_search::BlockSearchRecordVersion {
+            len: 1,
+            oldest_sequence: Some(7),
+            newest_sequence: Some(7),
+        };
+        let mut state = crate::block_search::BlockSearchState {
+            query: "[".to_string(),
+            regex: true,
+            hits: vec![crate::block_mode::BlockSearchHit {
+                record_id: "old-hit".to_string(),
+                is_output_line: false,
+                line_no: None,
+                match_span: None,
+                line_text: "old result".to_string(),
+                command_preview: "old result".to_string(),
+            }],
+            cache: vec![crate::block_mode::CachedBlockSearchRecord::new(
+                "old-hit",
+                Some("old result"),
+                None,
+            )],
+            selected_index: 0,
+            session_id: Some("pane-a".to_string()),
+            record_version: Some(version),
+            computed_query: None,
+            ..Default::default()
+        };
+
+        assert!(defer_same_session_block_search_rebuild_if_invalid(
+            &mut state, "pane-a"
+        ));
+        assert!(state.query_error.is_some());
+        assert_eq!(state.computed_query.as_deref(), Some("["));
+        assert_eq!(state.record_version, Some(version));
+        assert_eq!(state.hits[0].record_id, "old-hit");
+        assert_eq!(state.cache[0].record_id, "old-hit");
+
+        // The already-known error remains a constant-time deferral on later
+        // frames, but changing the intent to a valid literal permits rebuild.
+        assert!(defer_same_session_block_search_rebuild_if_invalid(
+            &mut state, "pane-a"
+        ));
+        state.regex = false;
+        state.computed_query = None;
+        assert!(!defer_same_session_block_search_rebuild_if_invalid(
+            &mut state, "pane-a"
+        ));
+
+        // A pane switch must never retain another terminal's identities, even
+        // when the remembered expression is invalid there too.
+        state.regex = true;
+        state.computed_query = None;
+        assert!(!defer_same_session_block_search_rebuild_if_invalid(
+            &mut state, "pane-b"
+        ));
     }
 }

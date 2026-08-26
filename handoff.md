@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.3)
+Updated: 2026-08-26 (Block Search 3.9)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,23 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.9 (2026-08-26)**: manual refresh is now pointer-accessible
+  through a visible Refresh control, and that button shares the exact
+  selection-preserving path with plain, non-repeated F5. The currently configured
+  `block:search` chord wins if it is remapped onto F5; other modified F5 chords
+  are not reinterpreted as refresh, and the new two-row header keeps the query
+  usable at minimum width. Escape and the currently configured `block:search` chord
+  now terminate the picker's whole input batch, so later events from the same
+  frame cannot rebuild or activate released state. Auto-repeat from the physical
+  chord that opened the picker is consumed without toggling it closed; a fresh
+  non-repeat press retains the normal close behavior. Same-pane completed-record
+  churn now defers its destructive cache rebuild while the current query intent
+  is invalid, preserving the last valid results until correction; pane switches
+  still release the old terminal's identities immediately. Tab/Shift+Tab and
+  AccessKit focus requests that precede Enter in one input batch now leave Enter
+  to the newly focused intent control instead of activating a search result from
+  the previous frame's focus snapshot.
 
 - **Block Search 3.3 (2026-08-26)**: continuous review now advances only
   after the selected completed record is revalidated and revealed. Plain Enter
