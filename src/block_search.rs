@@ -49,6 +49,8 @@ pub struct BlockSearchHitAnchor {
     pub record_id: String,
     pub line_no: Option<usize>,
     pub is_output_line: bool,
+    /// Previous visual rank, used only when retention removed the exact hit.
+    pub index: usize,
 }
 
 #[derive(Default)]
@@ -235,6 +237,7 @@ impl BlockSearchState {
             record_id: hit.record_id.clone(),
             line_no: hit.line_no,
             is_output_line: hit.is_output_line,
+            index: self.selected_index,
         })
     }
 
@@ -252,23 +255,28 @@ impl BlockSearchState {
         session_id: &str,
         anchor: Option<&BlockSearchHitAnchor>,
     ) {
-        let anchored_index = anchor
-            .filter(|anchor| anchor.session_id == session_id)
-            .and_then(|anchor| {
-                hits.iter().position(|hit| {
-                    hit.record_id == anchor.record_id
-                        && hit.line_no == anchor.line_no
-                        && hit.is_output_line == anchor.is_output_line
-                })
-            });
-        self.selected_index = anchored_index.unwrap_or(0);
+        let same_session_anchor = anchor.filter(|anchor| anchor.session_id == session_id);
+        let anchored_index = same_session_anchor.and_then(|anchor| {
+            hits.iter().position(|hit| {
+                hit.record_id == anchor.record_id
+                    && hit.line_no == anchor.line_no
+                    && hit.is_output_line == anchor.is_output_line
+            })
+        });
+        self.selected_index = anchored_index
+            .or_else(|| {
+                same_session_anchor
+                    .filter(|_| !hits.is_empty())
+                    .map(|anchor| anchor.index.min(hits.len() - 1))
+            })
+            .unwrap_or(0);
         self.hits = hits;
         self.capped = capped;
         self.query_error = None;
         // A background record-version refresh that retained the exact row
         // must not yank a pointer user away from the scroll position they are
         // inspecting. Preserve any already-pending keyboard request, while a
-        // new intent or vanished anchor deliberately reveals the fallback row.
+        // new intent or vanished anchor reveals the rank-preserving fallback.
         if anchored_index.is_none() {
             self.scroll_to_selected = true;
         }
@@ -481,14 +489,15 @@ mod tests {
             "a retained background-refresh anchor preserves pointer scroll"
         );
 
-        // The anchored row disappearing falls back to the first row.
+        // The anchored row disappearing preserves the closest old rank.
         state.adopt_hits(
             vec![hit("newest"), hit("oldest")],
             false,
             "pane-a",
             Some(&anchor),
         );
-        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.selected_index, 1);
+        assert_eq!(state.selected_hit().unwrap().record_id, "oldest");
         assert!(state.scroll_to_selected);
 
         // Record ids repeat across panes (`local:{sequence}` restarts at 1),
