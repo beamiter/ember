@@ -12,6 +12,8 @@
 
 use crate::block_mode::{BlockSearchHit, BlockSearchScope, CachedBlockSearchRecord};
 
+const BLOCK_SEARCH_PAGE_STEP: usize = 10;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockSearchFilter {
     #[default]
@@ -131,22 +133,58 @@ impl BlockSearchState {
 
     /// Move the highlight down one row, wrapping (palette semantics).
     pub fn select_next(&mut self) {
-        if !self.hits.is_empty() {
-            self.selected_index = (self.selected_index + 1) % self.hits.len();
-            self.scroll_to_selected = true;
+        if self.hits.is_empty() {
+            self.selected_index = 0;
+            return;
         }
+        let current = self.selected_index.min(self.hits.len() - 1);
+        self.selected_index = (current + 1) % self.hits.len();
+        self.scroll_to_selected = true;
     }
 
     /// Move the highlight up one row, wrapping (palette semantics).
     pub fn select_prev(&mut self) {
+        if self.hits.is_empty() {
+            self.selected_index = 0;
+            return;
+        }
+        let current = self.selected_index.min(self.hits.len() - 1);
+        self.selected_index = if current == 0 {
+            self.hits.len() - 1
+        } else {
+            current - 1
+        };
+        self.scroll_to_selected = true;
+    }
+
+    pub fn select_first(&mut self) {
+        self.selected_index = 0;
         if !self.hits.is_empty() {
-            self.selected_index = if self.selected_index == 0 {
-                self.hits.len() - 1
-            } else {
-                self.selected_index - 1
-            };
             self.scroll_to_selected = true;
         }
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected_index = self.hits.len().saturating_sub(1);
+        if !self.hits.is_empty() {
+            self.scroll_to_selected = true;
+        }
+    }
+
+    pub fn select_page(&mut self, forward: bool) {
+        if self.hits.is_empty() {
+            self.selected_index = 0;
+            return;
+        }
+        let current = self.selected_index.min(self.hits.len() - 1);
+        self.selected_index = if forward {
+            current
+                .saturating_add(BLOCK_SEARCH_PAGE_STEP)
+                .min(self.hits.len() - 1)
+        } else {
+            current.saturating_sub(BLOCK_SEARCH_PAGE_STEP)
+        };
+        self.scroll_to_selected = true;
     }
 
     /// Let pointer hover take ownership only after real pointer movement.
@@ -235,7 +273,14 @@ impl BlockSearchState {
     pub fn count_label(&self) -> String {
         let count = self.hits.len();
         let noun = if count == 1 { "match" } else { "matches" };
-        let mut label = format!("{count} {noun}");
+        let mut label = if count == 0 {
+            format!("{count} {noun}")
+        } else {
+            format!(
+                "{} of {count} {noun}",
+                self.selected_index.saturating_add(1).min(count)
+            )
+        };
         if self.capped {
             label.push_str(" · older blocks not searched");
         }
@@ -294,7 +339,10 @@ mod tests {
 
     #[test]
     fn selection_wraps_in_both_directions_and_survives_empty_hits() {
-        let mut state = BlockSearchState::default();
+        let mut state = BlockSearchState {
+            selected_index: usize::MAX,
+            ..Default::default()
+        };
         state.select_next();
         state.select_prev();
         assert_eq!(state.selected_index, 0);
@@ -304,6 +352,23 @@ mod tests {
         state.select_next();
         assert_eq!(state.selected_index, 0);
         assert_eq!(state.selected_hit().unwrap().record_id, "a");
+
+        state.hits = (0..25).map(|index| hit(&index.to_string())).collect();
+        state.select_page(true);
+        assert_eq!(state.selected_index, 10);
+        state.select_page(true);
+        assert_eq!(state.selected_index, 20);
+        state.select_page(true);
+        assert_eq!(state.selected_index, 24);
+        state.select_page(false);
+        assert_eq!(state.selected_index, 14);
+        state.select_first();
+        assert_eq!(state.selected_index, 0);
+        state.select_last();
+        assert_eq!(state.selected_index, 24);
+        state.selected_index = usize::MAX;
+        state.select_prev();
+        assert_eq!(state.selected_index, 23);
     }
 
     #[test]
@@ -436,15 +501,17 @@ mod tests {
 
         assert_eq!(state.count_label(), "0 matches");
         state.hits = vec![hit("a")];
-        assert_eq!(state.count_label(), "1 match");
+        assert_eq!(state.count_label(), "1 of 1 match");
         state.hits = vec![hit("a"), hit("b")];
+        assert_eq!(state.count_label(), "1 of 2 matches");
+        state.selected_index = 1;
         state.capped = true;
         state.older_not_indexed = true;
         // The cap label says what `capped` means — the scan stopped early —
         // not that more matches exist.
         assert_eq!(
             state.count_label(),
-            "2 matches · older blocks not searched · older blocks not indexed"
+            "2 of 2 matches · older blocks not searched · older blocks not indexed"
         );
     }
 

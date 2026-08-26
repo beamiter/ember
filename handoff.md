@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.1)
+Updated: 2026-08-26 (Block Search 3.2)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,11 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.2 (2026-08-26)**: the virtual result list now supports
+  Home/End and bounded ten-row PageUp/PageDown moves in addition to wrapping
+  arrows. Its footer reports current position plus total/cap state, and every
+  keyboard jump requests one precise scroll-to-selection operation.
 
 - **Block Search 3.1 (2026-08-26)**: `All / Cmd / Out` surface scopes and a
   `Ctrl+O` cycle now restrict matching before the result cap. The same scope

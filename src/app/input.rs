@@ -1618,6 +1618,10 @@ impl TerminalApp {
                 egui::Key::Escape => self.block_search.close(),
                 egui::Key::ArrowUp => self.block_search.select_prev(),
                 egui::Key::ArrowDown => self.block_search.select_next(),
+                egui::Key::Home => self.block_search.select_first(),
+                egui::Key::End => self.block_search.select_last(),
+                egui::Key::PageUp => self.block_search.select_page(false),
+                egui::Key::PageDown => self.block_search.select_page(true),
                 egui::Key::I if modifiers.ctrl => {
                     self.block_search.case_sensitive = !self.block_search.case_sensitive;
                     self.block_search.computed_query = None;
