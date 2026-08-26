@@ -354,6 +354,7 @@ impl TerminalApp {
         }
         if let Some(session_id) = removed_session_id.as_deref() {
             self.task_manager.handle_terminal_session_closed(session_id);
+            self.block_bookmarks.remove_session(session_id);
         }
         if self
             .pending_paste_confirm

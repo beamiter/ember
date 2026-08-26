@@ -1482,6 +1482,7 @@ impl TerminalApp {
             // The session was inserted but has not entered TabManager yet;
             // removing it immediately restores the original index layout.
             let _ = self.session_manager.close_session(created.session_index);
+            self.block_bookmarks.remove_session(&created.session_id);
             if failed_terminal_retry.is_none() && !native_recovery {
                 let _ = self.task_manager.update_status(
                     task_id,
@@ -1585,6 +1586,7 @@ impl TerminalApp {
             .bind_validation_session(task_id, created.session_id.clone())
         {
             let _ = self.session_manager.close_session(created.session_index);
+            self.block_bookmarks.remove_session(&created.session_id);
             self.set_status_for(error.to_string(), Duration::from_secs(6));
             return;
         }

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.9)
+Updated: 2026-08-26 (Block Search 4.3)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,27 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.3 (2026-08-26)**: each virtual result row now exposes an
+  independent, selected-state `☆` / `★` button; activating it changes only the
+  bookmark and never jumps or closes the picker. Exact `Ctrl+Shift+B` applies
+  the same action to the highlighted hit. A logical-B latch consumes repeats
+  through modifier release, resets on B release/focus loss/close, and leaves
+  ordinary Shift+B text repeats alone. A configured `block:search` remap onto
+  Ctrl+Shift+B retains close/repeat priority. Pointer and keyboard actions carry a
+  stable hit plus finalized-record generation and revalidate the live record
+  before resolving its terminal-owned monotonic sequence; duplicate command and
+  output hits therefore share one bookmark truth, while stale rows only report
+  and refresh. Removing a result under the Bookmarked filter uses the existing
+  anchor refresh to retain the nearest surviving selection. Runtime-only
+  bookmark sets and revisions are session scoped, are removed on session close,
+  and prune only when the retained `command_records` deque identity changes;
+  captured-output/snapshot eviction cannot erase a live bookmark or alias a
+  later PTY-reused record id. Empty-query metadata browsing now uses only real
+  command/output text and the first nonblank retained output line. Result rows,
+  bookmark buttons, filter controls, stale/unavailable feedback, empty states,
+  and the wrapped shortcut footer expose explicit accessible widget state via
+  eframe's AccessKit bridge.
 
 - **Block Search 3.9 (2026-08-26)**: manual refresh is now pointer-accessible
   through a visible Refresh control, and that button shares the exact

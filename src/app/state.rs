@@ -239,9 +239,9 @@ pub struct TerminalApp {
     /// 输入,终端事件被拦截,因此不会顺带清掉 block_selection。
     pub block_search: crate::block_search::BlockSearchState,
 
-    /// Runtime bookmarks keyed by stable session and execution identity, not
-    /// mutable tab/pane indices.
-    pub block_bookmarks: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Runtime bookmarks keyed by stable session and terminal-owned monotonic
+    /// record sequence, not mutable tab/pane indices or PTY-controlled ids.
+    pub block_bookmarks: crate::block_search::BlockBookmarkState,
 
     // Find & Replace (operates on selection)
     pub search_replace_panel: search_replace_panel::SearchReplacePanel,

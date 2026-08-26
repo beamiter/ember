@@ -950,9 +950,9 @@ pub struct TerminalRenderer {
     /// Strongly outlined active edge within `selected_block_ids`. The other
     /// selected blocks keep a lighter outline.
     active_block_id: Option<String>,
-    /// Runtime, session-scoped bookmarks mirrored by the app. Kept as a set so
-    /// visible-card lookup remains O(1) even with the maximum retained history.
-    bookmarked_block_ids: std::collections::HashSet<String>,
+    /// Runtime, session-scoped bookmarks mirrored by the app. Terminal-owned
+    /// monotonic sequences cannot alias when a PTY-provided id is later reused.
+    bookmarked_block_sequences: std::collections::HashSet<u64>,
     /// Block-mode hit-test outcome of this frame's click, drained by the app
     /// the way `cursor_move_input` is.
     pub block_click: Option<crate::block_mode::BlockClick>,
@@ -1064,7 +1064,7 @@ impl TerminalRenderer {
             selected_block_ids: Vec::new(),
             selected_block_id_set: std::collections::HashSet::new(),
             active_block_id: None,
-            bookmarked_block_ids: std::collections::HashSet::new(),
+            bookmarked_block_sequences: std::collections::HashSet::new(),
             block_click: None,
             block_menu_action: None,
             context_block_id: None,
@@ -1179,12 +1179,12 @@ impl TerminalRenderer {
         }
     }
 
-    pub fn set_block_bookmarks(&mut self, bookmarks: Option<&std::collections::HashSet<String>>) {
+    pub fn set_block_bookmarks(&mut self, bookmarks: Option<&std::collections::HashSet<u64>>) {
         match bookmarks {
-            Some(bookmarks) if &self.bookmarked_block_ids != bookmarks => {
-                self.bookmarked_block_ids.clone_from(bookmarks);
+            Some(bookmarks) if &self.bookmarked_block_sequences != bookmarks => {
+                self.bookmarked_block_sequences.clone_from(bookmarks);
             }
-            None => self.bookmarked_block_ids.clear(),
+            None => self.bookmarked_block_sequences.clear(),
             Some(_) => {}
         }
     }
@@ -1683,7 +1683,7 @@ impl TerminalRenderer {
             entries.push(BlockChromeEntry {
                 selected: self.selected_block_id_set.contains(record.id.as_str()),
                 active: self.active_block_id.as_deref() == Some(record.id.as_str()),
-                bookmarked: self.bookmarked_block_ids.contains(record.id.as_str()),
+                bookmarked: self.bookmarked_block_sequences.contains(&record.sequence),
                 live,
                 hovered: false,
                 id: record.id.clone(),
@@ -2024,7 +2024,7 @@ impl TerminalRenderer {
             entries.push(BlockChromeEntry {
                 selected: self.selected_block_id_set.contains(record.id.as_str()),
                 active: self.active_block_id.as_deref() == Some(record.id.as_str()),
-                bookmarked: self.bookmarked_block_ids.contains(record.id.as_str()),
+                bookmarked: self.bookmarked_block_sequences.contains(&record.sequence),
                 live,
                 hovered: false,
                 id: record.id.clone(),
@@ -2598,7 +2598,7 @@ impl TerminalRenderer {
             .unwrap_or(clicked_start);
         let long_block = clicked_end.saturating_sub(clicked_start)
             >= terminal.grid.rows().saturating_sub(1) as u64;
-        let bookmarked = self.bookmarked_block_ids.contains(target_id.as_str());
+        let bookmarked = self.bookmarked_block_sequences.contains(&clicked.sequence);
         let collapse_requested = self
             .requested_collapsed_zone_ids
             .contains(&clicked.sequence);

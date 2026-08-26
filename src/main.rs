@@ -5750,6 +5750,12 @@ impl eframe::App for TerminalApp {
             }
         }
 
+        // Bookmark truth follows retained semantic records, not scrollback or
+        // captured-output availability. The version-gated pass is O(1) on
+        // static frames and scans only bookmarked sessions after a real deque
+        // insertion/rotation.
+        self.prune_block_bookmarks_to_retained_records();
+
         // 渲染 UI
         // A host-owned Ctrl-link press must not start renderer-local text
         // selection in the same frame. The mouse capture already suppresses

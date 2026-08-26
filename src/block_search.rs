@@ -11,8 +11,133 @@
 //! replacement pane.
 
 use crate::block_mode::{BlockSearchHit, BlockSearchScope, CachedBlockSearchRecord};
+use std::collections::{HashMap, HashSet};
 
 const BLOCK_SEARCH_PAGE_STEP: usize = 10;
+
+/// Cheap identity of the terminal's retained semantic-record deque. This is
+/// deliberately independent of output snapshots and scrollback rows: only a
+/// real `command_records` insertion/retirement changes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetainedRecordVersion {
+    pub len: usize,
+    pub oldest_sequence: Option<u64>,
+    pub newest_sequence: Option<u64>,
+}
+
+/// Pane-local, process-lifetime bookmark truth. PTY-controlled record ids are
+/// unsuitable here because their bounded tombstones eventually permit reuse;
+/// the terminal-owned sequence is monotonic for the lifetime of one pane.
+///
+/// Mutation is centralized so revisions advance only when the actual set
+/// changes. Empty bookmark sets are removed, while their last revision remains
+/// until the session closes so an open picker can observe the transition.
+#[derive(Default)]
+pub struct BlockBookmarkState {
+    by_session: HashMap<String, HashSet<u64>>,
+    revisions: HashMap<String, u64>,
+    observed_records: HashMap<String, RetainedRecordVersion>,
+}
+
+impl BlockBookmarkState {
+    pub fn get(&self, session_id: &str) -> Option<&HashSet<u64>> {
+        self.by_session.get(session_id)
+    }
+
+    pub fn contains(&self, session_id: &str, sequence: u64) -> bool {
+        self.by_session
+            .get(session_id)
+            .is_some_and(|bookmarks| bookmarks.contains(&sequence))
+    }
+
+    pub fn revision(&self, session_id: &str) -> u64 {
+        self.revisions.get(session_id).copied().unwrap_or(0)
+    }
+
+    pub fn session_ids(&self) -> Vec<String> {
+        self.by_session.keys().cloned().collect()
+    }
+
+    pub fn needs_prune(&self, session_id: &str, version: RetainedRecordVersion) -> bool {
+        self.by_session.contains_key(session_id)
+            && self.observed_records.get(session_id).copied() != Some(version)
+    }
+
+    /// Toggle one live sequence and return its new state. The caller supplies
+    /// the deque version observed during live-record validation, preventing a
+    /// redundant full retained-record scan on the next static frame.
+    pub fn toggle(
+        &mut self,
+        session_id: &str,
+        sequence: u64,
+        version: RetainedRecordVersion,
+    ) -> bool {
+        let bookmarks = self.by_session.entry(session_id.to_string()).or_default();
+        let active = if bookmarks.remove(&sequence) {
+            false
+        } else {
+            bookmarks.insert(sequence);
+            true
+        };
+        if bookmarks.is_empty() {
+            self.by_session.remove(session_id);
+        }
+        self.observed_records
+            .insert(session_id.to_string(), version);
+        self.bump_revision(session_id);
+        active
+    }
+
+    /// Reconcile bookmarks only after the retained-record deque identity
+    /// changes. Snapshot/output eviction never calls this path and therefore
+    /// cannot erase a still-live bookmark.
+    pub fn retain_live(
+        &mut self,
+        session_id: &str,
+        version: RetainedRecordVersion,
+        live_complete_sequences: &HashSet<u64>,
+    ) -> bool {
+        self.observed_records
+            .insert(session_id.to_string(), version);
+        let Some(bookmarks) = self.by_session.get_mut(session_id) else {
+            return false;
+        };
+        let previous_len = bookmarks.len();
+        bookmarks.retain(|sequence| live_complete_sequences.contains(sequence));
+        let changed = bookmarks.len() != previous_len;
+        if bookmarks.is_empty() {
+            self.by_session.remove(session_id);
+        }
+        if changed {
+            self.bump_revision(session_id);
+        }
+        changed
+    }
+
+    pub fn remove_session(&mut self, session_id: &str) -> bool {
+        self.observed_records.remove(session_id);
+        self.revisions.remove(session_id);
+        self.by_session.remove(session_id).is_some()
+    }
+
+    fn bump_revision(&mut self, session_id: &str) {
+        let revision = self.revisions.entry(session_id.to_string()).or_default();
+        *revision = revision.saturating_add(1);
+    }
+}
+
+/// Honest empty-state detail for the Bookmarked filter. The picker has a
+/// single metadata-filter axis, so there is no additional AND-filter case on
+/// this frontend.
+pub fn bookmarked_empty_message(has_live_bookmarks: bool, query_is_empty: bool) -> &'static str {
+    if !has_live_bookmarks {
+        "No bookmarked command blocks in retained history"
+    } else if query_is_empty {
+        "No bookmarked blocks with retained text in this scope"
+    } else {
+        "No matches in bookmarked blocks"
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockSearchFilter {
@@ -24,10 +149,21 @@ pub enum BlockSearchFilter {
     Background,
 }
 
+/// Result of routing one physical `B` press while the picker is open. The
+/// first edge owns the whole physical-key lifetime: an exact bookmark chord
+/// keeps suppressing repeats even if Ctrl/Shift is released before `B`, while
+/// an ordinary text press keeps propagating even if modifiers later change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSearchBookmarkKeyRoute {
+    Toggle,
+    Suppress,
+    Propagate,
+}
+
 /// Exact finalized-record set represented by one cache. Length alone is not
 /// enough because the bounded deque can evict one old record while adding one
 /// new record in the same update.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct BlockSearchRecordVersion {
     pub len: usize,
     pub oldest_sequence: Option<u64>,
@@ -51,6 +187,19 @@ pub struct BlockSearchHitAnchor {
     pub is_output_line: bool,
     /// Previous visual rank, used only when retention removed the exact hit.
     pub index: usize,
+}
+
+/// Stable picker-row claim queued by pointer or keyboard input. The visual
+/// index is deliberately absent: a refresh may reorder rows before an action
+/// is applied, so callers revalidate this identity against the current hit
+/// set and finalized-record generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSearchBookmarkTarget {
+    pub session_id: String,
+    pub record_version: BlockSearchRecordVersion,
+    pub record_id: String,
+    pub line_no: Option<usize>,
+    pub is_output_line: bool,
 }
 
 #[derive(Default)]
@@ -90,9 +239,17 @@ pub struct BlockSearchState {
     /// switch while the picker is open invalidates both.
     pub session_id: Option<String>,
     pub record_version: Option<BlockSearchRecordVersion>,
+    /// Bookmark-set revision used for the current hits. Unlike record version,
+    /// a change here only re-filters the existing bounded cache.
+    pub bookmark_revision: Option<u64>,
     /// Query the current `hits` were computed for; `None` forces a recompute
     /// on the next rendered frame.
     pub computed_query: Option<String>,
+    /// Physical-key latch for picker-local Ctrl+Shift+B. App code transitions
+    /// it only through the tested routing helpers; crate visibility keeps
+    /// struct-update syntax available to sibling-module tests.
+    pub(crate) bookmark_b_held: bool,
+    pub(crate) bookmark_b_claimed: bool,
 }
 
 impl BlockSearchState {
@@ -138,7 +295,9 @@ impl BlockSearchState {
         self.cache = Vec::new();
         self.session_id = None;
         self.record_version = None;
+        self.bookmark_revision = None;
         self.computed_query = None;
+        self.reset_bookmark_key_latch();
     }
 
     pub fn close(&mut self) {
@@ -158,7 +317,44 @@ impl BlockSearchState {
         self.selected_index = 0;
         self.session_id = None;
         self.record_version = None;
+        self.bookmark_revision = None;
         self.computed_query = None;
+        self.reset_bookmark_key_latch();
+    }
+
+    /// Route a physical `B` press. `repeat` is still checked on an unlatched
+    /// edge so a stale repeat delivered after focus loss can never toggle.
+    pub fn bookmark_key_press(
+        &mut self,
+        exact_ctrl_shift: bool,
+        repeat: bool,
+    ) -> BlockSearchBookmarkKeyRoute {
+        if self.bookmark_b_held {
+            return if self.bookmark_b_claimed {
+                BlockSearchBookmarkKeyRoute::Suppress
+            } else {
+                BlockSearchBookmarkKeyRoute::Propagate
+            };
+        }
+        if repeat {
+            return BlockSearchBookmarkKeyRoute::Suppress;
+        }
+        self.bookmark_b_held = true;
+        self.bookmark_b_claimed = exact_ctrl_shift;
+        if exact_ctrl_shift {
+            BlockSearchBookmarkKeyRoute::Toggle
+        } else {
+            BlockSearchBookmarkKeyRoute::Propagate
+        }
+    }
+
+    pub fn release_bookmark_key(&mut self) {
+        self.reset_bookmark_key_latch();
+    }
+
+    pub fn reset_bookmark_key_latch(&mut self) {
+        self.bookmark_b_held = false;
+        self.bookmark_b_claimed = false;
     }
 
     /// Release every index/result allocation before a version rebuild starts.
@@ -246,6 +442,32 @@ impl BlockSearchState {
             .flatten()
     }
 
+    pub fn bookmark_target(&self, index: usize) -> Option<BlockSearchBookmarkTarget> {
+        if !self.is_open || self.query_error.is_some() || self.computed_query.is_none() {
+            return None;
+        }
+        let hit = self.hits.get(index)?;
+        Some(BlockSearchBookmarkTarget {
+            session_id: self.session_id.clone()?,
+            record_version: self.record_version?,
+            record_id: hit.record_id.clone(),
+            line_no: hit.line_no,
+            is_output_line: hit.is_output_line,
+        })
+    }
+
+    pub fn contains_bookmark_target(&self, target: &BlockSearchBookmarkTarget) -> bool {
+        self.is_open
+            && self.query_error.is_none()
+            && self.session_id.as_deref() == Some(target.session_id.as_str())
+            && self.record_version == Some(target.record_version)
+            && self.hits.iter().any(|hit| {
+                hit.record_id == target.record_id
+                    && hit.line_no == target.line_no
+                    && hit.is_output_line == target.is_output_line
+            })
+    }
+
     /// The highlighted row's stable identity. Captured BEFORE a refresh so it
     /// survives `release_index_for_rebuild`, which empties `hits`. `None` when
     /// no row is highlighted, or when the current hits have no owning session
@@ -308,10 +530,12 @@ impl BlockSearchState {
         &self,
         active_session_id: &str,
         record_version: BlockSearchRecordVersion,
+        bookmark_revision: u64,
     ) -> bool {
         self.computed_query.as_deref() != Some(self.query.as_str())
             || self.session_id.as_deref() != Some(active_session_id)
             || self.record_version != Some(record_version)
+            || self.bookmark_revision != Some(bookmark_revision)
     }
 
     /// Result-count footer: `"N matches"` (`"1 match"`), plus
@@ -388,7 +612,7 @@ mod tests {
         assert_eq!(state.selected_index, 0);
         // session_id is cleared, which is also the cache-rebuild trigger.
         assert_eq!(state.session_id, None);
-        assert!(state.needs_refresh("s", BlockSearchRecordVersion::default()));
+        assert!(state.needs_refresh("s", BlockSearchRecordVersion::default(), 0));
         // Closing releases the (potentially large) extraction cache.
         state.close();
         assert!(!state.is_open && state.cache.is_empty() && state.hits.is_empty());
@@ -577,12 +801,14 @@ mod tests {
             oldest_sequence: Some(1),
             newest_sequence: Some(1),
         };
-        assert!(state.needs_refresh("s1", version));
+        assert!(state.needs_refresh("s1", version, 0));
         state.computed_query = Some("q".to_string());
         state.session_id = Some("s1".to_string());
         state.record_version = Some(version);
-        assert!(!state.needs_refresh("s1", version));
-        assert!(state.needs_refresh("s2", version));
+        state.bookmark_revision = Some(0);
+        assert!(!state.needs_refresh("s1", version, 0));
+        assert!(state.needs_refresh("s2", version, 0));
+        assert!(state.needs_refresh("s1", version, 1));
         assert!(state.needs_refresh(
             "s1",
             BlockSearchRecordVersion {
@@ -591,10 +817,11 @@ mod tests {
                 oldest_sequence: Some(2),
                 newest_sequence: Some(2),
                 ..version
-            }
+            },
+            0,
         ));
         state.query.push('x');
-        assert!(state.needs_refresh("s1", version));
+        assert!(state.needs_refresh("s1", version, 0));
 
         assert_eq!(state.count_label(), "0 matches");
         state.hits = vec![hit("a")];
@@ -674,5 +901,146 @@ mod tests {
         assert_eq!(state.scope, BlockSearchScope::Output);
         assert_eq!(state.filter, BlockSearchFilter::Failed);
         assert!(state.query_error.is_none());
+    }
+
+    #[test]
+    fn bookmark_key_latch_claims_until_physical_b_release() {
+        let mut state = BlockSearchState::default();
+        assert_eq!(
+            state.bookmark_key_press(true, false),
+            BlockSearchBookmarkKeyRoute::Toggle
+        );
+        assert_eq!(
+            state.bookmark_key_press(true, true),
+            BlockSearchBookmarkKeyRoute::Suppress
+        );
+        assert_eq!(
+            state.bookmark_key_press(false, true),
+            BlockSearchBookmarkKeyRoute::Suppress,
+            "releasing modifiers before B must not leak a repeat into query text"
+        );
+        state.release_bookmark_key();
+        assert_eq!(
+            state.bookmark_key_press(true, false),
+            BlockSearchBookmarkKeyRoute::Toggle
+        );
+        state.reset_bookmark_key_latch();
+        assert_eq!(
+            state.bookmark_key_press(true, true),
+            BlockSearchBookmarkKeyRoute::Suppress,
+            "a repeat received after focus loss is never a fresh toggle"
+        );
+    }
+
+    #[test]
+    fn bookmark_key_latch_preserves_shift_b_text_repeats() {
+        let mut state = BlockSearchState::default();
+        assert_eq!(
+            state.bookmark_key_press(false, false),
+            BlockSearchBookmarkKeyRoute::Propagate
+        );
+        assert_eq!(
+            state.bookmark_key_press(false, true),
+            BlockSearchBookmarkKeyRoute::Propagate
+        );
+        assert_eq!(
+            state.bookmark_key_press(true, true),
+            BlockSearchBookmarkKeyRoute::Propagate,
+            "modifiers acquired midway through one physical B do not steal text input"
+        );
+    }
+
+    #[test]
+    fn bookmark_state_uses_sequences_and_bumps_only_for_real_set_changes() {
+        let mut bookmarks = BlockBookmarkState::default();
+        let version = RetainedRecordVersion {
+            len: 2,
+            oldest_sequence: Some(10),
+            newest_sequence: Some(11),
+        };
+        assert!(bookmarks.toggle("pane", 10, version));
+        assert!(bookmarks.contains("pane", 10));
+        assert!(!bookmarks.contains("pane", 11));
+        assert_eq!(bookmarks.revision("pane"), 1);
+        assert!(!bookmarks.needs_prune("pane", version));
+
+        let live = HashSet::from([10, 11]);
+        assert!(!bookmarks.retain_live("pane", version, &live));
+        assert_eq!(bookmarks.revision("pane"), 1);
+
+        // The PTY-visible record id may later be reused, but a new terminal-
+        // owned sequence cannot inherit the old bookmark.
+        let rotated = RetainedRecordVersion {
+            len: 2,
+            oldest_sequence: Some(11),
+            newest_sequence: Some(12),
+        };
+        assert!(bookmarks.needs_prune("pane", rotated));
+        assert!(bookmarks.retain_live("pane", rotated, &HashSet::from([11, 12])));
+        assert!(!bookmarks.contains("pane", 12));
+        assert_eq!(bookmarks.revision("pane"), 2);
+        assert!(bookmarks.get("pane").is_none(), "empty sets are removed");
+    }
+
+    #[test]
+    fn bookmark_session_close_clears_truth_revision_and_prune_gate() {
+        let mut bookmarks = BlockBookmarkState::default();
+        let version = RetainedRecordVersion {
+            len: 1,
+            oldest_sequence: Some(3),
+            newest_sequence: Some(3),
+        };
+        assert!(bookmarks.toggle("pane", 3, version));
+        assert!(bookmarks.remove_session("pane"));
+        assert!(bookmarks.get("pane").is_none());
+        assert_eq!(bookmarks.revision("pane"), 0);
+        assert!(!bookmarks.needs_prune("pane", version));
+    }
+
+    #[test]
+    fn bookmark_target_is_stable_identity_not_a_queued_visual_index() {
+        let version = BlockSearchRecordVersion {
+            len: 2,
+            oldest_sequence: Some(1),
+            newest_sequence: Some(2),
+        };
+        let mut state = BlockSearchState {
+            is_open: true,
+            session_id: Some("pane".to_string()),
+            record_version: Some(version),
+            bookmark_revision: Some(0),
+            computed_query: Some(String::new()),
+            hits: vec![hit("first"), hit("second")],
+            ..Default::default()
+        };
+        let target = state.bookmark_target(1).expect("current row identity");
+        state.hits.swap(0, 1);
+        assert!(state.contains_bookmark_target(&target));
+        state
+            .hits
+            .retain(|candidate| candidate.record_id != "second");
+        assert!(!state.contains_bookmark_target(&target));
+        state.hits.push(hit("second"));
+        state.record_version = Some(BlockSearchRecordVersion {
+            newest_sequence: Some(3),
+            ..version
+        });
+        assert!(!state.contains_bookmark_target(&target));
+    }
+
+    #[test]
+    fn bookmarked_empty_state_distinguishes_truth_scope_and_query() {
+        assert_eq!(
+            bookmarked_empty_message(false, true),
+            "No bookmarked command blocks in retained history"
+        );
+        assert_eq!(
+            bookmarked_empty_message(true, true),
+            "No bookmarked blocks with retained text in this scope"
+        );
+        assert_eq!(
+            bookmarked_empty_message(true, false),
+            "No matches in bookmarked blocks"
+        );
     }
 }

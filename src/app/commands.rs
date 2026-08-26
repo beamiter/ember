@@ -66,6 +66,60 @@ pub struct CommandTarget {
     pub execution_id: String,
 }
 
+fn retained_record_version(
+    records: &std::collections::VecDeque<crate::terminal::CommandRecord>,
+) -> crate::block_search::RetainedRecordVersion {
+    crate::block_search::RetainedRecordVersion {
+        len: records.len(),
+        oldest_sequence: records.front().map(|record| record.sequence),
+        newest_sequence: records.back().map(|record| record.sequence),
+    }
+}
+
+fn block_search_record_version(
+    records: &std::collections::VecDeque<crate::terminal::CommandRecord>,
+) -> crate::block_search::BlockSearchRecordVersion {
+    let mut complete = records.iter().filter(|record| record.complete);
+    let oldest_sequence = complete.next().map(|record| record.sequence);
+    let mut len = usize::from(oldest_sequence.is_some());
+    let mut newest_sequence = oldest_sequence;
+    for record in complete {
+        len += 1;
+        newest_sequence = Some(record.sequence);
+    }
+    crate::block_search::BlockSearchRecordVersion {
+        len,
+        oldest_sequence,
+        newest_sequence,
+    }
+}
+
+fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+}
+
+fn metadata_browse_display(
+    record: &crate::block_mode::CachedBlockSearchRecord,
+    scope: crate::block_mode::BlockSearchScope,
+) -> Option<(&str, bool, Option<usize>)> {
+    let command = record
+        .command
+        .as_deref()
+        .map(|command| (command, false, None));
+    let output = record
+        .output
+        .as_deref()
+        .and_then(first_meaningful_line)
+        .map(|(index, line)| (line, true, Some(index + 1)));
+    match scope {
+        crate::block_mode::BlockSearchScope::All => command.or(output),
+        crate::block_mode::BlockSearchScope::Command => command,
+        crate::block_mode::BlockSearchScope::Output => output,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockSearchActivation {
     RejectStale,
@@ -1625,7 +1679,7 @@ impl TerminalApp {
             }
             crate::block_mode::BlockMenuAction::Search => self.block_search_toggle(),
             crate::block_mode::BlockMenuAction::ToggleBookmark => {
-                self.block_toggle_bookmark_target(&target)
+                let _ = self.block_toggle_bookmark_target(&target);
             }
             crate::block_mode::BlockMenuAction::CopyJson => self.copy_block_json(&target),
             crate::block_mode::BlockMenuAction::CollapseOutput => {
@@ -1735,39 +1789,39 @@ impl TerminalApp {
         true
     }
 
-    fn block_toggle_bookmark_target(&mut self, target: &CommandTarget) {
-        let target_is_complete = self
-            .target_session_index(target)
-            .and_then(|index| self.session_manager.sessions().get(index))
-            .is_some_and(|session| {
-                session
-                    .terminal
-                    .lock()
-                    .command_record(&target.execution_id)
-                    .is_some_and(|record| record.complete)
-            });
-        if !target_is_complete {
-            self.set_status("Command block is no longer available");
-            return;
-        }
-        let bookmarks = self
-            .block_bookmarks
-            .entry(target.session_id.clone())
-            .or_default();
-        let added = if bookmarks.remove(&target.execution_id) {
-            false
-        } else {
-            bookmarks.insert(target.execution_id.clone());
-            true
-        };
-        if bookmarks.is_empty() {
-            self.block_bookmarks.remove(&target.session_id);
-        }
+    fn toggle_resolved_block_bookmark(
+        &mut self,
+        session_id: &str,
+        sequence: u64,
+        version: crate::block_search::RetainedRecordVersion,
+    ) -> bool {
+        let added = self.block_bookmarks.toggle(session_id, sequence, version);
         self.set_status(if added {
             "Bookmarked command block"
         } else {
             "Removed command block bookmark"
         });
+        added
+    }
+
+    fn block_toggle_bookmark_target(&mut self, target: &CommandTarget) -> Option<bool> {
+        let identity = self
+            .target_session_index(target)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .and_then(|session| {
+                let terminal = session.terminal.lock();
+                let records = terminal.command_records();
+                let sequence = terminal
+                    .command_record(&target.execution_id)
+                    .filter(|record| record.complete)
+                    .map(|record| record.sequence)?;
+                Some((sequence, retained_record_version(records)))
+            });
+        let Some((sequence, version)) = identity else {
+            self.set_status("That block is no longer retained");
+            return None;
+        };
+        Some(self.toggle_resolved_block_bookmark(&target.session_id, sequence, version))
     }
 
     pub(crate) fn block_toggle_bookmark(&mut self) {
@@ -1785,7 +1839,110 @@ impl TerminalApp {
             self.set_status("Select a completed command block to bookmark");
             return;
         };
-        self.block_toggle_bookmark_target(&target);
+        let _ = self.block_toggle_bookmark_target(&target);
+    }
+
+    /// Toggle the record behind one picker hit without activating or closing
+    /// the row. Every path validates the live record id and resolves it to the
+    /// terminal-owned sequence before touching bookmark truth.
+    pub(crate) fn block_search_toggle_bookmark(
+        &mut self,
+        target: Option<crate::block_search::BlockSearchBookmarkTarget>,
+    ) -> bool {
+        if !self.block_search.is_open {
+            return false;
+        }
+        if self.block_search.query_error.is_some() {
+            self.set_status("Fix the search query before bookmarking a result");
+            return false;
+        }
+        let Some(target) = target else {
+            self.block_search.computed_query = None;
+            self.refresh_block_search_hits();
+            self.set_status(if self.block_search.hits.is_empty() {
+                "No search result is selected"
+            } else {
+                "Block search is refreshing; choose the result again"
+            });
+            return false;
+        };
+        let active_session_id = self
+            .session_manager
+            .get_active_session_mut()
+            .metadata
+            .session_id
+            .clone();
+        let identity = if active_session_id == target.session_id
+            && self.block_search.contains_bookmark_target(&target)
+        {
+            self.session_manager
+                .index_of(&target.session_id)
+                .and_then(|index| self.session_manager.sessions().get(index))
+                .and_then(|session| {
+                    let terminal = session.terminal.lock();
+                    let records = terminal.command_records();
+                    if block_search_record_version(records) != target.record_version {
+                        return None;
+                    }
+                    let sequence = terminal
+                        .command_record(&target.record_id)
+                        .filter(|record| record.complete)
+                        .map(|record| record.sequence)?;
+                    Some((sequence, retained_record_version(records)))
+                })
+        } else {
+            None
+        };
+        let Some((sequence, version)) = identity else {
+            self.block_search.computed_query = None;
+            self.refresh_block_search_hits();
+            self.set_status("That search result is no longer retained");
+            return false;
+        };
+        self.toggle_resolved_block_bookmark(&target.session_id, sequence, version);
+        {
+            // Bookmark revision forces an anchor-preserving re-filter of the
+            // existing bounded cache. Under Bookmarked, removing the selected
+            // record therefore lands on the closest surviving old rank.
+            self.block_search.needs_focus = true;
+            self.refresh_block_search_hits();
+        }
+        true
+    }
+
+    /// Prune only after the retained `command_records` deque identity changes.
+    /// The O(1) gate keeps static frames cheap; a changed deque then scans at
+    /// most the bounded semantic history. Captured-output or scrollback
+    /// eviction leaves this version unchanged and cannot erase bookmarks.
+    pub(crate) fn prune_block_bookmarks_to_retained_records(&mut self) -> bool {
+        let mut changed = false;
+        for session_id in self.block_bookmarks.session_ids() {
+            let Some(session) = self
+                .session_manager
+                .sessions()
+                .iter()
+                .find(|session| session.metadata.session_id == session_id)
+            else {
+                changed |= self.block_bookmarks.remove_session(&session_id);
+                continue;
+            };
+            let terminal = session.terminal.lock();
+            let records = terminal.command_records();
+            let version = retained_record_version(records);
+            if !self.block_bookmarks.needs_prune(&session_id, version) {
+                continue;
+            }
+            let live_complete_sequences = records
+                .iter()
+                .filter(|record| record.complete)
+                .map(|record| record.sequence)
+                .collect::<std::collections::HashSet<_>>();
+            drop(terminal);
+            changed |=
+                self.block_bookmarks
+                    .retain_live(&session_id, version, &live_complete_sequences);
+        }
+        changed
     }
 
     pub(crate) fn block_jump_bookmark(&mut self, step: crate::block_mode::SelectStep) {
@@ -1796,31 +1953,41 @@ impl TerminalApp {
             return;
         }
         let records = terminal.command_records();
-        let valid_ids = records
+        let valid_records = records
             .iter()
             .filter(|record| record.complete)
-            .map(|record| record.id.clone())
+            .map(|record| (record.sequence, record.id.clone()))
             .collect::<Vec<_>>();
         let current = self
             .block_selection
             .as_ref()
             .filter(|selection| selection.session_id == session_id)
-            .and_then(|selection| valid_ids.iter().position(|id| id == &selection.active_id));
+            .and_then(|selection| {
+                valid_records
+                    .iter()
+                    .position(|(_, id)| id == &selection.active_id)
+            });
         let mut bookmarked_indices = self
             .block_bookmarks
             .get(&session_id)
             .map(|bookmarks| {
-                valid_ids
+                valid_records
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, id)| bookmarks.contains(id).then_some(index))
+                    .filter_map(|(index, (sequence, _))| {
+                        bookmarks.contains(sequence).then_some(index)
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let retained_version = retained_record_version(records);
+        let retained_sequences = valid_records
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<std::collections::HashSet<_>>();
         drop(terminal);
-        if let Some(bookmarks) = self.block_bookmarks.get_mut(&session_id) {
-            bookmarks.retain(|id| valid_ids.iter().any(|valid| valid == id));
-        }
+        self.block_bookmarks
+            .retain_live(&session_id, retained_version, &retained_sequences);
         if bookmarked_indices.is_empty() {
             let message =
                 self.explain_block_absence("No bookmarked command blocks in this session");
@@ -1847,7 +2014,7 @@ impl TerminalApp {
                 })
                 .unwrap_or(bookmarked_indices[0]),
         };
-        let Some(record_id) = valid_ids.get(target_index).cloned() else {
+        let Some((_, record_id)) = valid_records.get(target_index).cloned() else {
             return;
         };
         self.apply_block_selection(CommandTarget {
@@ -2909,32 +3076,21 @@ impl TerminalApp {
         let (session_id, record_version) = {
             let session = self.session_manager.get_active_session_mut();
             let terminal = session.terminal.lock();
-            let mut complete = terminal
-                .command_records()
-                .iter()
-                .filter(|record| record.complete);
-            let oldest_sequence = complete.next().map(|record| record.sequence);
-            let mut len = usize::from(oldest_sequence.is_some());
-            let mut newest_sequence = oldest_sequence;
-            for record in complete {
-                len += 1;
-                newest_sequence = Some(record.sequence);
-            }
             (
                 session.metadata.session_id.clone(),
-                crate::block_search::BlockSearchRecordVersion {
-                    len,
-                    oldest_sequence,
-                    newest_sequence,
-                },
+                block_search_record_version(terminal.command_records()),
             )
         };
+        let bookmark_revision = self.block_bookmarks.revision(&session_id);
         // 切换 tab/pane 后旧的高亮行不再有任何意义:同名 id 会指向另一个
         // pane 里完全无关的块。回到第一行。
         if anchor_session_id.as_deref() != Some(session_id.as_str()) {
             retained_anchor = None;
         }
-        if !self.block_search.needs_refresh(&session_id, record_version) {
+        if !self
+            .block_search
+            .needs_refresh(&session_id, record_version, bookmark_revision)
+        {
             return;
         }
         let cache_needs_rebuild = self.block_search.session_id.as_deref()
@@ -2979,10 +3135,9 @@ impl TerminalApp {
                             duration >= self.config.notify_long_block_threshold_ms
                         })
                     }
-                    crate::block_search::BlockSearchFilter::Bookmarked => self
-                        .block_bookmarks
-                        .get(&session_id)
-                        .is_some_and(|bookmarks| bookmarks.contains(&record.id)),
+                    crate::block_search::BlockSearchFilter::Bookmarked => {
+                        self.block_bookmarks.contains(&session_id, record.sequence)
+                    }
                     crate::block_search::BlockSearchFilter::Background => matches!(
                         crate::block_mode::classify_outcome(
                             record.command.as_deref(),
@@ -3017,30 +3172,7 @@ impl TerminalApp {
                         capped = true;
                         break;
                     }
-                    let display = match scope {
-                        crate::block_mode::BlockSearchScope::All => {
-                            if let Some(command) = &record.command {
-                                Some((command.as_str(), false, None))
-                            } else if let Some(line) = record
-                                .output
-                                .as_deref()
-                                .and_then(|text| text.lines().next())
-                            {
-                                Some((line, true, Some(1)))
-                            } else {
-                                Some(("Background output", false, None))
-                            }
-                        }
-                        crate::block_mode::BlockSearchScope::Command => record
-                            .command
-                            .as_deref()
-                            .map(|command| (command, false, None)),
-                        crate::block_mode::BlockSearchScope::Output => record
-                            .output
-                            .as_deref()
-                            .and_then(|text| text.lines().next())
-                            .map(|line| (line, true, Some(1))),
-                    };
+                    let display = metadata_browse_display(record, scope);
                     let Some((line_text, is_output_line, line_no)) = display else {
                         continue;
                     };
@@ -3088,6 +3220,7 @@ impl TerminalApp {
         }
         self.block_search.session_id = Some(session_id);
         self.block_search.record_version = Some(record_version);
+        self.block_search.bookmark_revision = Some(bookmark_revision);
         self.block_search.computed_query = Some(query);
     }
 
@@ -5228,5 +5361,56 @@ mod tests {
         assert!(!defer_same_session_block_search_rebuild_if_invalid(
             &mut state, "pane-b"
         ));
+    }
+
+    #[test]
+    fn metadata_browse_scopes_use_only_real_meaningful_text() {
+        let background = crate::block_mode::CachedBlockSearchRecord::new(
+            "background",
+            None,
+            Some("\n  \nfirst output\nsecond output".to_string()),
+        );
+        assert_eq!(
+            metadata_browse_display(&background, crate::block_mode::BlockSearchScope::Command),
+            None,
+            "commandless background records must not synthesize Cmd text"
+        );
+        assert_eq!(
+            metadata_browse_display(&background, crate::block_mode::BlockSearchScope::Output),
+            Some(("first output", true, Some(3)))
+        );
+        assert_eq!(
+            metadata_browse_display(&background, crate::block_mode::BlockSearchScope::All),
+            Some(("first output", true, Some(3))),
+            "All must fall back to retained output, never a fake Background output label"
+        );
+
+        let command_only = crate::block_mode::CachedBlockSearchRecord::new(
+            "command",
+            Some("  printf hi  \necho done"),
+            Some("\n\t".to_string()),
+        );
+        assert_eq!(
+            metadata_browse_display(&command_only, crate::block_mode::BlockSearchScope::All),
+            Some(("  printf hi  \necho done", false, None))
+        );
+        assert_eq!(
+            metadata_browse_display(&command_only, crate::block_mode::BlockSearchScope::Output),
+            None,
+            "blank retained output is not a browse hit"
+        );
+
+        let blank = crate::block_mode::CachedBlockSearchRecord::new(
+            "blank",
+            None,
+            Some("\n \t\n".to_string()),
+        );
+        for scope in [
+            crate::block_mode::BlockSearchScope::All,
+            crate::block_mode::BlockSearchScope::Command,
+            crate::block_mode::BlockSearchScope::Output,
+        ] {
+            assert_eq!(metadata_browse_display(&blank, scope), None);
+        }
     }
 }

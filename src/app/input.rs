@@ -24,6 +24,51 @@ fn is_plain_block_search_refresh_key(
     key == egui::Key::F5 && modifiers == egui::Modifiers::NONE && !repeat
 }
 
+fn is_exact_block_search_bookmark_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    key == egui::Key::B && modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.mac_cmd
+}
+
+fn route_block_search_bookmark_key_event(
+    state: &mut crate::block_search::BlockSearchState,
+    event: &egui::Event,
+) -> Option<crate::block_search::BlockSearchBookmarkKeyRoute> {
+    match event {
+        egui::Event::WindowFocused(false) => {
+            state.reset_bookmark_key_latch();
+            None
+        }
+        egui::Event::Key {
+            key,
+            pressed: false,
+            ..
+        } if *key == egui::Key::B => {
+            state.release_bookmark_key();
+            None
+        }
+        egui::Event::Key {
+            key,
+            pressed: true,
+            repeat,
+            modifiers,
+            ..
+        } if *key == egui::Key::B => Some(state.bookmark_key_press(
+            is_exact_block_search_bookmark_chord(*key, *modifiers),
+            *repeat,
+        )),
+        _ => None,
+    }
+}
+
+fn route_block_search_bookmark_after_primary(
+    state: &mut crate::block_search::BlockSearchState,
+    event: &egui::Event,
+    primary: BlockSearchKeyRoute,
+) -> Option<crate::block_search::BlockSearchBookmarkKeyRoute> {
+    (primary == BlockSearchKeyRoute::Other)
+        .then(|| route_block_search_bookmark_key_event(state, event))
+        .flatten()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockSearchKeyRoute {
     CloseToggle,
@@ -1686,6 +1731,9 @@ impl TerminalApp {
                 ..
             } = evt
             else {
+                // Release/focus-loss transitions must reset the logical-B
+                // latch even though they are not press actions.
+                let _ = route_block_search_bookmark_key_event(&mut self.block_search, evt);
                 continue;
             };
             // egui makes every button Tab-focusable and activates a focused
@@ -1696,13 +1744,14 @@ impl TerminalApp {
             // next Enter as the normal picker confirmation.
             let intent_control_owns_enter = focus_may_have_changed
                 || (self.block_search.intent_control_focused && !self.block_search.needs_focus);
-            match block_search_key_route(
+            let primary_route = block_search_key_route(
                 *key,
                 *modifiers,
                 *repeat,
                 intent_control_owns_enter,
                 &self.keybindings,
-            ) {
+            );
+            match primary_route {
                 BlockSearchKeyRoute::CloseToggle => {
                     self.block_search.close();
                     // Remove the chord before the global keybinding pass, so
@@ -1726,6 +1775,36 @@ impl TerminalApp {
                     break;
                 }
                 BlockSearchKeyRoute::Other => {}
+            }
+            if let Some(route) = route_block_search_bookmark_after_primary(
+                &mut self.block_search,
+                evt,
+                primary_route,
+            ) {
+                match route {
+                    crate::block_search::BlockSearchBookmarkKeyRoute::Toggle => {
+                        // Clone the currently highlighted stable identity
+                        // before any refresh can move the visual index. The
+                        // shared action revalidates its pane/generation/live
+                        // record and refreshes with an anchor on success.
+                        let index = self.block_search.selected_index;
+                        let target = self.block_search.bookmark_target(index);
+                        let _ = self.block_search_toggle_bookmark(target);
+                        // Own both the key and any generated text so neither
+                        // the query editor nor the pane-level bookmark action
+                        // sees this picker-local chord.
+                        consume_bound_key_event(&mut self.frame_events, *key, *modifiers);
+                        continue;
+                    }
+                    crate::block_search::BlockSearchBookmarkKeyRoute::Suppress => {
+                        // A claimed logical key remains claimed even if the
+                        // user releases Ctrl/Shift before B. This is the edge
+                        // that prevents a repeat from leaking `b` into query.
+                        consume_bound_key_event(&mut self.frame_events, *key, *modifiers);
+                        continue;
+                    }
+                    crate::block_search::BlockSearchBookmarkKeyRoute::Propagate => {}
+                }
             }
             match key {
                 egui::Key::Escape => {
@@ -2165,6 +2244,88 @@ mod tests {
     }
 
     #[test]
+    fn block_search_bookmark_chord_is_exact_ctrl_shift_b() {
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            // Linux/Windows mirror Ctrl in the logical command bit; that is
+            // not an additional physical modifier.
+            command: true,
+            ..Default::default()
+        };
+        assert!(is_exact_block_search_bookmark_chord(
+            egui::Key::B,
+            ctrl_shift
+        ));
+        assert!(!is_exact_block_search_bookmark_chord(
+            egui::Key::G,
+            ctrl_shift
+        ));
+        for extra in [
+            egui::Modifiers {
+                alt: true,
+                ..ctrl_shift
+            },
+            egui::Modifiers {
+                mac_cmd: true,
+                ..ctrl_shift
+            },
+            egui::Modifiers {
+                ctrl: false,
+                ..ctrl_shift
+            },
+            egui::Modifiers {
+                shift: false,
+                ..ctrl_shift
+            },
+        ] {
+            assert!(!is_exact_block_search_bookmark_chord(egui::Key::B, extra));
+        }
+    }
+
+    #[test]
+    fn configured_block_search_binding_wins_ctrl_shift_b_collision() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut bindings = keybindings::KeyBindings::new();
+        bindings
+            .bindings
+            .insert("ctrl+shift+b".to_string(), "block:search".to_string());
+        let press = key_press(egui::Key::B, modifiers);
+        let primary = block_search_key_route(egui::Key::B, modifiers, false, false, &bindings);
+        assert_eq!(primary, BlockSearchKeyRoute::CloseToggle);
+        let mut state = crate::block_search::BlockSearchState::default();
+        assert_eq!(
+            route_block_search_bookmark_after_primary(&mut state, &press, primary),
+            None,
+            "the configured close action must not also arm or toggle Bookmarked"
+        );
+        assert_eq!(
+            route_block_search_bookmark_after_primary(
+                &mut state,
+                &press,
+                BlockSearchKeyRoute::Other,
+            ),
+            Some(crate::block_search::BlockSearchBookmarkKeyRoute::Toggle),
+            "the rejected lower-priority route did not mutate the B latch"
+        );
+
+        state.reset_bookmark_key_latch();
+        let repeat = key_repeat(egui::Key::B, modifiers);
+        let repeat_primary =
+            block_search_key_route(egui::Key::B, modifiers, true, false, &bindings);
+        assert_eq!(repeat_primary, BlockSearchKeyRoute::SuppressToggleRepeat);
+        assert_eq!(
+            route_block_search_bookmark_after_primary(&mut state, &repeat, repeat_primary,),
+            None
+        );
+    }
+
+    #[test]
     fn transformed_next_after_last_mark_returns_to_live_bottom() {
         assert!(transformed_next_command_returns_to_bottom(true, false, 7));
         assert!(!transformed_next_command_returns_to_bottom(true, false, 0));
@@ -2215,6 +2376,109 @@ mod tests {
             repeat: true,
             modifiers,
         }
+    }
+
+    fn key_release(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: false,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn block_search_logical_b_event_latch_survives_modifier_release_and_resets() {
+        use crate::block_search::BlockSearchBookmarkKeyRoute::{Propagate, Suppress, Toggle};
+
+        let exact = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut state = crate::block_search::BlockSearchState::default();
+        assert_eq!(
+            route_block_search_bookmark_key_event(&mut state, &key_press(egui::Key::B, exact)),
+            Some(Toggle)
+        );
+        assert_eq!(
+            route_block_search_bookmark_key_event(
+                &mut state,
+                &key_repeat(egui::Key::B, egui::Modifiers::NONE)
+            ),
+            Some(Suppress),
+            "modifier release cannot leak a held bookmark B into query text"
+        );
+        assert_eq!(
+            route_block_search_bookmark_key_event(
+                &mut state,
+                &key_release(egui::Key::B, egui::Modifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            route_block_search_bookmark_key_event(&mut state, &key_press(egui::Key::B, exact)),
+            Some(Toggle)
+        );
+
+        assert_eq!(
+            route_block_search_bookmark_key_event(&mut state, &egui::Event::WindowFocused(false)),
+            None
+        );
+        assert_eq!(
+            route_block_search_bookmark_key_event(
+                &mut state,
+                &key_press(egui::Key::B, egui::Modifiers::SHIFT)
+            ),
+            Some(Propagate)
+        );
+        assert_eq!(
+            route_block_search_bookmark_key_event(
+                &mut state,
+                &key_repeat(egui::Key::B, egui::Modifiers::SHIFT)
+            ),
+            Some(Propagate),
+            "ordinary uppercase text retains auto-repeat"
+        );
+
+        let _ = route_block_search_bookmark_key_event(
+            &mut state,
+            &key_release(egui::Key::B, egui::Modifiers::SHIFT),
+        );
+        let logical_b_on_another_physical_key = egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: Some(egui::Key::P),
+            pressed: true,
+            repeat: false,
+            modifiers: exact,
+        };
+        assert_eq!(
+            route_block_search_bookmark_key_event(&mut state, &logical_b_on_another_physical_key,),
+            Some(Toggle),
+            "shortcut recognition follows the user's logical keyboard layout"
+        );
+        let logical_b_release = egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: Some(egui::Key::P),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = route_block_search_bookmark_key_event(&mut state, &logical_b_release);
+        let physical_b_with_another_logical_key = egui::Event::Key {
+            key: egui::Key::X,
+            physical_key: Some(egui::Key::B),
+            pressed: true,
+            repeat: false,
+            modifiers: exact,
+        };
+        assert_eq!(
+            route_block_search_bookmark_key_event(&mut state, &physical_b_with_another_logical_key,),
+            None,
+            "an unrelated logical shortcut is not stolen by physical position"
+        );
     }
 
     fn block_search_route_prefix(

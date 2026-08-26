@@ -336,7 +336,7 @@ are shown as unavailable because Ember's history is one continuous terminal
 grid; pretending to delete only metadata would leave the visible terminal bytes
 behind.
 
-`Ctrl+Shift+G` opens Block Search 3.9. `Aa` selects case-sensitive matching,
+`Ctrl+Shift+G` opens Block Search 4.3. `Aa` selects case-sensitive matching,
 `.*` selects Rust-regex matching, and `W` requires Unicode whole-word matches;
 `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle the same controls without leaving the
 query. `All / Cmd / Out` restricts matching to all text, commands, or output;
@@ -349,6 +349,25 @@ keeping the virtual list aligned. `Enter` reveals and closes; `Shift+Enter`
 reveals, keeps the picker focused, and advances only after the record is
 revalidated. An evicted result stays open, refreshes, and reports the stale
 target instead of silently stepping.
+Each virtual result row has its own `☆` / `★` bookmark button. Clicking the
+star never jumps or closes the picker; exact `Ctrl+Shift+B` toggles the
+highlighted hit instead. Both paths validate the current pane, completed-record
+generation, hit identity, and live record before resolving the terminal-owned
+monotonic sequence. This keeps every command/output hit for one record in sync
+and prevents a later PTY-reused record id from inheriting a bookmark. Holding
+the chord toggles at most once even if Ctrl or Shift is released before B;
+ordinary Shift+B repeats still type normally. If `block:search` itself is
+remapped to Ctrl+Shift+B, its close/repeat behavior retains priority over the
+picker-local bookmark action. Under the Bookmarked filter,
+removing the current record retains the nearest surviving result. Bookmarks are
+pane-local and process-lifetime only: session close clears them, while real
+`command_records` retirement prunes them behind a deque-version gate. Output
+snapshot or scrollback eviction alone never removes one. Accessible result rows
+report selected state, bookmark buttons report pressed state and action, and
+the picker distinguishes no retained bookmarks from bookmarks with no real text
+in the chosen scope. Empty-query metadata browsing never invents command or
+output text: `All` / `Out` use the first nonblank retained output line when no
+real command is available, and `Cmd` produces no hit for a commandless record.
 Reopening restores the last valid query, matching controls, scope, and
 metadata filter for this process only; it is never written to config or a
 session snapshot. `Ctrl+U` clears only the query; **Reset** or `Ctrl+Shift+U`
@@ -584,7 +603,7 @@ Defaults include:
 | Select previous / next command block | `Ctrl+Shift+[` / `Ctrl+Shift+]` (also bound as `{` / `}`, since layouts report the shifted bracket either way) |
 | Jump to the oldest failed block | `Ctrl+Shift+X` |
 | Previous / next failed block | `Ctrl+Shift+,` / `Ctrl+Shift+.` |
-| Toggle bookmark on the active completed block | `Ctrl+Shift+B` |
+| Toggle bookmark on the active completed block (or selected Block Search hit) | `Ctrl+Shift+B` |
 | Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
 | Toggle Agent panel | `Ctrl+Shift+Alt+A` |

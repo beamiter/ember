@@ -62,6 +62,39 @@ fn terminal_frame_interaction_enabled(
     !terminal_input_blocked && !frame_pointer_input_blocked
 }
 
+fn block_search_record_is_bookmarked(
+    record_id: &str,
+    live_record_sequences: &std::collections::HashMap<String, u64>,
+    bookmarked_sequences: &std::collections::HashSet<u64>,
+) -> bool {
+    live_record_sequences
+        .get(record_id)
+        .is_some_and(|sequence| bookmarked_sequences.contains(sequence))
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct BlockSearchRowWidgetIdentity<'a> {
+    session_id: &'a str,
+    record_version: crate::block_search::BlockSearchRecordVersion,
+    record_id: &'a str,
+    line_no: Option<usize>,
+    is_output_line: bool,
+}
+
+fn block_search_row_widget_identity<'a>(
+    session_id: &'a str,
+    record_version: crate::block_search::BlockSearchRecordVersion,
+    hit: &'a crate::block_mode::BlockSearchHit,
+) -> BlockSearchRowWidgetIdentity<'a> {
+    BlockSearchRowWidgetIdentity {
+        session_id,
+        record_version,
+        record_id: &hit.record_id,
+        line_no: hit.line_no,
+        is_output_line: hit.is_output_line,
+    }
+}
+
 /// Adjust the next PTY parsing budget from measured parser work, not from the
 /// interval between UI frames. The latter includes time spent completely idle
 /// and used to collapse the budget after a cursor-blink repaint.
@@ -1370,7 +1403,9 @@ impl TerminalApp {
 
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
         let mut clicked_hit_index = None;
+        let mut clicked_bookmark_target = None;
         let mut hovered_hit_index = None;
+        let mut focused_hit_index = None;
         let block_search_pointer_moved =
             ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
         if self.block_search.is_open {
@@ -1384,11 +1419,36 @@ impl TerminalApp {
             self.refresh_block_search_hits();
 
             let active_index = self.session_manager.active_index();
-            let pane_has_prompt_marks = self
+            let picker_session_id = self.block_search.session_id.clone();
+            let (pane_has_prompt_marks, live_record_sequences) = self
                 .session_manager
                 .sessions()
                 .get(active_index)
-                .is_some_and(|session| session.terminal.lock().has_prompt_marks());
+                .map(|session| {
+                    let terminal = session.terminal.lock();
+                    let sequences = if picker_session_id.as_deref()
+                        == Some(session.metadata.session_id.as_str())
+                    {
+                        terminal
+                            .command_records()
+                            .iter()
+                            .filter(|record| record.complete)
+                            .map(|record| (record.id.clone(), record.sequence))
+                            .collect::<std::collections::HashMap<_, _>>()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    (terminal.has_prompt_marks(), sequences)
+                })
+                .unwrap_or_default();
+            let bookmarked_sequences = picker_session_id
+                .as_deref()
+                .and_then(|session_id| self.block_bookmarks.get(session_id))
+                .cloned()
+                .unwrap_or_default();
+            let has_live_bookmarks = live_record_sequences
+                .values()
+                .any(|sequence| bookmarked_sequences.contains(sequence));
             let pane_has_completed_blocks = self
                 .block_search
                 .record_version
@@ -1649,10 +1709,36 @@ impl TerminalApp {
                                     };
                                     let is_selected = idx == selected_index;
                                     let width = ui.available_width();
-                                    let (rect, response) = ui.allocate_exact_size(
+                                    let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(width, BLOCK_SEARCH_ROW_HEIGHT),
-                                        egui::Sense::click(),
+                                        egui::Sense::hover(),
                                     );
+                                    let bookmark_width = 30.0;
+                                    let row_rect = egui::Rect::from_min_max(
+                                        rect.min,
+                                        egui::pos2(rect.right() - bookmark_width, rect.bottom()),
+                                    );
+                                    let bookmark_rect = egui::Rect::from_min_max(
+                                        egui::pos2(row_rect.right(), rect.top()),
+                                        rect.max,
+                                    );
+                                    let record_version = self
+                                        .block_search
+                                        .record_version
+                                        .unwrap_or_default();
+                                    let stable_row_identity = block_search_row_widget_identity(
+                                        picker_session_id.as_deref().unwrap_or_default(),
+                                        record_version,
+                                        hit,
+                                    );
+                                    let response = ui
+                                        .push_id(("block-search-result", stable_row_identity), |ui| {
+                                            ui.put(
+                                                row_rect,
+                                                egui::Button::new("").frame(false),
+                                            )
+                                        })
+                                        .inner;
                                     if is_selected {
                                         ui.painter().rect_filled(
                                             rect,
@@ -1664,7 +1750,7 @@ impl TerminalApp {
                                         );
                                     }
 
-                                    let content_rect = rect.shrink2(egui::vec2(4.0, 2.0));
+                                    let content_rect = row_rect.shrink2(egui::vec2(4.0, 2.0));
                                     ui.scope_builder(
                                         egui::UiBuilder::new()
                                             .max_rect(content_rect)
@@ -1727,10 +1813,85 @@ impl TerminalApp {
                                         ui.visuals().widgets.noninteractive.bg_stroke,
                                     );
 
+                                    let bookmarked = block_search_record_is_bookmarked(
+                                        &hit.record_id,
+                                        &live_record_sequences,
+                                        &bookmarked_sequences,
+                                    );
+                                    let bookmark_label = if bookmarked {
+                                        "Remove bookmark from this block"
+                                    } else {
+                                        "Bookmark this block for this running session"
+                                    };
+                                    let bookmark_response = ui
+                                        .push_id(
+                                            ("block-search-bookmark", stable_row_identity),
+                                            |ui| {
+                                                ui.put(
+                                                    bookmark_rect
+                                                        .shrink2(egui::vec2(2.0, 4.0)),
+                                                    egui::Button::new(if bookmarked {
+                                                        "★"
+                                                    } else {
+                                                        "☆"
+                                                    })
+                                                    .selected(bookmarked)
+                                                    .frame(false),
+                                                )
+                                            },
+                                        )
+                                        .inner
+                                        .on_hover_text(bookmark_label);
+                                    bookmark_response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            bookmarked,
+                                            bookmark_label,
+                                        )
+                                    });
+                                    intent_control_focused |= bookmark_response.has_focus();
+                                    if bookmark_response.clicked() {
+                                        clicked_bookmark_target =
+                                            Some(self.block_search.bookmark_target(idx));
+                                    }
+
                                     let response = response
                                         .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let row_accessible_label = if hit.is_output_line {
+                                        format!(
+                                            "Result {} of {}; {}; output line {} for {}",
+                                            idx + 1,
+                                            hit_count,
+                                            hit.line_text,
+                                            hit.line_no.unwrap_or(0),
+                                            if hit.command_preview.is_empty() {
+                                                "a commandless block"
+                                            } else {
+                                                hit.command_preview.as_str()
+                                            }
+                                        )
+                                    } else {
+                                        format!(
+                                            "Result {} of {}; {}; command",
+                                            idx + 1,
+                                            hit_count,
+                                            hit.line_text
+                                        )
+                                    };
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            is_selected,
+                                            &row_accessible_label,
+                                        )
+                                    });
                                     if response.hovered() {
                                         hovered_hit_index = Some(idx);
+                                    }
+                                    if response.has_focus() {
+                                        focused_hit_index = Some(idx);
                                     }
                                     if response.clicked() {
                                         clicked_hit_index = Some(idx);
@@ -1742,38 +1903,45 @@ impl TerminalApp {
                         egui::ScrollArea::vertical()
                             .max_height(list_height)
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(if !pane_has_prompt_marks {
-                                        "This pane has no command blocks: the shell is not reporting commands (OSC 133). Run “Install or update jsh” from the command palette."
-                                    } else if !pane_has_completed_blocks {
-                                        "This pane has no completed command blocks yet"
-                                    } else if query_is_empty {
-                                        if self.block_search.filter
-                                            == crate::block_search::BlockSearchFilter::All
-                                        {
-                                            "Type to search every command block in this session"
-                                        } else if self.block_search.older_not_indexed {
-                                            "No matching indexed blocks · older blocks not indexed"
-                                        } else {
-                                            "No matching blocks"
-                                        }
+                                let mut empty_message = if !pane_has_prompt_marks {
+                                    "This pane has no command blocks: the shell is not reporting commands (OSC 133). Run “Install or update jsh” from the command palette.".to_string()
+                                } else if !pane_has_completed_blocks {
+                                    "This pane has no completed command blocks yet".to_string()
+                                } else if self.block_search.filter
+                                    == crate::block_search::BlockSearchFilter::Bookmarked
+                                {
+                                    crate::block_search::bookmarked_empty_message(
+                                        has_live_bookmarks,
+                                        query_is_empty,
+                                    )
+                                    .to_string()
+                                } else if query_is_empty {
+                                    if self.block_search.filter
+                                        == crate::block_search::BlockSearchFilter::All
+                                    {
+                                        "Type to search every command block in this session"
+                                            .to_string()
                                     } else {
-                                        if self.block_search.older_not_indexed {
-                                            "No matches in indexed blocks · older blocks not indexed"
-                                        } else {
-                                            "No matches"
-                                        }
-                                    })
-                                    .color(ui.visuals().weak_text_color()),
+                                        "No matching blocks".to_string()
+                                    }
+                                } else {
+                                    "No matches".to_string()
+                                };
+                                if self.block_search.older_not_indexed {
+                                    empty_message.push_str(" · older blocks not indexed");
+                                }
+                                ui.label(
+                                    egui::RichText::new(empty_message)
+                                        .color(ui.visuals().weak_text_color()),
                                 );
                             });
                     }
 
                     ui.separator();
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new(
-                                "F5 Refresh  ↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close",
+                                "F5 Refresh  ↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+Shift+B Bookmark  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close",
                             )
                                 .size(10.0)
                                 .color(ui.visuals().weak_text_color()),
@@ -1783,11 +1951,18 @@ impl TerminalApp {
             self.block_search.intent_control_focused = intent_control_focused;
         }
 
+        if let Some(index) = focused_hit_index {
+            self.block_search.selected_index = index;
+        }
         if let Some(index) = hovered_hit_index {
             self.block_search
                 .select_hovered(index, block_search_pointer_moved);
         }
-        if let Some(index) = clicked_hit_index {
+        if let Some(target) = clicked_bookmark_target {
+            if self.block_search_toggle_bookmark(target) {
+                ctx.request_repaint();
+            }
+        } else if let Some(index) = clicked_hit_index {
             self.block_search.selected_index = index;
             self.block_search_confirm();
         }
@@ -2488,6 +2663,74 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_search_hits_share_one_sequence_bookmark_state() {
+        let live = std::collections::HashMap::from([
+            ("same-record".to_string(), 42),
+            ("other-record".to_string(), 43),
+        ]);
+        let bookmarks = std::collections::HashSet::from([42]);
+        // Command and output hits carry the same record id; every virtual row
+        // therefore reflects the same sequence truth without per-row state.
+        assert!(block_search_record_is_bookmarked(
+            "same-record",
+            &live,
+            &bookmarks
+        ));
+        assert!(block_search_record_is_bookmarked(
+            "same-record",
+            &live,
+            &bookmarks
+        ));
+        assert!(!block_search_record_is_bookmarked(
+            "other-record",
+            &live,
+            &bookmarks
+        ));
+    }
+
+    #[test]
+    fn virtual_row_widget_identity_follows_hit_not_visual_index() {
+        let hit = |record_id: &str, line_no: Option<usize>| crate::block_mode::BlockSearchHit {
+            record_id: record_id.to_string(),
+            is_output_line: line_no.is_some(),
+            line_no,
+            match_span: None,
+            line_text: String::new(),
+            command_preview: String::new(),
+        };
+        let version = crate::block_search::BlockSearchRecordVersion {
+            len: 2,
+            oldest_sequence: Some(7),
+            newest_sequence: Some(8),
+        };
+        let first = hit("record-a", Some(2));
+        let second = hit("record-b", None);
+        let before_reorder = block_search_row_widget_identity("pane", version, &first);
+        let reordered_hits = [second, first.clone()];
+        assert_eq!(
+            before_reorder,
+            block_search_row_widget_identity("pane", version, &reordered_hits[1]),
+            "moving the same hit to another visual index keeps pointer ownership"
+        );
+        assert_ne!(
+            before_reorder,
+            block_search_row_widget_identity("pane", version, &reordered_hits[0])
+        );
+        assert_ne!(
+            before_reorder,
+            block_search_row_widget_identity(
+                "pane",
+                crate::block_search::BlockSearchRecordVersion {
+                    newest_sequence: Some(9),
+                    ..version
+                },
+                &first,
+            ),
+            "a retained-record generation change cancels an in-flight click"
+        );
+    }
 
     #[test]
     fn idle_and_short_tail_samples_do_not_change_the_budget() {
