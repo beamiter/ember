@@ -850,6 +850,39 @@ header opens a type-to-filter row that prunes the loaded tree client-side
 expansion state restored on clear, no new scans — identical for local and
 remote listings).
 
+The Files header also makes the terminal boundary explicit. On **Local**, **Open
+terminal here** creates a new interactive tab whose cwd is the current tree
+root. On `ssh:` / `docker:`, **Connect terminal (profile default)** opens the
+selected profile through the same validated remote launcher as Ctrl+Shift+S;
+it intentionally starts in that profile's normal default directory rather than
+pretending the independently browsed Files path belongs to the new PTY.
+
+Remote Files locations are reconciled by complete profile identity when
+Settings adds, removes, edits, or reorders entries. A uniquely moved profile
+keeps its tree and file clipboard while its config index is remapped. If the old
+profile is missing, changed, duplicated, invalid, or moved beyond the active
+limit, Ember fails closed to **Local**, invalidates the old remote selection
+and queued/in-flight tree authority, and reports the recovery. The clipboard
+source is reconciled independently: a different exact/unique/valid profile is
+remapped and retained (with its intent token), while only an unprovable source
+is cleared.
+A remote-home probe failure follows the same recovery instead of leaving an
+empty, unusable remote tree selected.
+File-menu actions and the New/Rename/Delete dialogs are stamped with both that
+tree generation and its complete location identity. Changing roots or failing
+over from an edited remote profile closes/rejects the old intent, so a retained
+path cannot later execute against Local or a different host.
+
+File Copy/Cut state also has an intent identity independent of its payload.
+Every new Copy or Cut receives a fresh token (even when the selected paths are
+identical), and a slow paste may clear or shrink the clipboard only if that
+exact token is still current. Safe remote-profile reorders remap the payload
+while preserving its token. File operations use a separate location-authority
+generation from tree scans, so Refresh or a local cwd/root update cannot leave
+a completed transfer's progress/Cancel row behind or suppress safe clipboard
+settlement; actually leaving/replacing the backend still rejects all late UI
+effects.
+
 ## Security notes
 
 - OSC 52 clipboard writes and reads are disabled by default; each direction

@@ -1858,6 +1858,8 @@ struct FsNameDialog {
     base: std::path::PathBuf,
     input: String,
     error: Option<String>,
+    /// Exact Files root/location that produced this delayed intent.
+    context: sidebar::FilesIntentContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1873,6 +1875,8 @@ struct FsDeleteDialog {
     paths: Vec<std::path::PathBuf>,
     /// 其中目录的数量（递归删除警告）。
     dir_count: usize,
+    /// Exact Files root/location that produced this delayed intent.
+    context: sidebar::FilesIntentContext,
 }
 
 impl TerminalApp {
@@ -2381,6 +2385,40 @@ impl TerminalApp {
         new_idx
     }
 
+    /// Files-header Local action: open a fresh interactive tab at the exact
+    /// tree root. This is explicit rather than inheriting the active PTY's cwd,
+    /// because the user may have browsed the tree independently.
+    fn open_local_terminal_at_sidebar_root(&mut self, cwd: &std::path::Path) {
+        let (cols, rows) = clamp_terminal_dimensions(self.cols, self.rows);
+        let created = match self.session_manager.new_session_in_cwd(
+            None,
+            None,
+            cwd,
+            cols,
+            rows,
+            self.config.scrollback_lines,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                self.set_status_for(
+                    format!("无法从文件树目录新建终端：{error}"),
+                    Duration::from_secs(5),
+                );
+                return;
+            }
+        };
+        self.tabs.on_session_inserted(created.session_index);
+        self.tabs.insert_tab_after_active(created.session_index);
+        self.activate_session(created.session_index);
+        self.force_resize_session = true;
+        self.schedule_session_save();
+        let display = jterm_core::review_input::safe_inline_display(&cwd.to_string_lossy(), 256);
+        self.set_status_for(
+            format!("已在 {display} 新建本地终端"),
+            Duration::from_secs(5),
+        );
+    }
+
     /// 顶部水平 tab 栏是否应显示：Top 模式下始终显示。
     /// 即便只有一个会话也保留，因为栏内含有侧边栏 toggle 控件。
     fn show_top_tab_bar(&self) -> bool {
@@ -2415,6 +2453,12 @@ impl TerminalApp {
     /// 否则中央区域不会正确收缩。
     #[allow(deprecated)]
     fn render_sidebar(&mut self, root_ui: &mut egui::Ui) {
+        // Configuration can change while the sidebar is hidden (and a Files
+        // dialog can still be open). Reconcile before the visibility early
+        // return so stale remote paths never retain a live dispatch context.
+        if let Some(message) = self.sidebar.set_remote_hosts(&self.config.remote_hosts) {
+            self.set_status_for(message, Duration::from_secs(6));
+        }
         if !self.sidebar.visible {
             // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
             // 不再使用浮动按钮，避免覆盖终端内容。
@@ -2429,9 +2473,6 @@ impl TerminalApp {
         for message in self.sidebar.poll_op_results() {
             self.set_status_for(message, Duration::from_secs(5));
         }
-        // 远程主机配置可能刚在设置里改过：有变化才替换快照，成本可忽略。
-        self.sidebar.set_remote_hosts(&self.config.remote_hosts);
-
         // 拖拽导入的帧级输入：落下的文件（raw_input_hook 已按面板区域放行）、
         // OS 拖悬停状态与指针位置。只在 Files 视图消费。
         let (dropped_paths, hover_files_active, pointer_pos) =
@@ -2488,7 +2529,11 @@ impl TerminalApp {
         let mut do_refresh = false;
         let mut view_changed = false;
         let mut location_changed: Option<remote_fs::FsLocation> = None;
+        let mut files_terminal_target: Option<sidebar::FilesTerminalTarget> = None;
         let mut fs_menu_action: Option<FsMenuAction> = None;
+        // Every menu action is stamped before rendering. If a location/root
+        // change is also applied later in this frame, dispatch fails closed.
+        let fs_intent_context = self.sidebar.files_intent_context();
         let mut cancel_transfer = false;
         // 右键点在选中集之外：选中集先收缩为该行（闭包结束后写回）。
         let mut selection_apply: Option<std::collections::BTreeMap<std::path::PathBuf, bool>> =
@@ -2612,6 +2657,63 @@ impl TerminalApp {
                                     }
                                 }
                             });
+                        let terminal_target = self.sidebar.files_terminal_target();
+                        let (terminal_label, terminal_hint, terminal_enabled) =
+                            match &terminal_target {
+                                Some(sidebar::FilesTerminalTarget::Local(path)) => (
+                                    "Open terminal here",
+                                    format!(
+                                        "Open a new local terminal tab in {}",
+                                        path.display()
+                                    ),
+                                    true,
+                                ),
+                                Some(sidebar::FilesTerminalTarget::Remote(index)) => {
+                                    let display = self
+                                        .config
+                                        .remote_hosts
+                                        .get(*index)
+                                        .map(|host| {
+                                            crate::config::remote_host_display_name(host, *index)
+                                        })
+                                        .unwrap_or_else(|| format!("remote host #{}", index + 1));
+                                    match crate::config::validate_remote_host_at(
+                                        &self.config.remote_hosts,
+                                        *index,
+                                    ) {
+                                        Ok(_) => (
+                                            "Connect terminal (profile default)",
+                                            format!(
+                                                "Open {display} in a new terminal tab using the profile default directory, not the current Files path"
+                                            ),
+                                            true,
+                                        ),
+                                        Err(problem) => (
+                                            "Connect terminal (profile default)",
+                                            format!("{display} is unavailable: {problem}"),
+                                            false,
+                                        ),
+                                    }
+                                }
+                                None => (
+                                    "Open terminal here",
+                                    "Wait for the local Files root to become available".to_string(),
+                                    false,
+                                ),
+                            };
+                        let terminal_response = ui.add_enabled(
+                            terminal_enabled,
+                            egui::Button::new(terminal_label),
+                        );
+                        let terminal_clicked = terminal_response.clicked();
+                        if terminal_enabled {
+                            terminal_response.on_hover_text(terminal_hint);
+                        } else {
+                            terminal_response.on_disabled_hover_text(terminal_hint);
+                        }
+                        if terminal_clicked {
+                            files_terminal_target = terminal_target;
+                        }
                         // 树内过滤开关（客户端过滤已加载的树，不触发新扫描）。
                         let filter_icon =
                             if self.sidebar.filter_open && !self.sidebar.filter.is_empty() {
@@ -2876,8 +2978,18 @@ impl TerminalApp {
                 self.set_status_for(format!("切换浏览位置失败:{error}"), Duration::from_secs(5));
             }
         }
+        if let Some(target) = files_terminal_target {
+            match target {
+                sidebar::FilesTerminalTarget::Local(path) => {
+                    self.open_local_terminal_at_sidebar_root(&path);
+                }
+                sidebar::FilesTerminalTarget::Remote(index) => {
+                    self.connect_remote_host(index);
+                }
+            }
+        }
         if let Some(action) = fs_menu_action {
-            self.apply_fs_menu_action(action);
+            self.apply_fs_menu_action(action, fs_intent_context);
         }
         if cancel_transfer && self.sidebar.cancel_transfers() > 0 {
             self.set_status("正在取消传输…");
@@ -3279,7 +3391,14 @@ impl TerminalApp {
     }
 
     /// 执行右键菜单收集到的动作（对话框/剪贴板/操作 worker 分派）。
-    fn apply_fs_menu_action(&mut self, action: FsMenuAction) {
+    fn apply_fs_menu_action(&mut self, action: FsMenuAction, context: sidebar::FilesIntentContext) {
+        if !self.sidebar.files_intent_is_current(&context) {
+            self.set_status_for(
+                "文件树位置已变化；已取消旧位置的操作",
+                Duration::from_secs(5),
+            );
+            return;
+        }
         match action {
             FsMenuAction::NewFile(dir) => {
                 self.sidebar_name_dialog = Some(FsNameDialog {
@@ -3287,6 +3406,7 @@ impl TerminalApp {
                     base: dir,
                     input: String::new(),
                     error: None,
+                    context,
                 });
             }
             FsMenuAction::NewFolder(dir) => {
@@ -3295,6 +3415,7 @@ impl TerminalApp {
                     base: dir,
                     input: String::new(),
                     error: None,
+                    context,
                 });
             }
             FsMenuAction::Rename(src) => {
@@ -3308,6 +3429,7 @@ impl TerminalApp {
                     base: src,
                     input,
                     error: None,
+                    context,
                 });
             }
             FsMenuAction::Delete { paths } => {
@@ -3315,6 +3437,7 @@ impl TerminalApp {
                 self.sidebar_delete_dialog = Some(FsDeleteDialog {
                     paths: paths.into_iter().map(|(path, _)| path).collect(),
                     dir_count,
+                    context,
                 });
             }
             FsMenuAction::Copy { paths } => self.set_fs_clipboard(paths, false),
@@ -3338,7 +3461,7 @@ impl TerminalApp {
     /// Copy/Cut 进文件剪贴板（支持多选批量）。
     fn set_fs_clipboard(&mut self, paths: Vec<(std::path::PathBuf, bool)>, cut: bool) {
         let count = paths.len();
-        self.sidebar.clipboard = Some(remote_fs::FsClipboard {
+        self.sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: self.sidebar.location().clone(),
             items: paths
                 .into_iter()
@@ -3356,8 +3479,8 @@ impl TerminalApp {
 
     /// 粘贴：目标目录 + 源文件名。单项保持既有路径（同位置 rename/copy；
     /// 跨位置流式传输带进度/取消）；多项走批量任务（逐项、跳过失败、汇总，
-    /// 跨位置逐项复用 transfer）。成功后是否清空剪贴板由 sidebar 按
-    /// clear_clipboard_on_success 处理（批量部分失败时收缩为失败项）。
+    /// 跨位置逐项复用 transfer）。sidebar 会冻结这次粘贴的 Copy/Cut
+    /// intent token；完成时仍匹配才清空/收缩剪贴板。
     fn paste_fs_clipboard(&mut self, target_dir: &std::path::Path) {
         let Some(clipboard) = self.sidebar.clipboard.clone() else {
             return;
@@ -3447,6 +3570,13 @@ impl TerminalApp {
 
     /// 名称对话框提交：校验已在对话框内做过，这里负责组装操作并分派。
     fn submit_fs_name_dialog(&mut self, dialog: FsNameDialog) {
+        if !self.sidebar.files_intent_is_current(&dialog.context) {
+            self.set_status_for(
+                "文件树位置已变化；未执行旧位置的文件操作",
+                Duration::from_secs(5),
+            );
+            return;
+        }
         let name = dialog.input.trim().to_string();
         let (kind, verb) = match dialog.kind {
             FsNameDialogKind::NewFile => (
@@ -3480,6 +3610,27 @@ impl TerminalApp {
     /// 文件树的模态对话框：名称输入（New File / New Folder / Rename 共用）
     /// 与删除确认。浮动窗口，仿 remote_picker 的模式。
     pub fn render_sidebar_fs_dialogs(&mut self, ctx: &egui::Context) {
+        let stale_name = self
+            .sidebar_name_dialog
+            .as_ref()
+            .is_some_and(|dialog| !self.sidebar.files_intent_is_current(&dialog.context));
+        let stale_delete = self
+            .sidebar_delete_dialog
+            .as_ref()
+            .is_some_and(|dialog| !self.sidebar.files_intent_is_current(&dialog.context));
+        if stale_name {
+            self.sidebar_name_dialog = None;
+        }
+        if stale_delete {
+            self.sidebar_delete_dialog = None;
+        }
+        if stale_name || stale_delete {
+            self.set_status_for(
+                "文件树位置已变化；已关闭旧位置的文件操作",
+                Duration::from_secs(5),
+            );
+        }
+
         let mut submitted_dialog: Option<FsNameDialog> = None;
         if let Some(dialog) = &mut self.sidebar_name_dialog {
             let mut open = true;
@@ -3535,7 +3686,7 @@ impl TerminalApp {
             self.submit_fs_name_dialog(dialog);
         }
 
-        let mut confirmed_delete: Option<Vec<std::path::PathBuf>> = None;
+        let mut confirmed_delete: Option<FsDeleteDialog> = None;
         if let Some(dialog) = &self.sidebar_delete_dialog {
             let mut open = true;
             let mut cancel = false;
@@ -3570,7 +3721,7 @@ impl TerminalApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
-                            confirmed_delete = Some(dialog.paths.clone());
+                            confirmed_delete = Some(dialog.clone());
                         }
                         if ui.button("Cancel").clicked() {
                             cancel = true;
@@ -3581,8 +3732,16 @@ impl TerminalApp {
                 self.sidebar_delete_dialog = None;
             }
         }
-        if let Some(paths) = confirmed_delete {
+        if let Some(dialog) = confirmed_delete {
             self.sidebar_delete_dialog = None;
+            if !self.sidebar.files_intent_is_current(&dialog.context) {
+                self.set_status_for(
+                    "文件树位置已变化；未执行旧位置的删除操作",
+                    Duration::from_secs(5),
+                );
+                return;
+            }
+            let paths = dialog.paths;
             if paths.len() == 1 {
                 let path = paths.into_iter().next().expect("len == 1");
                 if let Some(error) = self

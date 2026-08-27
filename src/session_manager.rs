@@ -699,6 +699,36 @@ impl SessionManager {
         self.insert_session(name, tags, cols, rows, scrollback_lines, None)
     }
 
+    /// Start an interactive shell in an explicit local directory. Unlike the
+    /// legacy index-returning helper this reports spawn/cwd failures instead of
+    /// silently returning the previously active session.
+    pub fn new_session_in_cwd(
+        &mut self,
+        name: Option<String>,
+        tags: Option<Vec<String>>,
+        cwd: &Path,
+        cols: usize,
+        rows: usize,
+        scrollback_lines: usize,
+    ) -> Result<CreatedSession, String> {
+        if !cwd.is_absolute() {
+            return Err("session working directory must be absolute".to_string());
+        }
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| "session working directory is not valid UTF-8".to_string())?;
+        self.try_insert_session(
+            name,
+            tags,
+            cols,
+            rows,
+            scrollback_lines,
+            None,
+            Some(cwd),
+            None,
+        )
+    }
+
     /// 以显式 argv 打开一次性辅助会话(例如 jsh 安装脚本)，而不是交互 shell。
     /// 脚本自己打印进度，会话本身就是进度界面。
     pub fn new_command_session(
@@ -1323,6 +1353,53 @@ mod tests {
         let snapshots = manager.get_session_snapshots();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].session_id.as_deref(), Some(first_id.as_str()));
+    }
+
+    #[test]
+    fn explicit_interactive_session_uses_the_requested_absolute_cwd() {
+        let repaint = egui::Context::default();
+        let first_id = format!("test-root-{}", uuid::Uuid::new_v4());
+        let first_shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            Some(&first_id),
+            Some("/bin/sh"),
+            None,
+            repaint.clone(),
+        )
+        .expect("interactive fixture shell starts");
+        let first = Session::new_with_session_id(
+            "interactive".to_string(),
+            Vec::new(),
+            Arc::new(ParkingMutex::new(TerminalState::new(80, 24))),
+            first_shell,
+            first_id,
+        );
+        let mut manager = SessionManager::new(first, repaint, Some("/bin/sh".into()));
+
+        let before = manager.len();
+        assert!(manager
+            .new_session_in_cwd(None, None, Path::new("relative/path"), 80, 24, 100)
+            .is_err());
+        assert_eq!(manager.len(), before, "a rejected cwd must not add a tab");
+
+        let requested = std::env::temp_dir();
+        let created = manager
+            .new_session_in_cwd(None, None, &requested, 80, 24, 100)
+            .expect("absolute local cwd starts an interactive session");
+        assert_eq!(
+            manager.sessions()[created.session_index].purpose,
+            SessionPurpose::Interactive
+        );
+        let actual = jterm_core::process::process_cwd(
+            manager.sessions()[created.session_index].get_shell_pid(),
+        )
+        .expect("spawned shell exposes its cwd");
+        assert_eq!(
+            std::fs::canonicalize(actual).unwrap(),
+            std::fs::canonicalize(requested).unwrap()
+        );
     }
 
     #[test]

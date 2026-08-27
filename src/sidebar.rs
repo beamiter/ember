@@ -46,6 +46,36 @@ pub enum SidebarView {
     Tasks,
 }
 
+/// Terminal action offered by the Files header. Local browsing can safely
+/// start an interactive shell at the exact tree root; a remote tree is not
+/// bound to any existing PTY, so its action reconnects the selected profile
+/// and lets that profile choose its normal starting directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilesTerminalTarget {
+    Local(PathBuf),
+    Remote(usize),
+}
+
+/// Stable identity for a Files UI intent that can outlive the tree frame that
+/// created it (for example a rename or delete confirmation dialog). Raw remote
+/// indices are deliberately not retained: a safe profile reorder remains the
+/// same location, while an edited/replaced/ambiguous profile does not.
+#[derive(Clone, Debug, PartialEq)]
+enum FilesLocationIdentity {
+    Local,
+    Remote(RemoteHostConfig),
+    InvalidRemote,
+}
+
+/// Capability-like stamp for delayed Files UI work. Both the root generation
+/// and complete location identity must still match immediately before an
+/// operation is dispatched; otherwise the old path is rejected fail closed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilesIntentContext {
+    generation: u64,
+    location: FilesLocationIdentity,
+}
+
 /// Keep hand-edited or previously-saved experimental views loadable while
 /// ensuring the disabled feature never strands the sidebar on an unreachable
 /// tab.
@@ -407,12 +437,16 @@ enum OpRequestKind {
 
 #[derive(Clone, Debug)]
 struct FsOpRequest {
-    generation: u64,
+    /// Stable Files-location authority. Unlike `scan_generation`, this only
+    /// changes when Local/remote identity changes, so refreshing the visible
+    /// tree cannot strand operation bookkeeping.
+    authority_generation: u64,
     location: FsLocation,
     hosts: Arc<Vec<RemoteHostConfig>>,
     kind: OpRequestKind,
-    /// cut-paste 成功后才清空剪贴板；普通重命名不带这个标记。
-    clear_clipboard_on_success: bool,
+    /// The exact Copy/Cut user intent this paste was dispatched from. Results
+    /// may clear/shrink the clipboard only while this token is still current.
+    clipboard_intent: Option<u64>,
     /// 传输取消令牌（仅 Transfer 携带）：排队时 worker 跳过执行，
     /// 传输途中由 watchdog 按超时同一路径 kill。
     cancel_token: Option<Arc<AtomicBool>>,
@@ -420,9 +454,9 @@ struct FsOpRequest {
 
 #[derive(Debug)]
 struct FsOpResult {
-    generation: u64,
+    authority_generation: u64,
     kind: OpRequestKind,
-    clear_clipboard_on_success: bool,
+    clipboard_intent: Option<u64>,
     /// StartDir/Transfer 成功时携带路径；文件操作成功为 Ok(None)；
     /// Batch 恒为 Ok(None)（成败细节在 batch_outcome）。
     outcome: Result<Option<PathBuf>, String>,
@@ -441,7 +475,7 @@ struct FsOpResult {
 #[derive(Debug)]
 enum OpEvent {
     Progress {
-        generation: u64,
+        authority_generation: u64,
         token: Arc<AtomicBool>,
         bytes: u64,
     },
@@ -510,9 +544,9 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
         {
             if results
                 .send(OpEvent::Done(Box::new(FsOpResult {
-                    generation: request.generation,
+                    authority_generation: request.authority_generation,
                     kind: request.kind,
-                    clear_clipboard_on_success: false,
+                    clipboard_intent: request.clipboard_intent,
                     outcome: Ok(None),
                     warning: None,
                     batch_outcome: None,
@@ -532,9 +566,9 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
             .is_some_and(remote_fs::is_cancelled_error);
         if results
             .send(OpEvent::Done(Box::new(FsOpResult {
-                generation: request.generation,
+                authority_generation: request.authority_generation,
                 kind: request.kind,
-                clear_clipboard_on_success: request.clear_clipboard_on_success,
+                clipboard_intent: request.clipboard_intent,
                 outcome: execution
                     .as_ref()
                     .map(|done| done.path.clone())
@@ -665,11 +699,11 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
             // 进度回报：节流后经 OpEvent 通道发给 UI（有损，通道满就丢）。
             let sink = request.cancel_token.as_ref().map(|token| {
                 let token = token.clone();
-                let generation = request.generation;
+                let authority_generation = request.authority_generation;
                 let events = events.clone();
                 remote_fs::ProgressSink::new(move |bytes| {
                     let _ = events.try_send(OpEvent::Progress {
-                        generation,
+                        authority_generation,
                         token: token.clone(),
                         bytes,
                     });
@@ -787,6 +821,28 @@ fn scan_dir(dir: &Path) -> io::Result<DirectoryListing> {
     Ok(DirectoryListing { entries, truncated })
 }
 
+/// Resolve one index from an old host snapshot into the new active prefix.
+/// Equality covers the complete shared profile (including fields not surfaced
+/// in Settings). A duplicate is intentionally ambiguous rather than choosing
+/// whichever identical row happens to come first.
+fn unique_remote_profile_index(
+    previous_hosts: &[RemoteHostConfig],
+    previous_index: usize,
+    hosts: &[RemoteHostConfig],
+) -> Option<usize> {
+    let profile = previous_hosts.get(previous_index)?;
+    let mut matches = hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == profile).then_some(index));
+    let index = matches.next()?;
+    if matches.next().is_some() || crate::config::validate_remote_host_at(hosts, index).is_err() {
+        return None;
+    }
+    Some(index)
+}
+
 /// 侧边栏状态
 #[derive(Debug)]
 pub struct Sidebar {
@@ -806,7 +862,14 @@ pub struct Sidebar {
     pub view: SidebarView,
     /// 文件操作剪贴板（Copy/Cut → Paste；同位置 copy/rename，跨位置传输）。
     pub clipboard: Option<remote_fs::FsClipboard>,
+    /// Identity of the current user Copy/Cut action. Payload equality is not
+    /// identity: an old slow paste must never clear a later identical action.
+    clipboard_intent: Option<u64>,
+    next_clipboard_intent: u64,
     scan_generation: u64,
+    /// Changes only when the Files backend authority changes. Tree refreshes
+    /// and cwd/root changes deliberately do not invalidate operation cleanup.
+    authority_generation: u64,
     scan_service: Option<DirectoryScanService>,
     worker_error: Option<String>,
     worker_error_reported: bool,
@@ -864,7 +927,10 @@ impl Sidebar {
             filter: String::new(),
             view: SidebarView::default(),
             clipboard: None,
+            clipboard_intent: None,
+            next_clipboard_intent: 0,
             scan_generation: 0,
+            authority_generation: 0,
             scan_service,
             worker_error,
             worker_error_reported: false,
@@ -916,21 +982,147 @@ impl Sidebar {
         self.start_dir_pending
     }
 
+    /// Replace the Files clipboard as a fresh user intent. Even an identical
+    /// payload receives a distinct token, preventing slow-operation ABA races.
+    pub fn set_clipboard(&mut self, clipboard: remote_fs::FsClipboard) {
+        self.next_clipboard_intent = self.next_clipboard_intent.wrapping_add(1);
+        if self.next_clipboard_intent == 0 {
+            self.next_clipboard_intent = 1;
+        }
+        self.clipboard_intent = Some(self.next_clipboard_intent);
+        self.clipboard = Some(clipboard);
+    }
+
+    fn clear_clipboard(&mut self) {
+        self.clipboard = None;
+        self.clipboard_intent = None;
+    }
+
+    fn clipboard_intent_for_clear(&self, clear_on_success: bool) -> Option<u64> {
+        clear_on_success.then_some(self.clipboard_intent).flatten()
+    }
+
+    fn clipboard_matches(&self, intent: Option<u64>) -> bool {
+        intent.is_some() && intent == self.clipboard_intent && self.clipboard.is_some()
+    }
+
+    fn clear_clipboard_if_matches(&mut self, intent: Option<u64>) {
+        if self.clipboard_matches(intent) {
+            self.clear_clipboard();
+        }
+    }
+
     /// 是否有还在 worker 上执行的文件操作（含起始目录解析）。
     pub fn has_pending_op(&self) -> bool {
         self.pending_ops > 0
     }
 
-    /// 同步远程主机配置快照。每帧调用、只在内容变化时替换，成本可忽略。
-    pub fn set_remote_hosts(&mut self, hosts: &[RemoteHostConfig]) {
-        if self.remote_hosts.as_slice() != hosts {
-            self.remote_hosts = Arc::new(hosts.to_vec());
+    /// 同步远程主机配置快照。`FsLocation::Remote` 的下标只在一份配置快照
+    /// 内有意义；配置增删/重排后，必须按旧 profile 的完整身份唯一重映射。
+    /// 找不到或出现重复候选时 fail closed 回 Local，避免旧树上的路径操作被
+    /// 静默发给另一台主机。返回值是可直接展示的恢复提示。
+    pub fn set_remote_hosts(&mut self, hosts: &[RemoteHostConfig]) -> Option<String> {
+        if self.remote_hosts.as_slice() == hosts {
+            return None;
+        }
+
+        let previous_hosts = Arc::clone(&self.remote_hosts);
+        let remap = |index| unique_remote_profile_index(&previous_hosts, index, hosts);
+        let remapped_location = match &self.location {
+            FsLocation::Local => Some(FsLocation::Local),
+            FsLocation::Remote(index) => remap(*index).map(FsLocation::Remote),
+        };
+        let remapped_clipboard = self.clipboard.as_ref().and_then(|clipboard| {
+            if let FsLocation::Remote(index) = &clipboard.loc {
+                Some(remap(*index))
+            } else {
+                None
+            }
+        });
+
+        self.remote_hosts = Arc::new(hosts.to_vec());
+        // The active tree and clipboard source are independent authorities.
+        // Reconcile the clipboard even if the tree itself must fall back.
+        let clipboard_notice = match remapped_clipboard {
+            Some(Some(index)) => {
+                if let Some(clipboard) = &mut self.clipboard {
+                    clipboard.loc = FsLocation::Remote(index);
+                }
+                None
+            }
+            Some(None) => {
+                self.clear_clipboard();
+                Some(
+                    "远端文件剪贴板来源 profile 已被删除、更改或不再唯一；已清除剪贴板".to_string(),
+                )
+            }
+            None => None,
+        };
+        match remapped_location {
+            Some(location) => self.location = location,
+            None => {
+                let local_refresh_error = self.set_location(FsLocation::Local);
+                let mut message =
+                    "所选远端 Files profile 已被删除、更改或不再唯一；已返回 Local".to_string();
+                if let Some(clipboard_notice) = clipboard_notice {
+                    message.push_str(&format!("；{clipboard_notice}"));
+                }
+                if let Some(error) = local_refresh_error {
+                    message.push_str(&format!("（本地文件树刷新失败：{error}）"));
+                }
+                return Some(message);
+            }
+        }
+
+        clipboard_notice
+    }
+
+    /// Current Files-header terminal action, if the local tree has a usable
+    /// root. Remote actions deliberately carry only the profile index: their
+    /// terminal starts in the profile's default directory, not the independently
+    /// browsed Files path.
+    pub fn files_terminal_target(&self) -> Option<FilesTerminalTarget> {
+        match &self.location {
+            FsLocation::Local if !self.current_dir.as_os_str().is_empty() => {
+                Some(FilesTerminalTarget::Local(self.current_dir.clone()))
+            }
+            FsLocation::Local => None,
+            FsLocation::Remote(index) => Some(FilesTerminalTarget::Remote(*index)),
         }
     }
 
-    /// 切换浏览位置：作废旧 generation（排队与在途的扫描/操作结果随之
-    /// 全部丢弃）、清空树，再解析新位置的起始目录。本机当场解析；远程经
-    /// 操作 worker 异步解析，期间面板显示"正在连接"。
+    fn files_location_identity(&self) -> FilesLocationIdentity {
+        match &self.location {
+            FsLocation::Local => FilesLocationIdentity::Local,
+            FsLocation::Remote(index) => self
+                .remote_hosts
+                .get(*index)
+                .cloned()
+                .map(FilesLocationIdentity::Remote)
+                .unwrap_or(FilesLocationIdentity::InvalidRemote),
+        }
+    }
+
+    /// Stamp a menu/dialog intent against the exact tree root and location
+    /// visible to the user. A uniquely remapped identical remote profile stays
+    /// valid across configuration reorder; every root/location change does not.
+    pub fn files_intent_context(&self) -> FilesIntentContext {
+        FilesIntentContext {
+            generation: self.scan_generation,
+            location: self.files_location_identity(),
+        }
+    }
+
+    /// Revalidate a delayed Files intent immediately before dispatching it.
+    pub fn files_intent_is_current(&self, context: &FilesIntentContext) -> bool {
+        context.generation == self.scan_generation
+            && context.location != FilesLocationIdentity::InvalidRemote
+            && context.location == self.files_location_identity()
+    }
+
+    /// 切换浏览位置：作废旧扫描与 location authority、清空树，再解析新位置
+    /// 的起始目录。本机当场解析；远程经操作 worker 异步解析，期间面板显示
+    /// "正在连接"。
     pub fn set_location(&mut self, location: FsLocation) -> Option<String> {
         if self.location == location {
             return None;
@@ -940,11 +1132,12 @@ impl Sidebar {
         self.selection.clear();
         self.location_error = None;
         self.scan_generation = self.scan_generation.wrapping_add(1);
+        self.authority_generation = self.authority_generation.wrapping_add(1);
         self.root = None;
         self.current_dir = PathBuf::new();
         self.start_dir_pending = false;
         // 离开当前位置即放弃在途/排队的传输：置令牌（worker 按取消收尾），
-        // 面板条目直接清空；迟到的 Progress/Done 会被 generation 检查丢弃。
+        // 面板条目直接清空；迟到的 Progress/Done 会被 authority 检查丢弃。
         for track in self.transfer_tracks.drain(..) {
             track.token.store(true, Ordering::SeqCst);
         }
@@ -954,7 +1147,7 @@ impl Sidebar {
             self.start_root_scan()
         } else {
             self.start_dir_pending = true;
-            self.enqueue_op(OpRequestKind::StartDir, false, None)
+            self.enqueue_op(OpRequestKind::StartDir, None, None)
         }
     }
 
@@ -966,7 +1159,8 @@ impl Sidebar {
         kind: FsOpKind,
         clear_clipboard_on_success: bool,
     ) -> Option<String> {
-        self.enqueue_op(OpRequestKind::Fs(kind), clear_clipboard_on_success, None)
+        let intent = self.clipboard_intent_for_clear(clear_clipboard_on_success);
+        self.enqueue_op(OpRequestKind::Fs(kind), intent, None)
     }
 
     /// UI 入口：批量操作（多选粘贴/批量删除）。逐项执行、跳过失败、
@@ -976,11 +1170,8 @@ impl Sidebar {
         batch: BatchIntent,
         clear_clipboard_on_success: bool,
     ) -> Option<String> {
-        self.enqueue_op(
-            OpRequestKind::Batch(batch),
-            clear_clipboard_on_success,
-            None,
-        )
+        let intent = self.clipboard_intent_for_clear(clear_clipboard_on_success);
+        self.enqueue_op(OpRequestKind::Batch(batch), intent, None)
     }
 
     /// UI 入口：跨位置传输（下载/上传/中转）。cut 在复制成功后经 delete 删源，
@@ -1010,11 +1201,8 @@ impl Sidebar {
             total,
             bytes: 0,
         };
-        let result = self.enqueue_op(
-            OpRequestKind::Transfer(transfer),
-            clear_clipboard_on_success,
-            Some(token),
-        );
+        let intent = self.clipboard_intent_for_clear(clear_clipboard_on_success);
+        let result = self.enqueue_op(OpRequestKind::Transfer(transfer), intent, Some(token));
         if result.is_none() {
             self.transfer_tracks.push(track);
         }
@@ -1047,7 +1235,7 @@ impl Sidebar {
     fn enqueue_op(
         &mut self,
         kind: OpRequestKind,
-        clear_clipboard_on_success: bool,
+        clipboard_intent: Option<u64>,
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> Option<String> {
         let Some(service) = &self.op_service else {
@@ -1059,11 +1247,11 @@ impl Sidebar {
             );
         };
         let request = FsOpRequest {
-            generation: self.scan_generation,
+            authority_generation: self.authority_generation,
             location: self.location.clone(),
             hosts: self.remote_hosts.clone(),
             kind,
-            clear_clipboard_on_success,
+            clipboard_intent,
             cancel_token,
         };
         match service.request(request) {
@@ -1095,12 +1283,13 @@ impl Sidebar {
         loop {
             match receiver.try_recv() {
                 Ok(OpEvent::Progress {
-                    generation,
+                    authority_generation,
                     token,
                     bytes,
                 }) => {
-                    // set_location 会 bump generation：迟到进度一律丢弃。
-                    if generation != self.scan_generation {
+                    // A refresh/root scan keeps the same location authority,
+                    // while leaving Local/remote invalidates late progress.
+                    if authority_generation != self.authority_generation {
                         continue;
                     }
                     if let Some(track) = self
@@ -1113,14 +1302,17 @@ impl Sidebar {
                 }
                 Ok(OpEvent::Done(result)) => {
                     self.pending_ops = self.pending_ops.saturating_sub(1);
-                    // set_location 会 bump generation：迟到结果一律丢弃。
-                    if result.generation != self.scan_generation {
-                        continue;
-                    }
-                    // 传输完成（无论成败）：摘掉在途条目，忙碌行让位给下一个。
+                    // Always retire the matching transfer row before any
+                    // authority/presentation gate. Refresh bumps the scan
+                    // generation, and must not leave a permanent Cancel row.
                     if let Some(token) = &result.cancel_token {
                         self.transfer_tracks
                             .retain(|track| !Arc::ptr_eq(&track.token, token));
+                    }
+                    // Leaving the Files authority makes all remaining UI and
+                    // clipboard effects stale. A mere tree refresh does not.
+                    if result.authority_generation != self.authority_generation {
+                        continue;
                     }
                     // 取消是中性结果：不清剪贴板（cut 可重试），不刷新目录。
                     if result.cancelled {
@@ -1143,16 +1335,22 @@ impl Sidebar {
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
-                                    self.location_error = Some(error.clone());
-                                    messages.push(format!("无法进入该位置：{error}"));
+                                    let label = self.location.label(&self.remote_hosts);
+                                    let local_refresh_error = self.set_location(FsLocation::Local);
+                                    let mut message =
+                                        format!("无法进入 {label}：{error}；已返回 Local");
+                                    if let Some(refresh_error) = local_refresh_error {
+                                        message.push_str(&format!(
+                                            "（本地文件树刷新失败：{refresh_error}）"
+                                        ));
+                                    }
+                                    messages.push(message);
                                 }
                             }
                         }
                         OpRequestKind::Fs(kind) => match result.outcome {
                             Ok(_) => {
-                                if result.clear_clipboard_on_success {
-                                    self.clipboard = None;
-                                }
+                                self.clear_clipboard_if_matches(result.clipboard_intent);
                                 for dir in kind.affected_dirs() {
                                     if let Some(error) = self.refresh_loaded_node(&dir) {
                                         messages.push(format!("文件树刷新失败：{error}"));
@@ -1166,9 +1364,7 @@ impl Sidebar {
                         },
                         OpRequestKind::Transfer(transfer) => match result.outcome {
                             Ok(dst) => {
-                                if result.clear_clipboard_on_success {
-                                    self.clipboard = None;
-                                }
+                                self.clear_clipboard_if_matches(result.clipboard_intent);
                                 // 落位目录可能正是当前显示的目录，重新扫描它。
                                 if let Some(error) = self.refresh_loaded_node(&transfer.dst_dir) {
                                     messages.push(format!("文件树刷新失败：{error}"));
@@ -1217,18 +1413,20 @@ impl Sidebar {
                                 }
                             }
                             // cut 粘贴：全成功清剪贴板；部分失败收缩为失败项（便于重试）。
-                            if result.clear_clipboard_on_success {
+                            if result.clipboard_intent.is_some() {
                                 if outcome.failed.is_empty() {
-                                    self.clipboard = None;
-                                } else if let Some(clipboard) = &mut self.clipboard {
+                                    self.clear_clipboard_if_matches(result.clipboard_intent);
+                                } else if self.clipboard_matches(result.clipboard_intent) {
                                     let failed: Vec<&Path> = outcome
                                         .failed
                                         .iter()
                                         .map(|(path, _)| path.as_path())
                                         .collect();
-                                    clipboard
-                                        .items
-                                        .retain(|item| failed.contains(&item.path.as_path()));
+                                    if let Some(clipboard) = &mut self.clipboard {
+                                        clipboard
+                                            .items
+                                            .retain(|item| failed.contains(&item.path.as_path()));
+                                    }
                                 }
                             }
                             messages.push(outcome.summary(verb, total));
@@ -1692,6 +1890,179 @@ mod tests {
         assert_eq!(effective_view(SidebarView::Tasks, true), SidebarView::Tasks);
     }
 
+    #[test]
+    fn files_terminal_target_uses_the_local_root_but_only_the_remote_profile() {
+        let mut sidebar = Sidebar::with_scanner(
+            PathBuf::from("/work/tree-root"),
+            Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>,
+        );
+        assert_eq!(
+            sidebar.files_terminal_target(),
+            Some(FilesTerminalTarget::Local(PathBuf::from("/work/tree-root")))
+        );
+
+        sidebar.location = FsLocation::Remote(7);
+        sidebar.current_dir = PathBuf::from("/independent/remote/browse/path");
+        assert_eq!(
+            sidebar.files_terminal_target(),
+            Some(FilesTerminalTarget::Remote(7)),
+            "a remote terminal must use its profile default, never the Files browse path"
+        );
+    }
+
+    #[test]
+    fn remote_profile_identity_remap_requires_one_active_exact_match() {
+        let profiles = crate::config::default_remote_hosts();
+        let first = profiles[0].clone();
+        let second = profiles[1].clone();
+        assert_eq!(
+            unique_remote_profile_index(&profiles, 1, &[second.clone(), first.clone()]),
+            Some(0)
+        );
+        assert_eq!(unique_remote_profile_index(&profiles, 0, &[second]), None);
+        assert_eq!(
+            unique_remote_profile_index(&profiles, 0, &[first.clone(), first]),
+            None,
+            "duplicate full profiles are ambiguous even when one retains the old index"
+        );
+    }
+
+    #[test]
+    fn remote_profile_reorder_remaps_location_and_clipboard_without_resetting_tree() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        sidebar.location = FsLocation::Remote(1);
+        sidebar.current_dir = PathBuf::from("/remote/home");
+        sidebar.select_single(Path::new("/remote/home/kept.txt"), false);
+        sidebar.set_clipboard(remote_fs::FsClipboard {
+            loc: FsLocation::Remote(0),
+            items: vec![remote_fs::FsClipboardItem {
+                path: PathBuf::from("/remote/source.txt"),
+                is_dir: false,
+            }],
+            cut: false,
+        });
+        let generation = sidebar.scan_generation;
+        let clipboard_intent = sidebar.clipboard_intent;
+        let delayed_intent = sidebar.files_intent_context();
+
+        let reordered = vec![profiles[1].clone(), profiles[0].clone()];
+        assert!(sidebar.set_remote_hosts(&reordered).is_none());
+        assert_eq!(sidebar.location(), &FsLocation::Remote(0));
+        assert_eq!(
+            sidebar.clipboard.as_ref().map(|clipboard| &clipboard.loc),
+            Some(&FsLocation::Remote(1))
+        );
+        assert!(sidebar
+            .selection
+            .contains_key(Path::new("/remote/home/kept.txt")));
+        assert_eq!(sidebar.scan_generation, generation);
+        assert_eq!(sidebar.clipboard_intent, clipboard_intent);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/home"));
+        assert!(
+            sidebar.files_intent_is_current(&delayed_intent),
+            "a unique full-profile reorder must not invalidate a dialog for the same host"
+        );
+    }
+
+    #[test]
+    fn changed_remote_profile_falls_back_local_and_invalidates_remote_state() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.current_dir = PathBuf::from("/remote/home");
+        sidebar.root = Some(Sidebar::root_node(&sidebar.current_dir));
+        sidebar.select_single(Path::new("/remote/home/stale.txt"), false);
+        sidebar.set_clipboard(remote_fs::FsClipboard {
+            loc: FsLocation::Remote(0),
+            items: vec![remote_fs::FsClipboardItem {
+                path: PathBuf::from("/remote/home/stale.txt"),
+                is_dir: false,
+            }],
+            cut: true,
+        });
+        let token = Arc::new(AtomicBool::new(false));
+        sidebar.transfer_tracks.push(TransferTrack {
+            token: Arc::clone(&token),
+            direction: "下载",
+            name: "stale.txt".to_string(),
+            total: None,
+            bytes: 0,
+        });
+        let generation = sidebar.scan_generation;
+        let delayed_intent = sidebar.files_intent_context();
+        let mut changed = profiles;
+        changed[0].host = "replacement.example.test".to_string();
+
+        let notice = sidebar
+            .set_remote_hosts(&changed)
+            .expect("unsafe index reuse must be visible");
+        assert!(notice.contains("已返回 Local"));
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert!(sidebar.selection.is_empty());
+        assert!(sidebar.selected_path.is_none());
+        assert!(sidebar.clipboard.is_none());
+        assert!(sidebar.transfer_tracks.is_empty());
+        assert!(token.load(Ordering::SeqCst));
+        assert_ne!(sidebar.scan_generation, generation);
+        assert_eq!(sidebar.current_dir, std::env::current_dir().unwrap());
+        assert!(
+            !sidebar.files_intent_is_current(&delayed_intent),
+            "a dialog from the replaced remote must not dispatch against Local"
+        );
+    }
+
+    #[test]
+    fn removed_active_remote_preserves_an_independently_valid_clipboard_source() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.current_dir = PathBuf::from("/remote-a/home");
+        sidebar.set_clipboard(remote_fs::FsClipboard {
+            loc: FsLocation::Remote(1),
+            items: vec![remote_fs::FsClipboardItem {
+                path: PathBuf::from("/remote-b/kept.txt"),
+                is_dir: false,
+            }],
+            cut: true,
+        });
+        let clipboard_intent = sidebar.clipboard_intent;
+
+        // A disappears while B moves from index 1 to 0. The tree authority A
+        // must fail closed, but B remains independently provable.
+        let notice = sidebar
+            .set_remote_hosts(&[profiles[1].clone()])
+            .expect("removed active tree authority must be visible");
+
+        assert!(notice.contains("已返回 Local"));
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert_eq!(sidebar.clipboard_intent, clipboard_intent);
+        let clipboard = sidebar
+            .clipboard
+            .as_ref()
+            .expect("independently valid B clipboard survives A fallback");
+        assert_eq!(clipboard.loc, FsLocation::Remote(0));
+        assert_eq!(clipboard.items[0].path, PathBuf::from("/remote-b/kept.txt"));
+    }
+
+    #[test]
+    fn files_intent_context_is_invalidated_when_the_tree_root_changes() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/first/root"), scanner);
+        let delayed_intent = sidebar.files_intent_context();
+
+        assert!(sidebar
+            .set_current_dir(PathBuf::from("/second/root"))
+            .is_none());
+        assert!(!sidebar.files_intent_is_current(&delayed_intent));
+    }
+
     fn entry(parent: &Path, name: impl Into<String>, is_dir: bool) -> FileEntry {
         let name = name.into();
         FileEntry {
@@ -1850,6 +2221,38 @@ mod tests {
         messages
     }
 
+    /// Replace the real worker with deterministic request/result channels so
+    /// race tests can change UI state after dispatch but before completion.
+    fn controlled_op_service(sidebar: &mut Sidebar) -> (Receiver<FsOpRequest>, Sender<OpEvent>) {
+        let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
+        sidebar.op_service = Some(FsOpService {
+            request_tx,
+            result_rx,
+        });
+        (request_rx, result_tx)
+    }
+
+    fn complete_request(
+        results: &Sender<OpEvent>,
+        request: FsOpRequest,
+        outcome: Result<Option<PathBuf>, String>,
+        batch_outcome: Option<BatchOutcome>,
+    ) {
+        results
+            .send(OpEvent::Done(Box::new(FsOpResult {
+                authority_generation: request.authority_generation,
+                kind: request.kind,
+                clipboard_intent: request.clipboard_intent,
+                outcome,
+                warning: None,
+                batch_outcome,
+                cancelled: false,
+                cancel_token: request.cancel_token,
+            })))
+            .unwrap();
+    }
+
     /// 唯一临时目录，Drop 时递归清理（本机文件操作测试用真实文件系统）。
     struct TestDir(PathBuf);
 
@@ -1874,28 +2277,29 @@ mod tests {
     }
 
     #[test]
-    fn switching_to_an_unknown_remote_host_surfaces_an_error_without_network() {
+    fn failed_remote_start_dir_reports_and_recovers_to_local_without_network() {
         let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
         let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
         // 没配置任何主机：Remote(0) 的起始目录解析会在 worker 上立即失败，
-        // 错误要落在 location_error 上，而不是 panic、卡死或触网。
+        // 错误必须可见，并自动回到 Local，而不是卡在空远端树或触网。
         assert!(sidebar.set_location(FsLocation::Remote(0)).is_none());
         assert!(sidebar.is_starting());
         assert!(sidebar.has_pending_op());
 
-        let messages = poll_ops_until(&mut sidebar, |sidebar| sidebar.location_error().is_some());
+        let messages = poll_ops_until(&mut sidebar, |sidebar| {
+            sidebar.location() == &FsLocation::Local && !sidebar.has_pending_op()
+        });
         assert!(
-            sidebar.location_error().is_some(),
+            messages
+                .iter()
+                .any(|message| message.contains("已返回 Local")),
             "messages so far: {messages:?}"
         );
-        assert!(!sidebar.is_starting());
-        assert!(!sidebar.has_pending_op());
-
-        // 切回本机立即恢复，且以进程 cwd 为根。
-        assert!(sidebar.set_location(FsLocation::Local).is_none());
         assert_eq!(sidebar.location(), &FsLocation::Local);
         assert_eq!(sidebar.current_dir, std::env::current_dir().unwrap());
         assert!(sidebar.location_error().is_none());
+        assert!(!sidebar.is_starting());
+        assert!(!sidebar.has_pending_op());
         poll_until_loaded(&mut sidebar);
     }
 
@@ -1981,7 +2385,7 @@ mod tests {
         assert!(!sub.exists());
 
         // cut-paste 成功后剪贴板被清空。
-        sidebar.clipboard = Some(remote_fs::FsClipboard {
+        sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
             items: vec![remote_fs::FsClipboardItem {
                 path: renamed.clone(),
@@ -2005,6 +2409,152 @@ mod tests {
     }
 
     #[test]
+    fn old_completion_cannot_clear_a_new_identical_clipboard_intent() {
+        let dir = TestDir::new();
+        let src = dir.0.join("source.txt");
+        let dst = dir.0.join("copy.txt");
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        let (requests, results) = controlled_op_service(&mut sidebar);
+        let clipboard = remote_fs::FsClipboard {
+            loc: FsLocation::Local,
+            items: vec![remote_fs::FsClipboardItem {
+                path: src.clone(),
+                is_dir: false,
+            }],
+            cut: true,
+        };
+
+        sidebar.set_clipboard(clipboard.clone());
+        let old_intent = sidebar.clipboard_intent;
+        assert!(sidebar
+            .request_fs_op(FsOpKind::Copy { src, dst }, true)
+            .is_none());
+        let request = requests.recv().unwrap();
+        assert_eq!(request.clipboard_intent, old_intent);
+
+        // Same payload, distinct user action: payload equality must not let
+        // the old completion erase this replacement.
+        sidebar.set_clipboard(clipboard.clone());
+        assert_ne!(sidebar.clipboard_intent, old_intent);
+        complete_request(&results, request, Ok(None), None);
+        let messages = sidebar.poll_op_results();
+
+        assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
+        assert!(messages.iter().any(|message| message.contains("已粘贴")));
+    }
+
+    #[test]
+    fn old_partial_batch_cannot_shrink_a_new_identical_clipboard_intent() {
+        let dir = TestDir::new();
+        let a = dir.0.join("a.txt");
+        let b = dir.0.join("b.txt");
+        let dst = dir.0.join("dst");
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        let (requests, results) = controlled_op_service(&mut sidebar);
+        let clipboard = remote_fs::FsClipboard {
+            loc: FsLocation::Local,
+            items: vec![
+                remote_fs::FsClipboardItem {
+                    path: a.clone(),
+                    is_dir: false,
+                },
+                remote_fs::FsClipboardItem {
+                    path: b.clone(),
+                    is_dir: false,
+                },
+            ],
+            cut: true,
+        };
+        let batch = BatchIntent::Paste {
+            src_loc: FsLocation::Local,
+            dst_loc: FsLocation::Local,
+            dst_dir: dst,
+            items: vec![(a.clone(), false), (b.clone(), false)],
+            cut: true,
+        };
+
+        sidebar.set_clipboard(clipboard.clone());
+        let old_intent = sidebar.clipboard_intent;
+        assert!(sidebar.request_batch(batch, true).is_none());
+        let request = requests.recv().unwrap();
+        sidebar.set_clipboard(clipboard.clone());
+        assert_ne!(sidebar.clipboard_intent, old_intent);
+        complete_request(
+            &results,
+            request,
+            Ok(None),
+            Some(BatchOutcome {
+                succeeded: 1,
+                failed: vec![(b, "collision".to_string())],
+                warnings: Vec::new(),
+            }),
+        );
+        let _ = sidebar.poll_op_results();
+
+        assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
+        assert_eq!(sidebar.clipboard.as_ref().unwrap().items.len(), 2);
+    }
+
+    #[test]
+    fn refresh_during_transfer_keeps_progress_and_retires_the_exact_track() {
+        let dir = TestDir::new();
+        let src = dir.0.join("source.bin");
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        let (requests, results) = controlled_op_service(&mut sidebar);
+        sidebar.set_clipboard(remote_fs::FsClipboard {
+            loc: FsLocation::Local,
+            items: vec![remote_fs::FsClipboardItem {
+                path: src.clone(),
+                is_dir: false,
+            }],
+            cut: true,
+        });
+        let transfer = FsTransfer {
+            src_loc: FsLocation::Local,
+            src,
+            src_is_dir: false,
+            dst_loc: FsLocation::Remote(0),
+            dst_dir: PathBuf::from("/remote/dst"),
+            cut: true,
+        };
+
+        assert!(sidebar.request_transfer(transfer, true).is_none());
+        let request = requests.recv().unwrap();
+        let transfer_token = request.cancel_token.as_ref().unwrap().clone();
+        let scan_generation = sidebar.scan_generation;
+        let authority_generation = sidebar.authority_generation;
+        assert!(sidebar.refresh().is_none());
+        assert_ne!(sidebar.scan_generation, scan_generation);
+        assert_eq!(sidebar.authority_generation, authority_generation);
+
+        results
+            .send(OpEvent::Progress {
+                authority_generation: request.authority_generation,
+                token: transfer_token,
+                bytes: 4096,
+            })
+            .unwrap();
+        let _ = sidebar.poll_op_results();
+        assert_eq!(
+            sidebar.transfer_status().map(|status| status.bytes),
+            Some(4096)
+        );
+
+        complete_request(
+            &results,
+            request,
+            Ok(Some(PathBuf::from("/remote/dst/source.bin"))),
+            None,
+        );
+        let messages = sidebar.poll_op_results();
+
+        assert!(!sidebar.has_pending_op());
+        assert!(sidebar.transfer_status().is_none());
+        assert!(sidebar.clipboard.is_none());
+        assert!(messages.iter().any(|message| message.contains("已上传")));
+    }
+
+    #[test]
     fn a_failed_transfer_keeps_clipboard_and_never_deletes_the_source() {
         let dir = TestDir::new();
         let src = dir.0.join("keep.txt");
@@ -2015,7 +2565,7 @@ mod tests {
 
         // 本机 → 未配置的 Remote(9)：传输在 worker 上失败，错误进状态栏；
         // cut 的删源只在复制成功后发生 —— 剪贴板保留、源文件原样还在。
-        sidebar.clipboard = Some(remote_fs::FsClipboard {
+        sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
             items: vec![remote_fs::FsClipboardItem {
                 path: src.clone(),
@@ -2079,7 +2629,7 @@ mod tests {
         let service = FsOpService::new().expect("op service");
         let token = Arc::new(AtomicBool::new(true));
         let request = FsOpRequest {
-            generation: 0,
+            authority_generation: 0,
             location: FsLocation::Local,
             hosts: Arc::new(Vec::new()),
             kind: OpRequestKind::Transfer(FsTransfer {
@@ -2090,7 +2640,7 @@ mod tests {
                 dst_dir: PathBuf::from("/tmp"),
                 cut: false,
             }),
-            clear_clipboard_on_success: false,
+            clipboard_intent: None,
             cancel_token: Some(token.clone()),
         };
         service.request(request).unwrap();
@@ -2489,7 +3039,7 @@ mod tests {
         std::fs::write(dst_dir.join("b.txt"), b"old").unwrap();
 
         let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
-        sidebar.clipboard = Some(remote_fs::FsClipboard {
+        sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
             items: vec![
                 remote_fs::FsClipboardItem {

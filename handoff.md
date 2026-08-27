@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.4)
+Updated: 2026-08-27 (Files terminal entry, identity recovery, and transfer races)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,39 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Files clipboard/transfer race closure (2026-08-27)**: every user Copy/Cut
+  now receives a monotonically advancing intent token. Paste requests/results
+  freeze that token; full-success clearing and partial-batch shrinking occur
+  only while it is still current, so an older slow paste cannot mutate a later
+  identical clipboard action. Exact remote-profile reorder preserves the token
+  while remapping its payload. Operation progress/results now use a stable
+  location-authority generation rather than the presentation scan generation,
+  and every Done event retires its exact transfer token before stale UI effects
+  are gated. Refresh/root changes therefore settle clipboard bookkeeping and
+  cannot strand a progress/Cancel row, while a real Local/remote authority
+  change still drops late effects. Deterministic channel tests cover clear ABA,
+  partial-shrink ABA, token-preserving reorder, and Refresh-during-transfer.
+
+- **Files terminal entry and remote identity recovery (2026-08-27)**: the Files
+  header now exposes one explicit terminal action. Local opens a fresh
+  interactive tab at the exact current tree root; SSH/Docker opens the current
+  validated profile at its normal default directory, with the distinction in
+  the visible label and hover text. Remote Files state no longer trusts a
+  mutable config index: host-list changes uniquely remap the old complete
+  profile identity, while a missing, edited, duplicated, invalid, or inactive
+  profile fails closed to Local and invalidates the stale selection, transfer
+  tokens, and scan generation. Clipboard authority is reconciled separately:
+  an independently valid remote source survives/remaps with its intent token,
+  while an unprovable source alone is cleared. A failed remote start-dir
+  probe now also reports the failure and automatically recovers to Local. File
+  menu actions and delayed New/Rename/Delete dialogs carry a tree-generation +
+  complete-location stamp; root/profile changes close and reject those intents
+  before they can dispatch an old path against Local or another remote.
+  State regressions cover terminal-target semantics, reordered profile and
+  clipboard remapping (including A-tree fallback with independently retained
+  B clipboard), ambiguous identity rejection, stale-state/dialog-token cleanup,
+  explicit local cwd creation, and no-network start-dir recovery.
 
 - **Block Search 4.4 (2026-08-26)**: virtual result rows and stars now use
   direct stable egui interactions, so each exposes one authoritative AccessKit
