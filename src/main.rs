@@ -36,6 +36,7 @@ mod session_manager;
 mod session_persistence;
 mod shell;
 mod sidebar;
+mod ssh_files_follow;
 mod tab_manager;
 mod terminal;
 mod theme;
@@ -2205,6 +2206,8 @@ impl TerminalApp {
             sidebar_delete_dialog: None,
             sidebar_drop_rect: None,
             last_pointer_pos: None,
+            ssh_files_follow: Default::default(),
+            active_session_epoch: 1,
             command_sidebar: Default::default(),
             task_sidebar: Default::default(),
             block_selection: None,
@@ -2268,8 +2271,12 @@ impl TerminalApp {
         if !self.config.block_mode {
             self.clear_block_selection();
         }
-        self.sidebar.view =
+        let effective_sidebar_view =
             sidebar::effective_view(self.sidebar.view, self.config.experimental_task_sidebar);
+        if effective_sidebar_view != self.sidebar.view {
+            self.sidebar.note_files_user_intent();
+            self.sidebar.view = effective_sidebar_view;
+        }
         // Apply UI scale: use config value if provided, otherwise use native DPI
         let scale = self
             .config
@@ -2419,6 +2426,320 @@ impl TerminalApp {
         );
     }
 
+    fn active_ssh_files_observation(&self) -> ssh_files_follow::Observation {
+        self.session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(ssh_files_follow::observe_session)
+            .unwrap_or(ssh_files_follow::Observation::None)
+    }
+
+    fn active_session_allows_local_files_cwd_follow(&self) -> bool {
+        let Some(session) = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+        else {
+            return false;
+        };
+        session.purpose == crate::session::SessionPurpose::Interactive
+            && matches!(
+                ssh_files_follow::observe_session(session),
+                ssh_files_follow::Observation::None
+            )
+    }
+
+    /// Advance the single-flight hand-written SSH observer. Probe completion
+    /// is gated before *any* status/tree/sidebar mutation; a stale success or
+    /// failure is silently discarded because the user's newer UI/session
+    /// intent owns the surface.
+    fn update_ssh_files_follow(&mut self, ctx: &egui::Context, frame_start_files_user_intent: u64) {
+        while let Some(result) = self.ssh_files_follow.try_result() {
+            if !self
+                .ssh_files_follow
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.token == result.token)
+            {
+                continue;
+            }
+            let pending = self
+                .ssh_files_follow
+                .pending
+                .take()
+                .expect("matching pending SSH Files probe");
+            let observation = self.active_ssh_files_observation();
+            let observation_epoch = self.ssh_files_follow.sync_observation(&observation);
+            let sidebar_ui = ssh_files_follow::SidebarUiSnapshot::capture(
+                &self.sidebar,
+                self.sidebar_name_dialog.is_some() || self.sidebar_delete_dialog.is_some(),
+            );
+            let sidebar_ui_epoch = self.ssh_files_follow.sync_sidebar_ui(&sidebar_ui);
+            let files_context_current =
+                self.sidebar.files_intent_is_current(&pending.files_context)
+                    && !self.sidebar.has_pending_op();
+            if !ssh_files_follow::result_is_current(
+                &pending,
+                &observation,
+                observation_epoch,
+                self.active_session_epoch,
+                self.sidebar.files_user_intent_generation(),
+                sidebar_ui_epoch,
+                files_context_current,
+                &self.sidebar.current_dir,
+                &sidebar_ui,
+            ) {
+                // A user file operation or Files UI change that happened while
+                // the network probe was in flight owns the surface and
+                // consumes this observation. Only a real process/focus
+                // authority change re-arms it; ordinary UI cancellation must
+                // not turn the same argv into a surprise automatic retry.
+                if ssh_files_follow::stale_probe_should_rearm(
+                    &pending,
+                    &observation,
+                    observation_epoch,
+                    self.active_session_epoch,
+                    self.sidebar.files_user_intent_generation(),
+                    sidebar_ui_epoch,
+                    files_context_current,
+                    &self.sidebar.current_dir,
+                    &sidebar_ui,
+                ) {
+                    // Focus/process ABA is not a user rejection of Files
+                    // following. The old staged result is invalid, but when
+                    // this exact session becomes active again it deserves a
+                    // fresh probe rather than remaining deduped forever.
+                    self.ssh_files_follow.rearm_after_stale_probe(&pending.key);
+                }
+                continue;
+            }
+
+            let label = crate::config::remote_host_runtime_label(&pending.profile);
+            match pending.commit {
+                ssh_files_follow::FollowCommit::RebindCurrentOverlay => {
+                    match self
+                        .sidebar
+                        .finish_probed_execution_overlay(pending.overlay, result.outcome)
+                    {
+                        Ok(()) => {
+                            self.ssh_files_follow.clear_failure();
+                            self.sidebar.visible = true;
+                            self.sidebar.view = sidebar::SidebarView::Files;
+                            self.set_status_for(
+                                format!("Files 已验证并切换 SSH 连接：{label}"),
+                                Duration::from_secs(5),
+                            );
+                        }
+                        Err(error) => {
+                            self.ssh_files_follow.record_failure(pending.key);
+                            let error = jterm_core::review_input::safe_inline_display(&error, 320);
+                            self.set_status_for(
+                                format!(
+                                    "无法更新远程 Files 连接：{error}。旧文件树和旧连接保持不变。非交互 BatchMode 连接需要可用的 SSH key、agent，或可复用的 ControlMaster/ControlPath socket；配置后可点击重试。"
+                                ),
+                                Duration::from_secs(15),
+                            );
+                        }
+                    }
+                }
+                ssh_files_follow::FollowCommit::ReplaceLocation => match result.outcome {
+                    Ok(home) => {
+                        let Some(location) = pending
+                            .authority
+                            .current_location(&pending.profile, &self.config.remote_hosts)
+                        else {
+                            self.ssh_files_follow.record_failure(pending.key);
+                            self.set_status_for(
+                                "无法自动打开远程 Files：匹配的 saved profile 在连接期间被修改、删除或变得不唯一。可点击重试。",
+                                Duration::from_secs(12),
+                            );
+                            continue;
+                        };
+                        match self
+                            .sidebar
+                            .commit_probed_location(location, pending.overlay, home)
+                        {
+                            Ok(scan_error) => {
+                                self.ssh_files_follow.clear_failure();
+                                self.sidebar.visible = true;
+                                self.sidebar.view = sidebar::SidebarView::Files;
+                                if let Some(error) = scan_error {
+                                    self.set_status_for(
+                                        format!("已连接 {label}，但文件树读取失败：{error}"),
+                                        Duration::from_secs(7),
+                                    );
+                                } else {
+                                    self.set_status_for(
+                                        format!("Files 已跟随 SSH：{label}"),
+                                        Duration::from_secs(5),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                self.ssh_files_follow.record_failure(pending.key);
+                                self.set_status_for(
+                                    format!("无法自动打开远程 Files：{error}。可点击重试。"),
+                                    Duration::from_secs(12),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.ssh_files_follow.record_failure(pending.key);
+                        let error = jterm_core::review_input::safe_inline_display(&error, 320);
+                        self.set_status_for(
+                            format!(
+                                "无法自动打开远程 Files：{error}。非交互 BatchMode 连接需要可用的 SSH key、agent，或可复用的 ControlMaster/ControlPath socket；配置后可点击重试。"
+                            ),
+                            Duration::from_secs(15),
+                        );
+                    }
+                },
+            }
+        }
+
+        let observation = self.active_ssh_files_observation();
+        let observation_epoch = self.ssh_files_follow.sync_observation(&observation);
+        let sidebar_ui = ssh_files_follow::SidebarUiSnapshot::capture(
+            &self.sidebar,
+            self.sidebar_name_dialog.is_some() || self.sidebar_delete_dialog.is_some(),
+        );
+        let sidebar_ui_epoch = self.ssh_files_follow.sync_sidebar_ui(&sidebar_ui);
+        match observation {
+            ssh_files_follow::Observation::None => {
+                // SSH exiting only re-arms future observations; the transient
+                // Files tree remains exactly where the user left it.
+                self.ssh_files_follow.mark_observation_absent();
+            }
+            ssh_files_follow::Observation::Unsupported { key, reason } => {
+                if self.ssh_files_follow.pending.is_none()
+                    && !self.ssh_files_follow.was_handled(&key)
+                {
+                    self.ssh_files_follow.mark_handled(key);
+                    self.set_status_for(
+                        format!("无法自动打开远程 Files：{reason}"),
+                        Duration::from_secs(7),
+                    );
+                }
+            }
+            ssh_files_follow::Observation::Target {
+                key,
+                profile,
+                overlay,
+            } => {
+                let retry = self.ssh_files_follow.retry_requested_for(&key);
+                if ssh_files_follow::same_frame_files_intent_suppresses_new_observation(
+                    frame_start_files_user_intent,
+                    self.sidebar.files_user_intent_generation(),
+                ) {
+                    // This frame's user action predates the first time the
+                    // observation can be staged. Treat it exactly like an
+                    // in-flight gate failure instead of letting end-of-frame
+                    // ordering force-reveal Remote Files on a later callback.
+                    self.ssh_files_follow.suppress_for_files_intent(&key);
+                    return;
+                }
+                // Never let an automatic backend switch cancel work the user
+                // had already started. This explicit Files intent consumes the
+                // current observation; only the persistent Retry control can
+                // ask for another probe of the same live process.
+                if self.sidebar.has_pending_op()
+                    || self.sidebar_name_dialog.is_some()
+                    || self.sidebar_delete_dialog.is_some()
+                {
+                    self.ssh_files_follow.suppress_for_files_intent(&key);
+                    return;
+                }
+                if self.ssh_files_follow.pending.is_some() {
+                    return;
+                }
+                if self.ssh_files_follow.was_handled(&key) && !retry {
+                    return;
+                }
+                let same_target_with_valid_tree = ssh_files_follow::location_matches_observed(
+                    self.sidebar.location(),
+                    &self.config.remote_hosts,
+                    &profile,
+                ) && self.sidebar.root.is_some()
+                    && self.sidebar.current_dir.is_absolute()
+                    && self.sidebar.location_error().is_none();
+                let commit = match ssh_files_follow::same_target_action(
+                    same_target_with_valid_tree,
+                    self.sidebar.execution_overlay(),
+                    &overlay,
+                ) {
+                    ssh_files_follow::SameTargetAction::RevealExisting => {
+                        self.ssh_files_follow.mark_handled(key);
+                        self.ssh_files_follow.clear_failure();
+                        self.sidebar.visible = true;
+                        self.sidebar.view = sidebar::SidebarView::Files;
+                        return;
+                    }
+                    ssh_files_follow::SameTargetAction::ProbeOverlayUpgrade => {
+                        ssh_files_follow::FollowCommit::RebindCurrentOverlay
+                    }
+                    ssh_files_follow::SameTargetAction::DifferentLocation => {
+                        ssh_files_follow::FollowCommit::ReplaceLocation
+                    }
+                };
+                if let Err(problem) = crate::config::validate_remote_host(&profile) {
+                    self.ssh_files_follow.mark_handled(key.clone());
+                    self.ssh_files_follow.record_failure(key);
+                    self.set_status_for(
+                        format!("无法自动打开远程 Files：临时 SSH profile 不安全：{problem}"),
+                        Duration::from_secs(7),
+                    );
+                    return;
+                }
+
+                let authority =
+                    ssh_files_follow::target_authority(&profile, &self.config.remote_hosts);
+                if let Err(error) = remote_fs::validate_execution_endpoint(
+                    &remote_fs::FsLocation::Transient(authority.profile().clone()),
+                    &[],
+                    &overlay,
+                ) {
+                    self.ssh_files_follow.mark_handled(key.clone());
+                    self.ssh_files_follow.record_failure(key);
+                    self.set_status_for(
+                        format!("无法自动打开远程 Files：SSH execution overlay 不安全：{error}"),
+                        Duration::from_secs(12),
+                    );
+                    return;
+                }
+
+                let files_context = self.sidebar.files_intent_context();
+                let root = self.sidebar.current_dir.clone();
+                if retry {
+                    self.ssh_files_follow.consume_retry_for(&key);
+                }
+                self.ssh_files_follow.mark_handled(key.clone());
+                let pending = ssh_files_follow::PendingProbe {
+                    token: 0,
+                    observation_epoch,
+                    active_session_epoch: self.active_session_epoch,
+                    files_user_intent_generation: self.sidebar.files_user_intent_generation(),
+                    sidebar_ui_epoch,
+                    key: key.clone(),
+                    authority,
+                    profile: *profile,
+                    overlay,
+                    commit,
+                    files_context,
+                    root,
+                    sidebar_ui,
+                };
+                if let Err(error) = self.ssh_files_follow.begin_probe(pending, ctx.clone()) {
+                    self.ssh_files_follow.record_failure(key);
+                    self.set_status_for(
+                        format!("无法自动打开远程 Files：{error}。可点击重试。"),
+                        Duration::from_secs(12),
+                    );
+                }
+            }
+        }
+    }
+
     /// 顶部水平 tab 栏是否应显示：Top 模式下始终显示。
     /// 即便只有一个会话也保留，因为栏内含有侧边栏 toggle 控件。
     fn show_top_tab_bar(&self) -> bool {
@@ -2428,6 +2749,7 @@ impl TerminalApp {
     /// 切换标签栏位置(顶部 ⇄ 侧边栏)，并同步侧边栏视图与配置。
     /// 由顶栏内的位置切换按钮调用(两种模式下均可触发)。
     fn toggle_tab_bar_position(&mut self) {
+        self.sidebar.note_files_user_intent();
         self.config.tab_bar_position = match self.config.tab_bar_position {
             config::TabBarPosition::Top => config::TabBarPosition::Sidebar,
             config::TabBarPosition::Sidebar => config::TabBarPosition::Top,
@@ -2459,19 +2781,19 @@ impl TerminalApp {
         if let Some(message) = self.sidebar.set_remote_hosts(&self.config.remote_hosts) {
             self.set_status_for(message, Duration::from_secs(6));
         }
-        if !self.sidebar.visible {
-            // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
-            // 不再使用浮动按钮，避免覆盖终端内容。
-            self.sidebar_drop_rect = None;
-            return;
-        }
-
         if let Some(error) = self.sidebar.poll_scan_results().into_iter().last() {
             self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
         }
         // 文件操作 worker 的结果（新建/重命名/删除/粘贴、远程起始目录解析）。
         for message in self.sidebar.poll_op_results() {
             self.set_status_for(message, Duration::from_secs(5));
+        }
+        if !self.sidebar.visible {
+            // 展开按钮统一由顶部栏内的 ☰ 负责(Top 模式在 tab 栏，Sidebar 模式在精简顶部栏)，
+            // 不再使用浮动按钮，避免覆盖终端内容。后台结果仍需在上方收割，
+            // 否则隐藏侧边栏会让自动 SSH follow 永久误判为“仍有操作”。
+            self.sidebar_drop_rect = None;
+            return;
         }
         // 拖拽导入的帧级输入：落下的文件（raw_input_hook 已按面板区域放行）、
         // OS 拖悬停状态与指针位置。只在 Files 视图消费。
@@ -2502,6 +2824,9 @@ impl TerminalApp {
         // 仅在浏览本机时跟随：本地 shell 的 cwd 对远程文件系统没有意义。
         if self.sidebar.view == sidebar::SidebarView::Files
             && matches!(self.sidebar.location(), remote_fs::FsLocation::Local)
+            && self.ssh_files_follow.pending.is_none()
+            && self.ssh_files_follow.handled_observation.is_none()
+            && self.active_session_allows_local_files_cwd_follow()
         {
             let reported_cwd = {
                 let session = self.session_manager.get_active_session_mut();
@@ -2527,6 +2852,14 @@ impl TerminalApp {
         let mut cd_path: Option<std::path::PathBuf> = None;
         let mut show_more_path: Option<std::path::PathBuf> = None;
         let mut do_refresh = false;
+        let ssh_retry_available = if self.sidebar.view == sidebar::SidebarView::Files {
+            let observation = self.active_ssh_files_observation();
+            self.ssh_files_follow
+                .retry_available_for_observation(&observation)
+        } else {
+            false
+        };
+        let mut retry_ssh_files = false;
         let mut view_changed = false;
         let mut location_changed: Option<remote_fs::FsLocation> = None;
         let mut files_terminal_target: Option<sidebar::FilesTerminalTarget> = None;
@@ -2540,25 +2873,30 @@ impl TerminalApp {
             None;
         // 过滤开关本帧刚打开时给输入行焦点。
         let mut filter_request_focus = false;
+        let mut filter_interacted = false;
+        let mut files_popup_open = false;
         // 本帧渲染出的文件树行矩形（拖放落点命中测试用，帧级、不持久）。
         let mut tree_row_rects: Vec<(egui::Rect, std::path::PathBuf, bool)> = Vec::new();
         // 粘贴状态：同位置直接粘贴；跨位置走流式传输（下载/上传/中转）。
         let paste_state = match &self.sidebar.clipboard {
             None => FsPasteState::Empty,
-            Some(clipboard) => match (&clipboard.loc, self.sidebar.location()) {
-                (remote_fs::FsLocation::Local, remote_fs::FsLocation::Local) => FsPasteState::Ready,
-                (remote_fs::FsLocation::Remote(i), remote_fs::FsLocation::Remote(j)) if i == j => {
-                    FsPasteState::Ready
-                }
-                (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
-                    FsPasteState::Download
-                }
-                (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => {
-                    FsPasteState::Upload
-                }
-                (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Remote(_)) => {
-                    FsPasteState::Relay
-                }
+            Some(clipboard)
+                if remote_fs::same_files_namespace(
+                    &clipboard.loc,
+                    self.sidebar.location(),
+                    &self.config.remote_hosts,
+                ) =>
+            {
+                FsPasteState::Ready
+            }
+            Some(clipboard) => match (
+                clipboard.loc.is_remote(),
+                self.sidebar.location().is_remote(),
+            ) {
+                (true, false) => FsPasteState::Download,
+                (false, true) => FsPasteState::Upload,
+                (true, true) => FsPasteState::Relay,
+                (false, false) => FsPasteState::Ready,
             },
         };
 
@@ -2625,12 +2963,23 @@ impl TerminalApp {
                         do_refresh = true;
                     }
                     if self.sidebar.view == sidebar::SidebarView::Files {
+                        if ssh_retry_available
+                            && ui
+                                .button("Retry SSH Files")
+                                .on_hover_text(
+                                    "Retry the failed Files probe for the still-active SSH process",
+                                )
+                                .clicked()
+                        {
+                            retry_ssh_files = true;
+                        }
                         // 浏览位置选择器：本机 + config.remote_hosts 里的
                         // SSH 主机 / Docker 容器。每帧从配置重建，设置面板
                         // 的增删改立即生效。
                         let hosts = &self.config.remote_hosts;
                         let current = self.sidebar.location().clone();
-                        egui::ComboBox::from_id_salt("sidebar-fs-location")
+                        let location_picker =
+                            egui::ComboBox::from_id_salt("sidebar-fs-location")
                             .selected_text(current.label(hosts))
                             .show_ui(ui, |ui| {
                                 if ui
@@ -2651,12 +3000,32 @@ impl TerminalApp {
                                             current == location,
                                             location.label(hosts),
                                         )
+                                        .on_hover_text(location.detail(hosts))
                                         .clicked()
                                     {
                                         location_changed = Some(location);
                                     }
                                 }
+                                if matches!(current, remote_fs::FsLocation::Transient(_)) {
+                                    // A transient process-observed profile is a
+                                    // real current choice, but never becomes a
+                                    // config row implicitly. Keep it visible in
+                                    // the open dropdown so selection state does
+                                    // not appear to point at no item.
+                                    ui.selectable_label(true, current.label(hosts)).on_hover_text(
+                                        format!(
+                                            "{}\nTemporary profile observed from the active SSH process",
+                                            current.detail(hosts)
+                                        ),
+                                    );
+                                }
                             });
+                        if location_picker.inner.is_some() {
+                            files_popup_open = true;
+                        }
+                        location_picker
+                            .response
+                            .on_hover_text(current.detail(hosts));
                         let terminal_target = self.sidebar.files_terminal_target();
                         let (terminal_label, terminal_hint, terminal_enabled) =
                             match &terminal_target {
@@ -2668,7 +3037,10 @@ impl TerminalApp {
                                     ),
                                     true,
                                 ),
-                                Some(sidebar::FilesTerminalTarget::Remote(index)) => {
+                                Some(sidebar::FilesTerminalTarget::Remote {
+                                    index,
+                                    overlay,
+                                }) => {
                                     let display = self
                                         .config
                                         .remote_hosts
@@ -2681,6 +3053,13 @@ impl TerminalApp {
                                         &self.config.remote_hosts,
                                         *index,
                                     ) {
+                                        Ok(_) if !overlay.is_empty() => (
+                                            "Connect terminal (SSH login)",
+                                            format!(
+                                                "Open {display} as a plain interactive SSH login using the live Files connection, not the current Files path"
+                                            ),
+                                            true,
+                                        ),
                                         Ok(_) => (
                                             "Connect terminal (profile default)",
                                             format!(
@@ -2690,6 +3069,27 @@ impl TerminalApp {
                                         ),
                                         Err(problem) => (
                                             "Connect terminal (profile default)",
+                                            format!("{display} is unavailable: {problem}"),
+                                            false,
+                                        ),
+                                    }
+                                }
+                                Some(sidebar::FilesTerminalTarget::Transient {
+                                    host,
+                                    overlay: _,
+                                }) => {
+                                    let display =
+                                        crate::config::remote_host_runtime_label(host);
+                                    match crate::config::validate_remote_host(host) {
+                                        Ok(()) => (
+                                            "Connect terminal (SSH login)",
+                                            format!(
+                                                "Open {display} in a new terminal tab using the observed SSH connection options and its default login directory, not the current Files path"
+                                            ),
+                                            true,
+                                        ),
+                                        Err(problem) => (
+                                            "Connect terminal (SSH login)",
                                             format!("{display} is unavailable: {problem}"),
                                             false,
                                         ),
@@ -2726,6 +3126,7 @@ impl TerminalApp {
                             .on_hover_text("树内过滤（名称子串；Esc 或再次点击关闭）")
                             .clicked()
                         {
+                            filter_interacted = true;
                             self.sidebar.filter_open = !self.sidebar.filter_open;
                             if !self.sidebar.filter_open {
                                 self.sidebar.filter.clear();
@@ -2784,12 +3185,16 @@ impl TerminalApp {
                                         .hint_text("名称子串，Esc 关闭")
                                         .desired_width(f32::INFINITY),
                                 );
+                                if resp.changed() {
+                                    filter_interacted = true;
+                                }
                                 if filter_request_focus {
                                     resp.request_focus();
                                 }
                                 if resp.has_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Escape))
                                 {
+                                    filter_interacted = true;
                                     self.sidebar.filter.clear();
                                     self.sidebar.filter_open = false;
                                 }
@@ -2822,6 +3227,7 @@ impl TerminalApp {
                                         paste_state,
                                     );
                                 });
+                                files_popup_open |= label_resp.context_menu_opened();
                             }
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2862,6 +3268,7 @@ impl TerminalApp {
                                         paste_state,
                                         &mut tree_row_rects,
                                         &mut selection_apply,
+                                        &mut files_popup_open,
                                     );
                                 }
                                 let remaining = root.remaining_children();
@@ -2888,6 +3295,25 @@ impl TerminalApp {
             });
 
         // 闭包结束，安全 mutate
+        let files_user_intent = toggle_path.is_some()
+            || show_more_path.is_some()
+            || selection_apply.is_some()
+            || select_action.is_some()
+            || cd_path.is_some()
+            || do_refresh
+            || view_changed
+            || location_changed.is_some()
+            || files_terminal_target.is_some()
+            || fs_menu_action.is_some()
+            || cancel_transfer
+            || filter_interacted
+            || ssh_files_follow::ongoing_files_surface_is_user_intent(
+                files_popup_open,
+                hover_files_active,
+            );
+        if files_user_intent {
+            self.sidebar.note_files_user_intent();
+        }
         self.execute_pending_command_sidebar_action();
         self.execute_pending_task_sidebar_action();
         if let Some(p) = toggle_path {
@@ -2973,6 +3399,9 @@ impl TerminalApp {
                 self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
             }
         }
+        if retry_ssh_files {
+            self.ssh_files_follow.request_retry();
+        }
         if let Some(location) = location_changed {
             if let Some(error) = self.sidebar.set_location(location) {
                 self.set_status_for(format!("切换浏览位置失败:{error}"), Duration::from_secs(5));
@@ -2983,8 +3412,11 @@ impl TerminalApp {
                 sidebar::FilesTerminalTarget::Local(path) => {
                     self.open_local_terminal_at_sidebar_root(&path);
                 }
-                sidebar::FilesTerminalTarget::Remote(index) => {
-                    self.connect_remote_host(index);
+                sidebar::FilesTerminalTarget::Remote { index, overlay } => {
+                    self.connect_files_remote_host(index, overlay);
+                }
+                sidebar::FilesTerminalTarget::Transient { host, overlay } => {
+                    self.connect_transient_remote_host(host, overlay);
                 }
             }
         }
@@ -3033,7 +3465,7 @@ impl TerminalApp {
                         remote_fs::FsLocation::Local => {
                             format!("松开以导入到 {}", target.display())
                         }
-                        location @ remote_fs::FsLocation::Remote(_) => format!(
+                        location => format!(
                             "松开以上传到 {} 的 {}",
                             location.label(&self.config.remote_hosts),
                             target.display()
@@ -3056,6 +3488,7 @@ impl TerminalApp {
                 if let Some(target_dir) =
                     Self::resolve_drop_target(pointer, panel_rect, &tree_row_rects, drop_root)
                 {
+                    self.sidebar.note_files_user_intent();
                     match sidebar::plan_drop(&dropped_paths, &target_dir, self.sidebar.location()) {
                         Ok(plan) => self.execute_drop_plan(plan),
                         Err(reason) => self.set_status_for(reason, Duration::from_secs(5)),
@@ -3112,10 +3545,16 @@ impl TerminalApp {
                     is_dir,
                 } => self.sidebar.request_transfer(
                     sidebar::FsTransfer {
-                        src_loc: remote_fs::FsLocation::Local,
+                        src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                            remote_fs::FsLocation::Local,
+                            remote_fs::SshExecutionOverlay::default(),
+                        ),
                         src,
                         src_is_dir: is_dir,
-                        dst_loc: self.sidebar.location().clone(),
+                        dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                            self.sidebar.location().clone(),
+                            self.sidebar.execution_overlay().clone(),
+                        ),
                         dst_dir,
                         cut: false,
                     },
@@ -3158,6 +3597,7 @@ impl TerminalApp {
         paste: FsPasteState,
         rows: &mut Vec<(egui::Rect, std::path::PathBuf, bool)>,
         selection_apply: &mut Option<std::collections::BTreeMap<std::path::PathBuf, bool>>,
+        files_popup_open: &mut bool,
     ) {
         let is_selected = selection.contains_key(&node.path);
         let modifiers = ui.input(|input| input.modifiers);
@@ -3204,6 +3644,7 @@ impl TerminalApp {
                     paste,
                 );
             });
+            *files_popup_open |= resp.context_menu_opened();
             resp.on_hover_text("单击展开/折叠，双击进入目录 (cd)；ctrl/shift 点击多选");
             if node.expanded {
                 ui.indent(node.path.to_string_lossy(), |ui| {
@@ -3228,6 +3669,7 @@ impl TerminalApp {
                             paste,
                             rows,
                             selection_apply,
+                            files_popup_open,
                         );
                     }
                     let remaining = node.remaining_children();
@@ -3276,6 +3718,7 @@ impl TerminalApp {
                     paste,
                 );
             });
+            *files_popup_open |= resp.context_menu_opened();
         }
     }
 
@@ -3463,6 +3906,7 @@ impl TerminalApp {
         let count = paths.len();
         self.sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: self.sidebar.location().clone(),
+            overlay: self.sidebar.execution_overlay().clone(),
             items: paths
                 .into_iter()
                 .map(|(path, is_dir)| remote_fs::FsClipboardItem { path, is_dir })
@@ -3489,11 +3933,19 @@ impl TerminalApp {
             return;
         }
         let current = self.sidebar.location().clone();
+        let same_namespace =
+            remote_fs::same_files_namespace(&clipboard.loc, &current, &self.config.remote_hosts);
         if clipboard.items.len() > 1 {
             // 多项：一个批量任务（同位置逐项 rename/copy，跨位置逐项 transfer）。
             let batch = sidebar::BatchIntent::Paste {
-                src_loc: clipboard.loc.clone(),
-                dst_loc: current,
+                src_endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                    clipboard.loc.clone(),
+                    clipboard.overlay.clone(),
+                )),
+                dst_endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                    current,
+                    self.sidebar.execution_overlay().clone(),
+                )),
                 dst_dir: target_dir.to_path_buf(),
                 items: clipboard
                     .items
@@ -3508,7 +3960,7 @@ impl TerminalApp {
             return;
         }
         let item = clipboard.items[0].clone();
-        if clipboard.loc == current {
+        if same_namespace {
             // 同位置：cut → rename，copy → copy（探针的 17/AlreadyExists 兜底）。
             let Some(dst) = item.paste_destination(target_dir) else {
                 self.set_status("无法粘贴：源路径没有文件名");
@@ -3535,7 +3987,15 @@ impl TerminalApp {
                     false,
                 )
             };
-            if let Some(error) = self.sidebar.request_fs_op(kind, clear_clipboard_on_success) {
+            let overlay = remote_fs::same_namespace_execution_overlay(
+                &clipboard.overlay,
+                self.sidebar.execution_overlay(),
+            )
+            .clone();
+            if let Some(error) =
+                self.sidebar
+                    .request_fs_op_with_overlay(kind, clear_clipboard_on_success, overlay)
+            {
                 self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
             }
             return;
@@ -3545,17 +4005,23 @@ impl TerminalApp {
             self.set_status("无法粘贴：源路径没有文件名");
             return;
         }
-        let direction = match (&clipboard.loc, &current) {
-            (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => "下载",
-            (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => "上传",
+        let direction = match (clipboard.loc.is_remote(), current.is_remote()) {
+            (true, false) => "下载",
+            (false, true) => "上传",
             _ => "中转",
         };
         let cut = clipboard.cut;
         let transfer = sidebar::FsTransfer {
-            src_loc: clipboard.loc.clone(),
+            src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                clipboard.loc.clone(),
+                clipboard.overlay.clone(),
+            ),
             src: item.path.clone(),
             src_is_dir: item.is_dir,
-            dst_loc: current,
+            dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                current,
+                self.sidebar.execution_overlay().clone(),
+            ),
             dst_dir: target_dir.to_path_buf(),
             cut,
         };
@@ -3610,6 +4076,7 @@ impl TerminalApp {
     /// 文件树的模态对话框：名称输入（New File / New Folder / Rename 共用）
     /// 与删除确认。浮动窗口，仿 remote_picker 的模式。
     pub fn render_sidebar_fs_dialogs(&mut self, ctx: &egui::Context) {
+        let mut files_dialog_interacted = false;
         let stale_name = self
             .sidebar_name_dialog
             .as_ref()
@@ -3655,6 +4122,7 @@ impl TerminalApp {
                     }
                     let response = ui.text_edit_singleline(&mut dialog.input);
                     if response.changed() {
+                        files_dialog_interacted = true;
                         dialog.error = None;
                     }
                     if let Some(error) = &dialog.error {
@@ -3664,9 +4132,11 @@ impl TerminalApp {
                         && ui.input(|input| input.key_pressed(egui::Key::Enter));
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
+                            files_dialog_interacted = true;
                             submitted = true;
                         }
                         if ui.button("Cancel").clicked() {
+                            files_dialog_interacted = true;
                             cancel = true;
                         }
                     });
@@ -3678,10 +4148,12 @@ impl TerminalApp {
                     }
                 });
             if !open || cancel || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                files_dialog_interacted = true;
                 self.sidebar_name_dialog = None;
             }
         }
         if let Some(dialog) = submitted_dialog {
+            files_dialog_interacted = true;
             self.sidebar_name_dialog = None;
             self.submit_fs_name_dialog(dialog);
         }
@@ -3721,20 +4193,25 @@ impl TerminalApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
+                            files_dialog_interacted = true;
                             confirmed_delete = Some(dialog.clone());
                         }
                         if ui.button("Cancel").clicked() {
+                            files_dialog_interacted = true;
                             cancel = true;
                         }
                     });
                 });
             if !open || cancel || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                files_dialog_interacted = true;
                 self.sidebar_delete_dialog = None;
             }
         }
         if let Some(dialog) = confirmed_delete {
+            files_dialog_interacted = true;
             self.sidebar_delete_dialog = None;
             if !self.sidebar.files_intent_is_current(&dialog.context) {
+                self.sidebar.note_files_user_intent();
                 self.set_status_for(
                     "文件树位置已变化；未执行旧位置的删除操作",
                     Duration::from_secs(5),
@@ -3753,13 +4230,19 @@ impl TerminalApp {
             } else {
                 // 多选删除：一个批量任务逐项删除、跳过失败、汇总上报。
                 let batch = sidebar::BatchIntent::Delete {
-                    loc: self.sidebar.location().clone(),
+                    endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                        self.sidebar.location().clone(),
+                        self.sidebar.execution_overlay().clone(),
+                    )),
                     items: paths,
                 };
                 if let Some(error) = self.sidebar.request_batch(batch, false) {
                     self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
                 }
             }
+        }
+        if files_dialog_interacted {
+            self.sidebar.note_files_user_intent();
         }
     }
 
@@ -3948,6 +4431,11 @@ impl eframe::App for TerminalApp {
         // 与 root_ui 的可变借用互不冲突。
         let ctx_owned = root_ui.ctx().clone();
         let ctx = &ctx_owned;
+        // Capture before any command, panel, dialog, or pane interaction in
+        // this frame. SSH follow is drained only after rendering, so a first
+        // observation must still yield to an explicit Files intent that ran
+        // earlier in the same frame.
+        let frame_start_files_user_intent = self.sidebar.files_user_intent_generation();
 
         // 检查是否收到退出信号（SIGINT/SIGTERM）
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -6015,6 +6503,25 @@ impl eframe::App for TerminalApp {
                 crate::debug_log!("[SHELL EXIT] closing window");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+
+        // Drain/stage only after every frame interaction *and* scheduled shell
+        // exit/active-session transition. Publishing next frame is harmless;
+        // observing the closing session before close_session_synced bumps its
+        // focus epoch would let a dead A commit immediately before B becomes
+        // active. A retained/only exited session is never a follow authority.
+        let active_session_id_after_close = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| session.metadata.session_id.as_str());
+        let active_session_is_live_for_follow = ssh_files_follow::poll_allowed_after_shell_exit(
+            shell_exited,
+            &active_session_id,
+            active_session_id_after_close,
+        );
+        if active_session_is_live_for_follow {
+            self.update_ssh_files_follow(ctx, frame_start_files_user_intent);
         }
     }
 }

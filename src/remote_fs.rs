@@ -47,14 +47,55 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// 流式转发的块大小。
 const STREAM_BUF_SIZE: usize = 64 * 1024;
 
-/// 文件树当前浏览的位置：本机，或 `config.remote_hosts` 里的第 N 台主机。
+/// 文件树当前浏览的位置：本机、`config.remote_hosts` 里的第 N 台主机，
+/// 或从真实前台 `ssh` argv 临时派生出的独立 profile。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FsLocation {
     Local,
     Remote(usize),
+    Transient(RemoteHostConfig),
+}
+
+/// Execution-only connection material for one Files endpoint, kept outside
+/// its stable identity. This can come from an explicit `ssh -S`/
+/// `ControlPath` option or from a trusted jsh launcher's reusable
+/// ControlMaster socket; storing either in `RemoteHostConfig::ssh_args` would
+/// corrupt config matching, clipboard identity, and transient deduplication.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SshExecutionOverlay {
+    pub control_path: Option<String>,
+}
+
+impl SshExecutionOverlay {
+    pub fn from_control_path(path: Option<String>) -> Self {
+        Self { control_path: path }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.control_path.is_none()
+    }
+}
+
+/// An immutable Files execution endpoint captured when asynchronous work is
+/// dispatched. `location` remains the stable namespace identity while
+/// `overlay` carries only the live execution material for that snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsEndpointSnapshot {
+    pub location: FsLocation,
+    pub overlay: SshExecutionOverlay,
+}
+
+impl FsEndpointSnapshot {
+    pub fn new(location: FsLocation, overlay: SshExecutionOverlay) -> Self {
+        Self { location, overlay }
+    }
 }
 
 impl FsLocation {
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Self::Local)
+    }
+
     /// 位置选择器里显示的标签。
     pub fn label(&self, hosts: &[RemoteHostConfig]) -> String {
         match self {
@@ -66,7 +107,7 @@ impl FsLocation {
                     let mut label = format!(
                         "{}: {}",
                         if host.docker { "docker" } else { "ssh" },
-                        crate::config::remote_host_display_name(host, *index)
+                        crate::config::remote_host_location_display_name(host, *index)
                     );
                     if unavailable {
                         label.push_str(" (unavailable)");
@@ -75,6 +116,36 @@ impl FsLocation {
                 }
                 None => format!("remote #{index}（已从配置移除）"),
             },
+            FsLocation::Transient(host) => format!(
+                "ssh: {} (temporary)",
+                crate::config::remote_host_runtime_location_label(host)
+            ),
+        }
+    }
+
+    /// Full safe endpoint detail for a Files-location selector tooltip. The
+    /// visible label is compact; this keeps the complete ordinary DSW host
+    /// available without letting it determine sidebar width.
+    pub fn detail(&self, hosts: &[RemoteHostConfig]) -> String {
+        match self {
+            FsLocation::Local => "Local filesystem".to_string(),
+            FsLocation::Remote(index) => match hosts.get(*index) {
+                Some(host) => {
+                    let kind = if host.docker { "docker" } else { "ssh" };
+                    let display = crate::config::remote_host_display_name(host, *index);
+                    let endpoint = crate::config::remote_host_endpoint_detail(host);
+                    if display == endpoint {
+                        format!("{kind}: {endpoint}")
+                    } else {
+                        format!("{kind}: {display} — {endpoint}")
+                    }
+                }
+                None => format!("remote #{} (removed from configuration)", index + 1),
+            },
+            FsLocation::Transient(host) => format!(
+                "Temporary SSH profile: {}",
+                crate::config::remote_host_endpoint_detail(host)
+            ),
         }
     }
 }
@@ -93,6 +164,10 @@ pub struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsClipboard {
     pub loc: FsLocation,
+    /// Frozen execution metadata for the source location. It is independent
+    /// of the active tree's overlay so switching destinations cannot make a
+    /// later paste lose the authenticated source socket.
+    pub overlay: SshExecutionOverlay,
     pub items: Vec<FsClipboardItem>,
     pub cut: bool,
 }
@@ -950,6 +1025,184 @@ fn host_at(hosts: &[RemoteHostConfig], index: usize) -> io::Result<&RemoteHostCo
         .map_err(|problem| io::Error::new(io::ErrorKind::InvalidInput, problem))
 }
 
+/// Resolve a remote location against the exact authority captured with the
+/// request. A transient profile is self-contained and deliberately ignores
+/// later configuration edits/reorders.
+fn host_for_location<'a>(
+    loc: &'a FsLocation,
+    hosts: &'a [RemoteHostConfig],
+) -> io::Result<Option<&'a RemoteHostConfig>> {
+    match loc {
+        FsLocation::Local => Ok(None),
+        FsLocation::Remote(index) => host_at(hosts, *index).map(Some),
+        FsLocation::Transient(host) => {
+            validate_host_for_execution(host)?;
+            Ok(Some(host))
+        }
+    }
+}
+
+pub(crate) fn split_ssh_control_path_args(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut base = Vec::with_capacity(args.len());
+    let mut control_path = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "-S" {
+            if let Some(path) = args.get(index + 1) {
+                control_path.get_or_insert_with(|| path.clone());
+                index += 2;
+                continue;
+            }
+        } else if let Some(path) = argument.strip_prefix("-S").filter(|path| !path.is_empty()) {
+            control_path.get_or_insert_with(|| path.to_string());
+            index += 1;
+            continue;
+        }
+        let control_path_option = |option: &str| -> Option<String> {
+            let (key, value) = option.split_once('=')?;
+            key.eq_ignore_ascii_case("controlpath")
+                .then(|| value.to_string())
+        };
+        if argument == "-o" {
+            if let Some(option) = args.get(index + 1) {
+                if let Some(path) = control_path_option(option) {
+                    control_path.get_or_insert(path);
+                    index += 2;
+                    continue;
+                }
+                base.push(argument.clone());
+                base.push(option.clone());
+                index += 2;
+                continue;
+            }
+        } else if let Some(option) = argument.strip_prefix("-o") {
+            if let Some(path) = control_path_option(option) {
+                control_path.get_or_insert(path);
+                index += 1;
+                continue;
+            }
+        }
+        base.push(argument.clone());
+        index += 1;
+    }
+    (base, control_path)
+}
+
+/// Whether two stable locations address the same filesystem namespace. SSH
+/// display/deployment fields and ControlPath execution material do not change
+/// that namespace; endpoint/authentication options do. Invalid locations fail
+/// closed rather than being treated as equal.
+pub fn same_files_namespace(
+    left: &FsLocation,
+    right: &FsLocation,
+    hosts: &[RemoteHostConfig],
+) -> bool {
+    let Ok(left_host) = host_for_location(left, hosts) else {
+        return false;
+    };
+    let Ok(right_host) = host_for_location(right, hosts) else {
+        return false;
+    };
+    match (left_host, right_host) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.docker || right.docker => {
+            left.docker && right.docker && left.host == right.host && left.user == right.user
+        }
+        (Some(left), Some(right)) => {
+            left.host == right.host
+                && left.user == right.user
+                && split_ssh_control_path_args(&left.ssh_args).0
+                    == split_ssh_control_path_args(&right.ssh_args).0
+        }
+        _ => false,
+    }
+}
+
+/// Choose execution authority for a direct same-namespace copy/rename. A
+/// current destination socket wins when present; otherwise preserve the
+/// source clipboard's live/temporary socket instead of falling back to a
+/// saved profile's possibly stale ControlPath.
+pub fn same_namespace_execution_overlay<'a>(
+    source: &'a SshExecutionOverlay,
+    destination: &'a SshExecutionOverlay,
+) -> &'a SshExecutionOverlay {
+    if destination.is_empty() {
+        source
+    } else {
+        destination
+    }
+}
+
+fn validate_control_path(path: &str) -> io::Result<()> {
+    let replayable_without_original_cwd = Path::new(path).is_absolute()
+        || path
+            .strip_prefix("~/")
+            .is_some_and(|home_relative| !home_relative.is_empty());
+    if path.is_empty()
+        || path.len() > 512
+        || path.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(path)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH ControlPath is unsafe",
+        ));
+    }
+    if !replayable_without_original_cwd {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH ControlPath must be absolute or use ~/…; a relative socket depends on the original shell directory, so use an absolute ControlPath or a saved remote profile",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve and clone an endpoint's immutable base profile, then apply the
+/// narrowly typed execution overlay. The augmented clone is revalidated by
+/// Ember immediately before it can become process argv; the base location and
+/// configuration remain unchanged.
+fn execution_host_for_location(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+) -> io::Result<Option<RemoteHostConfig>> {
+    let Some(mut host) = host_for_location(loc, hosts)?.cloned() else {
+        if overlay.is_empty() {
+            return Ok(None);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an SSH execution overlay cannot target Local Files",
+        ));
+    };
+    if let Some(path) = overlay.control_path.as_deref() {
+        if host.docker {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an SSH execution overlay cannot target Docker Files",
+            ));
+        }
+        validate_control_path(path)?;
+        host.ssh_args = split_ssh_control_path_args(&host.ssh_args).0;
+        host.ssh_args.push("-S".to_string());
+        host.ssh_args.push(path.to_string());
+    }
+    validate_host_for_execution(&host)?;
+    Ok(Some(host))
+}
+
+/// Public preflight used by the UI's atomic SSH-follow commit. It performs
+/// the same endpoint resolution and overlay validation as every worker path
+/// without contacting a host.
+pub fn validate_execution_endpoint(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+) -> io::Result<()> {
+    execution_host_for_location(loc, hosts, overlay).map(|_| ())
+}
+
 /// Defense-in-depth for private helpers that receive a host reference instead
 /// of its config index. Public remote-fs entry points first use [`host_at`] so
 /// the 128-entry boundary is enforced; this second check guarantees a future
@@ -1007,83 +1260,148 @@ fn probe_op(host: &RemoteHostConfig, op: &str, args: &[&str]) -> io::Result<()> 
 }
 
 /// 列举目录。返回的条目数最多 MAX_DIRECTORY_ENTRIES + 1（截断信号，见上）。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn list_dir(
     loc: &FsLocation,
     hosts: &[RemoteHostConfig],
     dir: &Path,
 ) -> io::Result<Vec<Entry>> {
-    match loc {
-        FsLocation::Local => local_list_dir(dir),
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            require_absolute(dir)?;
-            let capture = run_probe(
-                host,
-                "list",
-                &[path_str(dir)?],
-                PROBE_LIST_TIMEOUT,
-                MAX_LIST_OUTPUT,
-            )?;
-            let output = probe_output(capture)?;
-            Ok(parse_list(&output, dir))
-        }
-    }
+    list_dir_with_overlay(loc, hosts, &SshExecutionOverlay::default(), dir)
+}
+
+pub fn list_dir_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    dir: &Path,
+) -> io::Result<Vec<Entry>> {
+    let Some(host) = execution_host_for_location(loc, hosts, overlay)? else {
+        return local_list_dir(dir);
+    };
+    require_absolute(dir)?;
+    let capture = run_probe(
+        &host,
+        "list",
+        &[path_str(dir)?],
+        PROBE_LIST_TIMEOUT,
+        MAX_LIST_OUTPUT,
+    )?;
+    let output = probe_output(capture)?;
+    Ok(parse_list(&output, dir))
+}
+
+fn remote_start_dir(host: &RemoteHostConfig) -> io::Result<PathBuf> {
+    let capture = run_probe(host, "home", &[], PROBE_LIST_TIMEOUT, MAX_SMALL_OUTPUT)?;
+    let output = probe_output(capture)?;
+    let path = PathBuf::from(String::from_utf8_lossy(&output).trim().to_string());
+    require_absolute(&path)?;
+    Ok(path)
+}
+
+fn remote_create_dir(host: &RemoteHostConfig, path: &Path) -> io::Result<()> {
+    require_absolute(path)?;
+    probe_op(host, "mkdir", &[path_str(path)?])
+}
+
+fn remote_create_file(host: &RemoteHostConfig, path: &Path) -> io::Result<()> {
+    require_absolute(path)?;
+    probe_op(host, "mkfile", &[path_str(path)?])
+}
+
+fn remote_delete(host: &RemoteHostConfig, path: &Path) -> io::Result<()> {
+    require_absolute(path)?;
+    probe_op(host, "rm", &[path_str(path)?])
+}
+
+fn remote_rename(host: &RemoteHostConfig, src: &Path, dst: &Path) -> io::Result<()> {
+    require_absolute(src)?;
+    require_absolute(dst)?;
+    probe_op(host, "mv", &[path_str(src)?, path_str(dst)?])
+}
+
+fn remote_copy(host: &RemoteHostConfig, src: &Path, dst: &Path) -> io::Result<()> {
+    require_absolute(src)?;
+    require_absolute(dst)?;
+    probe_op(host, "cp", &[path_str(src)?, path_str(dst)?])
 }
 
 /// 进入某个位置时的起始目录：本机沿用今天的行为（进程 cwd，失败回 `/`），
 /// 远程取远端 `$HOME`（探针 `home`）。
 pub fn start_dir(loc: &FsLocation, hosts: &[RemoteHostConfig]) -> io::Result<PathBuf> {
-    match loc {
-        FsLocation::Local => Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            let capture = run_probe(host, "home", &[], PROBE_LIST_TIMEOUT, MAX_SMALL_OUTPUT)?;
-            let output = probe_output(capture)?;
-            let path = PathBuf::from(String::from_utf8_lossy(&output).trim().to_string());
-            require_absolute(&path)?;
-            Ok(path)
-        }
+    start_dir_with_overlay(loc, hosts, &SshExecutionOverlay::default())
+}
+
+pub fn start_dir_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+) -> io::Result<PathBuf> {
+    match execution_host_for_location(loc, hosts, overlay)? {
+        None => Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+        Some(host) => remote_start_dir(&host),
     }
 }
 
 /// 新建目录；已存在 → AlreadyExists。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn create_dir(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::Result<()> {
-    match loc {
-        FsLocation::Local => std::fs::create_dir(path),
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            require_absolute(path)?;
-            probe_op(host, "mkdir", &[path_str(path)?])
-        }
+    create_dir_with_overlay(loc, hosts, &SshExecutionOverlay::default(), path)
+}
+
+pub fn create_dir_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    path: &Path,
+) -> io::Result<()> {
+    match execution_host_for_location(loc, hosts, overlay)? {
+        None => std::fs::create_dir(path),
+        Some(host) => remote_create_dir(&host, path),
     }
 }
 
 /// 新建空文件；已存在 → AlreadyExists。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn create_file(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::Result<()> {
-    match loc {
-        FsLocation::Local => std::fs::OpenOptions::new()
+    create_file_with_overlay(loc, hosts, &SshExecutionOverlay::default(), path)
+}
+
+pub fn create_file_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    path: &Path,
+) -> io::Result<()> {
+    match execution_host_for_location(loc, hosts, overlay)? {
+        None => std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
             .map(|_| ()),
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            require_absolute(path)?;
-            probe_op(host, "mkfile", &[path_str(path)?])
-        }
+        Some(host) => remote_create_file(&host, path),
     }
 }
 
 /// 删除文件或目录（目录递归删除；符号链接按链接本身删）。拒绝删除 `/`。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn delete(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::Result<()> {
+    delete_with_overlay(loc, hosts, &SshExecutionOverlay::default(), path)
+}
+
+pub fn delete_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    path: &Path,
+) -> io::Result<()> {
     if path == Path::new("/") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refusing to delete /",
         ));
     }
-    match loc {
-        FsLocation::Local => {
+    match execution_host_for_location(loc, hosts, overlay)? {
+        None => {
             // 与探针一致：目录（非符号链接）递归删除，其余按文件删。
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.is_dir() {
@@ -1092,53 +1410,61 @@ pub fn delete(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::
                 std::fs::remove_file(path)
             }
         }
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            require_absolute(path)?;
-            probe_op(host, "rm", &[path_str(path)?])
-        }
+        Some(host) => remote_delete(&host, path),
     }
 }
 
 /// 重命名/移动；目标已存在 → AlreadyExists。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn rename(
     loc: &FsLocation,
     hosts: &[RemoteHostConfig],
     src: &Path,
     dst: &Path,
 ) -> io::Result<()> {
-    match loc {
-        FsLocation::Local => {
+    rename_with_overlay(loc, hosts, &SshExecutionOverlay::default(), src, dst)
+}
+
+pub fn rename_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    src: &Path,
+    dst: &Path,
+) -> io::Result<()> {
+    match execution_host_for_location(loc, hosts, overlay)? {
+        None => {
             ensure_absent(dst)?;
             std::fs::rename(src, dst)
         }
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            require_absolute(src)?;
-            require_absolute(dst)?;
-            probe_op(host, "mv", &[path_str(src)?, path_str(dst)?])
-        }
+        Some(host) => remote_rename(&host, src, dst),
     }
 }
 
 /// 复制文件或目录（目录递归复制；符号链接按链接复制）；目标已存在 → AlreadyExists。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn copy(
     loc: &FsLocation,
     hosts: &[RemoteHostConfig],
     src: &Path,
     dst: &Path,
 ) -> io::Result<()> {
-    match loc {
-        FsLocation::Local => {
+    copy_with_overlay(loc, hosts, &SshExecutionOverlay::default(), src, dst)
+}
+
+pub fn copy_with_overlay(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    src: &Path,
+    dst: &Path,
+) -> io::Result<()> {
+    match execution_host_for_location(loc, hosts, overlay)? {
+        None => {
             ensure_absent(dst)?;
             copy_recursive(src, dst, 0)
         }
-        FsLocation::Remote(index) => {
-            let host = host_at(hosts, *index)?;
-            require_absolute(src)?;
-            require_absolute(dst)?;
-            probe_op(host, "cp", &[path_str(src)?, path_str(dst)?])
-        }
+        Some(host) => remote_copy(&host, src, dst),
     }
 }
 
@@ -1311,6 +1637,7 @@ fn remote_ensure_absent(host: &RemoteHostConfig, path: &Path) -> io::Result<()> 
 /// 跨位置传输（下载 / 上传 / 本地中转）的统一入口，在 op worker 上阻塞
 /// 执行；返回最终落位路径。本机→本机不应走这里（那是 copy/rename），
 /// 防御性报错。`control` 携带进度回报与取消令牌。
+#[allow(dead_code)] // compatibility wrapper used by the library test surface
 pub fn transfer(
     src_loc: &FsLocation,
     hosts: &[RemoteHostConfig],
@@ -1320,24 +1647,48 @@ pub fn transfer(
     dst_dir: &Path,
     control: TransferControl,
 ) -> io::Result<PathBuf> {
+    let src_endpoint = FsEndpointSnapshot::new(src_loc.clone(), SshExecutionOverlay::default());
+    let dst_endpoint = FsEndpointSnapshot::new(dst_loc.clone(), SshExecutionOverlay::default());
+    transfer_with_overlays(
+        &src_endpoint,
+        hosts,
+        src,
+        src_is_dir,
+        &dst_endpoint,
+        dst_dir,
+        control,
+    )
+}
+
+pub fn transfer_with_overlays(
+    src_endpoint: &FsEndpointSnapshot,
+    hosts: &[RemoteHostConfig],
+    src: &Path,
+    src_is_dir: bool,
+    dst_endpoint: &FsEndpointSnapshot,
+    dst_dir: &Path,
+    control: TransferControl,
+) -> io::Result<PathBuf> {
     let name = src.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name")
     })?;
     let dst = dst_dir.join(name);
-    match (src_loc, dst_loc) {
-        (FsLocation::Remote(index), FsLocation::Local) => {
-            let host = host_at(hosts, *index)?;
-            download(host, src, src_is_dir, &dst, control)
-        }
-        (FsLocation::Local, FsLocation::Remote(index)) => {
-            let host = host_at(hosts, *index)?;
-            upload(host, src, src_is_dir, dst_dir, &dst, control)
-        }
-        (FsLocation::Remote(i), FsLocation::Remote(j)) if i != j => {
-            let (src_host, dst_host) = (host_at(hosts, *i)?, host_at(hosts, *j)?);
-            relay(src_host, src, src_is_dir, dst_host, dst_dir, &dst, control)
-        }
-        _ => Err(io::Error::new(
+    if same_files_namespace(&src_endpoint.location, &dst_endpoint.location, hosts) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "same-location transfer should use copy/rename instead",
+        ));
+    }
+    match (
+        execution_host_for_location(&src_endpoint.location, hosts, &src_endpoint.overlay)?,
+        execution_host_for_location(&dst_endpoint.location, hosts, &dst_endpoint.overlay)?,
+    ) {
+        (Some(host), None) => download(&host, src, src_is_dir, &dst, control),
+        (None, Some(host)) => upload(&host, src, src_is_dir, dst_dir, &dst, control),
+        (Some(src_host), Some(dst_host)) => relay(
+            &src_host, src, src_is_dir, &dst_host, dst_dir, &dst, control,
+        ),
+        (None, None) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "same-location transfer should use copy/rename instead",
         )),
@@ -2049,6 +2400,145 @@ docker = true
         assert_eq!(FsLocation::Remote(0).label(&hosts), "ssh: devbox");
         assert_eq!(FsLocation::Remote(1).label(&hosts), "docker: myubuntu");
         assert!(FsLocation::Remote(9).label(&hosts).contains('#'));
+        let transient = FsLocation::Transient(hosts[0].clone());
+        assert_eq!(transient.label(&[]), "ssh: devbox (temporary)");
+        assert_eq!(
+            host_for_location(&transient, &[]).unwrap().unwrap(),
+            &hosts[0]
+        );
+    }
+
+    #[test]
+    fn control_path_is_split_from_stable_ssh_args_in_supported_spellings() {
+        for (args, expected_base, expected_path) in [
+            (
+                vec!["-p", "22", "-S", "/tmp/cm-%C"],
+                vec!["-p", "22"],
+                "/tmp/cm-%C",
+            ),
+            (
+                vec!["-S/tmp/cm-joined-%C", "-p", "22"],
+                vec!["-p", "22"],
+                "/tmp/cm-joined-%C",
+            ),
+            (
+                vec!["-o", "ControlPath=~/.ssh/cm-%C", "-p", "22"],
+                vec!["-p", "22"],
+                "~/.ssh/cm-%C",
+            ),
+            (
+                vec!["-oControlPath=/tmp/cm-inline-%C", "-p", "22"],
+                vec!["-p", "22"],
+                "/tmp/cm-inline-%C",
+            ),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let (base, path) = split_ssh_control_path_args(&args);
+            assert_eq!(base, expected_base);
+            assert_eq!(path.as_deref(), Some(expected_path));
+        }
+    }
+
+    #[test]
+    fn execution_overlay_overrides_profile_socket_without_mutating_identity() {
+        let mut configured = ssh_host();
+        configured
+            .ssh_args
+            .extend(["-o".to_string(), "ControlPath=/tmp/saved-%C".to_string()]);
+        let original = configured.clone();
+        let hosts = vec![configured];
+        let overlay = SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/anvil/live-%C".to_string(),
+        ));
+        let execution = execution_host_for_location(&FsLocation::Remote(0), &hosts, &overlay)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            hosts[0], original,
+            "stable configured identity is immutable"
+        );
+        assert_eq!(
+            execution.ssh_args,
+            ["-p", "2222", "-S", "/run/user/1000/anvil/live-%C",]
+        );
+    }
+
+    #[test]
+    fn saved_and_transient_control_paths_share_one_files_namespace() {
+        let mut saved = ssh_host();
+        saved
+            .ssh_args
+            .extend(["-S".to_string(), "/tmp/saved-%C".to_string()]);
+        let mut transient = ssh_host();
+        transient.name = "observed".to_string();
+        let hosts = vec![saved];
+        assert!(same_files_namespace(
+            &FsLocation::Remote(0),
+            &FsLocation::Transient(transient.clone()),
+            &hosts,
+        ));
+        assert!(same_files_namespace(
+            &FsLocation::Transient(transient),
+            &FsLocation::Remote(0),
+            &hosts,
+        ));
+    }
+
+    #[test]
+    fn direct_same_namespace_operation_prefers_any_live_execution_socket() {
+        let source = SshExecutionOverlay::from_control_path(Some("/tmp/source-%C".to_string()));
+        let destination = SshExecutionOverlay::default();
+        assert_eq!(
+            same_namespace_execution_overlay(&source, &destination),
+            &source,
+            "a saved destination must not discard the transient clipboard socket",
+        );
+
+        let destination =
+            SshExecutionOverlay::from_control_path(Some("/tmp/destination-%C".to_string()));
+        assert_eq!(
+            same_namespace_execution_overlay(&source, &destination),
+            &destination,
+            "the active destination socket is freshest when both sides have one",
+        );
+    }
+
+    #[test]
+    fn execution_overlay_rejects_local_docker_and_control_characters() {
+        let overlay = SshExecutionOverlay::from_control_path(Some("/tmp/cm-%C".to_string()));
+        assert!(validate_execution_endpoint(&FsLocation::Local, &[], &overlay).is_err());
+        assert!(
+            validate_execution_endpoint(&FsLocation::Transient(docker_host()), &[], &overlay,)
+                .is_err()
+        );
+        let unsafe_overlay =
+            SshExecutionOverlay::from_control_path(Some("/tmp/cm\nmalicious".to_string()));
+        assert!(validate_execution_endpoint(
+            &FsLocation::Transient(ssh_host()),
+            &[],
+            &unsafe_overlay,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn execution_overlay_accepts_only_cwd_independent_control_paths() {
+        let target = FsLocation::Transient(ssh_host());
+        for accepted in ["/run/user/1000/ember/cm-%C", "~/.ssh/cm-%C"] {
+            let overlay = SshExecutionOverlay::from_control_path(Some(accepted.to_string()));
+            validate_execution_endpoint(&target, &[], &overlay).unwrap();
+        }
+        for rejected in ["./cm-%C", "cm-%C", "~other/.ssh/cm-%C", "~", "~/"] {
+            let overlay = SshExecutionOverlay::from_control_path(Some(rejected.to_string()));
+            let error = validate_execution_endpoint(&target, &[], &overlay).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("absolute")
+                    && error.to_string().contains("saved remote profile"),
+                "{rejected:?}: {error}"
+            );
+        }
     }
 
     // ---- run_capture ----

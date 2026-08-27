@@ -850,12 +850,51 @@ header opens a type-to-filter row that prunes the loaded tree client-side
 expansion state restored on clear, no new scans — identical for local and
 remote listings).
 
+An interactive terminal that is already running a manually typed `ssh`
+command can also move Files to that destination automatically. The authority
+is the focused session's real foreground process argv read through `/proc`;
+terminal text, titles, OSC command/cwd reports, and Ember-created managed
+remote panes are never accepted as proof of an SSH connection. Direct
+`ssh TARGET -p 22`, explicit `-S` / `ControlPath`, and the constrained
+`jsh-remote.sh` launcher shape are recognized. Ember first runs the remote-home
+probe in non-interactive BatchMode while leaving the current tree visible. A
+failure therefore keeps the old location unchanged and offers a Retry action
+in the toast plus a persistent **Retry SSH Files** control in the Files
+header, with the reminder that a key, agent, or live ControlMaster socket is
+required. Probe results are consumed only after the frame's Files and pane-
+focus interactions, so a same-frame click cannot be overwritten. Exiting SSH
+does not force Files back to Local.
+
+Observed ControlPath material is execution-only: the stable saved/temporary
+profile identity never contains the live socket. Every scan, operation,
+clipboard source, transfer leg, drop, and terminal action freezes the matching
+execution overlay. A uniquely matching saved profile is preferred; otherwise
+the selector shows an independent `(temporary)` location that survives config
+reordering. Saved and temporary forms of the same stable SSH transport are one
+filesystem namespace, so Copy/Cut can use direct copy/rename and retain the
+live socket instead of relaying. If Files is already on that namespace, an
+identical overlay reveals it immediately; a new socket is staged and probed
+first, then rebound in place without changing the current root, loaded rows,
+or expansion state. A failed or stale upgrade retains both the old tree and
+old socket. Long DSW-style labels use safe middle elision (for example
+`root@dsw…aliyuncs.com`) while the complete bounded endpoint remains in the
+location tooltip.
+Observed ControlPath values are replayed only when absolute or in strict
+`~/...` form; cwd-relative sockets such as `./cm` are rejected because Ember
+cannot safely recover the original SSH process's working-directory semantics.
+
 The Files header also makes the terminal boundary explicit. On **Local**, **Open
 terminal here** creates a new interactive tab whose cwd is the current tree
 root. On `ssh:` / `docker:`, **Connect terminal (profile default)** opens the
 selected profile through the same validated remote launcher as Ctrl+Shift+S;
 it intentionally starts in that profile's normal default directory rather than
-pretending the independently browsed Files path belongs to the new PTY.
+pretending the independently browsed Files path belongs to the new PTY. A
+process-observed temporary SSH location instead offers **Connect terminal (SSH
+login)** and opens a plain interactive `ssh -t` login with its validated
+connection arguments/live ControlPath, without deploying jsh or inventing a
+remote command. A saved SSH location currently rebound to a live ControlPath
+uses that same plain-login action and exact socket; only a saved location with
+no live overlay uses its configured deploy/default behavior.
 
 Remote Files locations are reconciled by complete profile identity when
 Settings adds, removes, edits, or reorders entries. A uniquely moved profile

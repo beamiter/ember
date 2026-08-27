@@ -1085,6 +1085,7 @@ impl TerminalApp {
                 self.set_status("Debug overlay toggled");
             }
             keybindings::Command::SidebarToggle => {
+                self.sidebar.note_files_user_intent();
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {
                     if let Some(error) = self.sidebar.refresh() {
@@ -1139,6 +1140,11 @@ impl TerminalApp {
     /// 先切到拥有它的 tab，再在 tab 内聚焦对应窗格——绝不把它搬进别的窗格，
     /// 那会让 tab 高亮、键盘输入和可见内容三者分离。
     pub fn activate_session(&mut self, index: usize) -> bool {
+        let previous_session_id = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| session.metadata.session_id.clone());
         let target_session_id = self
             .session_manager
             .sessions()
@@ -1146,6 +1152,9 @@ impl TerminalApp {
             .map(|session| session.metadata.session_id.clone());
         if !self.session_manager.switch_session(index) {
             return false;
+        }
+        if previous_session_id != target_session_id {
+            self.bump_active_session_epoch();
         }
         if let Some(tab_idx) = self.tabs.tab_of_session(index) {
             self.tabs.set_active(tab_idx);
@@ -1522,10 +1531,9 @@ impl TerminalApp {
     }
 
     fn activate_previous_session(&mut self) -> bool {
-        if !self.session_manager.switch_to_previous_active() {
+        let Some(index) = self.session_manager.previous_active_index() else {
             return false;
-        }
-        let index = self.session_manager.active_index();
+        };
         self.activate_session(index)
     }
 

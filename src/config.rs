@@ -14,6 +14,12 @@ pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// what keeps the file from being overwritten by the next font zoom.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_NAME_BYTES: usize = 256;
+/// Compact remote labels must fit the narrow Files selector while keeping
+/// both ends of long DSW-style host names recognizable.
+const MAX_REMOTE_LOCATION_LABEL_CHARS: usize = 64;
+/// Tooltips retain the complete ordinary endpoint, but remain bounded even
+/// for an invalid in-memory settings draft.
+const MAX_REMOTE_ENDPOINT_DETAIL_BYTES: usize = 1024;
 const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
 const MAX_REMOTE_SSH_ARGS: usize = 64;
 const MAX_REMOTE_PROFILE_BYTES: usize = 64 * 1024;
@@ -1160,6 +1166,62 @@ pub(crate) fn remote_host_runtime_label(host: &jterm_core::jsh_remote::RemoteHos
     }
 }
 
+fn middle_elide_chars(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars || max_chars < 3 {
+        return value.to_string();
+    }
+    let prefix_chars = (max_chars - 1) / 2;
+    let suffix_chars = max_chars - prefix_chars - 1;
+    let prefix = value.chars().take(prefix_chars);
+    let suffix = value.chars().skip(count.saturating_sub(suffix_chars));
+    prefix.chain(std::iter::once('…')).chain(suffix).collect()
+}
+
+/// Narrow Files-location label. Middle elision preserves the login/host
+/// prefix and the DNS suffix (for example `root@dsw…aliyuncs.com`) instead of
+/// making many long DSW endpoints indistinguishable.
+pub(crate) fn remote_host_location_display_name(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+    index: usize,
+) -> String {
+    let display = if host.name.trim().is_empty() && !host.host.trim().is_empty() {
+        remote_host_endpoint_detail(host)
+    } else {
+        remote_host_display_name(host, index)
+    };
+    middle_elide_chars(&display, MAX_REMOTE_LOCATION_LABEL_CHARS)
+}
+
+/// Index-free form for a process-observed transient profile.
+pub(crate) fn remote_host_runtime_location_label(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> String {
+    let display = if host.name.trim().is_empty() && !host.host.trim().is_empty() {
+        remote_host_endpoint_detail(host)
+    } else {
+        remote_host_runtime_label(host)
+    };
+    middle_elide_chars(&display, MAX_REMOTE_LOCATION_LABEL_CHARS)
+}
+
+/// Full, formatting-safe `user@host` endpoint for hover/detail surfaces.
+pub(crate) fn remote_host_endpoint_detail(
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> String {
+    let endpoint = match host.user.as_deref().filter(|user| !user.is_empty()) {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let endpoint =
+        jterm_core::review_input::safe_inline_display(&endpoint, MAX_REMOTE_ENDPOINT_DETAIL_BYTES);
+    if endpoint.trim().is_empty() {
+        "remote host".to_string()
+    } else {
+        endpoint
+    }
+}
+
 fn normalize_required_text(value: &mut String, max_bytes: usize, fallback: fn() -> String) -> bool {
     let normalized = value.trim().to_string();
     if valid_config_text(&normalized, max_bytes) {
@@ -1200,6 +1262,29 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+    }
+
+    #[test]
+    fn long_dsw_location_label_keeps_login_prefix_and_dns_suffix() {
+        let mut host = default_remote_hosts()[0].clone();
+        host.name.clear();
+        host.user = Some("root".to_string());
+        host.host = format!(
+            "dsw-{}-master-0.cluster.cn-shanghai.pai.aliyuncs.com",
+            "a".repeat(120)
+        );
+        let full_endpoint = format!("root@{}", host.host);
+
+        for compact in [
+            remote_host_location_display_name(&host, 0),
+            remote_host_runtime_location_label(&host),
+        ] {
+            assert!(compact.starts_with("root@dsw"), "{compact}");
+            assert!(compact.ends_with("aliyuncs.com"), "{compact}");
+            assert!(compact.contains('…'), "{compact}");
+            assert!(compact.chars().count() <= MAX_REMOTE_LOCATION_LABEL_CHARS);
+        }
+        assert_eq!(remote_host_endpoint_detail(&host), full_endpoint);
     }
 
     #[test]

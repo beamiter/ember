@@ -343,6 +343,11 @@ impl TerminalApp {
         if index >= self.session_manager.len() || self.session_manager.len() <= 1 {
             return false;
         }
+        let active_session_before = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| session.metadata.session_id.clone());
         let removed_session_id = self
             .session_manager
             .sessions()
@@ -351,6 +356,14 @@ impl TerminalApp {
         self.clear_workspace_drag();
         if !self.session_manager.close_session(index) {
             return false;
+        }
+        let active_session_after = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| session.metadata.session_id.clone());
+        if active_session_before != active_session_after {
+            self.bump_active_session_epoch();
         }
         if let Some(session_id) = removed_session_id.as_deref() {
             self.task_manager.handle_terminal_session_closed(session_id);
@@ -1089,6 +1102,7 @@ impl TerminalApp {
         if btn_hovered {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             if mouse_released {
+                self.sidebar.note_files_user_intent();
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {
                     if let Some(error) = self.sidebar.refresh() {
@@ -1490,6 +1504,7 @@ impl TerminalApp {
             if sb_hovered {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 if mouse_released && !any_tab_drag_in_flight && !pane_drag_in_flight {
+                    self.sidebar.note_files_user_intent();
                     self.sidebar.visible = !self.sidebar.visible;
                     if self.sidebar.visible
                         && self.sidebar.view == crate::sidebar::SidebarView::Files

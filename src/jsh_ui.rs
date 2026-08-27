@@ -11,7 +11,40 @@
 use crate::app::state::TerminalApp;
 use eframe::egui;
 use jterm_core::jsh_install::{self, Prompt, Status};
+use jterm_core::jsh_remote::RemoteHostConfig;
 use std::sync::mpsc::{Receiver, TryRecvError};
+
+fn ssh_files_login_argv(
+    host: &RemoteHostConfig,
+    overlay: &crate::remote_fs::SshExecutionOverlay,
+) -> Result<Vec<String>, String> {
+    crate::config::validate_remote_host(host)?;
+    if host.docker {
+        return Err("a Files execution overlay requires SSH".to_string());
+    }
+    crate::remote_fs::validate_execution_endpoint(
+        &crate::remote_fs::FsLocation::Transient(host.clone()),
+        &[],
+        overlay,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    if overlay.is_empty() {
+        argv.extend(host.ssh_args.iter().cloned());
+    } else {
+        argv.extend(crate::remote_fs::split_ssh_control_path_args(&host.ssh_args).0);
+    }
+    if let Some(path) = &overlay.control_path {
+        argv.push("-S".to_string());
+        argv.push(path.clone());
+    }
+    argv.push("--".to_string());
+    argv.push(match &host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    });
+    Ok(argv)
+}
 
 /// Background update check plus whatever it decided to offer.
 #[derive(Default)]
@@ -88,6 +121,37 @@ impl JshNotice {
 }
 
 impl TerminalApp {
+    fn connect_plain_ssh_files_host(
+        &mut self,
+        display_name: String,
+        host: RemoteHostConfig,
+        overlay: crate::remote_fs::SshExecutionOverlay,
+    ) {
+        let argv = match ssh_files_login_argv(&host, &overlay) {
+            Ok(argv) => argv,
+            Err(problem) => {
+                self.set_status(format!("Remote host {display_name}: {problem}"));
+                return;
+            }
+        };
+        self.set_status(format!("Connecting to {display_name}"));
+
+        let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
+        let old_len = self.session_manager.len();
+        let index = self.session_manager.new_command_session(
+            display_name,
+            argv,
+            cols,
+            rows,
+            self.config.scrollback_lines,
+        );
+        if self.session_manager.len() > old_len {
+            self.tabs.on_session_inserted(index);
+            self.tabs.insert_tab_after_active(index);
+        }
+        self.activate_session(index);
+    }
+
     /// Draw the notice row, if there is anything to say. Returns true when the
     /// user asked to install, so the caller can act outside the closure.
     pub fn render_jsh_notice(&mut self, root_ui: &mut egui::Ui) -> bool {
@@ -209,5 +273,135 @@ impl TerminalApp {
             self.tabs.insert_tab_after_active(index);
         }
         self.activate_session(index);
+    }
+
+    /// Open the terminal action for a saved Files profile. Ordinarily this
+    /// preserves the profile's existing deploy/jsh behavior. When the Files
+    /// tree is bound to a live execution overlay, however, the exact socket is
+    /// the connection authority: use a plain interactive SSH login and never
+    /// inject the saved profile's remote command.
+    pub fn connect_files_remote_host(
+        &mut self,
+        index: usize,
+        overlay: crate::remote_fs::SshExecutionOverlay,
+    ) {
+        if overlay.is_empty() {
+            self.connect_remote_host(index);
+            return;
+        }
+        let host = match crate::config::validate_remote_host_at(&self.config.remote_hosts, index) {
+            Ok(host) => host.clone(),
+            Err(problem) => {
+                let name = self
+                    .config
+                    .remote_hosts
+                    .get(index)
+                    .map(|host| crate::config::remote_host_display_name(host, index))
+                    .unwrap_or_else(|| format!("remote host #{}", index + 1));
+                self.set_status(format!("Remote host {name}: {problem}"));
+                return;
+            }
+        };
+        let display_name = crate::config::remote_host_display_name(&host, index);
+        self.connect_plain_ssh_files_host(display_name, host, overlay);
+    }
+
+    /// Re-open a transient Files target as an interactive SSH login. Unlike a
+    /// configured jsh profile this intentionally has no remote command: the
+    /// target came from a hand-written plain SSH login and may not have jsh.
+    /// `new_command_session` marks it `EphemeralCommand`, which also prevents
+    /// the SSH Files observer from following Ember's own managed tab again.
+    pub fn connect_transient_remote_host(
+        &mut self,
+        host: RemoteHostConfig,
+        overlay: crate::remote_fs::SshExecutionOverlay,
+    ) {
+        let display_name = crate::config::remote_host_runtime_label(&host);
+        self.connect_plain_ssh_files_host(display_name, host, overlay);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jterm_core::jsh_remote::{observed_ssh_target, ObservedSshTarget};
+
+    #[test]
+    fn transient_terminal_reuses_connection_options_but_no_remote_command() {
+        let host = match observed_ssh_target(&[
+            "ssh".to_string(),
+            "alice@example.test".to_string(),
+            "-p".to_string(),
+            "2222".to_string(),
+        ]) {
+            ObservedSshTarget::Target(host) => host,
+            other => panic!("expected SSH target, got {other:?}"),
+        };
+        assert_eq!(
+            ssh_files_login_argv(&host, &crate::remote_fs::SshExecutionOverlay::default(),)
+                .unwrap(),
+            ["ssh", "-t", "-p", "2222", "--", "alice@example.test"]
+        );
+    }
+
+    #[test]
+    fn transient_terminal_is_plain_ssh_with_execution_only_control_path() {
+        let host = match observed_ssh_target(&["ssh".to_string(), "example.test".to_string()]) {
+            ObservedSshTarget::Target(host) => host,
+            other => panic!("expected SSH target, got {other:?}"),
+        };
+        let overlay = crate::remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/anvil/cm-%C".to_string(),
+        ));
+        assert_eq!(
+            ssh_files_login_argv(&host, &overlay).unwrap(),
+            [
+                "ssh",
+                "-t",
+                "-S",
+                "/run/user/1000/anvil/cm-%C",
+                "--",
+                "example.test",
+            ]
+        );
+        assert!(host.ssh_args.is_empty(), "overlay must not mutate identity");
+    }
+
+    #[test]
+    fn saved_live_overlay_terminal_is_plain_ssh_and_omits_deploy_command() {
+        let mut host = match observed_ssh_target(&[
+            "ssh".to_string(),
+            "alice@example.test".to_string(),
+            "-p".to_string(),
+            "2222".to_string(),
+        ]) {
+            ObservedSshTarget::Target(host) => host,
+            other => panic!("expected SSH target, got {other:?}"),
+        };
+        host.deploy = "persist".to_string();
+        host.ssh_args
+            .extend(["-S".to_string(), "/tmp/saved-stale-%C".to_string()]);
+        let overlay = crate::remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/ember/live-%C".to_string(),
+        ));
+
+        let argv = ssh_files_login_argv(&host, &overlay).unwrap();
+        assert_eq!(
+            argv,
+            [
+                "ssh",
+                "-t",
+                "-p",
+                "2222",
+                "-S",
+                "/run/user/1000/ember/live-%C",
+                "--",
+                "alice@example.test",
+            ]
+        );
+        assert!(
+            argv.iter().all(|arg| !arg.contains("jsh-remote")),
+            "a live Files socket must never inherit a saved deploy command"
+        );
     }
 }

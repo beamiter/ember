@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-27 (Files terminal entry, identity recovery, and transfer races)
+Updated: 2026-08-27 (process-observed SSH Files following and staged socket upgrades)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,38 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Process-observed SSH → Files following (2026-08-27)**: every interactive
+  terminal presentation now observes only the focused session's real `/proc`
+  foreground argv and recognizes direct SSH plus the constrained jsh launcher
+  shape from `jterm_core` revision
+  `1f5f0fbcfd91a084da9216392fe5ab26a5994adc`. OSC/text/title evidence is out of
+  bounds, and Ember-managed remote panes are skipped. A sidecar BatchMode home
+  probe is staged without blanking or switching the current tree; its callback
+  requires the exact session, raw argv, normalized profile, ControlPath
+  overlay, focus/observation epoch, Files location/root/generations, pending-op
+  state, an independent synchronous active-session epoch, and sidebar UI
+  snapshot before any mutation. Result draining happens after all frame input
+  surfaces, closing the render-order focus TOCTOU. Failure retains the tree and
+  exposes both a bounded toast action and a persistent exact-observation Files-
+  header Retry control explaining key/agent/ControlMaster requirements; SSH
+  exit does not return Files to Local. Retry dedupe
+  distinguishes ordinary user cancellation from focus A→B→A re-entry.
+  Stable saved/transient identity excludes ControlPath while immutable
+  execution snapshots carry it through scans, file ops, clipboard, both
+  transfer legs, drop, and terminal launch. Final saved matching is unique and
+  recomputed after config changes; otherwise a temporary selector row is
+  retained. Saved/transient forms of one transport use direct copy/rename and
+  prefer a live overlay. Same-target equal-overlay observations reveal the
+  existing tree; a different live socket must pass a staged probe before an
+  in-place rebind, which preserves root/loaded rows/expansion and generation-
+  retires old socket loads. Probe failure preserves the old overlay. Temporary
+  terminal launch is a plain validated `ssh -t` login. A saved location with a
+  live overlay also opens a plain login with that exact socket rather than its
+  deploy command; cwd-relative ControlPaths fail closed unless absolute or in
+  strict `~/...` form. Long DSW endpoints are
+  safely middle-elided in the selector while their complete bounded endpoint
+  remains available in hover detail.
 
 - **Files clipboard/transfer race closure (2026-08-27)**: every user Copy/Cut
   now receives a monotonically advancing intent token. Paste requests/results

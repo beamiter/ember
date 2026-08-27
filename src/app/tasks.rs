@@ -619,6 +619,7 @@ impl TerminalApp {
             worker: Some(worker),
             cancel,
         });
+        self.sidebar.note_files_user_intent();
         self.sidebar.visible = true;
         self.sidebar.view = crate::sidebar::SidebarView::Tasks;
         self.config.sidebar_view = crate::sidebar::SidebarView::Tasks;

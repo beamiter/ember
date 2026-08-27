@@ -31,7 +31,10 @@ type ScanFn = dyn Fn(&Path) -> io::Result<DirectoryListing> + Send + Sync + 'sta
 #[derive(Clone, Debug)]
 enum ScanBackend {
     Local,
-    Remote(usize, Arc<Vec<RemoteHostConfig>>),
+    Remote(
+        Box<remote_fs::FsEndpointSnapshot>,
+        Arc<Vec<RemoteHostConfig>>,
+    ),
 }
 
 /// 侧边栏内容视图。命令时间线在两种 tab 栏布局下都可用；会话列表仅在
@@ -53,7 +56,14 @@ pub enum SidebarView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilesTerminalTarget {
     Local(PathBuf),
-    Remote(usize),
+    Remote {
+        index: usize,
+        overlay: remote_fs::SshExecutionOverlay,
+    },
+    Transient {
+        host: RemoteHostConfig,
+        overlay: remote_fs::SshExecutionOverlay,
+    },
 }
 
 /// Stable identity for a Files UI intent that can outlive the tree frame that
@@ -64,6 +74,7 @@ pub enum FilesTerminalTarget {
 enum FilesLocationIdentity {
     Local,
     Remote(RemoteHostConfig),
+    Transient(RemoteHostConfig),
     InvalidRemote,
 }
 
@@ -73,6 +84,8 @@ enum FilesLocationIdentity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FilesIntentContext {
     generation: u64,
+    tree_ui_generation: u64,
+    operation_generation: u64,
     location: FilesLocationIdentity,
 }
 
@@ -168,6 +181,15 @@ impl FileTreeNode {
                 .children
                 .iter()
                 .any(FileTreeNode::has_loading_descendant)
+    }
+
+    fn collect_loading_paths(&self, paths: &mut Vec<PathBuf>) {
+        if self.is_loading() {
+            paths.push(self.path.clone());
+        }
+        for child in &self.children {
+            child.collect_loading_paths(paths);
+        }
     }
 
     /// 树内过滤视图（纯函数，不动原树）：名称大小写不敏感命中（含子串）的
@@ -349,10 +371,10 @@ impl FsOpKind {
 /// 跨位置粘贴（下载/上传/中转）的载荷。复制成功后才按 cut 删源。
 #[derive(Clone, Debug)]
 pub struct FsTransfer {
-    pub src_loc: FsLocation,
+    pub src_endpoint: remote_fs::FsEndpointSnapshot,
     pub src: PathBuf,
     pub src_is_dir: bool,
-    pub dst_loc: FsLocation,
+    pub dst_endpoint: remote_fs::FsEndpointSnapshot,
     /// 目标目录；最终路径 = dst_dir.join(源文件名)。
     pub dst_dir: PathBuf,
     pub cut: bool,
@@ -361,9 +383,12 @@ pub struct FsTransfer {
 impl FsTransfer {
     /// 状态文案用的方向词。
     fn direction(&self) -> &'static str {
-        match (&self.src_loc, &self.dst_loc) {
-            (FsLocation::Remote(_), FsLocation::Local) => "下载",
-            (FsLocation::Local, FsLocation::Remote(_)) => "上传",
+        match (
+            self.src_endpoint.location.is_remote(),
+            self.dst_endpoint.location.is_remote(),
+        ) {
+            (true, false) => "下载",
+            (false, true) => "上传",
             _ => "传输",
         }
     }
@@ -377,15 +402,15 @@ pub enum BatchIntent {
     /// 同位置逐项 copy/rename（cut）；跨位置逐项 transfer（cut = 成功后删源，
     /// 只删复制成功的源）。
     Paste {
-        src_loc: FsLocation,
-        dst_loc: FsLocation,
+        src_endpoint: Box<remote_fs::FsEndpointSnapshot>,
+        dst_endpoint: Box<remote_fs::FsEndpointSnapshot>,
         dst_dir: PathBuf,
         items: Vec<(PathBuf, bool)>,
         cut: bool,
     },
     /// 批量删除（同一位置内）。
     Delete {
-        loc: FsLocation,
+        endpoint: Box<remote_fs::FsEndpointSnapshot>,
         items: Vec<PathBuf>,
     },
 }
@@ -431,7 +456,7 @@ impl BatchOutcome {
 enum OpRequestKind {
     StartDir,
     Fs(FsOpKind),
-    Transfer(FsTransfer),
+    Transfer(Box<FsTransfer>),
     Batch(BatchIntent),
 }
 
@@ -442,6 +467,7 @@ struct FsOpRequest {
     /// tree cannot strand operation bookkeeping.
     authority_generation: u64,
     location: FsLocation,
+    overlay: remote_fs::SshExecutionOverlay,
     hosts: Arc<Vec<RemoteHostConfig>>,
     kind: OpRequestKind,
     /// The exact Copy/Cut user intent this paste was dispatched from. Results
@@ -612,8 +638,8 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
     let mut outcome = BatchOutcome::default();
     match batch {
         BatchIntent::Paste {
-            src_loc,
-            dst_loc,
+            src_endpoint,
+            dst_endpoint,
             dst_dir,
             items,
             cut,
@@ -627,19 +653,40 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                 };
                 let dst = dst_dir.join(name);
                 let name = name.to_string_lossy().into_owned();
-                let result = if src_loc == dst_loc {
+                let same_namespace = remote_fs::same_files_namespace(
+                    &src_endpoint.location,
+                    &dst_endpoint.location,
+                    hosts,
+                );
+                let same_namespace_overlay = remote_fs::same_namespace_execution_overlay(
+                    &src_endpoint.overlay,
+                    &dst_endpoint.overlay,
+                );
+                let result = if same_namespace {
                     if *cut {
-                        remote_fs::rename(dst_loc, hosts, src, &dst)
+                        remote_fs::rename_with_overlay(
+                            &dst_endpoint.location,
+                            hosts,
+                            same_namespace_overlay,
+                            src,
+                            &dst,
+                        )
                     } else {
-                        remote_fs::copy(dst_loc, hosts, src, &dst)
+                        remote_fs::copy_with_overlay(
+                            &dst_endpoint.location,
+                            hosts,
+                            same_namespace_overlay,
+                            src,
+                            &dst,
+                        )
                     }
                 } else {
-                    remote_fs::transfer(
-                        src_loc,
+                    remote_fs::transfer_with_overlays(
+                        src_endpoint,
                         hosts,
                         src,
                         *is_dir,
-                        dst_loc,
+                        dst_endpoint,
                         dst_dir,
                         remote_fs::TransferControl::default(),
                     )
@@ -648,9 +695,14 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                 match result {
                     Ok(()) => {
                         outcome.succeeded += 1;
-                        if *cut && src_loc != dst_loc {
+                        if *cut && !same_namespace {
                             // 跨位置 cut：复制成功后删源；删源失败记警告、不回滚。
-                            if let Err(error) = remote_fs::delete(src_loc, hosts, src) {
+                            if let Err(error) = remote_fs::delete_with_overlay(
+                                &src_endpoint.location,
+                                hosts,
+                                &src_endpoint.overlay,
+                                src,
+                            ) {
                                 outcome
                                     .warnings
                                     .push(format!("{name}：源删除失败（已保留）：{error}"));
@@ -661,9 +713,14 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                 }
             }
         }
-        BatchIntent::Delete { loc, items } => {
+        BatchIntent::Delete { endpoint, items } => {
             for path in items {
-                match remote_fs::delete(loc, hosts, path) {
+                match remote_fs::delete_with_overlay(
+                    &endpoint.location,
+                    hosts,
+                    &endpoint.overlay,
+                    path,
+                ) {
                     Ok(()) => outcome.succeeded += 1,
                     Err(error) => outcome.failed.push((path.clone(), error.to_string())),
                 }
@@ -676,24 +733,29 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
 fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpDone> {
     let location = &request.location;
     let hosts = request.hosts.as_slice();
+    let overlay = &request.overlay;
     match &request.kind {
-        OpRequestKind::StartDir => {
-            remote_fs::start_dir(location, hosts).map(|dir| OpDone::plain(Some(dir)))
-        }
+        OpRequestKind::StartDir => remote_fs::start_dir_with_overlay(location, hosts, overlay)
+            .map(|dir| OpDone::plain(Some(dir))),
         OpRequestKind::Fs(FsOpKind::CreateDir(path)) => {
-            remote_fs::create_dir(location, hosts, path).map(|_| OpDone::plain(None))
+            remote_fs::create_dir_with_overlay(location, hosts, overlay, path)
+                .map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::CreateFile(path)) => {
-            remote_fs::create_file(location, hosts, path).map(|_| OpDone::plain(None))
+            remote_fs::create_file_with_overlay(location, hosts, overlay, path)
+                .map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::Delete(path)) => {
-            remote_fs::delete(location, hosts, path).map(|_| OpDone::plain(None))
+            remote_fs::delete_with_overlay(location, hosts, overlay, path)
+                .map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::Rename { src, dst }) => {
-            remote_fs::rename(location, hosts, src, dst).map(|_| OpDone::plain(None))
+            remote_fs::rename_with_overlay(location, hosts, overlay, src, dst)
+                .map(|_| OpDone::plain(None))
         }
         OpRequestKind::Fs(FsOpKind::Copy { src, dst }) => {
-            remote_fs::copy(location, hosts, src, dst).map(|_| OpDone::plain(None))
+            remote_fs::copy_with_overlay(location, hosts, overlay, src, dst)
+                .map(|_| OpDone::plain(None))
         }
         OpRequestKind::Transfer(transfer) => {
             // 进度回报：节流后经 OpEvent 通道发给 UI（有损，通道满就丢）。
@@ -713,12 +775,12 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
                 progress: sink,
                 cancel: request.cancel_token.clone(),
             };
-            let dst = remote_fs::transfer(
-                &transfer.src_loc,
+            let dst = remote_fs::transfer_with_overlays(
+                &transfer.src_endpoint,
                 hosts,
                 &transfer.src,
                 transfer.src_is_dir,
-                &transfer.dst_loc,
+                &transfer.dst_endpoint,
                 &transfer.dst_dir,
                 control,
             )?;
@@ -726,7 +788,12 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
             if transfer.cut {
                 // 跨位置 cut = 复制成功后删源；删源失败按部分成功如实上报，
                 // 复制的成果不回滚、剪贴板照样清空（粘贴动作本身已完成）。
-                if let Err(error) = remote_fs::delete(&transfer.src_loc, hosts, &transfer.src) {
+                if let Err(error) = remote_fs::delete_with_overlay(
+                    &transfer.src_endpoint.location,
+                    hosts,
+                    &transfer.src_endpoint.overlay,
+                    &transfer.src,
+                ) {
                     warning = Some(format!("源删除失败（已保留）：{error}"));
                 }
             }
@@ -748,9 +815,15 @@ fn scan_worker(requests: Receiver<ScanRequest>, results: Sender<ScanResult>, sca
     while let Ok(request) = requests.recv() {
         let listing = match &request.backend {
             ScanBackend::Local => scanner(&request.path),
-            ScanBackend::Remote(index, hosts) => {
-                remote_fs::list_dir(&FsLocation::Remote(*index), hosts, &request.path).map(
-                    |entries| DirectoryListing {
+            ScanBackend::Remote(endpoint, hosts) => {
+                remote_fs::list_dir_with_overlay(
+                    &endpoint.location,
+                    hosts,
+                    &endpoint.overlay,
+                    &request.path,
+                )
+                .map(|entries| {
+                    DirectoryListing {
                         entries: entries
                             .into_iter()
                             .map(|entry| FileEntry {
@@ -761,8 +834,8 @@ fn scan_worker(requests: Receiver<ScanRequest>, results: Sender<ScanResult>, sca
                             .collect(),
                         // 截断由下方统一处理：remote_fs 会多带一条作为信号。
                         truncated: false,
-                    },
-                )
+                    }
+                })
             }
         };
         let entries = listing
@@ -867,6 +940,17 @@ pub struct Sidebar {
     clipboard_intent: Option<u64>,
     next_clipboard_intent: u64,
     scan_generation: u64,
+    /// User-visible tree interactions that do not require a rescan (collapse
+    /// and pagination) still revoke an automatic SSH probe's commit authority.
+    tree_ui_generation: u64,
+    /// Monotonic user/file-operation intent. Automatic SSH following captures
+    /// this separately from tree scans so a paste/delete started during a slow
+    /// probe is never cancelled by the eventual location commit.
+    operation_generation: u64,
+    /// Advances synchronously for every explicit Files/chrome interaction.
+    /// This is distinct from backend generations: a no-op Refresh, cancelled
+    /// dialog, or view/location ABA still consumes a same-frame SSH follow.
+    user_intent_generation: u64,
     /// Changes only when the Files backend authority changes. Tree refreshes
     /// and cwd/root changes deliberately do not invalidate operation cleanup.
     authority_generation: u64,
@@ -876,6 +960,9 @@ pub struct Sidebar {
     worker_disconnect_reported: bool,
     /// 文件树当前浏览的位置（本机或某台远程主机）。
     location: FsLocation,
+    /// Execution-only connection material for the active endpoint. This is
+    /// intentionally outside `FsLocation` and every identity comparison.
+    execution_overlay: remote_fs::SshExecutionOverlay,
     /// 远程主机配置快照，随扫描/操作请求携带。
     remote_hosts: Arc<Vec<RemoteHostConfig>>,
     op_service: Option<FsOpService>,
@@ -930,12 +1017,16 @@ impl Sidebar {
             clipboard_intent: None,
             next_clipboard_intent: 0,
             scan_generation: 0,
+            tree_ui_generation: 0,
             authority_generation: 0,
+            operation_generation: 0,
+            user_intent_generation: 0,
             scan_service,
             worker_error,
             worker_error_reported: false,
             worker_disconnect_reported: false,
             location: FsLocation::Local,
+            execution_overlay: remote_fs::SshExecutionOverlay::default(),
             remote_hosts: Arc::new(Vec::new()),
             op_service,
             op_worker_error,
@@ -970,6 +1061,52 @@ impl Sidebar {
     /// 文件树当前浏览的位置（本机或某台远程主机）。
     pub fn location(&self) -> &FsLocation {
         &self.location
+    }
+
+    pub fn execution_overlay(&self) -> &remote_fs::SshExecutionOverlay {
+        &self.execution_overlay
+    }
+
+    /// Update worker/terminal execution for the same Files identity without
+    /// resetting its root, loaded rows, selection, or expansion state. Old
+    /// in-flight scans keep immutable snapshots but are retired by generation;
+    /// directories that were loading are immediately reissued on the new
+    /// endpoint. File operations must be idle at the SSH-follow call site.
+    pub fn set_execution_overlay(
+        &mut self,
+        overlay: remote_fs::SshExecutionOverlay,
+    ) -> Result<(), String> {
+        remote_fs::validate_execution_endpoint(&self.location, &self.remote_hosts, &overlay)
+            .map_err(|error| error.to_string())?;
+        if self.execution_overlay != overlay {
+            let mut loading_paths = Vec::new();
+            if let Some(root) = &self.root {
+                root.collect_loading_paths(&mut loading_paths);
+            }
+            self.execution_overlay = overlay;
+            self.authority_generation = self.authority_generation.wrapping_add(1);
+            self.scan_generation = self.scan_generation.wrapping_add(1);
+            for (index, path) in loading_paths.into_iter().enumerate() {
+                // The first replacement request discards queued work carrying
+                // the old socket. Already-running workers may finish, but the
+                // generation gate rejects those results before tree mutation.
+                let _ = self.enqueue_scan(path, index == 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish a staged same-namespace socket upgrade. Probe failure is
+    /// checked before validation or mutation, so the old tree and execution
+    /// overlay remain authoritative. A successful probe deliberately ignores
+    /// its home path: this is an in-place transport rebind, not navigation.
+    pub fn finish_probed_execution_overlay(
+        &mut self,
+        overlay: remote_fs::SshExecutionOverlay,
+        probe: Result<PathBuf, String>,
+    ) -> Result<(), String> {
+        let _probed_home = probe?;
+        self.set_execution_overlay(overlay)
     }
 
     /// 起始目录解析失败（连不上主机等）时留在面板上的错误。
@@ -1031,6 +1168,7 @@ impl Sidebar {
         let remapped_location = match &self.location {
             FsLocation::Local => Some(FsLocation::Local),
             FsLocation::Remote(index) => remap(*index).map(FsLocation::Remote),
+            FsLocation::Transient(host) => Some(FsLocation::Transient(host.clone())),
         };
         let remapped_clipboard = self.clipboard.as_ref().and_then(|clipboard| {
             if let FsLocation::Remote(index) = &clipboard.loc {
@@ -1078,16 +1216,23 @@ impl Sidebar {
     }
 
     /// Current Files-header terminal action, if the local tree has a usable
-    /// root. Remote actions deliberately carry only the profile index: their
-    /// terminal starts in the profile's default directory, not the independently
-    /// browsed Files path.
+    /// root. Remote actions deliberately omit the independently browsed Files
+    /// path, but retain the immutable execution overlay: a saved target may be
+    /// using a freshly observed live ControlPath that its profile does not own.
     pub fn files_terminal_target(&self) -> Option<FilesTerminalTarget> {
         match &self.location {
             FsLocation::Local if !self.current_dir.as_os_str().is_empty() => {
                 Some(FilesTerminalTarget::Local(self.current_dir.clone()))
             }
             FsLocation::Local => None,
-            FsLocation::Remote(index) => Some(FilesTerminalTarget::Remote(*index)),
+            FsLocation::Remote(index) => Some(FilesTerminalTarget::Remote {
+                index: *index,
+                overlay: self.execution_overlay.clone(),
+            }),
+            FsLocation::Transient(host) => Some(FilesTerminalTarget::Transient {
+                host: host.clone(),
+                overlay: self.execution_overlay.clone(),
+            }),
         }
     }
 
@@ -1100,6 +1245,7 @@ impl Sidebar {
                 .cloned()
                 .map(FilesLocationIdentity::Remote)
                 .unwrap_or(FilesLocationIdentity::InvalidRemote),
+            FsLocation::Transient(host) => FilesLocationIdentity::Transient(host.clone()),
         }
     }
 
@@ -1109,13 +1255,39 @@ impl Sidebar {
     pub fn files_intent_context(&self) -> FilesIntentContext {
         FilesIntentContext {
             generation: self.scan_generation,
+            tree_ui_generation: self.tree_ui_generation,
+            operation_generation: self.operation_generation,
             location: self.files_location_identity(),
+        }
+    }
+
+    pub fn note_files_user_intent(&mut self) {
+        self.user_intent_generation = self.user_intent_generation.wrapping_add(1);
+        if self.user_intent_generation == 0 {
+            self.user_intent_generation = 1;
+        }
+    }
+
+    pub fn files_user_intent_generation(&self) -> u64 {
+        self.user_intent_generation
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // The binary-only SSH follow tests consume this; lib tests do not.
+    pub(crate) fn test_files_intent_context(generation: u64) -> FilesIntentContext {
+        FilesIntentContext {
+            generation,
+            tree_ui_generation: 0,
+            operation_generation: 0,
+            location: FilesLocationIdentity::Local,
         }
     }
 
     /// Revalidate a delayed Files intent immediately before dispatching it.
     pub fn files_intent_is_current(&self, context: &FilesIntentContext) -> bool {
         context.generation == self.scan_generation
+            && context.tree_ui_generation == self.tree_ui_generation
+            && context.operation_generation == self.operation_generation
             && context.location != FilesLocationIdentity::InvalidRemote
             && context.location == self.files_location_identity()
     }
@@ -1128,6 +1300,7 @@ impl Sidebar {
             return None;
         }
         self.location = location;
+        self.execution_overlay = remote_fs::SshExecutionOverlay::default();
         self.selected_path = None;
         self.selection.clear();
         self.location_error = None;
@@ -1151,6 +1324,54 @@ impl Sidebar {
         }
     }
 
+    /// Commit a process-observed SSH location only after its sidecar `home`
+    /// probe and every UI/session authority check succeeded. The location may
+    /// be a uniquely matched saved profile or a transient stable identity.
+    /// Unlike `set_location`, this installs the already-probed root in one UI
+    /// mutation, so a slow or failed connection never blanks the tree that the
+    /// user was looking at.
+    pub fn commit_probed_location(
+        &mut self,
+        location: FsLocation,
+        overlay: remote_fs::SshExecutionOverlay,
+        current_dir: PathBuf,
+    ) -> Result<Option<String>, String> {
+        if matches!(location, FsLocation::Local) {
+            return Err("an observed SSH target cannot commit Local Files".to_string());
+        }
+        remote_fs::validate_execution_endpoint(&location, &self.remote_hosts, &overlay)
+            .map_err(|error| format!("observed SSH endpoint is invalid: {error}"))?;
+        if !current_dir.is_absolute() {
+            return Err("observed SSH home is not an absolute path".to_string());
+        }
+
+        self.location = location;
+        self.execution_overlay = overlay;
+        self.current_dir = current_dir;
+        self.selected_path = None;
+        self.selection.clear();
+        self.location_error = None;
+        self.authority_generation = self.authority_generation.wrapping_add(1);
+        self.start_dir_pending = false;
+        for track in self.transfer_tracks.drain(..) {
+            track.token.store(true, Ordering::SeqCst);
+        }
+        Ok(self.start_root_scan())
+    }
+
+    #[cfg(test)]
+    fn commit_probed_transient(
+        &mut self,
+        host: RemoteHostConfig,
+        current_dir: PathBuf,
+    ) -> Result<Option<String>, String> {
+        self.commit_probed_location(
+            FsLocation::Transient(host),
+            remote_fs::SshExecutionOverlay::default(),
+            current_dir,
+        )
+    }
+
     /// UI 入口：请求一个文件变更操作（CreateDir/CreateFile/Delete/Rename/
     /// Copy）。cut-paste 传 clear_clipboard_on_success = true，成功后清空
     /// 剪贴板；失败则保留，方便用户换个目录重试。
@@ -1161,6 +1382,20 @@ impl Sidebar {
     ) -> Option<String> {
         let intent = self.clipboard_intent_for_clear(clear_clipboard_on_success);
         self.enqueue_op(OpRequestKind::Fs(kind), intent, None)
+    }
+
+    /// Same-namespace paste may cross the stable saved/transient presentation
+    /// boundary. Execute its direct copy/rename through the live socket carried
+    /// by the source clipboard or current destination, without changing the
+    /// active tree's stable identity.
+    pub fn request_fs_op_with_overlay(
+        &mut self,
+        kind: FsOpKind,
+        clear_clipboard_on_success: bool,
+        overlay: remote_fs::SshExecutionOverlay,
+    ) -> Option<String> {
+        let intent = self.clipboard_intent_for_clear(clear_clipboard_on_success);
+        self.enqueue_op_with_overlay(OpRequestKind::Fs(kind), intent, None, overlay)
     }
 
     /// UI 入口：批量操作（多选粘贴/批量删除）。逐项执行、跳过失败、
@@ -1189,7 +1424,9 @@ impl Sidebar {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| transfer.src.display().to_string());
         // 上传（本地文件）可以用 metadata 显示 X / Y MiB；下载/中转只有已传字节。
-        let total = if !transfer.src_is_dir && matches!(transfer.src_loc, FsLocation::Local) {
+        let total = if !transfer.src_is_dir
+            && matches!(&transfer.src_endpoint.location, FsLocation::Local)
+        {
             std::fs::metadata(&transfer.src).ok().map(|meta| meta.len())
         } else {
             None
@@ -1202,7 +1439,11 @@ impl Sidebar {
             bytes: 0,
         };
         let intent = self.clipboard_intent_for_clear(clear_clipboard_on_success);
-        let result = self.enqueue_op(OpRequestKind::Transfer(transfer), intent, Some(token));
+        let result = self.enqueue_op(
+            OpRequestKind::Transfer(Box::new(transfer)),
+            intent,
+            Some(token),
+        );
         if result.is_none() {
             self.transfer_tracks.push(track);
         }
@@ -1238,6 +1479,22 @@ impl Sidebar {
         clipboard_intent: Option<u64>,
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> Option<String> {
+        self.enqueue_op_with_overlay(
+            kind,
+            clipboard_intent,
+            cancel_token,
+            self.execution_overlay.clone(),
+        )
+    }
+
+    fn enqueue_op_with_overlay(
+        &mut self,
+        kind: OpRequestKind,
+        clipboard_intent: Option<u64>,
+        cancel_token: Option<Arc<AtomicBool>>,
+        overlay: remote_fs::SshExecutionOverlay,
+    ) -> Option<String> {
+        self.operation_generation = self.operation_generation.wrapping_add(1);
         let Some(service) = &self.op_service else {
             self.start_dir_pending = false;
             return Some(
@@ -1249,6 +1506,7 @@ impl Sidebar {
         let request = FsOpRequest {
             authority_generation: self.authority_generation,
             location: self.location.clone(),
+            overlay,
             hosts: self.remote_hosts.clone(),
             kind,
             clipboard_intent,
@@ -1539,7 +1797,9 @@ impl Sidebar {
     /// 切换节点展开状态，并只在第一次展开（或错误后重试）时请求扫描。
     pub fn toggle_node(&mut self, path: &Path) -> Option<String> {
         let mut should_scan = false;
+        let mut interacted = false;
         if let Some(node) = self.find_node_mut(path) {
+            interacted = true;
             node.expanded = !node.expanded;
             if node.expanded
                 && matches!(
@@ -1554,6 +1814,9 @@ impl Sidebar {
                 should_scan = true;
             }
         }
+        if interacted {
+            self.tree_ui_generation = self.tree_ui_generation.wrapping_add(1);
+        }
 
         if should_scan {
             self.enqueue_scan(path.to_path_buf(), false)
@@ -1563,11 +1826,16 @@ impl Sidebar {
     }
 
     pub fn show_more(&mut self, path: &Path) {
+        let mut interacted = false;
         if let Some(node) = self.find_node_mut(path) {
+            interacted = true;
             node.visible_children = node
                 .visible_children
                 .saturating_add(DIRECTORY_PAGE_SIZE)
                 .min(node.children.len());
+        }
+        if interacted {
+            self.tree_ui_generation = self.tree_ui_generation.wrapping_add(1);
         }
     }
 
@@ -1594,7 +1862,13 @@ impl Sidebar {
     fn enqueue_scan(&mut self, path: PathBuf, supersede_queued: bool) -> Option<String> {
         let backend = match &self.location {
             FsLocation::Local => ScanBackend::Local,
-            FsLocation::Remote(index) => ScanBackend::Remote(*index, self.remote_hosts.clone()),
+            location => ScanBackend::Remote(
+                Box::new(remote_fs::FsEndpointSnapshot::new(
+                    location.clone(),
+                    self.execution_overlay.clone(),
+                )),
+                self.remote_hosts.clone(),
+            ),
         };
         let result = match &self.scan_service {
             Some(service) => service.request(
@@ -1857,7 +2131,7 @@ fn plan_drop_with_limits(
                     is_dir,
                 });
             }
-            FsLocation::Remote(_) => {
+            FsLocation::Remote(_) | FsLocation::Transient(_) => {
                 plan.items.push(DropPlanItem::Upload {
                     src: src.clone(),
                     dst_dir: target_dir.to_path_buf(),
@@ -1905,8 +2179,51 @@ mod tests {
         sidebar.current_dir = PathBuf::from("/independent/remote/browse/path");
         assert_eq!(
             sidebar.files_terminal_target(),
-            Some(FilesTerminalTarget::Remote(7)),
+            Some(FilesTerminalTarget::Remote {
+                index: 7,
+                overlay: remote_fs::SshExecutionOverlay::default(),
+            }),
             "a remote terminal must use its profile default, never the Files browse path"
+        );
+
+        let live_overlay = remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/ember/live-%C".to_string(),
+        ));
+        sidebar.execution_overlay = live_overlay.clone();
+        assert_eq!(
+            sidebar.files_terminal_target(),
+            Some(FilesTerminalTarget::Remote {
+                index: 7,
+                overlay: live_overlay,
+            }),
+            "a saved Files target must carry its live execution socket into the terminal action"
+        );
+
+        let transient = crate::config::default_remote_hosts()[0].clone();
+        sidebar.location = FsLocation::Transient(transient.clone());
+        sidebar.execution_overlay = remote_fs::SshExecutionOverlay::default();
+        assert_eq!(
+            sidebar.files_terminal_target(),
+            Some(FilesTerminalTarget::Transient {
+                host: transient,
+                overlay: remote_fs::SshExecutionOverlay::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_follow_intent_epoch_does_not_invalidate_delayed_file_menu_context() {
+        let mut sidebar = Sidebar::with_scanner(
+            PathBuf::from("/work/tree-root"),
+            Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>,
+        );
+        let context = sidebar.files_intent_context();
+        let before = sidebar.files_user_intent_generation();
+        sidebar.note_files_user_intent();
+        assert_ne!(sidebar.files_user_intent_generation(), before);
+        assert!(
+            sidebar.files_intent_is_current(&context),
+            "SSH follow dedupe must not make a just-opened file dialog stale"
         );
     }
 
@@ -1938,6 +2255,7 @@ mod tests {
         sidebar.select_single(Path::new("/remote/home/kept.txt"), false);
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Remote(0),
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: PathBuf::from("/remote/source.txt"),
                 is_dir: false,
@@ -1968,6 +2286,216 @@ mod tests {
     }
 
     #[test]
+    fn config_replacement_does_not_retarget_transient_tree_or_clipboard() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        let tree_profile = profiles[0].clone();
+        let mut clipboard_profile = profiles[0].clone();
+        clipboard_profile.name = "temporary clipboard host".to_string();
+        clipboard_profile.host = "clipboard.example.test".to_string();
+        let clipboard_overlay = remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/anvil/clipboard-%C".to_string(),
+        ));
+        sidebar.location = FsLocation::Transient(tree_profile.clone());
+        sidebar.current_dir = PathBuf::from("/transient/home");
+        sidebar.set_clipboard(remote_fs::FsClipboard {
+            loc: FsLocation::Transient(clipboard_profile.clone()),
+            overlay: clipboard_overlay.clone(),
+            items: vec![remote_fs::FsClipboardItem {
+                path: PathBuf::from("/other/source.txt"),
+                is_dir: false,
+            }],
+            cut: false,
+        });
+        let generation = sidebar.scan_generation;
+        let intent = sidebar.files_intent_context();
+        let clipboard_intent = sidebar.clipboard_intent;
+
+        let mut replacement = profiles[0].clone();
+        replacement.host = "replacement.example.test".to_string();
+        assert!(sidebar.set_remote_hosts(&[replacement]).is_none());
+        assert_eq!(
+            sidebar.location(),
+            &FsLocation::Transient(tree_profile),
+            "a transient tree never aliases a configured row"
+        );
+        let clipboard = sidebar.clipboard.as_ref().unwrap();
+        assert_eq!(
+            clipboard.loc,
+            FsLocation::Transient(clipboard_profile),
+            "the independently frozen clipboard source also survives config replacement"
+        );
+        assert_eq!(clipboard.overlay, clipboard_overlay);
+        assert_eq!(sidebar.clipboard_intent, clipboard_intent);
+        assert_eq!(sidebar.scan_generation, generation);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/transient/home"));
+        assert!(sidebar.files_intent_is_current(&intent));
+    }
+
+    #[test]
+    fn same_target_socket_upgrade_preserves_tree_and_reissues_only_loading_rows() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.current_dir = PathBuf::from("/remote/root");
+
+        let mut root = Sidebar::root_node(&sidebar.current_dir);
+        root.load_state = DirectoryLoadState::Loaded;
+        let mut expanded = FileTreeNode::directory(
+            PathBuf::from("/remote/root/expanded"),
+            "expanded".to_string(),
+            true,
+        );
+        expanded.load_state = DirectoryLoadState::Loading;
+        expanded.children.push(FileTreeNode::from_entry(FileEntry {
+            name: "already-loaded.txt".to_string(),
+            path: PathBuf::from("/remote/root/expanded/already-loaded.txt"),
+            is_dir: false,
+        }));
+        expanded.visible_children = 1;
+        root.children.push(expanded);
+        root.visible_children = 1;
+        sidebar.root = Some(root);
+
+        // Replace the production scan workers with a deterministic channel so
+        // both the old-generation rejection and new-overlay request are exact.
+        let (request_tx, request_rx) = crossbeam_channel::bounded(4);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(4);
+        sidebar.scan_service = Some(DirectoryScanService {
+            request_tx,
+            request_rx: request_rx.clone(),
+            result_rx,
+        });
+        let old_generation = sidebar.scan_generation;
+        let old_root = sidebar.current_dir.clone();
+        let live_overlay = remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/ember/live-%C".to_string(),
+        ));
+
+        sidebar
+            .finish_probed_execution_overlay(
+                live_overlay.clone(),
+                Ok(PathBuf::from("/different/probed/home")),
+            )
+            .unwrap();
+        assert_eq!(sidebar.current_dir, old_root);
+        assert_eq!(sidebar.location(), &FsLocation::Remote(0));
+        assert_ne!(sidebar.scan_generation, old_generation);
+        let expanded = &sidebar.root.as_ref().unwrap().children[0];
+        assert!(expanded.expanded);
+        assert_eq!(expanded.children[0].name, "already-loaded.txt");
+
+        let replacement = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("loading directory is reissued on the new socket");
+        assert_eq!(replacement.generation, sidebar.scan_generation);
+        assert_eq!(replacement.path, PathBuf::from("/remote/root/expanded"));
+        match &replacement.backend {
+            ScanBackend::Remote(endpoint, _) => assert_eq!(endpoint.overlay, live_overlay),
+            ScanBackend::Local => panic!("remote loading row must stay remote"),
+        }
+
+        result_tx
+            .send(ScanResult {
+                generation: old_generation,
+                path: replacement.path.clone(),
+                entries: Ok(DirectoryListing::complete(vec![FileEntry {
+                    name: "stale.txt".to_string(),
+                    path: replacement.path.join("stale.txt"),
+                    is_dir: false,
+                }])),
+            })
+            .unwrap();
+        assert!(sidebar.poll_scan_results().is_empty());
+        assert_eq!(
+            sidebar.root.as_ref().unwrap().children[0].children[0].name,
+            "already-loaded.txt",
+            "the old socket may not overwrite loaded rows"
+        );
+
+        result_tx
+            .send(ScanResult {
+                generation: replacement.generation,
+                path: replacement.path.clone(),
+                entries: Ok(DirectoryListing::complete(vec![FileEntry {
+                    name: "fresh.txt".to_string(),
+                    path: replacement.path.join("fresh.txt"),
+                    is_dir: false,
+                }])),
+            })
+            .unwrap();
+        assert!(sidebar.poll_scan_results().is_empty());
+        let expanded = &sidebar.root.as_ref().unwrap().children[0];
+        assert!(expanded.expanded);
+        assert_eq!(expanded.children[0].name, "fresh.txt");
+    }
+
+    #[test]
+    fn failed_same_target_socket_probe_keeps_old_overlay_and_tree_untouched() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.current_dir = PathBuf::from("/remote/kept-root");
+        let old_overlay = remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/ember/old-%C".to_string(),
+        ));
+        sidebar.execution_overlay = old_overlay.clone();
+        let mut root = Sidebar::root_node(&sidebar.current_dir);
+        root.load_state = DirectoryLoadState::Loaded;
+        root.children.push(FileTreeNode::from_entry(FileEntry {
+            name: "kept.txt".to_string(),
+            path: PathBuf::from("/remote/kept-root/kept.txt"),
+            is_dir: false,
+        }));
+        root.visible_children = 1;
+        sidebar.root = Some(root);
+        let scan_generation = sidebar.scan_generation;
+        let authority_generation = sidebar.authority_generation;
+
+        let new_overlay = remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/ember/unverified-new-%C".to_string(),
+        ));
+        assert!(sidebar
+            .finish_probed_execution_overlay(
+                new_overlay,
+                Err("new socket rejected the BatchMode probe".to_string()),
+            )
+            .is_err());
+
+        assert_eq!(sidebar.execution_overlay(), &old_overlay);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/kept-root"));
+        assert_eq!(sidebar.scan_generation, scan_generation);
+        assert_eq!(sidebar.authority_generation, authority_generation);
+        let root = sidebar.root.as_ref().unwrap();
+        assert_eq!(root.children[0].name, "kept.txt");
+        assert_eq!(root.load_state, DirectoryLoadState::Loaded);
+    }
+
+    #[test]
+    fn rejected_transient_commit_preserves_the_existing_tree() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/existing/root"), scanner);
+        let location = sidebar.location().clone();
+        let generation = sidebar.scan_generation;
+        let authority = sidebar.authority_generation;
+
+        let profile = crate::config::default_remote_hosts()[0].clone();
+        assert!(sidebar
+            .commit_probed_transient(profile, PathBuf::from("relative/home"))
+            .is_err());
+        assert_eq!(sidebar.location(), &location);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/existing/root"));
+        assert_eq!(sidebar.scan_generation, generation);
+        assert_eq!(sidebar.authority_generation, authority);
+    }
+
+    #[test]
     fn changed_remote_profile_falls_back_local_and_invalidates_remote_state() {
         let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
         let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
@@ -1979,6 +2507,7 @@ mod tests {
         sidebar.select_single(Path::new("/remote/home/stale.txt"), false);
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Remote(0),
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: PathBuf::from("/remote/home/stale.txt"),
                 is_dir: false,
@@ -2026,6 +2555,7 @@ mod tests {
         sidebar.current_dir = PathBuf::from("/remote-a/home");
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Remote(1),
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: PathBuf::from("/remote-b/kept.txt"),
                 is_dir: false,
@@ -2387,6 +2917,7 @@ mod tests {
         // cut-paste 成功后剪贴板被清空。
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: renamed.clone(),
                 is_dir: false,
@@ -2417,6 +2948,7 @@ mod tests {
         let (requests, results) = controlled_op_service(&mut sidebar);
         let clipboard = remote_fs::FsClipboard {
             loc: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: src.clone(),
                 is_dir: false,
@@ -2444,6 +2976,60 @@ mod tests {
     }
 
     #[test]
+    fn saved_destination_uses_transient_clipboard_socket_for_direct_cut_rename() {
+        let dir = TestDir::new();
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+        let saved = crate::config::default_remote_hosts()[0].clone();
+        assert!(sidebar
+            .set_remote_hosts(std::slice::from_ref(&saved))
+            .is_none());
+        sidebar.location = FsLocation::Remote(0);
+        let (requests, results) = controlled_op_service(&mut sidebar);
+
+        let mut transient = saved.clone();
+        transient.name = "process-observed".to_string();
+        let live_overlay = remote_fs::SshExecutionOverlay::from_control_path(Some(
+            "/run/user/1000/anvil/live-%C".to_string(),
+        ));
+        sidebar.set_clipboard(remote_fs::FsClipboard {
+            loc: FsLocation::Transient(transient),
+            overlay: live_overlay.clone(),
+            items: vec![remote_fs::FsClipboardItem {
+                path: PathBuf::from("/remote/source.txt"),
+                is_dir: false,
+            }],
+            cut: true,
+        });
+        assert!(remote_fs::same_files_namespace(
+            &sidebar.clipboard.as_ref().unwrap().loc,
+            sidebar.location(),
+            &sidebar.remote_hosts,
+        ));
+
+        assert!(sidebar
+            .request_fs_op_with_overlay(
+                FsOpKind::Rename {
+                    src: PathBuf::from("/remote/source.txt"),
+                    dst: PathBuf::from("/remote/dst/source.txt"),
+                },
+                true,
+                live_overlay.clone(),
+            )
+            .is_none());
+        let request = requests.recv().unwrap();
+        assert_eq!(request.location, FsLocation::Remote(0));
+        assert_eq!(request.overlay, live_overlay);
+        assert!(matches!(
+            &request.kind,
+            OpRequestKind::Fs(FsOpKind::Rename { .. })
+        ));
+
+        complete_request(&results, request, Ok(None), None);
+        let _ = sidebar.poll_op_results();
+        assert!(sidebar.clipboard.is_none());
+    }
+
+    #[test]
     fn old_partial_batch_cannot_shrink_a_new_identical_clipboard_intent() {
         let dir = TestDir::new();
         let a = dir.0.join("a.txt");
@@ -2453,6 +3039,7 @@ mod tests {
         let (requests, results) = controlled_op_service(&mut sidebar);
         let clipboard = remote_fs::FsClipboard {
             loc: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![
                 remote_fs::FsClipboardItem {
                     path: a.clone(),
@@ -2466,8 +3053,14 @@ mod tests {
             cut: true,
         };
         let batch = BatchIntent::Paste {
-            src_loc: FsLocation::Local,
-            dst_loc: FsLocation::Local,
+            src_endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            )),
+            dst_endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            )),
             dst_dir: dst,
             items: vec![(a.clone(), false), (b.clone(), false)],
             cut: true,
@@ -2503,6 +3096,7 @@ mod tests {
         let (requests, results) = controlled_op_service(&mut sidebar);
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: src.clone(),
                 is_dir: false,
@@ -2510,10 +3104,16 @@ mod tests {
             cut: true,
         });
         let transfer = FsTransfer {
-            src_loc: FsLocation::Local,
+            src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             src,
             src_is_dir: false,
-            dst_loc: FsLocation::Remote(0),
+            dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Remote(0),
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             dst_dir: PathBuf::from("/remote/dst"),
             cut: true,
         };
@@ -2567,6 +3167,7 @@ mod tests {
         // cut 的删源只在复制成功后发生 —— 剪贴板保留、源文件原样还在。
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![remote_fs::FsClipboardItem {
                 path: src.clone(),
                 is_dir: false,
@@ -2574,10 +3175,16 @@ mod tests {
             cut: true,
         });
         let transfer = FsTransfer {
-            src_loc: FsLocation::Local,
+            src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             src: src.clone(),
             src_is_dir: false,
-            dst_loc: FsLocation::Remote(9),
+            dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Remote(9),
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             dst_dir: PathBuf::from("/tmp"),
             cut: true,
         };
@@ -2604,10 +3211,16 @@ mod tests {
 
         // 本机 → 本机不是传输（那是 copy/rename），worker 如实报错且不触网。
         let transfer = FsTransfer {
-            src_loc: FsLocation::Local,
+            src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             src: src.clone(),
             src_is_dir: false,
-            dst_loc: FsLocation::Local,
+            dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             dst_dir: dir.0.clone(),
             cut: false,
         };
@@ -2631,15 +3244,22 @@ mod tests {
         let request = FsOpRequest {
             authority_generation: 0,
             location: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             hosts: Arc::new(Vec::new()),
-            kind: OpRequestKind::Transfer(FsTransfer {
-                src_loc: FsLocation::Local,
+            kind: OpRequestKind::Transfer(Box::new(FsTransfer {
+                src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                    FsLocation::Local,
+                    remote_fs::SshExecutionOverlay::default(),
+                ),
                 src: PathBuf::from("/nonexistent-source.bin"),
                 src_is_dir: false,
-                dst_loc: FsLocation::Remote(9),
+                dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                    FsLocation::Remote(9),
+                    remote_fs::SshExecutionOverlay::default(),
+                ),
                 dst_dir: PathBuf::from("/tmp"),
                 cut: false,
-            }),
+            })),
             clipboard_intent: None,
             cancel_token: Some(token.clone()),
         };
@@ -2668,10 +3288,16 @@ mod tests {
         let dir = TestDir::new();
         let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
         let make_transfer = || FsTransfer {
-            src_loc: FsLocation::Local,
+            src_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             src: dir.0.join("file.bin"),
             src_is_dir: false,
-            dst_loc: FsLocation::Remote(9),
+            dst_endpoint: remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Remote(9),
+                remote_fs::SshExecutionOverlay::default(),
+            ),
             dst_dir: PathBuf::from("/tmp"),
             cut: false,
         };
@@ -2728,20 +3354,24 @@ mod tests {
         );
 
         let plan = plan_drop(&dropped, &target, &FsLocation::Remote(0)).unwrap();
+        let expected_uploads = vec![
+            DropPlanItem::Upload {
+                src: src.clone(),
+                dst_dir: target.clone(),
+                is_dir: true,
+            },
+            DropPlanItem::Upload {
+                src: dir.0.join("b.bin"),
+                dst_dir: target.clone(),
+                is_dir: false,
+            },
+        ];
+        assert_eq!(plan.items, expected_uploads);
+        let transient = FsLocation::Transient(crate::config::default_remote_hosts()[0].clone());
+        let transient_plan = plan_drop(&dropped, &target, &transient).unwrap();
         assert_eq!(
-            plan.items,
-            vec![
-                DropPlanItem::Upload {
-                    src: src.clone(),
-                    dst_dir: target.clone(),
-                    is_dir: true,
-                },
-                DropPlanItem::Upload {
-                    src: dir.0.join("b.bin"),
-                    dst_dir: target.clone(),
-                    is_dir: false,
-                },
-            ]
+            transient_plan.items, expected_uploads,
+            "transient SSH is a remote upload backend too"
         );
         // Remote 位置不做就地预检（worker 的 17/AlreadyExists 兜底）。
         assert!(plan.refused_existing.is_empty());
@@ -2994,7 +3624,10 @@ mod tests {
         poll_until_loaded(&mut sidebar);
 
         let batch = BatchIntent::Delete {
-            loc: FsLocation::Local,
+            endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            )),
             items: vec![a.clone(), missing.clone(), b.clone()],
         };
         assert!(sidebar.request_batch(batch, false).is_none());
@@ -3041,6 +3674,7 @@ mod tests {
         let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
         sidebar.set_clipboard(remote_fs::FsClipboard {
             loc: FsLocation::Local,
+            overlay: remote_fs::SshExecutionOverlay::default(),
             items: vec![
                 remote_fs::FsClipboardItem {
                     path: a.clone(),
@@ -3054,8 +3688,14 @@ mod tests {
             cut: true,
         });
         let batch = BatchIntent::Paste {
-            src_loc: FsLocation::Local,
-            dst_loc: FsLocation::Local,
+            src_endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            )),
+            dst_endpoint: Box::new(remote_fs::FsEndpointSnapshot::new(
+                FsLocation::Local,
+                remote_fs::SshExecutionOverlay::default(),
+            )),
             dst_dir: dst_dir.clone(),
             items: vec![(a.clone(), false), (b.clone(), false)],
             cut: true,

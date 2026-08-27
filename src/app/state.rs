@@ -223,6 +223,15 @@ pub struct TerminalApp {
     pub sidebar_drop_rect: Option<egui::Rect>,
     /// 最近一次指针位置（拖放帧不一定带 PointerMoved，按帧缓存）。
     pub last_pointer_pos: Option<egui::Pos2>,
+    /// Single-flight observer/probe state for hand-launched interactive SSH.
+    /// The tree itself remains untouched until this state yields a fully gated
+    /// successful result.
+    pub(crate) ssh_files_follow: crate::ssh_files_follow::State,
+    /// Monotonic authority for the actually active terminal session. Unlike
+    /// sampled `/proc` observations, this advances synchronously on every real
+    /// activation so an A -> B -> A focus ABA between frames cannot validate a
+    /// probe that was staged under the first A.
+    pub(crate) active_session_epoch: u64,
 
     // Semantic command timeline sidebar
     pub command_sidebar: CommandSidebarState,
@@ -387,6 +396,13 @@ pub struct TerminalApp {
 }
 
 impl TerminalApp {
+    pub(crate) fn bump_active_session_epoch(&mut self) {
+        self.active_session_epoch = self.active_session_epoch.wrapping_add(1);
+        if self.active_session_epoch == 0 {
+            self.active_session_epoch = 1;
+        }
+    }
+
     /// 设置短暂的状态提示(默认 2.5 秒后自动隐藏)。多次调用会重置计时器。
     /// 主线程的所有反馈消息(分屏、跳转命令、复制等)都应走这里,避免再
     /// 出现"写了 status_message 却没人显示"的悄悄丢弃。

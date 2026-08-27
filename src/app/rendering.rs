@@ -2553,11 +2553,16 @@ impl TerminalApp {
         let alpha = (fade_alpha * 230.0) as u8;
         let bg =
             egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
+        let ssh_retry = self
+            .ssh_files_follow
+            .retry_available_for_observation(&self.active_ssh_files_observation())
+            && message.contains("远程 Files");
+        let mut retry_clicked = false;
 
         egui::Area::new(egui::Id::new("status_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .order(egui::Order::Tooltip)
-            .interactable(false)
+            .interactable(ssh_retry)
             .show(ctx, |ui| {
                 egui::Frame {
                     fill: bg,
@@ -2572,8 +2577,23 @@ impl TerminalApp {
                             .color(text_color.gamma_multiply(fade_alpha))
                             .size(12.0),
                     );
+                    if ssh_retry
+                        && ui
+                            .button("Retry Remote Files")
+                            .on_hover_text("Re-check the same live SSH process and retry safely")
+                            .clicked()
+                    {
+                        retry_clicked = true;
+                    }
                 });
             });
+
+        if retry_clicked {
+            self.ssh_files_follow.request_retry();
+            self.status_message = "正在重试远程 Files…".to_string();
+            self.status_expires_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        }
 
         // 还在显示期间持续重绘,保证淡出/到期清理及时生效。
         ctx.request_repaint();

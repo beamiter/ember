@@ -979,19 +979,15 @@ impl SessionManager {
         }
     }
 
-    /// 跳到最近一次被切走的会话(若仍存在)。返回是否成功跳转。
-    pub fn switch_to_previous_active(&mut self) -> bool {
-        let Some(prev_id) = self.previous_session_id.clone() else {
-            return false;
-        };
-        let target = self
-            .sessions
+    /// Resolve the most recently left session without mutating activation.
+    /// Callers must route the returned index through TerminalApp's single
+    /// activation path so focus authority epochs cannot miss the switch.
+    pub fn previous_active_index(&self) -> Option<usize> {
+        let prev_id = self.previous_session_id.as_deref()?;
+        self.sessions
             .iter()
-            .position(|s| s.metadata.session_id == prev_id);
-        match target {
-            Some(idx) if idx != self.active_index => self.switch_session(idx),
-            _ => false,
-        }
+            .position(|session| session.metadata.session_id == prev_id)
+            .filter(|index| *index != self.active_index)
     }
 
     /// 扫描所有后台会话:若其 shell 事件通道有未消费数据,标记 unseen_output。
@@ -1349,6 +1345,17 @@ mod tests {
         assert!(!manager.retain_exited_command(&first_id));
 
         manager.switch_session(created.session_index);
+        let active_before_resolution = manager.active_index();
+        assert_eq!(manager.previous_active_index(), Some(0));
+        assert_eq!(
+            manager.active_index(),
+            active_before_resolution,
+            "previous-session lookup must not pre-switch around TerminalApp's focus epoch gate"
+        );
+        let previous = manager.previous_active_index().unwrap();
+        assert!(manager.switch_session(previous));
+        assert_eq!(manager.active_index(), 0);
+        assert_eq!(manager.previous_active_index(), Some(created.session_index));
         assert_eq!(manager.restorable_active_index(), Some(0));
         let snapshots = manager.get_session_snapshots();
         assert_eq!(snapshots.len(), 1);
