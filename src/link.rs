@@ -58,11 +58,12 @@ pub struct LinkDetector {
 
 impl LinkDetector {
     pub fn new(config: LinkDetectionConfig) -> Self {
-        // URL regex: absolute HTTP(S) only. Family policy refuses every other
-        // scheme (ftp, file, ...) so detection cannot offer a clickable target
-        // the opener boundary would reject anyway.
+        // 先识别一切 URL 形状的文本（任意 scheme）；是否可点击仍由
+        // `is_supported_hyperlink_uri` 单独裁决。括号允许出现在 URL 体内
+        // （如维基百科的 /wiki/Foo_(bar)），尾部不配对的右括号在下方裁剪。
         let url_regex =
-            Regex::new(r"https?://[^\s<>\[\]{}|\\^`()]*[^\s<>\[\]{}|\\^`().,;:!?\-]").unwrap();
+            Regex::new(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\[\]{}|\\^`]*[^\s<>\[\]{}|\\^`.,;:!?\-]")
+                .unwrap();
 
         // IP 地址正则：x.x.x.x 格式
         let ip_regex = Regex::new(
@@ -89,18 +90,29 @@ impl LinkDetector {
     /// 在单行文本中检测所有链接
     pub fn detect_links_in_line(&self, line: &str, line_idx: usize) -> Vec<Link> {
         let mut links = Vec::new();
+        let mut url_spans = Vec::new();
 
-        // 检测 URL
-        if self.config.detect_urls {
-            for mat in self.url_regex.find_iter(line) {
-                let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-                let col_end = Self::byte_offset_to_char_offset(line, mat.end());
+        // 无论 URL 激活是否开启，都先圈出全部 URL 形状的区段：被拒 scheme
+        // 里的 IP/路径子串绝不允许回落成别的链接类型。
+        for mat in self.url_regex.find_iter(line) {
+            let mut url = mat.as_str();
+            // 裁掉尾部不配对的 )，让 (https://example.com) 不吞掉右括号，
+            // 同时保留配对的 /wiki/Foo_(bar)。
+            while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
+                url = &url[..url.len() - 1];
+            }
+            let col_start = Self::byte_offset_to_char_offset(line, mat.start());
+            let col_end = Self::byte_offset_to_char_offset(line, mat.start() + url.len());
+            // 即使策略拒绝这个 URL，也保留整个区段：否则
+            // https://user@192.0.2.1 的内层 IP 会被单独激活。
+            url_spans.push((col_start, col_end));
+            if self.config.detect_urls && crate::terminal::is_supported_hyperlink_uri(url) {
                 links.push(Link {
                     line: line_idx,
                     col_start,
                     col_end,
                     link_type: LinkType::Url,
-                    text: mat.as_str().to_string(),
+                    text: url.to_string(),
                 });
             }
         }
@@ -122,10 +134,13 @@ impl LinkDetector {
 
                 let col_start = Self::byte_offset_to_char_offset(line, mat.start());
                 let col_end = Self::byte_offset_to_char_offset(line, mat.end());
-                // 避免与 URL 重复
-                if !links
+                // 避免与 URL 重复（含被策略拒绝、未成为链接的 URL 区段）
+                if !url_spans
                     .iter()
-                    .any(|l| l.col_start <= col_start && col_end <= l.col_end)
+                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                    && !links
+                        .iter()
+                        .any(|l| l.col_start <= col_start && col_end <= l.col_end)
                 {
                     links.push(Link {
                         line: line_idx,
@@ -156,10 +171,13 @@ impl LinkDetector {
                 let col_start = Self::byte_offset_to_char_offset(line, start_b);
                 let col_end = Self::byte_offset_to_char_offset(line, end_b);
 
-                // 避免与 URL 重复
-                if !links
+                // 避免与 URL 重复（含被策略拒绝、未成为链接的 URL 区段）
+                if !url_spans
                     .iter()
-                    .any(|l| l.col_start <= col_start && col_end <= l.col_end)
+                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                    && !links
+                        .iter()
+                        .any(|l| l.col_start <= col_start && col_end <= l.col_end)
                     && Self::is_valid_file_path(matched_text)
                 {
                     links.push(Link {
@@ -671,9 +689,40 @@ mod tests {
         };
 
         let detector = LinkDetector::new(config);
-        let line = "Visit https://example.com for more info";
+        let line = "Visit https://192.0.2.1/a for more info";
         let links = detector.detect_links_in_line(line, 0);
 
         assert!(!links.iter().any(|l| l.link_type == LinkType::Url));
+        assert!(links.is_empty(), "inner IP must not bypass URL policy");
+    }
+
+    #[test]
+    fn unsafe_url_shapes_never_fall_back_to_inner_ip_links() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for text in [
+            "ftp://192.0.2.1/archive",
+            "https://user:token@192.0.2.1/private",
+            "file://192.0.2.1/etc/passwd",
+        ] {
+            assert!(
+                detector.detect_links_in_line(text, 0).is_empty(),
+                "unsafe enclosing URL became actionable: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbalanced_trailing_paren_is_trimmed_but_balanced_parens_stay() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+
+        let links = detector.detect_links_in_line("(https://example.com)", 0);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, "https://example.com");
+        assert_eq!(links[0].col_end, "(https://example.com".len());
+
+        let links =
+            detector.detect_links_in_line("see https://en.wikipedia.org/wiki/Foo_(bar) now", 0);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, "https://en.wikipedia.org/wiki/Foo_(bar)");
     }
 }

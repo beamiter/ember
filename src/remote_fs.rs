@@ -548,12 +548,34 @@ fn spawn_piped(argv: &[String]) -> io::Result<Child> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
-    Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 独立进程组（子进程任组长）：kill 时整组回收，探针 fork 出去的
+        // 子孙（rm -rf 半途、sh -c 下的 sleep）无法存活占管。
+        command.process_group(0);
+    }
+    command.spawn()
+}
+
+/// 杀掉整个进程组（子进程在 spawn 时被设为组长）；非 Unix 退化为只杀
+/// 直接子进程。只发信号、返回是否发出成功：直接子进程的回收由调用方的
+/// try_wait/wait 路径完成。
+fn kill_tree(child: &mut Child) -> bool {
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: 对 spawn 时建立的进程组发一次 kill；pid 来自存活的
+        // Child 句柄。
+        libc::kill(-(child.id() as i32), libc::SIGKILL) == 0
+    }
+    #[cfg(not(unix))]
+    child.kill().is_ok()
 }
 
 /// 子进程 + watchdog 的组合：超时或取消令牌触发时强制 kill（同一条 kill
@@ -592,13 +614,13 @@ impl MonitoredChild {
                                     .as_ref()
                                     .is_some_and(|token| token.load(Ordering::SeqCst))
                                 {
-                                    if child.lock().kill().is_ok() {
+                                    if kill_tree(&mut child.lock()) {
                                         cancelled.store(true, Ordering::SeqCst);
                                     }
                                     break;
                                 }
                                 if std::time::Instant::now() >= deadline {
-                                    if child.lock().kill().is_ok() {
+                                    if kill_tree(&mut child.lock()) {
                                         timed_out.store(true, Ordering::SeqCst);
                                     }
                                     break;
@@ -617,9 +639,9 @@ impl MonitoredChild {
         })
     }
 
-    /// 传输超限/流错误时立即中止子进程。
+    /// 传输超限/流错误时立即中止子进程（整组 kill，子孙一并回收）。
     fn kill(&self) {
-        let _ = self.child.lock().kill();
+        let _ = kill_tree(&mut self.child.lock());
     }
 
     /// 等子进程退出并停掉 watchdog，返回（退出码，是否超时，是否取消）。
@@ -641,19 +663,30 @@ impl MonitoredChild {
     }
 }
 
+/// 把子进程输出流读到 EOF，硬上限 max 字节：超出部分继续排空（子进程
+/// 不会堵在满管道上），调用方把 truncated 视为错误。
+fn read_bounded<R: Read>(reader: R, max: u64) -> io::Result<(Vec<u8>, bool)> {
+    let mut limited = reader.take(max + 1);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() <= max as usize {
+        return Ok((bytes, false));
+    }
+    bytes.truncate(max as usize);
+    let mut rest = limited.into_inner();
+    io::copy(&mut rest, &mut io::sink())?;
+    Ok((bytes, true))
+}
+
 /// stderr 另开读者线程：子进程写满 stderr 管道而主线程在读 stdout 时，
 /// 单线程顺序读会互相等待形成死锁。
 fn spawn_stderr_reader(
     stderr: std::process::ChildStderr,
     max_out: u64,
-) -> io::Result<std::thread::JoinHandle<Vec<u8>>> {
+) -> io::Result<std::thread::JoinHandle<(Vec<u8>, bool)>> {
     std::thread::Builder::new()
         .name("ember-fs-probe-stderr".to_string())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.take(max_out).read_to_end(&mut buf);
-            buf
-        })
+        .spawn(move || read_bounded(stderr, max_out).unwrap_or_default())
 }
 
 /// 有界地运行一个子进程：pipe stdio，写入并关闭 stdin，stdout/stderr 各按
@@ -695,14 +728,21 @@ fn run_capture_with_cancel(
     let monitored = MonitoredChild::new(child, timeout, cancel)?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, max_out)?;
 
-    let mut stdout = Vec::new();
-    let read_result = stdout_pipe.take(max_out).read_to_end(&mut stdout);
-    // 读端随 Take 一起 drop，子进程继续写会收到 SIGPIPE 自行退出。
+    // 超限字节继续排空（子进程不会堵在满管道上），截断在下方统一报错。
+    let stdout_read = read_bounded(stdout_pipe, max_out);
 
     let (code, timed_out, cancelled) = monitored.wait()?;
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
 
-    read_result?;
+    let (stdout, stdout_truncated) = stdout_read?;
+    // 被 kill（超时/取消）的进程输出本就不完整，截断错误只报给正常跑完
+    // 却超额输出的进程。
+    if (stdout_truncated || stderr_truncated) && !timed_out && !cancelled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("command produced more than {max_out} bytes of output"),
+        ));
+    }
     Ok(Capture {
         status: code,
         stdout,
@@ -780,7 +820,8 @@ fn run_stream_to_file(
     drop(file);
 
     let (code, timed_out, cancelled) = monitored.wait()?;
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // 传输路径的 stderr 仅作诊断：截断标志在这里无关紧要，保留封顶字节即可。
+    let (stderr, _) = stderr_reader.join().unwrap_or_default();
     if let Some(error) = stream_error {
         return Err(error);
     }
@@ -872,7 +913,8 @@ fn run_stream_from_file(
     let mut stdout = Vec::new();
     let read_result = stdout_pipe.take(MAX_SMALL_OUTPUT).read_to_end(&mut stdout);
     let (code, timed_out, cancelled) = monitored.wait()?;
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // 传输路径的 stderr 仅作诊断：截断标志在这里无关紧要，保留封顶字节即可。
+    let (stderr, _) = stderr_reader.join().unwrap_or_default();
     let written = writer
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("upload writer panicked")))?;
@@ -1478,6 +1520,27 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
     }
     let metadata = std::fs::symlink_metadata(src)?;
     if metadata.is_dir() {
+        if depth == 0 {
+            // 拒绝把目录复制进自己（cp /a /a/b）：src 与 dst 父目录都做
+            // 规范化，符号链接别名也绕不过去；没有这层检查时递归复制会
+            // 一路套娃直到撞上 MAX_COPY_DEPTH。
+            let canonical = src.canonicalize()?;
+            let dst_parent = dst
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .canonicalize()
+                .unwrap_or_else(|_| dst.parent().map(Path::to_path_buf).unwrap_or_default());
+            if dst_parent
+                .join(dst.file_name().unwrap_or_default())
+                .starts_with(&canonical)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot copy a directory into itself",
+                ));
+            }
+        }
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
@@ -2355,6 +2418,29 @@ docker = true
     }
 
     #[test]
+    fn local_copy_refuses_to_copy_a_directory_into_itself() {
+        let dir = TestDir::new();
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+
+        // 直接套娃：cp -r src src/inner。
+        let error = copy(&FsLocation::Local, &[], &src, &src.join("inner"))
+            .expect_err("copy into own subdirectory");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!src.join("inner").exists());
+
+        // 符号链接别名：dst 父目录经链接指向 src，规范化后同样被拒。
+        std::os::unix::fs::symlink(&src, dir.join("alias")).unwrap();
+        let error = copy(&FsLocation::Local, &[], &src, &dir.join("alias").join("inner"))
+            .expect_err("copy into itself through a symlink alias");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        // 兄弟目录不受影响。
+        copy(&FsLocation::Local, &[], &src, &dir.join("sibling")).unwrap();
+        assert!(dir.join("sibling/nested").is_dir());
+    }
+
+    #[test]
     fn local_list_dir_matches_scan_dir_policy() {
         let dir = TestDir::new();
         std::fs::create_dir(dir.join("subdir")).unwrap();
@@ -2566,14 +2652,41 @@ docker = true
     }
 
     #[test]
-    fn run_capture_bounds_stdout() {
+    fn run_capture_timeout_kills_the_whole_process_group() {
+        // 直接子进程（sh）被 kill 后，持有 stdout 管道的子孙也必须一起死，
+        // 否则读端迟迟等不到 EOF、run_capture 要多挂几十秒。
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & wait".to_string(),
+        ];
+        let started = std::time::Instant::now();
+        let capture = run_capture(&argv, &[], Duration::from_millis(150), 1024).unwrap();
+        assert!(capture.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "descendant survived the kill and held the pipes"
+        );
+    }
+
+    #[test]
+    fn read_bounded_reports_truncation_and_drains_the_rest() {
+        let (bytes, truncated) = read_bounded(&b"abcdef"[..], 3).unwrap();
+        assert_eq!((bytes.as_slice(), truncated), (&b"abc"[..], true));
+        let (bytes, truncated) = read_bounded(&b"abc"[..], 3).unwrap();
+        assert_eq!((bytes.as_slice(), truncated), (&b"abc"[..], false));
+    }
+
+    #[test]
+    fn run_capture_errors_when_output_exceeds_the_cap() {
         let argv = vec![
             "sh".to_string(),
             "-c".to_string(),
             "head -c 100000 /dev/zero | tr '\\0' 'a'".to_string(),
         ];
-        let capture = run_capture(&argv, &[], Duration::from_secs(5), 1024).unwrap();
-        assert_eq!(capture.stdout.len(), 1024);
+        let error = run_capture(&argv, &[], Duration::from_secs(5), 1024)
+            .expect_err("over-cap output must be an error, not silent truncation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -18,9 +18,7 @@ pub const DIRECTORY_PAGE_SIZE: usize = 64;
 pub const MAX_DIRECTORY_ENTRIES: usize = 16 * 1024;
 const MAX_DIRECTORY_SCAN_ENTRIES: usize = MAX_DIRECTORY_ENTRIES * 4;
 const SCAN_WORKERS: usize = 2;
-const SCAN_QUEUE_CAPACITY: usize = 8;
 const SCAN_RESULT_CAPACITY: usize = 8;
-const OP_QUEUE_CAPACITY: usize = 8;
 const OP_RESULT_CAPACITY: usize = 8;
 
 type ScanFn = dyn Fn(&Path) -> io::Result<DirectoryListing> + Send + Sync + 'static;
@@ -262,18 +260,21 @@ struct ScanResult {
     entries: Result<DirectoryListing, String>,
 }
 
+/// 目录扫描服务。请求通道无界：用户动作只排队、绝不拒绝（unbounded 的
+/// send 不阻塞，UI 线程安全）；真正并发的子进程数仍由 SCAN_WORKERS 个
+/// worker 限定。结果通道保持有界，worker 在 UI 停读时自然背压。
 #[derive(Debug)]
 struct DirectoryScanService {
     request_tx: Sender<ScanRequest>,
     /// Kept by the UI solely so a root-generation change can discard queued
-    /// work. Workers receive from clones of this same bounded queue.
+    /// work. Workers receive from clones of this same queue.
     request_rx: Receiver<ScanRequest>,
     result_rx: Receiver<ScanResult>,
 }
 
 impl DirectoryScanService {
     fn new(scanner: Arc<ScanFn>) -> io::Result<Self> {
-        let (request_tx, request_rx) = crossbeam_channel::bounded(SCAN_QUEUE_CAPACITY);
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
         let (result_tx, result_rx) = crossbeam_channel::bounded(SCAN_RESULT_CAPACITY);
 
         for worker_index in 0..SCAN_WORKERS {
@@ -298,15 +299,10 @@ impl DirectoryScanService {
             while self.request_rx.try_recv().is_ok() {}
         }
 
+        // 无界队列的 send 只在 worker 全部退出时失败；永不阻塞 UI 线程。
         self.request_tx
-            .try_send(request)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    "directory scan queue is busy; collapse and reopen the directory to retry"
-                        .to_string()
-                }
-                TrySendError::Disconnected(_) => "directory scan workers stopped".to_string(),
-            })
+            .send(request)
+            .map_err(|_| "directory scan workers stopped".to_string())
     }
 }
 
@@ -528,7 +524,8 @@ pub struct TransferStatus {
 }
 
 /// 文件操作 worker：单线程串行执行（操作之间本就有先后语义，比如
-/// cut-paste 不能被后续操作抢跑），有界队列与扫描服务同规格。
+/// cut-paste 不能被后续操作抢跑）。请求队列与扫描服务同契约：无界队列
+/// 只缓冲用户动作，并发由这唯一一个 worker 限定。
 #[derive(Debug)]
 struct FsOpService {
     request_tx: Sender<FsOpRequest>,
@@ -537,7 +534,7 @@ struct FsOpService {
 
 impl FsOpService {
     fn new() -> io::Result<Self> {
-        let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
         let (result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
         std::thread::Builder::new()
             .name("ember-fs-op".to_string())
@@ -549,14 +546,10 @@ impl FsOpService {
     }
 
     fn request(&self, request: FsOpRequest) -> Result<(), String> {
+        // 无界队列的 send 只在 worker 退出时失败；永不阻塞 UI 线程。
         self.request_tx
-            .try_send(request)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    "file operation queue is busy; try again in a moment".to_string()
-                }
-                TrySendError::Disconnected(_) => "file operation worker stopped".to_string(),
-            })
+            .send(request)
+            .map_err(|_| "file operation worker stopped".to_string())
     }
 }
 
@@ -974,7 +967,8 @@ pub struct Sidebar {
     start_dir_pending: bool,
     /// 起始目录解析失败（连不上主机等）时留在面板上的错误。
     location_error: Option<String>,
-    /// 在途/排队中的传输（≤ 队列容量 8）：忙碌行数据 + 取消令牌。
+    /// 在途/排队中的传输：忙碌行数据 + 取消令牌。请求队列无界后不再
+    /// 由容量限长；面板只展示第一个在途条目。
     transfer_tracks: Vec<TransferTrack>,
 }
 
@@ -2667,6 +2661,72 @@ mod tests {
     }
 
     #[test]
+    fn scan_requests_queue_instead_of_failing_while_workers_are_busy() {
+        // 旧有界队列（容量 8）在 worker 全忙时会拒绝第 9 个请求；现在用户
+        // 动作只排队，并发仍由 SCAN_WORKERS 限定。闸门挡住 worker，让队列
+        // 可观测地填满，全程不做真实文件系统/ssh 工作。
+        let (gate_tx, gate_rx) = crossbeam_channel::bounded::<()>(0);
+        let scanner = Arc::new(move |_: &Path| {
+            let _ = gate_rx.recv();
+            Ok(DirectoryListing::complete(vec![]))
+        }) as Arc<ScanFn>;
+        let service = DirectoryScanService::new(scanner).expect("scan workers spawn");
+
+        const TOTAL: usize = SCAN_WORKERS + 16;
+        for index in 0..TOTAL {
+            service
+                .request(
+                    ScanRequest {
+                        generation: 0,
+                        path: PathBuf::from(format!("/virtual/queued/{index}")),
+                        backend: ScanBackend::Local,
+                    },
+                    false,
+                )
+                .expect("queued scan requests must not be rejected");
+        }
+        // worker 最多拿走 SCAN_WORKERS 个，其余必须仍在队列里（超出旧容量）。
+        assert!(service.request_rx.len() >= TOTAL - SCAN_WORKERS);
+
+        // 关闭闸门放行，worker 清空队列并送达全部结果。
+        drop(gate_tx);
+        for _ in 0..TOTAL {
+            service
+                .result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("every queued scan completes once the gate opens");
+        }
+    }
+
+    #[test]
+    fn fs_op_requests_queue_instead_of_failing_while_the_worker_is_busy() {
+        // 与扫描服务同一契约：无界队列缓冲用户动作。不启动真 worker，
+        // 队列只进不出，可确定性地观察它涨过旧容量 8。
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (_result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
+        let service = FsOpService {
+            request_tx,
+            result_rx,
+        };
+
+        const TOTAL: usize = 16;
+        for _ in 0..TOTAL {
+            service
+                .request(FsOpRequest {
+                    authority_generation: 0,
+                    location: FsLocation::Local,
+                    overlay: remote_fs::SshExecutionOverlay::default(),
+                    hosts: Arc::new(Vec::new()),
+                    kind: OpRequestKind::StartDir,
+                    clipboard_intent: None,
+                    cancel_token: None,
+                })
+                .expect("queued file operations must not be rejected");
+        }
+        assert_eq!(request_rx.len(), TOTAL);
+    }
+
+    #[test]
     fn every_entry_in_a_wide_directory_is_reachable_through_show_more() {
         let root_path = PathBuf::from("/virtual/wide");
         let scanner = Arc::new(move |path: &Path| {
@@ -2753,8 +2813,9 @@ mod tests {
 
     /// Replace the real worker with deterministic request/result channels so
     /// race tests can change UI state after dispatch but before completion.
+    /// The request channel is unbounded to match the production service.
     fn controlled_op_service(sidebar: &mut Sidebar) -> (Receiver<FsOpRequest>, Sender<OpEvent>) {
-        let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
         let (result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
         sidebar.op_service = Some(FsOpService {
             request_tx,

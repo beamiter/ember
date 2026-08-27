@@ -64,6 +64,65 @@ pub(crate) fn safe_window_title(reported: &str, fallback: &str) -> String {
     title
 }
 
+/// 组装会话快照用于持久化。任务终端（Agent / 校验）等非常驻会话只存在于
+/// 运行时：它们的任务元数据不进快照，重启后只会变成一个恰好落在任务
+/// worktree 里的普通 shell，极易误操作——所以保存端把它们整个排除，而
+/// 不是恢复原样。
+fn sessions_snapshot_for_persistence(
+    session_manager: &crate::session_manager::SessionManager,
+    tabs: &crate::tab_manager::TabManager,
+) -> session_persistence::SessionsSnapshot {
+    let snapshots = session_manager.get_session_snapshots();
+    // 布局树叶子存的是会话向量的全局下标，解析时必须用未过滤的全局 ID
+    // 列表：用过滤后的列表会在中间夹着任务终端时把窗格映射到错误的会话
+    // （或让整页转换失败被静默丢弃）。
+    let session_ids: Vec<String> = session_manager
+        .sessions()
+        .iter()
+        .map(|session| session.metadata.session_id.clone())
+        .collect();
+    // 每个 tab 存一棵树。转换失败的 tab（其会话缺少稳定 ID）整个跳过，
+    // 恢复时它的会话会各自落到单窗格 tab 上，而不是让整份布局作废。
+    let original_active_tab = tabs.active_index();
+    let mut active_tab = None;
+    let mut kept_tabs = Vec::new();
+    for (original_index, (tab, flags)) in tabs.layouts().enumerate() {
+        // 含非常驻会话窗格的 tab 整页跳过：任务元数据是运行时专有的，把
+        // 窗格塞进快照只会在重启后冒出一个指向别处的重复页。被跳过页里
+        // 的交互会话在恢复时按孤儿各自落到单窗格 tab。
+        if tab.session_indices().into_iter().any(|index| {
+            session_manager
+                .sessions()
+                .get(index)
+                .is_none_or(|session| {
+                    session.purpose != crate::session::SessionPurpose::Interactive
+                })
+        }) {
+            continue;
+        }
+        let Some(mut snapshot) = tab.to_snapshot(&session_ids) else {
+            continue;
+        };
+        // 固定/标记是 tab 级别的状态，布局快照本身不知道它们。
+        snapshot.pinned = flags.pinned;
+        snapshot.marked = flags.marked;
+        snapshot.private_title = flags.private_title;
+        if original_index == original_active_tab {
+            active_tab = Some(kept_tabs.len());
+        }
+        kept_tabs.push(snapshot);
+    }
+    if active_tab.is_none() && !kept_tabs.is_empty() {
+        active_tab = Some(0);
+    }
+    session_persistence::SessionsSnapshot::from_snapshots(
+        snapshots,
+        session_manager.restorable_active_index(),
+        kept_tabs,
+        active_tab,
+    )
+}
+
 impl TerminalApp {
     // 配置保存相关方法
     pub fn schedule_config_save(&mut self) {
@@ -96,41 +155,7 @@ impl TerminalApp {
     }
 
     pub(crate) fn current_sessions_snapshot(&self) -> session_persistence::SessionsSnapshot {
-        let snapshots = self.session_manager.get_session_snapshots();
-        let session_ids: Vec<String> = self
-            .session_manager
-            .sessions()
-            .iter()
-            .filter(|session| session.purpose == crate::session::SessionPurpose::Interactive)
-            .map(|session| session.metadata.session_id.clone())
-            .collect();
-        // 每个 tab 存一棵树。转换失败的 tab（其会话缺少稳定 ID）整个跳过，
-        // 恢复时它的会话会各自落到单窗格 tab 上，而不是让整份布局作废。
-        let original_active_tab = self.tabs.active_index();
-        let mut active_tab = None;
-        let mut tabs = Vec::new();
-        for (original_index, (tab, flags)) in self.tabs.layouts().enumerate() {
-            let Some(mut snapshot) = tab.to_snapshot(&session_ids) else {
-                continue;
-            };
-            // 固定/标记是 tab 级别的状态，布局快照本身不知道它们。
-            snapshot.pinned = flags.pinned;
-            snapshot.marked = flags.marked;
-            snapshot.private_title = flags.private_title;
-            if original_index == original_active_tab {
-                active_tab = Some(tabs.len());
-            }
-            tabs.push(snapshot);
-        }
-        if active_tab.is_none() && !tabs.is_empty() {
-            active_tab = Some(0);
-        }
-        session_persistence::SessionsSnapshot::from_snapshots(
-            snapshots,
-            self.session_manager.restorable_active_index(),
-            tabs,
-            active_tab,
-        )
+        sessions_snapshot_for_persistence(&self.session_manager, &self.tabs)
     }
 
     /// 即时持久化命令面板最近命令 + 搜索历史。两者都很小,无需 debounce。
@@ -304,7 +329,7 @@ impl TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_window_title;
+    use super::{safe_window_title, sessions_snapshot_for_persistence};
 
     #[test]
     fn empty_or_control_only_osc_title_uses_a_safe_fallback() {
@@ -322,5 +347,94 @@ mod tests {
         let title = safe_window_title(&long, "fallback");
         assert_eq!(title.chars().count(), 201);
         assert!(title.ends_with('…'));
+    }
+
+    fn interactive_fixture_session(
+        name: &str,
+    ) -> (crate::session::Session, String, egui::Context) {
+        let repaint = egui::Context::default();
+        let session_id = format!("test-{name}-{}", uuid::Uuid::new_v4());
+        let shell = crate::shell::ShellSession::new_with_cwd(
+            80,
+            24,
+            Some("/tmp"),
+            Some(&session_id),
+            Some("/bin/sh"),
+            None,
+            repaint.clone(),
+        )
+        .expect("interactive fixture shell starts");
+        let session = crate::session::Session::new_with_session_id(
+            name.to_string(),
+            Vec::new(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::terminal::TerminalState::new(80, 24),
+            )),
+            shell,
+            session_id.clone(),
+        );
+        (session, session_id, repaint)
+    }
+
+    #[test]
+    fn task_terminal_tabs_are_pruned_from_session_snapshots() {
+        let (first, first_id, repaint) = interactive_fixture_session("interactive");
+        let mut manager =
+            crate::session_manager::SessionManager::new(first, repaint, Some("/bin/sh".into()));
+
+        // 任务终端：Agent CLI 走精确 argv，purpose 是 EphemeralCommand。
+        let task = manager
+            .new_command_session_in_cwd(
+                "Agent".to_string(),
+                vec!["/bin/sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+                std::path::Path::new("/tmp"),
+                80,
+                24,
+                100,
+            )
+            .expect("task terminal session starts");
+        assert_eq!(task.session_index, 1);
+        assert!(manager.switch_session(task.session_index));
+        // 交互会话插到任务终端之后：全局下标 [S0, T1, S2]，过滤后 [S0, S2]。
+        let second = manager
+            .new_session_in_cwd(None, None, std::path::Path::new("/tmp"), 80, 24, 100)
+            .expect("second interactive session starts");
+        assert_eq!(second.session_index, 2);
+        assert!(manager.switch_session(second.session_index));
+        let second_id = manager.sessions()[second.session_index]
+            .metadata
+            .session_id
+            .clone();
+
+        let mut tabs = crate::tab_manager::TabManager::new(0);
+        tabs.insert_tab_after_active(task.session_index);
+        tabs.insert_tab_after_active(second.session_index);
+
+        let snapshot = sessions_snapshot_for_persistence(&manager, &tabs);
+
+        // 任务终端的会话与 tab 都不进快照……
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(
+            snapshot.sessions[1].session_id.as_deref(),
+            Some(second_id.as_str())
+        );
+        assert_eq!(snapshot.tabs.len(), 2);
+        // ……而夹在中间的 S2 的窗格映射到它自己的稳定 ID（不会被任务终端
+        // 顶掉或错配）。
+        assert_eq!(
+            snapshot.tabs[0].root,
+            crate::session_persistence::LayoutNodeSnapshot::Pane {
+                session_id: first_id
+            }
+        );
+        assert_eq!(
+            snapshot.tabs[1].root,
+            crate::session_persistence::LayoutNodeSnapshot::Pane {
+                session_id: second_id
+            }
+        );
+        // 活动下标全部重映射到过滤后的幸存空间。
+        assert_eq!(snapshot.active_tab, Some(1));
+        assert_eq!(snapshot.active_index, Some(1));
     }
 }
