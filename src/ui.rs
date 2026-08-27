@@ -6157,10 +6157,17 @@ mod tests {
         terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
         let click = egui::pos2(32.0, 10.0);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
+        // egui 0.36 debug-asserts when a TexturesDelta with unapplied deltas is
+        // dropped. These tests own no texture atlas, so clear it explicitly.
+        fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+            let mut output = ctx.run_ui(input, f);
+            output.textures_delta.clear();
+        }
         // Register the widget's clickable hit-test geometry. egui resolves a
         // press against the previous pass; focus is explicitly surrendered
         // before the accepted-Paste release below.
-        let _ = ctx.run_ui(
+        run_frame(
+            &ctx,
             egui::RawInput {
                 screen_rect: Some(screen_rect),
                 ..Default::default()
@@ -6178,7 +6185,8 @@ mod tests {
             },
         );
         let mut pressed_response_id = None;
-        let _ = ctx.run_ui(
+        run_frame(
+            &ctx,
             egui::RawInput {
                 screen_rect: Some(screen_rect),
                 events: vec![
@@ -6227,7 +6235,7 @@ mod tests {
             ..Default::default()
         };
         let mut response_id = None;
-        let _ = ctx.run_ui(raw_input, |ui| {
+        run_frame(&ctx, raw_input, |ui| {
             let response = renderer.render(
                 ui,
                 &mut terminal,

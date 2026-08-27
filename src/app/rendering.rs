@@ -2821,6 +2821,18 @@ impl TerminalApp {
 mod tests {
     use super::*;
 
+    // egui 0.36 debug-asserts when a TexturesDelta with unapplied deltas is
+    // dropped. These tests own no texture atlas, so clear it explicitly.
+    fn run_frame(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        f: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(input, f);
+        output.textures_delta.clear();
+        output
+    }
+
     #[test]
     fn duplicate_search_hits_share_one_sequence_bookmark_state() {
         let live = std::collections::HashMap::from([
@@ -2989,7 +3001,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let first = ctx.run_ui(input.clone(), render);
+        let first = run_frame(&ctx, input.clone(), render);
         let id = widget_id.get().expect("stable bookmark widget id");
         let update = first
             .platform_output
@@ -3018,7 +3030,7 @@ mod tests {
                 data: None,
             },
         )];
-        let activated = ctx.run_ui(activated_input, render);
+        let activated = run_frame(&ctx, activated_input, render);
         assert!(
             !focused.get(),
             "a direct AccessKit Click need not synthesize Focus"
@@ -3049,7 +3061,7 @@ mod tests {
                 data: None,
             },
         )];
-        let focused_output = ctx.run_ui(focus_input, render);
+        let focused_output = run_frame(&ctx, focus_input, render);
         assert!(focused.get(), "AccessKit Focus must focus the real control");
         assert_eq!(
             focused_output
@@ -3100,19 +3112,21 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run_ui(input.clone(), render);
+        let _ = run_frame(&ctx, input.clone(), render);
         let id = widget_id.get().expect("stable result widget id");
 
         let mut shift_enter = input.clone();
-        shift_enter.modifiers = egui::Modifiers::SHIFT;
-        shift_enter.events = vec![egui::Event::Key {
-            key: egui::Key::Enter,
-            physical_key: Some(egui::Key::Enter),
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::SHIFT,
-        }];
-        let _ = ctx.run_ui(shift_enter, render);
+        shift_enter.events = vec![
+            egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+        ];
+        let _ = run_frame(&ctx, shift_enter, render);
         assert!(
             raw_clicked.get(),
             "egui exposes focused Shift+Enter as a keyboard fake click"
@@ -3133,7 +3147,7 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }];
-        let _ = ctx.run_ui(space, render);
+        let _ = run_frame(&ctx, space, render);
         assert!(raw_clicked.get());
         assert!(
             render_activated.get(),
@@ -3152,7 +3166,7 @@ mod tests {
                 data: None,
             },
         )];
-        let _ = ctx.run_ui(accesskit_click, render);
+        let _ = run_frame(&ctx, accesskit_click, render);
         assert!(raw_clicked.get());
         assert!(
             render_activated.get(),

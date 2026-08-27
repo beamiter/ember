@@ -280,7 +280,7 @@ mod unix_pty {
         // Round up: a sub-millisecond remainder must still yield a nonzero
         // poll timeout rather than an instant (busy-looping) zero.
         let rounded_ms =
-            remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
         rounded_ms.clamp(1, libc::c_int::MAX as u128) as libc::c_int
     }
 

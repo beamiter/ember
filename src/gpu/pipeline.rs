@@ -125,7 +125,7 @@ impl GridPipeline {
                 module: &shader_module,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[CellInstance::vertex_buffer_layout()],
+                buffers: &[Some(CellInstance::vertex_buffer_layout())],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader_module,
@@ -190,7 +190,7 @@ impl GridPipeline {
                         module: &dual_module,
                         entry_point: Some("vs_main"),
                         compilation_options: Default::default(),
-                        buffers: &[CellInstance::vertex_buffer_layout()],
+                        buffers: &[Some(CellInstance::vertex_buffer_layout())],
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &dual_module,

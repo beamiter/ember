@@ -125,7 +125,10 @@ impl ShapingFont {
         // internally. HarfRust exposes shaping as a method and requires the
         // caller to establish those segment properties before plan creation.
         buffer.guess_segment_properties();
-        (shaper.shape(buffer, &[]), units_per_em)
+        (
+            shaper.shape(buffer, harfrust::ShapeOptions::new()),
+            units_per_em,
+        )
     }
 }
 

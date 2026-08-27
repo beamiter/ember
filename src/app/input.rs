@@ -2133,6 +2133,11 @@ impl TerminalApp {
                         // commit 只是确认一个字/词，不代表用户要退出中文输入模式
                         // 只有 ImeEvent::Disabled 才是真正的 IME 关闭信号
                     }
+                    // egui 0.36 新增。光标前后文本的删除权在 shell/readline，
+                    // 终端无法擅自删除，忽略即可。
+                    egui::ImeEvent::DeleteSurrounding { .. } => {
+                        crate::debug_log!("[IME] DeleteSurrounding (ignored)");
+                    }
                     egui::ImeEvent::Disabled => {
                         crate::debug_log!("[IME] Disabled");
                         terminal.ime_enabled = false;

@@ -2805,7 +2805,7 @@ impl TerminalApp {
                             .raw
                             .dropped_files
                             .iter()
-                            .filter_map(|file| file.path.clone())
+                            .map(|file| file.path().to_path_buf())
                             .collect::<Vec<std::path::PathBuf>>(),
                         !input.raw.hovered_files.is_empty(),
                         input
@@ -4361,7 +4361,7 @@ impl eframe::App for TerminalApp {
         } else {
             std::mem::take(&mut raw_input.dropped_files)
                 .into_iter()
-                .filter_map(|file| file.path)
+                .map(|file| file.path().to_path_buf())
                 .collect::<Vec<_>>()
         };
         if !dropped_paths.is_empty() {
@@ -4408,7 +4408,18 @@ impl eframe::App for TerminalApp {
         // Event::Paste has no per-event modifiers. Recover Shift from V's
         // release when a whole Ctrl+Shift+V chord lands in one input batch;
         // the batch-level modifier snapshot may already be empty by now.
-        let shortcut_modifiers = semantic_paste_modifiers(&raw_input.events, raw_input.modifiers);
+        // egui 0.36 moved that snapshot into the event stream: the last
+        // Event::ModifiersChanged of the batch is the state at drain time.
+        let batch_modifiers = raw_input
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                egui::Event::ModifiersChanged(modifiers) => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let shortcut_modifiers = semantic_paste_modifiers(&raw_input.events, batch_modifiers);
 
         // egui-winit turns Ctrl/Cmd+C/X/V into semantic clipboard events and skips the
         // corresponding Key press. Restore those as Key events so the terminal can receive

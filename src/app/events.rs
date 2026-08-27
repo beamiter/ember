@@ -33,7 +33,8 @@ pub fn should_restore_terminal_shortcut_event(
 ///
 /// `egui::Event::Paste` carries only clipboard text. If V and the modifiers
 /// are released before eframe drains the window-event batch,
-/// `RawInput::modifiers` already contains the final (usually empty) state.
+/// the batch's trailing [`egui::Event::ModifiersChanged`] already contains the
+/// final (usually empty) state.
 /// Winit still emits V's release with its event-time modifiers, which lets us
 /// distinguish Ctrl+Shift+V from an application's ordinary Ctrl+V.
 pub fn semantic_paste_modifiers(
