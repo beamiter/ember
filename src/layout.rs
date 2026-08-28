@@ -819,6 +819,23 @@ impl LayoutManager {
         true
     }
 
+    /// frost 的 `pane:swap`：焦点窗格与渲染顺序（DFS）中的下一个叶子互换
+    /// 内容，末尾绕回第一个。几何形状与比例保持不变，焦点跟随被移动的会话
+    /// （tmux 语义，与拖拽标题栏重排共用 [`Self::swap_sessions`]）。不足两个
+    /// 窗格时返回 false。
+    pub fn swap_focused_with_next(&mut self) -> bool {
+        let leaves = self.tree.leaves();
+        if leaves.len() < 2 {
+            return false;
+        }
+        let position = leaves
+            .iter()
+            .position(|&session| session == self.focused_pane_id.0)
+            .unwrap_or(0);
+        let other = leaves[(position + 1) % leaves.len()];
+        self.swap_sessions(self.focused_pane_id.0, other)
+    }
+
     /// 根据坐标命中窗格但不改变焦点。拖拽过程中需要知道指针悬停在哪个
     /// 窗格上，而此时不应该把焦点提前移过去。
     pub fn session_at(&self, pos: egui::Pos2) -> Option<usize> {
@@ -1082,6 +1099,41 @@ mod tests {
         // silently remapping a session that is not on screen.
         assert!(!layout.swap_sessions(0, 0));
         assert!(!layout.swap_sessions(0, 9));
+    }
+
+    #[test]
+    fn swap_focused_with_next_rotates_through_leaves_and_keeps_geometry() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, true).unwrap();
+        layout.compute_pane_rects(test_rect());
+        let rects_before: Vec<Rect> = layout.panes().iter().map(|pane| pane.rect).collect();
+
+        // Split 后焦点在新窗格 2;渲染顺序 [0,1,2] 中的下一个绕回是 0。
+        assert_eq!(layout.focused_session_idx(), Some(2));
+        assert!(layout.swap_focused_with_next());
+        let sessions: Vec<usize> = layout.panes().iter().map(|pane| pane.session_idx).collect();
+        assert_eq!(sessions, vec![2, 1, 0]);
+        assert_eq!(
+            layout.focused_session_idx(),
+            Some(2),
+            "focus follows the moved session into its new pane"
+        );
+        layout.compute_pane_rects(test_rect());
+        let rects_after: Vec<Rect> = layout.panes().iter().map(|pane| pane.rect).collect();
+        assert_eq!(
+            rects_before, rects_after,
+            "a swap must not disturb the split geometry"
+        );
+
+        // 焦点会话现在是第一个叶子,下一个是渲染顺序中的 1。
+        assert!(layout.swap_focused_with_next());
+        let sessions: Vec<usize> = layout.panes().iter().map(|pane| pane.session_idx).collect();
+        assert_eq!(sessions, vec![1, 2, 0]);
+
+        // 单窗格布局没有可交换的对象。
+        let single = &mut LayoutManager::new(0);
+        assert!(!single.swap_focused_with_next());
     }
 
     #[test]

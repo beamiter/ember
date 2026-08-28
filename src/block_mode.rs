@@ -1745,6 +1745,15 @@ pub fn format_local_time_of_day(epoch_secs: u64, offset_secs: i32) -> String {
     format!("{hour:02}:{minute:02}:{second:02}")
 }
 
+/// Filename-safe `YYYYMMDD-HHMMSS` at a fixed UTC offset, used by whole-session
+/// export names (frost 的 `compact_timestamp_at_offset` 对应物). Kept beside
+/// [`format_local_datetime`] so export names and Markdown metadata share the
+/// exact same civil-time arithmetic.
+pub fn compact_local_datetime(epoch_secs: u64, offset_secs: i32) -> String {
+    let (year, month, day, hour, minute, second) = local_parts(epoch_secs, offset_secs);
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
 /// Local-timezone UTC offset (seconds east) in effect at `epoch_secs`, via
 /// libc `localtime_r` — the one deliberately impure function in this module
 /// (the formatters above take the offset as a parameter so tests never read
@@ -3231,6 +3240,10 @@ mod tests {
         assert_eq!(format_local_time_of_day(84_600, 28_800), "07:30:00");
         assert_eq!(format_local_time_of_day(3_600, -19_800), "19:30:00");
         assert_eq!(format_local_time_of_day(86_399, 0), "23:59:59");
+        // Whole-session export names use the same civil math, filename-safe.
+        assert_eq!(compact_local_datetime(0, 0), "19700101-000000");
+        assert_eq!(compact_local_datetime(84_600, 28_800), "19700102-073000");
+        assert_eq!(compact_local_datetime(1_000_000_000, -19_800), "20010908-201640");
     }
 
     #[test]

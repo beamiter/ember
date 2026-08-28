@@ -4664,6 +4664,139 @@ fn completed_snapshot_keeps_output_after_later_scrollback_eviction() {
 }
 
 #[test]
+fn clear_completed_blocks_keeps_live_records_and_monotonic_sequences() {
+    let mut terminal = TerminalState::new(40, 8);
+    emit_completed_block(&mut terminal, 0);
+    emit_completed_block(&mut terminal, 1);
+    // The still-editing prompt is PTY-owned live state; clearing must not
+    // touch it. Buffer rows stay put in ember's adaptation (only the record
+    // deque changes), so no anchor rebasing is needed at all.
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07draft");
+    let live_sequence = terminal.command_records().back().unwrap().sequence;
+    assert!(terminal.captured_command_output_bytes > 0);
+
+    assert_eq!(terminal.clear_completed_blocks(), 2);
+
+    assert_eq!(terminal.command_records().len(), 1);
+    assert!(!terminal.command_records()[0].complete);
+    assert_eq!(terminal.captured_command_output_bytes, 0);
+    // The live lifecycle still completes normally afterwards.
+    terminal.process_input(b"\r\n\x1b]133;C\x07new out\r\n\x1b]133;D;0\x07");
+    let record = terminal.command_records().back().unwrap();
+    assert!(record.complete);
+    assert_eq!(record.sequence, live_sequence);
+    assert_eq!(record.command.as_deref(), Some("draft"));
+    // Sequences keep advancing, so a stale pre-clear UI id can never target a
+    // record created after the clear.
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07next\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+    assert!(
+        terminal.command_records().back().unwrap().sequence > live_sequence
+    );
+}
+
+#[test]
+fn undo_clear_blocks_restores_records_in_order_ahead_of_newer_history() {
+    let mut terminal = TerminalState::new(40, 8);
+    emit_completed_block(&mut terminal, 0);
+    emit_completed_block(&mut terminal, 1);
+    let cleared_sequences: Vec<u64> = terminal
+        .command_records()
+        .iter()
+        .map(|record| record.sequence)
+        .collect();
+
+    assert_eq!(terminal.clear_completed_blocks(), 2);
+    assert!(terminal.command_records().is_empty());
+
+    // Blocks completed after the clear stay newer; restored records re-enter
+    // ahead of them (anvil/forge prepend semantics).
+    emit_completed_block(&mut terminal, 2);
+
+    assert_eq!(terminal.undo_clear_blocks(), 2);
+
+    let commands: Vec<Option<&str>> = terminal
+        .command_records()
+        .iter()
+        .map(|record| record.command.as_deref())
+        .collect();
+    assert_eq!(commands, vec![Some("cmd-0"), Some("cmd-1"), Some("cmd-2")]);
+    let restored: Vec<u64> = terminal
+        .command_records()
+        .iter()
+        .map(|record| record.sequence)
+        .collect();
+    assert_eq!(&restored[..2], &cleared_sequences[..]);
+    // Captured output and exact provenance survived the round trip.
+    assert!(terminal.captured_command_output_bytes > 0);
+    assert_eq!(
+        terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete)
+            .count(),
+        3
+    );
+    // The stash is single-level and consumed by the restore.
+    assert_eq!(terminal.undo_clear_blocks(), 0);
+}
+
+#[test]
+fn an_empty_clear_cannot_destroy_the_undo_stash() {
+    let mut terminal = TerminalState::new(40, 8);
+    emit_completed_block(&mut terminal, 0);
+
+    assert_eq!(terminal.clear_completed_blocks(), 1);
+    // A reflexive second clear finds nothing and must leave the stash alone
+    // (anvil/forge semantics).
+    assert_eq!(terminal.clear_completed_blocks(), 0);
+    assert_eq!(terminal.undo_clear_blocks(), 1);
+    assert_eq!(terminal.command_records().len(), 1);
+    assert_eq!(terminal.undo_clear_blocks(), 0);
+}
+
+#[test]
+fn undo_clear_blocks_enforces_the_record_cap_oldest_first() {
+    let mut terminal = TerminalState::new(40, 8);
+    for index in 0..MAX_COMMAND_MARKS {
+        emit_completed_block(&mut terminal, index);
+    }
+    assert_eq!(terminal.command_records().len(), MAX_COMMAND_MARKS);
+    let oldest_survivor = terminal.command_records()[1].sequence;
+    assert_eq!(terminal.clear_completed_blocks(), MAX_COMMAND_MARKS);
+
+    // One post-clear record pushes the restore one over the cap; the oldest
+    // restored record is evicted exactly as a natural overflow would evict it.
+    emit_completed_block(&mut terminal, MAX_COMMAND_MARKS);
+
+    assert_eq!(terminal.undo_clear_blocks(), MAX_COMMAND_MARKS - 1);
+    assert_eq!(terminal.command_records().len(), MAX_COMMAND_MARKS);
+    assert_eq!(terminal.command_records()[0].sequence, oldest_survivor);
+    let expected_newest = format!("cmd-{}", MAX_COMMAND_MARKS);
+    assert_eq!(
+        terminal
+            .command_records()
+            .back()
+            .unwrap()
+            .command
+            .as_deref(),
+        Some(expected_newest.as_str())
+    );
+}
+
+#[test]
+fn hard_reset_drops_the_undo_stash_with_the_rest_of_block_history() {
+    let mut terminal = TerminalState::new(40, 8);
+    emit_completed_block(&mut terminal, 0);
+    assert_eq!(terminal.clear_completed_blocks(), 1);
+
+    terminal.process_input(b"\x1bc");
+
+    assert_eq!(terminal.undo_clear_blocks(), 0);
+    assert!(terminal.command_records().is_empty());
+}
+
+
+#[test]
 fn captured_output_cache_evicts_oldest_payloads_at_session_cap() {
     let mut terminal = TerminalState::new(8, 2);
     for sequence in 0..65 {

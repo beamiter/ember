@@ -384,6 +384,90 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     atomic_replace_locked(path, contents, parent, &directory)
 }
 
+/// Open an application-owned directory without rejecting a too-permissive
+/// mode: [`ensure_private_directory`] is the one caller allowed to repair it,
+/// so validation here is identity (is-a-directory, owner) rather than policy.
+/// Ordinary persistence parents keep the stricter `open_existing_parent`.
+#[cfg(unix)]
+fn open_owned_directory(parent: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(invalid_path("persistence path is not a directory"));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "persistence directory is not owned by the current user",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_owned_directory(parent: &Path) -> io::Result<File> {
+    if fs::symlink_metadata(parent)?.is_dir() {
+        File::open(parent)
+    } else {
+        Err(invalid_path("persistence path is not a directory"))
+    }
+}
+
+/// Create or tighten one application-owned directory to owner-only access
+/// (frost 的 `ensure_private_directory` 对应物). Only for product-managed
+/// paths such as the session-export directory — never for a user-configured
+/// parent, whose mode this crate deliberately never changes.
+pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let directory = open_owned_directory(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+            directory.sync_all()
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_missing_parent(path),
+        Err(error) => Err(error),
+    }
+}
+
+/// Publish `contents` as a brand-new owner-private file without ever replacing
+/// an existing path (frost 的 `write_new_private_file` 对应物). Bytes first
+/// land in a hidden staging inode in the destination directory; only after
+/// `fsync` does an atomic, no-replace hard-link publish the final name. A
+/// crash can therefore leave a hidden staging file, but never a visible
+/// truncated file. `AlreadyExists` tells the caller to pick a fresh name.
+pub fn write_new_private_file(path: &Path, contents: &[u8], max_bytes: u64) -> io::Result<()> {
+    if contents.len() as u64 > max_bytes {
+        return Err(oversize_error(path, contents.len() as u64, max_bytes));
+    }
+    ensure_parent(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = open_existing_parent(parent)?;
+
+    let (mut file, temp_path) = create_unique_temp(path, parent)?;
+    let mut cleanup = TempFileGuard::new(temp_path.clone());
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    fs::hard_link(&temp_path, path)?;
+    fs::remove_file(&temp_path)?;
+    cleanup.committed = true;
+    directory.sync_all()
+}
+
 /// Compare the exact current bytes while holding the parent-directory lock,
 /// then publish one complete replacement. A stale editor/window can never
 /// silently overwrite a newer generation.
@@ -749,6 +833,93 @@ mod tests {
             .file_type()
             .is_symlink());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_private_file_never_replaces_and_bounds_bytes() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("create-new");
+        let path = root.join("export.md");
+        write_new_private_file(&path, b"first", 16).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        assert_eq!(
+            write_new_private_file(&path, b"second", 16)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            write_new_private_file(&root.join("big.md"), b"way too large", 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::FileTooLarge
+        );
+
+        let victim = root.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        let linked = root.join("linked.md");
+        symlink(&victim, &linked).unwrap();
+        assert_eq!(
+            write_new_private_file(&linked, b"new", 16)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(&linked).unwrap().file_type().is_symlink());
+
+        // A failed or successful publish never leaves staging files behind.
+        assert!(fs::read_dir(&root.0)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_directory_tightens_owned_dirs_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("private-dir");
+        let created = root.join("exports");
+        ensure_private_directory(&created).unwrap();
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let loose = root.join("loose");
+        fs::create_dir(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_directory(&loose).unwrap();
+        assert_eq!(
+            fs::metadata(&loose).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let victim = root.join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let linked = root.join("linked");
+        symlink(&victim, &linked).unwrap();
+        assert!(ensure_private_directory(&linked).is_err());
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the symlink target must not be tightened through the link"
+        );
+    }
+
 
     #[cfg(unix)]
     #[test]

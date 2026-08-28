@@ -2709,6 +2709,163 @@ impl TerminalApp {
         self.set_status(format!("Selected {count} command blocks"));
     }
 
+    /// `block:clear`: remove every completed command block in the active pane,
+    /// keeping the live prompt/running command. frost 的 Clear Blocks 加上
+    /// anvil/forge 的 undo 语义：被移除的记录有界地存放在终端级 stash 里，
+    /// `block:undo_clear` 可原样恢复。书签按既有 reconcile 逻辑随 deque
+    /// 身份变化自动剪枝（undo 恢复相同 sequence,未剪枝的书签随之复活）。
+    pub(crate) fn block_clear_blocks(&mut self) {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return;
+        }
+        let session = self.session_manager.get_active_session_mut();
+        let session_id = session.metadata.session_id.clone();
+        let cleared = {
+            let mut terminal = session.terminal.lock();
+            if terminal.is_alt_buffer_active() {
+                // 全屏应用拥有自己的画面,块界面不可见:与块导航一致静默忽略。
+                return;
+            }
+            terminal.clear_completed_blocks()
+        };
+        if cleared == 0 {
+            let message = self.explain_block_absence("No completed command blocks to clear");
+            self.set_status(message);
+            return;
+        }
+        // 与 frost 的 execute_block_clear 一致:块索引的 UI 状态随记录一起
+        // 原子丢弃。缓冲区未动,终端 find/链接缓存不受影响。
+        self.clear_block_selection_for_session(&session_id);
+        self.block_search.close();
+        self.set_status(format!(
+            "Cleared {cleared} command block{} — \"Undo Clear Blocks\" restores them",
+            if cleared == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// `block:undo_clear`: restore the blocks removed by the most recent
+    /// `block:clear` in the active pane. 单级 undo:stash 随之消耗;
+    /// 全屏应用下拒绝且不消耗 stash(anvil 语义,退出应用后仍可 undo)。
+    pub(crate) fn block_undo_clear(&mut self) {
+        if !self.config.block_mode {
+            return;
+        }
+        let session = self.session_manager.get_active_session_mut();
+        let restored = {
+            let mut terminal = session.terminal.lock();
+            if terminal.is_alt_buffer_active() {
+                return;
+            }
+            terminal.undo_clear_blocks()
+        };
+        if restored == 0 {
+            self.set_status("No cleared command blocks to restore");
+        } else {
+            self.set_status(format!(
+                "Restored {restored} command block{}",
+                if restored == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    /// `block:export_session_markdown` / `block:export_session_json`: snapshot
+    /// the active pane's retained finalized blocks, then serialize and durably
+    /// write the document off the UI thread (frost 的
+    /// `block_export_session_task` 对应物). The bounded snapshot is taken
+    /// under the terminal lock; file I/O never holds it.
+    pub(crate) fn block_export_session(&mut self, format: crate::block_export::SessionExportFormat) {
+        if !self.config.block_mode {
+            self.clear_block_selection();
+            return;
+        }
+        if self.pending_session_export.is_some() {
+            self.set_status("A session export is already in progress");
+            return;
+        }
+        let session = self.session_manager.get_active_session_mut();
+        let session_id = session.metadata.session_id.clone();
+        let prepared = {
+            let terminal = session.terminal.lock();
+            if terminal.is_alt_buffer_active() {
+                return;
+            }
+            if !terminal.command_records().iter().any(|record| record.complete) {
+                None
+            } else {
+                Some(crate::block_export::snapshot_session(&terminal, &session_id))
+            }
+        };
+        let snapshot = match prepared {
+            None => {
+                let message = self.explain_block_absence("No retained command blocks to export");
+                self.set_status(message);
+                return;
+            }
+            Some(Ok(snapshot)) => snapshot,
+            Some(Err(error)) => {
+                self.set_status_for(
+                    format!("Could not prepare session export: {error}"),
+                    Duration::from_secs(4),
+                );
+                return;
+            }
+        };
+        match crate::block_export::start_session_export(snapshot, format) {
+            Ok(pending) => {
+                self.pending_session_export = Some(pending);
+                self.set_status(format!("Exporting {} session blocks…", format.label()));
+            }
+            Err(error) => self.set_status_for(
+                format!("Could not start session export worker: {error}"),
+                Duration::from_secs(6),
+            ),
+        }
+    }
+
+    /// Poll the in-flight session export once per frame, next to
+    /// `poll_task_creation`. Completion only touches the status line; the
+    /// worker already published the file.
+    pub(crate) fn poll_session_export(&mut self, ctx: &egui::Context) {
+        let Some((format, result)) = self
+            .pending_session_export
+            .as_ref()
+            .map(|pending| (pending.format, pending.try_recv()))
+        else {
+            return;
+        };
+        match result {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(75));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_session_export = None;
+                self.set_status_for(
+                    "Session export worker stopped unexpectedly",
+                    Duration::from_secs(6),
+                );
+            }
+            Ok(Ok(path)) => {
+                self.pending_session_export = None;
+                self.set_status_for(
+                    format!(
+                        "Exported {} session blocks to {}",
+                        format.label(),
+                        path.display()
+                    ),
+                    Duration::from_secs(8),
+                );
+            }
+            Ok(Err(error)) => {
+                self.pending_session_export = None;
+                self.set_status_for(
+                    format!("Session export failed: {error}"),
+                    Duration::from_secs(8),
+                );
+            }
+        }
+    }
+
     /// `block:reinput_selected_commands`: put every selected real command back
     /// into the live editor, in terminal order, as one bracketed-paste frame.
     /// Background blocks contribute no empty line. The operation is atomic:

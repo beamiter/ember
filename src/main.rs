@@ -1,6 +1,7 @@
 pub mod agent;
 mod agent_panel;
 mod app;
+mod block_export;
 mod block_mode;
 mod block_search;
 mod bottom_bar;
@@ -2268,6 +2269,7 @@ impl TerminalApp {
             block_selection: None,
             block_search: Default::default(),
             block_bookmarks: Default::default(),
+            pending_session_export: None,
             search_replace_panel: search_replace_panel::SearchReplacePanel::new(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             hovered_link: None,
@@ -4514,6 +4516,7 @@ impl eframe::App for TerminalApp {
         self.debug_panel.record_frame();
         self.poll_task_creation(ctx);
         self.poll_native_agent_runtime(ctx);
+        self.poll_session_export(ctx);
 
         // A stateful mouse edge admitted in an earlier frame is older than
         // every keyboard/IME event arriving now. Retry it before any session

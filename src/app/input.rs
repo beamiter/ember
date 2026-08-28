@@ -988,6 +988,14 @@ impl TerminalApp {
             keybindings::Command::BlockJumpNextBookmark => {
                 self.block_jump_bookmark(crate::block_mode::SelectStep::Newer)
             }
+            keybindings::Command::BlockClear => self.block_clear_blocks(),
+            keybindings::Command::BlockUndoClear => self.block_undo_clear(),
+            keybindings::Command::BlockExportSessionMarkdown => {
+                self.block_export_session(crate::block_export::SessionExportFormat::Markdown)
+            }
+            keybindings::Command::BlockExportSessionJson => {
+                self.block_export_session(crate::block_export::SessionExportFormat::Json)
+            }
             keybindings::Command::FontIncrease => {
                 self.set_font_size_from_command(ctx, self.config.font_size + 1.0, "Font increased")
             }
@@ -1056,6 +1064,18 @@ impl TerminalApp {
                     self.set_status("Pane dividers reset to 50/50");
                 } else {
                     self.set_status("Pane dividers are already equal");
+                }
+            }
+            keybindings::Command::PaneSwap => {
+                // frost 的 pane:swap:焦点窗格与渲染顺序中的下一个叶子互换,
+                // 多窗格时各 pane 的 shell 在下一帧按各自 rect 自动 resize。
+                if self.layout_mut().swap_focused_with_next() {
+                    self.sync_active_session_to_focused_pane();
+                    self.schedule_session_save();
+                    self.set_status("Swapped panes");
+                    ctx.request_repaint();
+                } else {
+                    self.set_status("Only one pane is open");
                 }
             }
             keybindings::Command::WindowClose => {

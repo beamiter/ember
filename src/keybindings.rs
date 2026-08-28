@@ -76,6 +76,13 @@ pub enum Command {
     BlockToggleBookmark,
     BlockJumpPrevBookmark,
     BlockJumpNextBookmark,
+    /// 清除当前 pane 中所有已完成块（frost 的 `block:clear`；可撤销）。
+    BlockClear,
+    /// 撤销最近一次 `block:clear`（anvil/forge 的单级 undo stash 语义）。
+    BlockUndoClear,
+    /// 把整个会话的已完成块导出为私有 Markdown/JSON 文件（frost 的会话导出）。
+    BlockExportSessionMarkdown,
+    BlockExportSessionJson,
 
     FontIncrease,
     FontDecrease,
@@ -99,6 +106,9 @@ pub enum Command {
     PaneResizeDown,
     PaneZoomToggle,
     PaneEqualize,
+    /// 焦点窗格与渲染顺序中的下一个窗格互换内容（frost 的 `pane:swap`；
+    /// 几何与比例不变，焦点跟随移动的会话）。
+    PaneSwap,
 
     // === 窗口操作 ===
     WindowClose,
@@ -170,6 +180,12 @@ impl std::fmt::Display for Command {
             Command::BlockToggleBookmark => write!(f, "block:toggle_bookmark"),
             Command::BlockJumpPrevBookmark => write!(f, "block:jump_prev_bookmark"),
             Command::BlockJumpNextBookmark => write!(f, "block:jump_next_bookmark"),
+            Command::BlockClear => write!(f, "block:clear"),
+            Command::BlockUndoClear => write!(f, "block:undo_clear"),
+            Command::BlockExportSessionMarkdown => {
+                write!(f, "block:export_session_markdown")
+            }
+            Command::BlockExportSessionJson => write!(f, "block:export_session_json"),
             Command::FontIncrease => write!(f, "font:increase"),
             Command::FontDecrease => write!(f, "font:decrease"),
             Command::FontReset => write!(f, "font:reset"),
@@ -190,6 +206,7 @@ impl std::fmt::Display for Command {
             Command::PaneResizeDown => write!(f, "pane:resize_down"),
             Command::PaneZoomToggle => write!(f, "pane:zoom_toggle"),
             Command::PaneEqualize => write!(f, "pane:equalize"),
+            Command::PaneSwap => write!(f, "pane:swap"),
             Command::WindowClose => write!(f, "window:close"),
             Command::CommandPaletteToggle => write!(f, "command_palette:toggle"),
             Command::HelpToggle => write!(f, "help:toggle"),
@@ -249,6 +266,10 @@ impl std::str::FromStr for Command {
             "block:toggle_bookmark" => Ok(Command::BlockToggleBookmark),
             "block:jump_prev_bookmark" => Ok(Command::BlockJumpPrevBookmark),
             "block:jump_next_bookmark" => Ok(Command::BlockJumpNextBookmark),
+            "block:clear" => Ok(Command::BlockClear),
+            "block:undo_clear" => Ok(Command::BlockUndoClear),
+            "block:export_session_markdown" => Ok(Command::BlockExportSessionMarkdown),
+            "block:export_session_json" => Ok(Command::BlockExportSessionJson),
             "font:increase" => Ok(Command::FontIncrease),
             "font:decrease" => Ok(Command::FontDecrease),
             "font:reset" => Ok(Command::FontReset),
@@ -269,6 +290,7 @@ impl std::str::FromStr for Command {
             "pane:resize_down" => Ok(Command::PaneResizeDown),
             "pane:zoom_toggle" => Ok(Command::PaneZoomToggle),
             "pane:equalize" => Ok(Command::PaneEqualize),
+            "pane:swap" => Ok(Command::PaneSwap),
             "window:close" => Ok(Command::WindowClose),
             "command_palette:toggle" => Ok(Command::CommandPaletteToggle),
             "help:toggle" => Ok(Command::HelpToggle),
@@ -501,6 +523,13 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+g".to_string(), "block:search".to_string());
+        // Clear Blocks,与 frost/anvil/forge 同键位。Undo clear 和会话导出
+        // 保持无默认键位(可在 TOML 里绑定);frost 的 pane:swap 键位
+        // ctrl+shift+x 在本仓库已分给 block:jump_first_failed,因此
+        // pane:swap 同样只进 palette/可绑定。
+        bindings
+            .bindings
+            .insert("ctrl+shift+k".to_string(), "block:clear".to_string());
         // Warp/anvil/forge 的批量 block 工作流。Agent 移到
         // Ctrl+Shift+Alt+A，为 Select all blocks 让出家族统一键位。
         bindings
@@ -894,6 +923,11 @@ mod tests {
             Command::BlockToggleBookmark,
             Command::BlockJumpPrevBookmark,
             Command::BlockJumpNextBookmark,
+            Command::BlockClear,
+            Command::BlockUndoClear,
+            Command::BlockExportSessionMarkdown,
+            Command::BlockExportSessionJson,
+            Command::PaneSwap,
             Command::HistoryPickerToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
@@ -938,6 +972,7 @@ mod tests {
             ("f12", Command::DebugToggle),
             ("ctrl+shift+x", Command::BlockJumpFirstFailed),
             ("ctrl+shift+g", Command::BlockSearchToggle),
+            ("ctrl+shift+k", Command::BlockClear),
             ("ctrl+shift+,", Command::BlockJumpPrevFailed),
             ("ctrl+shift+.", Command::BlockJumpNextFailed),
             ("ctrl+shift+[", Command::BlockSelectPrev),

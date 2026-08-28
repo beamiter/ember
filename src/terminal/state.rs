@@ -382,6 +382,7 @@ impl super::TerminalState {
             active_output_provenance: None,
             pending_completed_command_outputs: VecDeque::new(),
             captured_command_output_bytes: 0,
+            cleared_blocks_stash: None,
             agent_prompt_input_tainted: false,
             armed_agent_execution: None,
         }
@@ -3045,6 +3046,121 @@ impl super::TerminalState {
     pub fn command_record(&self, id: &str) -> Option<&CommandRecord> {
         self.record_index_for_id(id)
             .and_then(|index| self.command_records.get(index))
+    }
+
+    /// Remove every finalized OSC 133 record while leaving the live prompt (or
+    /// the command currently running) intact — the terminal-state half of
+    /// Warp's "Clear Blocks", adapted from frost's `clear_completed_blocks`.
+    ///
+    /// frost also discards the cleared blocks' buffer rows. ember deliberately
+    /// keeps them: the record deque is the canonical block representation here
+    /// (records already survive row eviction), and row surgery could not be
+    /// undone cell-exactly through the projection/raw-row-id layers. Cleared
+    /// output therefore stays as ordinary scrollback text while every badge,
+    /// gutter stripe, navigation target, and export record derived from the
+    /// removed blocks disappears; the records themselves are stashed so
+    /// [`Self::undo_clear_blocks`] can restore them. Legacy `command_marks`
+    /// navigation keeps working against the retained rows. Record sequences
+    /// stay monotonic, so a stale UI id can never target a record created
+    /// after the clear.
+    ///
+    /// Returns how many records were cleared. An empty result leaves any
+    /// existing undo stash untouched, so a reflexive second clear cannot
+    /// destroy a real undo snapshot (anvil/forge semantics).
+    pub fn clear_completed_blocks(&mut self) -> usize {
+        let mut retained = VecDeque::with_capacity(self.command_records.len());
+        let mut cleared = Vec::new();
+        for record in std::mem::take(&mut self.command_records) {
+            if record.complete {
+                cleared.push(record);
+            } else {
+                retained.push_back(record);
+            }
+        }
+        self.command_records = retained;
+        let cleared_count = cleared.len();
+        if cleared_count == 0 {
+            return 0;
+        }
+
+        let mut captured_output_bytes = 0usize;
+        let mut provenance = Vec::new();
+        for record in &cleared {
+            captured_output_bytes = captured_output_bytes.saturating_add(
+                record
+                    .captured_output
+                    .as_ref()
+                    .map(|output| output.text.len())
+                    .unwrap_or(0),
+            );
+            if let Some(entry) = self.finished_output_provenance.get(&record.sequence).cloned() {
+                provenance.push(entry);
+            }
+            self.unregister_finished_output_zone(record.sequence);
+        }
+        self.captured_command_output_bytes = self
+            .captured_command_output_bytes
+            .saturating_sub(captured_output_bytes);
+        self.cleared_blocks_stash = Some(ClearedBlocksStash {
+            records: cleared,
+            provenance,
+            captured_output_bytes,
+        });
+        cleared_count
+    }
+
+    /// Restore the records removed by the most recent
+    /// [`Self::clear_completed_blocks`]. They are older than anything created
+    /// since, so they re-enter ahead of the retained deque (anvil/forge
+    /// prepend semantics) together with their finished-output sidecars.
+    ///
+    /// The `MAX_COMMAND_MARKS` bound is then enforced exactly like a natural
+    /// eviction: the oldest restored records are dropped first, and a still
+    /// live prompt/running record is never evicted. The buffer was never
+    /// touched by the clear, so restored anchors and provenance revalidate
+    /// against the same rows unless ordinary scrollback eviction removed them
+    /// in the meantime — in which case the existing fail-closed paths apply.
+    /// Returns how many records were actually restored; consumes the stash
+    /// either way (single-level undo).
+    pub fn undo_clear_blocks(&mut self) -> usize {
+        let Some(stash) = self.cleared_blocks_stash.take() else {
+            return 0;
+        };
+        let stashed = stash.records.len();
+        if stashed == 0 {
+            return 0;
+        }
+        for entry in stash.provenance {
+            self.register_finished_output_provenance(entry);
+        }
+        for record in stash.records.into_iter().rev() {
+            self.command_records.push_front(record);
+        }
+        self.captured_command_output_bytes = self
+            .captured_command_output_bytes
+            .saturating_add(stash.captured_output_bytes);
+
+        let mut evicted = 0usize;
+        while self.command_records.len() > MAX_COMMAND_MARKS
+            && self
+                .command_records
+                .front()
+                .is_some_and(|record| record.complete)
+        {
+            if let Some(record) = self.command_records.pop_front() {
+                evicted = evicted.saturating_add(1);
+                self.unregister_finished_output_zone(record.sequence);
+                self.captured_command_output_bytes =
+                    self.captured_command_output_bytes.saturating_sub(
+                        record
+                            .captured_output
+                            .as_ref()
+                            .map(|output| output.text.len())
+                            .unwrap_or(0),
+                    );
+            }
+        }
+        stashed.saturating_sub(evicted.min(stashed))
     }
 
     /// Exact half-open raw output range for one completed command sequence.

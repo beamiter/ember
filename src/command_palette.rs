@@ -344,6 +344,30 @@ impl CommandPalette {
                 crate::keybindings::Command::BlockJumpNextBookmark,
             ),
             CommandInfo::new(
+                "Clear Blocks",
+                CommandCategory::Terminal,
+                "Remove every completed command block in the active pane (undoable)",
+                crate::keybindings::Command::BlockClear,
+            ),
+            CommandInfo::new(
+                "Undo Clear Blocks",
+                CommandCategory::Terminal,
+                "Restore the blocks removed by the most recent Clear Blocks",
+                crate::keybindings::Command::BlockUndoClear,
+            ),
+            CommandInfo::new(
+                "Export Session Blocks as Markdown",
+                CommandCategory::Terminal,
+                "Write retained finalized blocks to a private Markdown file",
+                crate::keybindings::Command::BlockExportSessionMarkdown,
+            ),
+            CommandInfo::new(
+                "Export Session Blocks as JSON",
+                CommandCategory::Terminal,
+                "Write retained finalized blocks to a private JSON file",
+                crate::keybindings::Command::BlockExportSessionJson,
+            ),
+            CommandInfo::new(
                 "Split Vertically",
                 CommandCategory::Terminal,
                 "Create a terminal pane side by side",
@@ -432,6 +456,12 @@ impl CommandPalette {
                 CommandCategory::Terminal,
                 "Reset every pane divider to an even split",
                 crate::keybindings::Command::PaneEqualize,
+            ),
+            CommandInfo::new(
+                "Swap Panes",
+                CommandCategory::Terminal,
+                "Exchange the focused pane with the next one",
+                crate::keybindings::Command::PaneSwap,
             ),
             CommandInfo::new(
                 "Increase Font Size",

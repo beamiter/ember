@@ -654,6 +654,24 @@ pub struct TerminalState {
     active_output_provenance: Option<ActiveOutputProvenance>,
     pending_completed_command_outputs: VecDeque<CompletedCommandEvent>,
     captured_command_output_bytes: usize,
+    /// Single-level undo stash for `clear_completed_blocks` (see state.rs).
+    /// Dropped by `hard_reset` together with the rest of the block history.
+    cleared_blocks_stash: Option<ClearedBlocksStash>,
     agent_prompt_input_tainted: bool,
     armed_agent_execution: Option<ArmedAgentExecution>,
+}
+
+/// Bounded snapshot of the records removed by one `clear_completed_blocks`,
+/// kept as data so `undo_clear_blocks` can reinsert them (anvil/forge
+/// semantics). Inherits the live deque's bounds — at most `MAX_COMMAND_MARKS`
+/// records and `MAX_CAPTURED_COMMAND_OUTPUT_BYTES` of captured output — so
+/// undo data never needs a second budget.
+#[derive(Clone, Debug)]
+struct ClearedBlocksStash {
+    records: Vec<CommandRecord>,
+    /// Finished-output sidecars for the stashed records, keyed implicitly by
+    /// each record's `sequence`. Restored alongside so exact output ranges
+    /// revalidate against the untouched buffer rows.
+    provenance: Vec<FinishedOutputProvenance>,
+    captured_output_bytes: usize,
 }

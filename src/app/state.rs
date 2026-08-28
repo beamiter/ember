@@ -252,6 +252,10 @@ pub struct TerminalApp {
     /// record sequence, not mutable tab/pane indices or PTY-controlled ids.
     pub block_bookmarks: crate::block_search::BlockBookmarkState,
 
+    /// In-flight whole-session block export worker (frost 的
+    /// `block_export_in_flight` 对应物;同一时刻只允许一个导出任务).
+    pub pending_session_export: Option<crate::block_export::PendingSessionExport>,
+
     // Find & Replace (operates on selection)
     pub search_replace_panel: search_replace_panel::SearchReplacePanel,
 
