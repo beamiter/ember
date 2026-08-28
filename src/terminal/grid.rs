@@ -551,6 +551,27 @@ impl ScrollbackLine {
         }
     }
 
+    /// 供搜索使用的行文本视图,避免对 Plain 行做 decompress → 重建字符串的
+    /// 往返。返回(文本, 列映射, 可搜索列数):
+    /// - Plain 行只含窄字符(压缩时已排除 wide/wide_continuation),直接借用
+    ///   内部字符串,列映射为恒等(None)。
+    /// - Encoded 行解码后与活动网格行走同一条 `searchable_line_text` 路径,
+    ///   列映射跳过宽字符续接单元。
+    pub fn search_text(&self) -> (std::borrow::Cow<'_, str>, Option<Vec<usize>>, usize) {
+        match &self.data {
+            CompressedLineData::Plain(text, _) => (
+                std::borrow::Cow::Borrowed(text.as_str()),
+                None,
+                text.chars().count(),
+            ),
+            CompressedLineData::Encoded(_) => {
+                let cells = self.decompress();
+                let (text, col_map, total_cols) = searchable_line_text(&cells);
+                (std::borrow::Cow::Owned(text), Some(col_map), total_cols)
+            }
+        }
+    }
+
     fn encode_color(color: &Color, buf: &mut Vec<u8>) {
         match color {
             Color::Default => buf.push(0),
@@ -762,6 +783,36 @@ impl ScrollbackLine {
         cells.resize(cols, TerminalCell::default());
         cells
     }
+}
+
+/// 将网格行转换为字符串,并返回每个字符对应的网格列号。
+/// 跳过宽字符的续接单元(否则相邻宽字符间会被插入空格导致匹配失败),
+/// 因此字符索引与字节偏移都不再等于列号,需经 col_map 映射。
+pub(crate) fn searchable_line_text(line: &[TerminalCell]) -> (String, Vec<usize>, usize) {
+    let mut searchable_len = line.len();
+    while searchable_len > 0 {
+        let cell = &line[searchable_len - 1];
+        if cell.character == ' '
+            && cell.background == Color::Default
+            && !cell.flags.wide()
+            && !cell.flags.wide_continuation()
+        {
+            searchable_len -= 1;
+        } else {
+            break;
+        }
+    }
+    let line = &line[..searchable_len];
+    let mut s = String::with_capacity(searchable_len);
+    let mut col_map = Vec::with_capacity(searchable_len);
+    for (col, cell) in line.iter().enumerate() {
+        if cell.flags.wide_continuation() {
+            continue;
+        }
+        s.push(cell.character);
+        col_map.push(col);
+    }
+    (s, col_map, searchable_len)
 }
 
 #[derive(Clone, Copy, Debug)]

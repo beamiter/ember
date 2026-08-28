@@ -1222,6 +1222,7 @@ impl TerminalApp {
                 &self.search_state.query,
                 self.search_state.use_regex,
                 self.search_state.case_sensitive,
+                &mut self.search_state.regex_cache,
             );
             (
                 matches,

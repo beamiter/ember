@@ -1614,6 +1614,164 @@ fn malformed_kitty_apc_reports_errors_unless_quiet_suppresses_them() {
 }
 
 #[test]
+fn osc_window_title_survives_every_input_batch_boundary() {
+    for terminator in ["\x07", "\x1b\\"] {
+        let sequence = format!("\x1b]0;fragmented title{terminator}");
+        for split_at in 1..sequence.len() {
+            let mut terminal = TerminalState::new(8, 2);
+            terminal.process_input(&sequence.as_bytes()[..split_at]);
+            assert!(
+                terminal.window_title.is_empty(),
+                "incomplete OSC was applied at split {split_at}"
+            );
+            terminal.process_input(&sequence.as_bytes()[split_at..]);
+            assert_eq!(
+                terminal.window_title, "fragmented title",
+                "OSC was lost at input split {split_at}"
+            );
+            assert!(terminal.pending_osc.is_empty());
+        }
+    }
+}
+
+#[test]
+fn fragmented_osc_advances_its_scan_cursor_and_stays_bounded() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b]0;stream");
+    assert_eq!(
+        terminal.pending_osc_scan_from,
+        terminal.pending_osc.len().saturating_sub(1)
+    );
+
+    for fragment in [b"ed-".as_slice(), b"ti".as_slice(), b"tle".as_slice()] {
+        let old_len = terminal.pending_osc.len();
+        terminal.process_input(fragment);
+        assert_eq!(terminal.pending_osc.len(), old_len + fragment.len());
+        assert_eq!(
+            terminal.pending_osc_scan_from,
+            terminal.pending_osc.len().saturating_sub(1),
+            "unterminated fragments must resume scanning at the previous tail"
+        );
+    }
+    // The BEL terminator and the byte after it arrive in the same batch; the
+    // trailing byte is ordinary terminal input, not OSC payload.
+    terminal.process_input(b"\x07Z");
+    assert!(terminal.pending_osc.is_empty());
+    assert_eq!(terminal.window_title, "streamed-title");
+    assert_eq!(terminal.grid[0][0].character, 'Z');
+}
+
+#[test]
+fn osc_terminators_straddling_chunks_complete_the_sequence() {
+    // ST split across the batch boundary: pending ends with ESC, the next
+    // batch opens with `\`.
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b]0;straddle\x1b");
+    assert!(!terminal.pending_osc.is_empty());
+    terminal.process_input(b"\\Y");
+    assert!(terminal.pending_osc.is_empty());
+    assert_eq!(terminal.window_title, "straddle");
+    assert_eq!(terminal.grid[0][0].character, 'Y');
+
+    // An ESC at a chunk end that is not followed by `\` is payload content,
+    // and a BEL in the next chunk still terminates the OSC.
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b]0;ab\x1b");
+    terminal.process_input(b"cd\x07");
+    assert_eq!(terminal.window_title, "ab\x1bcd");
+
+    // ESC ESC \: the first ESC is content, the second pair terminates.
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b]0;ab\x1b");
+    terminal.process_input(b"\x1b\\");
+    assert_eq!(terminal.window_title, "ab\x1b");
+}
+
+#[test]
+fn oversized_osc_is_dropped_and_parsing_resumes_in_ground_state() {
+    let mut terminal = TerminalState::new(8, 2);
+    let mut oversized = b"\x1b]0;".to_vec();
+    oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    terminal.process_input(&oversized);
+    assert!(terminal.pending_osc.is_empty());
+    assert_eq!(terminal.pending_osc_scan_from, 0);
+
+    // Unlike kitty APCs there is no discard-until-ST mode: once the buffer is
+    // dropped the parser is back in ground state and the next batch is
+    // ordinary terminal input (the pre-existing pending_escape policy).
+    terminal.process_input(b"ok");
+    assert_eq!(terminal.grid[0][0].character, 'o');
+    assert_eq!(terminal.grid[0][1].character, 'k');
+
+    // Accumulation that crosses the cap over several batches is dropped the
+    // same way, and a later well-formed OSC still parses.
+    terminal.process_input(b"\x1b]0;title");
+    assert!(!terminal.pending_osc.is_empty());
+    let chunk = vec![b'B'; MAX_PENDING_ESCAPE];
+    terminal.process_input(&chunk);
+    assert!(terminal.pending_osc.is_empty());
+    terminal.process_input(b"\x1b]0;new\x07");
+    assert_eq!(terminal.window_title, "new");
+}
+
+#[test]
+fn dcs_stays_opaque_across_every_input_batch_boundary() {
+    let sequence = b"\x1bP1;2|a=opaque-body\x1b\\Z";
+    for split_at in 1..sequence.len() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(&sequence[..split_at]);
+        terminal.process_input(&sequence[split_at..]);
+        assert_eq!(
+            terminal.grid[0][0].character, 'Z',
+            "byte after ST was lost at input split {split_at}"
+        );
+        assert_eq!(
+            terminal.grid[0][1].character, ' ',
+            "opaque DCS payload leaked at input split {split_at}"
+        );
+        assert!(terminal.pending_string.is_empty());
+    }
+}
+
+#[test]
+fn fragmented_dcs_advances_its_scan_cursor_and_stays_bounded() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1bP1;2|");
+    assert_eq!(
+        terminal.pending_string_scan_from,
+        terminal.pending_string.len().saturating_sub(1)
+    );
+
+    for fragment in [b"ab".as_slice(), b"cd".as_slice()] {
+        let old_len = terminal.pending_string.len();
+        terminal.process_input(fragment);
+        assert_eq!(terminal.pending_string.len(), old_len + fragment.len());
+        assert_eq!(
+            terminal.pending_string_scan_from,
+            terminal.pending_string.len().saturating_sub(1),
+            "unterminated fragments must resume scanning at the previous tail"
+        );
+    }
+    terminal.process_input(b"\x1b\\Z");
+    assert!(terminal.pending_string.is_empty());
+    assert_eq!(terminal.grid[0][0].character, 'Z');
+
+    // Oversized DCS follows the pending_escape policy: drop the buffer and
+    // return to ground state.
+    let mut oversized = b"\x1bP".to_vec();
+    oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+    terminal.process_input(&oversized);
+    assert!(terminal.pending_string.is_empty());
+    assert_eq!(terminal.pending_string_scan_from, 0);
+    terminal.process_input(b"\x1b\\no");
+    // Ground state treats ESC <unhandled> as a lone ESC skip, so `\` is
+    // printed as ordinary text — this is the pre-existing parser behavior.
+    assert_eq!(terminal.grid[0][1].character, '\\');
+    assert_eq!(terminal.grid[0][2].character, 'n');
+    assert_eq!(terminal.grid[0][3].character, 'o');
+}
+
+#[test]
 fn ris_resets_graphics_and_parser_state_without_printing_the_final_byte() {
     let mut terminal = TerminalState::new(8, 3);
     terminal.set_max_scrollback(17);

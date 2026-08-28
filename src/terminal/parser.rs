@@ -198,8 +198,252 @@ impl super::TerminalState {
         true
     }
 
+    /// Dispatch a complete OSC payload (the bytes between `ESC ]` and the
+    /// BEL/ST terminator). Shared by the single-batch parser and the streaming
+    /// resume path so fragmented OSCs behave exactly like unfragmented ones.
+    fn handle_osc_payload(&mut self, payload: &[u8]) {
+        if let Ok(payload) = std::str::from_utf8(payload) {
+            // OSC 104/110/111/112 are valid without a
+            // `;value` part — treat those as empty.
+            if let Some((command, value)) = payload.split_once(';').or(Some((payload, ""))) {
+                if command == "0" || command == "2" {
+                    self.window_title.clear();
+                    self.window_title.push_str(value);
+                } else if command == "7" {
+                    // OSC 7 — current working directory.
+                    // Format: file://hostname/path (path is %-encoded).
+                    // We accept either the full URL or a bare path.
+                    self.current_working_dir = Self::decode_osc7_cwd(value);
+                    crate::debug_log!("[OSC7] cwd set to {:?}", self.current_working_dir);
+                } else if command == "8" {
+                    // OSC 8 - Hyperlinks
+                    // Format: ESC ] 8 ; params ; URI ST
+                    // Empty URI closes the current hyperlink. Invalid,
+                    // oversized, or unsafe openings also clear it so a
+                    // rejected sequence cannot accidentally extend the
+                    // preceding safe link over later text.
+                    if let Some((params, uri)) = value.split_once(';') {
+                        if uri.is_empty() {
+                            self.current_hyperlink = HyperlinkId::NONE;
+                        } else {
+                            self.current_hyperlink = self
+                                .hyperlinks
+                                .intern(params, uri)
+                                .unwrap_or(HyperlinkId::NONE);
+                        }
+                    } else {
+                        self.current_hyperlink = HyperlinkId::NONE;
+                    }
+                } else if command == "4" {
+                    self.handle_osc_palette(value);
+                } else if command == "104" {
+                    self.reset_osc_palette(value);
+                } else if command == "10" || command == "11" || command == "12" {
+                    self.handle_osc_color(command, value);
+                } else if command == "110" || command == "111" || command == "112" {
+                    self.reset_osc_color(command);
+                } else if command == "9" {
+                    // Desktop notification (iTerm2/ConEmu)
+                    if self.pending_notifications.len() < 8 {
+                        let title = "ember".to_string();
+                        let body = value.chars().take(256).collect();
+                        self.pending_notifications.push((title, body));
+                    }
+                } else if command == "777" {
+                    // rxvt notification: 777;notify;title;body
+                    let parts: Vec<&str> = value.splitn(3, ';').collect();
+                    if parts.len() >= 2 && parts[0] == "notify" {
+                        let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
+                        let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                        if self.pending_notifications.len() < 8 {
+                            self.pending_notifications.push((title, body));
+                        }
+                    }
+                } else if command == "52" {
+                    self.handle_osc_52(value);
+                } else if command == "133" {
+                    // OSC 133 (FinalTerm) shell integration:
+                    //   A           prompt start
+                    //   B           prompt end / command line begins
+                    //   C           command output begins
+                    //   D[;<exit>]  command finished, optional exit code
+                    // Parameters are parsed centrally so C can carry
+                    // Kitty's `cmdline_url` and jsh can correlate all
+                    // phases with `jsh_id`/`id`.
+                    self.handle_osc_133(value);
+                } else if command == "5522" {
+                    let (metadata, osc_payload) =
+                        if let Some((metadata, osc_payload)) = value.split_once(';') {
+                            (metadata, Some(osc_payload))
+                        } else {
+                            (value, None)
+                        };
+                    self.handle_osc_5522(metadata, osc_payload);
+                }
+            }
+        }
+    }
+
+    fn begin_pending_osc(&mut self, tail: &[u8]) {
+        if tail.len() > MAX_PENDING_ESCAPE {
+            crate::debug_log!(
+                "[PARSER] pending_osc exceeded {} bytes (+{}); discarding",
+                MAX_PENDING_ESCAPE,
+                tail.len()
+            );
+            self.pending_osc.clear();
+            return;
+        }
+        self.pending_osc.clear();
+        self.pending_osc.extend_from_slice(tail);
+        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
+    }
+
+    /// Resume a fragmented OSC. Returns true when this function consumed the
+    /// input (including any recursively processed bytes after the terminator).
+    /// Mirrors resume_pending_apc, except OSCs also terminate on BEL and an
+    /// oversized OSC follows the pending_escape policy: drop the buffer and
+    /// fall back to ground state instead of discarding until the terminator.
+    fn resume_pending_osc(&mut self, input: &[u8]) -> bool {
+        if self.pending_osc.is_empty() {
+            return false;
+        }
+
+        // Everything before pending_osc_scan_from was proved not to contain a
+        // terminator in the previous call. A new ST can therefore only straddle
+        // the old/new boundary or live entirely in input; BEL is a single byte
+        // and cannot straddle. Search the new bytes once before doing the
+        // capacity check: bytes after the terminator are normal terminal input
+        // and must not be charged to the OSC size limit.
+        let scan_from = self
+            .pending_osc_scan_from
+            .min(self.pending_osc.len().saturating_sub(1));
+        let terminator = if scan_from + 1 == self.pending_osc.len()
+            && self.pending_osc[scan_from] == 0x1b
+            && input.first() == Some(&b'\\')
+        {
+            Some((scan_from, 1))
+        } else {
+            let mut found = None;
+            let mut index = 0;
+            while index < input.len() {
+                if input[index] == 0x07 {
+                    found = Some((self.pending_osc.len() + index, index + 1));
+                    break;
+                } else if index + 1 < input.len()
+                    && input[index] == 0x1b
+                    && input[index + 1] == 0x5c
+                {
+                    found = Some((self.pending_osc.len() + index, index + 2));
+                    break;
+                }
+                index += 1;
+            }
+            found
+        };
+
+        if let Some((terminator, consumed)) = terminator {
+            self.pending_osc.extend_from_slice(&input[..consumed]);
+            let packet = std::mem::take(&mut self.pending_osc);
+            self.pending_osc_scan_from = 0;
+            if packet.starts_with(b"\x1b]") {
+                self.handle_osc_payload(&packet[2..terminator]);
+            }
+            if consumed < input.len() {
+                self.process_input(&input[consumed..]);
+            }
+            return true;
+        }
+
+        if self.pending_osc.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
+            crate::debug_log!(
+                "[PARSER] pending_osc exceeded {} bytes (have {}, +{}); discarding",
+                MAX_PENDING_ESCAPE,
+                self.pending_osc.len(),
+                input.len()
+            );
+            self.pending_osc.clear();
+            self.pending_osc_scan_from = 0;
+            return true;
+        }
+
+        self.pending_osc.extend_from_slice(input);
+        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
+        true
+    }
+
+    fn begin_pending_string(&mut self, tail: &[u8]) {
+        if tail.len() > MAX_PENDING_ESCAPE {
+            crate::debug_log!(
+                "[PARSER] pending_string exceeded {} bytes (+{}); discarding",
+                MAX_PENDING_ESCAPE,
+                tail.len()
+            );
+            self.pending_string.clear();
+            return;
+        }
+        self.pending_string.clear();
+        self.pending_string.extend_from_slice(tail);
+        self.pending_string_scan_from = self.pending_string.len().saturating_sub(1);
+    }
+
+    /// Resume a fragmented DCS/SOS/PM. Their payloads are opaque — only the
+    /// ST terminator matters — so a completed packet is simply dropped and the
+    /// same overflow policy as pending_escape applies.
+    fn resume_pending_string(&mut self, input: &[u8]) -> bool {
+        if self.pending_string.is_empty() {
+            return false;
+        }
+
+        let scan_from = self
+            .pending_string_scan_from
+            .min(self.pending_string.len().saturating_sub(1));
+        let terminator = if scan_from + 1 == self.pending_string.len()
+            && self.pending_string[scan_from] == 0x1b
+            && input.first() == Some(&b'\\')
+        {
+            Some(1)
+        } else {
+            input
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .map(|offset| offset + 2)
+        };
+
+        if let Some(consumed) = terminator {
+            self.pending_string.clear();
+            self.pending_string_scan_from = 0;
+            if consumed < input.len() {
+                self.process_input(&input[consumed..]);
+            }
+            return true;
+        }
+
+        if self.pending_string.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
+            crate::debug_log!(
+                "[PARSER] pending_string exceeded {} bytes (have {}, +{}); discarding",
+                MAX_PENDING_ESCAPE,
+                self.pending_string.len(),
+                input.len()
+            );
+            self.pending_string.clear();
+            self.pending_string_scan_from = 0;
+            return true;
+        }
+
+        self.pending_string.extend_from_slice(input);
+        self.pending_string_scan_from = self.pending_string.len().saturating_sub(1);
+        true
+    }
+
     pub fn process_input(&mut self, input: &[u8]) {
         if self.resume_pending_apc(input) {
+            return;
+        }
+        if self.resume_pending_osc(input) {
+            return;
+        }
+        if self.resume_pending_string(input) {
             return;
         }
         // Fast path: if no pending escape, process input directly without allocation
@@ -354,7 +598,7 @@ impl super::TerminalState {
                             }
 
                             if !terminated {
-                                self.stash_pending_escape(&data_slice[esc_start..]);
+                                self.begin_pending_osc(&data_slice[esc_start..]);
                                 break;
                             }
 
@@ -364,111 +608,7 @@ impl super::TerminalState {
                                 i - 2
                             };
                             if payload_end >= payload_start {
-                                if let Ok(payload) =
-                                    std::str::from_utf8(&data_slice[payload_start..payload_end])
-                                {
-                                    // OSC 104/110/111/112 are valid without a
-                                    // `;value` part — treat those as empty.
-                                    if let Some((command, value)) =
-                                        payload.split_once(';').or(Some((payload, "")))
-                                    {
-                                        if command == "0" || command == "2" {
-                                            self.window_title.clear();
-                                            self.window_title.push_str(value);
-                                        } else if command == "7" {
-                                            // OSC 7 — current working directory.
-                                            // Format: file://hostname/path (path is %-encoded).
-                                            // We accept either the full URL or a bare path.
-                                            self.current_working_dir = Self::decode_osc7_cwd(value);
-                                            crate::debug_log!(
-                                                "[OSC7] cwd set to {:?}",
-                                                self.current_working_dir
-                                            );
-                                        } else if command == "8" {
-                                            // OSC 8 - Hyperlinks
-                                            // Format: ESC ] 8 ; params ; URI ST
-                                            // Empty URI closes the current hyperlink. Invalid,
-                                            // oversized, or unsafe openings also clear it so a
-                                            // rejected sequence cannot accidentally extend the
-                                            // preceding safe link over later text.
-                                            if let Some((params, uri)) = value.split_once(';') {
-                                                if uri.is_empty() {
-                                                    self.current_hyperlink = HyperlinkId::NONE;
-                                                } else {
-                                                    self.current_hyperlink = self
-                                                        .hyperlinks
-                                                        .intern(params, uri)
-                                                        .unwrap_or(HyperlinkId::NONE);
-                                                }
-                                            } else {
-                                                self.current_hyperlink = HyperlinkId::NONE;
-                                            }
-                                        } else if command == "4" {
-                                            self.handle_osc_palette(value);
-                                        } else if command == "104" {
-                                            self.reset_osc_palette(value);
-                                        } else if command == "10"
-                                            || command == "11"
-                                            || command == "12"
-                                        {
-                                            self.handle_osc_color(command, value);
-                                        } else if command == "110"
-                                            || command == "111"
-                                            || command == "112"
-                                        {
-                                            self.reset_osc_color(command);
-                                        } else if command == "9" {
-                                            // Desktop notification (iTerm2/ConEmu)
-                                            if self.pending_notifications.len() < 8 {
-                                                let title = "ember".to_string();
-                                                let body = value.chars().take(256).collect();
-                                                self.pending_notifications.push((title, body));
-                                            }
-                                        } else if command == "777" {
-                                            // rxvt notification: 777;notify;title;body
-                                            let parts: Vec<&str> = value.splitn(3, ';').collect();
-                                            if parts.len() >= 2 && parts[0] == "notify" {
-                                                let title = parts
-                                                    .get(1)
-                                                    .unwrap_or(&"")
-                                                    .chars()
-                                                    .take(256)
-                                                    .collect();
-                                                let body = parts
-                                                    .get(2)
-                                                    .unwrap_or(&"")
-                                                    .chars()
-                                                    .take(256)
-                                                    .collect();
-                                                if self.pending_notifications.len() < 8 {
-                                                    self.pending_notifications.push((title, body));
-                                                }
-                                            }
-                                        } else if command == "52" {
-                                            self.handle_osc_52(value);
-                                        } else if command == "133" {
-                                            // OSC 133 (FinalTerm) shell integration:
-                                            //   A           prompt start
-                                            //   B           prompt end / command line begins
-                                            //   C           command output begins
-                                            //   D[;<exit>]  command finished, optional exit code
-                                            // Parameters are parsed centrally so C can carry
-                                            // Kitty's `cmdline_url` and jsh can correlate all
-                                            // phases with `jsh_id`/`id`.
-                                            self.handle_osc_133(value);
-                                        } else if command == "5522" {
-                                            let (metadata, osc_payload) =
-                                                if let Some((metadata, osc_payload)) =
-                                                    value.split_once(';')
-                                                {
-                                                    (metadata, Some(osc_payload))
-                                                } else {
-                                                    (value, None)
-                                                };
-                                            self.handle_osc_5522(metadata, osc_payload);
-                                        }
-                                    }
-                                }
+                                self.handle_osc_payload(&data_slice[payload_start..payload_end]);
                             }
                         }
                         b'P' | b'X' | b'^' | b'_' => {
@@ -505,7 +645,7 @@ impl super::TerminalState {
                                 if is_apc {
                                     self.begin_pending_apc(&data_slice[esc_start..]);
                                 } else {
-                                    self.stash_pending_escape(&data_slice[esc_start..]);
+                                    self.begin_pending_string(&data_slice[esc_start..]);
                                 }
                                 break;
                             }

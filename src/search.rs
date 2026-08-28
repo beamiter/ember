@@ -7,6 +7,17 @@ use std::collections::VecDeque;
 /// space) is run against a very large scrollback.
 pub const MAX_SEARCH_MATCHES: usize = 20_000;
 
+/// 编译后的正则缓存槽。由 `SearchState` 持有,这样搜索面板打开期间
+/// 每次刷新(PTY 输出、按键)只要 pattern 与大小写标志未变,就复用同一个
+/// `Regex`,而不是每次都付出一次完整的 `RegexBuilder::build()`。
+/// `pattern` 记录的是实际参与编译的字符串(纯文本模式下为转义后的字面量)。
+#[derive(Clone, Debug)]
+pub struct RegexCache {
+    pattern: String,
+    case_sensitive: bool,
+    regex: regex::Regex,
+}
+
 /// 单个搜索匹配项
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
 pub struct SearchMatch {
@@ -95,6 +106,8 @@ pub struct SearchState {
     /// reordered, while this id follows the terminal session itself.
     pub results_session_id: Option<String>,
     pub results_refreshed_at: Option<std::time::Instant>,
+    /// 编译后的正则缓存;pattern 与大小写标志不变时跨刷新复用。
+    pub regex_cache: Option<RegexCache>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,6 +147,7 @@ impl SearchState {
             results_session_idx: None,
             results_session_id: None,
             results_refreshed_at: None,
+            regex_cache: None,
         }
     }
 
@@ -263,16 +277,100 @@ impl SearchEngine {
         query: &str,
         use_regex: bool,
         case_sensitive: bool,
+        regex_cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, Option<String>, bool) {
         if query.is_empty() {
             return (Vec::new(), None, false);
         }
 
         if use_regex {
-            Self::search_regex(terminal, query, case_sensitive)
+            Self::search_regex(terminal, query, case_sensitive, regex_cache)
         } else {
-            let (matches, truncated) = Self::search_plaintext(terminal, query, case_sensitive);
+            let (matches, truncated) =
+                Self::search_plaintext(terminal, query, case_sensitive, regex_cache);
             (matches, None, truncated)
+        }
+    }
+
+    /// 取得缓存的编译正则;pattern(实际参与编译的字符串)或大小写标志
+    /// 变化时才重新编译并写回缓存,编译失败会清空缓存并返回错误。
+    fn cached_regex<'a>(
+        cache: &'a mut Option<RegexCache>,
+        pattern: &str,
+        case_sensitive: bool,
+    ) -> Result<&'a regex::Regex, String> {
+        let stale = match cache.as_ref() {
+            Some(c) => c.pattern != pattern || c.case_sensitive != case_sensitive,
+            None => true,
+        };
+        if stale {
+            let mut builder = RegexBuilder::new(pattern);
+            if !case_sensitive {
+                builder.case_insensitive(true);
+            }
+            match builder.build() {
+                Ok(regex) => {
+                    *cache = Some(RegexCache {
+                        pattern: pattern.to_string(),
+                        case_sensitive,
+                        regex,
+                    });
+                }
+                Err(e) => {
+                    *cache = None;
+                    return Err(format!("Invalid regex: {}", e));
+                }
+            }
+        }
+        Ok(&cache.as_ref().expect("cache was just rebuilt").regex)
+    }
+
+    /// 逐行遍历 scrollback(主缓冲时)与活动网格;回调返回 true 表示达到
+    /// 匹配上限、停止遍历。scrollback 的 Plain 行借用内部字符串,不做
+    /// decompress → 重建字符串的往返。
+    fn for_each_line(
+        terminal: &crate::terminal::TerminalState,
+        mut f: impl FnMut(u64, &str, Option<&[usize]>, usize) -> bool,
+    ) -> bool {
+        if !terminal.is_alt_buffer() {
+            let first_line_id = terminal
+                .total_lines_scrolled
+                .saturating_sub(terminal.scrollback.len() as u64);
+            for (line_idx, compressed) in terminal.scrollback.iter().enumerate() {
+                let (line_str, col_map, total_cols) = compressed.search_text();
+                if f(
+                    first_line_id.saturating_add(line_idx as u64),
+                    &line_str,
+                    col_map.as_deref(),
+                    total_cols,
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        for (line_idx, line) in terminal.grid.iter().enumerate() {
+            let (line_str, col_map, total_cols) = crate::terminal::searchable_line_text(line);
+            if f(
+                terminal
+                    .total_lines_scrolled
+                    .saturating_add(line_idx as u64),
+                &line_str,
+                Some(&col_map),
+                total_cols,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 字符索引 → 网格列号。col_map 为 None 表示恒等映射(Plain 行只含
+    /// 窄字符,每个字符恰好占一列);越界统一落到 total_cols。
+    fn column_of(col_map: Option<&[usize]>, total_cols: usize, char_idx: usize) -> usize {
+        match col_map {
+            Some(map) => map.get(char_idx).copied().unwrap_or(total_cols),
+            None => char_idx.min(total_cols),
         }
     }
 
@@ -281,74 +379,95 @@ impl SearchEngine {
         terminal: &crate::terminal::TerminalState,
         query: &str,
         case_sensitive: bool,
+        regex_cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, bool) {
         let mut matches = Vec::new();
-        let mut truncated = false;
-        // 在原字符串上做 Unicode 大小写不敏感匹配。整行 `to_lowercase()` 会让
+
+        // 大小写敏感时直接做子串查找(std 的 str::find 走 memmem),
+        // 连转义字面量正则的编译都省掉。
+        if case_sensitive {
+            let truncated =
+                Self::for_each_line(terminal, |line_id, line_str, col_map, total_cols| {
+                    Self::append_substring_matches(
+                        &mut matches,
+                        line_id,
+                        line_str,
+                        col_map,
+                        total_cols,
+                        query,
+                    )
+                });
+            return (matches, truncated);
+        }
+
+        // 大小写不敏感仍在原字符串上做 Unicode 匹配。整行 `to_lowercase()` 会让
         // 某些字符展开成多个码位（例如 İ → i + 组合点），从而把后续匹配映射
-        // 到错误的终端列。转义后的字面量正则既保留原始字节偏移，也支持 Unicode。
-        let mut builder = RegexBuilder::new(&regex::escape(query));
-        builder.case_insensitive(!case_sensitive);
-        let regex = builder
-            .build()
+        // 到错误的终端列。转义后的字面量正则既保留原始字节偏移,也支持 Unicode;
+        // 编译结果经 RegexCache 在搜索面板打开期间跨刷新复用。
+        let regex = Self::cached_regex(regex_cache, &regex::escape(query), false)
             .expect("an escaped literal must compile as a regex");
-
-        if !terminal.is_alt_buffer() {
-            let first_line_id = terminal
-                .total_lines_scrolled
-                .saturating_sub(terminal.scrollback.len() as u64);
-            for (line_idx, compressed) in terminal.scrollback.iter().enumerate() {
-                let line = compressed.decompress();
-                if Self::append_plaintext_matches(
-                    &mut matches,
-                    first_line_id.saturating_add(line_idx as u64),
-                    &line,
-                    &regex,
-                ) {
-                    truncated = true;
-                    break;
-                }
-            }
-        }
-
-        if !truncated {
-            for (line_idx, line) in terminal.grid.iter().enumerate() {
-                if Self::append_plaintext_matches(
-                    &mut matches,
-                    terminal
-                        .total_lines_scrolled
-                        .saturating_add(line_idx as u64),
-                    line,
-                    &regex,
-                ) {
-                    truncated = true;
-                    break;
-                }
-            }
-        }
-
+        let truncated = Self::for_each_line(terminal, |line_id, line_str, col_map, total_cols| {
+            Self::append_plaintext_regex_matches(
+                &mut matches,
+                line_id,
+                line_str,
+                col_map,
+                total_cols,
+                regex,
+            )
+        });
         (matches, truncated)
     }
 
-    fn append_plaintext_matches(
+    fn append_substring_matches(
         matches: &mut Vec<SearchMatch>,
         line_id: u64,
-        line: &[crate::terminal::TerminalCell],
+        line_str: &str,
+        col_map: Option<&[usize]>,
+        total_cols: usize,
+        query: &str,
+    ) -> bool {
+        let mut start_byte = 0;
+        while let Some(rel) = line_str[start_byte..].find(query) {
+            let found_start = start_byte + rel;
+            // 字节偏移 → 字符索引 → 网格列号(col_map 已跳过宽字符续接单元)。
+            let start_char = line_str[..found_start].chars().count();
+            let end_char = line_str[..found_start + query.len()].chars().count();
+            matches.push(SearchMatch {
+                line_id,
+                col_start: Self::column_of(col_map, total_cols, start_char),
+                col_end: Self::column_of(col_map, total_cols, end_char),
+            });
+            if matches.len() >= MAX_SEARCH_MATCHES {
+                return true;
+            }
+            // 前进到下一个字符边界:既能找到重叠匹配,又不会切到多字节字符中间导致 panic。
+            let step = line_str[found_start..]
+                .chars()
+                .next()
+                .map_or(1, |c| c.len_utf8());
+            start_byte = found_start + step;
+        }
+        false
+    }
+
+    fn append_plaintext_regex_matches(
+        matches: &mut Vec<SearchMatch>,
+        line_id: u64,
+        line_str: &str,
+        col_map: Option<&[usize]>,
+        total_cols: usize,
         regex: &regex::Regex,
     ) -> bool {
-        let (line_str, col_map, total_cols) = Self::grid_line_to_string(line);
-
         let mut start_byte = 0;
-        while let Some(found) = regex.find_at(&line_str, start_byte) {
+        while let Some(found) = regex.find_at(line_str, start_byte) {
             // 字节偏移 → 字符索引 → 网格列号(col_map 已跳过宽字符续接单元)。
             let start_char = line_str[..found.start()].chars().count();
             let end_char = line_str[..found.end()].chars().count();
-            let col_start = col_map.get(start_char).copied().unwrap_or(total_cols);
-            let col_end = col_map.get(end_char).copied().unwrap_or(total_cols);
             matches.push(SearchMatch {
                 line_id,
-                col_start,
-                col_end,
+                col_start: Self::column_of(col_map, total_cols, start_char),
+                col_end: Self::column_of(col_map, total_cols, end_char),
             });
             if matches.len() >= MAX_SEARCH_MATCHES {
                 return true;
@@ -368,114 +487,42 @@ impl SearchEngine {
         terminal: &crate::terminal::TerminalState,
         pattern: &str,
         case_sensitive: bool,
+        regex_cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, Option<String>, bool) {
         let mut matches = Vec::new();
-        let mut truncated = false;
 
-        // 编译正则表达式
-        let mut builder = RegexBuilder::new(pattern);
-        if !case_sensitive {
-            builder.case_insensitive(true);
-        }
-
-        let regex = match builder.build() {
-            Ok(r) => r,
-            Err(e) => {
-                return (Vec::new(), Some(format!("Invalid regex: {}", e)), false);
-            }
+        let regex = match Self::cached_regex(regex_cache, pattern, case_sensitive) {
+            Ok(regex) => regex,
+            Err(e) => return (Vec::new(), Some(e), false),
         };
-
-        if !terminal.is_alt_buffer() {
-            let first_line_id = terminal
-                .total_lines_scrolled
-                .saturating_sub(terminal.scrollback.len() as u64);
-            for (line_idx, compressed) in terminal.scrollback.iter().enumerate() {
-                let line = compressed.decompress();
-                if Self::append_regex_matches(
-                    &mut matches,
-                    first_line_id.saturating_add(line_idx as u64),
-                    &line,
-                    &regex,
-                ) {
-                    truncated = true;
-                    break;
-                }
-            }
-        }
-
-        if !truncated {
-            for (line_idx, line) in terminal.grid.iter().enumerate() {
-                if Self::append_regex_matches(
-                    &mut matches,
-                    terminal
-                        .total_lines_scrolled
-                        .saturating_add(line_idx as u64),
-                    line,
-                    &regex,
-                ) {
-                    truncated = true;
-                    break;
-                }
-            }
-        }
-
+        let truncated = Self::for_each_line(terminal, |line_id, line_str, col_map, total_cols| {
+            Self::append_regex_matches(&mut matches, line_id, line_str, col_map, total_cols, regex)
+        });
         (matches, None, truncated)
     }
 
     fn append_regex_matches(
         matches: &mut Vec<SearchMatch>,
         line_id: u64,
-        line: &[crate::terminal::TerminalCell],
+        line_str: &str,
+        col_map: Option<&[usize]>,
+        total_cols: usize,
         regex: &regex::Regex,
     ) -> bool {
-        let (line_str, col_map, total_cols) = Self::grid_line_to_string(line);
-
-        for mat in regex.find_iter(&line_str) {
+        for mat in regex.find_iter(line_str) {
             // regex 返回字节偏移,需转成字符索引再映射到网格列号。
             let start_char = line_str[..mat.start()].chars().count();
             let end_char = line_str[..mat.end()].chars().count();
-            let col_start = col_map.get(start_char).copied().unwrap_or(total_cols);
-            let col_end = col_map.get(end_char).copied().unwrap_or(total_cols);
             matches.push(SearchMatch {
                 line_id,
-                col_start,
-                col_end,
+                col_start: Self::column_of(col_map, total_cols, start_char),
+                col_end: Self::column_of(col_map, total_cols, end_char),
             });
             if matches.len() >= MAX_SEARCH_MATCHES {
                 return true;
             }
         }
         false
-    }
-
-    /// 将网格行转换为字符串,并返回每个字符对应的网格列号。
-    /// 跳过宽字符的续接单元(否则相邻宽字符间会被插入空格导致匹配失败),
-    /// 因此字符索引与字节偏移都不再等于列号,需经 col_map 映射。
-    fn grid_line_to_string(line: &[crate::terminal::TerminalCell]) -> (String, Vec<usize>, usize) {
-        let mut searchable_len = line.len();
-        while searchable_len > 0 {
-            let cell = &line[searchable_len - 1];
-            if cell.character == ' '
-                && cell.background == crate::terminal::Color::Default
-                && !cell.flags.wide()
-                && !cell.flags.wide_continuation()
-            {
-                searchable_len -= 1;
-            } else {
-                break;
-            }
-        }
-        let line = &line[..searchable_len];
-        let mut s = String::with_capacity(searchable_len);
-        let mut col_map = Vec::with_capacity(searchable_len);
-        for (col, cell) in line.iter().enumerate() {
-            if cell.flags.wide_continuation() {
-                continue;
-            }
-            s.push(cell.character);
-            col_map.push(col);
-        }
-        (s, col_map, searchable_len)
     }
 }
 
@@ -534,7 +581,8 @@ mod tests {
         terminal.grid.get_mut(0, 0).character = 'İ';
         terminal.grid.get_mut(0, 1).character = 'x';
 
-        let (matches, error, truncated) = SearchEngine::search(&terminal, "x", false, false);
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "x", false, false, &mut None);
 
         assert!(error.is_none());
         assert!(!truncated);
@@ -555,7 +603,8 @@ mod tests {
             terminal.grid.get_mut(0, col).character = 'a';
         }
 
-        let (matches, error, truncated) = SearchEngine::search(&terminal, "aa", false, true);
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "aa", false, true, &mut None);
 
         assert!(error.is_none());
         assert!(!truncated);
@@ -565,13 +614,142 @@ mod tests {
     }
 
     #[test]
+    fn search_text_borrows_plain_scrollback_rows_with_identity_columns() {
+        let mut cells = vec![crate::terminal::TerminalCell::default(); 8];
+        cells[0].character = 'h';
+        cells[1].character = 'i';
+        let line = crate::terminal::ScrollbackLine::compress(&cells, false);
+
+        let (text, col_map, total_cols) = line.search_text();
+        assert_eq!(text.as_ref(), "hi");
+        assert!(col_map.is_none(), "plain rows use the identity column map");
+        assert_eq!(total_cols, 2);
+
+        let mut terminal = crate::terminal::TerminalState::new(8, 1);
+        terminal.scrollback.push_back(line);
+        terminal.total_lines_scrolled = 1;
+
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "hi", false, true, &mut None);
+        assert!(error.is_none());
+        assert!(!truncated);
+        assert_eq!(
+            matches,
+            vec![SearchMatch {
+                line_id: 0,
+                col_start: 0,
+                col_end: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn search_text_maps_wide_char_columns_through_encoded_scrollback() {
+        // Styled cells force the Encoded representation; the wide char at
+        // column 2 occupies columns 2-3, so its continuation cell must not
+        // shift the column of the following 'x'.
+        let mut cells = vec![crate::terminal::TerminalCell::default(); 8];
+        cells[0].character = 'a';
+        cells[1].character = 'b';
+        cells[2].character = '好';
+        cells[2].flags.set_wide(true);
+        cells[3].flags.set_wide_continuation(true);
+        cells[4].character = 'x';
+        for cell in cells.iter_mut().take(5) {
+            cell.foreground = crate::terminal::Color::Red;
+        }
+        let line = crate::terminal::ScrollbackLine::compress(&cells, false);
+        let (text, col_map, total_cols) = line.search_text();
+        assert_eq!(text.as_ref(), "ab好x");
+        assert_eq!(col_map.as_deref(), Some(&[0, 1, 2, 4][..]));
+        assert_eq!(total_cols, 5);
+
+        let mut terminal = crate::terminal::TerminalState::new(8, 1);
+        terminal.scrollback.push_back(line);
+        terminal.total_lines_scrolled = 1;
+
+        for case_sensitive in [true, false] {
+            let (matches, error, truncated) =
+                SearchEngine::search(&terminal, "x", false, case_sensitive, &mut None);
+            assert!(error.is_none());
+            assert!(!truncated);
+            assert_eq!(
+                matches,
+                vec![SearchMatch {
+                    line_id: 0,
+                    col_start: 4,
+                    col_end: 5,
+                }],
+                "wide-char column mapping broke (case_sensitive={case_sensitive})"
+            );
+        }
+
+        // The wide character itself is searchable and spans both columns.
+        let (matches, error, _) = SearchEngine::search(&terminal, "好", false, true, &mut None);
+        assert!(error.is_none());
+        assert_eq!(
+            matches,
+            vec![SearchMatch {
+                line_id: 0,
+                col_start: 2,
+                col_end: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn regex_cache_invalidates_only_on_pattern_or_case_change() {
+        let mut terminal = crate::terminal::TerminalState::new(4, 1);
+        terminal.grid.get_mut(0, 0).character = 'a';
+        let mut cache = None;
+
+        // Case-sensitive plaintext never compiles a regex at all.
+        let (matches, error, _) = SearchEngine::search(&terminal, "a", false, true, &mut cache);
+        assert!(error.is_none() && matches.len() == 1);
+        assert!(cache.is_none());
+
+        // Regex mode compiles once and keeps the slot while nothing changes.
+        let (matches, error, _) = SearchEngine::search(&terminal, "a", true, true, &mut cache);
+        assert!(error.is_none() && matches.len() == 1);
+        assert_eq!(
+            cache
+                .as_ref()
+                .map(|c| (c.pattern.as_str(), c.case_sensitive)),
+            Some(("a", true))
+        );
+        let (matches, error, _) = SearchEngine::search(&terminal, "a", true, true, &mut cache);
+        assert!(error.is_none() && matches.len() == 1);
+        assert_eq!(
+            cache
+                .as_ref()
+                .map(|c| (c.pattern.as_str(), c.case_sensitive)),
+            Some(("a", true))
+        );
+
+        // A case-flag flip rebuilds; an invalid pattern reports the error and
+        // clears the slot so the next valid pattern compiles fresh.
+        let (_, error, _) = SearchEngine::search(&terminal, "a", true, false, &mut cache);
+        assert!(error.is_none());
+        assert_eq!(
+            cache
+                .as_ref()
+                .map(|c| (c.pattern.as_str(), c.case_sensitive)),
+            Some(("a", false))
+        );
+        let (matches, error, _) = SearchEngine::search(&terminal, "a(", true, true, &mut cache);
+        assert!(matches.is_empty());
+        assert!(error.is_some());
+        assert!(cache.is_none());
+    }
+
+    #[test]
     fn search_covers_scrollback_and_maps_matches_back_to_the_viewport() {
         let mut terminal = crate::terminal::TerminalState::new(12, 2);
         terminal.process_input(b"old-needle\r\nnew-one\r\nnew-two\r\n");
         assert!(!terminal.scrollback.is_empty());
 
         let (matches, error, truncated) =
-            SearchEngine::search(&terminal, "old-needle", false, true);
+            SearchEngine::search(&terminal, "old-needle", false, true, &mut None);
 
         assert!(error.is_none());
         assert!(!truncated);
@@ -581,7 +759,7 @@ mod tests {
 
         terminal.process_input(b"later-a\r\nlater-b\r\n");
         let (refreshed, error, truncated) =
-            SearchEngine::search(&terminal, "old-needle", false, true);
+            SearchEngine::search(&terminal, "old-needle", false, true, &mut None);
         assert!(error.is_none());
         assert!(!truncated);
         assert_eq!(refreshed, vec![original_match]);
@@ -600,14 +778,15 @@ mod tests {
             }
         }
 
-        let (matches, error, truncated) = SearchEngine::search(&terminal, "x", false, true);
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "x", false, true, &mut None);
         assert!(error.is_none());
         assert!(truncated);
         assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
 
         let blank_terminal = crate::terminal::TerminalState::new(64, 2);
         let (padding_matches, error, truncated) =
-            SearchEngine::search(&blank_terminal, " ", false, true);
+            SearchEngine::search(&blank_terminal, " ", false, true, &mut None);
         assert!(error.is_none());
         assert!(!truncated);
         assert!(padding_matches.is_empty());

@@ -60,7 +60,7 @@ pub const MAX_TERMINAL_ROWS: usize = 512;
 /// Hard cap on bytes carried across PTY read batches inside an unfinished
 /// OSC/DCS/CSI escape. Any well-formed sequence is far below this; a
 /// runaway/binary stream that never sends a terminator (BEL/ST/final byte)
-/// would otherwise grow `pending_escape` without bound.
+/// would otherwise grow the pending escape buffers without bound.
 pub const MAX_PENDING_ESCAPE: usize = 4 * 1024 * 1024;
 
 /// Clipboard reads triggered by Kitty paste events are capabilities, not a
@@ -533,6 +533,13 @@ pub struct TerminalState {
     pending_apc_scan_from: usize,
     discarding_oversized_apc: bool,
     discarding_apc_prev_escape: bool,
+    // OSC and DCS/SOS/PM use the same streaming pattern: large string payloads
+    // (e.g. OSC 52 clipboard data) would otherwise be merged and rescanned
+    // from byte 0 on every PTY read, which is quadratic on the UI thread.
+    pending_osc: Vec<u8>,
+    pending_osc_scan_from: usize,
+    pending_string: Vec<u8>,
+    pending_string_scan_from: usize,
 
     g0_charset: Charset,
     g1_charset: Charset,

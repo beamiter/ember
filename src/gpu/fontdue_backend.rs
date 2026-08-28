@@ -15,6 +15,72 @@ struct ShapeCacheKey {
     subpixel_offset: u8,
 }
 
+/// Borrowed view of a [`ShapeCacheKey`], used to probe the LRU without
+/// allocating the key's `String` on every lookup (hits included). The manual
+/// `Hash`/`Eq` impls on the trait object hash and compare the same fields in
+/// the same order as the derived impls on the owned key, so a probe and its
+/// stored key always land in the same bucket.
+trait ShapeCacheKeyView {
+    fn text(&self) -> &str;
+    fn bold(&self) -> bool;
+    fn subpixel_offset(&self) -> u8;
+}
+
+impl ShapeCacheKeyView for ShapeCacheKey {
+    fn text(&self) -> &str {
+        &self.text
+    }
+    fn bold(&self) -> bool {
+        self.bold
+    }
+    fn subpixel_offset(&self) -> u8 {
+        self.subpixel_offset
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn ShapeCacheKeyView + 'a> for ShapeCacheKey {
+    fn borrow(&self) -> &(dyn ShapeCacheKeyView + 'a) {
+        self
+    }
+}
+
+impl std::hash::Hash for dyn ShapeCacheKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.text().hash(state);
+        self.bold().hash(state);
+        self.subpixel_offset().hash(state);
+    }
+}
+
+impl PartialEq for dyn ShapeCacheKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.text() == other.text()
+            && self.bold() == other.bold()
+            && self.subpixel_offset() == other.subpixel_offset()
+    }
+}
+
+impl Eq for dyn ShapeCacheKeyView + '_ {}
+
+/// Stack-only probe for allocation-free shape-cache lookups.
+struct ShapeCacheProbe<'a> {
+    text: &'a str,
+    bold: bool,
+    subpixel_offset: u8,
+}
+
+impl ShapeCacheKeyView for ShapeCacheProbe<'_> {
+    fn text(&self) -> &str {
+        self.text
+    }
+    fn bold(&self) -> bool {
+        self.bold
+    }
+    fn subpixel_offset(&self) -> u8 {
+        self.subpixel_offset
+    }
+}
+
 /// Check if character is CJK or other wide script that shouldn't use subpixel binning.
 fn is_cjk_or_wide(ch: char) -> bool {
     matches!(ch as u32,
@@ -823,13 +889,15 @@ impl FontBackend for FontdueAtlas {
         // Fast path: identical runs recur every frame (e.g. a static prompt line).
         // Returning the cached Arc avoids rebuilding the HarfRust shaper and
         // re-running the shaper on every dirty row. The cache is cleared whenever
-        // the atlas grows/resets, so cached regions are always current.
-        let cache_key = ShapeCacheKey {
-            text: text.to_string(),
+        // the atlas grows/resets, so cached regions are always current. The
+        // borrowed probe keeps this path free of the key's String allocation;
+        // the owned key is only built on a miss, just before the put below.
+        let probe = ShapeCacheProbe {
+            text,
             bold,
             subpixel_offset,
         };
-        if let Some(cached) = self.shape_cache.get(&cache_key) {
+        if let Some(cached) = self.shape_cache.get(&probe as &dyn ShapeCacheKeyView) {
             return Arc::clone(cached);
         }
 
@@ -912,6 +980,11 @@ impl FontBackend for FontdueAtlas {
         // rescales UVs and would leave the earlier glyphs in this vec pointing at the
         // wrong region.
         if self.atlas_generation == generation_before {
+            let cache_key = ShapeCacheKey {
+                text: text.to_string(),
+                bold,
+                subpixel_offset,
+            };
             self.shape_cache.put(cache_key, Arc::clone(&arc));
         }
 
@@ -979,5 +1052,58 @@ mod tests {
         assert!(!glyphs.is_empty());
         assert!(glyphs.glyph_infos().iter().all(|glyph| glyph.cluster < 4));
         assert!(glyphs.clear().is_empty());
+    }
+
+    #[test]
+    fn shape_cache_borrowed_probe_matches_owned_key_semantics() {
+        let mut cache: LruCache<ShapeCacheKey, Arc<Vec<u8>>> =
+            LruCache::new(NonZeroUsize::new(2).unwrap());
+
+        // Miss on an empty cache must not confuse the probe for a stored key.
+        let empty_probe = ShapeCacheProbe {
+            text: "run",
+            bold: false,
+            subpixel_offset: 0,
+        };
+        assert!(cache.get(&empty_probe as &dyn ShapeCacheKeyView).is_none());
+
+        cache.put(
+            ShapeCacheKey {
+                text: "run".to_string(),
+                bold: false,
+                subpixel_offset: 0,
+            },
+            Arc::new(vec![1, 2, 3]),
+        );
+
+        // Hit through the borrowed probe: this also proves the probe and the
+        // owned key hash into the same bucket and compare equal.
+        let hit_probe = ShapeCacheProbe {
+            text: "run",
+            bold: false,
+            subpixel_offset: 0,
+        };
+        let hit = cache
+            .get(&hit_probe as &dyn ShapeCacheKeyView)
+            .expect("borrowed probe must hit the stored key");
+        assert_eq!(hit.as_slice(), &[1, 2, 3]);
+
+        // Any differing field must miss: the probe is not a text-only lookup.
+        for (text, bold, subpixel_offset) in [
+            ("run", true, 0),
+            ("run", false, 1),
+            ("ruN", false, 0),
+            ("runs", false, 0),
+        ] {
+            let wrong = ShapeCacheProbe {
+                text,
+                bold,
+                subpixel_offset,
+            };
+            assert!(
+                cache.get(&wrong as &dyn ShapeCacheKeyView).is_none(),
+                "probe ({text:?}, {bold}, {subpixel_offset}) must not hit"
+            );
+        }
     }
 }
