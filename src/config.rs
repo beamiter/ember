@@ -124,6 +124,16 @@ pub struct Config {
     #[serde(default)]
     pub ai_share_command_context: bool,
 
+    /// Review-first correction offers for narrowly classified failed commands
+    /// (anvil/forge parity). Off by default and inert while `ai_enabled` is
+    /// off or the Agent panel owns a session. Every candidate renders as an
+    /// editable review card; nothing is inserted or run without an explicit
+    /// click. The cloud fallback additionally requires the command-context
+    /// sharing consent above (or a direct loopback Ollama endpoint); local
+    /// PATH/APT evidence and target-provided hints never leave the machine.
+    #[serde(default)]
+    pub command_correction_enabled: bool,
+
     /// Optional path to a 0600 file holding the provider API key, so the key
     /// never has to live in the process environment or this config file.
     #[serde(default)]
@@ -555,6 +565,7 @@ impl Default for Config {
             ai_temperature: None,
             ai_redact_secrets: true,
             ai_share_command_context: false,
+            command_correction_enabled: false,
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
             experimental_task_sidebar: false,
@@ -1439,6 +1450,23 @@ mod tests {
         let serialized = toml::to_string_pretty(&opted_in).expect("config serializes");
         let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
         assert!(reparsed.ai_share_command_context);
+    }
+
+    #[test]
+    fn command_correction_defaults_off_and_round_trips() {
+        let defaults = Config::default();
+        assert!(!defaults.command_correction_enabled);
+
+        let omitted: Config = toml::from_str("").expect("empty config parses");
+        assert!(!omitted.command_correction_enabled);
+
+        let enabled: Config =
+            toml::from_str("command_correction_enabled = true\n").expect("explicit opt-in parses");
+        assert!(enabled.command_correction_enabled);
+
+        let serialized = toml::to_string_pretty(&enabled).expect("config serializes");
+        let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
+        assert!(reparsed.command_correction_enabled);
     }
 
     #[test]

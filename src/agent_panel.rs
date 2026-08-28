@@ -257,7 +257,7 @@ struct PendingAgentExecution {
     run_effect_claimed: bool,
 }
 
-fn client_from_config(config: &Config) -> Result<AiClient, String> {
+pub(crate) fn client_from_config(config: &Config) -> Result<AiClient, String> {
     if !config.ai_enabled {
         return Err("AI features are disabled by configuration".to_string());
     }
@@ -300,7 +300,7 @@ fn client_from_config(config: &Config) -> Result<AiClient, String> {
     .map_err(|error| error.to_string())
 }
 
-fn ensure_semantic_context_sharing_allowed(config: &Config) -> Result<(), String> {
+pub(crate) fn ensure_semantic_context_sharing_allowed(config: &Config) -> Result<(), String> {
     semantic_context_sharing_allowed(config, ai_proxy_environment_present())
 }
 
@@ -647,6 +647,13 @@ impl AgentPanel {
     /// context. The active tab may change while an Agent task is running.
     pub fn bound_session_id(&self) -> Option<&str> {
         self.bound_session_id.as_deref()
+    }
+
+    /// Whether the panel currently owns a live Agent session. While true,
+    /// automatic surfaces that write to a shell prompt (command correction)
+    /// stay closed: the Agent may be driving that same prompt.
+    pub fn session_active(&self) -> bool {
+        self.is_open && self.session.is_some()
     }
 
     /// Seal a task whose stable terminal binding disappeared. Keep the

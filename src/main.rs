@@ -7,6 +7,7 @@ mod block_search;
 mod bottom_bar;
 mod clipboard;
 mod color;
+mod command_correction;
 mod command_palette;
 mod config;
 mod config_panel;
@@ -2294,6 +2295,7 @@ impl TerminalApp {
             config_panel: config_panel::ConfigPanel::new(),
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
+            command_correction: command_correction::CorrectionMonitor::default(),
             agent_diff: agent::AgentDiffPanel::new(),
             task_manager: agent::TaskManager::new(),
             agent_runtime: agent::AgentRuntimeManager::new(),
@@ -4590,6 +4592,12 @@ impl eframe::App for TerminalApp {
             if let Some(session) = self.session_manager.sessions().get(session_idx) {
                 self.agent_panel
                     .handle_completed(&session.metadata.session_id, &completed);
+                self.command_correction.handle_completed(
+                    &self.config,
+                    self.agent_panel.session_active(),
+                    &session.metadata.session_id,
+                    &completed,
+                );
                 self.git_strip_cache
                     .mark_command_finished(&session.metadata.session_id);
             }
@@ -5352,6 +5360,12 @@ impl eframe::App for TerminalApp {
                 for completed in completed_outputs {
                     self.agent_panel
                         .handle_completed(&session.metadata.session_id, &completed);
+                    self.command_correction.handle_completed(
+                        &self.config,
+                        self.agent_panel.session_active(),
+                        &session.metadata.session_id,
+                        &completed,
+                    );
                     self.git_strip_cache
                         .mark_command_finished(&session.metadata.session_id);
                     // The active pane is on screen, so its completion was

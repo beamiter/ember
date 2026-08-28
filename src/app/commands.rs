@@ -2673,6 +2673,87 @@ impl TerminalApp {
         }
     }
 
+    /// Apply an accepted command-correction review decision. Unlike sidebar
+    /// replay this never re-reads a historical record — the reviewed text
+    /// arrives already validated — but every prompt guard is identical: the
+    /// correction writes only into an idle, empty, bracketed-paste prompt of
+    /// the session the card was presented for, which must still be active.
+    /// `run` additionally submits (the card offers it only for an unchanged,
+    /// host-verified, non-dangerous candidate); `fill` leaves Enter to the
+    /// user. The card stays open with the returned message on any refusal.
+    pub(crate) fn apply_command_correction(
+        &mut self,
+        effect: &crate::command_correction::CorrectionEffect,
+    ) -> Result<(), String> {
+        let Some(index) = self.session_manager.index_of(&effect.session_id) else {
+            return Err("The corrected command's session no longer exists".to_string());
+        };
+        // The card only renders for the active session; if focus raced ahead
+        // of the click, refuse rather than writing into a background PTY.
+        if self.session_manager.active_index() != index {
+            return Err("The corrected command's session is no longer active".to_string());
+        }
+        if self
+            .session_manager
+            .sessions()
+            .get(index)
+            .is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::RetainedCommand
+            })
+        {
+            return Err("Exited task terminals are read-only".to_string());
+        }
+        let direct_input_blocked = self.direct_input_is_blocked_for_session(&effect.session_id);
+        let Some(session) = self.session_manager.get_session_mut(index) else {
+            return Err("The corrected command's session no longer exists".to_string());
+        };
+        let pending_input = direct_input_blocked || !session.pending_input.is_empty();
+        let (alt_screen, prompt_ready, bracketed_paste, prompt_empty) = {
+            let terminal = session.terminal.lock();
+            (
+                terminal.is_alt_buffer(),
+                terminal.shell_is_prompt_ready(),
+                terminal.is_bracketed_paste_enabled(),
+                terminal.prompt_input_is_empty(),
+            )
+        };
+        if alt_screen {
+            return Err(
+                "Cannot apply a correction while an alternate-screen app is open".to_string(),
+            );
+        }
+        if !prompt_ready {
+            return Err("Wait for the shell prompt before applying a correction".to_string());
+        }
+        if !bracketed_paste {
+            return Err("Safe correction requires bracketed-paste mode".to_string());
+        }
+        if pending_input {
+            return Err("Wait for pending terminal input to be delivered".to_string());
+        }
+        if !prompt_empty {
+            return Err("Clear the current prompt before applying a correction".to_string());
+        }
+        let payload = correction_replay_payload(&effect.command, effect.run)
+            .map_err(|error| format!("Correction rejected: {error}"))?;
+        session
+            .shell
+            .write(&payload)
+            .map_err(|error| format!("Correction write failed: {error}"))?;
+        let mut terminal = session.terminal.lock();
+        terminal.note_user_input(&payload);
+        terminal.scroll_to_bottom();
+        drop(terminal);
+        session.projection_view_state.scroll_to_bottom();
+        self.clear_block_selection_for_session(&effect.session_id);
+        if effect.run {
+            self.set_status("Verified correction queued to run");
+        } else {
+            self.set_status("Correction filled at prompt");
+        }
+        Ok(())
+    }
+
     /// `block:select_prev`: move the block selection to the next-older
     /// selectable block (or start at the newest when nothing is selected).
     pub(crate) fn block_select_prev(&mut self) {
@@ -2774,7 +2855,10 @@ impl TerminalApp {
     /// write the document off the UI thread (frost 的
     /// `block_export_session_task` 对应物). The bounded snapshot is taken
     /// under the terminal lock; file I/O never holds it.
-    pub(crate) fn block_export_session(&mut self, format: crate::block_export::SessionExportFormat) {
+    pub(crate) fn block_export_session(
+        &mut self,
+        format: crate::block_export::SessionExportFormat,
+    ) {
         if !self.config.block_mode {
             self.clear_block_selection();
             return;
@@ -2790,10 +2874,17 @@ impl TerminalApp {
             if terminal.is_alt_buffer_active() {
                 return;
             }
-            if !terminal.command_records().iter().any(|record| record.complete) {
+            if !terminal
+                .command_records()
+                .iter()
+                .any(|record| record.complete)
+            {
                 None
             } else {
-                Some(crate::block_export::snapshot_session(&terminal, &session_id))
+                Some(crate::block_export::snapshot_session(
+                    &terminal,
+                    &session_id,
+                ))
             }
         };
         let snapshot = match prepared {
@@ -4713,6 +4804,20 @@ fn replay_payload(
 ) -> Result<Vec<u8>, crate::review_text::ReviewTextError> {
     let command = prepare_replay_command(command)?;
     Ok(replay_prepared_payload(&command, run))
+}
+
+/// Correction candidates are validated single-line commands, not OSC 133
+/// protocol text: the history sanitizer is belt-and-braces here, while the
+/// 16 KiB review budget (not the 64 KiB history budget) is the binding cap.
+pub(crate) fn correction_replay_payload(
+    command: &str,
+    run: bool,
+) -> Result<Vec<u8>, crate::review_text::ReviewTextError> {
+    let command = crate::review_text::validate_single_line(
+        command,
+        crate::review_text::MAX_AGENT_COMMAND_BYTES,
+    )?;
+    Ok(replay_prepared_payload(command, run))
 }
 
 /// Frame text already accepted by [`prepare_replay_command`]. Multi-selection

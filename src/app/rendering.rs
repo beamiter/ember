@@ -2685,6 +2685,44 @@ impl TerminalApp {
                 }
             }
         }
+        // Review-first command correction: harvest worker replies, enforce the
+        // shared deadline, render the active session's card, then apply an
+        // accepted decision through the same guarded prompt-write path as
+        // history Fill/Run. The card keeps the reason inline on any refusal.
+        let correction_agent_active = self.agent_panel.session_active();
+        self.command_correction
+            .drive(&self.config, correction_agent_active, ctx);
+        let (correction_session_id, correction_prompt_clean_idle) = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| {
+                let clean = {
+                    let terminal = session.terminal.lock();
+                    terminal.shell_is_prompt_ready()
+                        && !terminal.is_alt_buffer()
+                        && terminal.prompt_input_is_empty()
+                };
+                (
+                    Some(session.metadata.session_id.clone()),
+                    clean && session.pending_input.is_empty(),
+                )
+            })
+            .unwrap_or((None, false));
+        if let crate::command_correction::CorrectionUiOutcome::Accepted(effect) =
+            self.command_correction.show(
+                ctx,
+                &self.current_theme,
+                correction_session_id.as_deref(),
+                correction_prompt_clean_idle,
+            )
+        {
+            let session_id = effect.session_id.clone();
+            let generation = effect.generation;
+            let result = self.apply_command_correction(&effect);
+            self.command_correction
+                .complete_accept(&session_id, generation, result);
+        }
         self.agent_diff.show(ctx);
     }
 

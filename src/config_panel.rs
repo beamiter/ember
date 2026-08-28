@@ -132,6 +132,7 @@ pub struct ConfigPanel {
     edit_ai_temperature: String,
     edit_ai_redact_secrets: bool,
     edit_ai_share_command_context: bool,
+    edit_command_correction_enabled: bool,
     /// Configured credential path retained for hand-edited configs. The UI
     /// stores newly entered keys at ember's private default instead of asking
     /// the user to enter a path.
@@ -199,6 +200,7 @@ impl ConfigPanel {
             edit_ai_temperature: String::new(),
             edit_ai_redact_secrets: true,
             edit_ai_share_command_context: false,
+            edit_command_correction_enabled: false,
             edit_ai_api_key_file: String::new(),
             edit_ai_key_draft: String::new(),
             ai_key_store_status: None,
@@ -292,6 +294,7 @@ impl ConfigPanel {
             .unwrap_or_default();
         self.edit_ai_redact_secrets = config.ai_redact_secrets;
         self.edit_ai_share_command_context = config.ai_share_command_context;
+        self.edit_command_correction_enabled = config.command_correction_enabled;
         self.edit_ai_api_key_file = config.ai_api_key_file.clone().unwrap_or_default();
         // Never carry a secret draft across reopening/resetting the panel.
         self.edit_ai_key_draft.clear();
@@ -347,6 +350,7 @@ impl ConfigPanel {
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
         config.ai_redact_secrets = self.edit_ai_redact_secrets;
         config.ai_share_command_context = self.edit_ai_share_command_context;
+        config.command_correction_enabled = self.edit_command_correction_enabled;
         config.ai_api_key_file =
             Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
@@ -1259,6 +1263,32 @@ impl ConfigPanel {
                  Anthropic, OpenAI-compatible, or remote Ollama requests send the command, \
                  working directory, and captured output. Native Codex redaction applies to this \
                  initial attachment; Codex may separately send worktree files and tool output.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+
+        // anvil/forge parity: the correction row greys out with the AI master
+        // switch, because a disabled monitor must not look configurable.
+        if ui
+            .add_enabled(
+                self.edit_ai_enabled,
+                egui::Checkbox::new(
+                    &mut self.edit_command_correction_enabled,
+                    "Offer corrections for failed commands",
+                ),
+            )
+            .changed()
+        {
+            self.has_changes = true;
+        }
+        ui.label(
+            RichText::new(
+                "When a command fails with a likely typo (unknown command, subcommand, option, or \
+                 package name), show an editable correction card. Nothing is inserted or run \
+                 without an explicit click; only a candidate verified against this host's PATH or \
+                 APT index can be run directly. Local evidence never leaves the machine; the AI \
+                 fallback requires the command-context sharing consent above.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),

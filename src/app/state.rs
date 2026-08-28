@@ -326,6 +326,9 @@ pub struct TerminalApp {
 
     // AI agent panel (per-command approval agent over jterm_core)
     pub agent_panel: crate::agent_panel::AgentPanel,
+    /// Review-first correction offers for narrowly classified failed commands
+    /// (anvil/forge `command_correction` parity). Inert while AI is disabled.
+    pub command_correction: crate::command_correction::CorrectionMonitor,
     /// Native, read-only Git review surface requested by a structured Agent
     /// task. Git probes run on its bounded background worker.
     pub agent_diff: crate::agent::AgentDiffPanel,
