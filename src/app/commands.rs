@@ -1656,6 +1656,7 @@ impl TerminalApp {
             crate::block_mode::BlockMenuAction::AskAgent => {
                 self.block_ask_agent_about_target(&target)
             }
+            crate::block_mode::BlockMenuAction::AskAi => self.block_ask_ai_about_target(&target),
             crate::block_mode::BlockMenuAction::CopyOutputs => {
                 self.copy_block_context(&target, CopyKind::Output)
             }
@@ -2067,6 +2068,36 @@ impl TerminalApp {
                 format!("Could not start Agent task: {error}"),
                 Duration::from_secs(5),
             ),
+        }
+    }
+
+    /// frost `BlockMenuAction::AskAi` 的 ember 对应物：把右击块的命令+输出
+    /// （有界节选）作为不可信证据附加到 Agent 面板的当前对话——不新建任务、
+    /// 不替换 transcript。与 "Ask Agent About Block"（新建结构化任务、要求
+    /// 精确命令元数据）互补；宽松适配器负责节选有界与未知状态注记。
+    fn block_ask_ai_about_target(&mut self, target: &CommandTarget) {
+        if !self.config.ai_enabled {
+            self.set_status_for(
+                "Enable AI in Settings before asking about a block",
+                Duration::from_secs(5),
+            );
+            return;
+        }
+        let semantic = match self.semantic_context_for_command(target) {
+            Ok(semantic) => semantic,
+            Err(error) => {
+                self.set_status_for(error, Duration::from_secs(5));
+                return;
+            }
+        };
+        let session_id = semantic.source_session_id.clone();
+        let context = crate::agent::context::ad_hoc_block_context(&semantic);
+        match self
+            .agent_panel
+            .attach_block_context(&self.config, session_id, context)
+        {
+            Ok(()) => self.set_status("Block attached to the Agent panel"),
+            Err(error) => self.set_status_for(error, Duration::from_secs(5)),
         }
     }
 
@@ -2524,6 +2555,122 @@ impl TerminalApp {
             return;
         };
         self.replay_sidebar_command(&target, false, true);
+    }
+
+    /// `history:picker`: open/close the history picker. Opening loads a
+    /// bounded tail of the family-shared JSONL index; when recording is
+    /// disabled the picker stays closed with frost's hint instead of opening
+    /// an empty overlay.
+    pub(crate) fn history_picker_toggle(&mut self) {
+        if self.history_picker.is_some() {
+            self.history_picker = None;
+            return;
+        }
+        let Some(path) = self.config.resolved_command_history_path() else {
+            self.set_status("Command history is disabled (command_history_enabled = false)");
+            return;
+        };
+        self.history_picker = Some(crate::history_picker::HistoryPickerState::load(&path));
+    }
+
+    /// 历史选择器确认后的回填：把持久化历史里的命令写回活动 pane 的提示符，
+    /// 绝不执行。与 block 召回共用同一组守卫（只读任务终端、alt-screen、
+    /// 提示符未就绪、括号粘贴关闭、待发送输入、非空提示符都拒绝）与同一个
+    /// payload（行首 Ctrl+U + 括号粘贴帧、无回车）；命令文本在加载、选择与
+    /// 这里三处都经过单行校验。
+    pub(crate) fn fill_prompt_with_history_command(&mut self, command: &str) {
+        let index = self.session_manager.active_index();
+        let Some(session_id) = self
+            .session_manager
+            .sessions()
+            .get(index)
+            .map(|session| session.metadata.session_id.clone())
+        else {
+            return;
+        };
+        if self
+            .session_manager
+            .sessions()
+            .get(index)
+            .is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::RetainedCommand
+            })
+        {
+            self.set_status("Exited task terminals are read-only");
+            return;
+        }
+        let direct_input_blocked = self.direct_input_is_blocked_for_session(&session_id);
+        let outcome = {
+            let Some(session) = self.session_manager.get_session_mut(index) else {
+                return;
+            };
+            let pending_input = direct_input_blocked || !session.pending_input.is_empty();
+            let (alt_screen, prompt_ready, bracketed_paste, prompt_empty) = {
+                let terminal = session.terminal.lock();
+                (
+                    terminal.is_alt_buffer(),
+                    terminal.shell_is_prompt_ready(),
+                    terminal.is_bracketed_paste_enabled(),
+                    terminal.prompt_input_is_empty(),
+                )
+            };
+            if alt_screen {
+                ReplayOutcome::AlternateScreen
+            } else if !prompt_ready {
+                ReplayOutcome::NotPromptReady
+            } else if !bracketed_paste {
+                ReplayOutcome::BracketedPasteDisabled
+            } else if pending_input {
+                ReplayOutcome::PendingInput
+            } else if !prompt_empty {
+                ReplayOutcome::PromptNotEmpty
+            } else {
+                match replay_payload(command, false) {
+                    Err(error) => ReplayOutcome::UnsafeCommand(error.to_string()),
+                    Ok(payload) => match session.shell.write(&payload) {
+                        Ok(()) => {
+                            let mut terminal = session.terminal.lock();
+                            terminal.note_user_input(&payload);
+                            terminal.scroll_to_bottom();
+                            drop(terminal);
+                            session.projection_view_state.scroll_to_bottom();
+                            ReplayOutcome::Filled
+                        }
+                        Err(error) => ReplayOutcome::WriteFailed(error),
+                    },
+                }
+            }
+        };
+        // 状态文案与 replay_sidebar_command 逐字一致：同一个动作在两个
+        // 入口（块召回 / 历史召回）不给用户两套说法。
+        match outcome {
+            ReplayOutcome::Filled => self.set_status("Command filled at prompt"),
+            ReplayOutcome::NotPromptReady => {
+                self.set_status("Wait for the shell prompt before replaying a command")
+            }
+            ReplayOutcome::AlternateScreen => {
+                self.set_status("Cannot replay a command while an alternate-screen app is open")
+            }
+            ReplayOutcome::BracketedPasteDisabled => {
+                self.set_status("Safe replay requires bracketed-paste mode")
+            }
+            ReplayOutcome::PendingInput => {
+                self.set_status("Wait for pending terminal input to be delivered")
+            }
+            ReplayOutcome::PromptNotEmpty => {
+                self.set_status("Clear the current prompt before recalling a command")
+            }
+            ReplayOutcome::UnsafeCommand(error) => self.set_status_for(
+                format!("Command replay rejected: {error}"),
+                Duration::from_secs(5),
+            ),
+            ReplayOutcome::WriteFailed(error) => self.set_status_for(
+                format!("Command replay failed: {error}"),
+                Duration::from_secs(4),
+            ),
+            // 单行历史命令永远不会触发 run/多行/cwd 分支。
+            _ => {}
+        }
     }
 
     /// `block:select_prev`: move the block selection to the next-older

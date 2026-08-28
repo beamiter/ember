@@ -1501,6 +1501,167 @@ impl TerminalApp {
             self.dispatch_palette_command(ctx, command);
         }
 
+        // 历史命令选择器（history:picker）：与命令面板同款的中央浮层。
+        // Enter/点击只回填提示符，绝不执行。
+        let mut accepted_history_command = None;
+        let mut hovered_history_index = None;
+        if self.history_picker.is_some() {
+            let screen_rect = ctx.viewport_rect();
+            let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
+            let picker_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
+            let picker_pos = egui::pos2(
+                screen_rect.center().x - picker_width / 2.0,
+                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
+            );
+
+            egui::Window::new("Command History")
+                .title_bar(false)
+                .resizable(false)
+                .movable(false)
+                .default_pos(picker_pos)
+                .default_size([picker_width, picker_height])
+                .fixed_size([picker_width, picker_height])
+                .frame(egui::Frame {
+                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
+                    stroke: egui::Stroke::new(
+                        1.0,
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
+                    ),
+                    corner_radius: egui::CornerRadius::same(10),
+                    inner_margin: egui::Margin::same(8),
+                    ..Default::default()
+                })
+                .show(ctx, |ui| {
+                    let Some(state) = self.history_picker.as_mut() else {
+                        return;
+                    };
+                    // 搜索输入框：编辑即重置高亮（与 frost 的 on_input 一致）。
+                    ui.horizontal(|ui| {
+                        ui.label("↺");
+                        let search_response = ui.text_edit_singleline(&mut state.query);
+                        if search_response.changed() {
+                            state.selected = 0;
+                        }
+                        if state.needs_focus {
+                            search_response.request_focus();
+                            state.needs_focus = false;
+                        }
+                        if search_response.has_focus() && state.query.is_empty() {
+                            ui.label("Recall a command…");
+                        }
+                    });
+
+                    ui.separator();
+
+                    // 快照一份结果，指针动作在窗口闭包外统一应用（与命令面板
+                    // 相同，避免对 history_picker 的双重借用）。
+                    let results: Vec<_> = state.filtered().into_iter().cloned().collect();
+                    let selected_index = state.selected;
+
+                    egui::ScrollArea::vertical()
+                        .max_height(picker_height - 100.0)
+                        .show(ui, |ui| {
+                            for (idx, record) in results.iter().enumerate() {
+                                let is_selected = idx == selected_index;
+
+                                let bg_color = if is_selected {
+                                    crate::theme::Theme::rgb_to_color32(
+                                        self.current_theme.tabbar.active_border,
+                                    )
+                                    .gamma_multiply(0.18)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+
+                                let item_response = ui.horizontal(|ui| {
+                                    let item_rect = ui.available_rect_before_wrap();
+                                    ui.painter().rect_filled(item_rect, 2.0, bg_color);
+
+                                    ui.label(crate::history_picker::display_command(
+                                        &record.command,
+                                    ));
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if let Some(cwd) = record.cwd.as_deref() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        crate::pane_header::abbreviate_home(cwd),
+                                                    )
+                                                    .size(10.0)
+                                                    .color(ui.visuals().weak_text_color()),
+                                                );
+                                            }
+                                            if record.exit_code != 0 {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(255, 100, 100),
+                                                    format!("✗ {}", record.exit_code),
+                                                );
+                                            }
+                                        },
+                                    );
+                                });
+
+                                // 高亮项保持可见
+                                if is_selected {
+                                    item_response
+                                        .response
+                                        .scroll_to_me(Some(egui::Align::Center));
+                                }
+
+                                let click_response = ui
+                                    .interact(
+                                        item_response.response.rect,
+                                        item_response.response.id.with("history_click"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if click_response.hovered() {
+                                    hovered_history_index = Some(idx);
+                                }
+                                if click_response.clicked() {
+                                    accepted_history_command = Some(record.command.clone());
+                                }
+
+                                ui.separator();
+                            }
+
+                            if results.is_empty() {
+                                let hint = if state.query.is_empty() {
+                                    "No persisted commands yet (recorded via OSC 133 shell integration)"
+                                } else {
+                                    "No commands match"
+                                };
+                                ui.label(
+                                    egui::RichText::new(hint)
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                        });
+
+                    // 底部提示：Enter 只回填，不执行
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("↑↓ Navigate  Enter Fill at Prompt  Esc Cancel")
+                                .size(10.0)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+                });
+        }
+
+        if let Some(index) = hovered_history_index {
+            if let Some(state) = self.history_picker.as_mut() {
+                state.selected = index;
+            }
+        }
+        if let Some(command) = accepted_history_command {
+            self.history_picker = None;
+            self.fill_prompt_with_history_command(&command);
+        }
+
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
         let mut clicked_hit_index = None;
         let mut clicked_bookmark_target = None;

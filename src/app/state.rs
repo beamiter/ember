@@ -275,6 +275,10 @@ pub struct TerminalApp {
     // Command palette
     pub command_palette: command_palette::CommandPalette,
 
+    /// 历史命令选择器（Ctrl+Shift+H）。打开时从家族共享 JSONL 索引加载有界
+    /// 尾部；Enter 只回填提示符，绝不执行。`None` 表示浮层未打开。
+    pub history_picker: Option<crate::history_picker::HistoryPickerState>,
+
     // Force resize flag for new sessions
     pub force_resize_session: bool,
 

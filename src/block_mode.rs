@@ -639,6 +639,9 @@ pub enum BlockSelectionGesture {
 pub enum BlockMenuAction {
     CopyCommands,
     AskAgent,
+    /// frost 的 `BlockMenuAction::AskAi`：把块作为不可信证据附加到 Agent
+    /// 面板的当前对话（不新建任务），任何已完成块都可用。
+    AskAi,
     CopyOutputs,
     CopyBlocks,
     CopyMarkdown,

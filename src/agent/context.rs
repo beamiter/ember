@@ -247,6 +247,40 @@ impl TryFrom<&SemanticCommandContext> for BlockContext {
     }
 }
 
+/// frost `BlockMenuAction::AskAi` 的宽松适配器：任何已完成块都能作为不可信
+/// 证据附加到当前 Agent 对话，不像 [`SemanticCommandContext::to_block_context`]
+/// 那样要求精确命令元数据或可用 cwd。输出生成两级有界：实时捕获本身受
+/// `MAX_COMPLETED_COMMAND_OUTPUT_BYTES` 约束，这里再经
+/// [`jterm_core::ai::truncate_for_context`] 只保留头/尾各行窗口（核心同时
+/// 施加 64 KiB 字节预算）。未上报 exit status 时使用兼容性哨兵 -1 并在
+/// 输出前加上解释性注记，绝不把 Unknown 变成伪成功；捕获不可用用固定占位
+/// 文本并标记 truncated，不与真实空输出混淆。
+pub fn ad_hoc_block_context(context: &SemanticCommandContext) -> BlockContext {
+    /// frost 的占位文本逐字保留（家族共享词汇）。
+    const OUTPUT_UNAVAILABLE_NOTE: &str =
+        "[output unavailable: retained snapshot and scrollback rows were evicted]";
+
+    let (raw, capture_truncated) = if context.output_available {
+        (context.output_text.as_str(), context.output_truncated)
+    } else {
+        (OUTPUT_UNAVAILABLE_NOTE, true)
+    };
+    let prepared = if context.exit_code.is_none() {
+        format!("{UNKNOWN_EXIT_STATUS_NOTE}{raw}")
+    } else {
+        raw.to_string()
+    };
+    let bounded = jterm_core::ai::truncate_for_context(&prepared, 80);
+    let elided = bounded != prepared;
+    BlockContext {
+        cmd: context.command.clone().unwrap_or_default(),
+        output: bounded,
+        cwd: context.cwd.clone(),
+        exit_code: context.exit_code.unwrap_or(UNKNOWN_EXIT_STATUS_SENTINEL),
+        truncated: context.command_truncated || capture_truncated || elided,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +557,105 @@ mod tests {
             ),
             Some("The command working directory exceeds the Agent context limit")
         );
+    }
+
+    #[test]
+    fn ad_hoc_context_passes_an_ordinary_block_through() {
+        let block = ad_hoc_block_context(&context());
+        assert_eq!(block.cmd, "cargo test");
+        assert_eq!(block.output, "failures:\n    terminal::test");
+        assert_eq!(block.cwd.as_deref(), Some("/workspace/ember"));
+        assert_eq!(block.exit_code, 101);
+        // 捕获本身已被标记 truncated（capture truncation），适配器原样转发。
+        assert!(block.truncated);
+    }
+
+    #[test]
+    fn ad_hoc_context_marks_unknown_status_with_the_explained_sentinel() {
+        let mut semantic = context();
+        semantic.exit_code = None;
+        semantic.output_truncated = false;
+
+        let block = ad_hoc_block_context(&semantic);
+        assert_eq!(block.exit_code, UNKNOWN_EXIT_STATUS_SENTINEL);
+        assert!(block.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+        assert!(block.output.ends_with("failures:\n    terminal::test"));
+        assert!(!block.truncated);
+    }
+
+    #[test]
+    fn ad_hoc_context_never_conflates_unavailable_output_with_empty_output() {
+        let mut semantic = context();
+        semantic.output_available = false;
+        semantic.output_text.clear();
+        semantic.output_total_bytes = 0;
+        semantic.output_truncated = false;
+
+        let block = ad_hoc_block_context(&semantic);
+        assert_eq!(
+            block.output,
+            "[output unavailable: retained snapshot and scrollback rows were evicted]"
+        );
+        assert!(block.truncated);
+
+        // frost 的分层：未上报状态的注记同样加在占位文本之前。
+        semantic.exit_code = None;
+        let block = ad_hoc_block_context(&semantic);
+        assert!(block.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+        assert!(block.output.contains("output unavailable"));
+        assert!(block.truncated);
+    }
+
+    #[test]
+    fn ad_hoc_context_bounds_long_output_to_a_head_tail_window() {
+        let mut semantic = context();
+        semantic.output_truncated = false;
+        semantic.output_text = (0..500)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        semantic.output_total_bytes = semantic.output_text.len();
+
+        let block = ad_hoc_block_context(&semantic);
+        assert!(block.output.contains("lines elided"), "{}", block.output);
+        assert!(block.output.starts_with("line-0\n"));
+        assert!(block.output.ends_with("line-499"));
+        assert!(block.truncated);
+    }
+
+    #[test]
+    fn ad_hoc_context_keeps_background_blocks_attachable() {
+        let mut semantic = context();
+        semantic.command = None;
+        semantic.command_exact = false;
+        semantic.cwd = None;
+        semantic.exit_code = None;
+        // 严格适配器拒绝同一份证据（MissingCommand）。
+        assert_eq!(
+            semantic.to_block_context(),
+            Err(ContextError::MissingCommand)
+        );
+
+        let block = ad_hoc_block_context(&semantic);
+        assert_eq!(block.cmd, "");
+        assert_eq!(block.cwd, None);
+        assert_eq!(block.exit_code, UNKNOWN_EXIT_STATUS_SENTINEL);
+        assert!(block.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+    }
+
+    #[test]
+    fn ad_hoc_context_propagates_producer_declared_truncation() {
+        let mut semantic = context();
+        semantic.command_truncated = true;
+        semantic.output_truncated = false;
+        // 严格适配器拒绝截断命令；宽松路径保留证据但绝不洗掉截断标记。
+        assert_eq!(
+            semantic.to_block_context(),
+            Err(ContextError::CommandTruncated)
+        );
+
+        let block = ad_hoc_block_context(&semantic);
+        assert_eq!(block.cmd, "cargo test");
+        assert!(block.truncated);
     }
 }

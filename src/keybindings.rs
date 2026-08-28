@@ -36,6 +36,8 @@ pub enum Command {
     SearchHistoryPrev,
     SearchHistoryNext,
     SearchReplaceToggle,
+    /// 历史命令选择器（Ctrl+Shift+H）：模糊搜索持久化命令并回填提示符。
+    HistoryPickerToggle,
 
     // === 终端操作 ===
     TerminalSendSigint, // Ctrl+C
@@ -142,6 +144,7 @@ impl std::fmt::Display for Command {
             Command::SearchHistoryPrev => write!(f, "search:history:prev"),
             Command::SearchHistoryNext => write!(f, "search:history:next"),
             Command::SearchReplaceToggle => write!(f, "search:replace:toggle"),
+            Command::HistoryPickerToggle => write!(f, "history:picker"),
             Command::TerminalSendSigint => write!(f, "terminal:send_sigint"),
             Command::TerminalSendEof => write!(f, "terminal:send_eof"),
             Command::TerminalClear => write!(f, "terminal:clear"),
@@ -222,6 +225,7 @@ impl std::str::FromStr for Command {
             "search:history:prev" => Ok(Command::SearchHistoryPrev),
             "search:history:next" => Ok(Command::SearchHistoryNext),
             "search:replace:toggle" => Ok(Command::SearchReplaceToggle),
+            "history:picker" => Ok(Command::HistoryPickerToggle),
             "terminal:send_sigint" => Ok(Command::TerminalSendSigint),
             "terminal:send_eof" => Ok(Command::TerminalSendEof),
             "terminal:clear" => Ok(Command::TerminalClear),
@@ -363,6 +367,11 @@ impl KeyBindings {
             "ctrl+alt+r".to_string(),
             "search:replace:toggle".to_string(),
         );
+        // 历史命令选择器，与 anvil/forge/frost 的 Ctrl+Shift+H 同键位
+        // （ember 的默认表里 ctrl+shift+h 空闲）。
+        bindings
+            .bindings
+            .insert("ctrl+shift+h".to_string(), "history:picker".to_string());
 
         // 配置操作
         bindings
@@ -885,6 +894,7 @@ mod tests {
             Command::BlockToggleBookmark,
             Command::BlockJumpPrevBookmark,
             Command::BlockJumpNextBookmark,
+            Command::HistoryPickerToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
@@ -934,6 +944,7 @@ mod tests {
             ("ctrl+shift+{", Command::BlockSelectPrev),
             ("ctrl+shift+]", Command::BlockSelectNext),
             ("ctrl+shift+}", Command::BlockSelectNext),
+            ("ctrl+shift+h", Command::HistoryPickerToggle),
         ];
         for (key, command) in expected {
             assert_eq!(

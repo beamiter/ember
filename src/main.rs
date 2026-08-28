@@ -16,6 +16,7 @@ mod font_file;
 mod gpu;
 mod help;
 mod history_persistence;
+mod history_picker;
 mod image_drop;
 mod jsh_ui;
 mod keybindings;
@@ -1476,6 +1477,60 @@ fn maybe_notify_long_command(
     jterm_core::notify::long_block_finished(command, exit_code, completed.duration_ms.unwrap_or(0));
 }
 
+/// 把每条 shell 上报的已完成命令追加到家族共享的 JSONL 历史索引（与
+/// anvil/forge/frost 同键同格式），供 Ctrl+Shift+H 选择器跨重启召回。
+/// 写入走 jterm_core 的有界后台写入器；多行 heredoc 等不安全的重建文本
+/// 直接跳过而不是 noisy 报错。只记录命令行/cwd/exit code/结束时间——
+/// 绝不记录输出。与 [`maybe_notify_long_command`] 同为自由函数，因为
+/// 两个完成路径都持有 session manager 的可变借用。
+fn record_command_history(
+    config: &config::Config,
+    completed: &crate::terminal::CompletedCommandEvent,
+) {
+    if completed.completion_provenance != crate::block_mode::CompletionProvenance::ShellReported {
+        // 边界推断的结束只用于释放本地 UI/Agent 生命周期；持久化它会把
+        // 缺失的 OSC 证据变成跨会话的伪完成记录。
+        return;
+    }
+    let Some(path) = config.resolved_command_history_path() else {
+        return;
+    };
+    let Some(command) = completed
+        .command
+        .as_deref()
+        .and_then(history_picker::sanitized_command)
+    else {
+        return;
+    };
+    let Some(exit_code) = completed.exit_code else {
+        // 共享历史 schema 要求确切的状态。缺失 OSC 状态是 Unknown，绝不
+        // 当成隐式成功。
+        return;
+    };
+    let cwd = completed
+        .cwd
+        .as_deref()
+        .filter(|cwd| history_picker::sanitized_cwd(cwd).is_some());
+    if let Err(error) = jterm_core::command_history::prepare_path(&path, true) {
+        log::warn!("unsafe command-history path rejected: {error}");
+        return;
+    }
+    let end_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    if let Err(error) = jterm_core::command_history::enqueue(
+        &path,
+        config.command_history_max_entries as usize,
+        command,
+        cwd,
+        exit_code,
+        end_time_ms,
+    ) {
+        log::warn!("command history: {error}");
+    }
+}
+
 fn reported_capture_button(capture: Option<(bool, u8)>) -> Option<u8> {
     capture.and_then(|(reported_to_app, button)| reported_to_app.then_some(button))
 }
@@ -2222,6 +2277,7 @@ impl TerminalApp {
             cached_links_terminal_ptr: usize::MAX,
             keybindings,
             command_palette,
+            history_picker: None,
             force_resize_session: false,
             current_theme,
             tabs,
@@ -4543,6 +4599,7 @@ impl eframe::App for TerminalApp {
                 &completed,
                 window_focused && visible_sessions.contains(&session_idx),
             );
+            record_command_history(&self.config, &completed);
             if let Err(error) = execution_journal::submit(completed) {
                 log::warn!("jsh execution output journal queue rejected an event: {error:?}");
             }
@@ -4683,7 +4740,10 @@ impl eframe::App for TerminalApp {
         // Block-search picker keys (Enter/Escape/arrows), routed like the
         // palette's so the overlay owns the whole frame's keyboard input.
         let block_search_owned_input = self.handle_block_search_input();
-        let overlay_owned_input = palette_owned_input || block_search_owned_input;
+        // 历史命令选择器同理：浮层打开期间拥有整帧键盘输入。
+        let history_picker_owned_input = self.handle_history_picker_input();
+        let overlay_owned_input =
+            palette_owned_input || block_search_owned_input || history_picker_owned_input;
 
         let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
             self.handle_keybindings(
@@ -5300,6 +5360,7 @@ impl eframe::App for TerminalApp {
                         &completed,
                         window_focused,
                     );
+                    record_command_history(&self.config, &completed);
                     if let Err(error) = execution_journal::submit(completed) {
                         log::warn!(
                             "jsh execution output journal queue rejected an event: {error:?}"
@@ -6567,6 +6628,13 @@ impl Drop for TerminalApp {
         // jsh journal before process teardown terminates that worker.
         if !execution_journal::flush(Duration::from_secs(2)) {
             log::warn!("timed out flushing jsh execution output journal");
+        }
+        // 命令历史同样由后台写入器落盘；退出前给已接受的记录一个有界冲刷
+        // 窗口（与 frost 相同的 2 秒）。
+        if let Err(error) =
+            jterm_core::command_history::flush_pending(std::time::Duration::from_secs(2))
+        {
+            log::warn!("command history did not flush before exit: {error}");
         }
     }
 }

@@ -290,6 +290,22 @@ pub struct Config {
     #[serde(default)]
     pub block_compact: bool,
 
+    /// 把 OSC 133 上报的已完成命令追加到家族共享的 JSONL 历史索引（与
+    /// anvil/forge/frost 同名配置键、同文件格式），供 Ctrl+Shift+H 选择器
+    /// 跨重启召回。只记录命令行、cwd、exit code 与结束时间——绝不记录输出。
+    #[serde(default = "default_command_history_enabled")]
+    pub command_history_enabled: bool,
+
+    /// 历史索引位置。默认在 XDG state 目录
+    /// （`~/.local/state/ember/history.jsonl`）；指向兄弟终端的同一文件即可
+    /// 共享历史。
+    #[serde(default)]
+    pub command_history_path: Option<PathBuf>,
+
+    /// 索引压缩时保留的最大条数。
+    #[serde(default = "default_command_history_max_entries")]
+    pub command_history_max_entries: u32,
+
     /// Why this run could not use the on-disk config, if it exists but could
     /// not be read or parsed. Never serialized: it describes the load attempt,
     /// not a user setting.
@@ -327,6 +343,14 @@ fn default_block_mode() -> bool {
 }
 
 fn default_notify_long_block_threshold_ms() -> u64 {
+    10_000
+}
+
+fn default_command_history_enabled() -> bool {
+    true
+}
+
+fn default_command_history_max_entries() -> u32 {
     10_000
 }
 
@@ -571,6 +595,9 @@ impl Default for Config {
             click_moves_cursor: default_click_moves_cursor(),
             block_mode: default_block_mode(),
             block_compact: false,
+            command_history_enabled: default_command_history_enabled(),
+            command_history_path: None,
+            command_history_max_entries: default_command_history_max_entries(),
             load_error: None,
             revision: None,
         }
@@ -763,6 +790,30 @@ impl Config {
         }
     }
 
+    /// 共享命令历史索引的位置；历史记录被禁用时为 `None`。显式路径支持 `~`
+    /// 展开；相对路径落在默认目录旁，避免把增长的数据写进配置目录。默认
+    /// 路径遵循家族的 XDG state 目录语义。
+    pub fn resolved_command_history_path(&self) -> Option<PathBuf> {
+        if !self.command_history_enabled {
+            return None;
+        }
+        let state_dir = dirs::state_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))?
+            .join("ember");
+        let Some(path) = self.command_history_path.as_ref() else {
+            return Some(state_dir.join("history.jsonl"));
+        };
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+        if let Ok(rest) = path.strip_prefix("~") {
+            if let Some(home) = dirs::home_dir() {
+                return Some(home.join(rest));
+            }
+        }
+        Some(state_dir.join(path))
+    }
+
     pub fn ui_history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
         Ok(config_dir.join("ember").join("ui_history.json"))
@@ -836,6 +887,16 @@ impl Config {
             warnings.push(format!(
                 "scrollback_lines={} is outside 100..=1000000; using {}",
                 old_scrollback, self.scrollback_lines
+            ));
+        }
+
+        // 与 anvil/forge/frost 共享索引相同的保留上限。
+        let old_history_max = self.command_history_max_entries;
+        self.command_history_max_entries = self.command_history_max_entries.clamp(100, 1_000_000);
+        if self.command_history_max_entries != old_history_max {
+            warnings.push(format!(
+                "command_history_max_entries={} is outside 100..=1000000; using {}",
+                old_history_max, self.command_history_max_entries
             ));
         }
 
@@ -1307,6 +1368,60 @@ mod tests {
             toml::from_str("block_mode = false\nblock_compact = true\n").expect("overrides parse");
         assert!(!config.block_mode);
         assert!(config.block_compact);
+    }
+
+    #[test]
+    fn command_history_defaults_match_the_family() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        assert!(config.command_history_enabled);
+        assert_eq!(config.command_history_max_entries, 10_000);
+        let path = config
+            .resolved_command_history_path()
+            .expect("enabled history resolves a path");
+        assert!(path.ends_with("ember/history.jsonl"), "{}", path.display());
+    }
+
+    #[test]
+    fn command_history_overrides_are_resolved_and_bounded() {
+        let mut config: Config = toml::from_str(
+            "command_history_enabled = false\n\
+             command_history_path = '/tmp/shared-history.jsonl'\n\
+             command_history_max_entries = 7\n",
+        )
+        .expect("overrides parse");
+        assert_eq!(config.resolved_command_history_path(), None);
+        let warnings = config.normalize();
+        assert_eq!(config.command_history_max_entries, 100);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("command_history_max_entries")),
+            "{warnings:?}"
+        );
+
+        let mut config: Config = toml::from_str(
+            "command_history_path = '/tmp/shared-history.jsonl'\n\
+             command_history_max_entries = 2000000\n",
+        )
+        .expect("overrides parse");
+        assert_eq!(
+            config.resolved_command_history_path().as_deref(),
+            Some(std::path::Path::new("/tmp/shared-history.jsonl"))
+        );
+        config.normalize();
+        assert_eq!(config.command_history_max_entries, 1_000_000);
+
+        // 相对路径落在默认的 XDG state 目录旁，而不是配置目录。
+        let config: Config =
+            toml::from_str("command_history_path = 'shared/history.jsonl'\n").expect("parses");
+        let path = config
+            .resolved_command_history_path()
+            .expect("enabled history resolves a path");
+        assert!(
+            path.ends_with("ember/shared/history.jsonl"),
+            "{}",
+            path.display()
+        );
     }
 
     #[test]

@@ -2656,6 +2656,13 @@ impl TerminalRenderer {
                 chosen = Some(crate::block_mode::BlockMenuAction::AskAgent);
                 ui.close();
             }
+            // frost 的 "Ask AI about block"：宽松附加路径，任何已完成块都能
+            // 作为不可信证据附加到 Agent 面板的当前对话，因此始终可用；
+            // AI 未启用等失败在派发时用状态栏说明。
+            if ui.button("Ask AI About Block").clicked() {
+                chosen = Some(crate::block_mode::BlockMenuAction::AskAi);
+                ui.close();
+            }
             if block_menu_button(
                 ui,
                 if plural {

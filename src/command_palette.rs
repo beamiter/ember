@@ -197,6 +197,12 @@ impl CommandPalette {
                 "Open find-and-replace on the selection",
                 crate::keybindings::Command::SearchReplaceToggle,
             ),
+            CommandInfo::new(
+                "Search Command History",
+                CommandCategory::Search,
+                "Fuzzy-search persisted shell commands; Enter fills the prompt without running it",
+                crate::keybindings::Command::HistoryPickerToggle,
+            ),
             // === 终端操作 ===
             CommandInfo::new(
                 "Scroll Up",
@@ -733,6 +739,7 @@ mod tests {
             Command::SearchHistoryPrev,
             Command::SearchHistoryNext,
             Command::SearchReplaceToggle,
+            Command::HistoryPickerToggle,
             Command::TerminalSendSigint,
             Command::TerminalSendEof,
             Command::TerminalClear,

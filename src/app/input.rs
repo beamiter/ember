@@ -132,6 +132,7 @@ fn block_search_event_may_change_focus(event: &egui::Event) -> bool {
 /// Central input-routing decision for UI surfaces that own keyboard input.
 /// Keep this pure so regressions (especially Enter/Escape leaking into the PTY)
 /// can be covered without constructing a PTY-backed [`TerminalApp`].
+#[allow(clippy::too_many_arguments)] // 每个 UI surface 一个标志位，保持纯函数便于测试
 pub(crate) fn should_block_terminal_input(
     search_open: bool,
     config_open: bool,
@@ -139,6 +140,7 @@ pub(crate) fn should_block_terminal_input(
     paste_confirmation_open: bool,
     command_palette_open: bool,
     block_search_open: bool,
+    history_picker_open: bool,
     text_edit_focused: bool,
 ) -> bool {
     search_open
@@ -147,6 +149,7 @@ pub(crate) fn should_block_terminal_input(
         || paste_confirmation_open
         || command_palette_open
         || block_search_open
+        || history_picker_open
         || text_edit_focused
 }
 
@@ -698,6 +701,7 @@ impl TerminalApp {
             self.pending_paste_confirm.is_some(),
             self.command_palette.is_open,
             self.block_search.is_open,
+            self.history_picker.is_some(),
             ctx.text_edit_focused(),
         )
     }
@@ -930,6 +934,7 @@ impl TerminalApp {
                 self.refresh_search_matches();
             }
             keybindings::Command::SearchReplaceToggle => self.search_replace_panel.toggle(),
+            keybindings::Command::HistoryPickerToggle => self.history_picker_toggle(),
             keybindings::Command::TerminalSendSigint => self.queue_terminal_control_input(0x03),
             keybindings::Command::TerminalSendEof => self.queue_terminal_control_input(0x04),
             keybindings::Command::TerminalClear => self.queue_terminal_control_input(0x0c),
@@ -1718,6 +1723,60 @@ impl TerminalApp {
         (close_requested, true)
     }
 
+    /// Handle keys the history picker owns (same routing pattern as the
+    /// command palette; the `history:picker` chord itself toggles through the
+    /// modal-command path in `handle_keybindings`). Enter fills the highlighted
+    /// command at the prompt and closes — it never executes; Escape closes.
+    /// Returns whether the picker owned this frame's input; it never requests
+    /// a viewport close.
+    pub fn handle_history_picker_input(&mut self) -> bool {
+        if self.history_picker.is_none() {
+            return false;
+        }
+
+        let events_copy = self.frame_events.clone();
+        let mut accepted: Option<Option<String>> = None;
+        for evt in &events_copy {
+            let egui::Event::Key {
+                key, pressed: true, ..
+            } = evt
+            else {
+                continue;
+            };
+            match key {
+                egui::Key::Escape => self.history_picker = None,
+                egui::Key::ArrowUp => {
+                    if let Some(state) = self.history_picker.as_mut() {
+                        state.select_prev();
+                    }
+                }
+                egui::Key::ArrowDown => {
+                    if let Some(state) = self.history_picker.as_mut() {
+                        state.select_next();
+                    }
+                }
+                egui::Key::Enter => {
+                    // 与 frost 一致：即使过滤结果为空，Enter 也关闭浮层。
+                    accepted = Some(
+                        self.history_picker
+                            .as_ref()
+                            .and_then(|state| state.selected_command()),
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(command) = accepted {
+            self.history_picker = None;
+            if let Some(command) = command {
+                self.fill_prompt_with_history_command(&command);
+            }
+        }
+        true
+    }
+
     /// Handle keys the block-search picker owns (same routing pattern as the
     /// command palette; the `block:search` chord itself closes it through the
     /// modal-command path in `handle_keybindings`). Returns whether the
@@ -1880,6 +1939,7 @@ impl TerminalApp {
             }
             keybindings::Command::CommandPaletteToggle => self.command_palette.is_open,
             keybindings::Command::BlockSearchToggle => self.block_search.is_open,
+            keybindings::Command::HistoryPickerToggle => self.history_picker.is_some(),
             keybindings::Command::SearchReplaceToggle => self.search_replace_panel.is_open,
             _ => false,
         }
@@ -2770,14 +2830,16 @@ mod tests {
     #[test]
     fn interactive_ui_surfaces_block_terminal_input() {
         assert!(!should_block_terminal_input(
-            false, false, false, false, false, false, false
+            false, false, false, false, false, false, false, false
         ));
         // Each surface blocks on its own: search, settings, replace, paste
-        // confirmation, palette, block-search picker, focused text edit.
-        for index in 0..7 {
-            let mut flags = [false; 7];
+        // confirmation, palette, block-search picker, history picker, focused
+        // text edit.
+        for index in 0..8 {
+            let mut flags = [false; 8];
             flags[index] = true;
-            let [search, config, replace, paste, palette, block_search, text_edit] = flags;
+            let [search, config, replace, paste, palette, block_search, history_picker, text_edit] =
+                flags;
             assert!(
                 should_block_terminal_input(
                     search,
@@ -2786,6 +2848,7 @@ mod tests {
                     paste,
                     palette,
                     block_search,
+                    history_picker,
                     text_edit
                 ),
                 "surface {index} must block terminal input"
@@ -3545,6 +3608,7 @@ mod tests {
             true,  // paste confirmation owns keyboard focus
             false, // command palette
             false, // block search picker
+            false, // history picker
             false, // no unrelated text editor focus
         );
 

@@ -83,9 +83,14 @@ fn attached_exit_status(
     source: Option<&crate::agent::SemanticCommandContext>,
     compatibility: &BlockContext,
 ) -> Option<i32> {
-    source
-        .map(|source| source.exit_code)
-        .unwrap_or(Some(compatibility.exit_code))
+    match source {
+        Some(source) => source.exit_code,
+        // 宽松附加路径（Ask AI）用兼容性哨兵表示未上报的状态；UI 显示
+        // unknown，绝不把 -1 渲染成真实 exit code。既有的手动完成路径只在
+        // 有真实状态时附加，行为不变。
+        None => (compatibility.exit_code != crate::agent::context::UNKNOWN_EXIT_STATUS_SENTINEL)
+            .then_some(compatibility.exit_code),
+    }
 }
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
@@ -609,6 +614,33 @@ impl AgentPanel {
         } else {
             self.open(config, session_id);
         }
+    }
+
+    /// Attach one right-clicked block to the panel's current conversation as
+    /// untrusted context — frost 的 `BlockMenuAction::AskAi` 对应物。面板未
+    /// 打开或绑定在别的终端时先经 [`Self::open`] 绑定到块所在 session；已有
+    /// 对话的 transcript 保持不变，绝不新建任务。结构化任务已经持有自己的
+    /// 源证据时拒绝：静默换掉用户正在监督的块会把两条命令的证据混在一起。
+    pub fn attach_block_context(
+        &mut self,
+        config: &Config,
+        session_id: String,
+        context: BlockContext,
+    ) -> Result<(), String> {
+        if !config.ai_enabled {
+            return Err("AI features are disabled by configuration".to_string());
+        }
+        if !self.is_open || self.bound_session_id.as_deref() != Some(session_id.as_str()) {
+            self.open(config, session_id);
+        }
+        if self.source_context.is_some() {
+            return Err(
+                "The current Agent task already has its own block attached; finish it or choose New task first"
+                    .to_string(),
+            );
+        }
+        self.last_manual_completed = Some(context);
+        Ok(())
     }
 
     /// Stable terminal binding used for command execution and workspace
@@ -2194,6 +2226,113 @@ mod tests {
             None,
             "the compatibility sentinel must never leak into attached UI"
         );
+    }
+
+    #[test]
+    fn attach_block_context_opens_the_panel_without_creating_a_task() {
+        let context = crate::agent::context::ad_hoc_block_context(&failed_block_context());
+        let mut panel = AgentPanel::new();
+
+        panel
+            .attach_block_context(&ai_config(), "source-session".into(), context.clone())
+            .expect("closed panel opens bound to the block's session");
+
+        assert!(panel.is_open);
+        assert_eq!(panel.bound_session_id.as_deref(), Some("source-session"));
+        assert_eq!(panel.last_manual_completed.as_ref(), Some(&context));
+        assert!(
+            panel.source_context.is_none(),
+            "ad-hoc attach never fabricates structured provenance"
+        );
+    }
+
+    #[test]
+    fn attach_block_context_preserves_the_current_conversation() {
+        let config = ai_config();
+        let mut session = AgentSession::new(4);
+        session
+            .submit_user("why did that fail?".to_string())
+            .unwrap();
+        let epoch = session.epoch();
+        let mut panel = AgentPanel::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some("source-session".into());
+        panel.session = Some(session);
+        let context = crate::agent::context::ad_hoc_block_context(&failed_block_context());
+
+        panel
+            .attach_block_context(&config, "source-session".into(), context.clone())
+            .expect("attach to the bound conversation");
+
+        let session = panel.session.as_ref().expect("conversation preserved");
+        assert_eq!(session.epoch(), epoch);
+        assert_eq!(
+            session.transcript(),
+            &[Turn::User("why did that fail?".to_string())]
+        );
+        assert_eq!(panel.last_manual_completed.as_ref(), Some(&context));
+    }
+
+    #[test]
+    fn attach_block_context_refuses_to_swap_a_structured_task_evidence() {
+        let config = ai_config();
+        let structured = failed_block_context();
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&config, structured.clone(), None)
+            .expect("structured task");
+        let attached_before = panel.last_manual_completed.clone();
+
+        let other = BlockContext {
+            cmd: "git status".into(),
+            output: String::new(),
+            cwd: Some("/elsewhere".into()),
+            exit_code: 0,
+            truncated: false,
+        };
+        let error = panel
+            .attach_block_context(&config, "source-session".into(), other)
+            .expect_err("another block must not silently replace task evidence");
+
+        assert!(
+            error.contains("already has its own block attached"),
+            "{error}"
+        );
+        assert_eq!(panel.last_manual_completed, attached_before);
+        assert_eq!(panel.source_context.as_ref(), Some(&structured));
+    }
+
+    #[test]
+    fn attach_block_context_requires_ai_enabled() {
+        let mut disabled = ai_config();
+        disabled.ai_enabled = false;
+        let context = crate::agent::context::ad_hoc_block_context(&failed_block_context());
+        let mut panel = AgentPanel::new();
+
+        let error = panel
+            .attach_block_context(&disabled, "source-session".into(), context)
+            .expect_err("AI-disabled configuration fails closed");
+
+        assert!(error.contains("disabled"), "{error}");
+        assert!(!panel.is_open);
+        assert!(panel.last_manual_completed.is_none());
+    }
+
+    #[test]
+    fn attached_exit_status_hides_the_unknown_sentinel_for_ad_hoc_attach() {
+        let unknown = BlockContext {
+            cmd: "cargo test".into(),
+            output: String::new(),
+            cwd: None,
+            exit_code: crate::agent::context::UNKNOWN_EXIT_STATUS_SENTINEL,
+            truncated: false,
+        };
+        assert_eq!(attached_exit_status(None, &unknown), None);
+        let reported = BlockContext {
+            exit_code: 7,
+            ..unknown
+        };
+        assert_eq!(attached_exit_status(None, &reported), Some(7));
     }
 
     #[test]
