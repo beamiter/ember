@@ -38,6 +38,9 @@ pub enum Command {
     SearchReplaceToggle,
     /// 历史命令选择器（Ctrl+Shift+H）：模糊搜索持久化命令并回填提示符。
     HistoryPickerToggle,
+    /// 工作流选择器（Ctrl+Shift+M，与 anvil/forge 同键位）：模糊搜索参数化
+    /// 命令模板，填写参数后回填提示符（review-only，绝不自动执行）。
+    WorkflowPickerToggle,
 
     // === 终端操作 ===
     TerminalSendSigint, // Ctrl+C
@@ -155,6 +158,7 @@ impl std::fmt::Display for Command {
             Command::SearchHistoryNext => write!(f, "search:history:next"),
             Command::SearchReplaceToggle => write!(f, "search:replace:toggle"),
             Command::HistoryPickerToggle => write!(f, "history:picker"),
+            Command::WorkflowPickerToggle => write!(f, "workflow:picker"),
             Command::TerminalSendSigint => write!(f, "terminal:send_sigint"),
             Command::TerminalSendEof => write!(f, "terminal:send_eof"),
             Command::TerminalClear => write!(f, "terminal:clear"),
@@ -243,6 +247,7 @@ impl std::str::FromStr for Command {
             "search:history:next" => Ok(Command::SearchHistoryNext),
             "search:replace:toggle" => Ok(Command::SearchReplaceToggle),
             "history:picker" => Ok(Command::HistoryPickerToggle),
+            "workflow:picker" => Ok(Command::WorkflowPickerToggle),
             "terminal:send_sigint" => Ok(Command::TerminalSendSigint),
             "terminal:send_eof" => Ok(Command::TerminalSendEof),
             "terminal:clear" => Ok(Command::TerminalClear),
@@ -394,6 +399,11 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+h".to_string(), "history:picker".to_string());
+        // 工作流（参数化命令模板）选择器，与 anvil/forge 的 Ctrl+Shift+M
+        // 同键位（ember 的默认表里 ctrl+shift+m 空闲）。
+        bindings
+            .bindings
+            .insert("ctrl+shift+m".to_string(), "workflow:picker".to_string());
 
         // 配置操作
         bindings
@@ -929,6 +939,7 @@ mod tests {
             Command::BlockExportSessionJson,
             Command::PaneSwap,
             Command::HistoryPickerToggle,
+            Command::WorkflowPickerToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
@@ -980,6 +991,7 @@ mod tests {
             ("ctrl+shift+]", Command::BlockSelectNext),
             ("ctrl+shift+}", Command::BlockSelectNext),
             ("ctrl+shift+h", Command::HistoryPickerToggle),
+            ("ctrl+shift+m", Command::WorkflowPickerToggle),
         ];
         for (key, command) in expected {
             assert_eq!(

@@ -45,6 +45,8 @@ mod terminal;
 mod theme;
 mod ui;
 mod windows_compat;
+mod workflow_picker;
+mod workflows;
 
 use crate::theme::ThemeExt as _;
 use app::events::{
@@ -2281,6 +2283,8 @@ impl TerminalApp {
             keybindings,
             command_palette,
             history_picker: None,
+            workflow_picker: None,
+            workflow_args: None,
             force_resize_session: false,
             current_theme,
             tabs,
@@ -4753,8 +4757,12 @@ impl eframe::App for TerminalApp {
         let block_search_owned_input = self.handle_block_search_input();
         // 历史命令选择器同理：浮层打开期间拥有整帧键盘输入。
         let history_picker_owned_input = self.handle_history_picker_input();
-        let overlay_owned_input =
-            palette_owned_input || block_search_owned_input || history_picker_owned_input;
+        // 工作流选择器与参数对话框同理。
+        let workflow_picker_owned_input = self.handle_workflow_picker_input();
+        let overlay_owned_input = palette_owned_input
+            || block_search_owned_input
+            || history_picker_owned_input
+            || workflow_picker_owned_input;
 
         let (keybinding_requested_close, selection_postdates_terminal_input, accepted_ime_input) =
             self.handle_keybindings(

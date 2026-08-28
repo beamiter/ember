@@ -33,3 +33,4 @@ pub mod terminal;
 pub mod theme;
 pub mod ui;
 pub mod windows_compat;
+pub mod workflows;

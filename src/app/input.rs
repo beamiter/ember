@@ -141,6 +141,7 @@ pub(crate) fn should_block_terminal_input(
     command_palette_open: bool,
     block_search_open: bool,
     history_picker_open: bool,
+    workflow_picker_open: bool,
     text_edit_focused: bool,
 ) -> bool {
     search_open
@@ -150,6 +151,7 @@ pub(crate) fn should_block_terminal_input(
         || command_palette_open
         || block_search_open
         || history_picker_open
+        || workflow_picker_open
         || text_edit_focused
 }
 
@@ -702,6 +704,7 @@ impl TerminalApp {
             self.command_palette.is_open,
             self.block_search.is_open,
             self.history_picker.is_some(),
+            self.workflow_picker.is_some() || self.workflow_args.is_some(),
             ctx.text_edit_focused(),
         )
     }
@@ -935,6 +938,7 @@ impl TerminalApp {
             }
             keybindings::Command::SearchReplaceToggle => self.search_replace_panel.toggle(),
             keybindings::Command::HistoryPickerToggle => self.history_picker_toggle(),
+            keybindings::Command::WorkflowPickerToggle => self.workflow_picker_toggle(),
             keybindings::Command::TerminalSendSigint => self.queue_terminal_control_input(0x03),
             keybindings::Command::TerminalSendEof => self.queue_terminal_control_input(0x04),
             keybindings::Command::TerminalClear => self.queue_terminal_control_input(0x0c),
@@ -1797,6 +1801,79 @@ impl TerminalApp {
         true
     }
 
+    /// Handle keys the workflow picker and its parameter dialog own (same
+    /// routing pattern as the history picker). Picker: arrows navigate, Enter
+    /// accepts (arg-less workflows fill the prompt directly; parameterized ones
+    /// open the parameter dialog), Escape closes. Dialog: Enter submits,
+    /// Escape closes; every other key belongs to the egui text fields. Returns
+    /// whether either surface owned this frame's input; it never requests a
+    /// viewport close.
+    pub fn handle_workflow_picker_input(&mut self) -> bool {
+        if self.workflow_picker.is_none() && self.workflow_args.is_none() {
+            return false;
+        }
+
+        let events_copy = self.frame_events.clone();
+        let mut accepted: Option<Option<crate::workflows::Workflow>> = None;
+        let mut submit_args = false;
+        let mut close_args = false;
+        for evt in &events_copy {
+            let egui::Event::Key {
+                key, pressed: true, ..
+            } = evt
+            else {
+                continue;
+            };
+            if self.workflow_args.is_some() {
+                // 参数对话框打开时，方向键/字符键归 egui 文本框（光标移动与
+                // 编辑）；浮层只额外认领 Enter 提交与 Escape 取消。
+                match key {
+                    egui::Key::Escape => close_args = true,
+                    egui::Key::Enter => submit_args = true,
+                    _ => {}
+                }
+                continue;
+            }
+            match key {
+                egui::Key::Escape => self.workflow_picker = None,
+                egui::Key::ArrowUp => {
+                    if let Some(state) = self.workflow_picker.as_mut() {
+                        state.select_prev();
+                    }
+                }
+                egui::Key::ArrowDown => {
+                    if let Some(state) = self.workflow_picker.as_mut() {
+                        state.select_next();
+                    }
+                }
+                egui::Key::Enter => {
+                    // 与历史选择器一致：即使过滤结果为空，Enter 也关闭浮层。
+                    accepted = Some(
+                        self.workflow_picker
+                            .as_ref()
+                            .and_then(|state| state.selected_workflow().cloned()),
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if close_args {
+            self.workflow_args = None;
+        }
+        if submit_args {
+            self.submit_workflow_args();
+        }
+        if let Some(workflow) = accepted {
+            self.workflow_picker = None;
+            if let Some(workflow) = workflow {
+                self.workflow_picker_accept(workflow);
+            }
+        }
+        true
+    }
+
     /// Handle keys the block-search picker owns (same routing pattern as the
     /// command palette; the `block:search` chord itself closes it through the
     /// modal-command path in `handle_keybindings`). Returns whether the
@@ -1960,6 +2037,9 @@ impl TerminalApp {
             keybindings::Command::CommandPaletteToggle => self.command_palette.is_open,
             keybindings::Command::BlockSearchToggle => self.block_search.is_open,
             keybindings::Command::HistoryPickerToggle => self.history_picker.is_some(),
+            keybindings::Command::WorkflowPickerToggle => {
+                self.workflow_picker.is_some() || self.workflow_args.is_some()
+            }
             keybindings::Command::SearchReplaceToggle => self.search_replace_panel.is_open,
             _ => false,
         }
@@ -2850,15 +2930,15 @@ mod tests {
     #[test]
     fn interactive_ui_surfaces_block_terminal_input() {
         assert!(!should_block_terminal_input(
-            false, false, false, false, false, false, false, false
+            false, false, false, false, false, false, false, false, false
         ));
         // Each surface blocks on its own: search, settings, replace, paste
-        // confirmation, palette, block-search picker, history picker, focused
-        // text edit.
-        for index in 0..8 {
-            let mut flags = [false; 8];
+        // confirmation, palette, block-search picker, history picker, workflow
+        // picker, focused text edit.
+        for index in 0..9 {
+            let mut flags = [false; 9];
             flags[index] = true;
-            let [search, config, replace, paste, palette, block_search, history_picker, text_edit] =
+            let [search, config, replace, paste, palette, block_search, history_picker, workflow_picker, text_edit] =
                 flags;
             assert!(
                 should_block_terminal_input(
@@ -2869,6 +2949,7 @@ mod tests {
                     palette,
                     block_search,
                     history_picker,
+                    workflow_picker,
                     text_edit
                 ),
                 "surface {index} must block terminal input"
@@ -3629,6 +3710,7 @@ mod tests {
             false, // command palette
             false, // block search picker
             false, // history picker
+            false, // workflow picker
             false, // no unrelated text editor focus
         );
 

@@ -2673,6 +2673,59 @@ impl TerminalApp {
         }
     }
 
+    /// 工作流选择器开关（Ctrl+Shift+M）。发现/解析/校验全部在打开时同步完成
+    /// （有界目录扫描，与历史选择器的 load-on-open 同一模式）；anvil 的后台
+    /// 单飞刷新在单线程 egui 里没有对应物——见 workflows.rs 的移植说明。
+    pub(crate) fn workflow_picker_toggle(&mut self) {
+        if self.workflow_picker.is_some() || self.workflow_args.is_some() {
+            self.workflow_picker = None;
+            self.workflow_args = None;
+            return;
+        }
+        let dirs = crate::workflows::workflow_dirs();
+        self.workflow_picker = Some(crate::workflow_picker::WorkflowPickerState::load(&dirs));
+    }
+
+    /// 选择器确认一个工作流：无参数的直接渲染并回填提示符（绝不执行），有参数
+    /// 的打开填写对话框。回填走与历史/块召回完全相同的守卫路径
+    /// （`fill_prompt_with_history_command`：只读任务终端、alt-screen、提示符
+    /// 未就绪、括号粘贴关闭、待发送输入、非空提示符都拒绝）。
+    pub(crate) fn workflow_picker_accept(&mut self, workflow: crate::workflows::Workflow) {
+        self.workflow_picker = None;
+        if workflow.args.is_empty() {
+            match crate::workflows::render(&workflow, &std::collections::HashMap::new()) {
+                Ok(command) => self.fill_prompt_with_history_command(&command),
+                Err(error) => {
+                    log::warn!("workflow render failed: {error}");
+                    self.set_status_for(
+                        format!("Workflow could not be rendered: {error}"),
+                        Duration::from_secs(5),
+                    );
+                }
+            }
+            return;
+        }
+        self.workflow_args = Some(crate::workflow_picker::WorkflowArgsState::new(workflow));
+    }
+
+    /// 参数对话框提交：渲染成功则回填提示符并关闭；失败则与 anvil 一致——
+    /// 在同一对话框内显示错误并保持打开。
+    pub(crate) fn submit_workflow_args(&mut self) {
+        let Some(state) = self.workflow_args.take() else {
+            return;
+        };
+        match state.render() {
+            Ok(command) => self.fill_prompt_with_history_command(&command),
+            Err(error) => {
+                log::warn!("workflow render failed: {error}");
+                self.workflow_args = Some(crate::workflow_picker::WorkflowArgsState {
+                    error: Some(error),
+                    ..state
+                });
+            }
+        }
+    }
+
     /// Apply an accepted command-correction review decision. Unlike sidebar
     /// replay this never re-reads a historical record — the reviewed text
     /// arrives already validated — but every prompt guard is identical: the

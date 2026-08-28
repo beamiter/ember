@@ -1662,6 +1662,338 @@ impl TerminalApp {
             self.fill_prompt_with_history_command(&command);
         }
 
+        // 工作流选择器（workflow:picker，anvil/forge 的 workflows）：与历史
+        // 选择器同款的中央浮层。Enter/点击对无参数工作流直接回填提示符（绝不
+        // 执行），有参数的打开填写对话框。
+        let mut accepted_workflow = None;
+        let mut hovered_workflow_index = None;
+        if self.workflow_picker.is_some() {
+            let screen_rect = ctx.viewport_rect();
+            let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
+            let picker_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
+            let picker_pos = egui::pos2(
+                screen_rect.center().x - picker_width / 2.0,
+                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
+            );
+
+            egui::Window::new("Workflows")
+                .title_bar(false)
+                .resizable(false)
+                .movable(false)
+                .default_pos(picker_pos)
+                .default_size([picker_width, picker_height])
+                .fixed_size([picker_width, picker_height])
+                .frame(egui::Frame {
+                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
+                    stroke: egui::Stroke::new(
+                        1.0,
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
+                    ),
+                    corner_radius: egui::CornerRadius::same(10),
+                    inner_margin: egui::Margin::same(8),
+                    ..Default::default()
+                })
+                .show(ctx, |ui| {
+                    let Some(state) = self.workflow_picker.as_mut() else {
+                        return;
+                    };
+                    // 搜索输入框：编辑即重置高亮（与历史选择器一致）。
+                    ui.horizontal(|ui| {
+                        ui.label("⚙");
+                        let search_response = ui.text_edit_singleline(&mut state.query);
+                        if search_response.changed() {
+                            state.selected = 0;
+                        }
+                        if state.needs_focus {
+                            search_response.request_focus();
+                            state.needs_focus = false;
+                        }
+                        if search_response.has_focus() && state.query.is_empty() {
+                            ui.label("Search workflows…");
+                        }
+                    });
+
+                    ui.separator();
+
+                    // 快照一份结果，指针动作在窗口闭包外统一应用（与命令面板/
+                    // 历史选择器相同，避免对 workflow_picker 的双重借用）。
+                    let results: Vec<_> = state.filtered().into_iter().cloned().collect();
+                    let selected_index = state.selected;
+                    let entries_empty = results.is_empty() && state.query.is_empty();
+
+                    egui::ScrollArea::vertical()
+                        .max_height(picker_height - 100.0)
+                        .show(ui, |ui| {
+                            for (idx, workflow) in results.iter().enumerate() {
+                                let is_selected = idx == selected_index;
+
+                                let bg_color = if is_selected {
+                                    crate::theme::Theme::rgb_to_color32(
+                                        self.current_theme.tabbar.active_border,
+                                    )
+                                    .gamma_multiply(0.18)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+
+                                let item_response = ui.horizontal(|ui| {
+                                    let item_rect = ui.available_rect_before_wrap();
+                                    ui.painter().rect_filled(item_rect, 2.0, bg_color);
+
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "⚙ {}",
+                                                crate::workflow_picker::display_label(
+                                                    &workflow.name
+                                                )
+                                            ))
+                                            .strong(),
+                                        );
+                                        // anvil 的 sublabel 语义：有描述用描述，
+                                        // 否则回退到命令模板本身。
+                                        let sublabel = if workflow.description.is_empty() {
+                                            crate::workflow_picker::display_command_preview(
+                                                &workflow.command,
+                                            )
+                                        } else {
+                                            crate::workflow_picker::display_label(
+                                                &workflow.description,
+                                            )
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(sublabel)
+                                                    .size(10.0)
+                                                    .color(ui.visuals().weak_text_color()),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+
+                                    // anvil 的 right-hint 语义：标签以 `:` 前缀
+                                    // 列出（`:` 是源实现里工作流的 palette 前缀）。
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let right = if workflow.tags.is_empty() {
+                                                ":".to_string()
+                                            } else {
+                                                format!(
+                                                    ":{}",
+                                                    workflow
+                                                        .tags
+                                                        .iter()
+                                                        .map(|tag| {
+                                                            crate::workflow_picker::display_label(
+                                                                tag,
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(",")
+                                                )
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(right)
+                                                    .size(10.0)
+                                                    .monospace()
+                                                    .color(ui.visuals().weak_text_color()),
+                                            );
+                                        },
+                                    );
+                                });
+
+                                // 高亮项保持可见
+                                if is_selected {
+                                    item_response
+                                        .response
+                                        .scroll_to_me(Some(egui::Align::Center));
+                                }
+
+                                let click_response = ui
+                                    .interact(
+                                        item_response.response.rect,
+                                        item_response.response.id.with("workflow_click"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if click_response.hovered() {
+                                    hovered_workflow_index = Some(idx);
+                                }
+                                if click_response.clicked() {
+                                    accepted_workflow = Some(workflow.clone());
+                                }
+
+                                ui.separator();
+                            }
+
+                            if results.is_empty() {
+                                let hint = if entries_empty {
+                                    let dir = crate::workflows::user_workflow_dir()
+                                        .map(|dir| dir.display().to_string())
+                                        .unwrap_or_else(|| "~/.config/ember/workflows/".into());
+                                    format!(
+                                        "No workflows yet — add TOML/YAML templates under {dir}"
+                                    )
+                                } else {
+                                    "No workflows match".to_string()
+                                };
+                                ui.label(
+                                    egui::RichText::new(hint).color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                        });
+
+                    // 底部提示：Enter 只回填或打开参数对话框，绝不执行
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("↑↓ Navigate  Enter Select  Esc Cancel")
+                                .size(10.0)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+                });
+        }
+
+        if let Some(index) = hovered_workflow_index {
+            if let Some(state) = self.workflow_picker.as_mut() {
+                state.selected = index;
+            }
+        }
+        if let Some(workflow) = accepted_workflow {
+            self.workflow_picker_accept(workflow);
+        }
+
+        // 工作流参数填写对话框（anvil 的 dialogs/workflow.rs 对应物）：逐参数
+        // 一行文本框，预填声明的默认值；Insert command 只回填提示符。渲染失败
+        // 时对话框保持打开并显示错误（与 anvil 一致）。
+        let mut submit_args_clicked = false;
+        let mut cancel_args_clicked = false;
+        if self.workflow_args.is_some() {
+            let screen_rect = ctx.viewport_rect();
+            let dialog_width = (screen_rect.width() - 64.0).clamp(360.0, 560.0);
+            let dialog_pos = egui::pos2(
+                screen_rect.center().x - dialog_width / 2.0,
+                screen_rect.top() + (screen_rect.height() * 0.18).max(24.0),
+            );
+
+            egui::Window::new("Workflow Parameters")
+                .title_bar(false)
+                .resizable(false)
+                .movable(false)
+                .default_pos(dialog_pos)
+                .default_width(dialog_width)
+                .frame(egui::Frame {
+                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
+                    stroke: egui::Stroke::new(
+                        1.0,
+                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
+                    ),
+                    corner_radius: egui::CornerRadius::same(10),
+                    inner_margin: egui::Margin::same(8),
+                    ..Default::default()
+                })
+                .show(ctx, |ui| {
+                    let Some(state) = self.workflow_args.as_mut() else {
+                        return;
+                    };
+
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Workflow: {}",
+                            crate::workflow_picker::display_label(&state.workflow.name)
+                        ))
+                        .strong(),
+                    );
+                    if !state.workflow.description.is_empty() {
+                        ui.label(
+                            egui::RichText::new(crate::workflow_picker::display_label(
+                                &state.workflow.description,
+                            ))
+                            .size(10.0)
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    // 命令模板预览（anvil 的 <tt> 对应物）：等宽、可只读查看。
+                    ui.label(
+                        egui::RichText::new(crate::workflow_picker::display_command_preview(
+                            &state.workflow.command,
+                        ))
+                        .monospace()
+                        .size(10.0),
+                    );
+                    ui.separator();
+
+                    let mut focus_first = state.needs_focus;
+                    state.needs_focus = false;
+                    for (index, arg) in state.workflow.args.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(140.0);
+                                ui.label(
+                                    egui::RichText::new(crate::workflow_picker::display_label(
+                                        &arg.name,
+                                    ))
+                                    .size(11.0),
+                                );
+                                if !arg.description.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(crate::workflow_picker::display_label(
+                                            &arg.description,
+                                        ))
+                                        .size(9.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+                            });
+                            let Some(value) = state.values.get_mut(index) else {
+                                return;
+                            };
+                            let edit =
+                                egui::TextEdit::singleline(value).desired_width(f32::INFINITY);
+                            let response = ui.add(edit);
+                            if focus_first {
+                                response.request_focus();
+                                focus_first = false;
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+
+                    if let Some(error) = state.error.as_deref() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            crate::workflow_picker::display_label(error),
+                        );
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Enter Insert at Prompt  Esc Cancel")
+                                .size(10.0)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Insert command").clicked() {
+                                submit_args_clicked = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel_args_clicked = true;
+                            }
+                        });
+                    });
+                });
+        }
+
+        if cancel_args_clicked {
+            self.workflow_args = None;
+        }
+        if submit_args_clicked {
+            self.submit_workflow_args();
+        }
+
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
         let mut clicked_hit_index = None;
         let mut clicked_bookmark_target = None;

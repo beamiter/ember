@@ -203,6 +203,12 @@ impl CommandPalette {
                 "Fuzzy-search persisted shell commands; Enter fills the prompt without running it",
                 crate::keybindings::Command::HistoryPickerToggle,
             ),
+            CommandInfo::new(
+                "Open Workflows",
+                CommandCategory::Search,
+                "Fuzzy-search parameterized command templates; Enter fills the prompt without running it",
+                crate::keybindings::Command::WorkflowPickerToggle,
+            ),
             // === 终端操作 ===
             CommandInfo::new(
                 "Scroll Up",
@@ -770,6 +776,7 @@ mod tests {
             Command::SearchHistoryNext,
             Command::SearchReplaceToggle,
             Command::HistoryPickerToggle,
+            Command::WorkflowPickerToggle,
             Command::TerminalSendSigint,
             Command::TerminalSendEof,
             Command::TerminalClear,

@@ -283,6 +283,14 @@ pub struct TerminalApp {
     /// 尾部；Enter 只回填提示符，绝不执行。`None` 表示浮层未打开。
     pub history_picker: Option<crate::history_picker::HistoryPickerState>,
 
+    /// 工作流选择器（Ctrl+Shift+M，anvil/forge 的 workflows）。打开时同步加载
+    /// 有界目录扫描；Enter 对无参数工作流直接回填提示符，有参数则打开填写
+    /// 对话框（`workflow_args`）。两者都为 `None` 表示浮层未打开。
+    pub workflow_picker: Option<crate::workflow_picker::WorkflowPickerState>,
+    /// 工作流参数填写对话框。只与 `workflow_picker` 同时存在；提交成功后两者
+    /// 一起关闭。
+    pub workflow_args: Option<crate::workflow_picker::WorkflowArgsState>,
+
     // Force resize flag for new sessions
     pub force_resize_session: bool,
 
