@@ -1790,10 +1790,9 @@ impl TerminalApp {
 
                     ui.separator();
 
-                    // 结果索引已经由核心在查询变化时缓存；这一帧只借用可见行。
-                    // Workflow 的命令/标签总计可接近文件预算，逐帧深拷贝 15 条
-                    // 会把一次普通重绘放大到数 MiB。只有真正点击的那一条需要
-                    // 在闭包外继续存活，届时再克隆。
+                    // 这一帧只借用可见行。Workflow 的命令/标签总计可接近文件
+                    // 预算，逐帧深拷贝 15 条会把一次普通重绘放大到数 MiB。只有
+                    // 真正点击的那一条需要在闭包外继续存活，届时再克隆。
                     let results = state.filtered();
                     let selected_index = state.selected();
                     let entries_empty = results.is_empty() && state.query().is_empty();
