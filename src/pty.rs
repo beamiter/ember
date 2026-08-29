@@ -1500,7 +1500,9 @@ mod unix_pty {
                     .expect_err("EOF after a partial record must be rejected")
             };
             assert!(
-                error.to_string().contains("Incomplete shell startup status"),
+                error
+                    .to_string()
+                    .contains("Incomplete shell startup status"),
                 "unexpected error: {error:#}"
             );
         }

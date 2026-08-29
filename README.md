@@ -619,7 +619,8 @@ Defaults include:
 | Toggle bookmark on the active completed block (or selected Block Search hit) | `Ctrl+Shift+B` |
 | Previous / next bookmarked block (wrapping) | `Ctrl+,` / `Ctrl+.` |
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
-| Toggle Agent panel | `Ctrl+Shift+Alt+A` |
+| Toggle Agent panel (per-command approval) | `Ctrl+Alt+G` |
+| Toggle AI chats library (read-only; nothing runs) | `Ctrl+Shift+Alt+A` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
 

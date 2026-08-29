@@ -205,9 +205,9 @@ impl SessionExportBlock {
         let command = (!self.command_truncated)
             .then_some(self.command.as_deref())
             .flatten();
-        let finished = self.finished_at_ms.map(|ms| {
-            block_mode::format_local_datetime(ms / 1000, self.tz_offset_secs)
-        });
+        let finished = self
+            .finished_at_ms
+            .map(|ms| block_mode::format_local_datetime(ms / 1000, self.tz_offset_secs));
         block_mode::block_markdown_with_lifecycle(
             &block_mode::MarkdownBlock {
                 command,
@@ -265,7 +265,9 @@ pub fn snapshot_session(
             .saturating_add(record.command.as_ref().map_or(0, String::len))
             .saturating_add(record.cwd.as_ref().map_or(0, String::len))
             .saturating_add(128);
-        source_bytes = source_bytes.checked_add(record_bytes).ok_or_else(too_large)?;
+        source_bytes = source_bytes
+            .checked_add(record_bytes)
+            .ok_or_else(too_large)?;
         if source_bytes > MAX_SESSION_EXPORT_SOURCE_BYTES {
             return Err(too_large());
         }
@@ -403,8 +405,11 @@ fn write_session_export(
     persistence_file::ensure_private_directory(directory)?;
     for attempt in 0..100u32 {
         let path = directory.join(export_file_name(stamp, format.extension(), attempt));
-        match persistence_file::write_new_private_file(&path, contents, MAX_SESSION_EXPORT_BYTES as u64)
-        {
+        match persistence_file::write_new_private_file(
+            &path,
+            contents,
+            MAX_SESSION_EXPORT_BYTES as u64,
+        ) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),

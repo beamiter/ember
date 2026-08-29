@@ -2807,6 +2807,128 @@ impl TerminalApp {
         Ok(())
     }
 
+    /// Start a palette `?` natural-language command suggestion (anvil's
+    /// `handle_palette_ask_ai`). The request is pane-bound to the currently
+    /// active session; preflight failures (AI disabled/unconfigured, cloud
+    /// context sharing not consented) are toasted and open nothing.
+    pub(crate) fn start_ai_command_suggestion(&mut self, request: String) {
+        let index = self.session_manager.active_index();
+        let Some((session_id, cwd)) = self.session_manager.sessions().get(index).map(|session| {
+            let cwd = session
+                .terminal
+                .lock()
+                .current_working_dir
+                .clone()
+                .unwrap_or_else(|| ".".to_string());
+            (session.metadata.session_id.clone(), cwd)
+        }) else {
+            return;
+        };
+        if self
+            .session_manager
+            .sessions()
+            .get(index)
+            .is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::RetainedCommand
+            })
+        {
+            self.set_status("Exited task terminals are read-only");
+            return;
+        }
+        let shell = self
+            .config
+            .shell
+            .clone()
+            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()));
+        match crate::ai_command_suggestion::AiCommandSuggestion::start(
+            &self.config,
+            session_id,
+            request,
+            cwd,
+            shell,
+        ) {
+            Ok(session) => {
+                // Replacing drops the old session, which cancels its worker.
+                self.ai_command_suggestion = Some(session);
+            }
+            Err(message) => {
+                self.set_status_for(message, std::time::Duration::from_secs(6));
+            }
+        }
+    }
+
+    /// Apply an accepted AI command suggestion. Identical prompt guards to
+    /// the correction path, but a generated command is only ever *inserted*
+    /// for review (`run = false` does not exist here): the user presses Enter
+    /// themselves. anvil's invariant — generated commands never run
+    /// automatically.
+    pub(crate) fn apply_ai_command_suggestion(
+        &mut self,
+        effect: &crate::ai_command_suggestion::SuggestionEffect,
+    ) -> Result<(), String> {
+        let Some(index) = self.session_manager.index_of(&effect.session_id) else {
+            return Err("The suggested command's session no longer exists".to_string());
+        };
+        if self.session_manager.active_index() != index {
+            return Err("The suggested command's session is no longer active".to_string());
+        }
+        if self
+            .session_manager
+            .sessions()
+            .get(index)
+            .is_some_and(|session| {
+                session.purpose == crate::session::SessionPurpose::RetainedCommand
+            })
+        {
+            return Err("Exited task terminals are read-only".to_string());
+        }
+        let direct_input_blocked = self.direct_input_is_blocked_for_session(&effect.session_id);
+        let Some(session) = self.session_manager.get_session_mut(index) else {
+            return Err("The suggested command's session no longer exists".to_string());
+        };
+        let pending_input = direct_input_blocked || !session.pending_input.is_empty();
+        let (alt_screen, prompt_ready, bracketed_paste, prompt_empty) = {
+            let terminal = session.terminal.lock();
+            (
+                terminal.is_alt_buffer(),
+                terminal.shell_is_prompt_ready(),
+                terminal.is_bracketed_paste_enabled(),
+                terminal.prompt_input_is_empty(),
+            )
+        };
+        if alt_screen {
+            return Err(
+                "Cannot insert a suggestion while an alternate-screen app is open".to_string(),
+            );
+        }
+        if !prompt_ready {
+            return Err("Wait for the shell prompt before inserting a suggestion".to_string());
+        }
+        if !bracketed_paste {
+            return Err("Safe insertion requires bracketed-paste mode".to_string());
+        }
+        if pending_input {
+            return Err("Wait for pending terminal input to be delivered".to_string());
+        }
+        if !prompt_empty {
+            return Err("Clear the current prompt before inserting a suggestion".to_string());
+        }
+        let payload = correction_replay_payload(&effect.command, false)
+            .map_err(|error| format!("Suggestion rejected: {error}"))?;
+        session
+            .shell
+            .write(&payload)
+            .map_err(|error| format!("Suggestion write failed: {error}"))?;
+        let mut terminal = session.terminal.lock();
+        terminal.note_user_input(&payload);
+        terminal.scroll_to_bottom();
+        drop(terminal);
+        session.projection_view_state.scroll_to_bottom();
+        self.clear_block_selection_for_session(&effect.session_id);
+        self.set_status("Suggestion inserted at prompt for review");
+        Ok(())
+    }
+
     /// `block:select_prev`: move the block selection to the next-older
     /// selectable block (or start at the newest when nothing is selected).
     pub(crate) fn block_select_prev(&mut self) {

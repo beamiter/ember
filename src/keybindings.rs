@@ -127,7 +127,18 @@ pub enum Command {
 
     // === 侧边栏 ===
     SidebarToggle,
+    /// Agent 面板（按命令逐条批准后才执行）。默认 `ctrl+alt+g`——与
+    /// anvil/forge/frost 的 `OpenAgent` 同键位。此前 ember 把它放在
+    /// Ctrl+Shift+Alt+A 上，而那个键位在其余三个终端都是 AI 聊天面板：
+    /// 同一个手势在 ember 打开会执行命令的 Agent，在别处打开只读聊天库，
+    /// 这是家族契约里最不该错的方向，所以 ember 让回家族键位。
     AgentToggle,
+    /// 持久化 AI 聊天库面板（anvil `ToggleAiPanel` 的 ember 对应物；会话级，
+    /// 不绑定特定 pane，回复只读展示，绝不触碰 PTY）。默认
+    /// `ctrl+shift+alt+a`——anvil/forge/frost 的 AI 面板键位，命令 id 用
+    /// 家族 canonical 的单数形 `ai_chat:toggle`（与 `agent:toggle`、
+    /// `sidebar:toggle`、`debug:toggle` 同构）。
+    AiChatToggle,
 
     // === 配套 shell ===
     /// 在独立会话里安装或更新 jsh。
@@ -220,6 +231,7 @@ impl std::fmt::Display for Command {
             Command::DebugToggle => write!(f, "debug:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
+            Command::AiChatToggle => write!(f, "ai_chat:toggle"),
             Command::JshInstall => write!(f, "jsh:install"),
             Command::RemotePicker => write!(f, "remote:picker"),
         }
@@ -305,6 +317,7 @@ impl std::str::FromStr for Command {
             "debug:toggle" => Ok(Command::DebugToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
+            "ai_chat:toggle" => Ok(Command::AiChatToggle),
             "jsh:install" => Ok(Command::JshInstall),
             "remote:picker" => Ok(Command::RemotePicker),
             s if s.starts_with("session:jump:") => {
@@ -428,10 +441,15 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
 
-        // AI agent 面板
+        // AI 面板。两个键位都跟随 anvil/forge/frost：Ctrl+Alt+G 打开会执行
+        // 命令的 Agent，Ctrl+Shift+Alt+A 打开只读的 AI 聊天库。存储用
+        // `jterm_core::keybindings::Chord::canonical` 的 ctrl+shift+alt+ 顺序。
         bindings
             .bindings
-            .insert("ctrl+shift+alt+a".to_string(), "agent:toggle".to_string());
+            .insert("ctrl+alt+g".to_string(), "agent:toggle".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+a".to_string(), "ai_chat:toggle".to_string());
         bindings
             .bindings
             .insert("ctrl+shift+s".to_string(), "remote:picker".to_string());
@@ -540,8 +558,8 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+k".to_string(), "block:clear".to_string());
-        // Warp/anvil/forge 的批量 block 工作流。Agent 移到
-        // Ctrl+Shift+Alt+A，为 Select all blocks 让出家族统一键位。
+        // Warp/anvil/forge 的批量 block 工作流。Agent 让出这个键位给
+        // Select all blocks（家族统一），自己搬到家族的 Ctrl+Alt+G。
         bindings
             .bindings
             .insert("ctrl+shift+a".to_string(), "block:select_all".to_string());
@@ -940,9 +958,43 @@ mod tests {
             Command::PaneSwap,
             Command::HistoryPickerToggle,
             Command::WorkflowPickerToggle,
+            Command::AiChatToggle,
         ] {
             assert_eq!(command.to_string().parse::<Command>().unwrap(), command);
         }
+    }
+
+    #[test]
+    fn the_ai_chord_pair_matches_the_family_and_is_never_swapped() {
+        // 这一对键位是家族契约里最不该错的一条：Ctrl+Shift+Alt+A 在
+        // anvil/forge/frost 打开只读的 AI 聊天库，Ctrl+Alt+G 打开会把命令送进
+        // PTY 的 Agent。ember 曾经把两者对调（Agent 占了 AI 面板的键位，
+        // Agent 自己的家族键位空着），于是同一个手势在 ember 打开的是
+        // 「批准后执行命令」的面板，用户却以为还是只读的那个。
+        let bindings = KeyBindings::default_bindings();
+        assert_eq!(
+            bindings
+                .bindings
+                .get("ctrl+shift+alt+a")
+                .map(String::as_str),
+            Some("ai_chat:toggle")
+        );
+        assert_eq!(
+            bindings.bindings.get("ctrl+alt+g").map(String::as_str),
+            Some("agent:toggle")
+        );
+        // 命令 id 用家族 canonical 的单数形（与 `agent:toggle`、
+        // `sidebar:toggle`、`debug:toggle` 同构），且必须能往返。
+        assert_eq!(Command::AiChatToggle.to_string(), "ai_chat:toggle");
+        assert_eq!(
+            "ai_chat:toggle".parse::<Command>().unwrap(),
+            Command::AiChatToggle
+        );
+        // 存储与展示拼写都跟 `jterm_core::keybindings` 的 canonical 顺序走
+        // （Ctrl+Shift+Alt+Super+Key），而不是各家自己排。
+        let chord = jterm_core::keybindings::parse("ctrl+shift+alt+a").unwrap();
+        assert_eq!(chord.canonical(), "ctrl+shift+alt+a");
+        assert_eq!(chord.display(), "Ctrl+Shift+Alt+A");
     }
 
     #[test]
@@ -962,7 +1014,11 @@ mod tests {
             ("ctrl+pageup", Command::SessionPrev),
             ("ctrl+shift+o", Command::ConfigToggle),
             ("ctrl+backslash", Command::SidebarToggle),
-            ("ctrl+shift+alt+a", Command::AgentToggle),
+            // 家族契约：Ctrl+Shift+Alt+A 是 AI 聊天面板（anvil/forge/frost
+            // 同键位），Agent 在 Ctrl+Alt+G。两者绝不能互换——一个只读展示，
+            // 另一个会把命令送进 PTY。
+            ("ctrl+shift+alt+a", Command::AiChatToggle),
+            ("ctrl+alt+g", Command::AgentToggle),
             ("ctrl+shift+a", Command::BlockSelectAll),
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+shift+b", Command::BlockToggleBookmark),

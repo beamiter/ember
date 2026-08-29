@@ -1145,6 +1145,18 @@ impl TerminalApp {
                     "AI agent 已关闭"
                 });
             }
+            keybindings::Command::AiChatToggle => match self.ai_chat_panel.toggle(&self.config) {
+                Ok(()) => {
+                    self.set_status(if self.ai_chat_panel.is_open {
+                        "AI chats 已打开：对话只读展示，不会执行任何命令"
+                    } else {
+                        "AI chats 已关闭"
+                    });
+                }
+                Err(message) => {
+                    self.set_status_for(message, std::time::Duration::from_secs(5));
+                }
+            },
         }
         false
     }
@@ -1722,6 +1734,7 @@ impl TerminalApp {
 
         let events_copy = self.frame_events.clone();
         let mut selected_command = None;
+        let mut ask_ai_request = None;
         for evt in &events_copy {
             let egui::Event::Key {
                 key, pressed: true, ..
@@ -1734,13 +1747,26 @@ impl TerminalApp {
                 egui::Key::ArrowUp => self.command_palette.select_prev(),
                 egui::Key::ArrowDown => self.command_palette.select_next(),
                 egui::Key::Enter => {
-                    selected_command = self.command_palette.get_selected_command();
+                    // `?` mode (anvil's palette Ask-AI flow): the request goes
+                    // to the review-only command suggestion, never to a PTY.
+                    ask_ai_request = self.command_palette.ask_ai_request();
+                    // Fail closed inside `?` mode: an empty or oversized
+                    // request must do nothing, never fall through and dispatch
+                    // whatever command happens to be highlighted.
+                    if ask_ai_request.is_none() && !self.command_palette.ask_ai_mode() {
+                        selected_command = self.command_palette.get_selected_command();
+                    }
                     break;
                 }
                 _ => {}
             }
         }
 
+        if let Some(request) = ask_ai_request {
+            self.command_palette.close();
+            self.start_ai_command_suggestion(request);
+            return (false, true);
+        }
         let close_requested = selected_command
             .map(|command| self.dispatch_palette_command(ctx, command))
             .unwrap_or(false);

@@ -337,6 +337,13 @@ pub struct TerminalApp {
     /// Review-first correction offers for narrowly classified failed commands
     /// (anvil/forge `command_correction` parity). Inert while AI is disabled.
     pub command_correction: crate::command_correction::CorrectionMonitor,
+    /// Persistent AI chats library (anvil `ai_panel`/`ai_chat_store` parity):
+    /// named conversations persisted at ~/.config/ember/ai_chats.json.
+    /// Read-only chat surface — replies are displayed, never executed.
+    pub ai_chat_panel: crate::ai_chat_panel::AiChatPanel,
+    /// In-flight palette `?` natural-language command suggestion (anvil's
+    /// `ai_palette_ops`). The generated command is insert-for-review only.
+    pub ai_command_suggestion: Option<crate::ai_command_suggestion::AiCommandSuggestion>,
     /// Native, read-only Git review surface requested by a structured Agent
     /// task. Git probes run on its bounded background worker.
     pub agent_diff: crate::agent::AgentDiffPanel,

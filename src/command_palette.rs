@@ -3,6 +3,14 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use std::collections::VecDeque;
 
+/// Ask-AI request budget, enforced fail-closed at the palette entry (forge's
+/// `MAX_AI_QUERY_BYTES`). The number is core's own `MAX_USER_PROMPT_BYTES`
+/// (jterm_core/src/ai/mod.rs:41), which is private: past it `sample_output`
+/// elides the middle of the request, so an unbounded request reaches the
+/// model with a hole in it and the review card presents the resulting command
+/// as an ordinary suggestion. Refusing is the only honest answer.
+pub const MAX_AI_QUERY_BYTES: usize = 64 * 1024;
+
 /// 命令类别
 #[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandCategory {
@@ -519,6 +527,12 @@ impl CommandPalette {
                 crate::keybindings::Command::AgentToggle,
             ),
             CommandInfo::new(
+                "Toggle AI Chats",
+                CommandCategory::Window,
+                "Open/close the persistent AI chats library (read-only conversations; nothing runs)",
+                crate::keybindings::Command::AiChatToggle,
+            ),
+            CommandInfo::new(
                 "Connect to remote host",
                 CommandCategory::Session,
                 "Open a [[remote_hosts]] destination (ssh or container) in a new session",
@@ -590,6 +604,41 @@ impl CommandPalette {
         self.update_search_results();
     }
 
+    /// Ask-AI palette mode (anvil/forge's `?` prefix). When the raw query
+    /// starts with `?`, the remainder is a natural-language command request
+    /// for the review-only AI command suggestion — never a command to run.
+    /// Returns `Some` only for a non-empty request within the request budget.
+    ///
+    /// The leading trim matches anvil/forge, which parse `raw.trim_start()`
+    /// before looking for the `?`: a space typed (or left behind by a
+    /// backspace) in front of the prefix must not silently drop the user back
+    /// into ordinary command matching.
+    pub fn ask_ai_request(&self) -> Option<String> {
+        let rest = self.search_query.trim_start().strip_prefix('?')?;
+        let rest = rest.trim();
+        if rest.is_empty() || rest.len() > MAX_AI_QUERY_BYTES {
+            None
+        } else {
+            Some(rest.to_string())
+        }
+    }
+
+    /// True as soon as the query starts with `?`, even before the request is
+    /// non-empty, so the overlay can switch to the Ask-AI affordance.
+    pub fn ask_ai_mode(&self) -> bool {
+        self.search_query.trim_start().starts_with('?')
+    }
+
+    /// An Ask-AI request past the request budget. The affordance fails closed
+    /// (no row to accept) and the overlay says why, rather than sending a
+    /// request whose middle core would elide — forge's behaviour.
+    pub fn ask_ai_request_too_large(&self) -> bool {
+        self.search_query
+            .trim_start()
+            .strip_prefix('?')
+            .is_some_and(|rest| rest.trim().len() > MAX_AI_QUERY_BYTES)
+    }
+
     /// 关闭调色板
     pub fn close(&mut self) {
         self.is_open = false;
@@ -599,6 +648,12 @@ impl CommandPalette {
     pub fn update_search_results(&mut self) {
         self.search_results.clear();
         self.selected_index = 0;
+
+        // `?` switches to Ask-AI mode: the fixed command list is replaced by
+        // the single AI row, mirroring anvil's palette mode switch.
+        if self.ask_ai_mode() {
+            return;
+        }
 
         if self.search_query.is_empty() {
             // 如果没有搜索词，优先显示最近使用的命令
@@ -749,6 +804,70 @@ mod tests {
     }
 
     #[test]
+    fn ask_ai_prefix_switches_mode_and_extracts_the_request() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        assert!(!palette.ask_ai_mode());
+        assert_eq!(palette.ask_ai_request(), None);
+
+        // A bare `?` is already the mode but not yet a request.
+        palette.search_query = "?".to_string();
+        palette.update_search_results();
+        assert!(palette.ask_ai_mode());
+        assert_eq!(palette.ask_ai_request(), None);
+        assert!(palette.get_results().is_empty());
+
+        palette.search_query = "?  undo the last git commit  ".to_string();
+        palette.update_search_results();
+        assert_eq!(
+            palette.ask_ai_request().as_deref(),
+            Some("undo the last git commit")
+        );
+        // The fixed command list is replaced by the AI affordance row.
+        assert!(palette.get_results().is_empty());
+
+        // Ordinary queries and mid-string question marks never enter AI mode.
+        palette.search_query = "what does ? do".to_string();
+        palette.update_search_results();
+        assert!(!palette.ask_ai_mode());
+        assert_eq!(palette.ask_ai_request(), None);
+
+        // A leading space before the `?` is still Ask-AI (anvil/forge trim the
+        // raw query first). Without the trim the user silently gets the
+        // ordinary command list and Enter runs whatever row is highlighted.
+        palette.search_query = "  ? find large files".to_string();
+        palette.update_search_results();
+        assert!(palette.ask_ai_mode());
+        assert_eq!(
+            palette.ask_ai_request().as_deref(),
+            Some("find large files")
+        );
+        assert!(palette.get_results().is_empty());
+    }
+
+    #[test]
+    fn ask_ai_fails_closed_on_an_oversized_request() {
+        // Past the budget core elides the middle of the request and drafts a
+        // command from an instruction with a hole in it. Refuse instead.
+        let mut palette = CommandPalette::new();
+        palette.open();
+        let huge = "x".repeat(MAX_AI_QUERY_BYTES + 1);
+        palette.search_query = format!("? {huge}");
+        palette.update_search_results();
+        assert!(palette.ask_ai_mode());
+        assert!(palette.ask_ai_request_too_large());
+        assert_eq!(palette.ask_ai_request(), None, "no row may be accepted");
+
+        palette.search_query = format!("? {}", "x".repeat(MAX_AI_QUERY_BYTES));
+        palette.update_search_results();
+        assert!(!palette.ask_ai_request_too_large());
+        assert!(
+            palette.ask_ai_request().is_some(),
+            "the limit itself passes"
+        );
+    }
+
+    #[test]
     fn every_command_variant_is_discoverable() {
         use crate::keybindings::Command;
 
@@ -829,6 +948,7 @@ mod tests {
             Command::DebugToggle,
             Command::SidebarToggle,
             Command::AgentToggle,
+            Command::AiChatToggle,
             Command::JshInstall,
         ];
 

@@ -91,12 +91,9 @@ fn sessions_snapshot_for_persistence(
         // 窗格塞进快照只会在重启后冒出一个指向别处的重复页。被跳过页里
         // 的交互会话在恢复时按孤儿各自落到单窗格 tab。
         if tab.session_indices().into_iter().any(|index| {
-            session_manager
-                .sessions()
-                .get(index)
-                .is_none_or(|session| {
-                    session.purpose != crate::session::SessionPurpose::Interactive
-                })
+            session_manager.sessions().get(index).is_none_or(|session| {
+                session.purpose != crate::session::SessionPurpose::Interactive
+            })
         }) {
             continue;
         }
@@ -349,9 +346,7 @@ mod tests {
         assert!(title.ends_with('…'));
     }
 
-    fn interactive_fixture_session(
-        name: &str,
-    ) -> (crate::session::Session, String, egui::Context) {
+    fn interactive_fixture_session(name: &str) -> (crate::session::Session, String, egui::Context) {
         let repaint = egui::Context::default();
         let session_id = format!("test-{name}-{}", uuid::Uuid::new_v4());
         let shell = crate::shell::ShellSession::new_with_cwd(
@@ -386,7 +381,11 @@ mod tests {
         let task = manager
             .new_command_session_in_cwd(
                 "Agent".to_string(),
-                vec!["/bin/sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "exit 0".to_string(),
+                ],
                 std::path::Path::new("/tmp"),
                 80,
                 24,

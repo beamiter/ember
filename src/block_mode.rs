@@ -3243,7 +3243,10 @@ mod tests {
         // Whole-session export names use the same civil math, filename-safe.
         assert_eq!(compact_local_datetime(0, 0), "19700101-000000");
         assert_eq!(compact_local_datetime(84_600, 28_800), "19700102-073000");
-        assert_eq!(compact_local_datetime(1_000_000_000, -19_800), "20010908-201640");
+        assert_eq!(
+            compact_local_datetime(1_000_000_000, -19_800),
+            "20010908-201640"
+        );
     }
 
     #[test]

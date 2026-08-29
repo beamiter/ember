@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (Remote Files thirty-round evolution)
+Updated: 2026-08-29 (shared AI chat store adoption)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,91 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Shared AI chat store adoption — one library state machine for the family
+  (2026-08-29)**: `src/ai_chat_store.rs` is now a 76-line shim over
+  `jterm_core::ai::chat_store`. Ember's own ~900-line port of anvil's multi-chat
+  store, and the unit tests that pinned it, are gone: all four terminals had
+  grown a private copy of the same state over the shared
+  `jterm_core::ai::ConversationSnapshot` schema, all four had drifted, and no
+  copy was correct alone, so the core now carries their union (1,888 lines, 47
+  tests) and every app keeps only a shim. The core's copy is stricter than
+  ember's port was in the ways that matter here: a library-wide 8 MiB
+  live-history budget with real compaction, library previews sanitized through
+  `review_input::safe_inline_display`, idempotent draft merging so a recovered
+  retry cannot multiply itself across saves, and an at-capacity guard so
+  archiving cannot mutate and then fail. The one decision ember still owns is
+  `BusyChatPolicy::Refuse`, pinned on both `new_store` and `restore_store` and
+  tested on both construction paths — nothing in the panel cancels an in-flight
+  request before archiving or deleting a chat (forge's panel does, and takes
+  `Allow`), so a policy flip would silently orphan a running request's chat.
+
+- **AI chat library persistence — compaction before serialising, and failures
+  the user can see (2026-08-29)**: `persist_encoded` now builds its snapshot
+  with `snapshot_for_persistence`, which compacts the library *before*
+  `ConversationSnapshot::from_chats` validates it. Ember's port compacted
+  nothing on the way out and bounded no library as a whole — the store's other
+  caps are per chat (100 turns, 256 KiB per assistant reply), which a 50-chat
+  library outgrows — so a long-lived library could reach a size persistence
+  refuses, after which `Err(SnapshotInvalid)` was the only outcome and nothing
+  could be saved at all, every later chat included. The budgets are
+  deliberately unequal (8 MiB live history, 4 MiB of persisted turn text), so
+  `from_chats` still compacts on the way out and reports it through its returned
+  flag; the durable view is a clone, so `persist_library_to` folds the written
+  snapshot back with `sync_truncation_markers` and the chat row plus the status
+  line say what the file could not keep instead of a short saved copy looking
+  complete. The clone is flattened with `recover_retry_payload_detaching` — the
+  refusing `recover_retry_payload` is right for a live chat, but here the live
+  chat legitimately still has its request in flight and must keep its own draft.
+  Above that, the library file keeps its own 4 MiB budget (statically asserted
+  below `MAX_CONVERSATION_SNAPSHOT_JSON_BYTES`) with `compact_to_measured_limit`
+  measuring the real encoding. Write failures are no longer only a `log::warn`:
+  a GUI launch never shows stderr, so a library that stopped saving looked
+  exactly like one that saves fine until the next launch found the session's
+  chats gone. `PersistOutcome::Failed` now carries a sentence to the panel, and
+  a window that will never write — a non-owner instance, or a blocked restore
+  refusing to overwrite a file it could not read — says so above the
+  conversation rather than in a startup log line.
+
+- **Palette Ask-AI repairs — a dismissible card and a provable session
+  (2026-08-29)**: the `?` suggestion review card could not be dismissed at all.
+  Dismiss, Escape and the window ✕ were all no-ops, because
+  `SuggestionUiOutcome` had no `Dismissed` variant: nothing but a successful
+  insert or closing the bound terminal ever cleared
+  `TerminalApp::ai_command_suggestion`, and `show` re-rendered the card on the
+  very next frame. The variant exists, `rendering.rs` drops the session on it,
+  and dismissing also cancels the request still running behind the card, which
+  nothing would otherwise harvest. `generation` was the constant `1` on every
+  session, so both `suggestion_reply_is_current` and `complete_accept` compared
+  `x == x` — the staleness defence was inert and every card in every pane shared
+  one egui window id; a process-wide monotonic counter now makes a reply or an
+  accept-effect that outlived its session provably stale. The palette entry
+  fails closed in the same direction: `?` switches the list to the single AI
+  row, an empty request accepts nothing rather than falling through and
+  dispatching whatever command happens to be highlighted, a request past
+  `MAX_AI_QUERY_BYTES` (64 KiB, core's own private `MAX_USER_PROMPT_BYTES`,
+  past which `sample_output` elides the middle of the instruction) is refused
+  with the reason on screen, and the raw query is trimmed before the prefix
+  check so a leading space cannot silently drop the user back into ordinary
+  command matching. The generated command is inserted for review through the
+  same guarded prompt-write path as command correction — alt-screen, prompt
+  readiness, bracketed paste, pending input and an empty prompt are all
+  required — and Enter stays the user's own keypress.
+
+- **AI chord and history-cwd contracts (2026-08-29)**: `Ctrl+Shift+Alt+A` now
+  opens the read-only AI chats library, as it does in anvil, forge and frost;
+  `agent:toggle` moved off it to the family's `Ctrl+Alt+G`. Ember was the one
+  terminal where that gesture opened the panel that runs commands after
+  approval, which is the worst direction for a family contract to be wrong in.
+  The command id is the canonical singular `ai_chat:toggle` (matching
+  `agent:toggle`, `sidebar:toggle`, `debug:toggle`), and a test pins the pair,
+  the round trip, and `jterm_core::keybindings::Chord`'s canonical
+  `ctrl+shift+alt+a` storage and `Ctrl+Shift+Alt+A` display spelling.
+  Separately, `history_picker::MAX_HISTORY_CWD_BYTES` rises from 4 KiB to the
+  16 KiB `jterm_core::command_history` itself writes with: the family shares one
+  JSONL history file, so the smaller bound silently degraded a deep directory to
+  `cwd: None` on write (permanently, with no notice) and erased a sibling
+  terminal's 4–16 KiB cwd on read.
 
 - **Remote Files rounds 21–30 — transactional navigation and bounded ageing
   (2026-08-29)**: endpoint switches stage both home discovery and the first
@@ -484,8 +569,24 @@ fail closed.
 
 ## Remaining boundaries
 
-No open boundaries remain; the font-input descriptor boundary recorded above
-was the last item in this section.
+- **The AI chat surface is still uncommitted work in progress.**
+  `src/ai_chat_panel.rs`, `src/ai_chat_store.rs`, `src/ai_command_suggestion.rs`
+  are untracked and their wiring (`main.rs`, `app/state.rs`, `app/input.rs`,
+  `app/commands.rs`, `app/rendering.rs`, `app/tabs.rs`, `command_palette.rs`,
+  `keybindings.rs`) is unstaged, exactly as before this round. This round moved
+  that work's store onto the shared core and repaired defects in it; it did not
+  land it.
+- **The shared-core pin advanced to a published revision.** `jterm_core` is
+  pinned at `1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb`, the commit that
+  introduces `ai::chat_store`, and the transitive `jagent` in `Cargo.lock` is
+  `f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf`. Both were published before
+  the pin moved, the temporary local `[patch]` used to develop the two
+  together is gone, and the full gate below — including `--locked` — was rerun
+  against the published revisions. Note that `UPGRADE_ROUNDS.md` round 37
+  records the pin advancing to `0f47569`; the manifest never held that value,
+  and the entry is left as written rather than rewritten after the fact.
+- The font-input descriptor boundary recorded above was the last item carried
+  from the previous handoff; no other boundaries remain.
 
 ## Release checks
 
@@ -497,3 +598,9 @@ bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 bash scripts/test-install-paths.sh
 ```
+
+Run on 2026-08-29 for this tree: `cargo fmt --all -- --check` and
+`cargo clippy --locked --all-targets --all-features -- -D warnings` are clean,
+and `cargo test` reports 1,264 unit tests plus the native Codex worker
+end-to-end test passing with zero failures. The install-script checks were not
+re-run; nothing in this round touches `scripts/`.

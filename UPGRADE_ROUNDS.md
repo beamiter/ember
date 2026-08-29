@@ -97,5 +97,59 @@ Block Mode convergence continues with rounds 31–37:
     to `0f47569`, adopting AI origin/credential/no-proxy validation while retaining the
     established block lifecycle API.
 
+AI chat store convergence adds rounds 38–48 (2026-08-29):
+
+38. **Store moved into the shared core** — `src/ai_chat_store.rs` is now a
+    76-line shim over `jterm_core::ai::chat_store`; ember's ~900-line port of
+    anvil's multi-chat store and the tests pinning it are gone, and all four
+    terminals run the same 1,888-line union (47 tests).
+39. **Compaction before serialising** — `persist_encoded` builds its snapshot
+    with `snapshot_for_persistence`, so a library that outgrew the schema's
+    envelope compacts on the way out instead of returning `SnapshotInvalid`
+    forever and taking every later chat down with it.
+40. **Truncation travels back to the live chat** — the durable view is a clone,
+    so the written snapshot is folded back with `sync_truncation_markers`; the
+    chat row and status line say what the file could not keep instead of a
+    short saved copy looking complete.
+41. **Busy-chat policy is a construction-time choice** — `new_store` and
+    `restore_store` both pin `BusyChatPolicy::Refuse` (ember's panel has no
+    cancel-then-mutate step) and a test pins both paths, while the persistence
+    clone uses `recover_retry_payload_detaching` so flattening the copy leaves
+    the live request and its draft alone.
+42. **Save failures are visible** — `PersistOutcome::Failed` carries a sentence
+    to the panel instead of only a `log::warn` a GUI launch never shows, and a
+    window that will never write — a non-owner instance, or a blocked restore
+    refusing to overwrite an unreadable file — says so above the conversation.
+43. **The suggestion card can be dismissed** — `SuggestionUiOutcome` gained
+    `Dismissed`; Dismiss, Escape and the window ✕ were all no-ops because only
+    a successful insert or closing the bound terminal cleared the session and
+    `show` re-rendered the card next frame. Dismissing now also cancels the
+    in-flight request nothing would otherwise harvest.
+44. **Per-session suggestion generation** — `generation` was the constant `1`
+    on every session, so the reply guard and `complete_accept` both compared
+    `x == x` and every card shared one egui window id; a monotonic counter
+    makes a stale reply or accept-effect provable.
+45. **Ask-AI palette mode fails closed** — `?` replaces the command list with
+    one AI row; an empty request accepts nothing rather than dispatching the
+    highlighted command, an oversized one is refused with the reason on screen,
+    and the raw query is trimmed first so a leading space cannot silently drop
+    back into ordinary command matching.
+46. **Family AI chord** — `Ctrl+Shift+Alt+A` opens the read-only chats library
+    as `ai_chat:toggle` and `agent:toggle` moves to the family's `Ctrl+Alt+G`;
+    ember was the one terminal where that gesture opened the panel that runs
+    commands. A test pins the pair, the singular id, and `jterm_core`'s
+    canonical storage/display spelling.
+47. **History cwd bound matches the shared writer** — `MAX_HISTORY_CWD_BYTES`
+    rises from 4 KiB to the 16 KiB `jterm_core::command_history` writes with, so
+    a deep directory is no longer silently persisted as `cwd: None` and a
+    sibling terminal's cwd is no longer erased on read.
+48. **Neighbour-timing spawn retry** — the PTY hangup test retries briefly on
+    `ETXTBSY` instead of failing the run when a sibling test forks while its
+    script is still open for writing.
+
 Verification: `bash scripts/test-install-paths.sh`, Ember config tests, and the
-full workspace formatting/check/Clippy/test gates.
+full workspace formatting/check/Clippy/test gates. Rounds 38–48 were checked
+with `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
+--all-features -- -D warnings`, and `cargo test` (1,264 unit tests plus the
+native worker end-to-end test, zero failures); `scripts/` is untouched by this
+pass.

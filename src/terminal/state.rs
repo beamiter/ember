@@ -3093,7 +3093,11 @@ impl super::TerminalState {
                     .map(|output| output.text.len())
                     .unwrap_or(0),
             );
-            if let Some(entry) = self.finished_output_provenance.get(&record.sequence).cloned() {
+            if let Some(entry) = self
+                .finished_output_provenance
+                .get(&record.sequence)
+                .cloned()
+            {
                 provenance.push(entry);
             }
             self.unregister_finished_output_zone(record.sequence);

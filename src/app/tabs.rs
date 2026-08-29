@@ -369,6 +369,16 @@ impl TerminalApp {
             self.task_manager.handle_terminal_session_closed(session_id);
             self.block_bookmarks.remove_session(session_id);
             self.command_correction.remove_session(session_id);
+            // A suggestion bound to a closed terminal can never be inserted;
+            // dropping it cancels any in-flight worker (anvil's
+            // close_command_suggestion_for_pane).
+            if self
+                .ai_command_suggestion
+                .as_ref()
+                .is_some_and(|suggestion| suggestion.session_id() == session_id)
+            {
+                self.ai_command_suggestion = None;
+            }
         }
         if self
             .pending_paste_confirm

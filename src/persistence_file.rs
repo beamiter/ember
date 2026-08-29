@@ -873,16 +873,17 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&victim).unwrap(), b"keep");
-        assert!(fs::symlink_metadata(&linked).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         // A failed or successful publish never leaves staging files behind.
-        assert!(fs::read_dir(&root.0)
+        assert!(fs::read_dir(&root.0).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(".tmp.")));
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp.")));
     }
 
     #[cfg(unix)]
@@ -919,7 +920,6 @@ mod tests {
             "the symlink target must not be tightened through the link"
         );
     }
-
 
     #[cfg(unix)]
     #[test]

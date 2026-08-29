@@ -1308,6 +1308,7 @@ impl TerminalApp {
         // 命令调色板 UI（中央弹窗）
         let mut clicked_palette_command = None;
         let mut hovered_palette_index = None;
+        let mut accepted_ask_ai = None;
         if self.command_palette.is_open {
             let screen_rect = ctx.viewport_rect();
             let palette_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
@@ -1316,6 +1317,9 @@ impl TerminalApp {
                 screen_rect.center().x - palette_width / 2.0,
                 screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
             );
+            let ask_ai_mode = self.command_palette.ask_ai_mode();
+            let ask_ai_request = self.command_palette.ask_ai_request();
+            let ask_ai_too_large = self.command_palette.ask_ai_request_too_large();
 
             egui::Window::new("Command Palette")
                 .title_bar(false)
@@ -1337,7 +1341,7 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     // 搜索输入框
                     ui.horizontal(|ui| {
-                        ui.label("🔍");
+                        ui.label(if ask_ai_mode { "✨" } else { "🔍" });
                         let search_response =
                             ui.text_edit_singleline(&mut self.command_palette.search_query);
                         if search_response.changed() {
@@ -1350,17 +1354,74 @@ impl TerminalApp {
                         if search_response.has_focus()
                             && self.command_palette.search_query.is_empty()
                         {
-                            ui.label("Search commands...");
+                            ui.label("Search commands... (? asks AI)");
                         }
                     });
 
                     ui.separator();
 
-                    // 命令列表
-                    // Own a snapshot so pointer actions can be applied after the
-                    // window closure without borrowing command_palette twice.
-                    let results = self.command_palette.get_results().to_vec();
-                    let selected_index = self.command_palette.selected_index;
+                    if ask_ai_mode {
+                        // anvil/forge 的 Ask-AI 模式：固定命令列表被替换为一条
+                        // AI 行。Enter/点击只起草命令供审阅——绝不直接执行。
+                        match ask_ai_request {
+                            Some(request) => {
+                                let row = ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(150, 150, 255),
+                                        "[Terminal]",
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("Ask AI: {request}"))
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Draft a shell command with the configured AI provider; the result is inserted for review only and never runs automatically",
+                                            )
+                                            .size(10.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                        );
+                                    });
+                                });
+                                let click_response = ui
+                                    .interact(
+                                        row.response.rect,
+                                        row.response.id.with("palette_ask_ai"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if click_response.clicked() {
+                                    accepted_ask_ai = Some(request);
+                                }
+                            }
+                            None if ask_ai_too_large => {
+                                // Fail closed and say so: core would elide the
+                                // middle of a request this long, so the draft
+                                // would answer an instruction with a hole in it.
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    format!(
+                                        "AI request is too large ({} KiB limit)",
+                                        crate::command_palette::MAX_AI_QUERY_BYTES / 1024
+                                    ),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Describe the command you want after the ? — e.g. ? find large files",
+                                    )
+                                    .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                        }
+                    } else {
+                        // 命令列表
+                        // Own a snapshot so pointer actions can be applied after the
+                        // window closure without borrowing command_palette twice.
+                        let results = self.command_palette.get_results().to_vec();
+                        let selected_index = self.command_palette.selected_index;
 
                     egui::ScrollArea::vertical()
                         .max_height(palette_height - 100.0)
@@ -1481,14 +1542,19 @@ impl TerminalApp {
                                 );
                             }
                         });
+                    }
 
                     // 底部提示
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("↑↓ Navigate  Enter Execute  Esc Cancel")
-                                .size(10.0)
-                                .color(ui.visuals().weak_text_color()),
+                            egui::RichText::new(if ask_ai_mode {
+                                "Enter Draft command  Esc Cancel"
+                            } else {
+                                "↑↓ Navigate  Enter Execute  Esc Cancel  ·  ? Ask AI"
+                            })
+                            .size(10.0)
+                            .color(ui.visuals().weak_text_color()),
                         );
                     });
                 });
@@ -1496,6 +1562,10 @@ impl TerminalApp {
 
         if let Some(index) = hovered_palette_index {
             self.command_palette.selected_index = index;
+        }
+        if let Some(request) = accepted_ask_ai {
+            self.command_palette.close();
+            self.start_ai_command_suggestion(request);
         }
         if let Some(command) = clicked_palette_command {
             self.dispatch_palette_command(ctx, command);
@@ -3014,6 +3084,74 @@ impl TerminalApp {
                             );
                         }
                     }
+                }
+            }
+        }
+        // AI chats library panel: harvest streaming replies every frame (also
+        // while hidden, so background chats complete and persist), then render.
+        self.ai_chat_panel.drive(ctx);
+        if self.ai_chat_panel.is_open {
+            self.ai_chat_panel.show(ctx, &self.config);
+        }
+        // Palette `?` AI command suggestion: harvest the reply, render the
+        // review card for its bound session, and apply an accept through the
+        // same guarded prompt-write path as command correction. The generated
+        // command is insert-only; Enter remains the user's own keypress.
+        let suggestion_outcome = if let Some(suggestion) = self.ai_command_suggestion.as_mut() {
+            suggestion.drive(&self.config, ctx);
+            let suggestion_active = self
+                .session_manager
+                .sessions()
+                .get(self.session_manager.active_index())
+                .map(|session| session.metadata.session_id.as_str());
+            let suggestion_prompt_clean_idle = self
+                .session_manager
+                .sessions()
+                .get(self.session_manager.active_index())
+                .map(|session| {
+                    let clean = {
+                        let terminal = session.terminal.lock();
+                        terminal.shell_is_prompt_ready()
+                            && !terminal.is_alt_buffer()
+                            && terminal.prompt_input_is_empty()
+                    };
+                    clean && session.pending_input.is_empty()
+                })
+                .unwrap_or(false);
+            suggestion.show(
+                ctx,
+                &self.config,
+                &self.current_theme,
+                suggestion_active,
+                suggestion_prompt_clean_idle,
+            )
+        } else {
+            crate::ai_command_suggestion::SuggestionUiOutcome::None
+        };
+        // Dismiss/Escape/✕ must actually remove the card: the session is
+        // otherwise cleared only by a *successful* insert or by closing the
+        // bound terminal, and `show` re-renders it on the very next frame.
+        if matches!(
+            suggestion_outcome,
+            crate::ai_command_suggestion::SuggestionUiOutcome::Dismissed
+        ) {
+            self.ai_command_suggestion = None;
+        }
+        if let crate::ai_command_suggestion::SuggestionUiOutcome::Accepted(effect) =
+            suggestion_outcome
+        {
+            let generation = effect.generation;
+            let session_id = effect.session_id.clone();
+            let result = self.apply_ai_command_suggestion(&effect);
+            if result.is_ok() {
+                self.ai_command_suggestion = None;
+            } else if let Some(suggestion) = self.ai_command_suggestion.as_mut() {
+                // Keep the card open with the refusal inline (anvil keeps the
+                // card and shows the reason in place). A newer `?` request may
+                // have replaced the session meanwhile; settle only the exact
+                // one the effect came from.
+                if suggestion.session_id() == session_id {
+                    suggestion.complete_accept(generation, result);
                 }
             }
         }

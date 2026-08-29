@@ -15,7 +15,14 @@ pub const PICKER_MAX_ENTRIES: usize = 2_000;
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更早的命令通过输入查询来召回。
 pub const MAX_RESULTS: usize = 15;
-const MAX_HISTORY_CWD_BYTES: usize = 4 * 1024;
+/// 与共享历史文件的写入方保持一致：`jterm_core::command_history` 的
+/// `MAX_CWD_BYTES`（jterm_core/src/command_history.rs:31）是 16 KiB，forge 的
+/// 读取侧用的也是同一个数。核心没有导出这个常量，所以这里照抄并注明出处。
+///
+/// 之前这里是 4 KiB：ember 在写入前用 `sanitized_cwd` 过滤，于是深层目录里
+/// 完成的命令被静默地写成 `cwd: None`（永久丢失，没有任何提示），读取时又把
+/// 兄弟终端写进来的 4–16 KiB cwd 抹掉，连按目录模糊召回都找不到。
+const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
@@ -166,6 +173,24 @@ impl HistoryPickerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cwd_bound_matches_the_shared_history_writer() {
+        // 家族共享同一个 JSONL 历史文件：核心的写入方（以及 forge 的读取方）
+        // 用 16 KiB。这里如果更小，ember 写入时会把深层目录静默降级成
+        // cwd: None（永久丢失），读取时又会把兄弟终端写进来的 cwd 抹掉。
+        let deep = "/".to_string() + &"segment/".repeat(1024);
+        assert!(deep.len() > 4 * 1024 && deep.len() < 16 * 1024);
+        assert_eq!(
+            sanitized_cwd(&deep),
+            Some(deep.as_str()),
+            "a cwd the shared writer accepts must survive ember's filter"
+        );
+        // 超过共享上限的仍然拒绝，而且拒绝的理由与控制字符/欺骗字符一致。
+        assert_eq!(sanitized_cwd(&"x".repeat(MAX_HISTORY_CWD_BYTES + 1)), None);
+        assert_eq!(sanitized_cwd("/tmp/\u{202e}gnp.sh"), None);
+        assert_eq!(sanitized_cwd("/tmp/a\nb"), None);
+    }
 
     struct TestDir(std::path::PathBuf);
 

@@ -1,5 +1,8 @@
 pub mod agent;
 mod agent_panel;
+mod ai_chat_panel;
+mod ai_chat_store;
+mod ai_command_suggestion;
 mod app;
 mod block_export;
 mod block_mode;
@@ -2311,6 +2314,10 @@ impl TerminalApp {
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
             command_correction: command_correction::CorrectionMonitor::default(),
+            // 与会话快照同一所有权规则：只有持实例锁的主窗口写共享聊天库文件，
+            // 后开的窗口可以浏览/对话但落盘由主窗口负责。
+            ai_chat_panel: ai_chat_panel::AiChatPanel::with_persistence_owner(is_first_instance),
+            ai_command_suggestion: None,
             agent_diff: agent::AgentDiffPanel::new(),
             task_manager: agent::TaskManager::new(),
             agent_runtime: agent::AgentRuntimeManager::new(),
@@ -7161,6 +7168,11 @@ impl Drop for TerminalApp {
     fn drop(&mut self) {
         // 保存 agent 会话（取消/清空会话时会删除快照文件）
         self.agent_panel.persist();
+
+        // 取消聊天面板在途请求并落盘聊天库（仅在面板曾成功加载、且本窗口是
+        // 持锁主实例时写入；加载失败的旧文件绝不覆盖）。
+        self.ai_chat_panel.cancel_all();
+        self.ai_chat_panel.persist();
 
         // 保存配置
         if self.config_save_pending {

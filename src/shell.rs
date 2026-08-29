@@ -1138,7 +1138,23 @@ mod tests {
         std::fs::set_permissions(&script_path, permissions).unwrap();
 
         let script = script_path.to_string_lossy().into_owned();
-        let session = ShellSession::new(80, 24, Some(&script), egui::Context::default()).unwrap();
+        // Cargo runs the suite as threads of one process: a sibling test that
+        // forks while this script is still open for writing hands its child a
+        // writable descriptor to it, and our exec then fails with ETXTBSY
+        // until that child execs. The window is a neighbour's timing, not this
+        // test's subject, so retry briefly instead of failing the run.
+        let spawn_deadline = Instant::now() + Duration::from_secs(5);
+        let session = loop {
+            match ShellSession::new(80, 24, Some(&script), egui::Context::default()) {
+                Ok(session) => break session,
+                Err(error)
+                    if error.contains("Text file busy") && Instant::now() < spawn_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("could not start the hangup script: {error}"),
+            }
+        };
 
         // The old implementation emitted Exit(-1) after a 30 ms reap window,
         // causing the live child to be dropped and killed before it could reopen.

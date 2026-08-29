@@ -4689,9 +4689,7 @@ fn clear_completed_blocks_keeps_live_records_and_monotonic_sequences() {
     // Sequences keep advancing, so a stale pre-clear UI id can never target a
     // record created after the clear.
     terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07next\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
-    assert!(
-        terminal.command_records().back().unwrap().sequence > live_sequence
-    );
+    assert!(terminal.command_records().back().unwrap().sequence > live_sequence);
 }
 
 #[test]
@@ -4794,7 +4792,6 @@ fn hard_reset_drops_the_undo_stash_with_the_rest_of_block_history() {
     assert_eq!(terminal.undo_clear_blocks(), 0);
     assert!(terminal.command_records().is_empty());
 }
-
 
 #[test]
 fn captured_output_cache_evicts_oldest_payloads_at_session_cap() {
