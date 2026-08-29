@@ -1737,6 +1737,11 @@ impl TerminalApp {
         // 执行），有参数的打开填写对话框。
         let mut accepted_workflow = None;
         let mut hovered_workflow_index = None;
+        // A stationary pointer can remain over a row while ArrowUp/Down moves
+        // the keyboard highlight. Treating mere continued hover as fresh
+        // input would immediately undo that move on every frame (the block
+        // search picker below uses the same movement gate).
+        let workflow_pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
         if self.workflow_picker.is_some() {
             let screen_rect = ctx.viewport_rect();
             let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
@@ -1770,26 +1775,28 @@ impl TerminalApp {
                     // 搜索输入框：编辑即重置高亮（与历史选择器一致）。
                     ui.horizontal(|ui| {
                         ui.label("⚙");
-                        let search_response = ui.text_edit_singleline(&mut state.query);
+                        let search_response = ui.text_edit_singleline(state.query_buffer_mut());
                         if search_response.changed() {
-                            state.selected = 0;
+                            state.sync_query();
                         }
                         if state.needs_focus {
                             search_response.request_focus();
                             state.needs_focus = false;
                         }
-                        if search_response.has_focus() && state.query.is_empty() {
+                        if search_response.has_focus() && state.query().is_empty() {
                             ui.label("Search workflows…");
                         }
                     });
 
                     ui.separator();
 
-                    // 快照一份结果，指针动作在窗口闭包外统一应用（与命令面板/
-                    // 历史选择器相同，避免对 workflow_picker 的双重借用）。
-                    let results: Vec<_> = state.filtered().into_iter().cloned().collect();
-                    let selected_index = state.selected;
-                    let entries_empty = results.is_empty() && state.query.is_empty();
+                    // 结果索引已经由核心在查询变化时缓存；这一帧只借用可见行。
+                    // Workflow 的命令/标签总计可接近文件预算，逐帧深拷贝 15 条
+                    // 会把一次普通重绘放大到数 MiB。只有真正点击的那一条需要
+                    // 在闭包外继续存活，届时再克隆。
+                    let results = state.filtered();
+                    let selected_index = state.selected();
+                    let entries_empty = results.is_empty() && state.query().is_empty();
 
                     egui::ScrollArea::vertical()
                         .max_height(picker_height - 100.0)
@@ -1887,11 +1894,11 @@ impl TerminalApp {
                                         egui::Sense::click(),
                                     )
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if click_response.hovered() {
+                                if click_response.hovered() && workflow_pointer_moved {
                                     hovered_workflow_index = Some(idx);
                                 }
                                 if click_response.clicked() {
-                                    accepted_workflow = Some(workflow.clone());
+                                    accepted_workflow = Some((*workflow).clone());
                                 }
 
                                 ui.separator();
@@ -1928,7 +1935,7 @@ impl TerminalApp {
 
         if let Some(index) = hovered_workflow_index {
             if let Some(state) = self.workflow_picker.as_mut() {
-                state.selected = index;
+                state.select(index);
             }
         }
         if let Some(workflow) = accepted_workflow {
@@ -1972,14 +1979,14 @@ impl TerminalApp {
                     ui.label(
                         egui::RichText::new(format!(
                             "Workflow: {}",
-                            crate::workflow_picker::display_label(&state.workflow.name)
+                            crate::workflow_picker::display_label(&state.workflow().name)
                         ))
                         .strong(),
                     );
-                    if !state.workflow.description.is_empty() {
+                    if !state.workflow().description.is_empty() {
                         ui.label(
                             egui::RichText::new(crate::workflow_picker::display_label(
-                                &state.workflow.description,
+                                &state.workflow().description,
                             ))
                             .size(10.0)
                             .color(ui.visuals().weak_text_color()),
@@ -1988,7 +1995,7 @@ impl TerminalApp {
                     // 命令模板预览（anvil 的 <tt> 对应物）：等宽、可只读查看。
                     ui.label(
                         egui::RichText::new(crate::workflow_picker::display_command_preview(
-                            &state.workflow.command,
+                            &state.workflow().command,
                         ))
                         .monospace()
                         .size(10.0),
@@ -1997,14 +2004,29 @@ impl TerminalApp {
 
                     let mut focus_first = state.needs_focus;
                     state.needs_focus = false;
-                    for (index, arg) in state.workflow.args.iter().enumerate() {
+                    let mut any_required = false;
+                    for index in 0..state.arg_count() {
+                        // 缺值行（文件没声明默认值、当前还是空）标星：提交时
+                        // 核心会报 `missing values: …`，但用户不该按下 Enter
+                        // 才发现少了什么。
+                        let required = state.is_missing(index);
+                        any_required |= required;
+                        // 编辑发生在缓冲上，整轮画完再一次性写回模型——
+                        // `ArgsForm` 用“没填”与“填了空串”两种状态托住缺值
+                        // 守卫，直接把内部值借给 `TextEdit` 会把两者抹平。
                         ui.horizontal(|ui| {
+                            let Some((arg, value)) = state.row_mut(index) else {
+                                return;
+                            };
                             ui.vertical(|ui| {
                                 ui.set_width(140.0);
+                                let name = crate::workflow_picker::display_label(&arg.name);
                                 ui.label(
-                                    egui::RichText::new(crate::workflow_picker::display_label(
-                                        &arg.name,
-                                    ))
+                                    egui::RichText::new(if required {
+                                        format!("{name} *")
+                                    } else {
+                                        name
+                                    })
                                     .size(11.0),
                                 );
                                 if !arg.description.is_empty() {
@@ -2017,9 +2039,6 @@ impl TerminalApp {
                                     );
                                 }
                             });
-                            let Some(value) = state.values.get_mut(index) else {
-                                return;
-                            };
                             let edit =
                                 egui::TextEdit::singleline(value).desired_width(f32::INFINITY);
                             let response = ui.add(edit);
@@ -2030,6 +2049,7 @@ impl TerminalApp {
                         });
                         ui.add_space(2.0);
                     }
+                    state.sync();
 
                     if let Some(error) = state.error.as_deref() {
                         ui.colored_label(
@@ -2041,9 +2061,13 @@ impl TerminalApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("Enter Insert at Prompt  Esc Cancel")
-                                .size(10.0)
-                                .color(ui.visuals().weak_text_color()),
+                            egui::RichText::new(if any_required {
+                                "Enter Insert at Prompt  Esc Cancel   * needs a value"
+                            } else {
+                                "Enter Insert at Prompt  Esc Cancel"
+                            })
+                            .size(10.0)
+                            .color(ui.visuals().weak_text_color()),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Insert command").clicked() {

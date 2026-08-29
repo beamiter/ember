@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared command-correction engine adoption)
+Updated: 2026-08-29 (shared workflow engine adoption)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,90 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Shared workflow engine adoption — discovery, parsing, validation and
+  rendering leave ember (2026-08-29)**: `src/workflows.rs` drops from 867 lines
+  to a 241-line shim (127 before the test module) over `jterm_core::workflows`,
+  and `src/workflow_picker.rs` (284 → 349) becomes an egui shell over the
+  core's `WorkflowPicker` and `ArgsForm`. The workflow surface goes 1,151 → 590
+  lines. The five-tier search path, the bounded
+  `O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW` reader, both serde parsers, the eleven
+  budgets, validation and the `{name}` / `{{name}}` template engine are gone
+  from this repo. All four terminals carried that code against the *same*
+  on-disk format — anvil 1,164 lines, forge 801, ember 1,151, frost 1,143 — and
+  they read the same files out of the same directories, so a divergence meant a
+  workflow file *meant* something different depending on which terminal opened
+  it. What stays here is policy, stated once and pinned by tests: app segment
+  `ember` (with `EMBER_WORKFLOW_DIR` derived from it rather than typed),
+  `XdgEnvDirs` as the discovery backend, `dev_root()` from ember's own
+  `CARGO_MANIFEST_DIR`, and `LoadOrder::ByName` — which is now the single
+  statement of ordering, since the picker no longer re-sorts what the loader
+  handed it.
+
+  BEHAVIOUR CHANGE: an argument that declares no default and is left blank is no
+  longer substituted as the empty string. `kill -9 {pid}` submitted with an
+  untouched Pid field used to render `kill -9 ` and fill it at the prompt —
+  ember implemented that guard in `render`, unit-tested it, and then defeated it
+  by pre-seeding every declared argument with `""`. The guard was green in
+  isolation and dead in practice, in all four apps. The rule now lives in
+  `render`, applied to the values map itself, so no dialog can seed past it, and
+  `ArgsForm` carries Unset vs Supplied in the type system so the dialog can mark
+  such rows with `*` (and print `* needs a value` in its footer) before the user
+  presses Enter; submitting anyway reports `missing values: <names>` and keeps
+  the dialog open. An argument that *declares* a default — `default = ""`
+  included — may still render empty, so clearing a defaulted field stays a
+  deliberate empty value and does not fall back to the default. Whitespace-only
+  counts as blank. `ArgsForm::missing()` is deliberately a superset of what
+  `render` will refuse: it flags every undefaulted blank row, while the error
+  names only the ones the template actually references.
+
+  This round also removed `default: ""` from `container` in the bundled
+  `scripts/workflows/docker-tail-logs.yaml`. That is the one shipped example the
+  new rule touches: the declaration said "an empty value is meaningful here"
+  where the file plainly meant "required", so the headline guard would not have
+  fired on the example ember ships — it would have inserted
+  `docker logs -f --tail 100 `. Every other bundled argument declares a real
+  default and is unaffected. The edit is family-wide by construction, and after
+  it `diff -rq` reports `scripts/workflows` byte-identical across anvil, ember,
+  forge and frost — forge's copy, which had diverged in five of six files and
+  substantively in `find-large-files.yaml`, was reconciled to the other three in
+  the same round. Name-keyed first-wins dedup means that divergence had made
+  "Find large files" resolve to a *different command* in forge than in its
+  siblings.
+
+  Three more user-visible changes, all in the same direction: a workflow file
+  whose declared argument name has leading or trailing whitespace is now
+  rejected at load instead of loading with a row that could never bind (it used
+  to render the literal `{ pid }`, call the form complete, and drop what the
+  user typed); an unterminated `{{` is preserved even when a later placeholder
+  closes a pair (`awk '{{print $1}' {{log}}` used to silently become a
+  different, executable awk program, because the close scan ran to the end of
+  the template — `{{` and `}}` nest now); and both halves of a skip log line are
+  sanitised and bounded, where ember used to write `path.display()` and the
+  parser's message raw into `log::warn!` and a TOML error quotes the offending
+  source line back verbatim.
+
+  One correction to the migration's own record: `src/workflows.rs`'s module doc
+  says ember contributed `O_NOFOLLOW` to the union, and the pre-migration file
+  says otherwise — its comment at the `custom_flags` call reads "anvil uses
+  O_NONBLOCK | O_CLOEXEC; forge additionally passes O_NOFOLLOW. Ember takes the
+  stricter set", so forge is the origin and anvil was the copy that would follow
+  a planted symlink out of the workflow directory. Fix that sentence in the shim
+  when the module is next touched. What ember did carry into the union is
+  the `dirs`-crate discovery backend, now the core's `XdgEnvDirs` and the
+  default for an app with no GTK dependency. `welcome_notebook_path` is still
+  not ported: ember has no notebook surface and the core left that lookup with
+  the two apps that do. `serde_yaml_ng` leaves this manifest — the loader that
+  read YAML is now the core's, which depends on the same parser, and no other
+  ember surface reads YAML. `fuzzy-matcher` stays a direct dependency:
+  `history_picker.rs` and `command_palette.rs` still use it.
+
+  These are user-visible, so they are documented where a user looks, not only
+  here: README gained a `### Workflows` section (search path, file format, the
+  undefaulted-argument rule, the `docker-tail-logs.yaml` change and the two
+  strictness changes), a Highlights bullet and the missing `Ctrl+Shift+M` row in
+  the keybinding table. Workflows had no README coverage at all before this
+  round.
 
 - **Shared command-correction engine adoption — the engine half leaves ember
   (2026-08-29)**: `src/command_correction.rs` drops from 2,335 lines to an
@@ -715,9 +799,50 @@ fail closed.
 
 ## Remaining boundaries
 
-- **This round is uncommitted.** `Cargo.toml`, `Cargo.lock` and
-  `src/command_correction.rs` are modified in the working tree and nothing is
-  staged. (The AI chat surface that the previous handoff listed here as
+- **This round is uncommitted.** `Cargo.toml`, `Cargo.lock`,
+  `src/workflows.rs`, `src/workflow_picker.rs`, `src/app/rendering.rs`,
+  `src/app/commands.rs` and `scripts/workflows/docker-tail-logs.yaml` are
+  modified in the working tree and nothing is staged. The core pin, however, is
+  *not* outstanding: `jterm_core` was published and the manifest and lock both
+  moved to `790d06ab19b9f3dec7c188728fc468f008df5414`, the revision that
+  introduces `workflows`. No `[patch]` remains in `~/.cargo/config.toml`, and
+  the gate below was rerun with `--locked` against the published revision. The
+  only other line the lock moved is `serde_yaml_ng` migrating from ember's own
+  dependency list to `jterm_core`'s; no new crate enters the build.
+- **The picker overlay did move — the query bridge is what stayed.**
+  `WorkflowPickerState` now wraps `jterm_core::workflows::WorkflowPicker` with
+  `PickerPolicy::new(MAX_RESULTS, false)`, so filtering, the 15-result cap, the
+  highlight reset and UTF-8-safe query truncation are the core's. Ember keeps
+  one `String` edit buffer because `ui.text_edit_singleline` needs
+  `&mut String` while the core's query is writable only through `set_query`;
+  `sync_query()` writes it across each frame and copies the core's normalised
+  result back into the box. The parameter dialog keeps a per-row buffer for the
+  same reason, and for a second one that matters more: handing `TextEdit` a
+  `&mut` into `ArgsForm` would flatten Unset and Supplied("") back together and
+  kill the guard this round exists for. `sync()` after the row loop is the only
+  write path into the model, and it compares content rather than trusting
+  egui's `changed()`, so the model and what is on screen cannot disagree.
+  Frost is the other consumer of the same core picker and should be checked
+  against this shape.
+- **The migration's own "not done" list is largely closed, and this handoff
+  supersedes it.** The core rev was published and pinned (`790d06a`), the picker
+  overlay *did* adopt `WorkflowPicker`/`PickerPolicy`, `docker-tail-logs.yaml`
+  was fixed, and `scripts/workflows` was reconciled across the family — all four
+  after the migration report was written, so read that report against the diff,
+  not on its own. What genuinely remains: this round is unstaged and
+  uncommitted; the shim's `O_NOFOLLOW` attribution sentence is wrong (above);
+  `welcome_notebook_path` stays with anvil and frost, which is correct for ember
+  and not work; and no core API bug was found to report — every choice that
+  changes which directories are read or in what order is a required argument
+  with no `Default`, so no compiling call can omit a policy.
+- **Nothing this round was exercised in a running window.** The `*` marker, the
+  `* needs a value` footer and the error-and-stay-open dialog behaviour are
+  covered at the state layer and read off `app/rendering.rs`; the family's GUI
+  harness was not run. Treat the dialog's visual claims in README as
+  code-derived until someone opens the picker.
+- The correction round's items below are unchanged: `Cargo.toml`, `Cargo.lock`
+  and `src/command_correction.rs` were modified in the working tree and nothing
+  was staged. (The AI chat surface that the previous handoff listed here as
   untracked has since landed — `src/ai_chat_panel.rs`, `src/ai_chat_store.rs`
   and `src/ai_command_suggestion.rs` are tracked as of `b3d5ffd`, and the
   correction surface itself as of `e297954`.)
@@ -773,9 +898,36 @@ shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 bash scripts/test-install-paths.sh
 ```
 
-Run on 2026-08-29 for this tree: `cargo fmt --all -- --check` and
+Run on 2026-08-29 for the workflow round: `cargo fmt --all -- --check` and
 `cargo clippy --locked --all-targets --all-features -- -D warnings` are clean,
-and `cargo test --locked` reports 947 library tests plus 1,248 binary tests plus
-the native Codex worker end-to-end test — 2,196 in total — passing with zero
-failures, against the published `badcce2` core. The install-script checks were
-not re-run; nothing in this round touches `scripts/`.
+and `cargo test --locked` reports 931 library tests plus 1,234 binary tests plus
+the native Codex worker end-to-end test — 2,166 in total — passing with zero
+failures, against the published `790d06a` core. (`--locked` was expected to be
+unusable this round because the core was still unpublished; it was published and
+pinned before the docs pass, so the gate is the ordinary one.)
+
+The count drops by 30 against the previous round. `src/workflows.rs` goes from
+21 tests to 5: sixteen loader, discovery and renderer tests duplicated the
+engine's and now live in `jterm_core::workflows` (3,186 lines across five files,
+73 `#[test]`s at `790d06a`). The five that remain cover only this app's own
+wiring — the discovery policy including the derived `EMBER_WORKFLOW_DIR` and
+ember's own dev root, the pinned load order observed through `load_all` rather
+than through the constant alone, uniqueness and bounding of the search path, the
+directory the empty picker names, and the bundled-library contract.
+`src/workflow_picker.rs` goes from 6 tests to 8, adding the query-buffer
+boundary and the emptied-defaulted-row rule; it is a binary-only module, which
+is why the library count falls by 16 and the binary count by 14.
+
+The previous round's run, for comparison: `cargo test --locked` reported 947
+library tests plus 1,248 binary tests plus the end-to-end test — 2,196 in total
+— against the published `badcce2` core. The install-script checks were not
+re-run in either round; nothing in them touches `scripts/`. `scripts/workflows/`
+is data this round *does* change (`docker-tail-logs.yaml`), and it is covered by
+`every_bundled_workflow_is_parseable_and_review_only` rather than by those
+scripts.
+
+Not verified, and not claimed: nothing here was exercised through a running
+desktop session. The `*` marker, the footer hint and the error-and-stay-open
+behaviour of the parameter dialog are asserted at the state layer
+(`WorkflowArgsState`) and read off the egui code in `app/rendering.rs`; no GUI
+run was made.

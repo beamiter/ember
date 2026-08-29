@@ -1190,7 +1190,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "smallvec",
  "toml",
  "unicode-normalization",
@@ -1932,7 +1931,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=badcce222fb5471a6afbfc5d5e898e2bc3faf632#badcce222fb5471a6afbfc5d5e898e2bc3faf632"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=790d06ab19b9f3dec7c188728fc468f008df5414#790d06ab19b9f3dec7c188728fc468f008df5414"
 dependencies = [
  "crossbeam-channel",
  "dirs",
@@ -1945,6 +1944,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "toml",
  "unicode-width",
 ]

@@ -231,3 +231,88 @@ Rounds 49–59 were checked with `cargo fmt --all -- --check`, `cargo clippy
 2,196 total — with zero failures) against the published core revision. The
 module's own suite went from 23 tests to 7 as twenty engine duplicates moved to
 the core; `scripts/` is untouched by this pass.
+
+Workflow convergence adds rounds 60–69 (2026-08-29):
+
+60. **An undefaulted argument may no longer be left blank** — the family-wide
+    defect this round exists for. `render` was always supposed to refuse a
+    declared argument that has no default and no value, and ember, anvil and
+    frost each unit-tested that guard; every UI in the family then pre-seeded
+    each declared argument with `""`, so it never fired. `kill -9 {{pid}}` with
+    an untouched Pid field inserted `kill -9 ` at the prompt. The contract is
+    now stated once — an empty value is meaningful only if the file declares it,
+    `default = ""` included — and enforced twice: in `render`, against the
+    values map itself, so a caller that pre-seeds cannot seed past it, and in
+    `ArgsForm`, which keeps Unset and Supplied apart in the type system so the
+    dialog can mark outstanding rows with `*` and print `* needs a value` before
+    Enter is pressed. Emptying a *defaulted* field stays a deliberate empty
+    value; emptying an undefaulted one is a missing value. Whitespace-only
+    counts as blank.
+61. **The bundled example the rule would have missed** — `docker-tail-logs.yaml`
+    declared `default: ""` for its required `container` argument, which under
+    the new contract is an explicit empty value: round 60 would not have fired
+    on the library ember ships, and the palette would have inserted
+    `docker logs -f --tail 100 `. The empty default is removed and `container`
+    is a required argument. Every other bundled argument declares a real
+    default, so it is the only shipped file the rule touches.
+62. **One bundled library across the family** — `diff -rq scripts/workflows` is
+    now clean between anvil, ember, forge and frost. Ember's copy is unchanged
+    apart from round 61; forge's had diverged in five of six files, and
+    substantively in `find-large-files.yaml`, so name-keyed first-wins dedup
+    resolved "Find large files" to a different command there than here.
+63. **Engine moved into the shared core** — `src/workflows.rs` is now a
+    241-line shim (127 before its tests) over `jterm_core::workflows`, and
+    `src/workflow_picker.rs` an egui shell over the core's `WorkflowPicker` and
+    `ArgsForm`; ember's workflow surface goes 1,151 → 590 lines. The five-tier
+    search path, the bounded reader, both serde parsers, the eleven budgets,
+    validation and the template engine leave the repo. All four terminals read
+    the same files from the same directories out of four separately drifted
+    copies — anvil 1,164 lines, forge 801, ember 1,151, frost 1,143 — so a
+    divergence in one app was a divergence in what a user's file *meant*.
+64. **Discovery policy is injected, not assumed** — the XDG backend (ember and
+    frost ask the `dirs` crate, anvil and forge ask glib, and the fallback
+    chains differ), the app segment, `LoadOrder` and the dev-tree root are all
+    required arguments with no `Default`. `env!("CARGO_MANIFEST_DIR")` resolves
+    against the compiling crate, so moving it into the core would have pointed
+    all four apps at a directory that does not exist while their bundled-library
+    tests kept passing. `SearchPathSpec::for_current_app` returns `Option`
+    rather than silently resolving to the neutral `jterm` identity when
+    `identity::init` has not run — which is every unit test.
+65. **Load order is stated once** — the picker no longer re-sorts the entries it
+    is handed. `workflows::LOAD_ORDER` is `ByName`, so the visible ordering is
+    byte-for-byte what it was, but changing the loader now actually changes the
+    overlay instead of being overwritten by a second `sort_by`.
+66. **A padded argument name is rejected at load** — `name = "pid "` used to
+    load clean and bind nothing, because placeholder names were trimmed and
+    declared names were not: `{{ pid }}` rendered as the literal `{ pid }`, the
+    missing-value check called the form complete, and the typed value was
+    dropped between the dialog and the prompt. Both sides of that lookup are now
+    held to the same spelling.
+67. **`{{` and `}}` nest** — the close scan used to run to the end of the
+    template, so an unterminated `{{` claimed a later placeholder's `}}`.
+    `awk '{{print $1}' {{log}} | sort -u` rendered as
+    `awk '{print $1}' access.log | sort -u`: a different, executable awk
+    program. Nested JSON bodies such as `-d '{{"a":{{"b":1}}}}'` are unaffected.
+68. **A skipped file is logged safely and visibly** — ember wrote
+    `path.display()` and the parser's message raw into `log::warn!`, and a TOML
+    error quotes the offending source line back verbatim, so a workflow file
+    chose the ESC/BEL/bidi bytes that reached whatever tty was tailing the log.
+    Both halves are now sanitised and bounded. The line itself stays: a workflow
+    that vanishes from the palette without one is indistinguishable from one
+    that was never installed.
+69. **Current shared pin** — `jterm_core` advances to `790d06a`, the revision
+    that introduces `workflows`; `jagent` is unchanged. `serde_yaml_ng` leaves
+    ember's manifest and reappears under `jterm_core` in the lock, which is the
+    lock's only other movement. No new crate enters the build, and
+    `fuzzy-matcher` stays a direct dependency for the history picker and command
+    palette.
+
+Rounds 60–69 were checked with `cargo fmt --all -- --check`, `cargo clippy
+--locked --all-targets --all-features -- -D warnings`, and `cargo test --locked`
+(931 library tests, 1,234 binary tests and the native worker end-to-end test —
+2,166 total — with zero failures) against the published `790d06a` core. The
+workflow module's own suite went from 21 tests to 5 as sixteen engine duplicates
+moved to the core, and the picker's from 6 to 8. `scripts/` is otherwise
+untouched by this pass; `scripts/workflows/docker-tail-logs.yaml` is the one
+data file it changes (round 61), and no GUI session was run — the dialog changes
+are covered at the state layer only.

@@ -39,6 +39,11 @@ claimed.
   host's APT index or executable PATH where it can be, and an AI fallback only
   where command-context sharing is consented to. The engine is
   `jterm_core::command_correction`, shared with the sibling terminals
+- [Workflows](#workflows): saved command templates with named parameters, in
+  TOML or YAML, opened with `Ctrl+Shift+M`. The rendered command is *inserted*
+  at the prompt and never run for you. Discovery, both parsers, validation and
+  the template engine are `jterm_core::workflows`, shared with the sibling
+  terminals, so one workflow file means the same thing in all four
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
@@ -682,6 +687,94 @@ trust predicate, the probe layer and the request epoch machine — lives in
 frost. Ember keeps only the card, its focus and arming rules, and the effect the
 app applies to the PTY.
 
+### Workflows
+
+A workflow is a saved command template with named parameters — the jterm
+family's shared "parameterised snippet" format. `Ctrl+Shift+M` opens the
+picker; fuzzy search matches name, description and tags. Enter on a result
+opens the parameter dialog, or — for a template that declares no arguments —
+goes straight to the prompt. **Insert command** (or Enter in the dialog) writes
+the rendered command to the prompt and stops. Nothing is executed for you, the
+same review-first rule the correction card and the history picker follow, and
+insertion takes the identical guarded path: a read-only task terminal, an
+alternate screen, a prompt that is not ready or not empty, or pending input all
+refuse it. Escape closes either surface. The library is re-read each time the
+picker opens, so a file added on disk appears the next time you press
+`Ctrl+Shift+M`.
+
+Workflow files are TOML or YAML (`.toml`, `.yaml`, `.yml`) and are read, in
+precedence order, from:
+
+1. `~/.config/ember/workflows/`
+2. every entry of `$EMBER_WORKFLOW_DIR` — a `:`-separated list that *adds* to
+   the standard locations rather than replacing them
+3. `~/.local/share/ember/workflows/`
+4. `<dir>/ember/workflows/` for each `$XDG_DATA_DIRS` entry
+5. the checked-out `scripts/workflows/` when Ember runs from a source tree
+
+Workflow *names* are unique across the whole path and the first occurrence
+wins, so a file in `~/.config/ember/workflows` shadows an installed example of
+the same name. The picker lists the library alphabetically by name. A file that
+does not parse is skipped and logged with its path and the reason: one broken
+file never hides the rest, and it never disappears from the palette without a
+trace either. Each file is opened with `O_NOFOLLOW` and read under a size cap,
+so a symlinked or oversized workflow file is refused rather than followed.
+
+```yaml
+name: "Kill process on port"
+description: "Find and kill whatever is listening on a TCP port"
+command: "lsof -ti tcp:{{port}} | xargs -r kill -{{signal}}"
+tags: [net, debug]
+args:
+  - name: port
+    description: "TCP port"
+    default: "3000"
+  - name: signal
+    description: "Signal to send (TERM/KILL/HUP)"
+    default: "TERM"
+```
+
+`{name}` and `{{name}}` both substitute a declared argument, and placeholder
+names are trimmed, so `{{ port }}` binds exactly like `{{port}}`. A `{{…}}`
+that matches no argument is the literal-brace escape and emits single braces,
+mirroring `format!` — `awk '{{print $1}}'` renders `awk '{print $1}'`.
+
+**An argument that declares no `default` can no longer be left blank** (changed
+2026-08-29). Ember used to pre-fill every parameter field with the empty
+string, so `kill -9 {{pid}}` submitted with an untouched **Pid** field rendered
+`kill -9 ` and put *that* at the prompt. Submitting it now reports
+`missing values: pid`, the dialog stays open with the error, and the row is
+marked `*` — with `* needs a value` in the dialog footer — before Enter is ever
+pressed. Whitespace-only counts as blank.
+
+Declaring a default is how a file says that an empty value is meaningful there.
+`default: ""` still renders empty, and clearing a field that *has* a default is
+a deliberate empty value rather than a fallback to the default. The one bundled
+example this changes is `docker-tail-logs.yaml`: its `container` argument
+declared `default: ""` while plainly meaning "required", which would have
+inserted `docker logs -f --tail 100 `. That empty default is gone, so
+`container` must now be filled.
+
+Two further changes in the same direction:
+
+- A declared argument name with leading or trailing whitespace (`name: "pid "`)
+  is now rejected at load. It used to load clean and then bind nothing:
+  `{{ pid }}` rendered as the literal `{ pid }`, the dialog considered the form
+  complete, and whatever was typed in that field was dropped on the way to the
+  prompt.
+- `{{` and `}}` now nest, so an unterminated `{{` survives a later placeholder
+  closing a pair. `awk '{{print $1}' {{log}} | sort -u` used to render as
+  `awk '{print $1}' access.log | sort -u` — a different, executable awk program
+  — because the scan for the closing braces ran to the end of the template.
+  Nested JSON bodies such as `-d '{{"a":{{"b":1}}}}'` are unaffected.
+
+Since 2026-08-29 discovery, the bounded reader, both parsers, validation and
+the template engine live in `jterm_core::workflows` and are shared verbatim
+with anvil, forge and frost — the four terminals read the same files out of the
+same directories, so a difference in what one of them accepted was a difference
+in what a user's file *meant* depending on which terminal opened it. Ember
+keeps its search-path policy, its alphabetical load order and the egui overlay.
+
 ### Keybindings
 
 Defaults include:
@@ -716,6 +809,7 @@ Defaults include:
 | Search/filter completed command blocks | `Ctrl+Shift+G` |
 | Toggle Agent panel (per-command approval) | `Ctrl+Alt+G` |
 | Toggle AI chats library (read-only; nothing runs) | `Ctrl+Shift+Alt+A` |
+| Workflow picker (parameterised command templates) | `Ctrl+Shift+M` |
 | Help | `Ctrl+Shift+/` |
 | Debug overlay | `F12` |
 

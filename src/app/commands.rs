@@ -2709,19 +2709,19 @@ impl TerminalApp {
     }
 
     /// 参数对话框提交：渲染成功则回填提示符并关闭；失败则与 anvil 一致——
-    /// 在同一对话框内显示错误并保持打开。
+    /// 在同一对话框内显示错误并保持打开。文件没声明默认值、用户也没填的参数
+    /// 现在会走到这条失败路径（`missing values: …`），而不是像以前那样按空串
+    /// 渲染出半截命令再回填。
     pub(crate) fn submit_workflow_args(&mut self) {
-        let Some(state) = self.workflow_args.take() else {
+        let Some(mut state) = self.workflow_args.take() else {
             return;
         };
         match state.render() {
             Ok(command) => self.fill_prompt_with_history_command(&command),
             Err(error) => {
                 log::warn!("workflow render failed: {error}");
-                self.workflow_args = Some(crate::workflow_picker::WorkflowArgsState {
-                    error: Some(error),
-                    ..state
-                });
+                state.error = Some(error);
+                self.workflow_args = Some(state);
             }
         }
     }
