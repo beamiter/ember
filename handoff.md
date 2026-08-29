@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-27 (process-observed SSH Files following and staged socket upgrades)
+Updated: 2026-08-29 (Remote Files thirty-round evolution)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,69 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Remote Files rounds 21–30 — transactional navigation and bounded ageing
+  (2026-08-29)**: endpoint switches stage both home discovery and the first
+  listing, while path/root changes scan a detached, generation-stamped
+  candidate; only the latest successful listing commits. Failure, queue
+  rejection, cancellation, and out-of-order completion preserve the last-good
+  root, selection, expanded descendants, current path, and success-only
+  history. Back/Forward (32 entries), Up/Home, clickable breadcrumbs, and a
+  Ctrl+L absolute-path editor share this commit boundary; path input is
+  UTF-8/4-KiB bounded, lexically normalized, and rejects relative/root-escaping,
+  control, and bidi text. An eight-root authority-bound cache preserves loaded
+  descendants and is invalidated at exact operation parents. Visible remote
+  snapshots older than 60 seconds revalidate stale-while-revalidate on a
+  five-second tick with a two-directory budget. Retryable failures use capped
+  1/2/4/8/16/30-second automatic cooldowns, non-retryable failures stop
+  automatic retries, and explicit Retry remains available. The Files status
+  surface distinguishes queue delay from scan execution time. Deterministic
+  tests cover atomic success/failure, stale-result rejection, history/cache
+  bounds, path attacks, retry classification, TTL budget/cooldown, and timing.
+
+- **Remote Files rounds 11–20 — bounded scheduling and native navigation
+  (2026-08-29)**: directory scans now use a 64-pending/two-worker envelope with
+  Root/Retry/Lazy priority, bounded anti-starvation, same-path physical
+  coalescing, collapse cancellation, and visible pending/queued counts. The
+  serialized operation queue is independently capped at 64. Last-good directory
+  snapshots record completion age; mutation reconciliation refreshes exact
+  materialized parents and restores focus to confirmed create/copy/rename/
+  transfer destinations. Remote double-click, Up/Home and scoped Alt+Up/
+  Alt+Home navigate the tree itself and never write a remote path to an
+  unrelated terminal. Home parsing is strict UTF-8/single-line/absolute, while
+  UI diagnostics use stable error classes plus credential redaction,
+  control/bidi removal and Unicode-safe bounds. Queue saturation, priority
+  fairness, coalescing, collapse cancellation, strict home output, diagnostic
+  attacks, freshness and selection restoration all have deterministic tests.
+
+- **Remote Files probe v4 and recoverable UI (2026-08-29)**: superseding a
+  per-directory request now cancels queued work and kills a running remote
+  probe process group. The list protocol filters hidden rows and stops at the
+  requested retained ceiling remotely, classifies symlinks before directories,
+  and rejects invalid UTF-8, oversized, dangerous, or duplicate/colliding
+  basenames before constructing an actionable path. Initial/stale errors have
+  an in-place Retry control, refreshing and first-load states are distinct, F5
+  and Files Alt/Ctrl+L navigation require both panel hover and actual tree-row
+  focus (filter/path editors and popups retain their keys), and reconciliation prunes
+  vanished selections while revoking delayed path actions. A last-good stale
+  snapshot remains browsable, but path-dereferencing/mutating actions fail
+  closed until Retry succeeds; Refresh and Copy Path remain available.
+
+- **Remote Files resilient refresh (2026-08-29)**: directory scans now carry
+  both the tree generation and a per-path latest-wins revision, preventing an
+  older slow SSH/Docker response from overwriting a newer refresh. Root and
+  loaded-directory refreshes keep the last-good rows visible, reconcile
+  surviving directories in place by path/type (preserving loaded descendants,
+  expansion and pagination), and retain that snapshot with an inline error if
+  revalidation fails. A generation change retires orphaned nested Loading
+  states so stale work cannot leave the tree permanently busy.
+
+- **Files hidden-entry policy (2026-08-29)**: a visible **Hidden** control now
+  switches local and remote dotfile policy together. The policy is frozen into
+  every scan request; changing it clears row selection and rebuilds the root
+  under a new generation, so queued or slow old-policy results cannot publish.
+  Remote parsing and local enumeration apply the preference before the retained
+  entry cap, preventing hidden-heavy directories from starving visible rows.
 
 - **Process-observed SSH → Files following (2026-08-27)**: every interactive
   terminal presentation now observes only the focused session's real `/proc`

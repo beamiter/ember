@@ -15,6 +15,7 @@
 //!   （`sh -s` 的预读缓冲会和探针里的 `cat`/`tar x` 抢 stdin 字节）。
 
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -36,6 +37,10 @@ const MAX_LIST_OUTPUT: u64 = 8 * 1024 * 1024;
 const MAX_SMALL_OUTPUT: u64 = 64 * 1024;
 /// 与 sidebar::scan_dir 相同的扫描上限：超过即按截断处理。
 const MAX_SCANNED_PAIRS: usize = MAX_DIRECTORY_ENTRIES * 4;
+/// Remote names become command operands after parsing. Reject pathological
+/// protocol rows before allocation/path construction; real filesystem
+/// NAME_MAX values are far below this defensive ceiling.
+const MAX_REMOTE_NAME_BYTES: usize = 4096;
 /// 本地递归复制的防御性深度上限。符号链接按链接复制、不会成环，
 /// 这个上限防的是病态深树耗尽 op worker 的栈。
 const MAX_COPY_DEPTH: usize = 256;
@@ -210,14 +215,18 @@ pub struct Capture {
 ///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
 ///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
 ///   打印 "<t> <size>"（f 为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
-/// - 退出码：0 正常，2 用法/路径非法，3 无法进入目录，4 操作失败，17 目标已存在。
-pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
+/// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
+///   17 目标已存在，20 非目录。
+pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
-# Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
+# Exit codes: 0 ok, 2 usage/bad path, 3 missing, 4 op failed, 13 permission,
+# 17 target exists, 20 not a directory.
 # v2 adds: cat (stream file to stdout), put (stream stdin to a new file),
 # tar (stream dir as tar to stdout), untar (extract stdin tar into a dir).
 # v3: untar takes <dir> <name> and refuses an existing <dir>/<name> (17) before
 # extracting; new stat op prints "<t> <size>" (t in {d,f,l}; bytes for f, else 0).
+# v4: list accepts [max_rows] [show_hidden], stops remotely at the requested
+# retained-row ceiling, and classifies symlinks before directories.
 set -u
 op=${1:-}
 case "$op" in
@@ -228,14 +237,26 @@ case "$op" in
   list)
     d=${2:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
-    cd "$d" 2>/dev/null || exit 3
+    limit=${3:-0}
+    show_hidden=${4:-1}
+    case "$limit" in *[!0-9]*|'') exit 2 ;; esac
+    case "$show_hidden" in 0|1) ;; *) exit 2 ;; esac
+    cd "$d" 2>/dev/null || {
+      [ -e "$d" ] || exit 3
+      [ -d "$d" ] || exit 20
+      exit 13
+    }
+    count=0
     for f in * .[!.]* ..?*; do
-      if [ -d "$f" ]; then t=d
-      elif [ -L "$f" ]; then t=l
+      case "$show_hidden:$f" in 0:.*) continue ;; esac
+      if [ -L "$f" ]; then t=l
+      elif [ -d "$f" ]; then t=d
       elif [ -e "$f" ]; then t=f
       else continue
       fi
       printf '%s\0%s\0' "$t" "$f"
+      count=$((count + 1))
+      if [ "$limit" -gt 0 ] && [ "$count" -ge "$limit" ]; then break; fi
     done
     ;;
   mkdir)
@@ -941,16 +962,29 @@ fn run_probe(
     timeout: Duration,
     max_out: u64,
 ) -> io::Result<Capture> {
-    run_capture(
+    run_probe_with_cancel(host, op, args, timeout, max_out, None)
+}
+
+fn run_probe_with_cancel(
+    host: &RemoteHostConfig,
+    op: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_out: u64,
+    cancel: Option<Arc<AtomicBool>>,
+) -> io::Result<Capture> {
+    run_capture_with_cancel(
         &checked_probe_argv(host, op, args)?,
         PROBE_SCRIPT.as_bytes(),
         timeout,
         max_out,
+        cancel,
     )
 }
 
-/// 探针退出码 → io 错误。脚本协议：0 正常，2 用法/路径非法，3 无法进入
-/// 目录，4 操作失败，17 目标已存在；其余（含 127 = 远端没有 sh）一律 Other。
+/// 探针退出码 → io 错误。脚本协议：0 正常，2 用法/路径非法，3 缺失，
+/// 4 操作失败，13 权限，17 目标已存在，20 非目录；其余（含 127 =
+/// 远端没有 sh）一律 Other。
 /// 取消与超时优先于退出码（被 kill 的进程退出码没有意义）。
 fn probe_output(capture: Capture) -> io::Result<Vec<u8>> {
     if capture.cancelled {
@@ -970,7 +1004,15 @@ fn probe_output(capture: Capture) -> io::Result<Vec<u8>> {
         )),
         Some(3) => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "cannot enter directory",
+            "directory no longer exists",
+        )),
+        Some(13) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )),
+        Some(20) => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "path is not a directory",
         )),
         Some(2) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -980,6 +1022,126 @@ fn probe_output(capture: Capture) -> io::Result<Vec<u8>> {
     }
 }
 
+const MAX_INLINE_DIAGNOSTIC_CHARS: usize = 200;
+
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn sensitive_key(key: &str) -> bool {
+    matches!(
+        key.trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+            .as_str(),
+        "password"
+            | "passwd"
+            | "token"
+            | "secret"
+            | "authorization"
+            | "proxyauthorization"
+            | "proxy-authorization"
+            | "apikey"
+            | "api_key"
+    )
+}
+
+/// Convert an untrusted subprocess/OS diagnostic into one bounded UI line.
+/// Control and bidi-format characters cannot spoof adjacent chrome, common
+/// credential assignments are redacted, and the limit is counted in Unicode
+/// scalar values (never a byte index inside a multibyte character).
+pub(crate) fn safe_inline_diagnostic(text: &str) -> String {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("remote operation failed");
+    let cleaned: String = first
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || is_bidi_control(ch) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+
+    let mut redacted = Vec::new();
+    let mut redact_next = false;
+    for word in cleaned.split_whitespace() {
+        if redact_next {
+            redacted.push("<redacted>".to_string());
+            redact_next = false;
+            continue;
+        }
+        if let Some((key, _value)) = word.split_once('=') {
+            if sensitive_key(key) {
+                redacted.push(format!("{key}=<redacted>"));
+                continue;
+            }
+        }
+        if let Some(key) = word.strip_suffix(':') {
+            if sensitive_key(key) {
+                redacted.push(format!("{key}:"));
+                redact_next = true;
+                continue;
+            }
+        }
+        redacted.push(word.to_string());
+    }
+    let redacted = redacted.join(" ");
+    let mut chars = redacted.chars();
+    let mut bounded: String = chars.by_ref().take(MAX_INLINE_DIAGNOSTIC_CHARS).collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Stable, retry-oriented error text for Files UI. Raw remote stderr is never
+/// required to decide the user action and is only admitted through the safe
+/// inline boundary above.
+pub(crate) fn user_facing_error(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => "target already exists".to_string(),
+        io::ErrorKind::NotFound => "path not found or no longer available".to_string(),
+        io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        io::ErrorKind::NotADirectory => "path is not a directory".to_string(),
+        io::ErrorKind::TimedOut => "remote request timed out; retry".to_string(),
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe => "remote connection unavailable; retry".to_string(),
+        io::ErrorKind::InvalidData => "remote returned invalid directory data".to_string(),
+        io::ErrorKind::Interrupted => "operation cancelled".to_string(),
+        _ => safe_inline_diagnostic(&error.to_string()),
+    }
+}
+
+pub(crate) fn is_retryable_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Other
+    )
+}
+
 /// 从有界的 stderr 里取一行短消息用于 UI 展示。
 fn probe_stderr(capture: &Capture) -> String {
     let text = String::from_utf8_lossy(&capture.stderr);
@@ -987,36 +1149,44 @@ fn probe_stderr(capture: &Capture) -> String {
     if text.is_empty() {
         return format!("remote probe failed (exit {:?})", capture.status);
     }
-    let mut line = text
-        .lines()
-        .next()
-        .unwrap_or("remote probe failed")
-        .to_string();
-    if line.len() > 200 {
-        line.truncate(200);
-    }
-    line
+    safe_inline_diagnostic(text)
 }
 
 /// 解析 `list` 的 stdout：NUL 分隔的 (type, name) 对。d → 目录，f/l → 文件
 /// （符号链接不展开成目录）。与本地 scan_dir 同一策略：隐藏 dotfiles、目录
-/// 在前且大小写不敏感排序；非 UTF-8 名称 lossy 转换。远端输出不可信：
-/// 空名、`.`/`..`、带 `/` 的名称一律跳过。至多保留 MAX_DIRECTORY_ENTRIES + 1
-/// 条 —— 多出的第 MAX+1 条让上层（扫描 worker）据此标记"目录已截断"。
+/// 在前且大小写不敏感排序。远端输出不可信：非 UTF-8/超长名称、空名、
+/// `.`/`..`、带 `/` 或重复碰撞的名称一律跳过。至多保留
+/// MAX_DIRECTORY_ENTRIES + 1 条 —— 多出的第 MAX+1 条让上层（扫描 worker）
+/// 据此标记"目录已截断"。
+#[allow(dead_code)] // compatibility wrapper and default-policy test surface
 fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
-    let mut entries = Vec::new();
+    parse_list_with_hidden(bytes, dir, false)
+}
+
+fn parse_list_with_hidden(bytes: &[u8], dir: &Path, show_hidden: bool) -> Vec<Entry> {
+    // A lossy-decoded remote name is not the same command operand. Invalid
+    // UTF-8 is therefore skipped instead of displayed as U+FFFD and later sent
+    // back to a potentially different path. Duplicate names are ambiguous
+    // protocol output; drop every occurrence rather than choosing a type.
+    let mut entries_by_name: BTreeMap<String, Option<Entry>> = BTreeMap::new();
     let mut tokens = bytes.split(|byte| *byte == 0);
     let mut scanned = 0usize;
     while let (Some(kind), Some(name)) = (tokens.next(), tokens.next()) {
         scanned += 1;
-        if scanned > MAX_SCANNED_PAIRS || entries.len() > MAX_DIRECTORY_ENTRIES {
+        if scanned > MAX_SCANNED_PAIRS {
             break;
         }
-        if name.is_empty() || matches!(name, [b'.'] | [b'.', b'.']) || name.contains(&b'/') {
+        if name.is_empty()
+            || name.len() > MAX_REMOTE_NAME_BYTES
+            || matches!(name, [b'.'] | [b'.', b'.'])
+            || name.contains(&b'/')
+        {
             continue;
         }
-        let name = String::from_utf8_lossy(name).into_owned();
-        if name.starts_with('.') {
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if !show_hidden && name.starts_with('.') {
             continue;
         }
         let is_dir = match kind.first() {
@@ -1024,13 +1194,23 @@ fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
             Some(b'f') | Some(b'l') => false,
             _ => continue,
         };
-        entries.push(Entry {
-            path: dir.join(&name),
-            name,
-            is_dir,
-        });
+        use std::collections::btree_map::Entry as MapEntry;
+        match entries_by_name.entry(name.to_string()) {
+            MapEntry::Vacant(slot) => {
+                slot.insert(Some(Entry {
+                    path: dir.join(name),
+                    name: name.to_string(),
+                    is_dir,
+                }));
+            }
+            MapEntry::Occupied(mut slot) => {
+                slot.insert(None);
+            }
+        }
     }
+    let mut entries: Vec<Entry> = entries_by_name.into_values().flatten().collect();
     sort_entries(&mut entries);
+    entries.truncate(MAX_DIRECTORY_ENTRIES + 1);
     entries
 }
 
@@ -1041,7 +1221,12 @@ fn sort_entries(entries: &mut [Entry]) {
 
 /// 本机目录列举，与远端 [`parse_list`] 完全同策略（dotfiles / 排序 / 上限），
 /// 这样本机与远程在文件树里的行为没有可见差异。
+#[allow(dead_code)] // compatibility wrapper and default-policy test surface
 fn local_list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
+    local_list_dir_with_hidden(dir, false)
+}
+
+fn local_list_dir_with_hidden(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for (scanned, entry) in std::fs::read_dir(dir)?.enumerate() {
         if scanned >= MAX_SCANNED_PAIRS || entries.len() > MAX_DIRECTORY_ENTRIES {
@@ -1049,7 +1234,7 @@ fn local_list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
         }
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if !show_hidden && name.starts_with('.') {
             continue;
         }
         entries.push(Entry {
@@ -1317,27 +1502,95 @@ pub fn list_dir_with_overlay(
     overlay: &SshExecutionOverlay,
     dir: &Path,
 ) -> io::Result<Vec<Entry>> {
+    list_dir_with_overlay_and_hidden(loc, hosts, overlay, dir, false)
+}
+
+pub fn list_dir_with_overlay_and_hidden(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    dir: &Path,
+    show_hidden: bool,
+) -> io::Result<Vec<Entry>> {
+    list_dir_with_overlay_and_hidden_impl(loc, hosts, overlay, dir, show_hidden, None)
+}
+
+/// Cancellable listing used by the Files scan coordinator. Cancellation kills
+/// the whole remote probe process group and is reported as Interrupted; the
+/// caller's generation/revision gate then discards that retired result.
+pub fn list_dir_with_overlay_and_hidden_control(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    dir: &Path,
+    show_hidden: bool,
+    cancel: Arc<AtomicBool>,
+) -> io::Result<Vec<Entry>> {
+    list_dir_with_overlay_and_hidden_impl(loc, hosts, overlay, dir, show_hidden, Some(cancel))
+}
+
+fn list_dir_with_overlay_and_hidden_impl(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    overlay: &SshExecutionOverlay,
+    dir: &Path,
+    show_hidden: bool,
+    cancel: Option<Arc<AtomicBool>>,
+) -> io::Result<Vec<Entry>> {
     let Some(host) = execution_host_for_location(loc, hosts, overlay)? else {
-        return local_list_dir(dir);
+        return local_list_dir_with_hidden(dir, show_hidden);
     };
     require_absolute(dir)?;
-    let capture = run_probe(
+    let probe_args = list_probe_args(dir, show_hidden)?;
+    let capture = run_probe_with_cancel(
         &host,
         "list",
-        &[path_str(dir)?],
+        &[
+            probe_args[0].as_str(),
+            probe_args[1].as_str(),
+            probe_args[2].as_str(),
+        ],
         PROBE_LIST_TIMEOUT,
         MAX_LIST_OUTPUT,
+        cancel,
     )?;
     let output = probe_output(capture)?;
-    Ok(parse_list(&output, dir))
+    Ok(parse_list_with_hidden(&output, dir, show_hidden))
+}
+
+fn list_probe_args(dir: &Path, show_hidden: bool) -> io::Result<[String; 3]> {
+    require_absolute(dir)?;
+    Ok([
+        path_str(dir)?.to_string(),
+        (MAX_DIRECTORY_ENTRIES + 1).to_string(),
+        if show_hidden { "1" } else { "0" }.to_string(),
+    ])
+}
+
+fn parse_home_output(output: &[u8]) -> io::Result<PathBuf> {
+    let text = std::str::from_utf8(output).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "remote home is not valid UTF-8")
+    })?;
+    let text = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .or_else(|| text.strip_suffix('\r'))
+        .unwrap_or(text);
+    if text.is_empty() || text.contains(['\n', '\r', '\0']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote home has an invalid line shape",
+        ));
+    }
+    let path = PathBuf::from(text);
+    require_absolute(&path)?;
+    Ok(path)
 }
 
 fn remote_start_dir(host: &RemoteHostConfig) -> io::Result<PathBuf> {
     let capture = run_probe(host, "home", &[], PROBE_LIST_TIMEOUT, MAX_SMALL_OUTPUT)?;
     let output = probe_output(capture)?;
-    let path = PathBuf::from(String::from_utf8_lossy(&output).trim().to_string());
-    require_absolute(&path)?;
-    Ok(path)
+    parse_home_output(&output)
 }
 
 fn remote_create_dir(host: &RemoteHostConfig, path: &Path) -> io::Result<()> {
@@ -2132,6 +2385,23 @@ docker = true
     }
 
     #[test]
+    fn production_list_probe_stamps_limit_and_hidden_policy() {
+        assert_eq!(
+            list_probe_args(Path::new("/remote/work"), false).unwrap(),
+            [
+                "/remote/work".to_string(),
+                (MAX_DIRECTORY_ENTRIES + 1).to_string(),
+                "0".to_string(),
+            ]
+        );
+        assert_eq!(
+            list_probe_args(Path::new("/remote/work"), true).unwrap()[2],
+            "1"
+        );
+        assert!(list_probe_args(Path::new("relative"), false).is_err());
+    }
+
+    #[test]
     fn ssh_argv_is_batch_mode_single_command_element() {
         let argv = probe_argv(&ssh_host(), "list", &["/var/log"]);
         assert_eq!(
@@ -2234,17 +2504,24 @@ docker = true
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         // 未知类型 x 同样丢弃；剩下的只有 kept.txt。
         assert_eq!(names, vec!["kept.txt"]);
+
+        let shown = parse_list_with_hidden(bytes, Path::new("/base"), true);
+        let shown_names: Vec<&str> = shown.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(shown_names, vec![".visible", "kept.txt"]);
     }
 
     #[test]
-    fn parse_list_tolerates_spaces_newlines_and_non_utf8_names() {
+    fn parse_list_keeps_exact_utf8_names_and_rejects_ambiguous_operands() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"f\0my file.txt\0");
         bytes.extend_from_slice(b"f\0line\nbreak\0");
         bytes.extend_from_slice(b"f\0bad\xffname\0");
+        bytes.extend_from_slice(b"f\0duplicate\0d\0duplicate\0");
         let entries = parse_list(&bytes, Path::new("/base"));
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["bad\u{fffd}name", "line\nbreak", "my file.txt"]);
+        assert_eq!(names, vec!["line\nbreak", "my file.txt"]);
+        assert!(entries.iter().all(|entry| !entry.name.contains('\u{fffd}')));
+        assert!(entries.iter().all(|entry| entry.name != "duplicate"));
     }
 
     #[test]
@@ -2431,8 +2708,13 @@ docker = true
 
         // 符号链接别名：dst 父目录经链接指向 src，规范化后同样被拒。
         std::os::unix::fs::symlink(&src, dir.join("alias")).unwrap();
-        let error = copy(&FsLocation::Local, &[], &src, &dir.join("alias").join("inner"))
-            .expect_err("copy into itself through a symlink alias");
+        let error = copy(
+            &FsLocation::Local,
+            &[],
+            &src,
+            &dir.join("alias").join("inner"),
+        )
+        .expect_err("copy into itself through a symlink alias");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         // 兄弟目录不受影响。
@@ -2670,6 +2952,32 @@ docker = true
     }
 
     #[test]
+    fn run_capture_cancellation_retires_a_remote_probe_process_group() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & wait".to_string(),
+        ];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancel);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let capture =
+            run_capture_with_cancel(&argv, &[], Duration::from_secs(30), 1024, Some(cancel))
+                .unwrap();
+        setter.join().unwrap();
+        assert!(capture.cancelled);
+        assert!(!capture.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancelled probe descendants must not hold stdout/stderr open"
+        );
+    }
+
+    #[test]
     fn read_bounded_reports_truncation_and_drains_the_rest() {
         let (bytes, truncated) = read_bounded(&b"abcdef"[..], 3).unwrap();
         assert_eq!((bytes.as_slice(), truncated), (&b"abc"[..], true));
@@ -2695,6 +3003,11 @@ docker = true
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         let error = probe_output(capture(Some(3), "")).expect_err("3");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let error = probe_output(capture(Some(13), "hostile secret=credential")).expect_err("13");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "permission denied");
+        let error = probe_output(capture(Some(20), "")).expect_err("20");
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
         let error = probe_output(capture(Some(2), "usage")).expect_err("2");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         let error = probe_output(capture(Some(4), "disk full\nmore detail")).expect_err("4");
@@ -2707,6 +3020,58 @@ docker = true
         timed.timed_out = true;
         let error = probe_output(timed).expect_err("timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(is_retryable_error(&error));
+        assert!(!is_retryable_error(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad protocol"
+        )));
+    }
+
+    #[test]
+    fn home_output_is_strict_utf8_single_line_and_absolute() {
+        assert_eq!(
+            parse_home_output(b"/remote/home\n").unwrap(),
+            Path::new("/remote/home")
+        );
+        assert_eq!(
+            parse_home_output(b"/remote/home\r\n").unwrap(),
+            Path::new("/remote/home")
+        );
+        for invalid in [
+            b"relative\n".as_slice(),
+            b"/one\n/two\n".as_slice(),
+            b"/one\0two\n".as_slice(),
+            b"\xff\n".as_slice(),
+            b"\n".as_slice(),
+        ] {
+            assert!(parse_home_output(invalid).is_err(), "invalid={invalid:?}");
+        }
+    }
+
+    #[test]
+    fn inline_remote_diagnostics_are_redacted_control_safe_and_unicode_bounded() {
+        let diagnostic = format!(
+            "permission denied\u{202e}\nignored token=super-secret password: hunter2 {}",
+            "远".repeat(240)
+        );
+        let first = safe_inline_diagnostic(&diagnostic);
+        assert!(!first.contains('\u{202e}'));
+        assert!(!first.contains("super-secret"));
+        assert!(!first.contains("hunter2"));
+        // The first non-empty line is authoritative, so later attacker text
+        // never leaks into a probe error either.
+        assert_eq!(first, "permission denied");
+
+        let long = safe_inline_diagnostic(&format!("token=super-secret {}", "远".repeat(240)));
+        assert!(long.contains("token=<redacted>"));
+        assert!(!long.contains("super-secret"));
+        assert!(long.chars().count() <= MAX_INLINE_DIAGNOSTIC_CHARS + 1);
+        assert!(long.ends_with('…'));
+
+        let error = io::Error::other("Authorization: Bearer-credential\u{0007}");
+        let visible = user_facing_error(&error);
+        assert!(!visible.contains("Bearer-credential"));
+        assert!(!visible.chars().any(char::is_control));
     }
 
     // ---- 探针脚本端到端（本机 sh，不触网） ----
@@ -2730,6 +3095,8 @@ docker = true
         std::fs::create_dir(dir.join("sub dir")).unwrap();
         std::fs::write(dir.join("file.txt"), b"x").unwrap();
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("sub dir"), dir.join("linked dir")).unwrap();
 
         let dir_arg = dir.path().to_str().unwrap().to_string();
         let capture = run_probe_locally(&["list", &dir_arg]);
@@ -2737,8 +3104,23 @@ docker = true
         let entries = parse_list(&capture.stdout, dir.path());
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         // dotfile 在 Rust 侧过滤；空格名原样保留。
-        assert_eq!(names, vec!["sub dir", "file.txt"]);
+        assert_eq!(names, vec!["sub dir", "file.txt", "linked dir"]);
         assert!(entries[0].is_dir);
+        #[cfg(unix)]
+        assert!(
+            !entries
+                .iter()
+                .find(|entry| entry.name == "linked dir")
+                .unwrap()
+                .is_dir,
+            "a symlink to a directory must never become an expandable row"
+        );
+
+        let capture = run_probe_locally(&["list", &dir_arg, "2", "0"]);
+        assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
+        let limited = parse_list_with_hidden(&capture.stdout, dir.path(), true);
+        assert_eq!(limited.len(), 2, "the remote probe enforces its row cap");
+        assert!(limited.iter().all(|entry| !entry.name.starts_with('.')));
 
         let capture = run_probe_locally(&["home"]);
         assert_eq!(capture.status, Some(0));
@@ -2763,6 +3145,13 @@ docker = true
         );
         assert_eq!(run_probe_locally(&["bogus"]).status, Some(2));
         assert_eq!(run_probe_locally(&[]).status, Some(2));
+
+        let plain_file = dir.join("not-a-directory");
+        std::fs::write(&plain_file, b"x").unwrap();
+        assert_eq!(
+            run_probe_locally(&["list", plain_file.to_str().unwrap()]).status,
+            Some(20)
+        );
 
         // mkdir 正常 + 已存在 17。
         let sub = dir.join("sub");

@@ -1,9 +1,9 @@
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use jterm_core::jsh_remote::RemoteHostConfig;
@@ -18,8 +18,27 @@ pub const DIRECTORY_PAGE_SIZE: usize = 64;
 pub const MAX_DIRECTORY_ENTRIES: usize = 16 * 1024;
 const MAX_DIRECTORY_SCAN_ENTRIES: usize = MAX_DIRECTORY_ENTRIES * 4;
 const SCAN_WORKERS: usize = 2;
+/// Queued (not running) directory scans are bounded independently from the
+/// worker count. A hostile/wide remote tree can therefore never turn clicks
+/// into unbounded `ScanRequest` memory growth.
+const SCAN_QUEUE_CAPACITY: usize = 64;
 const SCAN_RESULT_CAPACITY: usize = 8;
+const OP_QUEUE_CAPACITY: usize = 64;
 const OP_RESULT_CAPACITY: usize = 8;
+/// Retry requests normally jump ahead of lazy expansion work. After this many
+/// consecutive jumps, one already-queued lazy request is allowed through so a
+/// user repeatedly retrying one broken host cannot starve the rest of the
+/// visible tree forever.
+const INTERACTIVE_SCAN_BURST: usize = 3;
+/// Remote snapshots are served stale-while-revalidate. A low-frequency UI
+/// tick refreshes only a tiny visible prefix, so an idle Files panel cannot
+/// turn a large expanded tree into a polling storm.
+const REMOTE_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const AUTO_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const AUTO_REVALIDATE_BUDGET: usize = 2;
+const NAVIGATION_HISTORY_CAPACITY: usize = 32;
+const NAVIGATION_CACHE_CAPACITY: usize = 8;
+const MAX_REMOTE_PATH_BYTES: usize = 4_096;
 
 type ScanFn = dyn Fn(&Path) -> io::Result<DirectoryListing> + Send + Sync + 'static;
 
@@ -98,12 +117,91 @@ pub fn effective_view(configured: SidebarView, task_sidebar_enabled: bool) -> Si
     }
 }
 
+/// Validate and lexically normalize a path typed into Remote Files. Remote
+/// shell probes receive this value as data, but rejecting ambiguous/control
+/// text here also keeps breadcrumbs, logs, and status messages truthful.
+pub fn validate_remote_navigation_text(input: &str) -> Result<PathBuf, String> {
+    if input.is_empty() {
+        return Err("Remote Files path cannot be empty".to_string());
+    }
+    if input.len() > MAX_REMOTE_PATH_BYTES {
+        return Err(format!(
+            "Remote Files path is too long (maximum {MAX_REMOTE_PATH_BYTES} bytes)"
+        ));
+    }
+    if !input.starts_with('/') {
+        return Err("Remote Files navigation requires an absolute path".to_string());
+    }
+    if input.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }) {
+        return Err("Remote Files path contains control or bidirectional text".to_string());
+    }
+
+    let mut components: Vec<&str> = Vec::new();
+    for component in input.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(
+                        "Remote Files path attempts to escape the filesystem root".to_string()
+                    );
+                }
+            }
+            value => components.push(value),
+        }
+    }
+    let normalized = if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    };
+    Ok(PathBuf::from(normalized))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl DirectoryFailure {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    fn from_io(error: &io::Error) -> Self {
+        Self {
+            message: remote_fs::user_facing_error(error),
+            retryable: remote_fs::is_retryable_error(error),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DirectoryLoadState {
     NotLoaded,
     Loading,
     Loaded,
-    Error(String),
+    /// A new listing is in flight while the last successful snapshot remains
+    /// visible. Slow remote refreshes must not blank a usable tree.
+    Refreshing,
+    Error(DirectoryFailure),
+    /// A refresh failed after this directory had loaded successfully. Keep the
+    /// last-good children visible and let a later refresh retry.
+    StaleError(DirectoryFailure),
 }
 
 /// 文件树节点。目录的 children 只在用户展开它后由后台 worker 填充。
@@ -117,6 +215,10 @@ pub struct FileTreeNode {
     visible_children: usize,
     entries_truncated: bool,
     load_state: DirectoryLoadState,
+    /// Monotonic completion time of the last successful listing. It survives
+    /// Refreshing/StaleError so the UI can state how old the retained snapshot
+    /// actually is without trusting wall-clock changes.
+    last_loaded_at: Option<std::time::Instant>,
 }
 
 impl FileTreeNode {
@@ -130,6 +232,7 @@ impl FileTreeNode {
             visible_children: 0,
             entries_truncated: false,
             load_state: DirectoryLoadState::NotLoaded,
+            last_loaded_at: None,
         }
     }
 
@@ -146,6 +249,7 @@ impl FileTreeNode {
                 visible_children: 0,
                 entries_truncated: false,
                 load_state: DirectoryLoadState::Loaded,
+                last_loaded_at: None,
             }
         }
     }
@@ -160,17 +264,43 @@ impl FileTreeNode {
 
     pub fn load_error(&self) -> Option<&str> {
         match &self.load_state {
-            DirectoryLoadState::Error(error) => Some(error),
+            DirectoryLoadState::Error(error) | DirectoryLoadState::StaleError(error) => {
+                Some(&error.message)
+            }
             _ => None,
         }
     }
 
+    pub fn load_error_retryable(&self) -> bool {
+        match &self.load_state {
+            DirectoryLoadState::Error(error) | DirectoryLoadState::StaleError(error) => {
+                error.retryable
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_loading(&self) -> bool {
-        matches!(self.load_state, DirectoryLoadState::Loading)
+        matches!(
+            self.load_state,
+            DirectoryLoadState::Loading | DirectoryLoadState::Refreshing
+        )
+    }
+
+    pub fn is_refreshing(&self) -> bool {
+        matches!(&self.load_state, DirectoryLoadState::Refreshing)
+    }
+
+    pub fn has_stale_error(&self) -> bool {
+        matches!(&self.load_state, DirectoryLoadState::StaleError(_))
     }
 
     pub fn entries_truncated(&self) -> bool {
         self.entries_truncated
+    }
+
+    pub fn snapshot_age(&self) -> Option<std::time::Duration> {
+        self.last_loaded_at.map(|loaded| loaded.elapsed())
     }
 
     fn has_loading_descendant(&self) -> bool {
@@ -188,6 +318,84 @@ impl FileTreeNode {
         for child in &self.children {
             child.collect_loading_paths(paths);
         }
+    }
+
+    /// A root-generation change retires nested requests from the old
+    /// generation. Preserve their last-good snapshots, but return a first-load
+    /// node to NotLoaded so expanding it can issue a fresh request.
+    fn retire_nested_loading(&mut self) {
+        self.retire_own_loading();
+        for child in &mut self.children {
+            child.retire_nested_loading();
+        }
+    }
+
+    fn retire_own_loading(&mut self) {
+        self.load_state = match std::mem::replace(&mut self.load_state, DirectoryLoadState::Loaded)
+        {
+            DirectoryLoadState::Loading if self.children.is_empty() => {
+                DirectoryLoadState::NotLoaded
+            }
+            DirectoryLoadState::Loading | DirectoryLoadState::Refreshing => {
+                DirectoryLoadState::Loaded
+            }
+            state => state,
+        };
+    }
+
+    fn cancel_own_loading(&mut self) {
+        self.load_state = match std::mem::replace(&mut self.load_state, DirectoryLoadState::Loaded)
+        {
+            DirectoryLoadState::Loading if self.children.is_empty() => {
+                DirectoryLoadState::NotLoaded
+            }
+            DirectoryLoadState::Loading => DirectoryLoadState::Loaded,
+            DirectoryLoadState::Refreshing => DirectoryLoadState::StaleError(
+                DirectoryFailure::retryable("refresh cancelled when directory was collapsed"),
+            ),
+            state => state,
+        };
+    }
+
+    /// Reconcile one refreshed directory level while retaining the complete
+    /// state of surviving rows. Matching directories keep loaded descendants,
+    /// expansion, and pagination; a path whose type changed is replaced.
+    fn apply_listing(&mut self, listing: DirectoryListing) {
+        let previous_visible = self.visible_children;
+        let mut previous = std::mem::take(&mut self.children)
+            .into_iter()
+            .map(|child| (child.path.clone(), child))
+            .collect::<BTreeMap<_, _>>();
+        self.children = listing
+            .entries
+            .into_iter()
+            .map(|entry| match previous.remove(&entry.path) {
+                Some(mut child) if child.is_dir == entry.is_dir => {
+                    child.name = entry.name;
+                    child
+                }
+                _ => FileTreeNode::from_entry(entry),
+            })
+            .collect();
+        self.visible_children = previous_visible
+            .max(DIRECTORY_PAGE_SIZE)
+            .min(self.children.len());
+        self.entries_truncated = listing.truncated;
+        self.load_state = DirectoryLoadState::Loaded;
+        self.last_loaded_at = Some(std::time::Instant::now());
+    }
+
+    fn mark_scan_error(&mut self, error: DirectoryFailure) {
+        self.load_state = if matches!(&self.load_state, DirectoryLoadState::Refreshing)
+            || !self.children.is_empty()
+        {
+            DirectoryLoadState::StaleError(error)
+        } else {
+            self.children.clear();
+            self.visible_children = 0;
+            self.entries_truncated = false;
+            DirectoryLoadState::Error(error)
+        };
     }
 
     /// 树内过滤视图（纯函数，不动原树）：名称大小写不敏感命中（含子串）的
@@ -249,20 +457,102 @@ impl DirectoryListing {
 #[derive(Clone, Debug)]
 struct ScanRequest {
     generation: u64,
+    revision: u64,
     path: PathBuf,
     backend: ScanBackend,
+    show_hidden: bool,
+    cancel: Arc<AtomicBool>,
+    priority: ScanPriority,
+    queued_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanPriority {
+    /// A root/navigation request supersedes every queued request from the old
+    /// tree generation and is always dispatched first.
+    Root,
+    /// Explicit retry of a visible error. It may jump lazy expansion work,
+    /// subject to [`INTERACTIVE_SCAN_BURST`] fairness.
+    Retry,
+    /// First expansion and operation-driven background reconciliation.
+    Lazy,
 }
 
 #[derive(Debug)]
 struct ScanResult {
     generation: u64,
+    revision: u64,
     path: PathBuf,
-    entries: Result<DirectoryListing, String>,
+    entries: Result<DirectoryListing, DirectoryFailure>,
+    queue_delay: std::time::Duration,
+    run_time: std::time::Duration,
 }
 
-/// 目录扫描服务。请求通道无界：用户动作只排队、绝不拒绝（unbounded 的
-/// send 不阻塞，UI 线程安全）；真正并发的子进程数仍由 SCAN_WORKERS 个
-/// worker 限定。结果通道保持有界，worker 在 UI 停读时自然背压。
+#[derive(Clone, Debug)]
+pub struct ScanTiming {
+    pub path: PathBuf,
+    pub queue_delay: std::time::Duration,
+    pub run_time: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationCause {
+    Ordinary,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Debug)]
+struct PendingNavigation {
+    generation: u64,
+    origin: PathBuf,
+    target: PathBuf,
+    cause: NavigationCause,
+    endpoint_commit: Option<PendingEndpoint>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingEndpoint {
+    location: FsLocation,
+    overlay: remote_fs::SshExecutionOverlay,
+    home: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PendingLocationProbe {
+    authority_generation: u64,
+    location: FsLocation,
+    overlay: remote_fs::SshExecutionOverlay,
+}
+
+#[derive(Clone, Debug)]
+struct CachedRoot {
+    path: PathBuf,
+    root: FileTreeNode,
+}
+
+#[derive(Clone, Debug)]
+struct FailureState {
+    consecutive: u8,
+    retry_not_before: Option<std::time::Instant>,
+    automatic_retry: bool,
+}
+
+fn retry_delay(consecutive: u8) -> std::time::Duration {
+    let seconds = match consecutive {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 8,
+        5 => 16,
+        _ => 30,
+    };
+    std::time::Duration::from_secs(seconds)
+}
+
+/// 目录扫描服务。请求与结果通道都有硬上限；入队前会物理清理已取消/
+/// 同路径旧请求。Root 总是优先，Retry 有有界插队权，Lazy 仍通过加权
+/// 公平性获得运行机会。真正并发的远端子进程数由 SCAN_WORKERS 限定。
 #[derive(Debug)]
 struct DirectoryScanService {
     request_tx: Sender<ScanRequest>,
@@ -270,11 +560,13 @@ struct DirectoryScanService {
     /// work. Workers receive from clones of this same queue.
     request_rx: Receiver<ScanRequest>,
     result_rx: Receiver<ScanResult>,
+    interactive_streak: AtomicUsize,
+    queue_capacity: usize,
 }
 
 impl DirectoryScanService {
     fn new(scanner: Arc<ScanFn>) -> io::Result<Self> {
-        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (request_tx, request_rx) = crossbeam_channel::bounded(SCAN_QUEUE_CAPACITY);
         let (result_tx, result_rx) = crossbeam_channel::bounded(SCAN_RESULT_CAPACITY);
 
         for worker_index in 0..SCAN_WORKERS {
@@ -291,18 +583,97 @@ impl DirectoryScanService {
             request_tx,
             request_rx,
             result_rx,
+            interactive_streak: AtomicUsize::new(0),
+            queue_capacity: SCAN_QUEUE_CAPACITY,
         })
     }
 
     fn request(&self, request: ScanRequest, supersede_queued: bool) -> Result<(), String> {
-        if supersede_queued {
-            while self.request_rx.try_recv().is_ok() {}
+        let mut queued = VecDeque::new();
+        while let Ok(previous) = self.request_rx.try_recv() {
+            if supersede_queued
+                || previous.cancel.load(Ordering::SeqCst)
+                || previous.path == request.path
+            {
+                previous.cancel.store(true, Ordering::SeqCst);
+            } else {
+                queued.push_back(previous);
+            }
         }
 
-        // 无界队列的 send 只在 worker 全部退出时失败；永不阻塞 UI 线程。
-        self.request_tx
-            .send(request)
-            .map_err(|_| "directory scan workers stopped".to_string())
+        if supersede_queued {
+            self.interactive_streak.store(0, Ordering::SeqCst);
+        }
+
+        // The queue was drained above, so re-sending at most its hard capacity
+        // cannot block the UI thread. On overflow, preserve every older live
+        // request and fail only the new row into a visible/retryable Error.
+        if queued.len() >= self.queue_capacity {
+            for pending in queued {
+                self.request_tx
+                    .send(pending)
+                    .map_err(|_| "directory scan workers stopped".to_string())?;
+            }
+            return Err(format!(
+                "directory scan queue is busy (maximum {}); retry shortly",
+                self.queue_capacity
+            ));
+        }
+
+        let send = |pending| {
+            self.request_tx
+                .send(pending)
+                .map_err(|_| "directory scan workers stopped".to_string())
+        };
+
+        match request.priority {
+            ScanPriority::Root => send(request),
+            ScanPriority::Retry => {
+                let streak = self.interactive_streak.fetch_add(1, Ordering::SeqCst);
+                if streak >= INTERACTIVE_SCAN_BURST {
+                    if let Some(index) = queued
+                        .iter()
+                        .position(|pending| pending.priority == ScanPriority::Lazy)
+                    {
+                        if let Some(fair) = queued.remove(index) {
+                            send(fair)?;
+                            self.interactive_streak.store(0, Ordering::SeqCst);
+                        }
+                    }
+                }
+                send(request)?;
+                for pending in queued {
+                    send(pending)?;
+                }
+                Ok(())
+            }
+            ScanPriority::Lazy => {
+                self.interactive_streak.store(0, Ordering::SeqCst);
+                for pending in queued {
+                    send(pending)?;
+                }
+                send(request)
+            }
+        }
+    }
+
+    fn cancel_queued_path(&self, path: &Path) {
+        let mut retained = VecDeque::new();
+        while let Ok(pending) = self.request_rx.try_recv() {
+            if pending.path == path || pending.cancel.load(Ordering::SeqCst) {
+                pending.cancel.store(true, Ordering::SeqCst);
+            } else {
+                retained.push_back(pending);
+            }
+        }
+        for pending in retained {
+            // Only the UI owns request production and the queue was just
+            // drained, so this cannot hit capacity. A disconnected worker set
+            // is reported by the ordinary poll path.
+            if self.request_tx.send(pending).is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -339,6 +710,17 @@ impl FsOpKind {
             }
         }
         dirs
+    }
+
+    /// Destination row that should regain focus once its exact parent listing
+    /// confirms the mutation. Deletes intentionally have no synthetic target.
+    fn selection_target(&self) -> Option<(PathBuf, PathBuf)> {
+        let target = match self {
+            FsOpKind::CreateDir(path) | FsOpKind::CreateFile(path) => path,
+            FsOpKind::Rename { dst, .. } | FsOpKind::Copy { dst, .. } => dst,
+            FsOpKind::Delete(_) => return None,
+        };
+        Some((target.parent()?.to_path_buf(), target.clone()))
     }
 
     /// 状态栏的失败前缀（完整消息由 poll_op_results 拼上具体错误）。
@@ -524,8 +906,8 @@ pub struct TransferStatus {
 }
 
 /// 文件操作 worker：单线程串行执行（操作之间本就有先后语义，比如
-/// cut-paste 不能被后续操作抢跑）。请求队列与扫描服务同契约：无界队列
-/// 只缓冲用户动作，并发由这唯一一个 worker 限定。
+/// cut-paste 不能被后续操作抢跑）。请求队列有硬上限，并发由这唯一一个
+/// worker 限定；满载时 UI 得到可见可重试的错误，绝不阻塞。
 #[derive(Debug)]
 struct FsOpService {
     request_tx: Sender<FsOpRequest>,
@@ -534,7 +916,7 @@ struct FsOpService {
 
 impl FsOpService {
     fn new() -> io::Result<Self> {
-        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
         let (result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
         std::thread::Builder::new()
             .name("ember-fs-op".to_string())
@@ -546,10 +928,15 @@ impl FsOpService {
     }
 
     fn request(&self, request: FsOpRequest) -> Result<(), String> {
-        // 无界队列的 send 只在 worker 退出时失败；永不阻塞 UI 线程。
-        self.request_tx
-            .send(request)
-            .map_err(|_| "file operation worker stopped".to_string())
+        match self.request_tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(_)) => Err(format!(
+                "file operation queue is busy (maximum {OP_QUEUE_CAPACITY}); retry shortly"
+            )),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                Err("file operation worker stopped".to_string())
+            }
+        }
     }
 }
 
@@ -591,7 +978,7 @@ fn op_worker(requests: Receiver<FsOpRequest>, results: Sender<OpEvent>) {
                 outcome: execution
                     .as_ref()
                     .map(|done| done.path.clone())
-                    .map_err(|error| error.to_string()),
+                    .map_err(remote_fs::user_facing_error),
                 warning: execution
                     .as_ref()
                     .ok()
@@ -696,13 +1083,16 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                                 &src_endpoint.overlay,
                                 src,
                             ) {
-                                outcome
-                                    .warnings
-                                    .push(format!("{name}：源删除失败（已保留）：{error}"));
+                                outcome.warnings.push(format!(
+                                    "{name}：源删除失败（已保留）：{}",
+                                    remote_fs::user_facing_error(&error)
+                                ));
                             }
                         }
                     }
-                    Err(error) => outcome.failed.push((src.clone(), error.to_string())),
+                    Err(error) => outcome
+                        .failed
+                        .push((src.clone(), remote_fs::user_facing_error(&error))),
                 }
             }
         }
@@ -715,7 +1105,9 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                     path,
                 ) {
                     Ok(()) => outcome.succeeded += 1,
-                    Err(error) => outcome.failed.push((path.clone(), error.to_string())),
+                    Err(error) => outcome
+                        .failed
+                        .push((path.clone(), remote_fs::user_facing_error(&error))),
                 }
             }
         }
@@ -787,7 +1179,10 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
                     &transfer.src_endpoint.overlay,
                     &transfer.src,
                 ) {
-                    warning = Some(format!("源删除失败（已保留）：{error}"));
+                    warning = Some(format!(
+                        "源删除失败（已保留）：{}",
+                        remote_fs::user_facing_error(&error)
+                    ));
                 }
             }
             Ok(OpDone {
@@ -806,14 +1201,23 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
 
 fn scan_worker(requests: Receiver<ScanRequest>, results: Sender<ScanResult>, scanner: Arc<ScanFn>) {
     while let Ok(request) = requests.recv() {
+        // Superseded queued work retires without consuming a local scan or a
+        // remote SSH/Docker subprocess slot.
+        if request.cancel.load(Ordering::SeqCst) {
+            continue;
+        }
+        let started_at = std::time::Instant::now();
+        let queue_delay = started_at.saturating_duration_since(request.queued_at);
         let listing = match &request.backend {
             ScanBackend::Local => scanner(&request.path),
             ScanBackend::Remote(endpoint, hosts) => {
-                remote_fs::list_dir_with_overlay(
+                remote_fs::list_dir_with_overlay_and_hidden_control(
                     &endpoint.location,
                     hosts,
                     &endpoint.overlay,
                     &request.path,
+                    request.show_hidden,
+                    Arc::clone(&request.cancel),
                 )
                 .map(|entries| {
                     DirectoryListing {
@@ -833,18 +1237,28 @@ fn scan_worker(requests: Receiver<ScanRequest>, results: Sender<ScanResult>, sca
         };
         let entries = listing
             .map(|mut listing| {
+                if !request.show_hidden {
+                    listing.entries.retain(|entry| !entry.name.starts_with('.'));
+                }
                 if listing.entries.len() > MAX_DIRECTORY_ENTRIES {
                     listing.entries.truncate(MAX_DIRECTORY_ENTRIES);
                     listing.truncated = true;
                 }
                 listing
             })
-            .map_err(|error| error.to_string());
+            .map_err(|error| DirectoryFailure::from_io(&error));
+        if request.cancel.load(Ordering::SeqCst) {
+            continue;
+        }
+        let run_time = started_at.elapsed();
         if results
             .send(ScanResult {
                 generation: request.generation,
+                revision: request.revision,
                 path: request.path,
                 entries,
+                queue_delay,
+                run_time,
             })
             .is_err()
         {
@@ -864,18 +1278,10 @@ fn scan_dir(dir: &Path) -> io::Result<DirectoryListing> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        // Keep the existing product behavior: dotfiles are deliberately
-        // hidden. Unlike the former implementation, visible entries are never
-        // silently cut off after item 20.
-        if name.starts_with('.') {
-            continue;
-        }
-
-        if entries.len() == MAX_DIRECTORY_ENTRIES {
-            truncated = true;
-            break;
-        }
-
+        // Keep raw rows until the scanned-entry bound. The worker applies the
+        // request's hidden-file policy before the smaller retained cap, so a
+        // directory full of dotfiles cannot crowd ordinary names out while
+        // hidden mode is off.
         entries.push(FileEntry {
             name,
             path: entry.path(),
@@ -915,15 +1321,26 @@ pub struct Sidebar {
     pub visible: bool,
     pub width: f32,
     pub current_dir: PathBuf,
+    /// Authority-bound start directory. For a remote endpoint this is the
+    /// strictly parsed home returned by its successful probe and remains
+    /// stable while `current_dir` navigates deeper.
+    location_home: Option<PathBuf>,
     pub root: Option<FileTreeNode>,
     pub selected_path: Option<PathBuf>,
     /// 多选集合（有序，路径 → 是否目录）。空 = 无选中；`selected_path` 是
     /// 主选中行（最后点击），兼作 shift 范围选择的锚点。
     pub selection: BTreeMap<PathBuf, bool>,
+    /// Destination to focus after the exact parent refresh caused by a
+    /// successful create/copy/rename/transfer. Keyed by parent scan path so a
+    /// cross-directory rename cannot be pruned by the source refresh first.
+    pending_selection_after_scan: BTreeMap<PathBuf, PathBuf>,
     /// 树内过滤：漏斗按钮展开输入行；非空时对已加载的树做客户端过滤
     /// （不触发新扫描；本机与远程一致）。
     pub filter_open: bool,
     pub filter: String,
+    /// Runtime-only dotfile policy. Switching it starts a generation-stamped
+    /// rescan, so a result from the previous policy cannot repopulate the tree.
+    show_hidden: bool,
     /// 当前侧边栏视图。
     pub view: SidebarView,
     /// 文件操作剪贴板（Copy/Cut → Paste；同位置 copy/rename，跨位置传输）。
@@ -933,6 +1350,32 @@ pub struct Sidebar {
     clipboard_intent: Option<u64>,
     next_clipboard_intent: u64,
     scan_generation: u64,
+    /// The tree generation protects root/location changes. Per-directory
+    /// revisions additionally make repeated refreshes latest-wins inside one
+    /// generation, which is essential when two remote probes finish out of
+    /// order.
+    next_scan_revision: u64,
+    latest_scan_revisions: BTreeMap<PathBuf, u64>,
+    last_scan_timing: Option<ScanTiming>,
+    /// Remote directory changes are staged independently from the visible
+    /// tree. Only the matching successful listing may commit the new root.
+    pending_navigation: Option<PendingNavigation>,
+    pending_location_probe: Option<PendingLocationProbe>,
+    navigation_back: VecDeque<PathBuf>,
+    navigation_forward: VecDeque<PathBuf>,
+    navigation_cache: VecDeque<CachedRoot>,
+    /// Per-path automatic retry gates. Explicit Retry/F5/navigation may make
+    /// one deliberate attempt; background TTL and expand-driven retries obey
+    /// this cooldown.
+    failure_states: BTreeMap<PathBuf, FailureState>,
+    last_auto_revalidate_at: std::time::Instant,
+    /// Runtime-only path editor state; never serialized into shared config.
+    pub path_entry_open: bool,
+    pub path_entry: String,
+    /// Cancellation for the latest scan of each path. Replacing a request or
+    /// advancing the root generation retires queued work immediately and asks
+    /// a running remote probe to kill its process group.
+    scan_cancel_tokens: BTreeMap<PathBuf, Arc<AtomicBool>>,
     /// User-visible tree interactions that do not require a rescan (collapse
     /// and pagination) still revoke an automatic SSH probe's commit authority.
     tree_ui_generation: u64,
@@ -944,8 +1387,9 @@ pub struct Sidebar {
     /// This is distinct from backend generations: a no-op Refresh, cancelled
     /// dialog, or view/location ABA still consumes a same-frame SSH follow.
     user_intent_generation: u64,
-    /// Changes only when the Files backend authority changes. Tree refreshes
-    /// and cwd/root changes deliberately do not invalidate operation cleanup.
+    /// Changes when a Files authority switch starts, commits, or is cancelled.
+    /// Tree refreshes and same-authority cwd/root changes deliberately do not
+    /// invalidate operation cleanup.
     authority_generation: u64,
     scan_service: Option<DirectoryScanService>,
     worker_error: Option<String>,
@@ -967,8 +1411,8 @@ pub struct Sidebar {
     start_dir_pending: bool,
     /// 起始目录解析失败（连不上主机等）时留在面板上的错误。
     location_error: Option<String>,
-    /// 在途/排队中的传输：忙碌行数据 + 取消令牌。请求队列无界后不再
-    /// 由容量限长；面板只展示第一个在途条目。
+    /// 在途/排队中的传输：忙碌行数据 + 取消令牌。长度由
+    /// OP_QUEUE_CAPACITY + 单个 running worker 封顶；面板只展示第一个条目。
     transfer_tracks: Vec<TransferTrack>,
 }
 
@@ -1000,17 +1444,33 @@ impl Sidebar {
         Self {
             visible: true,
             width: 200.0,
+            location_home: Some(current_dir.clone()),
             current_dir,
             root,
             selected_path: None,
             selection: BTreeMap::new(),
+            pending_selection_after_scan: BTreeMap::new(),
             filter_open: false,
             filter: String::new(),
+            show_hidden: false,
             view: SidebarView::default(),
             clipboard: None,
             clipboard_intent: None,
             next_clipboard_intent: 0,
             scan_generation: 0,
+            next_scan_revision: 0,
+            latest_scan_revisions: BTreeMap::new(),
+            last_scan_timing: None,
+            pending_navigation: None,
+            pending_location_probe: None,
+            navigation_back: VecDeque::new(),
+            navigation_forward: VecDeque::new(),
+            navigation_cache: VecDeque::new(),
+            failure_states: BTreeMap::new(),
+            last_auto_revalidate_at: std::time::Instant::now(),
+            path_entry_open: false,
+            path_entry: String::new(),
+            scan_cancel_tokens: BTreeMap::new(),
             tree_ui_generation: 0,
             authority_generation: 0,
             operation_generation: 0,
@@ -1043,13 +1503,220 @@ impl Sidebar {
     }
 
     pub fn set_current_dir(&mut self, path: PathBuf) -> Option<String> {
+        if !path.is_absolute() {
+            return Some("Files navigation requires an absolute path".to_string());
+        }
+        if self.location.is_remote() {
+            let Some(path_text) = path.to_str() else {
+                return Some("Remote Files path is not valid UTF-8".to_string());
+            };
+            let path = match validate_remote_navigation_text(path_text) {
+                Ok(path) => path,
+                Err(error) => return Some(error),
+            };
+            return self.request_navigation(path, NavigationCause::Ordinary);
+        }
         if self.current_dir == path {
             return None;
         }
         self.current_dir = path;
         self.selected_path = None;
         self.selection.clear();
+        self.pending_selection_after_scan.clear();
         self.start_root_scan()
+    }
+
+    fn request_navigation(&mut self, target: PathBuf, cause: NavigationCause) -> Option<String> {
+        if self.current_dir == target {
+            return None;
+        }
+        if self
+            .pending_navigation
+            .as_ref()
+            .is_some_and(|pending| pending.target == target && pending.cause == cause)
+        {
+            return None;
+        }
+
+        self.advance_scan_generation();
+        if let Some(root) = &mut self.root {
+            root.retire_nested_loading();
+        }
+        self.location_error = None;
+        let pending = PendingNavigation {
+            generation: self.scan_generation,
+            origin: self.current_dir.clone(),
+            target: target.clone(),
+            cause,
+            endpoint_commit: None,
+        };
+        self.pending_navigation = Some(pending);
+        if let Some(error) = self.enqueue_scan(target, true, ScanPriority::Root) {
+            self.pending_navigation = None;
+            return Some(error);
+        }
+        None
+    }
+
+    pub fn navigation_pending_target(&self) -> Option<&Path> {
+        self.pending_navigation
+            .as_ref()
+            .map(|pending| pending.target.as_path())
+    }
+
+    pub fn can_navigate_back(&self) -> bool {
+        self.location.is_remote()
+            && self.pending_navigation.is_none()
+            && !self.navigation_back.is_empty()
+    }
+
+    pub fn can_navigate_forward(&self) -> bool {
+        self.location.is_remote()
+            && self.pending_navigation.is_none()
+            && !self.navigation_forward.is_empty()
+    }
+
+    pub fn navigate_back(&mut self) -> Option<String> {
+        let target = self.navigation_back.back().cloned()?;
+        self.request_navigation(target, NavigationCause::Back)
+    }
+
+    pub fn navigate_forward(&mut self) -> Option<String> {
+        let target = self.navigation_forward.back().cloned()?;
+        self.request_navigation(target, NavigationCause::Forward)
+    }
+
+    pub fn open_path_entry(&mut self) {
+        self.path_entry = self.current_dir.to_string_lossy().into_owned();
+        self.path_entry_open = true;
+    }
+
+    pub fn cancel_path_entry(&mut self) {
+        self.path_entry_open = false;
+        self.path_entry.clear();
+    }
+
+    pub fn submit_path_entry(&mut self) -> Option<String> {
+        let target = match validate_remote_navigation_text(&self.path_entry) {
+            Ok(target) => target,
+            Err(error) => return Some(error),
+        };
+        self.path_entry_open = false;
+        self.path_entry.clear();
+        self.request_navigation(target, NavigationCause::Ordinary)
+    }
+
+    pub fn breadcrumbs(&self) -> Vec<(String, PathBuf)> {
+        let Some(path) = self.current_dir.to_str() else {
+            return Vec::new();
+        };
+        let mut result = vec![("/".to_string(), PathBuf::from("/"))];
+        let mut current = PathBuf::from("/");
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            current.push(component);
+            result.push((component.to_string(), current.clone()));
+        }
+        result
+    }
+
+    fn push_history(stack: &mut VecDeque<PathBuf>, path: PathBuf) {
+        if stack.back() == Some(&path) {
+            return;
+        }
+        stack.push_back(path);
+        while stack.len() > NAVIGATION_HISTORY_CAPACITY {
+            stack.pop_front();
+        }
+    }
+
+    fn cache_root(&mut self, root: FileTreeNode) {
+        self.navigation_cache
+            .retain(|cached| cached.path != root.path);
+        self.navigation_cache.push_back(CachedRoot {
+            path: root.path.clone(),
+            root,
+        });
+        while self.navigation_cache.len() > NAVIGATION_CACHE_CAPACITY {
+            self.navigation_cache.pop_front();
+        }
+    }
+
+    fn commit_navigation(&mut self, pending: PendingNavigation, listing: DirectoryListing) {
+        let changes_endpoint = pending.endpoint_commit.is_some();
+        let mut candidate = if changes_endpoint {
+            Self::root_node(&pending.target)
+        } else {
+            self.find_node(&pending.target)
+                .cloned()
+                .or_else(|| {
+                    self.navigation_cache
+                        .iter()
+                        .rev()
+                        .find(|cached| cached.path == pending.target)
+                        .map(|cached| cached.root.clone())
+                })
+                .unwrap_or_else(|| Self::root_node(&pending.target))
+        };
+        candidate.expanded = true;
+        candidate.apply_listing(listing);
+
+        if !changes_endpoint {
+            if let Some(old_root) = self.root.take() {
+                self.cache_root(old_root);
+            }
+        }
+        if let Some(endpoint) = pending.endpoint_commit {
+            self.location = endpoint.location;
+            self.execution_overlay = endpoint.overlay;
+            self.location_home = Some(endpoint.home);
+            self.pending_location_probe = None;
+            self.start_dir_pending = false;
+            self.navigation_back.clear();
+            self.navigation_forward.clear();
+            self.navigation_cache.clear();
+            self.failure_states.clear();
+            self.cancel_path_entry();
+        } else {
+            self.navigation_cache
+                .retain(|cached| cached.path != pending.target);
+            match pending.cause {
+                NavigationCause::Ordinary => {
+                    Self::push_history(&mut self.navigation_back, pending.origin);
+                    self.navigation_forward.clear();
+                }
+                NavigationCause::Back => {
+                    if self.navigation_back.back() == Some(&pending.target) {
+                        self.navigation_back.pop_back();
+                        Self::push_history(&mut self.navigation_forward, pending.origin);
+                    }
+                }
+                NavigationCause::Forward => {
+                    if self.navigation_forward.back() == Some(&pending.target) {
+                        self.navigation_forward.pop_back();
+                        Self::push_history(&mut self.navigation_back, pending.origin);
+                    }
+                }
+            }
+        }
+
+        self.current_dir = pending.target;
+        self.root = Some(candidate);
+        self.selected_path = None;
+        self.selection.clear();
+        self.pending_selection_after_scan.clear();
+        self.location_error = None;
+        self.tree_ui_generation = self.tree_ui_generation.wrapping_add(1);
+    }
+
+    pub fn parent_dir(&self) -> Option<PathBuf> {
+        self.current_dir
+            .parent()
+            .filter(|parent| *parent != self.current_dir)
+            .map(Path::to_path_buf)
+    }
+
+    pub fn home_dir(&self) -> Option<&Path> {
+        self.location_home.as_deref()
     }
 
     /// 文件树当前浏览的位置（本机或某台远程主机）。
@@ -1078,13 +1745,21 @@ impl Sidebar {
                 root.collect_loading_paths(&mut loading_paths);
             }
             self.execution_overlay = overlay;
+            self.pending_navigation = None;
+            self.navigation_cache.clear();
+            self.failure_states.clear();
             self.authority_generation = self.authority_generation.wrapping_add(1);
-            self.scan_generation = self.scan_generation.wrapping_add(1);
+            self.advance_scan_generation();
             for (index, path) in loading_paths.into_iter().enumerate() {
                 // The first replacement request discards queued work carrying
                 // the old socket. Already-running workers may finish, but the
                 // generation gate rejects those results before tree mutation.
-                let _ = self.enqueue_scan(path, index == 0);
+                let priority = if index == 0 {
+                    ScanPriority::Root
+                } else {
+                    ScanPriority::Lazy
+                };
+                let _ = self.enqueue_scan(path, index == 0, priority);
             }
         }
         Ok(())
@@ -1156,6 +1831,17 @@ impl Sidebar {
         if self.remote_hosts.as_slice() == hosts {
             return None;
         }
+        if self.pending_location_probe.is_some()
+            || self
+                .pending_navigation
+                .as_ref()
+                .is_some_and(|pending| pending.endpoint_commit.is_some())
+        {
+            // A queued target index belongs to the old host snapshot. Cancel
+            // it before reconciling active identities; never reinterpret it
+            // against a reordered/edited vector.
+            self.note_files_user_intent();
+        }
 
         let previous_hosts = Arc::clone(&self.remote_hosts);
         let remap = |index| unique_remote_profile_index(&previous_hosts, index, hosts);
@@ -1195,7 +1881,8 @@ impl Sidebar {
             None => {
                 let local_refresh_error = self.set_location(FsLocation::Local);
                 let mut message =
-                    "所选远端 Files profile 已被删除、更改或不再唯一；已返回 Local".to_string();
+                    "所选远端 Files profile 已被删除、更改或不再唯一；正在验证并切换 Local"
+                        .to_string();
                 if let Some(clipboard_notice) = clipboard_notice {
                     message.push_str(&format!("；{clipboard_notice}"));
                 }
@@ -1260,6 +1947,21 @@ impl Sidebar {
         if self.user_intent_generation == 0 {
             self.user_intent_generation = 1;
         }
+        self.location_error = None;
+        // A later explicit Files action wins over a slow candidate listing.
+        // The old root was never replaced, so cancellation is lossless.
+        let endpoint_pending = self.pending_location_probe.take().is_some()
+            || self
+                .pending_navigation
+                .as_ref()
+                .is_some_and(|pending| pending.endpoint_commit.is_some());
+        if self.pending_navigation.take().is_some() || endpoint_pending {
+            self.start_dir_pending = false;
+            if endpoint_pending {
+                self.authority_generation = self.authority_generation.wrapping_add(1);
+            }
+            self.advance_scan_generation();
+        }
     }
 
     pub fn files_user_intent_generation(&self) -> u64 {
@@ -1279,51 +1981,163 @@ impl Sidebar {
 
     /// Revalidate a delayed Files intent immediately before dispatching it.
     pub fn files_intent_is_current(&self, context: &FilesIntentContext) -> bool {
-        context.generation == self.scan_generation
+        !self.start_dir_pending
+            && context.generation == self.scan_generation
             && context.tree_ui_generation == self.tree_ui_generation
             && context.operation_generation == self.operation_generation
             && context.location != FilesLocationIdentity::InvalidRemote
             && context.location == self.files_location_identity()
     }
 
-    /// 切换浏览位置：作废旧扫描与 location authority、清空树，再解析新位置
-    /// 的起始目录。本机当场解析；远程经操作 worker 异步解析，期间面板显示
-    /// "正在连接"。
-    pub fn set_location(&mut self, location: FsLocation) -> Option<String> {
-        if self.location == location {
-            return None;
+    fn prepare_endpoint_switch(&mut self) {
+        self.pending_location_probe = None;
+        self.pending_navigation = None;
+        self.advance_scan_generation();
+        if let Some(root) = &mut self.root {
+            root.retire_nested_loading();
         }
-        self.location = location;
-        self.execution_overlay = remote_fs::SshExecutionOverlay::default();
-        self.selected_path = None;
-        self.selection.clear();
-        self.location_error = None;
-        self.scan_generation = self.scan_generation.wrapping_add(1);
         self.authority_generation = self.authority_generation.wrapping_add(1);
-        self.root = None;
-        self.current_dir = PathBuf::new();
-        self.start_dir_pending = false;
-        // 离开当前位置即放弃在途/排队的传输：置令牌（worker 按取消收尾），
-        // 面板条目直接清空；迟到的 Progress/Done 会被 authority 检查丢弃。
+        self.operation_generation = self.operation_generation.wrapping_add(1);
+        self.location_error = None;
+        self.start_dir_pending = true;
+        self.pending_selection_after_scan.clear();
+        self.cancel_path_entry();
+        // A location intent abandons transfers from the old authority, but its
+        // last-good tree remains visible and read-only until the target root
+        // commits.
         for track in self.transfer_tracks.drain(..) {
             track.token.store(true, Ordering::SeqCst);
         }
-        if matches!(self.location, FsLocation::Local) {
-            self.current_dir = remote_fs::start_dir(&self.location, &self.remote_hosts)
-                .unwrap_or_else(|_| PathBuf::from("/"));
-            self.start_root_scan()
+    }
+
+    fn enqueue_start_dir_probe(
+        &mut self,
+        location: FsLocation,
+        overlay: remote_fs::SshExecutionOverlay,
+    ) -> Option<String> {
+        let Some(service) = &self.op_service else {
+            self.start_dir_pending = false;
+            self.pending_location_probe = None;
+            return Some(
+                self.op_worker_error
+                    .clone()
+                    .unwrap_or_else(|| "file operation worker is unavailable".to_string()),
+            );
+        };
+        let request = FsOpRequest {
+            authority_generation: self.authority_generation,
+            location,
+            overlay,
+            hosts: self.remote_hosts.clone(),
+            kind: OpRequestKind::StartDir,
+            clipboard_intent: None,
+            cancel_token: None,
+        };
+        match service.request(request) {
+            Ok(()) => {
+                self.pending_ops += 1;
+                None
+            }
+            Err(error) => {
+                self.start_dir_pending = false;
+                self.pending_location_probe = None;
+                Some(error)
+            }
+        }
+    }
+
+    fn stage_endpoint_root(&mut self, endpoint: PendingEndpoint) -> Option<String> {
+        let target = endpoint.home.clone();
+        let endpoint_label = endpoint.location.label(&self.remote_hosts);
+        self.advance_scan_generation();
+        if let Some(root) = &mut self.root {
+            root.retire_nested_loading();
+        }
+        let generation = self.scan_generation;
+        self.pending_navigation = Some(PendingNavigation {
+            generation,
+            origin: self.current_dir.clone(),
+            target: target.clone(),
+            cause: NavigationCause::Ordinary,
+            endpoint_commit: Some(endpoint.clone()),
+        });
+        self.start_dir_pending = true;
+        let backend = if endpoint.location.is_remote() {
+            ScanBackend::Remote(
+                Box::new(remote_fs::FsEndpointSnapshot::new(
+                    endpoint.location,
+                    endpoint.overlay,
+                )),
+                self.remote_hosts.clone(),
+            )
         } else {
-            self.start_dir_pending = true;
-            self.enqueue_op(OpRequestKind::StartDir, None, None)
+            ScanBackend::Local
+        };
+        if let Some(error) =
+            self.enqueue_scan_with_backend(target.clone(), true, ScanPriority::Root, backend)
+        {
+            self.pending_navigation = None;
+            self.start_dir_pending = false;
+            self.failure_states.remove(&target);
+            self.location_error = Some(format!(
+                "无法进入 {endpoint_label}：{error}；原文件树保持不变"
+            ));
+            return Some(error);
+        }
+        None
+    }
+
+    /// Stage a new Files authority without clearing the active tree. Remote
+    /// home discovery and the first root listing must both succeed before the
+    /// location, path, selection, history, or root are replaced.
+    pub fn set_location(&mut self, location: FsLocation) -> Option<String> {
+        let pending_target_matches = self
+            .pending_location_probe
+            .as_ref()
+            .is_some_and(|pending| pending.location == location)
+            || self.pending_navigation.as_ref().is_some_and(|pending| {
+                pending
+                    .endpoint_commit
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.location == location)
+            });
+        if pending_target_matches {
+            return None;
+        }
+        if self.location == location {
+            // Selecting the still-active endpoint is an explicit cancellation
+            // of a different staged switch.
+            if self.start_dir_pending || self.pending_navigation.is_some() {
+                self.note_files_user_intent();
+            }
+            return None;
+        }
+
+        self.prepare_endpoint_switch();
+        let overlay = remote_fs::SshExecutionOverlay::default();
+        if matches!(location, FsLocation::Local) {
+            let home = remote_fs::start_dir(&location, &self.remote_hosts)
+                .unwrap_or_else(|_| PathBuf::from("/"));
+            self.stage_endpoint_root(PendingEndpoint {
+                location,
+                overlay,
+                home,
+            })
+        } else {
+            self.pending_location_probe = Some(PendingLocationProbe {
+                authority_generation: self.authority_generation,
+                location: location.clone(),
+                overlay: overlay.clone(),
+            });
+            self.enqueue_start_dir_probe(location, overlay)
         }
     }
 
     /// Commit a process-observed SSH location only after its sidecar `home`
     /// probe and every UI/session authority check succeeded. The location may
     /// be a uniquely matched saved profile or a transient stable identity.
-    /// Unlike `set_location`, this installs the already-probed root in one UI
-    /// mutation, so a slow or failed connection never blanks the tree that the
-    /// user was looking at.
+    /// Its first listing is still staged, so even a failure after the home
+    /// probe leaves the old authority and tree untouched.
     pub fn commit_probed_location(
         &mut self,
         location: FsLocation,
@@ -1339,18 +2153,17 @@ impl Sidebar {
             return Err("observed SSH home is not an absolute path".to_string());
         }
 
-        self.location = location;
-        self.execution_overlay = overlay;
-        self.current_dir = current_dir;
-        self.selected_path = None;
-        self.selection.clear();
-        self.location_error = None;
-        self.authority_generation = self.authority_generation.wrapping_add(1);
-        self.start_dir_pending = false;
-        for track in self.transfer_tracks.drain(..) {
-            track.token.store(true, Ordering::SeqCst);
-        }
-        Ok(self.start_root_scan())
+        let Some(path_text) = current_dir.to_str() else {
+            return Err("observed SSH home is not valid UTF-8".to_string());
+        };
+        let current_dir = validate_remote_navigation_text(path_text)?;
+
+        self.prepare_endpoint_switch();
+        Ok(self.stage_endpoint_root(PendingEndpoint {
+            location,
+            overlay,
+            home: current_dir,
+        }))
     }
 
     #[cfg(test)]
@@ -1488,6 +2301,12 @@ impl Sidebar {
         cancel_token: Option<Arc<AtomicBool>>,
         overlay: remote_fs::SshExecutionOverlay,
     ) -> Option<String> {
+        if self.start_dir_pending {
+            return Some(
+                "Files location validation is in progress; the retained tree is read-only"
+                    .to_string(),
+            );
+        }
         self.operation_generation = self.operation_generation.wrapping_add(1);
         let Some(service) = &self.op_service else {
             self.start_dir_pending = false;
@@ -1577,33 +2396,71 @@ impl Sidebar {
                     }
                     match result.kind {
                         OpRequestKind::StartDir => {
-                            self.start_dir_pending = false;
+                            let Some(pending) = self.pending_location_probe.take() else {
+                                self.start_dir_pending = false;
+                                continue;
+                            };
+                            if pending.authority_generation != result.authority_generation {
+                                continue;
+                            }
                             match result.outcome {
                                 Ok(Some(dir)) => {
-                                    self.current_dir = dir;
-                                    if let Some(error) = self.start_root_scan() {
+                                    let dir = if pending.location.is_remote() {
+                                        let Some(path_text) = dir.to_str() else {
+                                            self.start_dir_pending = false;
+                                            messages.push(
+                                                "远端 home 不是有效 UTF-8；原文件树保持不变"
+                                                    .to_string(),
+                                            );
+                                            continue;
+                                        };
+                                        match validate_remote_navigation_text(path_text) {
+                                            Ok(path) => path,
+                                            Err(error) => {
+                                                self.start_dir_pending = false;
+                                                messages.push(format!(
+                                                    "远端 home 无效：{error}；原文件树保持不变"
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        dir
+                                    };
+                                    if let Some(error) = self.stage_endpoint_root(PendingEndpoint {
+                                        location: pending.location,
+                                        overlay: pending.overlay,
+                                        home: dir,
+                                    }) {
+                                        self.start_dir_pending = false;
                                         messages.push(format!("文件树读取失败：{error}"));
                                     }
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    self.start_dir_pending = false;
+                                }
                                 Err(error) => {
-                                    let label = self.location.label(&self.remote_hosts);
-                                    let local_refresh_error = self.set_location(FsLocation::Local);
-                                    let mut message =
-                                        format!("无法进入 {label}：{error}；已返回 Local");
-                                    if let Some(refresh_error) = local_refresh_error {
-                                        message.push_str(&format!(
-                                            "（本地文件树刷新失败：{refresh_error}）"
-                                        ));
-                                    }
-                                    messages.push(message);
+                                    self.start_dir_pending = false;
+                                    let label = pending.location.label(&self.remote_hosts);
+                                    self.location_error = Some(format!(
+                                        "无法进入 {label}：{error}；原文件树保持不变"
+                                    ));
+                                    messages.push(
+                                        self.location_error
+                                            .clone()
+                                            .expect("location error was just set"),
+                                    );
                                 }
                             }
                         }
                         OpRequestKind::Fs(kind) => match result.outcome {
                             Ok(_) => {
                                 self.clear_clipboard_if_matches(result.clipboard_intent);
+                                if let Some((parent, target)) = kind.selection_target() {
+                                    self.queue_selection_after_scan(&parent, target);
+                                }
                                 for dir in kind.affected_dirs() {
+                                    self.invalidate_navigation_cache(&dir);
                                     if let Some(error) = self.refresh_loaded_node(&dir) {
                                         messages.push(format!("文件树刷新失败：{error}"));
                                     }
@@ -1611,13 +2468,35 @@ impl Sidebar {
                                 messages.push(kind.success_message());
                             }
                             Err(error) => {
+                                if self.location.is_remote() {
+                                    // A remote command can commit and then lose
+                                    // its transport before the client observes
+                                    // success. Revalidate only the exact parent
+                                    // directories so the UI never treats an
+                                    // ambiguous failure as proof of no change.
+                                    for dir in kind.affected_dirs() {
+                                        self.invalidate_navigation_cache(&dir);
+                                        if let Some(refresh_error) = self.refresh_loaded_node(&dir)
+                                        {
+                                            messages
+                                                .push(format!("文件树重验失败：{refresh_error}"));
+                                        }
+                                    }
+                                }
                                 messages.push(format!("{}：{error}", kind.verb()));
                             }
                         },
                         OpRequestKind::Transfer(transfer) => match result.outcome {
                             Ok(dst) => {
                                 self.clear_clipboard_if_matches(result.clipboard_intent);
+                                if let Some(target) = dst.as_ref() {
+                                    self.queue_selection_after_scan(
+                                        &transfer.dst_dir,
+                                        target.clone(),
+                                    );
+                                }
                                 // 落位目录可能正是当前显示的目录，重新扫描它。
+                                self.invalidate_navigation_cache(&transfer.dst_dir);
                                 if let Some(error) = self.refresh_loaded_node(&transfer.dst_dir) {
                                     messages.push(format!("文件树刷新失败：{error}"));
                                 }
@@ -1633,6 +2512,12 @@ impl Sidebar {
                                 messages.push(message);
                             }
                             Err(error) => {
+                                self.invalidate_navigation_cache(&transfer.dst_dir);
+                                if let Some(refresh_error) =
+                                    self.refresh_loaded_node(&transfer.dst_dir)
+                                {
+                                    messages.push(format!("文件树重验失败：{refresh_error}"));
+                                }
                                 messages.push(format!("{}失败：{error}", transfer.direction()));
                             }
                         },
@@ -1660,6 +2545,7 @@ impl Sidebar {
                                 }
                             }
                             for dir in dirs {
+                                self.invalidate_navigation_cache(&dir);
                                 if let Some(error) = self.refresh_loaded_node(&dir) {
                                     messages.push(format!("文件树刷新失败:{error}"));
                                 }
@@ -1701,19 +2587,166 @@ impl Sidebar {
         messages
     }
 
+    fn record_scan_failure(&mut self, path: &Path, failure: &DirectoryFailure) {
+        let state = self
+            .failure_states
+            .entry(path.to_path_buf())
+            .or_insert(FailureState {
+                consecutive: 0,
+                retry_not_before: None,
+                automatic_retry: failure.retryable,
+            });
+        state.consecutive = state.consecutive.saturating_add(1);
+        state.automatic_retry = failure.retryable;
+        state.retry_not_before = if failure.retryable {
+            Some(std::time::Instant::now() + retry_delay(state.consecutive))
+        } else {
+            None
+        };
+    }
+
+    fn clear_scan_failure(&mut self, path: &Path) {
+        self.failure_states.remove(path);
+    }
+
+    fn automatic_retry_allowed_at(&self, path: &Path, now: std::time::Instant) -> bool {
+        self.failure_states.get(path).is_none_or(|state| {
+            state.automatic_retry
+                && state
+                    .retry_not_before
+                    .is_none_or(|retry_at| now >= retry_at)
+        })
+    }
+
+    pub fn retry_cooldown(&self, path: &Path) -> Option<std::time::Duration> {
+        let state = self.failure_states.get(path)?;
+        if !state.automatic_retry {
+            return None;
+        }
+        state
+            .retry_not_before
+            .and_then(|retry_at| retry_at.checked_duration_since(std::time::Instant::now()))
+    }
+
+    fn invalidate_navigation_cache(&mut self, path: &Path) {
+        fn invalidate(node: &mut FileTreeNode, path: &Path) -> bool {
+            if node.path == path {
+                if !matches!(node.load_state, DirectoryLoadState::NotLoaded) {
+                    node.load_state = DirectoryLoadState::StaleError(DirectoryFailure::retryable(
+                        "cached directory changed; revalidate",
+                    ));
+                }
+                return true;
+            }
+            node.children
+                .iter_mut()
+                .any(|child| invalidate(child, path))
+        }
+
+        for cached in &mut self.navigation_cache {
+            let _ = invalidate(&mut cached.root, path);
+        }
+        self.failure_states.remove(path);
+    }
+
+    /// Revalidate at most a small visible prefix of an idle remote tree. The
+    /// old listing stays rendered until a successful result is reconciled.
+    pub fn auto_revalidate_visible(&mut self) -> Vec<String> {
+        let now = std::time::Instant::now();
+        if !self.location.is_remote()
+            || self.view != SidebarView::Files
+            || self.start_dir_pending
+            || self.pending_navigation.is_some()
+            || now.saturating_duration_since(self.last_auto_revalidate_at)
+                < AUTO_REVALIDATE_INTERVAL
+        {
+            return Vec::new();
+        }
+        self.last_auto_revalidate_at = now;
+
+        fn collect(node: &FileTreeNode, now: std::time::Instant, paths: &mut Vec<PathBuf>) {
+            let has_snapshot = node
+                .last_loaded_at
+                .is_some_and(|loaded| now.saturating_duration_since(loaded) >= REMOTE_SNAPSHOT_TTL);
+            if node.is_dir
+                && has_snapshot
+                && matches!(
+                    node.load_state,
+                    DirectoryLoadState::Loaded | DirectoryLoadState::StaleError(_)
+                )
+            {
+                paths.push(node.path.clone());
+            }
+            if node.expanded {
+                for child in node.visible_children() {
+                    if child.is_dir && child.expanded {
+                        collect(child, now, paths);
+                    }
+                }
+            }
+        }
+
+        let mut candidates = Vec::new();
+        if let Some(root) = &self.root {
+            collect(root, now, &mut candidates);
+        }
+        candidates.retain(|path| {
+            !self.latest_scan_revisions.contains_key(path)
+                && self.automatic_retry_allowed_at(path, now)
+        });
+        candidates.truncate(AUTO_REVALIDATE_BUDGET);
+
+        let mut errors = Vec::new();
+        for path in candidates {
+            if let Some(node) = self.find_node_mut(&path) {
+                node.load_state = DirectoryLoadState::Refreshing;
+            }
+            if let Some(error) = self.enqueue_scan(path.clone(), false, ScanPriority::Lazy) {
+                errors.push(format!("{}: {error}", path.display()));
+            }
+        }
+        errors
+    }
+
     /// 重新扫描一个已加载的节点（文件操作成功后调用）。尚未加载过的目录
     /// 不主动扫描：折叠时内容不可见，下次展开自然会重新拉取。
     pub fn refresh_loaded_node(&mut self, path: &Path) -> Option<String> {
-        let loaded = self
-            .find_node_mut(path)
-            .is_some_and(|node| matches!(node.load_state, DirectoryLoadState::Loaded));
+        let loaded = self.find_node_mut(path).is_some_and(|node| {
+            matches!(
+                &node.load_state,
+                DirectoryLoadState::Loaded
+                    | DirectoryLoadState::Refreshing
+                    | DirectoryLoadState::StaleError(_)
+            )
+        });
         if !loaded {
             return None;
         }
         if let Some(node) = self.find_node_mut(path) {
-            node.load_state = DirectoryLoadState::Loading;
+            node.load_state = DirectoryLoadState::Refreshing;
         }
-        self.enqueue_scan(path.to_path_buf(), false)
+        self.enqueue_scan(path.to_path_buf(), false, ScanPriority::Lazy)
+    }
+
+    /// Retry an initial-load or stale-refresh error without changing expansion
+    /// state. A stale snapshot remains visible while the retry is in flight.
+    pub fn retry_node(&mut self, path: &Path) -> Option<String> {
+        let mut should_scan = false;
+        if let Some(node) = self.find_node_mut(path) {
+            if matches!(&node.load_state, DirectoryLoadState::Error(_)) {
+                node.children.clear();
+                node.visible_children = 0;
+                node.entries_truncated = false;
+                node.load_state = DirectoryLoadState::Loading;
+                should_scan = true;
+            } else if matches!(&node.load_state, DirectoryLoadState::StaleError(_)) {
+                node.load_state = DirectoryLoadState::Refreshing;
+                should_scan = true;
+            }
+        }
+        should_scan
+            .then(|| self.enqueue_scan(path.to_path_buf(), false, ScanPriority::Retry))
+            .flatten()
     }
 
     // ---- 多选 ----
@@ -1791,29 +2824,53 @@ impl Sidebar {
     /// 切换节点展开状态，并只在第一次展开（或错误后重试）时请求扫描。
     pub fn toggle_node(&mut self, path: &Path) -> Option<String> {
         let mut should_scan = false;
+        let mut should_cancel = false;
         let mut interacted = false;
+        let automatic_retry_allowed =
+            self.automatic_retry_allowed_at(path, std::time::Instant::now());
         if let Some(node) = self.find_node_mut(path) {
             interacted = true;
             node.expanded = !node.expanded;
-            if node.expanded
-                && matches!(
-                    node.load_state,
+            if node.expanded {
+                if matches!(
+                    &node.load_state,
                     DirectoryLoadState::NotLoaded | DirectoryLoadState::Error(_)
-                )
-            {
-                node.children.clear();
-                node.visible_children = 0;
-                node.entries_truncated = false;
-                node.load_state = DirectoryLoadState::Loading;
-                should_scan = true;
+                ) && automatic_retry_allowed
+                {
+                    node.children.clear();
+                    node.visible_children = 0;
+                    node.entries_truncated = false;
+                    node.load_state = DirectoryLoadState::Loading;
+                    should_scan = true;
+                } else if matches!(&node.load_state, DirectoryLoadState::StaleError(_))
+                    && automatic_retry_allowed
+                {
+                    node.load_state = DirectoryLoadState::Refreshing;
+                    should_scan = true;
+                }
+            } else if node.is_loading() {
+                // A collapsed directory is no longer visible work. Retire its
+                // latest queue entry/running remote probe immediately; a later
+                // expansion issues a fresh request from a truthful state.
+                node.cancel_own_loading();
+                should_cancel = true;
             }
         }
         if interacted {
             self.tree_ui_generation = self.tree_ui_generation.wrapping_add(1);
         }
+        if should_cancel {
+            if let Some(token) = self.scan_cancel_tokens.remove(path) {
+                token.store(true, Ordering::SeqCst);
+            }
+            self.latest_scan_revisions.remove(path);
+            if let Some(service) = &self.scan_service {
+                service.cancel_queued_path(path);
+            }
+        }
 
         if should_scan {
-            self.enqueue_scan(path.to_path_buf(), false)
+            self.enqueue_scan(path.to_path_buf(), false, ScanPriority::Lazy)
         } else {
             None
         }
@@ -1833,10 +2890,38 @@ impl Sidebar {
         }
     }
 
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    /// Change dotfile visibility and rebuild the current root under a fresh
+    /// scan generation. Selection is cleared because its rows may disappear.
+    pub fn set_show_hidden(&mut self, show_hidden: bool) -> Option<String> {
+        if self.show_hidden == show_hidden {
+            return None;
+        }
+        self.show_hidden = show_hidden;
+        self.selected_path = None;
+        self.selection.clear();
+        self.pending_navigation = None;
+        self.navigation_cache.clear();
+        self.failure_states.clear();
+        self.start_root_scan()
+    }
+
     /// 刷新当前目录。旧 generation 的排队请求会被移除；已经在 worker
     /// 中执行的请求允许自然结束，但结果不会写回新树。
     pub fn refresh(&mut self) -> Option<String> {
         self.start_root_scan()
+    }
+
+    fn advance_scan_generation(&mut self) {
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        self.latest_scan_revisions.clear();
+        for token in self.scan_cancel_tokens.values() {
+            token.store(true, Ordering::SeqCst);
+        }
+        self.scan_cancel_tokens.clear();
     }
 
     fn start_root_scan(&mut self) -> Option<String> {
@@ -1845,15 +2930,41 @@ impl Sidebar {
         if self.current_dir.as_os_str().is_empty() {
             return None;
         }
-        self.scan_generation = self.scan_generation.wrapping_add(1);
-        self.root = Some(Self::root_node(&self.current_dir));
-        if let Some(root) = &mut self.root {
+        self.pending_navigation = None;
+        self.advance_scan_generation();
+        let can_refresh_in_place = self
+            .root
+            .as_ref()
+            .is_some_and(|root| root.path == self.current_dir);
+        if can_refresh_in_place {
+            if let Some(root) = &mut self.root {
+                let has_snapshot = matches!(
+                    &root.load_state,
+                    DirectoryLoadState::Loaded
+                        | DirectoryLoadState::Refreshing
+                        | DirectoryLoadState::StaleError(_)
+                ) || !root.children.is_empty();
+                root.retire_nested_loading();
+                root.load_state = if has_snapshot {
+                    DirectoryLoadState::Refreshing
+                } else {
+                    DirectoryLoadState::Loading
+                };
+            }
+        } else {
+            let mut root = Self::root_node(&self.current_dir);
             root.load_state = DirectoryLoadState::Loading;
+            self.root = Some(root);
         }
-        self.enqueue_scan(self.current_dir.clone(), true)
+        self.enqueue_scan(self.current_dir.clone(), true, ScanPriority::Root)
     }
 
-    fn enqueue_scan(&mut self, path: PathBuf, supersede_queued: bool) -> Option<String> {
+    fn enqueue_scan(
+        &mut self,
+        path: PathBuf,
+        supersede_queued: bool,
+        priority: ScanPriority,
+    ) -> Option<String> {
         let backend = match &self.location {
             FsLocation::Local => ScanBackend::Local,
             location => ScanBackend::Remote(
@@ -1864,12 +2975,40 @@ impl Sidebar {
                 self.remote_hosts.clone(),
             ),
         };
+        self.enqueue_scan_with_backend(path, supersede_queued, priority, backend)
+    }
+
+    fn enqueue_scan_with_backend(
+        &mut self,
+        path: PathBuf,
+        supersede_queued: bool,
+        priority: ScanPriority,
+        backend: ScanBackend,
+    ) -> Option<String> {
+        self.next_scan_revision = self.next_scan_revision.wrapping_add(1);
+        if self.next_scan_revision == 0 {
+            self.next_scan_revision = 1;
+        }
+        let revision = self.next_scan_revision;
+        self.latest_scan_revisions.insert(path.clone(), revision);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self
+            .scan_cancel_tokens
+            .insert(path.clone(), Arc::clone(&cancel))
+        {
+            previous.store(true, Ordering::SeqCst);
+        }
         let result = match &self.scan_service {
             Some(service) => service.request(
                 ScanRequest {
                     generation: self.scan_generation,
+                    revision,
                     path: path.clone(),
                     backend,
+                    show_hidden: self.show_hidden,
+                    cancel: Arc::clone(&cancel),
+                    priority,
+                    queued_at: std::time::Instant::now(),
                 },
                 supersede_queued,
             ),
@@ -1882,7 +3021,20 @@ impl Sidebar {
         match result {
             Ok(()) => None,
             Err(error) => {
-                self.set_node_error(&path, error.clone());
+                if self.latest_scan_revisions.get(&path) == Some(&revision) {
+                    self.latest_scan_revisions.remove(&path);
+                    self.scan_cancel_tokens.remove(&path);
+                }
+                cancel.store(true, Ordering::SeqCst);
+                let failure = DirectoryFailure::retryable(error.clone());
+                self.record_scan_failure(&path, &failure);
+                if self
+                    .pending_navigation
+                    .as_ref()
+                    .is_none_or(|pending| pending.target != path)
+                {
+                    self.set_node_error(&path, error.clone());
+                }
                 Some(format!("{}: {error}", path.display()))
             }
         }
@@ -1908,26 +3060,91 @@ impl Sidebar {
                     if result.generation != self.scan_generation {
                         continue;
                     }
+                    if self.latest_scan_revisions.get(&result.path) != Some(&result.revision) {
+                        continue;
+                    }
+                    self.latest_scan_revisions.remove(&result.path);
+                    self.scan_cancel_tokens.remove(&result.path);
+                    self.last_scan_timing = Some(ScanTiming {
+                        path: result.path.clone(),
+                        queue_delay: result.queue_delay,
+                        run_time: result.run_time,
+                    });
+                    let completed_path = result.path.clone();
+                    let pending_matches = self.pending_navigation.as_ref().is_some_and(|pending| {
+                        pending.generation == result.generation && pending.target == result.path
+                    });
+                    if pending_matches {
+                        let pending = self
+                            .pending_navigation
+                            .take()
+                            .expect("matching pending navigation must exist");
+                        match result.entries {
+                            Ok(listing) => {
+                                self.clear_scan_failure(&completed_path);
+                                self.commit_navigation(pending, listing);
+                            }
+                            Err(error) => {
+                                let message = error.message.clone();
+                                if let Some(endpoint) = pending.endpoint_commit {
+                                    self.start_dir_pending = false;
+                                    self.pending_location_probe = None;
+                                    self.failure_states.remove(&completed_path);
+                                    self.location_error = Some(format!(
+                                        "无法进入 {}：{}（仍显示 {}）",
+                                        endpoint.location.label(&self.remote_hosts),
+                                        message,
+                                        pending.origin.display()
+                                    ));
+                                } else {
+                                    self.record_scan_failure(&completed_path, &error);
+                                    self.location_error = Some(format!(
+                                        "{}（仍显示 {}）",
+                                        message,
+                                        pending.origin.display()
+                                    ));
+                                }
+                                errors.push(format!(
+                                    "{}: {message}；已保留原文件树",
+                                    completed_path.display()
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                     let Some(node) = self.find_node_mut(&result.path) else {
                         continue;
                     };
+                    let mut reconcile_tree_state = false;
                     match result.entries {
                         Ok(listing) => {
-                            node.children = listing
-                                .entries
-                                .into_iter()
-                                .map(FileTreeNode::from_entry)
-                                .collect();
-                            node.visible_children = node.children.len().min(DIRECTORY_PAGE_SIZE);
-                            node.entries_truncated = listing.truncated;
-                            node.load_state = DirectoryLoadState::Loaded;
+                            node.apply_listing(listing);
+                            reconcile_tree_state = true;
                         }
                         Err(error) => {
-                            node.children.clear();
-                            node.visible_children = 0;
-                            node.entries_truncated = false;
-                            node.load_state = DirectoryLoadState::Error(error.clone());
-                            errors.push(format!("{}: {error}", result.path.display()));
+                            let message = error.message.clone();
+                            node.mark_scan_error(error.clone());
+                            errors.push(format!("{}: {message}", result.path.display()));
+                        }
+                    }
+                    if reconcile_tree_state {
+                        self.clear_scan_failure(&completed_path);
+                    } else if let Some(node) = self.find_node(&completed_path) {
+                        if let DirectoryLoadState::Error(error)
+                        | DirectoryLoadState::StaleError(error) = &node.load_state
+                        {
+                            let error = error.clone();
+                            self.record_scan_failure(&completed_path, &error);
+                        }
+                    }
+                    if reconcile_tree_state {
+                        self.reconcile_tree_state();
+                        if let Some(target) =
+                            self.pending_selection_after_scan.remove(&completed_path)
+                        {
+                            if let Some(is_dir) = self.find_node(&target).map(|node| node.is_dir) {
+                                self.select_single(&target, is_dir);
+                            }
                         }
                     }
                 }
@@ -1947,9 +3164,84 @@ impl Sidebar {
     }
 
     pub fn has_pending_scan(&self) -> bool {
+        self.pending_navigation.is_some()
+            || self
+                .root
+                .as_ref()
+                .is_some_and(FileTreeNode::has_loading_descendant)
+    }
+
+    /// Latest authoritative requests still awaiting UI reconciliation and the
+    /// subset physically queued (rather than already taken by a worker). Old
+    /// superseded revisions are excluded by construction.
+    pub fn scan_activity(&self) -> (usize, usize) {
+        let pending = self.latest_scan_revisions.len();
+        let queued = self
+            .scan_service
+            .as_ref()
+            .map_or(0, |service| service.request_rx.len())
+            .min(pending);
+        (pending, queued)
+    }
+
+    pub fn last_scan_timing(&self) -> Option<&ScanTiming> {
+        self.last_scan_timing.as_ref()
+    }
+
+    pub fn directory_expanded(&self, path: &Path) -> Option<bool> {
+        self.find_node(path)
+            .and_then(|node| node.is_dir.then_some(node.expanded))
+    }
+
+    /// Whether an operation target is derived from a directory snapshot whose
+    /// latest revalidation failed. Browsing and Retry stay available, but
+    /// mutating/copy intents must wait for a current listing so a reused remote
+    /// pathname cannot silently target a different object.
+    pub fn path_uses_stale_snapshot(&self, path: &Path) -> bool {
+        fn visit(node: &FileTreeNode, path: &Path, stale_ancestor: bool) -> Option<bool> {
+            if !path.starts_with(&node.path) {
+                return None;
+            }
+            let stale = stale_ancestor || node.has_stale_error();
+            if node.path == path {
+                return Some(stale);
+            }
+            node.children
+                .iter()
+                .find_map(|child| visit(child, path, stale))
+                .or(Some(stale))
+        }
+
         self.root
             .as_ref()
-            .is_some_and(FileTreeNode::has_loading_descendant)
+            .and_then(|root| visit(root, path, false))
+            .unwrap_or(false)
+    }
+
+    fn find_node(&self, path: &Path) -> Option<&FileTreeNode> {
+        fn find<'a>(node: &'a FileTreeNode, path: &Path) -> Option<&'a FileTreeNode> {
+            if node.path == path {
+                return Some(node);
+            }
+            node.children.iter().find_map(|child| find(child, path))
+        }
+
+        self.root.as_ref().and_then(|root| find(root, path))
+    }
+
+    fn queue_selection_after_scan(&mut self, parent: &Path, target: PathBuf) {
+        let parent_has_snapshot = self.find_node(parent).is_some_and(|node| {
+            matches!(
+                &node.load_state,
+                DirectoryLoadState::Loaded
+                    | DirectoryLoadState::Refreshing
+                    | DirectoryLoadState::StaleError(_)
+            )
+        });
+        if parent_has_snapshot {
+            self.pending_selection_after_scan
+                .insert(parent.to_path_buf(), target);
+        }
     }
 
     fn find_node_mut(&mut self, path: &Path) -> Option<&mut FileTreeNode> {
@@ -1963,16 +3255,54 @@ impl Sidebar {
         self.root.as_mut().and_then(|root| find(root, path))
     }
 
+    /// Remove presentation and operation context for rows that disappeared
+    /// during reconciliation. A child-directory refresh does not advance the
+    /// root generation, so it must explicitly revoke delayed menu/dialog work.
+    fn reconcile_tree_state(&mut self) {
+        fn collect_paths(node: &FileTreeNode, paths: &mut BTreeSet<PathBuf>) {
+            paths.insert(node.path.clone());
+            for child in &node.children {
+                collect_paths(child, paths);
+            }
+        }
+
+        let mut live_paths = BTreeSet::new();
+        if let Some(root) = &self.root {
+            collect_paths(root, &mut live_paths);
+        }
+        let orphaned_scans: Vec<PathBuf> = self
+            .scan_cancel_tokens
+            .keys()
+            .filter(|path| !live_paths.contains(*path))
+            .cloned()
+            .collect();
+        for path in orphaned_scans {
+            if let Some(token) = self.scan_cancel_tokens.remove(&path) {
+                token.store(true, Ordering::SeqCst);
+            }
+            self.latest_scan_revisions.remove(&path);
+        }
+        self.selection.retain(|path, _| live_paths.contains(path));
+        if self
+            .selected_path
+            .as_ref()
+            .is_some_and(|path| !self.selection.contains_key(path) || !live_paths.contains(path))
+        {
+            self.selected_path = None;
+        }
+        self.tree_ui_generation = self.tree_ui_generation.wrapping_add(1);
+    }
+
     fn set_node_error(&mut self, path: &Path, error: String) {
         if let Some(node) = self.find_node_mut(path) {
-            node.load_state = DirectoryLoadState::Error(error);
+            node.mark_scan_error(DirectoryFailure::retryable(error));
         }
     }
 
     fn mark_loading_nodes_failed(&mut self, error: &str) {
         fn mark(node: &mut FileTreeNode, error: &str) {
             if node.is_loading() {
-                node.load_state = DirectoryLoadState::Error(error.to_string());
+                node.mark_scan_error(DirectoryFailure::retryable(error));
             }
             for child in &mut node.children {
                 mark(child, error);
@@ -2140,6 +3470,7 @@ fn plan_drop_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
@@ -2363,6 +3694,8 @@ mod tests {
             request_tx,
             request_rx: request_rx.clone(),
             result_rx,
+            interactive_streak: AtomicUsize::new(0),
+            queue_capacity: 4,
         });
         let old_generation = sidebar.scan_generation;
         let old_root = sidebar.current_dir.clone();
@@ -2396,12 +3729,15 @@ mod tests {
         result_tx
             .send(ScanResult {
                 generation: old_generation,
+                revision: replacement.revision,
                 path: replacement.path.clone(),
                 entries: Ok(DirectoryListing::complete(vec![FileEntry {
                     name: "stale.txt".to_string(),
                     path: replacement.path.join("stale.txt"),
                     is_dir: false,
                 }])),
+                queue_delay: Duration::ZERO,
+                run_time: Duration::ZERO,
             })
             .unwrap();
         assert!(sidebar.poll_scan_results().is_empty());
@@ -2414,16 +3750,22 @@ mod tests {
         result_tx
             .send(ScanResult {
                 generation: replacement.generation,
+                revision: replacement.revision,
                 path: replacement.path.clone(),
                 entries: Ok(DirectoryListing::complete(vec![FileEntry {
                     name: "fresh.txt".to_string(),
                     path: replacement.path.join("fresh.txt"),
                     is_dir: false,
                 }])),
+                queue_delay: Duration::from_millis(7),
+                run_time: Duration::from_millis(11),
             })
             .unwrap();
         assert!(sidebar.poll_scan_results().is_empty());
         let expanded = &sidebar.root.as_ref().unwrap().children[0];
+        let timing = sidebar.last_scan_timing().unwrap();
+        assert_eq!(timing.queue_delay, Duration::from_millis(7));
+        assert_eq!(timing.run_time, Duration::from_millis(11));
         assert!(expanded.expanded);
         assert_eq!(expanded.children[0].name, "fresh.txt");
     }
@@ -2490,6 +3832,335 @@ mod tests {
     }
 
     #[test]
+    fn remote_navigation_keeps_an_authority_bound_home_and_rejects_relative_paths() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/local/start"), scanner);
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.location_home = Some(PathBuf::from("/remote/home"));
+        sidebar.current_dir = PathBuf::from("/remote/home/work/src");
+
+        assert_eq!(
+            sidebar.parent_dir().as_deref(),
+            Some(Path::new("/remote/home/work"))
+        );
+        assert_eq!(sidebar.home_dir(), Some(Path::new("/remote/home")));
+        let generation = sidebar.scan_generation;
+        let error = sidebar
+            .set_current_dir(PathBuf::from("relative/escape"))
+            .expect("relative Remote navigation must fail closed");
+        assert!(error.contains("absolute"));
+        assert_eq!(sidebar.current_dir, Path::new("/remote/home/work/src"));
+        assert_eq!(sidebar.scan_generation, generation);
+    }
+
+    fn install_controlled_scan_service(
+        sidebar: &mut Sidebar,
+    ) -> (Receiver<ScanRequest>, Sender<ScanResult>) {
+        let (request_tx, request_rx) = crossbeam_channel::bounded(16);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(16);
+        sidebar.scan_service = Some(DirectoryScanService {
+            request_tx,
+            request_rx: request_rx.clone(),
+            result_rx,
+            interactive_streak: AtomicUsize::new(0),
+            queue_capacity: 16,
+        });
+        (request_rx, result_tx)
+    }
+
+    fn controlled_scan_result(
+        request: &ScanRequest,
+        entries: Result<DirectoryListing, DirectoryFailure>,
+    ) -> ScanResult {
+        ScanResult {
+            generation: request.generation,
+            revision: request.revision,
+            path: request.path.clone(),
+            entries,
+            queue_delay: Duration::from_millis(3),
+            run_time: Duration::from_millis(9),
+        }
+    }
+
+    #[test]
+    fn remote_path_input_normalizes_lexically_and_rejects_ambiguous_text() {
+        assert_eq!(
+            validate_remote_navigation_text("/srv//project/./src/../tests").unwrap(),
+            PathBuf::from("/srv/project/tests")
+        );
+        assert_eq!(
+            validate_remote_navigation_text("/").unwrap(),
+            PathBuf::from("/")
+        );
+        assert!(validate_remote_navigation_text("relative/path").is_err());
+        assert!(validate_remote_navigation_text("/../../escape").is_err());
+        assert!(validate_remote_navigation_text("/safe\nforged").is_err());
+        assert!(validate_remote_navigation_text("/safe\u{202e}txt").is_err());
+        assert!(validate_remote_navigation_text(&format!(
+            "/{}",
+            "x".repeat(MAX_REMOTE_PATH_BYTES)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn retry_backoff_is_capped_and_nonretryable_failures_disable_automation() {
+        let delays: Vec<Duration> = (1..=8).map(retry_delay).collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16, 30, 30, 30].map(Duration::from_secs)
+        );
+
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/remote/root"), scanner);
+        let path = PathBuf::from("/remote/root/private");
+        sidebar.record_scan_failure(
+            &path,
+            &DirectoryFailure {
+                message: "permission denied".to_string(),
+                retryable: false,
+            },
+        );
+        assert!(!sidebar.automatic_retry_allowed_at(&path, Instant::now()));
+        assert!(sidebar.retry_cooldown(&path).is_none());
+
+        sidebar.clear_scan_failure(&path);
+        assert!(sidebar.automatic_retry_allowed_at(&path, Instant::now()));
+    }
+
+    #[test]
+    fn failed_remote_navigation_preserves_last_good_tree_selection_and_history() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/remote/current"), scanner);
+        sidebar.location = FsLocation::Transient(crate::config::default_remote_hosts()[0].clone());
+        let kept = PathBuf::from("/remote/current/kept.txt");
+        let mut root = Sidebar::root_node(&sidebar.current_dir);
+        root.load_state = DirectoryLoadState::Loaded;
+        root.last_loaded_at = Some(Instant::now());
+        root.children.push(FileTreeNode::from_entry(FileEntry {
+            name: "kept.txt".to_string(),
+            path: kept.clone(),
+            is_dir: false,
+        }));
+        root.visible_children = 1;
+        sidebar.root = Some(root);
+        sidebar.select_single(&kept, false);
+        let (requests, results) = install_controlled_scan_service(&mut sidebar);
+
+        assert!(sidebar
+            .set_current_dir(PathBuf::from("/remote/missing"))
+            .is_none());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/current"));
+        assert_eq!(sidebar.selected_path.as_ref(), Some(&kept));
+        assert_eq!(sidebar.root.as_ref().unwrap().children[0].name, "kept.txt");
+        let request = requests.try_recv().unwrap();
+        results
+            .send(controlled_scan_result(
+                &request,
+                Err(DirectoryFailure::retryable("connection timed out")),
+            ))
+            .unwrap();
+
+        let messages = sidebar.poll_scan_results();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("已保留原文件树")));
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/current"));
+        assert_eq!(sidebar.selected_path.as_ref(), Some(&kept));
+        assert_eq!(sidebar.root.as_ref().unwrap().children[0].name, "kept.txt");
+        assert!(!sidebar.can_navigate_back());
+        assert!(sidebar.navigation_pending_target().is_none());
+        assert!(sidebar.location_error().unwrap().contains("仍显示"));
+        assert!(sidebar
+            .retry_cooldown(Path::new("/remote/missing"))
+            .is_some());
+    }
+
+    #[test]
+    fn successful_remote_navigation_commits_atomically_and_history_is_success_only() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/remote/a"), scanner);
+        sidebar.location = FsLocation::Transient(crate::config::default_remote_hosts()[0].clone());
+        let mut root = Sidebar::root_node(&sidebar.current_dir);
+        root.load_state = DirectoryLoadState::Loaded;
+        root.last_loaded_at = Some(Instant::now());
+        let mut cached_child =
+            FileTreeNode::directory(PathBuf::from("/remote/a/src"), "src".to_string(), true);
+        cached_child.load_state = DirectoryLoadState::Loaded;
+        cached_child.children.push(FileTreeNode::from_entry(entry(
+            Path::new("/remote/a/src"),
+            "kept.rs",
+            false,
+        )));
+        cached_child.visible_children = 1;
+        root.children.push(cached_child);
+        root.visible_children = 1;
+        sidebar.root = Some(root);
+        let (requests, results) = install_controlled_scan_service(&mut sidebar);
+
+        assert!(sidebar
+            .set_current_dir(PathBuf::from("/remote/b"))
+            .is_none());
+        let request = requests.try_recv().unwrap();
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/a"));
+        results
+            .send(controlled_scan_result(
+                &request,
+                Ok(DirectoryListing::complete(vec![entry(
+                    Path::new("/remote/b"),
+                    "new.txt",
+                    false,
+                )])),
+            ))
+            .unwrap();
+        assert!(sidebar.poll_scan_results().is_empty());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/b"));
+        assert_eq!(sidebar.root.as_ref().unwrap().children[0].name, "new.txt");
+        assert!(sidebar.can_navigate_back());
+        assert!(!sidebar.can_navigate_forward());
+
+        assert!(sidebar.navigate_back().is_none());
+        let back = requests.try_recv().unwrap();
+        assert_eq!(back.path, PathBuf::from("/remote/a"));
+        results
+            .send(controlled_scan_result(
+                &back,
+                Ok(DirectoryListing::complete(vec![entry(
+                    Path::new("/remote/a"),
+                    "src",
+                    true,
+                )])),
+            ))
+            .unwrap();
+        sidebar.poll_scan_results();
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/a"));
+        let restored = &sidebar.root.as_ref().unwrap().children[0];
+        assert!(restored.expanded);
+        assert_eq!(restored.children[0].name, "kept.rs");
+        assert!(sidebar.can_navigate_forward());
+
+        assert!(sidebar.navigate_forward().is_none());
+        let forward = requests.try_recv().unwrap();
+        assert_eq!(forward.path, PathBuf::from("/remote/b"));
+        results
+            .send(controlled_scan_result(
+                &forward,
+                Ok(DirectoryListing::complete(vec![entry(
+                    Path::new("/remote/b"),
+                    "new.txt",
+                    false,
+                )])),
+            ))
+            .unwrap();
+        sidebar.poll_scan_results();
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/b"));
+        assert!(sidebar.can_navigate_back());
+    }
+
+    #[test]
+    fn stale_navigation_result_cannot_commit_after_a_newer_target() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/remote/kept"), scanner);
+        sidebar.location = FsLocation::Transient(crate::config::default_remote_hosts()[0].clone());
+        sidebar.root.as_mut().unwrap().load_state = DirectoryLoadState::Loaded;
+        let (requests, results) = install_controlled_scan_service(&mut sidebar);
+
+        sidebar.set_current_dir(PathBuf::from("/remote/slow-a"));
+        let slow = requests.try_recv().unwrap();
+        sidebar.set_current_dir(PathBuf::from("/remote/new-b"));
+        let newest = requests.try_recv().unwrap();
+        results
+            .send(controlled_scan_result(
+                &slow,
+                Ok(DirectoryListing::complete(vec![])),
+            ))
+            .unwrap();
+        sidebar.poll_scan_results();
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/kept"));
+        assert_eq!(
+            sidebar.navigation_pending_target(),
+            Some(Path::new("/remote/new-b"))
+        );
+
+        results
+            .send(controlled_scan_result(
+                &newest,
+                Ok(DirectoryListing::complete(vec![])),
+            ))
+            .unwrap();
+        sidebar.poll_scan_results();
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/new-b"));
+    }
+
+    #[test]
+    fn remote_ttl_revalidates_only_a_bounded_visible_prefix_and_respects_cooldown() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/remote/root"), scanner);
+        sidebar.location = FsLocation::Transient(crate::config::default_remote_hosts()[0].clone());
+        sidebar.view = SidebarView::Files;
+        let old = Instant::now() - REMOTE_SNAPSHOT_TTL - Duration::from_secs(1);
+        let mut children = Vec::new();
+        for index in 0..4 {
+            let path = PathBuf::from(format!("/remote/root/d{index}"));
+            let mut child = FileTreeNode::directory(path, format!("d{index}"), true);
+            child.load_state = DirectoryLoadState::Loaded;
+            child.last_loaded_at = Some(old);
+            children.push(child);
+        }
+        let root = sidebar.root.as_mut().unwrap();
+        root.load_state = DirectoryLoadState::Loaded;
+        root.last_loaded_at = Some(old);
+        root.children = children;
+        root.visible_children = 4;
+        sidebar.last_auto_revalidate_at = Instant::now() - AUTO_REVALIDATE_INTERVAL;
+        sidebar.failure_states.insert(
+            PathBuf::from("/remote/root"),
+            FailureState {
+                consecutive: 1,
+                retry_not_before: Some(Instant::now() + Duration::from_secs(30)),
+                automatic_retry: true,
+            },
+        );
+        let (requests, _results) = install_controlled_scan_service(&mut sidebar);
+
+        assert!(sidebar.auto_revalidate_visible().is_empty());
+        assert_eq!(requests.len(), AUTO_REVALIDATE_BUDGET);
+        let queued: Vec<PathBuf> = (0..AUTO_REVALIDATE_BUDGET)
+            .map(|_| requests.try_recv().unwrap().path)
+            .collect();
+        assert_eq!(
+            queued,
+            vec![
+                PathBuf::from("/remote/root/d0"),
+                PathBuf::from("/remote/root/d1")
+            ]
+        );
+        assert!(sidebar.auto_revalidate_visible().is_empty());
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn navigation_history_and_root_cache_are_hard_bounded() {
+        let mut history = VecDeque::new();
+        for index in 0..100 {
+            Sidebar::push_history(&mut history, PathBuf::from(format!("/remote/{index}")));
+        }
+        assert_eq!(history.len(), NAVIGATION_HISTORY_CAPACITY);
+        assert_eq!(history.front(), Some(&PathBuf::from("/remote/68")));
+
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/remote/root"), scanner);
+        for index in 0..20 {
+            sidebar.cache_root(Sidebar::root_node(Path::new(&format!("/remote/{index}"))));
+        }
+        assert_eq!(sidebar.navigation_cache.len(), NAVIGATION_CACHE_CAPACITY);
+        assert_eq!(
+            sidebar.navigation_cache.front().map(|cached| &cached.path),
+            Some(&PathBuf::from("/remote/12"))
+        );
+    }
+
+    #[test]
     fn changed_remote_profile_falls_back_local_and_invalidates_remote_state() {
         let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
         let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
@@ -2524,7 +4195,8 @@ mod tests {
         let notice = sidebar
             .set_remote_hosts(&changed)
             .expect("unsafe index reuse must be visible");
-        assert!(notice.contains("已返回 Local"));
+        assert!(notice.contains("正在验证并切换 Local"));
+        poll_until_loaded(&mut sidebar);
         assert_eq!(sidebar.location(), &FsLocation::Local);
         assert!(sidebar.selection.is_empty());
         assert!(sidebar.selected_path.is_none());
@@ -2564,7 +4236,8 @@ mod tests {
             .set_remote_hosts(&[profiles[1].clone()])
             .expect("removed active tree authority must be visible");
 
-        assert!(notice.contains("已返回 Local"));
+        assert!(notice.contains("正在验证并切换 Local"));
+        poll_until_loaded(&mut sidebar);
         assert_eq!(sidebar.location(), &FsLocation::Local);
         assert_eq!(sidebar.clipboard_intent, clipboard_intent);
         let clipboard = sidebar
@@ -2616,6 +4289,278 @@ mod tests {
     }
 
     #[test]
+    fn hidden_policy_refreshes_under_a_new_generation() {
+        let dir = TestDir::new();
+        std::fs::write(dir.0.join("visible.txt"), b"v").unwrap();
+        std::fs::write(dir.0.join(".env"), b"h").unwrap();
+        let mut sidebar = Sidebar::with_scanner(dir.0.clone(), Arc::new(scan_dir) as Arc<ScanFn>);
+
+        assert!(sidebar.refresh().is_none());
+        poll_until_loaded(&mut sidebar);
+        let names: Vec<&str> = sidebar
+            .root
+            .as_ref()
+            .unwrap()
+            .children
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["visible.txt"]);
+        let hidden_generation = sidebar.scan_generation;
+
+        assert!(sidebar.set_show_hidden(true).is_none());
+        assert_ne!(sidebar.scan_generation, hidden_generation);
+        poll_until_loaded(&mut sidebar);
+        let names: Vec<&str> = sidebar
+            .root
+            .as_ref()
+            .unwrap()
+            .children
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, [".env", "visible.txt"]);
+    }
+
+    #[test]
+    fn repeated_directory_refresh_accepts_only_the_latest_completion() {
+        let root_path = PathBuf::from("/virtual/remote-root");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_started_tx, first_started_rx) = crossbeam_channel::bounded(1);
+        let (release_first_tx, release_first_rx) = crossbeam_channel::bounded(0);
+        let scanner = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |path: &Path| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    first_started_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                    Ok(DirectoryListing::complete(vec![entry(
+                        path,
+                        "stale.txt",
+                        false,
+                    )]))
+                } else {
+                    Ok(DirectoryListing::complete(vec![entry(
+                        path,
+                        "fresh.txt",
+                        false,
+                    )]))
+                }
+            }) as Arc<ScanFn>
+        };
+        let mut sidebar = Sidebar::with_scanner(root_path.clone(), scanner);
+        let root = sidebar.root.as_mut().unwrap();
+        root.load_state = DirectoryLoadState::Loaded;
+        root.children = vec![FileTreeNode::from_entry(entry(
+            &root_path,
+            "before.txt",
+            false,
+        ))];
+        root.visible_children = 1;
+
+        assert!(sidebar.refresh_loaded_node(&root_path).is_none());
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first refresh starts");
+        let superseded = Arc::clone(sidebar.scan_cancel_tokens.get(&root_path).unwrap());
+        assert!(sidebar.refresh_loaded_node(&root_path).is_none());
+        assert!(
+            superseded.load(Ordering::SeqCst),
+            "a newer directory refresh must actively retire the older request"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sidebar.root.as_ref().unwrap().children[0].name != "fresh.txt"
+            && Instant::now() < deadline
+        {
+            sidebar.poll_scan_results();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sidebar.root.as_ref().unwrap().children[0].name, "fresh.txt");
+
+        release_first_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..20 {
+            sidebar.poll_scan_results();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            sidebar.root.as_ref().unwrap().children[0].name,
+            "fresh.txt",
+            "the older same-directory request must not publish after the newer one"
+        );
+    }
+
+    #[test]
+    fn root_refresh_reconciles_surviving_subtrees_and_keeps_them_on_error() {
+        let root_path = PathBuf::from("/virtual/remote-root");
+        let child_path = root_path.join("src");
+        let scans = Arc::new(AtomicUsize::new(0));
+        let scanner = {
+            let scans = Arc::clone(&scans);
+            Arc::new(
+                move |path: &Path| match scans.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(DirectoryListing::complete(vec![
+                        entry(path, "src", true),
+                        entry(path, "new.txt", false),
+                    ])),
+                    1 => Err(io::Error::new(io::ErrorKind::TimedOut, "remote timed out")),
+                    _ => Ok(DirectoryListing::complete(vec![
+                        entry(path, "src", true),
+                        entry(path, "recovered.txt", false),
+                    ])),
+                },
+            ) as Arc<ScanFn>
+        };
+        let mut sidebar = Sidebar::with_scanner(root_path.clone(), scanner);
+        let mut child = FileTreeNode::directory(child_path.clone(), "src".to_string(), true);
+        child.load_state = DirectoryLoadState::Loaded;
+        child.children = vec![FileTreeNode::from_entry(entry(
+            &child_path,
+            "kept.rs",
+            false,
+        ))];
+        child.visible_children = 1;
+        let root = sidebar.root.as_mut().unwrap();
+        root.load_state = DirectoryLoadState::Loaded;
+        root.children = vec![child];
+        root.visible_children = 1;
+
+        assert!(sidebar.refresh().is_none());
+        let root = sidebar.root.as_ref().unwrap();
+        assert!(root.is_loading());
+        assert!(root.children[0].expanded);
+        assert_eq!(root.children[0].children[0].name, "kept.rs");
+        poll_until_loaded(&mut sidebar);
+        let root = sidebar.root.as_ref().unwrap();
+        assert_eq!(root.children.len(), 2);
+        assert!(root.children[0].expanded);
+        assert_eq!(root.children[0].children[0].name, "kept.rs");
+
+        assert!(sidebar.refresh().is_none());
+        let mut errors = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sidebar.has_pending_scan() && Instant::now() < deadline {
+            errors.extend(sidebar.poll_scan_results());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        errors.extend(sidebar.poll_scan_results());
+        let root = sidebar.root.as_ref().unwrap();
+        assert!(!root.is_loading());
+        assert!(root
+            .load_error()
+            .unwrap()
+            .contains("remote request timed out"));
+        assert!(root.load_error_retryable());
+        assert_eq!(root.children.len(), 2, "last-good rows stay visible");
+        assert!(
+            root.snapshot_age().is_some(),
+            "stale rows retain snapshot age"
+        );
+        assert!(root.children[0].expanded);
+        assert_eq!(root.children[0].children[0].name, "kept.rs");
+        assert!(sidebar.path_uses_stale_snapshot(&child_path.join("kept.rs")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("remote request timed out")));
+
+        assert!(sidebar.retry_node(&root_path).is_none());
+        poll_until_loaded(&mut sidebar);
+        let root = sidebar.root.as_ref().unwrap();
+        assert!(root.load_error().is_none());
+        assert_eq!(root.children[1].name, "recovered.txt");
+        assert!(root.children[0].expanded);
+        assert_eq!(root.children[0].children[0].name, "kept.rs");
+        assert!(!sidebar.path_uses_stale_snapshot(&child_path.join("kept.rs")));
+    }
+
+    #[test]
+    fn initial_load_error_retries_in_place_without_toggling_the_root() {
+        let root_path = PathBuf::from("/virtual/remote-root");
+        let scans = Arc::new(AtomicUsize::new(0));
+        let scanner = {
+            let scans = Arc::clone(&scans);
+            Arc::new(move |path: &Path| {
+                if scans.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))
+                } else {
+                    Ok(DirectoryListing::complete(vec![entry(
+                        path,
+                        "recovered.txt",
+                        false,
+                    )]))
+                }
+            }) as Arc<ScanFn>
+        };
+        let mut sidebar = Sidebar::with_scanner(root_path.clone(), scanner);
+
+        assert!(sidebar.refresh().is_none());
+        poll_until_loaded(&mut sidebar);
+        let root = sidebar.root.as_ref().unwrap();
+        assert!(root.expanded);
+        assert!(root
+            .load_error()
+            .unwrap()
+            .contains("remote request timed out"));
+        assert!(root.children.is_empty());
+
+        assert!(sidebar.retry_node(&root_path).is_none());
+        assert!(sidebar.root.as_ref().unwrap().is_loading());
+        poll_until_loaded(&mut sidebar);
+        let root = sidebar.root.as_ref().unwrap();
+        assert!(root.expanded);
+        assert!(root.load_error().is_none());
+        assert_eq!(root.children[0].name, "recovered.txt");
+    }
+
+    #[test]
+    fn child_reconciliation_prunes_selection_and_revokes_delayed_actions() {
+        let root_path = PathBuf::from("/virtual/root");
+        let child_path = root_path.join("dir");
+        let removed_path = child_path.join("removed.txt");
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(root_path.clone(), scanner);
+        let mut child = FileTreeNode::directory(child_path.clone(), "dir".to_string(), true);
+        child.load_state = DirectoryLoadState::Loaded;
+        let mut removed =
+            FileTreeNode::directory(removed_path.clone(), "removed.txt".to_string(), true);
+        removed.load_state = DirectoryLoadState::Loading;
+        child.children = vec![removed];
+        child.visible_children = 1;
+        let root = sidebar.root.as_mut().unwrap();
+        root.load_state = DirectoryLoadState::Loaded;
+        root.children = vec![child];
+        root.visible_children = 1;
+        sidebar.select_single(&removed_path, true);
+        let orphaned_scan = Arc::new(AtomicBool::new(false));
+        sidebar
+            .scan_cancel_tokens
+            .insert(removed_path.clone(), Arc::clone(&orphaned_scan));
+        sidebar
+            .latest_scan_revisions
+            .insert(removed_path.clone(), 99);
+        let delayed = sidebar.files_intent_context();
+        let generation = sidebar.scan_generation;
+
+        assert!(sidebar.refresh_loaded_node(&child_path).is_none());
+        poll_until_loaded(&mut sidebar);
+        assert_eq!(sidebar.scan_generation, generation);
+        assert!(sidebar.selection.is_empty());
+        assert!(sidebar.selected_path.is_none());
+        assert!(orphaned_scan.load(Ordering::SeqCst));
+        assert!(!sidebar.scan_cancel_tokens.contains_key(&removed_path));
+        assert!(!sidebar.latest_scan_revisions.contains_key(&removed_path));
+        assert!(
+            !sidebar.files_intent_is_current(&delayed),
+            "a delayed action for a removed row must fail closed"
+        );
+    }
+
+    #[test]
     fn stale_slow_scan_cannot_replace_a_new_generation() {
         let old = PathBuf::from("/virtual/slow");
         let new = PathBuf::from("/virtual/new");
@@ -2661,10 +4606,9 @@ mod tests {
     }
 
     #[test]
-    fn scan_requests_queue_instead_of_failing_while_workers_are_busy() {
-        // 旧有界队列（容量 8）在 worker 全忙时会拒绝第 9 个请求；现在用户
-        // 动作只排队，并发仍由 SCAN_WORKERS 限定。闸门挡住 worker，让队列
-        // 可观测地填满，全程不做真实文件系统/ssh 工作。
+    fn scan_requests_buffer_a_normal_burst_while_workers_are_busy() {
+        // 闸门挡住 worker，先证明正常 burst 会排队而不会回归早期
+        // 的 8 项容量；另一个纯通道测试在下方覆盖硬上限。
         let (gate_tx, gate_rx) = crossbeam_channel::bounded::<()>(0);
         let scanner = Arc::new(move |_: &Path| {
             let _ = gate_rx.recv();
@@ -2678,8 +4622,13 @@ mod tests {
                 .request(
                     ScanRequest {
                         generation: 0,
+                        revision: index as u64 + 1,
                         path: PathBuf::from(format!("/virtual/queued/{index}")),
                         backend: ScanBackend::Local,
+                        show_hidden: false,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        priority: ScanPriority::Lazy,
+                        queued_at: Instant::now(),
                     },
                     false,
                 )
@@ -2698,19 +4647,176 @@ mod tests {
         }
     }
 
+    fn queued_scan(path: &str, revision: u64, priority: ScanPriority) -> ScanRequest {
+        ScanRequest {
+            generation: 0,
+            revision,
+            path: PathBuf::from(path),
+            backend: ScanBackend::Local,
+            show_hidden: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            priority,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn controlled_scan_service(capacity: usize) -> DirectoryScanService {
+        let (request_tx, request_rx) = crossbeam_channel::bounded(capacity);
+        let (_result_tx, result_rx) = crossbeam_channel::bounded(SCAN_RESULT_CAPACITY);
+        DirectoryScanService {
+            request_tx,
+            request_rx,
+            result_rx,
+            interactive_streak: AtomicUsize::new(0),
+            queue_capacity: capacity,
+        }
+    }
+
     #[test]
-    fn fs_op_requests_queue_instead_of_failing_while_the_worker_is_busy() {
-        // 与扫描服务同一契约：无界队列缓冲用户动作。不启动真 worker，
-        // 队列只进不出，可确定性地观察它涨过旧容量 8。
-        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+    fn scan_queue_has_a_hard_cap_and_preserves_older_live_work_on_rejection() {
+        let service = controlled_scan_service(SCAN_QUEUE_CAPACITY);
+        for index in 0..SCAN_QUEUE_CAPACITY {
+            service
+                .request(
+                    queued_scan(
+                        &format!("/queued/{index}"),
+                        index as u64,
+                        ScanPriority::Lazy,
+                    ),
+                    false,
+                )
+                .unwrap();
+        }
+        let error = service
+            .request(
+                queued_scan("/queued/overflow", 999, ScanPriority::Lazy),
+                false,
+            )
+            .expect_err("the first request beyond the hard cap must be visible");
+        assert!(error.contains("maximum 64"), "{error}");
+        assert_eq!(service.request_rx.len(), SCAN_QUEUE_CAPACITY);
+        let paths: BTreeSet<PathBuf> = service
+            .request_rx
+            .try_iter()
+            .map(|request| request.path)
+            .collect();
+        assert!(!paths.contains(Path::new("/queued/overflow")));
+        assert_eq!(paths.len(), SCAN_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn same_path_scan_is_physically_coalesced_before_it_runs() {
+        let service = controlled_scan_service(SCAN_QUEUE_CAPACITY);
+        let old = queued_scan("/same", 1, ScanPriority::Lazy);
+        let old_cancel = Arc::clone(&old.cancel);
+        service.request(old, false).unwrap();
+        service
+            .request(queued_scan("/same", 2, ScanPriority::Retry), false)
+            .unwrap();
+
+        assert!(old_cancel.load(Ordering::SeqCst));
+        assert_eq!(service.request_rx.len(), 1);
+        let latest = service.request_rx.try_recv().unwrap();
+        assert_eq!(latest.path, Path::new("/same"));
+        assert_eq!(latest.revision, 2);
+    }
+
+    #[test]
+    fn retry_priority_is_bounded_so_lazy_work_cannot_starve() {
+        let service = controlled_scan_service(SCAN_QUEUE_CAPACITY);
+        service
+            .request(queued_scan("/lazy", 1, ScanPriority::Lazy), false)
+            .unwrap();
+        for revision in 2..=5 {
+            service
+                .request(
+                    queued_scan(&format!("/retry/{revision}"), revision, ScanPriority::Retry),
+                    false,
+                )
+                .unwrap();
+        }
+
+        // The fourth consecutive interactive insertion yields one turn to the
+        // already queued lazy request before dispatching the new retry.
+        assert_eq!(
+            service.request_rx.try_recv().unwrap().path,
+            Path::new("/lazy")
+        );
+        assert_eq!(
+            service.request_rx.try_recv().unwrap().path,
+            Path::new("/retry/5")
+        );
+    }
+
+    #[test]
+    fn root_scan_cancels_and_discards_every_queued_old_generation_request() {
+        let service = controlled_scan_service(SCAN_QUEUE_CAPACITY);
+        let old_a = queued_scan("/old/a", 1, ScanPriority::Lazy);
+        let old_b = queued_scan("/old/b", 2, ScanPriority::Retry);
+        let cancelled = [Arc::clone(&old_a.cancel), Arc::clone(&old_b.cancel)];
+        service.request(old_a, false).unwrap();
+        service.request(old_b, false).unwrap();
+        service
+            .request(queued_scan("/new/root", 3, ScanPriority::Root), true)
+            .unwrap();
+
+        assert!(cancelled.iter().all(|token| token.load(Ordering::SeqCst)));
+        assert_eq!(service.request_rx.len(), 1);
+        assert_eq!(
+            service.request_rx.try_recv().unwrap().path,
+            Path::new("/new/root")
+        );
+    }
+
+    #[test]
+    fn collapsing_a_loading_directory_cancels_and_physically_removes_its_scan() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/root"), scanner);
+        sidebar.scan_service = Some(controlled_scan_service(SCAN_QUEUE_CAPACITY));
+        let child_path = PathBuf::from("/root/slow");
+        let mut root = Sidebar::root_node(Path::new("/root"));
+        root.load_state = DirectoryLoadState::Loaded;
+        let mut child = FileTreeNode::directory(child_path.clone(), "slow".to_string(), true);
+        child.load_state = DirectoryLoadState::Loading;
+        root.children.push(child);
+        root.visible_children = 1;
+        sidebar.root = Some(root);
+
+        let request = queued_scan("/root/slow", 7, ScanPriority::Lazy);
+        let token = Arc::clone(&request.cancel);
+        sidebar.latest_scan_revisions.insert(child_path.clone(), 7);
+        sidebar
+            .scan_cancel_tokens
+            .insert(child_path.clone(), Arc::clone(&token));
+        sidebar
+            .scan_service
+            .as_ref()
+            .unwrap()
+            .request(request, false)
+            .unwrap();
+
+        assert!(sidebar.toggle_node(&child_path).is_none());
+        assert!(token.load(Ordering::SeqCst));
+        assert!(!sidebar.latest_scan_revisions.contains_key(&child_path));
+        let service = sidebar.scan_service.as_ref().unwrap();
+        assert_eq!(service.request_rx.len(), 0);
+        let child = &sidebar.root.as_ref().unwrap().children[0];
+        assert!(!child.expanded);
+        assert_eq!(child.load_state, DirectoryLoadState::NotLoaded);
+    }
+
+    #[test]
+    fn fs_op_queue_is_nonblocking_and_hard_bounded() {
+        // 不启动真 worker，队列只进不出：前 64 项入队，第 65 项立即
+        // 返回可重试错误，不阻塞 UI 也不丢弃旧操作。
+        let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
         let (_result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
         let service = FsOpService {
             request_tx,
             result_rx,
         };
 
-        const TOTAL: usize = 16;
-        for _ in 0..TOTAL {
+        for _ in 0..OP_QUEUE_CAPACITY {
             service
                 .request(FsOpRequest {
                     authority_generation: 0,
@@ -2723,7 +4829,19 @@ mod tests {
                 })
                 .expect("queued file operations must not be rejected");
         }
-        assert_eq!(request_rx.len(), TOTAL);
+        let error = service
+            .request(FsOpRequest {
+                authority_generation: 0,
+                location: FsLocation::Local,
+                overlay: remote_fs::SshExecutionOverlay::default(),
+                hosts: Arc::new(Vec::new()),
+                kind: OpRequestKind::StartDir,
+                clipboard_intent: None,
+                cancel_token: None,
+            })
+            .expect_err("overflow must be visible instead of allocating");
+        assert!(error.contains("maximum 64"), "{error}");
+        assert_eq!(request_rx.len(), OP_QUEUE_CAPACITY);
     }
 
     #[test]
@@ -2742,6 +4860,10 @@ mod tests {
         poll_until_loaded(&mut sidebar);
         let root = sidebar.root.as_ref().expect("loaded root");
         assert_eq!(root.children.len(), 145);
+        assert!(
+            root.snapshot_age().is_some(),
+            "every successful directory listing records snapshot freshness"
+        );
         assert_eq!(root.visible_children().len(), DIRECTORY_PAGE_SIZE);
         assert_eq!(root.remaining_children(), 145 - DIRECTORY_PAGE_SIZE);
 
@@ -2779,6 +4901,7 @@ mod tests {
             sidebar.root.as_ref().and_then(FileTreeNode::load_error),
             Some("permission denied")
         );
+        assert!(!sidebar.root.as_ref().unwrap().load_error_retryable());
     }
 
     #[test]
@@ -2813,9 +4936,9 @@ mod tests {
 
     /// Replace the real worker with deterministic request/result channels so
     /// race tests can change UI state after dispatch but before completion.
-    /// The request channel is unbounded to match the production service.
+    /// The request channel keeps the same hard cap as production.
     fn controlled_op_service(sidebar: &mut Sidebar) -> (Receiver<FsOpRequest>, Sender<OpEvent>) {
-        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
         let (result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
         sidebar.op_service = Some(FsOpService {
             request_tx,
@@ -2868,30 +4991,120 @@ mod tests {
     }
 
     #[test]
-    fn failed_remote_start_dir_reports_and_recovers_to_local_without_network() {
+    fn failed_remote_start_dir_preserves_the_active_local_tree_without_network() {
         let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
         let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
         // 没配置任何主机：Remote(0) 的起始目录解析会在 worker 上立即失败，
-        // 错误必须可见，并自动回到 Local，而不是卡在空远端树或触网。
+        // 错误必须可见，并保留当前 Local 树，而不是卡在空远端树或触网。
         assert!(sidebar.set_location(FsLocation::Remote(0)).is_none());
         assert!(sidebar.is_starting());
         assert!(sidebar.has_pending_op());
 
-        let messages = poll_ops_until(&mut sidebar, |sidebar| {
-            sidebar.location() == &FsLocation::Local && !sidebar.has_pending_op()
-        });
+        let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("已返回 Local")),
+                .any(|message| message.contains("原文件树保持不变")),
             "messages so far: {messages:?}"
         );
         assert_eq!(sidebar.location(), &FsLocation::Local);
-        assert_eq!(sidebar.current_dir, std::env::current_dir().unwrap());
-        assert!(sidebar.location_error().is_none());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/virtual/local"));
+        assert!(sidebar.location_error().is_some());
         assert!(!sidebar.is_starting());
         assert!(!sidebar.has_pending_op());
-        poll_until_loaded(&mut sidebar);
+    }
+
+    #[test]
+    fn endpoint_switch_commits_only_after_home_and_root_succeed() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/local/kept"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        assert!(sidebar.set_remote_hosts(&profiles).is_none());
+        let kept = PathBuf::from("/local/kept/visible.txt");
+        let root = sidebar.root.as_mut().unwrap();
+        root.load_state = DirectoryLoadState::Loaded;
+        root.children.push(FileTreeNode::from_entry(FileEntry {
+            name: "visible.txt".to_string(),
+            path: kept.clone(),
+            is_dir: false,
+        }));
+        root.visible_children = 1;
+        sidebar.select_single(&kept, false);
+        let (op_requests, op_results) = controlled_op_service(&mut sidebar);
+        let (scan_requests, scan_results) = install_controlled_scan_service(&mut sidebar);
+
+        assert!(sidebar.set_location(FsLocation::Remote(0)).is_none());
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/local/kept"));
+        assert_eq!(sidebar.selected_path.as_ref(), Some(&kept));
+        assert_eq!(
+            sidebar.root.as_ref().unwrap().children[0].name,
+            "visible.txt"
+        );
+        assert!(sidebar.is_starting());
+        assert!(sidebar
+            .request_fs_op(
+                FsOpKind::CreateFile(PathBuf::from("/local/kept/must-not-run.txt")),
+                false,
+            )
+            .is_some_and(|error| error.contains("read-only")));
+        assert_eq!(op_requests.len(), 1, "only the home probe may be queued");
+
+        let home = op_requests.try_recv().unwrap();
+        complete_request(
+            &op_results,
+            home,
+            Ok(Some(PathBuf::from("/remote/home"))),
+            None,
+        );
+        assert!(sidebar.poll_op_results().is_empty());
+        let first_root = scan_requests.try_recv().unwrap();
+        assert_eq!(first_root.path, PathBuf::from("/remote/home"));
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert_eq!(
+            sidebar.root.as_ref().unwrap().children[0].name,
+            "visible.txt"
+        );
+
+        scan_results
+            .send(controlled_scan_result(
+                &first_root,
+                Err(DirectoryFailure::retryable("target listing timed out")),
+            ))
+            .unwrap();
+        let errors = sidebar.poll_scan_results();
+        assert!(errors.iter().any(|error| error.contains("已保留原文件树")));
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/local/kept"));
+        assert_eq!(sidebar.selected_path.as_ref(), Some(&kept));
+        assert!(!sidebar.is_starting());
+
+        assert!(sidebar.set_location(FsLocation::Remote(0)).is_none());
+        let home = op_requests.try_recv().unwrap();
+        complete_request(
+            &op_results,
+            home,
+            Ok(Some(PathBuf::from("/remote/home"))),
+            None,
+        );
+        assert!(sidebar.poll_op_results().is_empty());
+        let second_root = scan_requests.try_recv().unwrap();
+        scan_results
+            .send(controlled_scan_result(
+                &second_root,
+                Ok(DirectoryListing::complete(vec![entry(
+                    Path::new("/remote/home"),
+                    "ready.txt",
+                    false,
+                )])),
+            ))
+            .unwrap();
+        assert!(sidebar.poll_scan_results().is_empty());
+        assert_eq!(sidebar.location(), &FsLocation::Remote(0));
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/home"));
+        assert_eq!(sidebar.root.as_ref().unwrap().children[0].name, "ready.txt");
+        assert!(sidebar.selection.is_empty());
+        assert!(!sidebar.is_starting());
     }
 
     #[test]
@@ -2904,8 +5117,7 @@ mod tests {
 
         let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
         assert!(sidebar.location_error().is_none());
-        assert_eq!(sidebar.current_dir, std::env::current_dir().unwrap());
-        poll_until_loaded(&mut sidebar);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/virtual/local"));
     }
 
     #[test]
@@ -2943,6 +5155,7 @@ mod tests {
             .map(|child| child.name.as_str())
             .collect();
         assert_eq!(names, vec!["sub", "existing.txt"]);
+        assert_eq!(sidebar.selected_path.as_deref(), Some(sub.as_path()));
 
         // 重名冲突：AlreadyExists 要变成状态栏错误消息。
         assert!(sidebar
@@ -2968,7 +5181,9 @@ mod tests {
             )
             .is_none());
         let _ = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
+        poll_until_loaded(&mut sidebar);
         assert!(renamed.exists());
+        assert_eq!(sidebar.selected_path.as_deref(), Some(renamed.as_path()));
         assert!(sidebar
             .request_fs_op(FsOpKind::Delete(sub.clone()), false)
             .is_none());
@@ -3034,6 +5249,51 @@ mod tests {
 
         assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
         assert!(messages.iter().any(|message| message.contains("已粘贴")));
+    }
+
+    #[test]
+    fn ambiguous_remote_mutation_failure_revalidates_only_its_exact_parent() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let parent = PathBuf::from("/remote/home/work");
+        let mut sidebar = Sidebar::with_scanner(parent.clone(), scanner);
+        sidebar.location = FsLocation::Remote(0);
+        let mut root = Sidebar::root_node(&parent);
+        root.load_state = DirectoryLoadState::Loaded;
+        root.last_loaded_at = Some(Instant::now());
+        sidebar.root = Some(root);
+        sidebar.scan_service = Some(controlled_scan_service(SCAN_QUEUE_CAPACITY));
+        let (requests, results) = controlled_op_service(&mut sidebar);
+
+        assert!(sidebar
+            .request_fs_op(
+                FsOpKind::CreateFile(parent.join("maybe-created.txt")),
+                false
+            )
+            .is_none());
+        let request = requests.recv().unwrap();
+        complete_request(
+            &results,
+            request,
+            Err("remote connection unavailable; retry".to_string()),
+            None,
+        );
+        let messages = sidebar.poll_op_results();
+
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("新建文件失败")));
+        assert_eq!(
+            sidebar.root.as_ref().unwrap().load_state,
+            DirectoryLoadState::Refreshing
+        );
+        let queued = sidebar
+            .scan_service
+            .as_ref()
+            .unwrap()
+            .request_rx
+            .try_recv()
+            .unwrap();
+        assert_eq!(queued.path, parent);
     }
 
     #[test]

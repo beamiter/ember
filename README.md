@@ -833,13 +833,17 @@ uploads) with a ✕ button that cancels it — the in-flight child is killed,
 local partial files are cleaned up, and the outcome is reported as a neutral
 已取消 rather than an error. The context menu also offers 复制路径, copying
 the row's full path (plain, unprefixed for remote rows) to the system
-clipboard. The v3 probe refuses directory collisions atomically (`untar
+clipboard. The v4 probe refuses directory collisions atomically (`untar
 <dir> <name>` exits 17 before extracting) and answers `stat` for cheap remote
 existence checks. You can also drag files and folders from the OS file manager
 straight onto the tree: dropping onto a row targets that directory (a file row
 targets its parent, blank space the current root), a hover hint shows the
 destination, drops are capped at 256 items and 512 MiB total, and the import
 runs through the same copy/upload pipeline with progress and cancellation.
+The **Hidden** header toggle opts into dot-prefixed entries for both local and
+remote trees. Each change starts a fresh generation-stamped root scan, clears
+row selection that may no longer be visible, and rejects results issued under
+the previous visibility policy.
 Rows support multi-select (ctrl+click toggles, shift+click extends a range in
 visible order): Delete/Copy/Cut/复制路径 act on the whole selection (delete
 asks once with a count and up to five names), batch paste iterates items with
@@ -849,6 +853,74 @@ header opens a type-to-filter row that prunes the loaded tree client-side
 (case-insensitive name substring, matches plus auto-expanded ancestors,
 expansion state restored on clear, no new scans — identical for local and
 remote listings).
+
+Directory refresh is stale-while-revalidate: the last-good rows, expanded
+subtrees and pagination remain usable while a new local or remote listing is
+in flight. Surviving directories are reconciled in place by path and type;
+refresh failures leave that snapshot visible with an inline **Retry** action;
+F5 refreshes only when the pointer is over Files and a tree row owns actual
+keyboard focus; a terminal, filter/path editor, or popup keeps the key. Every
+directory request also carries a per-path revision and a
+cancellation token, so a newer request retires queued work and kills the
+process group of an older slow SSH/Docker probe instead of merely ignoring its
+eventual result. Reconciliation removes vanished selections and revokes delayed
+menu/dialog intents before they can act on a stale remote path. When a failed
+refresh leaves a last-good snapshot visible, browsing, copying its displayed
+path and Retry remain available, while filesystem actions wait for a successful
+revalidation so a reused remote pathname cannot target a different object.
+
+The second Remote Files evolution pass also hard-bounds scheduling: at most 64
+directory requests may wait behind the two scan workers, and the serialized
+filesystem-operation queue has the same 64-item ceiling. Root/navigation work
+supersedes the old generation; visible Retry work may jump lazy expansion, but
+a bounded burst rule always lets queued lazy work progress. Repeated requests
+for one path are physically coalesced, and collapsing a still-loading directory
+cancels and removes its invisible probe. The sidebar reports authoritative
+pending/queued counts during bursts. Every successful directory snapshot keeps
+a monotonic completion timestamp, so Refreshing/StaleError rows disclose the
+age of the last-good data. Successful create/copy/rename/upload operations
+refresh only their exact materialized parent and focus the confirmed destination
+after reconciliation.
+
+The third pass makes remote navigation transactional. Switching endpoints
+stages both home discovery and the first root listing; entering a directory, a
+breadcrumb, Home/Up, or Back/Forward first scans a generation-stamped
+candidate while the current root, selection, expansion state, and
+last-good rows remain untouched. Only the matching successful result commits;
+a failure or out-of-order completion leaves the old authority/tree usable and
+leaves history unchanged. Successful navigation keeps a 32-entry success-only
+history and reuses up to eight authority-bound root snapshots before
+reconciling the fresh listing. The header provides Back/Forward, clickable
+breadcrumbs, and a Ctrl+L absolute-path editor; typed paths are UTF-8/length
+bounded, lexically normalized, and reject relative, root-escaping, control, and
+bidi-spoofing input. Remote snapshots older than 60 seconds are revalidated
+stale-while-revalidate in a five-second, two-directory visible-work budget.
+Retryable failures use a capped 1/2/4/8/16/30-second automatic cooldown
+(explicit Retry can make one deliberate attempt), while non-retryable failures
+do not loop in the background. The sidebar separates queue and execution
+latency for the last authoritative scan, and cache entries affected by
+filesystem operations are invalidated at their exact materialized directory.
+
+Remote browsing is now independent of terminal input: double-click enters the
+directory in the Remote tree, while **↑**/**Home** (or **Alt+Up**/**Alt+Home**
+with a focused tree row and the Files panel hovered) navigate the
+authority-bound remote root. These
+actions never inject `cd` into an unrelated PTY. Remote home output is strict
+UTF-8, single-line and absolute. Probe/OS failures shown in the tree are mapped
+to stable retry-oriented classes; untrusted diagnostics are single-line,
+credential-redacted, control/bidi-cleaned, and truncated on Unicode character
+boundaries. With Files hovered, a tree row actually focused, and no
+filter/path editor/menu owning focus, Arrow Up/Down move row focus, Left/Right
+collapse/expand or enter a child, Enter navigates the focused directory, and
+Ctrl+L opens the path editor; terminal/text/popup input is never captured.
+
+The v4 remote list protocol applies the requested hidden-file policy and
+`MAX_DIRECTORY_ENTRIES + 1` row ceiling on the far side, preserving an explicit
+truncation signal without streaming an unbounded directory over SSH. Symlinks
+are classified before directories and therefore never become expandable rows.
+Untrusted list output must contain exact UTF-8 basenames; invalid encodings,
+oversized operands, dangerous components and duplicate/colliding names are
+dropped rather than lossy-decoded into a different operable path.
 
 An interactive terminal that is already running a manually typed `ssh`
 command can also move Files to that destination automatically. The authority
