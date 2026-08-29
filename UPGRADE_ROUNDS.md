@@ -153,3 +153,81 @@ with `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets
 --all-features -- -D warnings`, and `cargo test` (1,264 unit tests plus the
 native worker end-to-end test, zero failures); `scripts/` is untouched by this
 pass.
+
+Command-correction convergence adds rounds 49–59 (2026-08-29):
+
+49. **Engine moved into the shared core** — `src/command_correction.rs` is now
+    an 889-line shim over `jterm_core::command_correction`. Ember's 2,335-line
+    copy of classification, token extraction, ranking, the safety gate, the
+    prompt, the reply parser, the helper-trust predicate, the probe layer and
+    the request epoch machine is gone; all four terminals ran the same engine
+    (7,852 lines between them), all four had drifted, and the core now carries
+    their union in 3,937 lines. Only ember's egui card, its focus/arming rules
+    and the PTY effect stayed.
+50. **One helper-trust predicate for the family** — helper resolution goes
+    through `jterm_core::helper::trusted_component`. Ember's own
+    `owner == euid || mode & 0o022 != 0` called a binary owned by a *third*
+    user at mode 0755 trusted, and resolution reached it by scanning the user's
+    `PATH`, so a hostile `bash` earlier on `PATH` was spawned automatically by
+    any failed command. Clamping the child's `PATH` was never a defence: the
+    helper was itself the hostile binary.
+51. **Helpers work again as root** — the same expression made `owner == euid`
+    true for every root-owned system binary, so under `sudo ember` or in a
+    container every helper was refused and `apt-cache pkgnames` could never
+    run, silently. The shared predicate exempts euid 0 and keeps refusing a
+    non-root user's own writable file.
+52. **Pipe-to-interpreter rule** — `syntax_markers` only asks whether a marker
+    is *present*, so against an original that already contained a pipe,
+    appending `| sh` introduced no new marker and passed the superset check.
+    Ember had no separate check at all. The shared rule splits the pipeline
+    quote-aware and compares the set of interpreter stage names, pinned by a
+    test against jagent's own lexer, so `|  sh`, `| /bin/sh`, `| zsh`,
+    `| busybox sh` and `| xargs -n1 sh -c` are refused while
+    `ls | gerp foo` → `ls | grep foo` is still offered.
+53. **Consent is a construction-time type** — ember was the only copy that
+    honoured `ai_share_command_context` before shipping the failed command, the
+    cwd and up to 8 KiB of output, and that behaviour is now the family's
+    `ContextSharing`, with no `Default` and a `ConsentProof` the prompt builder
+    demands. Ember's observable behaviour is unchanged; the shim no longer
+    conditionally builds the client but lets the policy refuse before the
+    provider stage.
+54. **The card renders only sanitised text** — the provider's `message` used to
+    be interpolated raw into `ui.label` one line above the pre-filled,
+    auto-focused command field, so a reply carrying U+202E could reverse the
+    rendered order of the prose beside it. Every string now arrives through the
+    engine's display accessors, collapsed to one line with controls and bidi
+    replaced by U+FFFD, and inline feedback is bounded to 200 characters.
+55. **Destructive drafts are labelled, and the action label matches the action**
+    — `is_dangerous` gates only the direct-run decision, whose verified conjunct
+    is false for every AI and target-output proposal, so `rm -rf ~/work` always
+    reached the card and ember drew it in the same chrome as `git status`. The
+    `⚠ destructive` label is recomputed after each frame's edit, and the primary
+    button's label is now computed after that edit too, so it can no longer be
+    one frame stale relative to what the button does.
+56. **Only a shell-reported completion raises a card** — a `BoundaryInferred`
+    block attributes stale scrollback and a guessed status to a command, so the
+    classifier could read "command not found" out of the *previous* command's
+    output. Ember's execution journal, Agent panel and long-command toast all
+    already refused such a completion; this surface was the exception.
+57. **The declared 16 KiB budget is enforced at classification** — a longer
+    command line is declined rather than classified, ranked, probed and
+    prompted about; ember relied on `review_input`'s 256 KiB cap. The provider
+    payload's cwd handling changed shape with it: an over-4 KiB cwd is
+    sanitised and truncated rather than replaced by `.`, and an absent cwd is
+    sent empty rather than as `.`.
+58. **A closed helper set** — the programs this surface may execute narrowed
+    from the `{apt-cache, bash, sh, sleep, head}` name allow-list to two
+    `TrustedHelper` constants. `sh`, `sleep` and `head` were in the production
+    allow-list only so one unit test could exercise `run_capture`'s bounds; that
+    test now lives in the core behind its own fixtures.
+59. **Current shared security pin** — `jterm_core` advances to `badcce2`, the
+    revision that introduces `command_correction`; `jagent` is unchanged at
+    `f9383ec`, and the only other `Cargo.lock` movement is `fuzzy-matcher`
+    appearing under `jterm_core`, a crate ember already depends on directly.
+
+Rounds 49–59 were checked with `cargo fmt --all -- --check`, `cargo clippy
+--locked --all-targets --all-features -- -D warnings`, and `cargo test --locked`
+(947 library tests, 1,248 binary tests and the native worker end-to-end test —
+2,196 total — with zero failures) against the published core revision. The
+module's own suite went from 23 tests to 7 as twenty engine duplicates moved to
+the core; `scripts/` is untouched by this pass.

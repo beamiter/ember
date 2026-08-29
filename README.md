@@ -34,6 +34,11 @@ claimed.
   and open a bounded native Git diff review surface. A finished task can rerun
   its exact source command as a separate validation terminal and retain the
   passed / failed / needs-review result on the task card
+- Opt-in [command correction](#command-correction) for narrowly classified
+  failures: one review card, never an automatic run, verified against this
+  host's APT index or executable PATH where it can be, and an AI fallback only
+  where command-context sharing is consented to. The engine is
+  `jterm_core::command_correction`, shared with the sibling terminals
 - Kitty graphics plus user-initiated MIME-aware paste events (OSC 5522)
 - Bracketed paste sanitization, multiline paste confirmation and guarded
   clipboard-read protocols
@@ -251,6 +256,17 @@ jsh_update_check = "daily"     # startup | daily | never
 # explicit cloud-sharing opt-in before Ember sends it.
 ai_enabled = false
 ai_share_command_context = false
+
+# Review-first correction card for a narrowly classified failed command
+# (command not found, unknown subcommand/option, an APT package name, or a
+# correction the failed tool printed itself). Requires ai_enabled as well.
+# Locally verified corrections — the host's APT index, the executable PATH, or
+# the tool's own suggestion — need nothing else and never leave the machine.
+# The AI fallback additionally requires ai_share_command_context, because its
+# payload is exactly the failed command, the working directory and a bounded
+# sample of that command's output. Nothing is ever executed without an explicit
+# review action on the card.
+command_correction_enabled = false
 
 # Experimental local task dashboard. Independent from cloud-context consent.
 experimental_task_sidebar = false
@@ -586,6 +602,85 @@ fresh session is saved; if that backup cannot be created, persistence remains
 disabled for the run instead of overwriting the original. The writer applies
 the same bounds, tab names are shortened on a UTF-8 boundary, and a saved
 working directory that no longer exists falls back to the default directory.
+
+### Command correction
+
+Off by default: it needs both `ai_enabled` and `command_correction_enabled`
+(**Settings → AI & Agent → Offer corrections for failed commands**). With them
+on, a failed command that Ember can classify *narrowly* — `command not found`,
+an unknown subcommand, an unknown option, an APT package name `apt` could not
+locate, or a correction the failed tool printed itself — raises one review card
+above the active session. An ordinary nonzero exit raises nothing.
+
+The card is review-first, and nothing on it runs by itself. It pre-fills an
+editable field with the proposal, takes keyboard focus only from a clean, idle
+prompt and only within a bounded retry window, and its first frame cannot
+consume a trailing Enter from the same input batch as approval. The primary
+action reads **Insert for review** — the command is written to the prompt and
+the user presses Enter — unless the proposal was verified against this host, is
+still exactly as proposed, and is not destructive; only then does it read **Run
+verified command**. Any edit downgrades it back to insert-only on the same
+frame. A destructive draft (`rm -rf …` and friends) is now labelled
+`⚠ destructive` beside the field; it was always offered, but previously in the
+same chrome as `git status`. Escape, **Dismiss** and the window ✕ close the card
+and cancel the request behind it.
+
+**Verified locally, or suggested by a model.** Two evidence classes reach the
+card and it says which:
+
+- *Verified* — the replacement exists in this host's APT package index or on its
+  executable PATH. Nothing leaves the machine, and this is the only class that
+  can offer direct execution.
+- *Unverified* — a correction the failed target printed, or the AI fallback.
+  These are always insert-only.
+
+The AI fallback runs only when `ai_share_command_context = true` (or the
+provider is a directly configured loopback Ollama endpoint, with no inherited
+HTTP proxy), because its payload is exactly the failed command, the working
+directory and a bounded sample of that command's output. With the switch off —
+its default — no AI correction is requested and none appears, while the
+locally verified ones keep working. Ember has gated the fallback this way since
+the feature landed; as of 2026-08-29 all four jterm terminals do, which is what
+the shared engine's `ContextSharing` state now enforces at compile time.
+
+**What a proposal may not be.** A candidate is refused, not shown, when it adds
+shell control syntax the original did not have, adds `sudo`/`doas`/`su`, adds
+`ssh`/`mosh`/`scp`/`sftp`, is unchanged, is not one printable line, exceeds
+16 KiB, or — new on 2026-08-29 — hands a pipeline stage to a shell or
+interpreter the original did not. That last rule is the reason a failed
+`curl … | head -20` can no longer be "corrected" into `curl … | sh`: the older
+check only asked whether a `|` was *present*, and the original already had one.
+The rule compares the set of interpreters each pipeline stage runs, so `|  sh`,
+`| /bin/sh`, `| zsh`, `| busybox sh` and `| xargs -n1 sh -c` are all refused,
+while `ls | gerp foo` → `ls | grep foo` is still offered.
+
+**Automatic helpers.** Gathering evidence runs two programs for you, without
+asking: `bash --noprofile --norc -lc 'compgen -c | LC_ALL=C sort -u'` to
+enumerate command names, and `apt-cache pkgnames` to check a package name.
+Those are the only two programs this surface may ever execute. Both are
+resolved through the family's shared trust predicate, which also checks every
+directory on the way to them: a binary that is group- or world-writable, or
+owned by neither root nor you, is not a system helper, wherever on `PATH` it
+sits. On a host where neither passes that check, PATH-verified corrections
+still work — command names then come from a read-only directory walk of the
+same `PATH`, which executes nothing — but APT-verified package corrections
+disappear, because nothing else can answer that question. That is the intended
+trade: the alternative was executing the binary. Running Ember as root no
+longer disables every helper (see **Security notes**).
+
+**Untrusted completions raise no card.** A command block whose end Ember had to
+infer — a later prompt forced it shut and the OSC 133 end mark never arrived —
+carries stale scrollback and a guessed status, so it is now skipped here, as it
+already was by the execution journal, the Agent panel and the long-command
+toast. Cards that used to appear after an interrupted or force-closed block will
+stop appearing.
+
+Since 2026-08-29 the whole engine half of this feature — classification, token
+extraction, ranking, the safety gate, the prompt, the reply parser, the helper
+trust predicate, the probe layer and the request epoch machine — lives in
+`jterm_core::command_correction` and is shared verbatim with anvil, forge and
+frost. Ember keeps only the card, its focus and arming rules, and the effect the
+app applies to the PTY.
 
 ### Keybindings
 
@@ -1016,6 +1111,26 @@ effects.
 - Custom-theme names are restricted to one safe filename component; theme
   saves replace symlinks rather than following them outside the theme directory.
 - Link targets are shown before opening and require `Ctrl+Click`.
+- The two helpers command correction may run automatically (`bash`,
+  `apt-cache`) are resolved through `jterm_core::helper`'s trust predicate,
+  which refuses a group/world-writable file, a file owned by a third user, and
+  any such directory on the path to it. Ember's own predicate, replaced on
+  2026-08-29, answered "trusted" for a binary owned by another account at mode
+  0755: on a shared machine, a hostile `bash` placed earlier on `PATH` was
+  spawned automatically by any failed command. Clamping the child's `PATH` was
+  never a defence, because the helper was itself the hostile binary. The same
+  predicate was wrong in the other direction under `sudo ember` or in a
+  container, where it refused every root-owned system binary and silently
+  produced no APT-verified corrections at all; both directions are fixed.
+- A proposed correction may not hand a pipeline stage to a shell or interpreter
+  the original command did not already feed. The previous check only asked
+  whether a pipe character was *present*, so `curl … | head` could be
+  "corrected" into `curl … | sh` with no new marker to detect.
+- Every string the correction card renders — the model's reason, the failed
+  command, and inline errors — is bounded and sanitised by the engine before it
+  reaches the card, so a reply carrying a bidi override cannot reorder the text
+  drawn beside a pre-filled, auto-focused command field. Destructive drafts are
+  labelled rather than drawn in ordinary chrome.
 
 Terminal output is untrusted input. Keep the read policy disabled unless a
 workflow genuinely requires programmatic clipboard reads.
