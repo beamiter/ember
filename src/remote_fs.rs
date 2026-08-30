@@ -206,7 +206,7 @@ pub struct Capture {
     pub cancelled: bool,
 }
 
-/// 远端探针脚本协议 v5。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
+/// 远端探针脚本协议 v6。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
 /// put/untar 例外，走 `sh -c` 内联脚本（stdin 整个留给上传载荷）：
 /// - `list` 的 stdout 是 NUL 分隔的 `<t>\0<name>\0` 对，t ∈ {d, f, l}，相对名。
 /// - v2 新增：`cat` 流式读文件、`put` 流式写新文件、
@@ -221,9 +221,11 @@ pub struct Capture {
 ///   打印 `<t> <size>`（普通文件为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
 /// - v5：`put` 在同父级私有目录内接收 stdin，再以 hard-link no-replace 原子发布；
 ///   预植临时路径不会被跟随，最后检查后出现的目标也不会被 `mv` 覆盖。
+/// - v6：`put <path> <transfer-id>` 由客户端唯一令牌命名有界的候选目录，
+///   取消/超时后只清理本次上传的 32 个可能候选。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
-pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v5 — runs under `sh -s -- <op> [args...]`.
+pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v6 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # Exit codes: 0 ok, 2 usage/bad path, 3 missing, 4 op failed, 13 permission,
 # 17 target exists, 20 not a directory.
@@ -235,6 +237,8 @@ pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v5 — runs under `sh -s -- 
 # retained-row ceiling, and classifies symlinks before directories.
 # v5: put receives data in a private same-parent directory and publishes with
 # an atomic no-replace hard link.
+# v6: put takes a client transfer id so cancel cleanup can enumerate only that
+# upload's bounded collision candidates.
 set -u
 op=${1:-}
 case "$op" in
@@ -305,8 +309,10 @@ case "$op" in
     cat "$p" || exit 4
     ;;
   put)
-    p=${2:-}
+    p=${2:-}; id=${3:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
+    [ "${#id}" -le 96 ] || exit 2
     if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     d=${p%/*}
     d=${d:-/}
@@ -314,7 +320,10 @@ case "$op" in
     i=0
     umask 077
     while [ "$i" -lt 32 ]; do
-      candidate="$d/.ember-fs-put-$$-$i"
+      case "$d" in
+        /) candidate="/.ember-fs-put-$id-$i" ;;
+        *) candidate="$d/.ember-fs-put-$id-$i" ;;
+      esac
       i=$((i + 1))
       [ "$candidate" = "$p" ] && continue
       if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
@@ -489,6 +498,41 @@ fn sq(s: &str) -> String {
     out
 }
 
+/// 进程内唯一、shell-safe 的上传令牌，同时绑定远端候选目录与
+/// 取消清理。远端探针会再独立校验字符集和长度。
+fn put_transfer_id() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let epoch_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{:x}-{epoch_nanos:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// 只枚举一个 transfer id 的 0..31 候选；不用 glob，不跟随链接，
+/// 并显式跳过最终目标（即使它恰好长得像内部名）。
+fn put_cleanup_command(dst: &str, transfer_id: &str) -> String {
+    let parent = Path::new(dst)
+        .parent()
+        .and_then(Path::to_str)
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or(".");
+    let prefix = if parent == "/" {
+        format!("/.ember-fs-put-{transfer_id}-")
+    } else {
+        format!("{parent}/.ember-fs-put-{transfer_id}-")
+    };
+    format!(
+        "i=0; while [ \"$i\" -lt 32 ]; do d={}$i; i=$((i + 1)); [ \"$d\" = {} ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done",
+        sq(&prefix),
+        sq(dst)
+    )
+}
+
 /// 远端命令行，作为单个 argv 元素传给 ssh。op 是我们自己的常量、直接拼接；
 /// 每个参数经 [`sq`] 转义，路径永远不会被远端 shell 重新解释。
 fn probe_command(op: &str, args: &[&str]) -> String {
@@ -545,6 +589,22 @@ fn docker_base_argv(host: &RemoteHostConfig) -> Vec<String> {
     }
     argv.push(host.host.clone());
     argv
+}
+
+/// 一条 Ember 自身构造的远端 shell 命令（当前只用于最佳努力的
+/// put 取消清理）。ssh 的命令仍是单个 argv；docker 显式走 `sh -c`。
+fn remote_shell_command_argv(host: &RemoteHostConfig, command: &str) -> Vec<String> {
+    if host.docker {
+        let mut argv = docker_base_argv(host);
+        argv.push("sh".to_string());
+        argv.push("-c".to_string());
+        argv.push(command.to_string());
+        argv
+    } else {
+        let mut argv = ssh_base_argv(host);
+        argv.push(command.to_string());
+        argv
+    }
 }
 
 /// 脚本走 stdin 的探针 argv（`sh -s --`）：除 put/untar 外的所有 op。
@@ -2407,8 +2467,44 @@ fn upload(
     } else {
         // put 在远端读流之前先给出友好的 17；最终 hard-link publication
         // 才是原子 no-replace 的权威检查。
-        let argv = checked_sh_c_probe_argv(host, "put", &[path_str(dst)?])?;
-        upload_file(&argv, src, MAX_TRANSFER_BYTES, control)
+        let transfer_id = put_transfer_id();
+        let argv = checked_sh_c_probe_argv(host, "put", &[path_str(dst)?, &transfer_id])?;
+        let result = upload_file(&argv, src, MAX_TRANSFER_BYTES, control);
+        if result.as_ref().is_err_and(put_cleanup_needed) {
+            cleanup_remote_put(host, dst, &transfer_id);
+        }
+        result
+    }
+}
+
+fn put_cleanup_needed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+    )
+}
+
+/// 探针正常失败会自行删除 staging；只有整个进程组被取消/超时
+/// kill 时才可能留下目录。此清理不继承已触发的取消令牌，错误仅记录。
+fn cleanup_remote_put(host: &RemoteHostConfig, dst: &Path, transfer_id: &str) {
+    if let Err(error) = validate_host_for_execution(host) {
+        log::warn!("remote upload staging cleanup rejected by execution gate: {error}");
+        return;
+    }
+    let Ok(dst) = path_str(dst) else {
+        log::warn!("remote upload staging cleanup skipped a non-UTF-8 path");
+        return;
+    };
+    let command = put_cleanup_command(dst, transfer_id);
+    let argv = remote_shell_command_argv(host, &command);
+    match run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_SMALL_OUTPUT) {
+        Ok(capture) if capture.status == Some(0) && !capture.timed_out && !capture.cancelled => {}
+        Ok(capture) => log::warn!(
+            "remote upload staging cleanup did not complete (status {:?}, timeout {})",
+            capture.status,
+            capture.timed_out
+        ),
+        Err(error) => log::warn!("remote upload staging cleanup failed to run: {error}"),
     }
 }
 
@@ -2520,7 +2616,7 @@ fn relay(
         let base = std::fs::metadata(temp.path())
             .map(|meta| meta.len())
             .unwrap_or(0);
-        let upload_argv = if src_is_dir {
+        let (upload_argv, transfer_id) = if src_is_dir {
             // tar 流的顶层名就是 src 的 basename（tar 探针 -C 父目录打包）。
             let name = src
                 .file_name()
@@ -2528,18 +2624,30 @@ fn relay(
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "source has no UTF-8 file name")
                 })?;
-            checked_sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?, name])?
+            (
+                checked_sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?, name])?,
+                None,
+            )
         } else {
-            checked_sh_c_probe_argv(dst_host, "put", &[path_str(dst)?])?
+            let transfer_id = put_transfer_id();
+            let argv =
+                checked_sh_c_probe_argv(dst_host, "put", &[path_str(dst)?, transfer_id.as_str()])?;
+            (argv, Some(transfer_id))
         };
-        run_stream_from_file(
+        let result = run_stream_from_file(
             &upload_argv,
             temp.path(),
             TRANSFER_TIMEOUT,
             MAX_TRANSFER_BYTES,
             legs.control_for(base),
         )
-        .and_then(probe_output_empty)
+        .and_then(probe_output_empty);
+        if let (Some(transfer_id), Err(error)) = (&transfer_id, &result) {
+            if put_cleanup_needed(error) {
+                cleanup_remote_put(dst_host, dst, transfer_id);
+            }
+        }
+        result
     })
 }
 
@@ -2705,8 +2813,9 @@ docker = true
 
     #[test]
     fn sh_c_argv_inlines_the_script_and_keeps_positional_layout() {
-        // put/untar 走 sh -c 内联脚本：$1=op、$2=路径，stdin 整个留给载荷。
-        let argv = sh_c_probe_argv(&docker_host(), "put", &["/tmp/dst file"]);
+        // put/untar 走 sh -c 内联脚本：$1=op、$2=路径，put 的 $3=令牌；
+        // stdin 整个留给载荷。
+        let argv = sh_c_probe_argv(&docker_host(), "put", &["/tmp/dst file", "feed-1"]);
         assert_eq!(
             argv,
             vec![
@@ -2722,6 +2831,7 @@ docker = true
                 "remote-fs-probe",
                 "put",
                 "/tmp/dst file",
+                "feed-1",
             ]
         );
         assert!(!argv.iter().any(|arg| arg == "-t"), "{argv:?}");
@@ -2732,6 +2842,25 @@ docker = true
         assert!(cmd.ends_with(" remote-fs-probe untar '/data'"), "{cmd}");
         // ssh 场景下远端命令仍必须是恰好一个 argv 元素。
         assert_eq!(argv.len(), 10);
+    }
+
+    #[test]
+    fn remote_shell_cleanup_keeps_one_command_argument_per_transport() {
+        let command = "i=0; while false; do :; done";
+        let docker = remote_shell_command_argv(&docker_host(), command);
+        assert_eq!(
+            &docker[docker.len() - 3..],
+            &["sh", "-c", command],
+            "docker executes the generated command directly"
+        );
+
+        let ssh = remote_shell_command_argv(&ssh_host(), command);
+        assert_eq!(ssh.last().map(String::as_str), Some(command));
+        assert_eq!(
+            ssh.iter().filter(|argument| *argument == command).count(),
+            1,
+            "ssh receives exactly one remote command element"
+        );
     }
 
     // ---- list 输出解析 ----
@@ -3571,7 +3700,7 @@ docker = true
 
         let (victim, link, argument) = dangling("put");
         let capture = run_capture(
-            &sh_c_argv_locally("put", &[&argument]),
+            &sh_c_argv_locally("put", &[&argument, "feed-1"]),
             b"payload",
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -3627,7 +3756,7 @@ docker = true
     }
 
     #[test]
-    fn probe_v5_put_writes_privately_and_refuses_existing() {
+    fn probe_v6_put_writes_privately_and_refuses_existing() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TestDir::new();
@@ -3636,7 +3765,7 @@ docker = true
         let payload = binary_sample();
 
         let capture = run_capture(
-            &sh_c_argv_locally("put", &[&arg]),
+            &sh_c_argv_locally("put", &[&arg, "feed-1"]),
             &payload,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -3652,7 +3781,7 @@ docker = true
 
         // 已存在 → 17，且临时文件不残留。
         let capture = run_capture(
-            &sh_c_argv_locally("put", &[&arg]),
+            &sh_c_argv_locally("put", &[&arg, "feed-2"]),
             &payload,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -3674,7 +3803,7 @@ docker = true
         // 目标目录不存在 → 4。
         let bad = dir.join("missing/file").to_str().unwrap().to_string();
         let capture = run_capture(
-            &sh_c_argv_locally("put", &[&bad]),
+            &sh_c_argv_locally("put", &[&bad, "feed-3"]),
             &payload,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -3687,7 +3816,7 @@ docker = true
         let long = dir.path().join("x".repeat(255));
         let long_arg = long.to_str().unwrap().to_string();
         let capture = run_capture(
-            &sh_c_argv_locally("put", &[&long_arg]),
+            &sh_c_argv_locally("put", &[&long_arg, "feed-4"]),
             &payload,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -3695,10 +3824,29 @@ docker = true
         .unwrap();
         assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
         assert_eq!(std::fs::read(long).unwrap(), payload);
+
+        let invalid_target = dir.join("invalid.bin");
+        let invalid_arg = invalid_target.to_str().unwrap().to_string();
+        let too_long = "a".repeat(97);
+        for invalid_args in [
+            vec![invalid_arg.as_str()],
+            vec![invalid_arg.as_str(), "bad_token"],
+            vec![invalid_arg.as_str(), &too_long],
+        ] {
+            let capture = run_capture(
+                &sh_c_argv_locally("put", &invalid_args),
+                &payload,
+                Duration::from_secs(5),
+                MAX_SMALL_OUTPUT,
+            )
+            .unwrap();
+            assert_eq!(capture.status, Some(2));
+        }
+        assert!(!invalid_target.exists());
     }
 
     #[test]
-    fn probe_v5_put_atomically_preserves_a_racing_destination() {
+    fn probe_v6_put_atomically_preserves_a_racing_destination() {
         let dir = TestDir::new();
         let file = dir.join("upload.bin");
         let arg = file.to_str().unwrap().to_string();
@@ -3708,6 +3856,7 @@ docker = true
             .arg("remote-fs-probe")
             .arg("put")
             .arg(&arg)
+            .arg("feed-5")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3756,6 +3905,93 @@ docker = true
                     .starts_with(".ember-fs-put-")),
             "private staging must be cleaned after a lost publication race"
         );
+    }
+
+    #[test]
+    fn put_transfer_ids_are_unique_shell_safe_and_bounded() {
+        let first = put_transfer_id();
+        let second = put_transfer_id();
+        assert_ne!(first, second);
+        for id in [first, second] {
+            assert!(id.len() <= 96);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
+                "unexpected transfer id: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn put_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
+        assert!(put_cleanup_needed(&cancelled_error()));
+        assert!(put_cleanup_needed(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timeout"
+        )));
+        assert!(!put_cleanup_needed(&io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "probe cleaned itself"
+        )));
+        assert!(!put_cleanup_needed(&io::Error::other("ordinary failure")));
+    }
+
+    #[test]
+    fn put_cleanup_command_enumerates_only_token_candidates() {
+        assert_eq!(
+            put_cleanup_command("/dst/dir name", "feed-1"),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.ember-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/dir name' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done"
+        );
+        assert_eq!(
+            put_cleanup_command("/dst/don't", "feed-1"),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.ember-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done"
+        );
+    }
+
+    #[test]
+    fn put_cleanup_command_preserves_target_links_and_other_uploads() {
+        let dir = TestDir::new();
+        let stage =
+            |token: &str, index: usize| dir.path().join(format!(".ember-fs-put-{token}-{index}"));
+        for index in [0, 31] {
+            std::fs::create_dir(stage("feed-1", index)).unwrap();
+            std::fs::write(stage("feed-1", index).join("payload"), b"partial").unwrap();
+        }
+        let outside_range = stage("feed-1", 32);
+        std::fs::create_dir(&outside_range).unwrap();
+        std::fs::write(outside_range.join("payload"), b"keep").unwrap();
+        let other_transfer = stage("beef-2", 0);
+        std::fs::create_dir(&other_transfer).unwrap();
+        std::fs::write(other_transfer.join("payload"), b"keep").unwrap();
+
+        let victim = dir.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("payload"), b"keep").unwrap();
+        let planted_link = stage("feed-1", 5);
+        std::os::unix::fs::symlink(&victim, &planted_link).unwrap();
+
+        // A final destination that happens to resemble an internal candidate
+        // is explicitly excluded from cleanup.
+        let dst = stage("feed-1", 7);
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("payload"), b"destination").unwrap();
+
+        let command = put_cleanup_command(dst.to_str().unwrap(), "feed-1");
+        let capture = run_capture(
+            &["sh".to_string(), "-c".to_string(), command],
+            &[],
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(std::fs::read(dst.join("payload")).unwrap(), b"destination");
+        assert!(!stage("feed-1", 0).exists());
+        assert!(!stage("feed-1", 31).exists());
+        assert!(outside_range.is_dir(), "indices outside retries survive");
+        assert!(other_transfer.is_dir(), "a concurrent upload survives");
+        assert!(planted_link.is_symlink(), "cleanup refuses planted links");
+        assert_eq!(std::fs::read(victim.join("payload")).unwrap(), b"keep");
     }
 
     #[test]
@@ -4146,7 +4382,7 @@ docker = true
 
         // 预检直接报错：子进程从未运行，远端（本机）不出现任何文件。
         let error = upload_file(
-            &sh_c_argv_locally("put", &[&dst_arg]),
+            &sh_c_argv_locally("put", &[&dst_arg, "feed-6"]),
             &big,
             1024,
             TransferControl::default(),
@@ -4365,7 +4601,7 @@ docker = true
         }
         let dst_arg = final_path.to_str().unwrap().to_string();
         upload_file(
-            &sh_c_argv_locally("put", &[&dst_arg]),
+            &sh_c_argv_locally("put", &[&dst_arg, "feed-7"]),
             &relay_temp,
             MAX_TRANSFER_BYTES,
             TransferControl::default(),

@@ -1071,7 +1071,9 @@ both legs, rather than deleting a guessed path in the system temp directory.
 Remote regular-file uploads likewise receive bytes inside a private same-parent
 directory and publish the mode-0600 payload with an atomic no-replace hard link;
 a destination created after preflight wins intact instead of being overwritten
-by `mv`.
+by `mv`. Direct uploads and remote relays carry a unique client transfer token;
+cancel/timeout cleanup enumerates only that upload's 32 candidates, refuses
+symbolic links, and cannot remove the final target or another concurrent upload.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
