@@ -213,6 +213,8 @@ pub struct Capture {
 ///   `tar` 目录打包流。
 /// - 所有创建型操作把悬空符号链接也视为已存在（17）；`test -e` 会漏掉这种
 ///   目录项，而 `mkfile` 随后会跟随它写到预期目录之外。
+/// - `stat` 与 `list` 一样先识别符号链接，并且只读取普通文件的大小；FIFO、
+///   socket/device 等现存叶节点返回 `f 0`，目标预检不会为求大小而阻塞。
 /// - v3：`untar` 改为 `untar <dir> <name>` —— 解包前先查 `<dir>/<name>` 是否
 ///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
 ///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
@@ -328,13 +330,14 @@ case "$op" in
   stat)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    if [ -d "$p" ]; then t=d
-    elif [ -L "$p" ]; then t=l
+    if [ -L "$p" ]; then t=l
+    elif [ -d "$p" ]; then t=d
+    elif [ -f "$p" ]; then t=f
     elif [ -e "$p" ]; then t=f
     else exit 3
     fi
     s=0
-    if [ "$t" = f ]; then s=$(wc -c < "$p") || exit 4; fi
+    if [ -f "$p" ] && [ ! -L "$p" ]; then s=$(wc -c < "$p") || exit 4; fi
     printf '%s %s\n' "$t" "$s"
     ;;
   *) exit 2 ;;
@@ -1893,7 +1896,7 @@ fn require_local_tar() -> io::Result<()> {
     }
 }
 
-/// 远端 stat 探针的解析结果：类型（d/f/l）与大小（f 为字节数，其余 0）。
+/// 远端 stat 探针的解析结果：类型（d/f/l）与大小（普通文件为字节数，其余 0）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteStat {
     /// 探针的类型字符：b'd' / b'f' / b'l'（与 list 同一套约定）。
@@ -3504,6 +3507,18 @@ docker = true
         std::fs::create_dir(&sub).unwrap();
         let link = dir.join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
+        let dir_link = dir.join("dir-link");
+        std::os::unix::fs::symlink(&sub, &dir_link).unwrap();
+        let fifo = dir.join("fifo");
+        let fifo_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            // SAFETY: `fifo_path` is a live NUL-terminated path and the mode
+            // contains only ordinary permission bits.
+            unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            io::Error::last_os_error()
+        );
 
         let stat = |path: &Path| {
             run_capture(
@@ -3536,6 +3551,22 @@ docker = true
                 kind: b'l',
                 size: 0
             })
+        );
+        assert_eq!(
+            parse_stat(&stat(&dir_link).stdout),
+            Some(RemoteStat {
+                kind: b'l',
+                size: 0
+            }),
+            "a link to a directory must keep the list protocol's link type"
+        );
+        assert_eq!(
+            parse_stat(&stat(&fifo).stdout),
+            Some(RemoteStat {
+                kind: b'f',
+                size: 0
+            }),
+            "a FIFO must count as occupied without being opened for a size read"
         );
         assert_eq!(stat(&dir.join("missing")).status, Some(3));
 

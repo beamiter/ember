@@ -351,3 +351,11 @@ Remote-probe target safety adds round 73 (2026-08-30):
     alongside `-e`. A dangling destination link can no longer make `mkfile`
     create its target outside the directory the user selected, or be silently
     replaced by another operation that promises no overwrite.
+
+Nonblocking remote type discovery adds round 74 (2026-08-30):
+
+74. **`stat` never reads a special leaf** — the probe now classifies links
+    before directories and runs `wc` only for a non-link regular file. A FIFO,
+    socket, or device still counts as an occupied destination (`f 0`) but can no
+    longer stall a paste preflight waiting for content; a link to a directory
+    also remains `l`, matching the listing protocol.

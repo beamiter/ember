@@ -1031,7 +1031,8 @@ local partial files are cleaned up, and the outcome is reported as a neutral
 the row's full path (plain, unprefixed for remote rows) to the system
 clipboard. The v4 probe refuses directory collisions atomically (`untar
 <dir> <name>` exits 17 before extracting) and answers `stat` for cheap remote
-existence checks. You can also drag files and folders from the OS file manager
+existence checks without opening FIFOs or other special leaves for a size read.
+You can also drag files and folders from the OS file manager
 straight onto the tree: dropping onto a row targets that directory (a file row
 targets its parent, blank space the current root), a hover hint shows the
 destination, drops are capped at 256 items and 512 MiB total, and the import
