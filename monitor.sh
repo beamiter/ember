@@ -53,8 +53,12 @@ while true; do
 
     CURRENT_TIME=$(date "+%Y-%m-%d %H:%M:%S")
 
-    # 获取数据
-    read -r cpu mem rss <<< $(ps -p "$PID" -o %cpu,%mem,rss --no-headers)
+    # 获取数据。进程可能在 kill -0 与 ps 之间退出，因此单独处理这个竞态。
+    if ! stats=$(ps -p "$PID" -o %cpu,%mem,rss --no-headers); then
+        echo "进程 $PID ($PNAME) 已结束。"
+        break
+    fi
+    read -r cpu mem rss <<< "$stats"
 
     # 格式化输出
     OUTPUT=$(printf "%-20s | %-8s | %-8s | %-10s" "$CURRENT_TIME" "$cpu" "$mem" "$rss")

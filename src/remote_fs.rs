@@ -6,7 +6,7 @@
 //! 是阻塞的；调用方（侧边栏的扫描/操作 worker 线程）负责把它们移出 UI 线程。
 //!
 //! 安全约束：
-//! - ssh 的远端命令是单个 argv 元素，每个参数经 [`sq`] 单引号转义，绝不未加
+//! - ssh 的远端命令是单个 argv 元素，每个参数经 `sq` 单引号转义，绝不未加
 //!   引号拼接路径（ssh 会把命令交给远端登录 shell 重新解析）。
 //! - `docker exec` 走原始 argv，无需转义；永远用 `-i`（stdin），不用 `-t`
 //!   （探针不是交互会话，分配 TTY 只会污染输出）。
@@ -208,13 +208,13 @@ pub struct Capture {
 
 /// 远端探针脚本协议 v3。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
 /// put/untar 例外，走 `sh -c` 内联脚本（stdin 整个留给上传载荷）：
-/// - `list` 的 stdout 是 NUL 分隔的 "<t>\0<name>\0" 对，t ∈ {d, f, l}，相对名。
+/// - `list` 的 stdout 是 NUL 分隔的 `<t>\0<name>\0` 对，t ∈ {d, f, l}，相对名。
 /// - v2 新增：`cat` 流式读文件、`put` 流式写新文件（临时名 + mv 原子就位）、
 ///   `tar` 目录打包流。
 /// - v3：`untar` 改为 `untar <dir> <name>` —— 解包前先查 `<dir>/<name>` 是否
 ///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
 ///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
-///   打印 "<t> <size>"（f 为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
+///   打印 `<t> <size>`（f 为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
 pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.

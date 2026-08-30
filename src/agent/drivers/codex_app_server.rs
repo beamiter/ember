@@ -1,6 +1,6 @@
 //! Native Codex adapter backed by the experimental app-server JSONL protocol.
 //!
-//! The UI-facing methods on [`CodexAppServerDriver`] never perform provider I/O.
+//! The UI-facing methods on `CodexAppServerDriver` never perform provider I/O.
 //! A bounded command channel feeds a single worker which owns the stdio pipes,
 //! the descriptor-pinned workspace capability, and the child process through
 //! final process-group termination and reap.
