@@ -390,3 +390,14 @@ Transactional directory downloads add round 78 (2026-08-30):
     directory root, and commit it with `RENAME_NOREPLACE`. A destination that
     appears during the stream is neither merged with archive content nor
     recursively removed by error cleanup; only private staging is cleaned.
+
+Bounded transfer staging names add round 79 (2026-08-30):
+
+79. **Keep private names short and collision-safe** — file and tar staging now
+    uses a fixed-size, process-unique basename instead of appending a suffix to
+    the user-controlled entry name, so a valid 255-byte component no longer
+    fails with `ENAMETOOLONG`. Each candidate is reserved owner-only with
+    exclusive create; an occupied path is retried without unlinking it or
+    starting a producer, and an internal candidate can never alias the source
+    or final destination it protects. Cleanup is bound to the reserved inode,
+    so a path replaced after reservation is left intact.

@@ -797,11 +797,16 @@ fn run_stream_to_file(
     dest: &Path,
     timeout: Duration,
     max_bytes: u64,
-    mut control: TransferControl,
+    control: TransferControl,
 ) -> io::Result<Capture> {
     // Reserve the staging name before starting a producer. O_EXCL refuses an
     // existing symlink instead of following it, and an open failure cannot
     // leave an unobserved child behind.
+    let file = open_transfer_staging(dest)?;
+    run_stream_to_open_file(argv, stdin_bytes, file, timeout, max_bytes, control)
+}
+
+fn open_transfer_staging(path: &Path) -> io::Result<std::fs::File> {
     let mut staging_options = std::fs::OpenOptions::new();
     staging_options.write(true).create_new(true);
     #[cfg(unix)]
@@ -809,7 +814,20 @@ fn run_stream_to_file(
         use std::os::unix::fs::OpenOptionsExt;
         staging_options.mode(0o600);
     }
-    let mut file = staging_options.open(dest)?;
+    staging_options.open(path)
+}
+
+/// Stream into an already exclusively reserved staging inode. Keeping name
+/// selection separate lets production retry occupied short names without
+/// ever starting the producer that would feed them.
+fn run_stream_to_open_file(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    mut file: std::fs::File,
+    timeout: Duration,
+    max_bytes: u64,
+    mut control: TransferControl,
+) -> io::Result<Capture> {
     let mut child = spawn_piped(argv)?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_bytes);
@@ -1887,29 +1905,87 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
 //
 // 全部流式执行，任何时刻内存里只有一个 64KB 块；字节帽
 // [`MAX_TRANSFER_BYTES`] 在转发途中实时执行（超限即中止并清理部分数据）。
-// 本地侧的"部分文件"用与目标同目录的隐藏名（`.name.fspart-<pid>`），
-// 最终存在性检查通过后才 rename 就位（同目录 rename 是原子的）。
+// 本地侧的"部分文件"用与锚点同目录、与 basename 长度无关的短隐藏名，
+// 独占占位成功后才启动生产者；下载最终用同目录 no-replace rename 就位。
 
-/// 与目标同目录的隐藏临时名（下载文件落盘用）。
-fn part_path(dst: &Path) -> io::Result<PathBuf> {
-    let name = dst
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dst has no file name"))?;
-    let mut temp = std::ffi::OsString::from(".");
-    temp.push(name);
-    temp.push(format!(".fspart-{}", std::process::id()));
-    Ok(dst.with_file_name(temp))
+/// One exclusively-created, owner-only staging file. The fixed-size basename
+/// keeps valid NAME_MAX-length entries transferable; Drop removes only the
+/// candidate this instance successfully reserved.
+struct StagedFile {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
-/// 目录传输时本地 tar 中间文件的隐藏临时名。
-fn part_tar_path(anchor: &Path) -> io::Result<PathBuf> {
-    let name = anchor
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let mut temp = std::ffi::OsString::from(".");
-    temp.push(name);
-    temp.push(format!(".fspart-{}.tar", std::process::id()));
-    Ok(anchor.with_file_name(temp))
+impl StagedFile {
+    fn beside(anchor: &Path) -> io::Result<(Self, std::fs::File)> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self::beside_with(anchor, || NEXT.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn beside_with(
+        anchor: &Path,
+        mut next: impl FnMut() -> usize,
+    ) -> io::Result<(Self, std::fs::File)> {
+        let parent = anchor
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for _ in 0..32 {
+            let path = parent.join(format!(".ember-fs-part-{}-{}", std::process::id(), next()));
+            // A legitimate source/destination can have our hidden-name shape.
+            // Never reserve the anchor itself, even when it is currently absent.
+            if path.file_name() == anchor.file_name() {
+                continue;
+            }
+            match open_transfer_staging(&path) {
+                Ok(file) => {
+                    use std::os::unix::fs::MetadataExt;
+
+                    let metadata = match file.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            drop(file);
+                            let _ = std::fs::remove_file(&path);
+                            return Err(error);
+                        }
+                    };
+                    return Ok((
+                        Self {
+                            path,
+                            device: metadata.dev(),
+                            inode: metadata.ino(),
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private transfer staging path",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+
+        // Do not unlink a path that was replaced after reservation. On a
+        // successful publication the original path is simply absent here.
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// 中转（远程 → 远程）的本地临时名：unique、用完即删。
@@ -1943,6 +2019,9 @@ impl ExtractionDir {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::SeqCst)
             ));
+            if path.file_name() == dst.file_name() {
+                continue;
+            }
             let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
             match builder.create(&path) {
@@ -2219,23 +2298,17 @@ fn download_file(
     control: TransferControl,
 ) -> io::Result<()> {
     ensure_absent(dst)?;
-    let temp = part_path(dst)?;
-    // 上次崩溃可能留下同名部分文件（命名只有我们自己的 pid），清掉再来。
-    let _ = std::fs::remove_file(&temp);
-    let outcome = run_stream_to_file(
+    let (temp, file) = StagedFile::beside(dst)?;
+    run_stream_to_open_file(
         cat_argv,
         PROBE_SCRIPT.as_bytes(),
-        &temp,
+        file,
         TRANSFER_TIMEOUT,
         max_bytes,
         control,
     )
     .and_then(probe_output_empty)
-    .and_then(|()| finalize_part(&temp, dst));
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    outcome
+    .and_then(|()| finalize_part(temp.path(), dst))
 }
 
 /// 下载目录核心：远端 tar 流 → 本地临时 tar 文件（限额）→ 本地解包。
@@ -2247,24 +2320,23 @@ fn download_dir(
 ) -> io::Result<()> {
     require_local_tar()?;
     ensure_absent(dst)?;
-    let temp = part_tar_path(dst)?;
-    let _ = std::fs::remove_file(&temp);
+    let (temp, file) = StagedFile::beside(dst)?;
     let cancel = control.cancel.clone();
-    let downloaded = run_stream_to_file(
+    let downloaded = run_stream_to_open_file(
         tar_argv,
         PROBE_SCRIPT.as_bytes(),
-        &temp,
+        file,
         TRANSFER_TIMEOUT,
         max_bytes,
         control,
     )
     .and_then(probe_output_empty);
-    let outcome = downloaded.and_then(|()| {
+    downloaded.and_then(|()| {
         let staging = ExtractionDir::beside(dst)?;
         let argv = vec![
             "tar".to_string(),
             "xf".to_string(),
-            path_str(&temp)?.to_string(),
+            path_str(temp.path())?.to_string(),
             "-C".to_string(),
             path_str(staging.path())?.to_string(),
         ];
@@ -2272,9 +2344,7 @@ fn download_dir(
             .and_then(local_status)?;
         let extracted = extracted_top_level(staging.path(), dst)?;
         rename_noreplace(&extracted, dst)
-    });
-    let _ = std::fs::remove_file(&temp);
-    outcome
+    })
 }
 
 /// 上传：本地 → 远端。
@@ -2341,34 +2411,33 @@ fn upload_dir(
         name.to_string(),
     ];
     let legs = LegProgress::new(control);
-    let temp = part_tar_path(src)?;
-    let _ = std::fs::remove_file(&temp);
-    let packed = run_stream_to_file(
+    let (temp, file) = StagedFile::beside(src)?;
+    let packed = run_stream_to_open_file(
         &tar_argv,
         &[],
-        &temp,
+        file,
         TRANSFER_TIMEOUT,
         max_bytes,
         legs.control_for(0),
     )
     .and_then(local_status);
-    let outcome = packed.and_then(|()| {
+    packed.and_then(|()| {
         // 解包腿的字节数接着打包腿累计。untar v3 在解包前原子拒绝
         // 已存在的 <dir>/<name>（检查与解包之间仍有微秒级 TOCTOU 窗口，
         // 这是 tar 合并语义的协议极限，Friendly 错误由 17 映射给出）。
-        let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
+        let base = std::fs::metadata(temp.path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         let untar_argv = checked_sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?, name])?;
         run_stream_from_file(
             &untar_argv,
-            &temp,
+            temp.path(),
             TRANSFER_TIMEOUT,
             max_bytes,
             legs.control_for(base),
         )
         .and_then(probe_output_empty)
-    });
-    let _ = std::fs::remove_file(&temp);
-    outcome
+    })
 }
 
 /// 中转：远程 i → 本地唯一临时文件 → 远程 j，用完即删。
@@ -3835,6 +3904,77 @@ docker = true
     }
 
     #[test]
+    fn unique_transfer_staging_skips_aliases_and_planted_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let pid = std::process::id();
+
+        // If a legitimate target has our internal name shape, the candidate
+        // bearing that exact basename is skipped without creating the target.
+        let anchor = dir.path().join(format!(".ember-fs-part-{pid}-7"));
+        let mut sequence = [7, 8].into_iter();
+        let (staging, file) =
+            StagedFile::beside_with(&anchor, || sequence.next().expect("one retry is enough"))
+                .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        assert_ne!(staging_path, anchor);
+        assert_eq!(
+            std::fs::metadata(&staging_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "reserved staging must remain owner-only"
+        );
+        drop(file);
+        drop(staging);
+        assert!(!anchor.exists());
+        assert!(!staging_path.exists());
+
+        // An occupied candidate is retried atomically. In particular, a
+        // planted symlink remains a symlink and its target is untouched.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let planted = dir.path().join(format!(".ember-fs-part-{pid}-11"));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let ordinary_anchor = dir.join("download.bin");
+        let mut sequence = [11, 12].into_iter();
+        let (staging, file) = StagedFile::beside_with(&ordinary_anchor, || {
+            sequence.next().expect("one retry is enough")
+        })
+        .unwrap();
+        let expected_name = format!(".ember-fs-part-{pid}-12");
+        assert_eq!(
+            staging.path().file_name(),
+            Some(std::ffi::OsStr::new(&expected_name))
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        drop(file);
+        drop(staging);
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // Cleanup is inode-bound as well as path-bound: replacing a reserved
+        // name cannot trick Drop into deleting the replacement.
+        let replacement_anchor = dir.join("replacement.bin");
+        let (staging, file) = StagedFile::beside(&replacement_anchor).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        std::fs::remove_file(&staging_path).unwrap();
+        std::fs::write(&staging_path, b"replacement").unwrap();
+        drop(file);
+        drop(staging);
+        assert_eq!(std::fs::read(&staging_path).unwrap(), b"replacement");
+    }
+
+    #[test]
     fn run_stream_to_file_enforces_the_cap_and_download_cleans_up() {
         let dir = TestDir::new();
         let big = dir.join("big.bin");
@@ -3855,7 +3995,12 @@ docker = true
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".fspart-"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".ember-fs-part-")
+            })
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
     }
@@ -3899,6 +4044,32 @@ docker = true
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         // 原内容原样保留，连临时文件都没有出现过。
         assert_eq!(std::fs::read(&dst).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn download_accepts_a_name_at_the_component_limit() {
+        let remote = TestDir::new();
+        let src = remote.join("source.bin");
+        std::fs::write(&src, binary_sample()).unwrap();
+        let src_arg = src.to_str().unwrap().to_string();
+
+        let local = TestDir::new();
+        let dst = local.path().join("x".repeat(255));
+        download_file(
+            &sh_s_argv_locally("cat", &[&src_arg]),
+            &dst,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), binary_sample());
+        assert_eq!(dst.file_name().unwrap().as_encoded_bytes().len(), 255);
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            1,
+            "fixed-size staging names leave no litter"
+        );
     }
 
     #[test]
@@ -4198,7 +4369,12 @@ docker = true
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".fspart-"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".ember-fs-part-")
+            })
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
     }
