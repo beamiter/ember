@@ -1065,6 +1065,24 @@ fn open_directory(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+fn open_source_directory(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn open_source_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
 fn create_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -1115,6 +1133,28 @@ fn open_transfer_staging_at(parent: &std::fs::File, name: &OsStr) -> io::Result<
             name.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
             0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn open_source_file_at(parent: &std::fs::File, name: &OsStr) -> io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+    // SAFETY: `parent` and `name` remain live for this call; a successful fd
+    // is uniquely transferred into File below.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1187,6 +1227,25 @@ fn anchored_entry_path(parent: &std::fs::File, name: &OsStr) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn anchored_descriptor_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from("/proc/self/fd").join(file.as_raw_fd().to_string())
+}
+
+fn tar_prefix_transform(name: &str) -> String {
+    let mut transform = String::from("s,^\\./,");
+    for character in name.chars() {
+        if matches!(character, '\\' | '&' | ',') {
+            transform.push('\\');
+        }
+        transform.push(character);
+    }
+    transform.push_str("/,");
+    transform
+}
+
+#[cfg(target_os = "linux")]
 fn atomic_rename_noreplace_at(
     src_parent: &std::fs::File,
     src_name: &OsStr,
@@ -1248,12 +1307,24 @@ fn atomic_rename_noreplace_at(
 fn run_stream_to_open_file(
     argv: &[String],
     stdin_bytes: &[u8],
+    file: std::fs::File,
+    timeout: Duration,
+    max_bytes: u64,
+    control: TransferControl,
+) -> io::Result<Capture> {
+    run_stream_to_open_file_inheriting(argv, stdin_bytes, file, timeout, max_bytes, control, &[])
+}
+
+fn run_stream_to_open_file_inheriting(
+    argv: &[String],
+    stdin_bytes: &[u8],
     mut file: std::fs::File,
     timeout: Duration,
     max_bytes: u64,
     mut control: TransferControl,
+    inherited_fds: &[i32],
 ) -> io::Result<Capture> {
-    let mut child = spawn_piped(argv)?;
+    let mut child = spawn_piped_inheriting(argv, inherited_fds)?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_bytes);
     }
@@ -1338,11 +1409,51 @@ fn run_stream_from_file(
     max_bytes: u64,
     control: TransferControl,
 ) -> io::Result<Capture> {
-    let expected = std::fs::metadata(src)?.len();
+    run_stream_from_file_with_spawn(argv, src, timeout, max_bytes, control, spawn_piped)
+}
+
+fn run_stream_from_file_with_spawn(
+    argv: &[String],
+    src: &Path,
+    timeout: Duration,
+    max_bytes: u64,
+    control: TransferControl,
+    spawn: impl FnOnce(&[String]) -> io::Result<Child>,
+) -> io::Result<Capture> {
+    let file = open_source_file(src)?;
+    run_stream_from_open_file_with_spawn(argv, file, timeout, max_bytes, control, spawn)
+}
+
+fn run_stream_from_open_file(
+    argv: &[String],
+    file: std::fs::File,
+    timeout: Duration,
+    max_bytes: u64,
+    control: TransferControl,
+) -> io::Result<Capture> {
+    run_stream_from_open_file_with_spawn(argv, file, timeout, max_bytes, control, spawn_piped)
+}
+
+fn run_stream_from_open_file_with_spawn(
+    argv: &[String],
+    file: std::fs::File,
+    timeout: Duration,
+    max_bytes: u64,
+    control: TransferControl,
+    spawn: impl FnOnce(&[String]) -> io::Result<Child>,
+) -> io::Result<Capture> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upload source is not a regular file",
+        ));
+    }
+    let expected = metadata.len();
     if expected > max_bytes {
         return Err(too_large_error(max_bytes));
     }
-    let mut child = spawn_piped(argv)?;
+    let mut child = spawn(argv)?;
     let stdin_pipe = child
         .stdin
         .take()
@@ -1359,12 +1470,11 @@ fn run_stream_from_file(
     let monitored = MonitoredChild::new(child, timeout, control.cancel.clone())?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
 
-    let src_path = src.to_path_buf();
     let mut progress = control.progress;
     let writer = std::thread::Builder::new()
         .name("ember-fs-upload-writer".to_string())
         .spawn(move || -> io::Result<u64> {
-            let mut file = std::fs::File::open(&src_path)?;
+            let mut file = file;
             let mut stdin = stdin_pipe;
             let mut buffer = [0u8; STREAM_BUF_SIZE];
             let mut total = 0u64;
@@ -2343,6 +2453,7 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
 /// keeps valid NAME_MAX-length entries transferable; Drop removes only the
 /// candidate this instance successfully reserved.
 struct StagedFile {
+    #[cfg(test)]
     path: PathBuf,
     parent: std::fs::File,
     name: OsString,
@@ -2387,6 +2498,7 @@ impl StagedFile {
                     };
                     return Ok((
                         Self {
+                            #[cfg(test)]
                             path,
                             parent: parent_handle,
                             name,
@@ -2406,6 +2518,7 @@ impl StagedFile {
         ))
     }
 
+    #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
     }
@@ -2423,6 +2536,20 @@ impl StagedFile {
 
     fn parent(&self) -> &std::fs::File {
         &self.parent
+    }
+
+    fn open_read(&self) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::MetadataExt;
+
+        let file = open_source_file_at(&self.parent, &self.name)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.dev() != self.device || metadata.ino() != self.inode {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "transfer staging file was replaced",
+            ));
+        }
+        Ok(file)
     }
 
     fn publish(&self, dst: &Path) -> io::Result<()> {
@@ -3000,6 +3127,52 @@ fn upload_file(
         .and_then(probe_output_empty)
 }
 
+fn pack_upload_directory_with(
+    src: &Path,
+    tar_program: &Path,
+    file: std::fs::File,
+    max_bytes: u64,
+    control: TransferControl,
+) -> io::Result<()> {
+    let name = src
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source has no UTF-8 file name")
+        })?;
+    let source = open_source_directory(src).map_err(|error| {
+        if std::fs::symlink_metadata(src).is_ok_and(|metadata| !metadata.is_dir()) {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upload source is not a directory",
+            )
+        } else {
+            error
+        }
+    })?;
+    let tar_argv = vec![
+        path_str(tar_program)?.to_string(),
+        "cf".to_string(),
+        "-".to_string(),
+        "--transform".to_string(),
+        tar_prefix_transform(name),
+        "-C".to_string(),
+        path_str(&anchored_descriptor_path(&source))?.to_string(),
+        ".".to_string(),
+    ];
+    use std::os::fd::AsRawFd;
+    run_stream_to_open_file_inheriting(
+        &tar_argv,
+        &[],
+        file,
+        TRANSFER_TIMEOUT,
+        max_bytes,
+        control,
+        &[source.as_raw_fd()],
+    )
+    .and_then(local_status)
+}
+
 /// 上传目录核心：远端存在性预检 → 本地打包（限额）→ 远端解包。
 fn upload_dir(
     host: &RemoteHostConfig,
@@ -3011,52 +3184,30 @@ fn upload_dir(
 ) -> io::Result<()> {
     require_local_tar()?;
     remote_ensure_absent(host, dst)?;
-    let parent = src.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source has no parent directory",
-        )
-    })?;
     let name = src
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "source has no UTF-8 file name")
         })?;
-    let tar_argv = vec![
-        "tar".to_string(),
-        "cf".to_string(),
-        "-".to_string(),
-        "-C".to_string(),
-        path_str(parent)?.to_string(),
-        name.to_string(),
-    ];
     let legs = LegProgress::new(control);
     let (temp, file) = StagedFile::beside(src)?;
-    let packed = run_stream_to_open_file(
-        &tar_argv,
-        &[],
-        file,
-        TRANSFER_TIMEOUT,
-        max_bytes,
-        legs.control_for(0),
-    )
-    .and_then(local_status);
+    let packed =
+        pack_upload_directory_with(src, Path::new("tar"), file, max_bytes, legs.control_for(0));
     packed.and_then(|()| {
         // 解包腿的字节数接着打包腿累计。v7 只在私有目录解包，
         // 验证完整根后再原子 no-replace 发布。
-        let base = std::fs::metadata(temp.path())
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let archive = temp.open_read()?;
+        let base = archive.metadata()?.len();
         let transfer_id = upload_transfer_id();
         let untar_argv = checked_sh_c_probe_argv(
             host,
             "untar",
             &[path_str(dst_dir)?, name, transfer_id.as_str()],
         )?;
-        let result = run_stream_from_file(
+        let result = run_stream_from_open_file(
             &untar_argv,
-            temp.path(),
+            archive,
             TRANSFER_TIMEOUT,
             max_bytes,
             legs.control_for(base),
@@ -3102,9 +3253,8 @@ fn relay(
     .and_then(probe_output_empty)
     .and_then(|()| {
         // 上传腿的字节数接着下载腿累计。
-        let base = std::fs::metadata(temp.path())
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let staged_payload = temp.open_read()?;
+        let base = staged_payload.metadata()?.len();
         let (upload_argv, transfer_id, directory_name) = if src_is_dir {
             // tar 流的顶层名就是 src 的 basename（tar 探针 -C 父目录打包）。
             let name = src
@@ -3129,9 +3279,9 @@ fn relay(
                 checked_sh_c_probe_argv(dst_host, "put", &[path_str(dst)?, transfer_id.as_str()])?;
             (argv, transfer_id, None)
         };
-        let result = run_stream_from_file(
+        let result = run_stream_from_open_file(
             &upload_argv,
-            temp.path(),
+            staged_payload,
             TRANSFER_TIMEOUT,
             MAX_TRANSFER_BYTES,
             legs.control_for(base),
@@ -5188,6 +5338,10 @@ docker = true
         std::fs::remove_file(&staging_path).unwrap();
         std::fs::write(&staging_path, b"replacement").unwrap();
         drop(file);
+        let error = staging
+            .open_read()
+            .expect_err("a replaced staging inode must never become an upload source");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
         drop(staging);
         assert_eq!(std::fs::read(&staging_path).unwrap(), b"replacement");
     }
@@ -5362,6 +5516,143 @@ printf genuine
         .expect_err("oversized upload must fail before streaming");
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn file_upload_keeps_the_source_inode_open_across_child_spawn() {
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let moved = dir.join("original.bin");
+        let dst = dir.join("uploaded.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        let dst_arg = dst.to_str().unwrap().to_string();
+        let argv = sh_c_argv_locally("put", &[&dst_arg, "feed-a"]);
+
+        run_stream_from_file_with_spawn(
+            &argv,
+            &src,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |argv| {
+                std::fs::rename(&src, &moved).unwrap();
+                std::fs::write(&src, b"replaced source").unwrap();
+                spawn_piped(argv)
+            },
+        )
+        .and_then(probe_output_empty)
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"replaced source");
+    }
+
+    #[test]
+    fn directory_pack_keeps_the_opened_root_and_literal_top_level_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let name = "tree,\n&\\root";
+        let src = dir.join(name);
+        let moved = dir.join("original-tree");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("nested/marker"), b"declared source").unwrap();
+        let shim = dir.join("tar-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nmv -- '{}' '{}'\nmkdir -p -- '{}/nested'\nprintf replacement > '{}/nested/marker'\nexec tar \"$@\"\n",
+                src.display(),
+                moved.display(),
+                src.display(),
+                src.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = dir.join("archive.tar");
+        let file = std::fs::File::create(&archive).unwrap();
+
+        pack_upload_directory_with(
+            &src,
+            &shim,
+            file,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+
+        let extracted = dir.join("extracted");
+        std::fs::create_dir(&extracted).unwrap();
+        let status = Command::new("tar")
+            .args(["xf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&extracted)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(extracted.join(name).join("nested/marker")).unwrap(),
+            b"declared source"
+        );
+        assert_eq!(
+            std::fs::read(src.join("nested/marker")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_upload_source_fds_are_cloexec_and_transfer_scoped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let file = dir.join("source.bin");
+        let directory = dir.join("tree");
+        std::fs::write(&file, b"source").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        let file_handle = open_source_file(&file).unwrap();
+        assert_cloexec_and_not_inherited(&file_handle, &file);
+        drop(file_handle);
+        let directory_handle = open_source_directory(&directory).unwrap();
+        assert_cloexec_and_not_inherited(&directory_handle, &directory);
+        drop(directory_handle);
+        assert_eq!(open_descriptor_count_for(&file), 0);
+        assert_eq!(open_descriptor_count_for(&directory), 0);
+
+        let argv = vec!["true".to_string()];
+        let error = run_stream_from_file_with_spawn(
+            &argv,
+            &file,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_| Err(io::Error::other("injected spawn failure")),
+        )
+        .expect_err("a child spawn failure must close the pinned file");
+        assert_eq!(error.to_string(), "injected spawn failure");
+        assert_eq!(open_descriptor_count_for(&file), 0);
+
+        let sleeping_tar = dir.join("sleeping-tar");
+        std::fs::write(&sleeping_tar, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&sleeping_tar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = dir.join("cancelled.tar");
+        let token = Arc::new(AtomicBool::new(true));
+        let error = pack_upload_directory_with(
+            &directory,
+            &sleeping_tar,
+            std::fs::File::create(&archive).unwrap(),
+            MAX_TRANSFER_BYTES,
+            TransferControl {
+                progress: None,
+                cancel: Some(token),
+            },
+        )
+        .expect_err("cancellation must kill tar and close its inherited root fd");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(open_descriptor_count_for(&directory), 0);
     }
 
     #[test]
