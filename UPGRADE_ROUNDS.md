@@ -359,3 +359,10 @@ Nonblocking remote type discovery adds round 74 (2026-08-30):
     socket, or device still counts as an occupied destination (`f 0`) but can no
     longer stall a paste preflight waiting for content; a link to a directory
     also remains `l`, matching the listing protocol.
+
+Root-directory transfer parity adds round 75 (2026-08-30):
+
+75. **Root children have a real tar parent** — packing `/name` now normalizes
+    the empty result of `${p%/*}` back to `/`, matching Anvil. Remote folders
+    directly below the filesystem root therefore use `tar -C / name` instead
+    of failing with an empty `-C` operand.

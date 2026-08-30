@@ -1029,7 +1029,8 @@ uploads) with a ✕ button that cancels it — the in-flight child is killed,
 local partial files are cleaned up, and the outcome is reported as a neutral
 已取消 rather than an error. The context menu also offers 复制路径, copying
 the row's full path (plain, unprefixed for remote rows) to the system
-clipboard. The v4 probe refuses directory collisions atomically (`untar
+clipboard. Root-level directories use `/` as their tar parent rather than an
+empty `-C` operand. The v4 probe refuses directory collisions atomically (`untar
 <dir> <name>` exits 17 before extracting) and answers `stat` for cheap remote
 existence checks without opening FIFOs or other special leaves for a size read.
 You can also drag files and folders from the OS file manager

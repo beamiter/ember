@@ -218,7 +218,7 @@ pub struct Capture {
 /// - v3：`untar` 改为 `untar <dir> <name>` —— 解包前先查 `<dir>/<name>` 是否
 ///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
 ///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
-///   打印 `<t> <size>`（f 为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
+///   打印 `<t> <size>`（普通文件为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
 pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
@@ -228,7 +228,7 @@ pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- 
 # v2 adds: cat (stream file to stdout), put (stream stdin to a new file),
 # tar (stream dir as tar to stdout), untar (extract stdin tar into a dir).
 # v3: untar takes <dir> <name> and refuses an existing <dir>/<name> (17) before
-# extracting; new stat op prints "<t> <size>" (t in {d,f,l}; bytes for f, else 0).
+# extracting; new stat op prints "<t> <size>" (t in {d,f,l}; regular-file bytes, else 0).
 # v4: list accepts [max_rows] [show_hidden], stops remotely at the requested
 # retained-row ceiling, and classifies symlinks before directories.
 set -u
@@ -315,7 +315,9 @@ case "$op" in
     case "$p" in /*) ;; *) exit 2 ;; esac
     [ -d "$p" ] || exit 3
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
-    tar cf - -C "${p%/*}" "${p##*/}" || exit 4
+    d=${p%/*}
+    d=${d:-/}
+    tar cf - -C "$d" "${p##*/}" || exit 4
     ;;
   untar)
     d=${2:-}
@@ -3496,6 +3498,40 @@ docker = true
         )
         .unwrap();
         assert_eq!(capture.status, Some(2));
+    }
+
+    #[test]
+    fn probe_tar_uses_root_as_the_parent_of_a_root_level_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let fake_tar = dir.join("tar");
+        std::fs::write(&fake_tar, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake_tar).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_tar, permissions).unwrap();
+
+        let argv = vec![
+            "env".to_string(),
+            format!("PATH={}:/usr/bin:/bin", dir.path().display()),
+            "sh".to_string(),
+            "-s".to_string(),
+            "--".to_string(),
+            "tar".to_string(),
+            "/tmp".to_string(),
+        ];
+        let capture = run_capture(
+            &argv,
+            PROBE_SCRIPT.as_bytes(),
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(
+            capture.stdout, b"cf\n-\n-C\n/\ntmp\n",
+            "the tar probe must never pass an empty root-level parent"
+        );
     }
 
     #[test]
