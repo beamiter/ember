@@ -15,9 +15,9 @@
 //!   （`sh -s` 的预读缓冲会和探针里的 `cat`/`tar x` 抢 stdin 字节）。
 
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1118,17 +1118,224 @@ fn source_fingerprint(metadata: &std::fs::Metadata) -> SourceFingerprint {
     }
 }
 
+/// Make a content-stable local snapshot without turning sparse holes into
+/// allocated zero blocks. The transfer cap is logical bytes: holes still
+/// count when the snapshot is later streamed, but they do not amplify local
+/// staging space. Same-filesystem reflink is preferred; sparse extent copying
+/// is the bounded fallback.
+fn snapshot_source_file(
+    source: &mut std::fs::File,
+    snapshot: &mut std::fs::File,
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    cancel: Option<&Arc<AtomicBool>>,
+    deadline: std::time::Instant,
+) -> io::Result<u64> {
+    snapshot_source_file_with_ops(
+        source,
+        snapshot,
+        metadata,
+        SnapshotBudget {
+            max_bytes,
+            cancel,
+            deadline,
+        },
+        |source, snapshot| {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: both descriptors remain live for this ioctl and the
+            // destination is this transfer's newly-created regular file.
+            if unsafe { libc::ioctl(snapshot.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0
+            {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        },
+        |source, offset, whence| {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: source remains open and the bounded logical offset fits
+            // off_t on supported Linux targets.
+            let found = unsafe { libc::lseek(source.as_raw_fd(), offset as libc::off_t, whence) };
+            if found >= 0 {
+                Ok(Some(found as u64))
+            } else {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENXIO) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotBudget<'a> {
+    max_bytes: u64,
+    cancel: Option<&'a Arc<AtomicBool>>,
+    deadline: std::time::Instant,
+}
+
+fn snapshot_source_file_with_ops(
+    source: &mut std::fs::File,
+    snapshot: &mut std::fs::File,
+    metadata: &std::fs::Metadata,
+    budget: SnapshotBudget<'_>,
+    mut clone_file: impl FnMut(&std::fs::File, &std::fs::File) -> io::Result<()>,
+    seek_extent: impl FnMut(&std::fs::File, u64, libc::c_int) -> io::Result<Option<u64>>,
+) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    check_local_transfer(budget.cancel, budget.deadline)?;
+    match clone_file(source, snapshot) {
+        Ok(()) => {
+            check_local_transfer(budget.cancel, budget.deadline)?;
+            let snapshotted = snapshot.metadata()?.len();
+            if snapshotted != metadata.len() {
+                return Err(io::Error::other(
+                    "local reflink snapshot has an unexpected size",
+                ));
+            }
+            return Ok(snapshotted);
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::EXDEV)
+            ) => {}
+        Err(error) => return Err(error),
+    }
+
+    snapshot.set_len(0)?;
+    source.seek(SeekFrom::Start(0))?;
+    snapshot.seek(SeekFrom::Start(0))?;
+    let allocated = metadata.blocks().saturating_mul(512);
+    if allocated < metadata.len() {
+        return snapshot_sparse_extents_with(
+            source,
+            snapshot,
+            metadata.len(),
+            budget.cancel,
+            budget.deadline,
+            seek_extent,
+        );
+    }
+
+    let mut buffer = [0u8; STREAM_BUF_SIZE];
+    let mut snapshotted = 0u64;
+    loop {
+        check_local_transfer(budget.cancel, budget.deadline)?;
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(snapshotted);
+        }
+        snapshotted = snapshotted
+            .checked_add(read as u64)
+            .ok_or_else(|| too_large_error(budget.max_bytes))?;
+        if snapshotted > budget.max_bytes {
+            return Err(too_large_error(budget.max_bytes));
+        }
+        snapshot.write_all(&buffer[..read])?;
+    }
+}
+
+fn snapshot_sparse_extents_with(
+    source: &mut std::fs::File,
+    snapshot: &mut std::fs::File,
+    logical_len: u64,
+    cancel: Option<&Arc<AtomicBool>>,
+    deadline: std::time::Instant,
+    mut seek_extent: impl FnMut(&std::fs::File, u64, libc::c_int) -> io::Result<Option<u64>>,
+) -> io::Result<u64> {
+    snapshot.set_len(logical_len)?;
+    let mut offset = 0u64;
+    let mut buffer = [0u8; STREAM_BUF_SIZE];
+    while offset < logical_len {
+        check_local_transfer(cancel, deadline)?;
+        let data = match seek_extent(source, offset, libc::SEEK_DATA) {
+            Ok(Some(data)) => data,
+            Ok(None) => break,
+            Err(error) => return Err(sparse_snapshot_seek_error(error)),
+        };
+        if data < offset || data >= logical_len {
+            return Err(invalid_sparse_extent_error());
+        }
+        let hole = match seek_extent(source, data, libc::SEEK_HOLE) {
+            Ok(Some(hole)) => hole,
+            Ok(None) => logical_len,
+            Err(error) => return Err(sparse_snapshot_seek_error(error)),
+        };
+        if hole <= data || hole > logical_len {
+            return Err(invalid_sparse_extent_error());
+        }
+
+        source.seek(SeekFrom::Start(data))?;
+        snapshot.seek(SeekFrom::Start(data))?;
+        let mut remaining = hole - data;
+        while remaining > 0 {
+            check_local_transfer(cancel, deadline)?;
+            let wanted = usize::try_from(remaining.min(STREAM_BUF_SIZE as u64))
+                .expect("bounded transfer chunk fits usize");
+            let read = source.read(&mut buffer[..wanted])?;
+            if read == 0 {
+                return Err(io::Error::other(
+                    "local file changed while sparse extents were snapshotted",
+                ));
+            }
+            snapshot.write_all(&buffer[..read])?;
+            remaining -= read as u64;
+        }
+        offset = hole;
+    }
+    Ok(logical_len)
+}
+
+fn sparse_snapshot_seek_error(error: io::Error) -> io::Error {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+    ) {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "source filesystem cannot preserve sparse upload snapshots",
+        )
+    } else {
+        error
+    }
+}
+
+fn invalid_sparse_extent_error() -> io::Error {
+    io::Error::other("source filesystem returned an invalid sparse extent")
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SourceManifestEntry {
     path: PathBuf,
     fingerprint: SourceFingerprint,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SourceManifest {
+    entries: Vec<SourceManifestEntry>,
+    logical_bytes: u64,
+}
+
+struct SourceManifestBuilder {
+    entries: Vec<SourceManifestEntry>,
+    counted_files: BTreeSet<(u64, u64)>,
+    logical_bytes: u64,
+    max_bytes: u64,
+}
+
 fn source_directory_manifest(
     root: &std::fs::File,
+    max_bytes: u64,
     cancel: Option<&Arc<AtomicBool>>,
     deadline: std::time::Instant,
-) -> io::Result<Vec<SourceManifestEntry>> {
+) -> io::Result<SourceManifest> {
     check_local_transfer(cancel, deadline)?;
     let mut root_fingerprint = source_fingerprint(&root.metadata()?);
     // Renaming the pinned root changes only its ctime from tar's point of
@@ -1136,19 +1343,27 @@ fn source_directory_manifest(
     // every archive-visible root field remains compared.
     root_fingerprint.changed_secs = 0;
     root_fingerprint.changed_nanos = 0;
-    let mut manifest = vec![SourceManifestEntry {
-        path: PathBuf::new(),
-        fingerprint: root_fingerprint,
-    }];
+    let mut manifest = SourceManifestBuilder {
+        entries: vec![SourceManifestEntry {
+            path: PathBuf::new(),
+            fingerprint: root_fingerprint,
+        }],
+        counted_files: BTreeSet::new(),
+        logical_bytes: 0,
+        max_bytes,
+    };
     append_source_directory_manifest(root, Path::new(""), 0, &mut manifest, cancel, deadline)?;
-    Ok(manifest)
+    Ok(SourceManifest {
+        entries: manifest.entries,
+        logical_bytes: manifest.logical_bytes,
+    })
 }
 
 fn append_source_directory_manifest(
     directory: &std::fs::File,
     relative: &Path,
     depth: usize,
-    manifest: &mut Vec<SourceManifestEntry>,
+    manifest: &mut SourceManifestBuilder,
     cancel: Option<&Arc<AtomicBool>>,
     deadline: std::time::Instant,
 ) -> io::Result<()> {
@@ -1164,7 +1379,7 @@ fn append_source_directory_manifest(
     let mut names = Vec::new();
     for entry in std::fs::read_dir(anchored_descriptor_path(directory))? {
         check_local_transfer(cancel, deadline)?;
-        if manifest.len().saturating_add(names.len()) >= MAX_UPLOAD_MANIFEST_ENTRIES {
+        if manifest.entries.len().saturating_add(names.len()) >= MAX_UPLOAD_MANIFEST_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("local directory contains more than {MAX_UPLOAD_MANIFEST_ENTRIES} entries"),
@@ -1176,7 +1391,7 @@ fn append_source_directory_manifest(
 
     for name in names {
         check_local_transfer(cancel, deadline)?;
-        if manifest.len() >= MAX_UPLOAD_MANIFEST_ENTRIES {
+        if manifest.entries.len() >= MAX_UPLOAD_MANIFEST_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("local directory contains more than {MAX_UPLOAD_MANIFEST_ENTRIES} entries"),
@@ -1185,10 +1400,26 @@ fn append_source_directory_manifest(
         let metadata = std::fs::symlink_metadata(anchored_entry_path(directory, &name))?;
         let fingerprint = source_fingerprint(&metadata);
         let path = relative.join(&name);
-        manifest.push(SourceManifestEntry {
+        manifest.entries.push(SourceManifestEntry {
             path: path.clone(),
             fingerprint,
         });
+        // The pre-spawn byte budget is logical content, so sparse holes count.
+        // Tar emits hard-linked content once; deduplicate that byte charge by
+        // inode while retaining a fingerprint entry for every visible path.
+        if metadata.is_file()
+            && manifest
+                .counted_files
+                .insert((fingerprint.device, fingerprint.inode))
+        {
+            manifest.logical_bytes = manifest
+                .logical_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| too_large_error(manifest.max_bytes))?;
+            if manifest.logical_bytes > manifest.max_bytes {
+                return Err(too_large_error(manifest.max_bytes));
+            }
+        }
         if metadata.is_dir() {
             let child = open_directory_at(directory, &name)?;
             if source_fingerprint(&child.metadata()?) != fingerprint {
@@ -1574,22 +1805,14 @@ fn run_stream_from_file_with_spawn(
     check_local_transfer(control.cancel.as_ref(), deadline)?;
     let initial_fingerprint = source_fingerprint(&metadata);
     let (snapshot_staging, mut snapshot_writer) = StagedFile::beside(src)?;
-    let mut buffer = [0u8; STREAM_BUF_SIZE];
-    let mut snapshotted = 0u64;
-    loop {
-        check_local_transfer(control.cancel.as_ref(), deadline)?;
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        snapshotted = snapshotted
-            .checked_add(read as u64)
-            .ok_or_else(|| too_large_error(max_bytes))?;
-        if snapshotted > max_bytes {
-            return Err(too_large_error(max_bytes));
-        }
-        snapshot_writer.write_all(&buffer[..read])?;
-    }
+    let snapshotted = snapshot_source_file(
+        &mut file,
+        &mut snapshot_writer,
+        &metadata,
+        max_bytes,
+        control.cancel.as_ref(),
+        deadline,
+    )?;
     let final_fingerprint = source_fingerprint(&file.metadata()?);
     if snapshotted != metadata.len() || final_fingerprint != initial_fingerprint {
         return Err(io::Error::other(format!(
@@ -3337,7 +3560,8 @@ fn pack_upload_directory_with(
         }
     })?;
     let cancel = control.cancel.clone();
-    let initial_manifest = source_directory_manifest(&source, cancel.as_ref(), deadline)?;
+    let initial_manifest =
+        source_directory_manifest(&source, max_bytes, cancel.as_ref(), deadline)?;
     let tar_argv = vec![
         path_str(tar_program)?.to_string(),
         "cf".to_string(),
@@ -3361,19 +3585,19 @@ fn pack_upload_directory_with(
         &[source.as_raw_fd()],
     );
     packed.and_then(local_status)?;
-    let final_manifest =
-        source_directory_manifest(&source, cancel.as_ref(), deadline).map_err(|error| {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-            ) {
-                error
-            } else {
-                io::Error::other(format!(
-                    "local directory changed while being archived: {error}"
-                ))
-            }
-        })?;
+    let final_manifest = source_directory_manifest(&source, max_bytes, cancel.as_ref(), deadline)
+        .map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+        ) {
+            error
+        } else {
+            io::Error::other(format!(
+                "local directory changed while being archived: {error}"
+            ))
+        }
+    })?;
     if final_manifest != initial_manifest {
         return Err(source_directory_changed_error());
     }
@@ -5723,6 +5947,302 @@ printf genuine
         .expect_err("oversized upload must fail before streaming");
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn file_upload_snapshot_preserves_sparse_allocation_before_child_spawn() {
+        use std::io::Seek;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let mut source = std::fs::File::create(&src).unwrap();
+        source.set_len(16 * 1024 * 1024).unwrap();
+        source.seek(io::SeekFrom::Start(0)).unwrap();
+        source.write_all(b"start").unwrap();
+        source.seek(io::SeekFrom::End(-3)).unwrap();
+        source.write_all(b"end").unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+        let source_blocks = std::fs::metadata(&src).unwrap().blocks();
+        let snapshot_blocks = std::cell::Cell::new(0);
+
+        let error = run_stream_from_file_with_spawn(
+            &["true".to_string()],
+            &src,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_| {
+                let snapshot = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".ember-fs-part-")
+                    })
+                    .expect("the complete private snapshot exists before child spawn");
+                snapshot_blocks.set(snapshot.metadata().unwrap().blocks());
+                Err(io::Error::other("injected child spawn failure"))
+            },
+        )
+        .expect_err("the injected spawn failure ends the test transfer");
+
+        assert_eq!(error.to_string(), "injected child spawn failure");
+        assert!(
+            snapshot_blocks.get() <= source_blocks.saturating_add(32),
+            "snapshot allocated {} blocks for a source using {source_blocks}",
+            snapshot_blocks.get()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the failed transfer removes only its sparse snapshot"
+        );
+    }
+
+    #[test]
+    fn sparse_upload_limit_counts_logical_bytes_and_preserves_hole_content() {
+        use std::io::Seek;
+
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let mut source = std::fs::File::create(&src).unwrap();
+        let logical_len = 1024 * 1024u64;
+        source.set_len(logical_len).unwrap();
+        source.seek(SeekFrom::Start(17)).unwrap();
+        source.write_all(b"start").unwrap();
+        source.seek(SeekFrom::Start(logical_len - 3)).unwrap();
+        source.write_all(b"end").unwrap();
+        drop(source);
+        let spawned = AtomicBool::new(false);
+
+        let error = run_stream_from_file_with_spawn(
+            &["true".to_string()],
+            &src,
+            TRANSFER_TIMEOUT,
+            logical_len - 1,
+            TransferControl::default(),
+            |_| {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("oversize upload must not spawn"))
+            },
+        )
+        .expect_err("a sparse file's holes still count toward the logical cap");
+        assert!(error.to_string().contains("limit"));
+        assert!(!spawned.load(Ordering::Relaxed));
+
+        let dst = dir.join("uploaded.bin");
+        let dst_arg = dst.to_str().unwrap().to_string();
+        upload_file(
+            &sh_c_argv_locally("put", &[&dst_arg, "feed-a3"]),
+            &src,
+            logical_len,
+            TransferControl::default(),
+        )
+        .unwrap();
+        let uploaded = std::fs::read(&dst).unwrap();
+        assert_eq!(uploaded.len() as u64, logical_len);
+        assert_eq!(&uploaded[17..22], b"start");
+        assert!(uploaded[22..logical_len as usize - 3]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(&uploaded[logical_len as usize - 3..], b"end");
+    }
+
+    #[test]
+    fn successful_clone_snapshot_stays_fixed_after_source_truncation() {
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let alias = dir.join("source-alias.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        std::fs::hard_link(&src, &alias).unwrap();
+        let mut source = open_source_file(&src).unwrap();
+        let metadata = source.metadata().unwrap();
+        let (snapshot_staging, mut snapshot_writer) = StagedFile::beside(&src).unwrap();
+        let clone_called = AtomicBool::new(false);
+
+        let snapshotted = snapshot_source_file_with_ops(
+            &mut source,
+            &mut snapshot_writer,
+            &metadata,
+            SnapshotBudget {
+                max_bytes: MAX_TRANSFER_BYTES,
+                cancel: None,
+                deadline: std::time::Instant::now() + TRANSFER_TIMEOUT,
+            },
+            |source, snapshot| {
+                clone_called.store(true, Ordering::Relaxed);
+                let mut source = source.try_clone()?;
+                let mut snapshot = snapshot.try_clone()?;
+                io::copy(&mut source, &mut snapshot)?;
+                Ok(())
+            },
+            |_, _, _| panic!("a successful clone must not query sparse extents"),
+        )
+        .unwrap();
+        assert_eq!(snapshotted, metadata.len());
+        assert!(clone_called.load(Ordering::Relaxed));
+        snapshot_writer.sync_all().unwrap();
+        drop(snapshot_writer);
+        std::fs::write(&alias, b"short").unwrap();
+
+        let mut snapshot = snapshot_staging.open_read().unwrap();
+        let mut uploaded = Vec::new();
+        snapshot.read_to_end(&mut uploaded).unwrap();
+        assert_eq!(uploaded, b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"short");
+    }
+
+    #[test]
+    fn sparse_snapshot_rejects_unsupported_and_invalid_extents_before_spawn() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Unsupported,
+            Reversed,
+            ZeroProgress,
+        }
+
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let keep = dir.join("keep.txt");
+        let source = std::fs::File::create(&src).unwrap();
+        source.set_len(16 * 1024 * 1024).unwrap();
+        drop(source);
+        std::fs::write(&keep, b"unrelated").unwrap();
+
+        for failure in [
+            Failure::Unsupported,
+            Failure::Reversed,
+            Failure::ZeroProgress,
+        ] {
+            let spawned = AtomicBool::new(false);
+            let result = (|| {
+                let mut source = open_source_file(&src)?;
+                let metadata = source.metadata()?;
+                let (_snapshot_staging, mut snapshot_writer) = StagedFile::beside(&src)?;
+                snapshot_source_file_with_ops(
+                    &mut source,
+                    &mut snapshot_writer,
+                    &metadata,
+                    SnapshotBudget {
+                        max_bytes: MAX_TRANSFER_BYTES,
+                        cancel: None,
+                        deadline: std::time::Instant::now() + TRANSFER_TIMEOUT,
+                    },
+                    |_, _| Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+                    |_, _, whence| match failure {
+                        Failure::Unsupported => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                        Failure::Reversed if whence == libc::SEEK_DATA => Ok(Some(4096)),
+                        Failure::Reversed => Ok(Some(4095)),
+                        Failure::ZeroProgress => Ok(Some(4096)),
+                    },
+                )?;
+                spawned.store(true, Ordering::Relaxed);
+                Ok::<(), io::Error>(())
+            })();
+
+            let error = result.expect_err("an unsafe extent map must stop before child spawn");
+            match failure {
+                Failure::Unsupported => assert_eq!(error.kind(), io::ErrorKind::Unsupported),
+                Failure::Reversed | Failure::ZeroProgress => {
+                    assert!(error.to_string().contains("invalid sparse extent"))
+                }
+            }
+            assert!(!spawned.load(Ordering::Relaxed));
+            assert_eq!(std::fs::read(&keep).unwrap(), b"unrelated");
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ember-fs-part-")),
+                "only this failed transfer's snapshot is removed"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_manifest_keeps_each_hardlink_path() {
+        let dir = TestDir::new();
+        let src = dir.join("tree");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("first"), b"shared content").unwrap();
+        std::fs::hard_link(src.join("first"), src.join("second")).unwrap();
+        let source = open_source_directory(&src).unwrap();
+
+        let manifest = source_directory_manifest(
+            &source,
+            MAX_TRANSFER_BYTES,
+            None,
+            std::time::Instant::now() + TRANSFER_TIMEOUT,
+        )
+        .unwrap();
+        let first = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == Path::new("first"))
+            .unwrap();
+        let second = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == Path::new("second"))
+            .unwrap();
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_ne!(first.path, second.path);
+        assert_eq!(
+            manifest.logical_bytes,
+            b"shared content".len() as u64,
+            "one hard-linked inode is charged once without dropping path fingerprints"
+        );
+        assert_eq!(
+            manifest.entries.len(),
+            3,
+            "root plus both hardlink paths are retained"
+        );
+    }
+
+    #[test]
+    fn oversized_sparse_directory_is_rejected_before_tar_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let src = dir.join("tree");
+        std::fs::create_dir(&src).unwrap();
+        let logical_len = 1024 * 1024u64;
+        let sparse = std::fs::File::create(src.join("sparse.bin")).unwrap();
+        sparse.set_len(logical_len).unwrap();
+        drop(sparse);
+        let marker = dir.join("tar-spawned");
+        let shim = dir.join("tar-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nexit 99\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = dir.join("archive.tar");
+
+        let error = pack_upload_directory_with(
+            &src,
+            &shim,
+            std::fs::File::create(&archive).unwrap(),
+            logical_len - 1,
+            TransferControl::default(),
+        )
+        .expect_err("logical sparse bytes over the cap must fail before tar spawn");
+
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert!(!marker.exists(), "the local tar child must not spawn");
+        assert_eq!(std::fs::metadata(&archive).unwrap().len(), 0);
     }
 
     #[test]
