@@ -1770,6 +1770,7 @@ fn run_stream_to_open_file_inheriting(
 /// 前把内容复制进同目录私有 staging；后续 hard-link 别名写入不再能改变上传
 /// 字节。写端仍在独立线程（子进程提前退出时 BrokenPipe 正常收尾，结果看退出
 /// 码）。`control` 携带进度回报（仅远端传输腿上报）与取消令牌。
+#[cfg(test)]
 fn run_stream_from_file(
     argv: &[String],
     src: &Path,
@@ -1829,16 +1830,6 @@ fn run_stream_from_file_with_spawn(
     run_stream_from_open_file_with_spawn(argv, snapshot, remaining, max_bytes, control, spawn)
 }
 
-fn run_stream_from_open_file(
-    argv: &[String],
-    file: std::fs::File,
-    timeout: Duration,
-    max_bytes: u64,
-    control: TransferControl,
-) -> io::Result<Capture> {
-    run_stream_from_open_file_with_spawn(argv, file, timeout, max_bytes, control, spawn_piped)
-}
-
 fn run_stream_from_open_file_with_spawn(
     argv: &[String],
     file: std::fs::File,
@@ -1858,6 +1849,11 @@ fn run_stream_from_open_file_with_spawn(
     if expected > max_bytes {
         return Err(too_large_error(max_bytes));
     }
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))?;
+    check_local_transfer(control.cancel.as_ref(), deadline)?;
+    let remaining = remaining_transfer_timeout(deadline)?;
     let mut child = spawn(argv)?;
     let stdin_pipe = child
         .stdin
@@ -1872,7 +1868,7 @@ fn run_stream_from_open_file_with_spawn(
         .take()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
 
-    let monitored = MonitoredChild::new(child, timeout, control.cancel.clone())?;
+    let monitored = MonitoredChild::new(child, remaining, control.cancel.clone())?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
 
     let mut progress = control.progress;
@@ -3340,6 +3336,18 @@ impl LegProgress {
             cancel: self.cancel.clone(),
         }
     }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            Err(cancelled_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// 下载：远端 → 本地。
@@ -3469,19 +3477,35 @@ fn upload(
         // 才是原子 no-replace 的权威检查。
         let transfer_id = upload_transfer_id();
         let argv = checked_sh_c_probe_argv(host, "put", &[path_str(dst)?, &transfer_id])?;
-        let result = upload_file(&argv, src, MAX_TRANSFER_BYTES, control);
-        if result.as_ref().is_err_and(upload_cleanup_needed) {
+        let remote_probe_started = AtomicBool::new(false);
+        let result = run_stream_from_file_with_spawn(
+            &argv,
+            src,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            control,
+            |argv| {
+                let child = spawn_piped(argv)?;
+                remote_probe_started.store(true, Ordering::Relaxed);
+                Ok(child)
+            },
+        )
+        .and_then(probe_output_empty);
+        if result.as_ref().is_err_and(|error| {
+            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
+        }) {
             cleanup_remote_put(host, dst, &transfer_id);
         }
         result
     }
 }
 
-fn upload_cleanup_needed(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-    )
+fn upload_cleanup_needed(error: &io::Error, remote_probe_started: bool) -> bool {
+    remote_probe_started
+        && matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+        )
 }
 
 /// 探针正常失败会自行删除 staging；只有整个进程组被取消/超时
@@ -3522,6 +3546,7 @@ fn run_remote_upload_cleanup(host: &RemoteHostConfig, command: &str) {
 }
 
 /// 上传文件核心：argv 是完整的 put 探针调用（测试可注入本机 sh）。
+#[cfg(test)]
 fn upload_file(
     put_argv: &[String],
     src: &Path,
@@ -3604,7 +3629,7 @@ fn pack_upload_directory_with(
     Ok(())
 }
 
-/// 上传目录核心：远端存在性预检 → 本地打包（限额）→ 远端解包。
+/// 上传目录核心：本地私有打包（限额）→ 远端存在性预检 → 远端解包。
 fn upload_dir(
     host: &RemoteHostConfig,
     src: &Path,
@@ -3613,8 +3638,48 @@ fn upload_dir(
     max_bytes: u64,
     control: TransferControl,
 ) -> io::Result<()> {
+    upload_dir_with_remote_ensure(
+        host,
+        src,
+        dst_dir,
+        dst,
+        max_bytes,
+        control,
+        remote_ensure_absent,
+    )
+}
+
+fn upload_dir_with_remote_ensure(
+    host: &RemoteHostConfig,
+    src: &Path,
+    dst_dir: &Path,
+    dst: &Path,
+    max_bytes: u64,
+    control: TransferControl,
+    ensure_remote_absent: impl Fn(&RemoteHostConfig, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    upload_dir_with_tar_and_remote_ensure(
+        host,
+        src,
+        (dst_dir, dst),
+        Path::new("tar"),
+        max_bytes,
+        control,
+        ensure_remote_absent,
+    )
+}
+
+fn upload_dir_with_tar_and_remote_ensure(
+    host: &RemoteHostConfig,
+    src: &Path,
+    destination: (&Path, &Path),
+    tar_program: &Path,
+    max_bytes: u64,
+    control: TransferControl,
+    ensure_remote_absent: impl Fn(&RemoteHostConfig, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let (dst_dir, dst) = destination;
     require_local_tar()?;
-    remote_ensure_absent(host, dst)?;
     let name = src
         .file_name()
         .and_then(|name| name.to_str())
@@ -3623,28 +3688,38 @@ fn upload_dir(
         })?;
     let legs = LegProgress::new(control);
     let (temp, file) = StagedFile::beside(src)?;
-    let packed =
-        pack_upload_directory_with(src, Path::new("tar"), file, max_bytes, legs.control_for(0));
+    let packed = pack_upload_directory_with(src, tar_program, file, max_bytes, legs.control_for(0));
     packed.and_then(|()| {
         // 解包腿的字节数接着打包腿累计。v7 只在私有目录解包，
         // 验证完整根后再原子 no-replace 发布。
         let archive = temp.open_read()?;
         let base = archive.metadata()?.len();
+        legs.check_cancelled()?;
+        ensure_remote_absent(host, dst)?;
+        legs.check_cancelled()?;
         let transfer_id = upload_transfer_id();
         let untar_argv = checked_sh_c_probe_argv(
             host,
             "untar",
             &[path_str(dst_dir)?, name, transfer_id.as_str()],
         )?;
-        let result = run_stream_from_open_file(
+        let remote_probe_started = AtomicBool::new(false);
+        let result = run_stream_from_open_file_with_spawn(
             &untar_argv,
             archive,
             TRANSFER_TIMEOUT,
             max_bytes,
             legs.control_for(base),
+            |argv| {
+                let child = spawn_piped(argv)?;
+                remote_probe_started.store(true, Ordering::Relaxed);
+                Ok(child)
+            },
         )
         .and_then(probe_output_empty);
-        if result.as_ref().is_err_and(upload_cleanup_needed) {
+        if result.as_ref().is_err_and(|error| {
+            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
+        }) {
             cleanup_remote_untar(host, dst_dir, name, &transfer_id);
         }
         result
@@ -3710,15 +3785,23 @@ fn relay(
                 checked_sh_c_probe_argv(dst_host, "put", &[path_str(dst)?, transfer_id.as_str()])?;
             (argv, transfer_id, None)
         };
-        let result = run_stream_from_open_file(
+        let remote_probe_started = AtomicBool::new(false);
+        let result = run_stream_from_open_file_with_spawn(
             &upload_argv,
             staged_payload,
             TRANSFER_TIMEOUT,
             MAX_TRANSFER_BYTES,
             legs.control_for(base),
+            |argv| {
+                let child = spawn_piped(argv)?;
+                remote_probe_started.store(true, Ordering::Relaxed);
+                Ok(child)
+            },
         )
         .and_then(probe_output_empty);
-        if result.as_ref().is_err_and(upload_cleanup_needed) {
+        if result.as_ref().is_err_and(|error| {
+            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
+        }) {
             if let Some(name) = directory_name.as_deref() {
                 cleanup_remote_untar(dst_host, dst_dir, name, &transfer_id);
             } else {
@@ -5140,18 +5223,26 @@ docker = true
 
     #[test]
     fn upload_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
-        assert!(upload_cleanup_needed(&cancelled_error()));
-        assert!(upload_cleanup_needed(&io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timeout"
-        )));
-        assert!(!upload_cleanup_needed(&io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "probe cleaned itself"
-        )));
-        assert!(!upload_cleanup_needed(&io::Error::other(
-            "ordinary failure"
-        )));
+        let cancelled = cancelled_error();
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "timeout");
+        assert!(upload_cleanup_needed(&cancelled, true));
+        assert!(upload_cleanup_needed(&timed_out, true));
+        assert!(
+            !upload_cleanup_needed(&cancelled, false),
+            "local cancellation before remote spawn must not contact remote cleanup"
+        );
+        assert!(
+            !upload_cleanup_needed(&timed_out, false),
+            "local timeout before remote spawn must not contact remote cleanup"
+        );
+        assert!(!upload_cleanup_needed(
+            &io::Error::new(io::ErrorKind::AlreadyExists, "probe cleaned itself"),
+            true,
+        ));
+        assert!(!upload_cleanup_needed(
+            &io::Error::other("ordinary failure"),
+            true,
+        ));
     }
 
     #[test]
@@ -6243,6 +6334,234 @@ printf genuine
         assert!(error.to_string().contains("limit"), "{error}");
         assert!(!marker.exists(), "the local tar child must not spawn");
         assert_eq!(std::fs::metadata(&archive).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn invalid_directory_upload_source_is_rejected_before_remote_stat_spawn() {
+        let dir = TestDir::new();
+        let src = dir.join("not-a-directory");
+        let dst_dir = Path::new("/remote");
+        let dst = dst_dir.join("not-a-directory");
+        std::fs::write(&src, b"ordinary file").unwrap();
+        let contacted_remote = AtomicBool::new(false);
+
+        let error = upload_dir_with_remote_ensure(
+            &ssh_host(),
+            &src,
+            dst_dir,
+            &dst,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_, _| {
+                contacted_remote.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .expect_err("an invalid local directory must fail before remote contact");
+
+        assert!(error.to_string().contains("not a directory"), "{error}");
+        assert!(
+            !contacted_remote.load(Ordering::Relaxed),
+            "remote stat spawned before local archive preparation"
+        );
+    }
+
+    #[test]
+    fn staged_upload_checks_cancel_and_timeout_before_remote_child_spawn() {
+        let dir = TestDir::new();
+        let archive = dir.join("archive.tar");
+        std::fs::write(&archive, b"complete local staging").unwrap();
+        let argv = vec!["remote-probe".to_string()];
+
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let spawned = AtomicBool::new(false);
+        let error = run_stream_from_open_file_with_spawn(
+            &argv,
+            std::fs::File::open(&archive).unwrap(),
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl {
+                progress: None,
+                cancel: Some(cancelled),
+            },
+            |_| {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("remote child must not spawn"))
+            },
+        )
+        .expect_err("pre-cancelled staged uploads must stop locally");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!spawned.load(Ordering::Relaxed));
+
+        let spawned = AtomicBool::new(false);
+        let error = run_stream_from_open_file_with_spawn(
+            &argv,
+            std::fs::File::open(&archive).unwrap(),
+            Duration::ZERO,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_| {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("remote child must not spawn"))
+            },
+        )
+        .expect_err("expired staged uploads must stop locally");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!spawned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn directory_archive_cap_is_enforced_before_remote_stat_spawn() {
+        let dir = TestDir::new();
+        let src = dir.join("tree");
+        std::fs::create_dir(&src).unwrap();
+        let dst_dir = Path::new("/remote");
+        let dst = dst_dir.join("tree");
+        let contacted_remote = AtomicBool::new(false);
+
+        let error = upload_dir_with_remote_ensure(
+            &ssh_host(),
+            &src,
+            dst_dir,
+            &dst,
+            1024,
+            TransferControl::default(),
+            |_, _| {
+                contacted_remote.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .expect_err("tar framing over the archive cap must fail locally");
+
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert!(!contacted_remote.load(Ordering::Relaxed));
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ember-fs-part-")),
+            "failed local packing must clean only its private archive"
+        );
+    }
+
+    #[test]
+    fn completed_nonzero_directory_tar_never_starts_remote_work() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let src = dir.join("tree");
+        std::fs::create_dir(&src).unwrap();
+        let tar = dir.join("failing-tar");
+        std::fs::write(
+            &tar,
+            "#!/bin/sh\nprintf partial-archive\nprintf 'injected tar failure\\n' >&2\nexit 42\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dst_dir = Path::new("/remote");
+        let dst = dst_dir.join("tree");
+        let contacted_remote = AtomicBool::new(false);
+
+        let error = upload_dir_with_tar_and_remote_ensure(
+            &ssh_host(),
+            &src,
+            (dst_dir, &dst),
+            &tar,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_, _| {
+                contacted_remote.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .expect_err("a completed nonzero tar must abort before remote stat and untar");
+
+        assert!(
+            error.to_string().contains("injected tar failure"),
+            "{error}"
+        );
+        assert!(!contacted_remote.load(Ordering::Relaxed));
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ember-fs-part-")),
+            "nonzero local tar must not leave its private archive"
+        );
+    }
+
+    #[test]
+    fn cancelling_directory_pack_never_starts_remote_work() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let src = dir.join("tree");
+        std::fs::create_dir(&src).unwrap();
+        let ready = dir.join("tar-ready");
+        let tar = dir.join("blocking-tar");
+        std::fs::write(
+            &tar,
+            format!(
+                "#!/bin/sh\nprintf ready > '{}'\nwhile :; do sleep 30; done\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let remote_contacted = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_remote = remote_contacted.clone();
+        let worker_src = src.clone();
+        let worker_tar = tar.clone();
+        let worker = std::thread::spawn(move || {
+            let dst_dir = Path::new("/remote");
+            upload_dir_with_tar_and_remote_ensure(
+                &ssh_host(),
+                &worker_src,
+                (dst_dir, &dst_dir.join("tree")),
+                &worker_tar,
+                MAX_TRANSFER_BYTES,
+                TransferControl {
+                    progress: None,
+                    cancel: Some(worker_cancel),
+                },
+                move |_, _| {
+                    worker_remote.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+        });
+
+        let started = std::time::Instant::now();
+        while !ready.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "blocking tar did not start");
+        cancel.store(true, Ordering::SeqCst);
+        let error = worker
+            .join()
+            .expect("directory upload worker panicked")
+            .expect_err("cancelled local tar must abort the upload");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!remote_contacted.load(Ordering::Relaxed));
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ember-fs-part-")),
+            "cancelled local packing must clean its private archive"
+        );
     }
 
     #[test]
