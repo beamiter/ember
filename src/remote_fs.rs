@@ -52,6 +52,8 @@ pub const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// 流式转发的块大小。
 const STREAM_BUF_SIZE: usize = 64 * 1024;
+/// 上传目录的稳定性清单有界，避免病态稀疏树耗尽 worker 内存。
+const MAX_UPLOAD_MANIFEST_ENTRIES: usize = 1_000_000;
 
 /// 文件树当前浏览的位置：本机、`config.remote_hosts` 里的第 N 台主机，
 /// 或从真实前台 `ssh` argv 临时派生出的独立 profile。
@@ -1083,6 +1085,142 @@ fn open_source_file(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceFingerprint {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u64,
+    len: u64,
+    modified_secs: i64,
+    modified_nanos: i64,
+    changed_secs: i64,
+    changed_nanos: i64,
+}
+
+fn source_fingerprint(metadata: &std::fs::Metadata) -> SourceFingerprint {
+    use std::os::unix::fs::MetadataExt;
+
+    SourceFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        rdev: metadata.rdev(),
+        len: metadata.len(),
+        modified_secs: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
+        changed_secs: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceManifestEntry {
+    path: PathBuf,
+    fingerprint: SourceFingerprint,
+}
+
+fn source_directory_manifest(
+    root: &std::fs::File,
+    cancel: Option<&Arc<AtomicBool>>,
+    deadline: std::time::Instant,
+) -> io::Result<Vec<SourceManifestEntry>> {
+    check_local_transfer(cancel, deadline)?;
+    let mut root_fingerprint = source_fingerprint(&root.metadata()?);
+    // Renaming the pinned root changes only its ctime from tar's point of
+    // view. The root's parent path is outside the content contract, while
+    // every archive-visible root field remains compared.
+    root_fingerprint.changed_secs = 0;
+    root_fingerprint.changed_nanos = 0;
+    let mut manifest = vec![SourceManifestEntry {
+        path: PathBuf::new(),
+        fingerprint: root_fingerprint,
+    }];
+    append_source_directory_manifest(root, Path::new(""), 0, &mut manifest, cancel, deadline)?;
+    Ok(manifest)
+}
+
+fn append_source_directory_manifest(
+    directory: &std::fs::File,
+    relative: &Path,
+    depth: usize,
+    manifest: &mut Vec<SourceManifestEntry>,
+    cancel: Option<&Arc<AtomicBool>>,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    check_local_transfer(cancel, deadline)?;
+    if depth >= MAX_COPY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local directory is too deeply nested to upload safely",
+        ));
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(anchored_descriptor_path(directory))? {
+        check_local_transfer(cancel, deadline)?;
+        if manifest.len().saturating_add(names.len()) >= MAX_UPLOAD_MANIFEST_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("local directory contains more than {MAX_UPLOAD_MANIFEST_ENTRIES} entries"),
+            ));
+        }
+        names.push(entry?.file_name());
+    }
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    for name in names {
+        check_local_transfer(cancel, deadline)?;
+        if manifest.len() >= MAX_UPLOAD_MANIFEST_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("local directory contains more than {MAX_UPLOAD_MANIFEST_ENTRIES} entries"),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(anchored_entry_path(directory, &name))?;
+        let fingerprint = source_fingerprint(&metadata);
+        let path = relative.join(&name);
+        manifest.push(SourceManifestEntry {
+            path: path.clone(),
+            fingerprint,
+        });
+        if metadata.is_dir() {
+            let child = open_directory_at(directory, &name)?;
+            if source_fingerprint(&child.metadata()?) != fingerprint {
+                return Err(source_directory_changed_error());
+            }
+            append_source_directory_manifest(&child, &path, depth + 1, manifest, cancel, deadline)?;
+        }
+    }
+    Ok(())
+}
+
+fn source_directory_changed_error() -> io::Error {
+    io::Error::other("local directory changed while being archived")
+}
+
+fn check_local_transfer(
+    cancel: Option<&Arc<AtomicBool>>,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    if cancel.is_some_and(|token| token.load(Ordering::SeqCst)) {
+        return Err(cancelled_error());
+    }
+    remaining_transfer_timeout(deadline).map(drop)
+}
+
+fn remaining_transfer_timeout(deadline: std::time::Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))
+}
+
 fn create_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -1397,11 +1535,10 @@ fn run_stream_to_open_file_inheriting(
     })
 }
 
-/// 有界地把本地文件流进子进程 stdin：先按 metadata 预检大小，写端在独立
-/// 线程（子进程提前退出时 BrokenPipe 正常收尾，结果看退出码）。子进程退出
-/// 码为 0 但写出的字节数与预检不符（本地文件在传输中被改动）时如实报错 —
-/// 此时远端落位的可能是截断文件，绝不包装成成功。`control` 携带进度回报
-/// （在写端线程里按块上报）与取消令牌。
+/// 有界地把本地文件流进子进程 stdin。路径入口先固定 inode，并在 child spawn
+/// 前把内容复制进同目录私有 staging；后续 hard-link 别名写入不再能改变上传
+/// 字节。写端仍在独立线程（子进程提前退出时 BrokenPipe 正常收尾，结果看退出
+/// 码）。`control` 携带进度回报（仅远端传输腿上报）与取消令牌。
 fn run_stream_from_file(
     argv: &[String],
     src: &Path,
@@ -1420,8 +1557,53 @@ fn run_stream_from_file_with_spawn(
     control: TransferControl,
     spawn: impl FnOnce(&[String]) -> io::Result<Child>,
 ) -> io::Result<Capture> {
-    let file = open_source_file(src)?;
-    run_stream_from_open_file_with_spawn(argv, file, timeout, max_bytes, control, spawn)
+    let mut file = open_source_file(src)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upload source is not a regular file",
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(too_large_error(max_bytes));
+    }
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))?;
+    check_local_transfer(control.cancel.as_ref(), deadline)?;
+    let initial_fingerprint = source_fingerprint(&metadata);
+    let (snapshot_staging, mut snapshot_writer) = StagedFile::beside(src)?;
+    let mut buffer = [0u8; STREAM_BUF_SIZE];
+    let mut snapshotted = 0u64;
+    loop {
+        check_local_transfer(control.cancel.as_ref(), deadline)?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        snapshotted = snapshotted
+            .checked_add(read as u64)
+            .ok_or_else(|| too_large_error(max_bytes))?;
+        if snapshotted > max_bytes {
+            return Err(too_large_error(max_bytes));
+        }
+        snapshot_writer.write_all(&buffer[..read])?;
+    }
+    let final_fingerprint = source_fingerprint(&file.metadata()?);
+    if snapshotted != metadata.len() || final_fingerprint != initial_fingerprint {
+        return Err(io::Error::other(format!(
+            "local file changed while being snapshotted ({snapshotted} of {} bytes captured)",
+            metadata.len()
+        )));
+    }
+    snapshot_writer.sync_all()?;
+    drop(snapshot_writer);
+    drop(file);
+    let snapshot = snapshot_staging.open_read()?;
+    check_local_transfer(control.cancel.as_ref(), deadline)?;
+    let remaining = remaining_transfer_timeout(deadline)?;
+    run_stream_from_open_file_with_spawn(argv, snapshot, remaining, max_bytes, control, spawn)
 }
 
 fn run_stream_from_open_file(
@@ -3134,6 +3316,10 @@ fn pack_upload_directory_with(
     max_bytes: u64,
     control: TransferControl,
 ) -> io::Result<()> {
+    let deadline = std::time::Instant::now()
+        .checked_add(TRANSFER_TIMEOUT)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))?;
+    check_local_transfer(control.cancel.as_ref(), deadline)?;
     let name = src
         .file_name()
         .and_then(|name| name.to_str())
@@ -3150,6 +3336,8 @@ fn pack_upload_directory_with(
             error
         }
     })?;
+    let cancel = control.cancel.clone();
+    let initial_manifest = source_directory_manifest(&source, cancel.as_ref(), deadline)?;
     let tar_argv = vec![
         path_str(tar_program)?.to_string(),
         "cf".to_string(),
@@ -3161,16 +3349,35 @@ fn pack_upload_directory_with(
         ".".to_string(),
     ];
     use std::os::fd::AsRawFd;
-    run_stream_to_open_file_inheriting(
+    check_local_transfer(control.cancel.as_ref(), deadline)?;
+    let remaining = remaining_transfer_timeout(deadline)?;
+    let packed = run_stream_to_open_file_inheriting(
         &tar_argv,
         &[],
         file,
-        TRANSFER_TIMEOUT,
+        remaining,
         max_bytes,
         control,
         &[source.as_raw_fd()],
-    )
-    .and_then(local_status)
+    );
+    packed.and_then(local_status)?;
+    let final_manifest =
+        source_directory_manifest(&source, cancel.as_ref(), deadline).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+            ) {
+                error
+            } else {
+                io::Error::other(format!(
+                    "local directory changed while being archived: {error}"
+                ))
+            }
+        })?;
+    if final_manifest != initial_manifest {
+        return Err(source_directory_changed_error());
+    }
+    Ok(())
 }
 
 /// 上传目录核心：远端存在性预检 → 本地打包（限额）→ 远端解包。
@@ -5548,6 +5755,64 @@ printf genuine
     }
 
     #[test]
+    fn file_upload_snapshots_content_before_child_mutates_a_hardlink() {
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let alias = dir.join("source-alias.bin");
+        let dst = dir.join("uploaded.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        std::fs::hard_link(&src, &alias).unwrap();
+        let dst_arg = dst.to_str().unwrap().to_string();
+        let argv = sh_c_argv_locally("put", &[&dst_arg, "feed-a1"]);
+
+        run_stream_from_file_with_spawn(
+            &argv,
+            &src,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |argv| {
+                std::fs::write(&alias, b"replaced source").unwrap();
+                spawn_piped(argv)
+            },
+        )
+        .and_then(probe_output_empty)
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"replaced source");
+    }
+
+    #[test]
+    fn file_upload_snapshots_content_before_child_truncates_a_hardlink() {
+        let dir = TestDir::new();
+        let src = dir.join("source.bin");
+        let alias = dir.join("source-alias.bin");
+        let dst = dir.join("uploaded.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        std::fs::hard_link(&src, &alias).unwrap();
+        let dst_arg = dst.to_str().unwrap().to_string();
+        let argv = sh_c_argv_locally("put", &[&dst_arg, "feed-a2"]);
+
+        run_stream_from_file_with_spawn(
+            &argv,
+            &src,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |argv| {
+                std::fs::write(&alias, b"short").unwrap();
+                spawn_piped(argv)
+            },
+        )
+        .and_then(probe_output_empty)
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"short");
+    }
+
+    #[test]
     fn directory_pack_keeps_the_opened_root_and_literal_top_level_name() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -5602,9 +5867,55 @@ printf genuine
         );
     }
 
+    #[test]
+    fn directory_pack_refuses_in_place_nested_content_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let src = dir.join("tree");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        let marker = src.join("nested/marker");
+        let alias = dir.join("marker-alias");
+        std::fs::write(&marker, b"declared source").unwrap();
+        std::fs::hard_link(&marker, &alias).unwrap();
+        let shim = dir.join("tar-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf 'replaced source' > '{}'\nexec tar \"$@\"\n",
+                alias.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = dir.join("archive.tar");
+        let spawned = AtomicBool::new(false);
+
+        let error = pack_upload_directory_with(
+            &src,
+            &shim,
+            std::fs::File::create(&archive).unwrap(),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .and_then(|()| {
+            spawned.store(true, Ordering::Relaxed);
+            Err::<(), _>(io::Error::other("remote untar must not start"))
+        })
+        .expect_err("a changing local tree must not become an upload archive");
+
+        assert!(
+            error.to_string().contains("changed while being archived"),
+            "the local source change must remain the primary error: {error}"
+        );
+        assert!(!spawned.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"replaced source");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pinned_upload_source_fds_are_cloexec_and_transfer_scoped() {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TestDir::new();
@@ -5623,6 +5934,42 @@ printf genuine
         assert_eq!(open_descriptor_count_for(&directory), 0);
 
         let argv = vec!["true".to_string()];
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let spawned = AtomicBool::new(false);
+        let error = run_stream_from_file_with_spawn(
+            &argv,
+            &file,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl {
+                progress: None,
+                cancel: Some(cancelled),
+            },
+            |_| {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("cancelled upload must not spawn"))
+            },
+        )
+        .expect_err("pre-cancellation must stop before snapshot or child spawn");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!spawned.load(Ordering::Relaxed));
+
+        let spawned = AtomicBool::new(false);
+        let error = run_stream_from_file_with_spawn(
+            &argv,
+            &file,
+            Duration::ZERO,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_| {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("timed-out upload must not spawn"))
+            },
+        )
+        .expect_err("an exhausted timeout must stop before snapshot or child spawn");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!spawned.load(Ordering::Relaxed));
+
         let error = run_stream_from_file_with_spawn(
             &argv,
             &file,
@@ -5634,6 +5981,13 @@ printf genuine
         .expect_err("a child spawn failure must close the pinned file");
         assert_eq!(error.to_string(), "injected spawn failure");
         assert_eq!(open_descriptor_count_for(&file), 0);
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().as_bytes().starts_with(b".ember-fs-part-")),
+            "cancel, timeout, and spawn failure leave no upload snapshot"
+        );
 
         let sleeping_tar = dir.join("sleeping-tar");
         std::fs::write(&sleeping_tar, "#!/bin/sh\nsleep 30\n").unwrap();
@@ -5650,7 +6004,7 @@ printf genuine
                 cancel: Some(token),
             },
         )
-        .expect_err("cancellation must kill tar and close its inherited root fd");
+        .expect_err("cancellation must stop before tar and close the pinned root fd");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(open_descriptor_count_for(&directory), 0);
     }
