@@ -417,3 +417,14 @@ Identity-bound extraction cleanup adds round 81 (2026-08-30):
     device and inode with the current path before recursive removal, so a path
     moved away and replaced during extraction cannot redirect cleanup into the
     replacement tree; collision retry and mode-0700 isolation remain intact.
+
+Atomic remote file publication adds round 82 (2026-08-30):
+
+82. **Receive privately, hard-link once** — probe v5 `put` now reserves a short
+    mode-0700 directory beside the destination, writes stdin to its mode-0600
+    payload, and publishes with `ln -T`, whose hard-link creation atomically
+    refuses an existing name. The old predictable `"$p.fspart.$$"` redirection
+    could follow a planted symlink, exceed `NAME_MAX`, and the final check plus
+    `mv` could still overwrite a destination created in between; all three
+    paths now fail closed and private staging is cleaned without touching a
+    colliding candidate.

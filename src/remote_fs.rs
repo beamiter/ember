@@ -206,10 +206,10 @@ pub struct Capture {
     pub cancelled: bool,
 }
 
-/// 远端探针脚本协议 v3。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
+/// 远端探针脚本协议 v5。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
 /// put/untar 例外，走 `sh -c` 内联脚本（stdin 整个留给上传载荷）：
 /// - `list` 的 stdout 是 NUL 分隔的 `<t>\0<name>\0` 对，t ∈ {d, f, l}，相对名。
-/// - v2 新增：`cat` 流式读文件、`put` 流式写新文件（临时名 + mv 原子就位）、
+/// - v2 新增：`cat` 流式读文件、`put` 流式写新文件、
 ///   `tar` 目录打包流。
 /// - 所有创建型操作把悬空符号链接也视为已存在（17）；`test -e` 会漏掉这种
 ///   目录项，而 `mkfile` 随后会跟随它写到预期目录之外。
@@ -219,9 +219,11 @@ pub struct Capture {
 ///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
 ///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
 ///   打印 `<t> <size>`（普通文件为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
+/// - v5：`put` 在同父级私有目录内接收 stdin，再以 hard-link no-replace 原子发布；
+///   预植临时路径不会被跟随，最后检查后出现的目标也不会被 `mv` 覆盖。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
-pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
+pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v5 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # Exit codes: 0 ok, 2 usage/bad path, 3 missing, 4 op failed, 13 permission,
 # 17 target exists, 20 not a directory.
@@ -231,6 +233,8 @@ pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- 
 # extracting; new stat op prints "<t> <size>" (t in {d,f,l}; regular-file bytes, else 0).
 # v4: list accepts [max_rows] [show_hidden], stops remotely at the requested
 # retained-row ceiling, and classifies symlinks before directories.
+# v5: put receives data in a private same-parent directory and publishes with
+# an atomic no-replace hard link.
 set -u
 op=${1:-}
 case "$op" in
@@ -304,10 +308,30 @@ case "$op" in
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
     if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
-    t="$p.fspart.$$"
-    if ! cat > "$t"; then rm -f "$t"; exit 4; fi
-    if [ -e "$p" ] || [ -L "$p" ]; then rm -f "$t"; exit 17; fi
-    mv "$t" "$p" || { rm -f "$t"; exit 4; }
+    d=${p%/*}
+    d=${d:-/}
+    stage=
+    i=0
+    umask 077
+    while [ "$i" -lt 32 ]; do
+      candidate="$d/.ember-fs-put-$$-$i"
+      i=$((i + 1))
+      [ "$candidate" = "$p" ] && continue
+      if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+    done
+    [ -n "$stage" ] || exit 4
+    payload="$stage/payload"
+    code=4
+    if cat > "$payload"; then
+      if ln -T "$payload" "$p" 2>/dev/null; then
+        code=0
+      elif [ -e "$p" ] || [ -L "$p" ]; then
+        code=17
+      fi
+    fi
+    rm -f "$payload"
+    rmdir "$stage" 2>/dev/null || :
+    exit "$code"
     ;;
   tar)
     p=${2:-}
@@ -2381,8 +2405,8 @@ fn upload(
     if src_is_dir {
         upload_dir(host, src, dst_dir, dst, MAX_TRANSFER_BYTES, control)
     } else {
-        // put 在远端读流之前就检查 [ -e "$p" ] → 17，不浪费字节；
-        // mv 就位前再查一次，存在性检查天然原子。
+        // put 在远端读流之前先给出友好的 17；最终 hard-link publication
+        // 才是原子 no-replace 的权威检查。
         let argv = checked_sh_c_probe_argv(host, "put", &[path_str(dst)?])?;
         upload_file(&argv, src, MAX_TRANSFER_BYTES, control)
     }
@@ -3603,7 +3627,9 @@ docker = true
     }
 
     #[test]
-    fn probe_v2_put_writes_stdin_atomically_and_refuses_existing() {
+    fn probe_v5_put_writes_privately_and_refuses_existing() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TestDir::new();
         let file = dir.join("upload.bin");
         let arg = file.to_str().unwrap().to_string();
@@ -3618,6 +3644,11 @@ docker = true
         .unwrap();
         assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
         assert_eq!(std::fs::read(&file).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o077,
+            0,
+            "remote upload publication must remain owner-only"
+        );
 
         // 已存在 → 17，且临时文件不残留。
         let capture = run_capture(
@@ -3631,7 +3662,12 @@ docker = true
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".fspart."))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".ember-fs-put-")
+            })
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
 
@@ -3645,6 +3681,81 @@ docker = true
         )
         .unwrap();
         assert_eq!(capture.status, Some(4));
+
+        // A filesystem-limit destination remains valid because the staging
+        // component is fixed-size and lives beside it.
+        let long = dir.path().join("x".repeat(255));
+        let long_arg = long.to_str().unwrap().to_string();
+        let capture = run_capture(
+            &sh_c_argv_locally("put", &[&long_arg]),
+            &payload,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(std::fs::read(long).unwrap(), payload);
+    }
+
+    #[test]
+    fn probe_v5_put_atomically_preserves_a_racing_destination() {
+        let dir = TestDir::new();
+        let file = dir.join("upload.bin");
+        let arg = file.to_str().unwrap().to_string();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(PROBE_SCRIPT)
+            .arg("remote-fs-probe")
+            .arg("put")
+            .arg(&arg)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+
+        // The child creates private staging before blocking in `cat`. Hold
+        // stdin open until that point, then make the final name win the race.
+        let started = std::time::Instant::now();
+        loop {
+            let staging_exists = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ember-fs-put-")
+                });
+            if staging_exists {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("put probe did not reserve staging");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        std::fs::write(&file, b"keep").unwrap();
+        stdin.write_all(&binary_sample()).unwrap();
+        drop(stdin);
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ember-fs-put-")),
+            "private staging must be cleaned after a lost publication race"
+        );
     }
 
     #[test]
