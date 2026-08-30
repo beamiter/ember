@@ -791,6 +791,7 @@ fn too_large_error(max_bytes: u64) -> io::Error {
 /// 有界地把子进程 stdout 流进本地文件：整块转发、随时计数，超限或流错误
 /// 立即 kill 子进程并报错；部分文件的清理由调用方负责。返回的 Capture
 /// stdout 恒为空（字节都落盘了）。`control` 携带进度回报与取消令牌。
+#[cfg(test)]
 fn run_stream_to_file(
     argv: &[String],
     stdin_bytes: &[u8],
@@ -1988,18 +1989,6 @@ impl Drop for StagedFile {
     }
 }
 
-/// 中转（远程 → 远程）的本地临时名：unique、用完即删。
-fn relay_temp_path(is_dir: bool) -> PathBuf {
-    static RELAY_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let suffix = if is_dir { ".tar" } else { "" };
-    std::env::temp_dir().join(format!(
-        "ember-fs-relay-{}-{}{}",
-        std::process::id(),
-        RELAY_COUNTER.fetch_add(1, Ordering::SeqCst),
-        suffix
-    ))
-}
-
 /// Private same-parent extraction root for one downloaded directory. Tar never
 /// writes into the final namespace; Drop removes only this process-owned tree.
 struct ExtractionDir(PathBuf);
@@ -2458,14 +2447,14 @@ fn relay(
     // 也来得及，但那时下载已经完成，白传一份）。
     remote_ensure_absent(dst_host, dst)?;
     let legs = LegProgress::new(control);
-    let temp = relay_temp_path(src_is_dir);
-    let _ = std::fs::remove_file(&temp);
+    let relay_anchor = std::env::temp_dir().join("ember-fs-relay");
+    let (temp, file) = StagedFile::beside(&relay_anchor)?;
     let src_arg = path_str(src)?;
     let download_op = if src_is_dir { "tar" } else { "cat" };
-    let outcome = run_stream_to_file(
+    run_stream_to_open_file(
         &checked_probe_argv(src_host, download_op, &[src_arg])?,
         PROBE_SCRIPT.as_bytes(),
-        &temp,
+        file,
         TRANSFER_TIMEOUT,
         MAX_TRANSFER_BYTES,
         legs.control_for(0),
@@ -2473,7 +2462,9 @@ fn relay(
     .and_then(probe_output_empty)
     .and_then(|()| {
         // 上传腿的字节数接着下载腿累计。
-        let base = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
+        let base = std::fs::metadata(temp.path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         let upload_argv = if src_is_dir {
             // tar 流的顶层名就是 src 的 basename（tar 探针 -C 父目录打包）。
             let name = src
@@ -2488,15 +2479,13 @@ fn relay(
         };
         run_stream_from_file(
             &upload_argv,
-            &temp,
+            temp.path(),
             TRANSFER_TIMEOUT,
             MAX_TRANSFER_BYTES,
             legs.control_for(base),
         )
         .and_then(probe_output_empty)
-    });
-    let _ = std::fs::remove_file(&temp);
-    outcome
+    })
 }
 
 #[cfg(test)]
@@ -4198,6 +4187,61 @@ docker = true
         .unwrap();
         std::fs::remove_file(&relay_temp).unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), binary_sample());
+    }
+
+    #[test]
+    fn directory_stream_relay_round_trips_through_private_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let remote_a = dir.join("remote-a");
+        let source = remote_a.join("tree");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::write(source.join("sub/blob.bin"), binary_sample()).unwrap();
+        let source_arg = source.to_str().unwrap().to_string();
+
+        let relay_anchor = dir.join("relay-anchor");
+        let (staging, file) = StagedFile::beside(&relay_anchor).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        run_stream_to_open_file(
+            &sh_s_argv_locally("tar", &[&source_arg]),
+            PROBE_SCRIPT.as_bytes(),
+            file,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .and_then(probe_output_empty)
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&staging_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "relay payloads remain owner-only between legs"
+        );
+
+        let remote_b = dir.join("remote-b");
+        std::fs::create_dir(&remote_b).unwrap();
+        let remote_b_arg = remote_b.to_str().unwrap().to_string();
+        run_stream_from_file(
+            &sh_c_argv_locally("untar", &[&remote_b_arg, "tree"]),
+            &staging_path,
+            TRANSFER_TIMEOUT,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .and_then(probe_output_empty)
+        .unwrap();
+        drop(staging);
+
+        assert!(!staging_path.exists(), "relay staging cleans up on success");
+        assert_eq!(
+            std::fs::read(remote_b.join("tree/sub/blob.bin")).unwrap(),
+            binary_sample()
+        );
     }
 
     #[test]

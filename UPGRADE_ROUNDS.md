@@ -401,3 +401,11 @@ Bounded transfer staging names add round 79 (2026-08-30):
     starting a producer, and an internal candidate can never alias the source
     or final destination it protects. Cleanup is bound to the reserved inode,
     so a path replaced after reservation is left intact.
+
+Exclusive relay scratch adds round 80 (2026-08-30):
+
+80. **Reserve once across both relay legs** — remote-to-remote file and tar
+    relays now hold one owner-only `StagedFile` from the source stream through
+    the destination upload. The relay no longer derives and unconditionally
+    removes a guessed `/tmp/ember-fs-relay-*` path before opening it; occupied
+    candidates are skipped and RAII removes only the inode actually reserved.

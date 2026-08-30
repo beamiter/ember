@@ -1066,6 +1066,8 @@ a fixed-size basename independent of the transferred name, so a valid
 filesystem-limit name remains transferable; occupied candidates are retried
 without unlinking them or starting the producer, and cleanup verifies the
 reserved inode before unlinking so a replaced candidate survives.
+Remote-to-remote relays use the same reserved owner-only scratch inode for
+both legs, rather than deleting a guessed path in the system temp directory.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
