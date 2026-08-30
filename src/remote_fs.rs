@@ -745,6 +745,31 @@ fn kill_tree(child: &mut Child) -> bool {
     child.kill().is_ok()
 }
 
+/// Kill only a child that has not already exited. Checking and signalling
+/// under the same lock prevents the watchdog from targeting a recycled
+/// process-group id after the main waiter has reaped the child.
+fn kill_running_child(child: &Arc<Mutex<Child>>) -> bool {
+    let mut child = child.lock();
+    match child.try_wait() {
+        Ok(Some(_)) | Err(_) => false,
+        Ok(None) => kill_tree(&mut child),
+    }
+}
+
+/// Best-effort setup-error cleanup. `try_wait` itself reaps an exited child;
+/// a still-running child takes the mutually exclusive kill-then-wait branch.
+fn kill_and_reap_child(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock();
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = kill_tree(&mut child);
+            let _ = child.wait();
+        }
+        Err(_) => {}
+    }
+}
+
 /// 子进程 + watchdog 的组合：超时或取消令牌触发时强制 kill（同一条 kill
 /// 路径），try_wait 轮询而不是 wait() 长持锁（watchdog 需要同一把锁来 kill）。
 struct MonitoredChild {
@@ -752,7 +777,8 @@ struct MonitoredChild {
     timed_out: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     done_tx: mpsc::Sender<()>,
-    watchdog: std::thread::JoinHandle<()>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+    reaped: bool,
 }
 
 /// watchdog 的醒转间隔：有取消令牌时按它轮询令牌。
@@ -781,13 +807,13 @@ impl MonitoredChild {
                                     .as_ref()
                                     .is_some_and(|token| token.load(Ordering::SeqCst))
                                 {
-                                    if kill_tree(&mut child.lock()) {
+                                    if kill_running_child(&child) {
                                         cancelled.store(true, Ordering::SeqCst);
                                     }
                                     break;
                                 }
                                 if std::time::Instant::now() >= deadline {
-                                    if kill_tree(&mut child.lock()) {
+                                    if kill_running_child(&child) {
                                         timed_out.store(true, Ordering::SeqCst);
                                     }
                                     break;
@@ -795,38 +821,63 @@ impl MonitoredChild {
                             }
                         }
                     }
-                })?
+                })
+        };
+        let watchdog = match watchdog {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                kill_and_reap_child(&child);
+                return Err(error);
+            }
         };
         Ok(Self {
             child,
             timed_out,
             cancelled,
             done_tx,
-            watchdog,
+            watchdog: Some(watchdog),
+            reaped: false,
         })
     }
 
     /// 传输超限/流错误时立即中止子进程（整组 kill，子孙一并回收）。
     fn kill(&self) {
-        let _ = kill_tree(&mut self.child.lock());
+        let _ = kill_running_child(&self.child);
     }
 
     /// 等子进程退出并停掉 watchdog，返回（退出码，是否超时，是否取消）。
-    fn wait(self) -> io::Result<(Option<i32>, bool, bool)> {
+    fn wait(mut self) -> io::Result<(Option<i32>, bool, bool)> {
         let status = loop {
             if let Some(status) = self.child.lock().try_wait()? {
                 break status;
             }
             std::thread::sleep(Duration::from_millis(5));
         };
+        self.reaped = true;
         // 通知 watchdog 停止并等它退出，避免残留线程挂着子进程的锁。
-        let _ = self.done_tx.send(());
-        let _ = self.watchdog.join();
+        self.stop_watchdog();
         Ok((
             status.code(),
             self.timed_out.load(Ordering::SeqCst),
             self.cancelled.load(Ordering::SeqCst),
         ))
+    }
+
+    fn stop_watchdog(&mut self) {
+        let _ = self.done_tx.send(());
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+impl Drop for MonitoredChild {
+    fn drop(&mut self) {
+        self.stop_watchdog();
+        if !self.reaped {
+            kill_and_reap_child(&self.child);
+            self.reaped = true;
+        }
     }
 }
 
@@ -847,13 +898,28 @@ fn read_bounded<R: Read>(reader: R, max: u64) -> io::Result<(Vec<u8>, bool)> {
 
 /// stderr 另开读者线程：子进程写满 stderr 管道而主线程在读 stdout 时，
 /// 单线程顺序读会互相等待形成死锁。
+type StderrReader = std::thread::JoinHandle<(Vec<u8>, bool)>;
+
 fn spawn_stderr_reader(
     stderr: std::process::ChildStderr,
     max_out: u64,
-) -> io::Result<std::thread::JoinHandle<(Vec<u8>, bool)>> {
+) -> io::Result<StderrReader> {
     std::thread::Builder::new()
         .name("ember-fs-probe-stderr".to_string())
         .spawn(move || read_bounded(stderr, max_out).unwrap_or_default())
+}
+
+fn monitor_with_stderr_reader(
+    child: Child,
+    stderr: std::process::ChildStderr,
+    timeout: Duration,
+    cancel: Option<Arc<AtomicBool>>,
+    max_out: u64,
+    spawn_reader: impl FnOnce(std::process::ChildStderr, u64) -> io::Result<StderrReader>,
+) -> io::Result<(MonitoredChild, StderrReader)> {
+    let monitored = MonitoredChild::new(child, timeout, cancel)?;
+    let stderr_reader = spawn_reader(stderr, max_out)?;
+    Ok((monitored, stderr_reader))
 }
 
 /// 有界地运行一个子进程：pipe stdio，写入并关闭 stdin，stdout/stderr 各按
@@ -981,8 +1047,14 @@ fn run_stream_to_open_file(
         .take()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
 
-    let monitored = MonitoredChild::new(child, timeout, control.cancel.clone())?;
-    let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
+    let (monitored, stderr_reader) = monitor_with_stderr_reader(
+        child,
+        stderr_pipe,
+        timeout,
+        control.cancel.clone(),
+        MAX_SMALL_OUTPUT,
+        spawn_stderr_reader,
+    )?;
 
     let mut buffer = [0u8; STREAM_BUF_SIZE];
     let mut total = 0u64;
@@ -3463,6 +3535,102 @@ docker = true
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "cancelled probe descendants must not hold stdout/stderr open"
+        );
+    }
+
+    fn process_was_reaped(pid: u32) -> bool {
+        let mut status = 0;
+        // SAFETY: pid belongs to the test child. WNOHANG only observes or
+        // reaps that exact process; the failure branches clean it up before
+        // returning so a failing regression cannot leak a sleeper.
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if waited == -1 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            return true;
+        }
+        if waited == 0 {
+            // SAFETY: the child was spawned as the leader of this private
+            // process group, matching the production spawn contract.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+                libc::waitpid(pid as i32, &mut status, 0);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn stderr_reader_setup_failure_reaps_a_running_download_child() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stderr = child.stderr.take().unwrap();
+        let error = monitor_with_stderr_reader(
+            child,
+            stderr,
+            Duration::from_secs(30),
+            None,
+            1024,
+            |_, _| -> io::Result<StderrReader> {
+                Err(io::Error::other("injected stderr reader failure"))
+            },
+        )
+        .err()
+        .expect("reader setup must return its injected error");
+
+        assert_eq!(error.to_string(), "injected stderr reader failure");
+        assert!(
+            process_was_reaped(pid),
+            "reader setup failure must kill and reap a running producer"
+        );
+    }
+
+    #[test]
+    fn stderr_reader_setup_failure_reaps_an_exited_download_child() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("sh")
+            .args(["-c", "printf finished"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let error = monitor_with_stderr_reader(
+            child,
+            stderr,
+            Duration::from_secs(30),
+            None,
+            1024,
+            move |_, _| -> io::Result<StderrReader> {
+                let mut output = Vec::new();
+                stdout.read_to_end(&mut output)?;
+                assert_eq!(output, b"finished");
+                Err(io::Error::other("injected stderr reader failure"))
+            },
+        )
+        .err()
+        .expect("reader setup must return its injected error");
+
+        assert_eq!(error.to_string(), "injected stderr reader failure");
+        assert!(
+            process_was_reaped(pid),
+            "reader setup failure must reap an already-exited producer"
         );
     }
 
