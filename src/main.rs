@@ -2538,11 +2538,11 @@ impl TerminalApp {
     /// intent owns the surface.
     fn update_ssh_files_follow(&mut self, ctx: &egui::Context, frame_start_files_user_intent: u64) {
         while let Some(result) = self.ssh_files_follow.try_result() {
-            if !self
+            if self
                 .ssh_files_follow
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.token == result.token)
+                .is_none_or(|pending| pending.token != result.token)
             {
                 continue;
             }

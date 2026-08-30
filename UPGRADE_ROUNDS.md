@@ -327,3 +327,12 @@ Workflow observability adds round 70 (2026-08-30):
     set is silent; fixing it clears the snapshot so a later regression is
     announced again. This brings ember's synchronous picker to the refusal UX
     anvil already exposes without changing discovery or rendering semantics.
+
+Toolchain gate maintenance adds round 71 (2026-08-30):
+
+71. **Rust 1.96 keeps the strict Clippy gate green** — the stale SSH Files
+    result guard now spells “missing pending request or mismatched token” with
+    `Option::is_none_or`. This is the exact inverse of the former
+    `!is_some_and` predicate, but avoids the new `nonminimal_bool` warning that
+    made the repository's `-D warnings` release check fail before reaching this
+    round's code.
