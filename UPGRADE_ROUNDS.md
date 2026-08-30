@@ -366,3 +366,10 @@ Root-directory transfer parity adds round 75 (2026-08-30):
     the empty result of `${p%/*}` back to `/`, matching Anvil. Remote folders
     directly below the filesystem root therefore use `tar -C / name` instead
     of failing with an empty `-C` operand.
+
+Local no-overwrite commits add round 76 (2026-08-30):
+
+76. **The final rename is the existence check** — local Rename and downloaded
+    file publication now commit with Linux `renameat2(RENAME_NOREPLACE)`.
+    Creating the destination between the earlier friendly check and the commit
+    can no longer be overwritten; unsupported kernels/filesystems fail closed.

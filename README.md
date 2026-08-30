@@ -1052,6 +1052,12 @@ header opens a type-to-filter row that prunes the loaded tree client-side
 expansion state restored on clear, no new scans — identical for local and
 remote listings).
 
+Local Rename and downloaded-file publication use Linux
+`renameat2(RENAME_NOREPLACE)`: a destination created by another process after
+the friendly existence check wins intact instead of being overwritten by the
+commit. On a kernel or filesystem without that atomic primitive, the operation
+fails closed rather than falling back to a racy rename.
+
 Directory refresh is stale-while-revalidate: the last-good rows, expanded
 subtrees and pagination remain usable while a new local or remote listing is
 in flight. Surviving directories are reconciled in place by path and type;
