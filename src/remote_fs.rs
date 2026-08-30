@@ -799,6 +799,17 @@ fn run_stream_to_file(
     max_bytes: u64,
     mut control: TransferControl,
 ) -> io::Result<Capture> {
+    // Reserve the staging name before starting a producer. O_EXCL refuses an
+    // existing symlink instead of following it, and an open failure cannot
+    // leave an unobserved child behind.
+    let mut staging_options = std::fs::OpenOptions::new();
+    staging_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        staging_options.mode(0o600);
+    }
+    let mut file = staging_options.open(dest)?;
     let mut child = spawn_piped(argv)?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_bytes);
@@ -815,7 +826,6 @@ fn run_stream_to_file(
     let monitored = MonitoredChild::new(child, timeout, control.cancel.clone())?;
     let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
 
-    let mut file = std::fs::File::create(dest)?;
     let mut buffer = [0u8; STREAM_BUF_SIZE];
     let mut total = 0u64;
     let mut stream_error: Option<io::Error> = None;
@@ -3690,6 +3700,72 @@ docker = true
     }
 
     // ---- 流式 runner 与传输组合（本机 sh 当"远端"） ----
+
+    #[test]
+    fn stream_staging_refuses_a_symlink_before_spawning() {
+        let dir = TestDir::new();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let staging = dir.join("staging");
+        std::os::unix::fs::symlink(&victim, &staging).unwrap();
+        let marker = dir.join("producer-started");
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf started > \"$1\"; printf payload".to_string(),
+            "--".to_string(),
+            marker.to_str().unwrap().to_string(),
+        ];
+
+        let error = run_stream_to_file(
+            &argv,
+            &[],
+            &staging,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+            TransferControl::default(),
+        )
+        .expect_err("an occupied staging name must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(&staging)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            !marker.exists(),
+            "producer started before staging was reserved"
+        );
+
+        let safe_staging = dir.join("safe-staging");
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf payload".to_string(),
+        ];
+        let capture = run_stream_to_file(
+            &argv,
+            &[],
+            &safe_staging,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(0));
+        assert_eq!(std::fs::read(&safe_staging).unwrap(), b"payload");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&safe_staging)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "partial transfer content must remain owner-only"
+        );
+    }
 
     #[test]
     fn run_stream_to_file_enforces_the_cap_and_download_cleans_up() {

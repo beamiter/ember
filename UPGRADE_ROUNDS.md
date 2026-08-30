@@ -373,3 +373,11 @@ Local no-overwrite commits add round 76 (2026-08-30):
     file publication now commit with Linux `renameat2(RENAME_NOREPLACE)`.
     Creating the destination between the earlier friendly check and the commit
     can no longer be overwritten; unsupported kernels/filesystems fail closed.
+
+Exclusive transfer staging adds round 77 (2026-08-30):
+
+77. **Reserve before spawn** — every local transfer staging file now opens with
+    owner-only `create_new` before its producer process starts. A preplanted
+    hidden symlink is rejected rather than followed and cannot truncate its
+    target; failure to reserve the name also cannot leave an unobserved child
+    process behind, and a permissive umask cannot expose partial content.

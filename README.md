@@ -1057,6 +1057,10 @@ Local Rename and downloaded-file publication use Linux
 the friendly existence check wins intact instead of being overwritten by the
 commit. On a kernel or filesystem without that atomic primitive, the operation
 fails closed rather than falling back to a racy rename.
+Transfer staging names are reserved owner-only with exclusive create before
+their producer starts, so partial content is not published by a permissive
+umask, and a planted hidden symlink is refused without touching its target or
+leaving a child process to reap.
 
 Directory refresh is stale-while-revalidate: the last-good rows, expanded
 subtrees and pagination remain usable while a new local or remote listing is
