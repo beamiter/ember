@@ -16,6 +16,7 @@
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -712,6 +713,10 @@ fn checked_sh_c_probe_argv(
 }
 
 fn spawn_piped(argv: &[String]) -> io::Result<Child> {
+    spawn_piped_inheriting(argv, &[])
+}
+
+fn spawn_piped_inheriting(argv: &[String], inherited_fds: &[i32]) -> io::Result<Child> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
@@ -727,7 +732,23 @@ fn spawn_piped(argv: &[String]) -> io::Result<Child> {
         // 独立进程组（子进程任组长）：kill 时整组回收，探针 fork 出去的
         // 子孙（rm -rf 半途、sh -c 下的 sleep）无法存活占管。
         command.process_group(0);
+        let inherited_fds = inherited_fds.to_vec();
+        // SAFETY: the closure only makes caller-selected live descriptors
+        // inheritable in the post-fork child, before exec. It does not
+        // allocate, lock, or touch parent process state.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in &inherited_fds {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
     }
+    #[cfg(not(unix))]
+    let _ = inherited_fds;
     command.spawn()
 }
 
@@ -941,7 +962,18 @@ fn run_capture_with_cancel(
     max_out: u64,
     cancel: Option<Arc<AtomicBool>>,
 ) -> io::Result<Capture> {
-    let mut child = spawn_piped(argv)?;
+    run_capture_with_cancel_inheriting(argv, stdin_bytes, timeout, max_out, cancel, &[])
+}
+
+fn run_capture_with_cancel_inheriting(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    inherited_fds: &[i32],
+) -> io::Result<Capture> {
+    let mut child = spawn_piped_inheriting(argv, inherited_fds)?;
 
     // 探针脚本约 2KB，远小于 64KB 管道缓冲，同步写不会阻塞；子进程若立即
     // 退出，BrokenPipe 按无害处理（结果由退出码说话）。
@@ -1012,6 +1044,7 @@ fn run_stream_to_file(
     run_stream_to_open_file(argv, stdin_bytes, file, timeout, max_bytes, control)
 }
 
+#[cfg(test)]
 fn open_transfer_staging(path: &Path) -> io::Result<std::fs::File> {
     let mut staging_options = std::fs::OpenOptions::new();
     staging_options.write(true).create_new(true);
@@ -1021,6 +1054,192 @@ fn open_transfer_staging(path: &Path) -> io::Result<std::fs::File> {
         staging_options.mode(0o600);
     }
     staging_options.open(path)
+}
+
+fn open_directory(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn create_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+    // SAFETY: `parent` and `name` remain live for this mkdirat call.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn open_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+    // SAFETY: `parent` and `name` remain live for this call; a successful fd
+    // is uniquely transferred into File below.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn open_transfer_staging_at(parent: &std::fs::File, name: &OsStr) -> io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+    // SAFETY: `parent` and `name` remain live for this call; a successful fd
+    // is uniquely transferred into File below.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn entry_identity_at(parent: &std::fs::File, name: &OsStr) -> io::Result<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the output points to writable storage and both input
+    // descriptors remain live for this single fstatat call.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat initialized the structure on success.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+fn remove_file_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+    // SAFETY: `parent` and `name` remain live for this unlinkat call.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn remove_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+    // SAFETY: `parent` and `name` remain live for this unlinkat call.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn anchored_entry_path(parent: &std::fs::File, name: &OsStr) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from("/proc/self/fd")
+        .join(parent.as_raw_fd().to_string())
+        .join(name)
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_rename_noreplace_at(
+    src_parent: &std::fs::File,
+    src_name: &OsStr,
+    dst_parent: &std::fs::File,
+    dst_name: &OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src_name = std::ffi::CString::new(src_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+    let dst_name = std::ffi::CString::new(dst_name.as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination name contains NUL")
+    })?;
+    // SAFETY: both directory descriptors and names remain live for the
+    // single namespace operation.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            src_parent.as_raw_fd(),
+            src_name.as_ptr(),
+            dst_parent.as_raw_fd(),
+            dst_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("atomic no-replace rename is unavailable: {error}"),
+        ));
+    }
+    Err(error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn atomic_rename_noreplace_at(
+    _src_parent: &std::fs::File,
+    _src_name: &OsStr,
+    _dst_parent: &std::fs::File,
+    _dst_name: &OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename requires Linux renameat2",
+    ))
 }
 
 /// Stream into an already exclusively reserved staging inode. Keeping name
@@ -2125,6 +2344,8 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
 /// candidate this instance successfully reserved.
 struct StagedFile {
     path: PathBuf,
+    parent: std::fs::File,
+    name: OsString,
     device: u64,
     inode: u64,
 }
@@ -2143,14 +2364,16 @@ impl StagedFile {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        let parent_handle = open_directory(parent)?;
         for _ in 0..32 {
-            let path = parent.join(format!(".ember-fs-part-{}-{}", std::process::id(), next()));
+            let name = OsString::from(format!(".ember-fs-part-{}-{}", std::process::id(), next()));
+            let path = parent.join(&name);
             // A legitimate source/destination can have our hidden-name shape.
             // Never reserve the anchor itself, even when it is currently absent.
             if path.file_name() == anchor.file_name() {
                 continue;
             }
-            match open_transfer_staging(&path) {
+            match open_transfer_staging_at(&parent_handle, &name) {
                 Ok(file) => {
                     use std::os::unix::fs::MetadataExt;
 
@@ -2165,6 +2388,8 @@ impl StagedFile {
                     return Ok((
                         Self {
                             path,
+                            parent: parent_handle,
+                            name,
                             device: metadata.dev(),
                             inode: metadata.ino(),
                         },
@@ -2184,18 +2409,54 @@ impl StagedFile {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn anchored_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            anchored_entry_path(&self.parent, &self.name)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.clone()
+        }
+    }
+
+    fn parent(&self) -> &std::fs::File {
+        &self.parent
+    }
+
+    fn publish(&self, dst: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        ensure_absent(dst)?;
+        let dst_name = dst.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+        })?;
+        let dst_parent = dst
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let current_parent = open_directory(dst_parent)?;
+        let expected = self.parent.metadata()?;
+        let current = current_parent.metadata()?;
+        if expected.dev() != current.dev() || expected.ino() != current.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "destination parent changed during transfer",
+            ));
+        }
+        atomic_rename_noreplace_at(&self.parent, &self.name, &current_parent, dst_name)
+    }
 }
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-
         // Do not unlink a path that was replaced after reservation. On a
         // successful publication the original path is simply absent here.
-        if std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        if entry_identity_at(&self.parent, &self.name)
+            .is_ok_and(|(device, inode)| device == self.device && inode == self.inode)
         {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = remove_file_at(&self.parent, &self.name);
         }
     }
 }
@@ -2203,48 +2464,71 @@ impl Drop for StagedFile {
 /// Private same-parent extraction root for one downloaded directory. Tar never
 /// writes into the final namespace; Drop removes only this process-owned tree.
 struct ExtractionDir {
+    #[cfg(any(test, not(target_os = "linux")))]
     path: PathBuf,
+    parent: std::fs::File,
+    name: OsString,
     handle: std::fs::File,
 }
 
 impl ExtractionDir {
+    #[cfg(test)]
     fn beside(dst: &Path) -> io::Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         Self::beside_with(dst, || NEXT.fetch_add(1, Ordering::SeqCst))
     }
 
+    #[cfg(test)]
     fn beside_with(dst: &Path, mut next: impl FnMut() -> usize) -> io::Result<Self> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-
         let parent = dst
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        let parent = open_directory(parent)?;
+        Self::beside_parent_with(dst, &parent, &mut next)
+    }
+
+    fn beside_parent(dst: &Path, parent: &std::fs::File) -> io::Result<Self> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self::beside_parent_with(dst, parent, &mut || NEXT.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn beside_parent_with(
+        dst: &Path,
+        parent: &std::fs::File,
+        mut next: impl FnMut() -> usize,
+    ) -> io::Result<Self> {
+        let parent_path = dst
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = parent.try_clone()?;
         for _ in 0..32 {
-            let path = parent.join(format!(
+            let name = OsString::from(format!(
                 ".ember-fs-extract-{}-{}",
                 std::process::id(),
                 next()
             ));
+            let path = parent_path.join(&name);
             if path.file_name() == dst.file_name() {
                 continue;
             }
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
-            match builder.create(&path) {
+            match create_directory_at(&parent, &name) {
                 Ok(()) => {
-                    let handle = match std::fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                        .open(&path)
-                    {
+                    let handle = match open_directory_at(&parent, &name) {
                         Ok(handle) => handle,
                         Err(error) => {
-                            let _ = std::fs::remove_dir(&path);
+                            let _ = remove_directory_at(&parent, &name);
                             return Err(error);
                         }
                     };
-                    return Ok(Self { path, handle });
+                    return Ok(Self {
+                        #[cfg(any(test, not(target_os = "linux")))]
+                        path,
+                        parent,
+                        name,
+                        handle,
+                    });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -2256,8 +2540,43 @@ impl ExtractionDir {
         ))
     }
 
+    #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn anchored_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            anchored_entry_path(&self.parent, &self.name)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.clone()
+        }
+    }
+
+    fn publish(&self, src_name: &OsStr, dst: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        ensure_absent(dst)?;
+        let dst_name = dst.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+        })?;
+        let dst_parent = dst
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let current_parent = open_directory(dst_parent)?;
+        let expected = self.parent.metadata()?;
+        let current = current_parent.metadata()?;
+        if expected.dev() != current.dev() || expected.ino() != current.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "destination parent changed during transfer",
+            ));
+        }
+        atomic_rename_noreplace_at(&self.handle, src_name, &current_parent, dst_name)
     }
 }
 
@@ -2268,12 +2587,10 @@ impl Drop for ExtractionDir {
         let Ok(expected) = self.handle.metadata() else {
             return;
         };
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|current| {
-            current.file_type().is_dir()
-                && current.dev() == expected.dev()
-                && current.ino() == expected.ino()
-        }) {
-            let _ = std::fs::remove_dir_all(&self.path);
+        if entry_identity_at(&self.parent, &self.name)
+            .is_ok_and(|(device, inode)| device == expected.dev() && inode == expected.ino())
+        {
+            let _ = std::fs::remove_dir_all(self.anchored_path());
         }
     }
 }
@@ -2306,6 +2623,7 @@ fn extracted_top_level(staging: &Path, dst: &Path) -> io::Result<PathBuf> {
 }
 
 /// 部分文件通过原子 no-replace rename 就位；失败由调用方清理 temp。
+#[cfg(test)]
 fn finalize_part(temp: &Path, dst: &Path) -> io::Result<()> {
     rename_noreplace(temp, dst)
 }
@@ -2539,7 +2857,7 @@ fn download_file(
         control,
     )
     .and_then(probe_output_empty)
-    .and_then(|()| finalize_part(temp.path(), dst))
+    .and_then(|()| temp.publish(dst))
 }
 
 /// 下载目录核心：远端 tar 流 → 本地临时 tar 文件（限额）→ 本地解包。
@@ -2563,18 +2881,41 @@ fn download_dir(
     )
     .and_then(probe_output_empty);
     downloaded.and_then(|()| {
-        let staging = ExtractionDir::beside(dst)?;
+        let staging = ExtractionDir::beside_parent(dst, temp.parent())?;
+        let temp_path = temp.anchored_path();
+        let staging_path = staging.anchored_path();
         let argv = vec![
             "tar".to_string(),
             "xf".to_string(),
-            path_str(temp.path())?.to_string(),
+            path_str(&temp_path)?.to_string(),
             "-C".to_string(),
-            path_str(staging.path())?.to_string(),
+            path_str(&staging_path)?.to_string(),
         ];
-        run_capture_with_cancel(&argv, &[], TRANSFER_TIMEOUT, MAX_SMALL_OUTPUT, cancel)
-            .and_then(local_status)?;
-        let extracted = extracted_top_level(staging.path(), dst)?;
-        rename_noreplace(&extracted, dst)
+        #[cfg(unix)]
+        let inherited_fds = {
+            use std::os::fd::AsRawFd;
+
+            [temp.parent.as_raw_fd(), staging.parent.as_raw_fd()]
+        };
+        #[cfg(not(unix))]
+        let inherited_fds = [];
+        run_capture_with_cancel_inheriting(
+            &argv,
+            &[],
+            TRANSFER_TIMEOUT,
+            MAX_SMALL_OUTPUT,
+            cancel,
+            &inherited_fds,
+        )
+        .and_then(local_status)?;
+        let extracted = extracted_top_level(&staging_path, dst)?;
+        let extracted_name = extracted.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extracted entry has no file name",
+            )
+        })?;
+        staging.publish(extracted_name, dst)
     })
 }
 
@@ -4844,6 +5185,62 @@ docker = true
     }
 
     #[test]
+    fn file_download_refuses_a_replaced_destination_parent() {
+        let root = TestDir::new();
+        let parent = root.join("parent");
+        let moved_parent = root.join("moved-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let dst = parent.join("download.bin");
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"
+set -eu
+parent=$1
+moved=$2
+stage=
+for candidate in "$parent"/.ember-fs-part-*; do
+    if [ -f "$candidate" ]; then stage=${candidate##*/}; break; fi
+done
+[ -n "$stage" ]
+mv "$parent" "$moved"
+mkdir "$parent"
+printf attacker > "$parent/$stage"
+printf genuine
+"#
+            .to_string(),
+            "--".to_string(),
+            parent.to_str().unwrap().to_string(),
+            moved_parent.to_str().unwrap().to_string(),
+        ];
+
+        let error = download_file(
+            &producer,
+            &dst,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .expect_err("publication must reject a replaced destination parent");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!dst.exists(), "a lookalike staging file was published");
+        let replacement_entries: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(replacement_entries.len(), 1, "replacement remains intact");
+        assert_eq!(
+            std::fs::read(parent.join(&replacement_entries[0])).unwrap(),
+            b"attacker"
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved_parent).unwrap().count(),
+            0,
+            "the transfer cleans its staging inode through the pinned parent"
+        );
+    }
+
+    #[test]
     fn run_stream_from_file_prechecks_size_before_spawning() {
         let dir = TestDir::new();
         let big = dir.join("big.bin");
@@ -5015,6 +5412,94 @@ docker = true
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, [std::ffi::OsString::from("tree")]);
+    }
+
+    #[test]
+    fn directory_download_refuses_a_replaced_destination_parent() {
+        let remote = TestDir::new();
+        let genuine_root = remote.join("genuine");
+        let attacker_root = remote.join("attacker");
+        let genuine_tree = genuine_root.join("tree");
+        let attacker_tree = attacker_root.join("tree");
+        std::fs::create_dir_all(&genuine_tree).unwrap();
+        std::fs::create_dir_all(&attacker_tree).unwrap();
+        std::fs::write(genuine_tree.join("marker"), b"genuine").unwrap();
+        std::fs::write(attacker_tree.join("marker"), b"attacker").unwrap();
+
+        let archive = |source: &Path| {
+            run_capture(
+                &sh_s_argv_locally("tar", &[source.to_str().unwrap()]),
+                PROBE_SCRIPT.as_bytes(),
+                Duration::from_secs(5),
+                MAX_LIST_OUTPUT,
+            )
+            .unwrap()
+            .stdout
+        };
+        let genuine_tar = remote.join("genuine.tar");
+        let attacker_tar = remote.join("attacker.tar");
+        std::fs::write(&genuine_tar, archive(&genuine_tree)).unwrap();
+        std::fs::write(&attacker_tar, archive(&attacker_tree)).unwrap();
+
+        let local = TestDir::new();
+        let parent = local.join("parent");
+        let moved_parent = local.join("moved-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let dst = parent.join("tree");
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"
+set -eu
+parent=$1
+moved=$2
+attacker=$3
+genuine=$4
+stage=
+for candidate in "$parent"/.ember-fs-part-*; do
+    if [ -f "$candidate" ]; then stage=${candidate##*/}; break; fi
+done
+[ -n "$stage" ]
+mv "$parent" "$moved"
+mkdir "$parent"
+cp "$attacker" "$parent/$stage"
+cat "$genuine"
+"#
+            .to_string(),
+            "--".to_string(),
+            parent.to_str().unwrap().to_string(),
+            moved_parent.to_str().unwrap().to_string(),
+            attacker_tar.to_str().unwrap().to_string(),
+            genuine_tar.to_str().unwrap().to_string(),
+        ];
+
+        let error = download_dir(
+            &producer,
+            &dst,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .expect_err("publication must reject a replaced destination parent");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            !dst.exists(),
+            "archive content reached a replacement parent"
+        );
+        let replacement_entries: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(replacement_entries.len(), 1, "replacement remains intact");
+        assert_eq!(
+            std::fs::read(&replacement_entries[0]).unwrap(),
+            std::fs::read(&attacker_tar).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved_parent).unwrap().count(),
+            0,
+            "the transfer cleans only its entries through the pinned parent"
+        );
     }
 
     #[test]
