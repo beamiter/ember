@@ -1991,13 +1991,20 @@ impl Drop for StagedFile {
 
 /// Private same-parent extraction root for one downloaded directory. Tar never
 /// writes into the final namespace; Drop removes only this process-owned tree.
-struct ExtractionDir(PathBuf);
+struct ExtractionDir {
+    path: PathBuf,
+    handle: std::fs::File,
+}
 
 impl ExtractionDir {
     fn beside(dst: &Path) -> io::Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self::beside_with(dst, || NEXT.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn beside_with(dst: &Path, mut next: impl FnMut() -> usize) -> io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
         let parent = dst
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -2006,7 +2013,7 @@ impl ExtractionDir {
             let path = parent.join(format!(
                 ".ember-fs-extract-{}-{}",
                 std::process::id(),
-                NEXT.fetch_add(1, Ordering::SeqCst)
+                next()
             ));
             if path.file_name() == dst.file_name() {
                 continue;
@@ -2014,7 +2021,20 @@ impl ExtractionDir {
             let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
             match builder.create(&path) {
-                Ok(()) => return Ok(Self(path)),
+                Ok(()) => {
+                    let handle = match std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&path)
+                    {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            let _ = std::fs::remove_dir(&path);
+                            return Err(error);
+                        }
+                    };
+                    return Ok(Self { path, handle });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -2026,13 +2046,24 @@ impl ExtractionDir {
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for ExtractionDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(expected) = self.handle.metadata() else {
+            return;
+        };
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|current| {
+            current.file_type().is_dir()
+                && current.dev() == expected.dev()
+                && current.ino() == expected.ino()
+        }) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -4058,6 +4089,50 @@ docker = true
             std::fs::read_dir(local.path()).unwrap().count(),
             1,
             "fixed-size staging names leave no litter"
+        );
+    }
+
+    #[test]
+    fn extraction_staging_is_private_collision_safe_and_identity_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new();
+        let dst = local.join("tree");
+        let pid = std::process::id();
+        let victim = local.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let planted = local.path().join(format!(".ember-fs-extract-{pid}-11"));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let mut sequence = [11, 12].into_iter();
+        let staging =
+            ExtractionDir::beside_with(&dst, || sequence.next().expect("one retry is enough"))
+                .unwrap();
+        assert_eq!(
+            std::fs::metadata(staging.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "archive extraction must remain owner-only"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        drop(staging);
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let staging = ExtractionDir::beside(&dst).unwrap();
+        let replaced_path = staging.path().to_path_buf();
+        std::fs::remove_dir(&replaced_path).unwrap();
+        std::fs::create_dir(&replaced_path).unwrap();
+        std::fs::write(replaced_path.join("replacement"), b"survive").unwrap();
+        drop(staging);
+        assert_eq!(
+            std::fs::read(replaced_path.join("replacement")).unwrap(),
+            b"survive",
+            "inode-bound cleanup must preserve a replacement directory"
         );
     }
 

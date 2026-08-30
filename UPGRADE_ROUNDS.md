@@ -409,3 +409,11 @@ Exclusive relay scratch adds round 80 (2026-08-30):
     the destination upload. The relay no longer derives and unconditionally
     removes a guessed `/tmp/ember-fs-relay-*` path before opening it; occupied
     candidates are skipped and RAII removes only the inode actually reserved.
+
+Identity-bound extraction cleanup adds round 81 (2026-08-30):
+
+81. **Pin the private extraction inode** — every directory-download staging
+    root now retains an `O_DIRECTORY|O_NOFOLLOW` descriptor. Drop compares its
+    device and inode with the current path before recursive removal, so a path
+    moved away and replaced during extraction cannot redirect cleanup into the
+    replacement tree; collision retry and mode-0700 isolation remain intact.
