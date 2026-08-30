@@ -2299,6 +2299,7 @@ impl TerminalApp {
             history_picker: None,
             workflow_picker: None,
             workflow_args: None,
+            workflow_refusals: Vec::new(),
             force_resize_session: false,
             current_theme,
             tabs,

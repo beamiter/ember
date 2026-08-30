@@ -33,11 +33,11 @@
 //!   offending source line back verbatim, so a workflow file chose the bytes
 //!   that reached whatever tty was tailing ember's log.
 //!
-//! What ember contributed to the union: `O_NOFOLLOW` on the bounded reader
-//! (anvil passed only `O_NONBLOCK | O_CLOEXEC` and followed a planted symlink
-//! out of the workflow directory), and the `dirs`-crate discovery backend,
-//! which is now the core's [`XdgEnvDirs`] and the default for an app with no
-//! GTK dependency.
+//! What ember contributed to the union is the `dirs`-crate discovery backend,
+//! now the core's [`XdgEnvDirs`] and the default for an app with no GTK
+//! dependency. Forge originated the stricter `O_NOFOLLOW` reader; ember had
+//! already adopted it before the union, while anvil still followed a planted
+//! symlink out of the workflow directory.
 //!
 //! `welcome_notebook_path` is still not ported: ember has no notebook surface,
 //! and the core deliberately left that lookup in the two apps that have one.
@@ -47,9 +47,13 @@
 //! caps keep the worst case small. The core exports anvil's `RefreshLatch` for
 //! the toolkit that needs it; ember does not.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use jterm_core::workflows::{search_path, DirSources as _, SearchPathSpec, XdgEnvDirs};
+use jterm_core::workflows::{
+    load_one, search_path, workflow_files_in, DirSources as _, SearchPathSpec, XdgEnvDirs,
+    MAX_WORKFLOW_DIRECTORIES,
+};
 
 pub use jterm_core::workflows::{render, ArgsForm, LoadOrder, Workflow, WorkflowArg};
 
@@ -125,6 +129,51 @@ pub fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
     jterm_core::workflows::load_all(dirs, LOAD_ORDER)
 }
 
+/// One completed picker refresh: accepted entries plus bounded refusal details.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryScan {
+    pub workflows: Vec<Workflow>,
+    pub refused: Vec<(PathBuf, String)>,
+}
+
+/// Load the picker library and identify workflow-looking files the shared
+/// loader rejected. Healthy files are not opened twice.
+pub fn scan(dirs: &[PathBuf]) -> LibraryScan {
+    let workflows = load_all(dirs);
+    let refused = refused_files(dirs, &workflows);
+    LibraryScan { workflows, refused }
+}
+
+/// Keep UI diagnostics bounded independently from the library's much larger
+/// admitted-workflow budget. One example is enough for the toast; retaining a
+/// small set lets the app suppress repeats and notice which refusal changed.
+const MAX_REFUSALS_REPORTED: usize = 64;
+
+fn refused_files(dirs: &[PathBuf], loaded: &[Workflow]) -> Vec<(PathBuf, String)> {
+    let accepted: HashSet<&Path> = loaded
+        .iter()
+        .filter_map(|workflow| workflow.source_path.as_deref())
+        .collect();
+    let mut refused = Vec::new();
+    for dir in dirs.iter().take(MAX_WORKFLOW_DIRECTORIES) {
+        if !dir.is_dir() {
+            continue;
+        }
+        for path in workflow_files_in(dir) {
+            if accepted.contains(path.as_path()) {
+                continue;
+            }
+            if let Err(reason) = load_one(&path) {
+                refused.push((path, reason));
+                if refused.len() >= MAX_REFUSALS_REPORTED {
+                    return refused;
+                }
+            }
+        }
+    }
+    refused
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +214,24 @@ mod tests {
             .map(|workflow| workflow.name)
             .collect();
         assert_eq!(names, ["Alpha", "Zeta"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_keeps_healthy_entries_and_reports_the_broken_candidate() {
+        let dir = tempdir();
+        let good = dir.join("good.yaml");
+        let broken = dir.join("broken.toml");
+        std::fs::write(&good, "name: Healthy\ncommand: echo ok\n").unwrap();
+        std::fs::write(&broken, "name = \"Broken\"\ncommand = [\n").unwrap();
+
+        let scan = scan(std::slice::from_ref(&dir));
+        assert_eq!(scan.workflows.len(), 1);
+        assert_eq!(scan.workflows[0].name, "Healthy");
+        assert_eq!(scan.refused.len(), 1);
+        assert_eq!(scan.refused[0].0, broken);
+        assert!(scan.refused[0].1.starts_with("parse TOML:"));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

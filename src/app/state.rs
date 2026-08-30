@@ -290,6 +290,10 @@ pub struct TerminalApp {
     /// 工作流参数填写对话框。只与 `workflow_picker` 同时存在；提交成功后两者
     /// 一起关闭。
     pub workflow_args: Option<crate::workflow_picker::WorkflowArgsState>,
+    /// Paths refused by the last workflow scan. The picker refreshes on every
+    /// open, but an unchanged broken file should not raise the same toast each
+    /// time; a newly broken or fixed path changes this snapshot.
+    pub workflow_refusals: Vec<std::path::PathBuf>,
 
     // Force resize flag for new sessions
     pub force_resize_session: bool,

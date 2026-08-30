@@ -715,10 +715,12 @@ precedence order, from:
 Workflow *names* are unique across the whole path and the first occurrence
 wins, so a file in `~/.config/ember/workflows` shadows an installed example of
 the same name. The picker lists the library alphabetically by name. A file that
-does not parse is skipped and logged with its path and the reason: one broken
-file never hides the rest, and it never disappears from the palette without a
-trace either. Each file is opened with `O_NOFOLLOW` and read under a size cap,
-so a symlinked or oversized workflow file is refused rather than followed.
+does not parse is skipped without hiding the rest; Ember logs its path and
+reason and shows a bounded one-line toast naming the first rejected file. The
+toast repeats only when the set of rejected paths changes, so reopening the
+picker does not nag while fixing or newly breaking a file remains visible. Each
+file is opened with `O_NOFOLLOW` and read under a size cap, so a symlinked or
+oversized workflow file is refused rather than followed.
 
 ```yaml
 name: "Kill process on port"

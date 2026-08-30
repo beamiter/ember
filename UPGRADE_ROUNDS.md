@@ -316,3 +316,14 @@ moved to the core, and the picker's from 6 to 8. `scripts/` is otherwise
 untouched by this pass; `scripts/workflows/docker-tail-logs.yaml` is the one
 data file it changes (round 61), and no GUI session was run — the dialog changes
 are covered at the state layer only.
+
+Workflow observability adds round 70 (2026-08-30):
+
+70. **A refused file is visible without a log terminal** — the picker refresh
+    now carries a bounded list of workflow-looking files the shared loader
+    rejected and raises a one-line status toast when that path set changes.
+    Paths and parser reasons are attacker-controlled display text, so both are
+    escaped and capped before egui receives them. Reopening over the same broken
+    set is silent; fixing it clears the snapshot so a later regression is
+    announced again. This brings ember's synchronous picker to the refusal UX
+    anvil already exposes without changing discovery or rendering semantics.

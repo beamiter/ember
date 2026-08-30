@@ -2683,7 +2683,24 @@ impl TerminalApp {
             return;
         }
         let dirs = crate::workflows::workflow_dirs();
-        self.workflow_picker = Some(crate::workflow_picker::WorkflowPickerState::load(&dirs));
+        let scan = crate::workflows::scan(&dirs);
+        self.report_refused_workflows(&scan.refused);
+        self.workflow_picker = Some(crate::workflow_picker::WorkflowPickerState::new(
+            scan.workflows,
+        ));
+    }
+
+    /// Surface loader refusals once per changed path set. `load_all` logs the
+    /// details, but a graphical user may have no log terminal and otherwise
+    /// sees a saved workflow silently disappear from the picker.
+    fn report_refused_workflows(&mut self, refused: &[(std::path::PathBuf, String)]) {
+        if !workflow_refusals_changed(&self.workflow_refusals, refused) {
+            return;
+        }
+        self.workflow_refusals = refused.iter().map(|(path, _)| path.clone()).collect();
+        if let Some(message) = workflow_refusal_toast(refused) {
+            self.set_status_for(message, Duration::from_secs(7));
+        }
     }
 
     /// 选择器确认一个工作流：无参数的直接渲染并回填提示符（绝不执行），有参数
@@ -5080,9 +5097,84 @@ fn combine_command_and_output(command: &str, output: &str) -> String {
     }
 }
 
+fn workflow_refusals_changed(
+    reported: &[std::path::PathBuf],
+    refused: &[(std::path::PathBuf, String)],
+) -> bool {
+    !refused.iter().map(|(path, _)| path).eq(reported.iter())
+}
+
+/// Both fields originate in an untrusted file: its author chooses the path,
+/// and a TOML/YAML parser error may quote source bytes. Keep them one-line and
+/// bounded before the status toast paints them over the terminal.
+fn workflow_refusal_toast(refused: &[(std::path::PathBuf, String)]) -> Option<String> {
+    const FIELD_BYTES: usize = 256;
+    let (path, reason) = refused.first()?;
+    let path = crate::review_text::visible_bounded(&path.to_string_lossy(), FIELD_BYTES);
+    let reason = crate::review_text::visible_bounded(reason, FIELD_BYTES);
+    Some(if refused.len() == 1 {
+        format!("Workflow file skipped — {path}: {reason}")
+    } else {
+        format!(
+            "{} workflow files skipped, including {path}: {reason}",
+            refused.len()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workflow_refusal(path: &str, reason: &str) -> (std::path::PathBuf, String) {
+        (std::path::PathBuf::from(path), reason.to_string())
+    }
+
+    #[test]
+    fn workflow_refusals_are_announced_only_when_the_path_set_changes() {
+        let broken = vec![workflow_refusal("/w/a.yaml", "parse YAML: bad")];
+        assert!(workflow_refusals_changed(&[], &broken));
+
+        let reported = vec![std::path::PathBuf::from("/w/a.yaml")];
+        assert!(!workflow_refusals_changed(&reported, &broken));
+        assert!(!workflow_refusals_changed(
+            &reported,
+            &[workflow_refusal(
+                "/w/a.yaml",
+                "read: Too many levels of symbolic links"
+            )]
+        ));
+        assert!(workflow_refusals_changed(
+            &reported,
+            &[workflow_refusal("/w/b.yaml", "parse YAML: bad")]
+        ));
+        assert!(workflow_refusals_changed(&reported, &[]));
+        assert!(workflow_refusal_toast(&[]).is_none());
+    }
+
+    #[test]
+    fn workflow_refusal_toast_escapes_file_control_bytes_and_is_bounded() {
+        let toast = workflow_refusal_toast(&[workflow_refusal(
+            "/w/\u{1b}]0;PWNED\u{7}.yaml",
+            "parse TOML: line 2\ncommand = \"echo \u{202e}",
+        )])
+        .unwrap();
+        assert!(toast.starts_with("Workflow file skipped — "), "{toast}");
+        assert!(!toast.contains('\u{1b}'), "{toast}");
+        assert!(!toast.contains('\u{7}'), "{toast}");
+        assert!(!toast.contains('\u{202e}'), "{toast}");
+        assert!(!toast.contains('\n'), "{toast}");
+
+        let many = workflow_refusal_toast(&[
+            workflow_refusal("/w/a.yaml", "parse YAML: bad"),
+            workflow_refusal("/w/b.yaml", "read: refused"),
+        ])
+        .unwrap();
+        assert!(
+            many.starts_with("2 workflow files skipped, including /w/a.yaml"),
+            "{many}"
+        );
+    }
 
     #[test]
     fn command_sidebar_uses_the_same_duration_contract_as_block_chrome() {

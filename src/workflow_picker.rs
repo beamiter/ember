@@ -21,7 +21,7 @@
 //! 把 64 个参数名串起来，单行 egui label 不该拿到这种长度。加上错误串是这
 //! 个面上唯一没经过加载期校验的字符串，这一层保留。
 
-use crate::workflows::{self, ArgsForm, Workflow, WorkflowArg};
+use crate::workflows::{ArgsForm, Workflow, WorkflowArg};
 use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
 
 /// 一次渲染/导航的最大结果数。与历史选择器一致：键盘选择与绘制共用
@@ -55,7 +55,7 @@ pub struct WorkflowPickerState {
 
 impl WorkflowPickerState {
     /// 条目按拿到的顺序原样持有。顺序是加载策略的事，只说一次
-    /// （`workflows::LOAD_ORDER`）；旧实现在这里又按名字排了一遍，等于把
+    /// （[`crate::workflows::LOAD_ORDER`]）；旧实现在这里又按名字排了一遍，等于把
     /// 加载顺序悄悄覆盖掉——两处口径一旦不同，用户看到的是这一处。
     pub fn new(entries: Vec<Workflow>) -> Self {
         Self {
@@ -63,11 +63,6 @@ impl WorkflowPickerState {
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             query_buffer: String::new(),
         }
-    }
-
-    /// 从给定目录加载（发现与校验的全部守卫都在 `workflows::load_all`）。
-    pub fn load(dirs: &[std::path::PathBuf]) -> Self {
-        Self::new(workflows::load_all(dirs))
     }
 
     pub fn query(&self) -> &str {
@@ -222,7 +217,7 @@ mod tests {
 
     #[test]
     fn empty_query_keeps_the_order_the_loader_chose() {
-        // 加载顺序是 `workflows::LOAD_ORDER` 的事：选择器不再重排，所以这里
+        // 加载顺序是 `crate::workflows::LOAD_ORDER` 的事：选择器不再重排，所以这里
         // 给的顺序原样出来（真实调用路径上，那个顺序已经是名称序）。
         let state = WorkflowPickerState::new(vec![
             workflow("zeta", "", &[]),

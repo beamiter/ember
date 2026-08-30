@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared workflow engine adoption)
+Updated: 2026-08-30 (visible workflow refusal diagnostics)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,21 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **Rejected workflows are visible in the graphical session (2026-08-30)**:
+  opening the picker now retains a bounded snapshot of candidate files the
+  shared loader refused and raises a status toast when that path set changes.
+  Previously ember only emitted `log::warn!`; a normal desktop launch therefore
+  made a malformed, oversized, non-regular, or symlinked workflow appear to
+  vanish with no visible explanation. The toast names the first file and
+  reason, bounds each untrusted field to 256 bytes, and escapes controls and
+  bidirectional formatting before egui paints it over terminal content. A
+  stable broken set is silent on later opens, while fixing a file clears the
+  remembered set so a future regression is announced again. This matches
+  anvil's refusal UX while preserving ember's synchronous-on-open refresh.
+  The workflow shim's stale claim that ember originated `O_NOFOLLOW` is also
+  corrected: forge originated that reader policy and ember adopted it before
+  the shared-core migration.
 
 - **Shared workflow engine adoption — discovery, parsing, validation and
   rendering leave ember (2026-08-29)**: `src/workflows.rs` drops from 867 lines
