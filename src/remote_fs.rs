@@ -211,6 +211,8 @@ pub struct Capture {
 /// - `list` 的 stdout 是 NUL 分隔的 `<t>\0<name>\0` 对，t ∈ {d, f, l}，相对名。
 /// - v2 新增：`cat` 流式读文件、`put` 流式写新文件（临时名 + mv 原子就位）、
 ///   `tar` 目录打包流。
+/// - 所有创建型操作把悬空符号链接也视为已存在（17）；`test -e` 会漏掉这种
+///   目录项，而 `mkfile` 随后会跟随它写到预期目录之外。
 /// - v3：`untar` 改为 `untar <dir> <name>` —— 解包前先查 `<dir>/<name>` 是否
 ///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
 ///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
@@ -262,13 +264,13 @@ case "$op" in
   mkdir)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    [ -e "$p" ] && exit 17
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     mkdir "$p" || exit 4
     ;;
   mkfile)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    [ -e "$p" ] && exit 17
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     : > "$p" || exit 4
     ;;
   rm)
@@ -280,14 +282,14 @@ case "$op" in
     s=${2:-}; n=${3:-}
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
-    [ -e "$n" ] && exit 17
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     mv "$s" "$n" || exit 4
     ;;
   cp)
     s=${2:-}; n=${3:-}
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
-    [ -e "$n" ] && exit 17
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     cp -a "$s" "$n" || exit 4
     ;;
   cat)
@@ -299,10 +301,10 @@ case "$op" in
   put)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    [ -e "$p" ] && exit 17
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     t="$p.fspart.$$"
     if ! cat > "$t"; then rm -f "$t"; exit 4; fi
-    [ -e "$p" ] && { rm -f "$t"; exit 17; }
+    if [ -e "$p" ] || [ -L "$p" ]; then rm -f "$t"; exit 17; fi
     mv "$t" "$p" || { rm -f "$t"; exit 4; }
     ;;
   tar)
@@ -319,7 +321,7 @@ case "$op" in
     case "$d" in /*) ;; *) exit 2 ;; esac
     case "$n" in ""|*/*) exit 2 ;; esac
     [ -d "$d" ] || exit 3
-    [ -e "$d/$n" ] && exit 17
+    if [ -e "$d/$n" ] || [ -L "$d/$n" ]; then exit 17; fi
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
     tar xf - -C "$d" || exit 4
     ;;
@@ -3238,6 +3240,88 @@ docker = true
     /// 覆盖全部 256 个字节值的二进制样本。
     fn binary_sample() -> Vec<u8> {
         (0..=255u8).cycle().take(4096).collect()
+    }
+
+    #[test]
+    fn probe_creators_refuse_dangling_symlink_targets() {
+        fn assert_refused(capture: &Capture, link: &Path, victim: &Path) {
+            assert_eq!(capture.status, Some(17), "stderr: {:?}", capture.stderr);
+            assert!(
+                !victim.exists(),
+                "probe followed dangling link and created {}",
+                victim.display()
+            );
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("destination link must remain")
+                    .file_type()
+                    .is_symlink(),
+                "probe replaced destination link {}",
+                link.display()
+            );
+        }
+
+        let dir = TestDir::new();
+        let dangling = |name: &str| {
+            let victim = dir.path().join(format!("outside-{name}"));
+            let link = dir.path().join(format!("link-{name}"));
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            let argument = link.to_str().unwrap().to_string();
+            (victim, link, argument)
+        };
+
+        let (victim, link, argument) = dangling("mkdir");
+        assert_refused(&run_probe_locally(&["mkdir", &argument]), &link, &victim);
+
+        let (victim, link, argument) = dangling("mkfile");
+        assert_refused(&run_probe_locally(&["mkfile", &argument]), &link, &victim);
+
+        let move_source = dir.join("move-source");
+        std::fs::write(&move_source, b"move").unwrap();
+        let move_source_arg = move_source.to_str().unwrap().to_string();
+        let (victim, link, argument) = dangling("move");
+        assert_refused(
+            &run_probe_locally(&["mv", &move_source_arg, &argument]),
+            &link,
+            &victim,
+        );
+        assert_eq!(std::fs::read(&move_source).unwrap(), b"move");
+
+        let copy_source = dir.join("copy-source");
+        std::fs::write(&copy_source, b"copy").unwrap();
+        let copy_source_arg = copy_source.to_str().unwrap().to_string();
+        let (victim, link, argument) = dangling("copy");
+        assert_refused(
+            &run_probe_locally(&["cp", &copy_source_arg, &argument]),
+            &link,
+            &victim,
+        );
+        assert_eq!(std::fs::read(&copy_source).unwrap(), b"copy");
+
+        let (victim, link, argument) = dangling("put");
+        let capture = run_capture(
+            &sh_c_argv_locally("put", &[&argument]),
+            b"payload",
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_refused(&capture, &link, &victim);
+
+        let extraction_dir = dir.join("extract");
+        std::fs::create_dir(&extraction_dir).unwrap();
+        let extraction_arg = extraction_dir.to_str().unwrap().to_string();
+        let victim = dir.join("outside-untar");
+        let link = extraction_dir.join("tree");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let capture = run_capture(
+            &sh_c_argv_locally("untar", &[&extraction_arg, "tree"]),
+            b"not consulted when the target is occupied",
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_refused(&capture, &link, &victim);
     }
 
     #[test]

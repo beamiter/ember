@@ -343,3 +343,11 @@ Desktop-install parity with Anvil adds round 72 (2026-08-30):
     `XDG_DATA_HOME` and the explicit `--data-dir` override for launcher,
     AppStream, and icon paths; the same validated runtime base is prepended by
     `DESTDIR`, so packaging metadata never leaks the staging root.
+
+Remote-probe target safety adds round 73 (2026-08-30):
+
+73. **Dangling links still occupy remote names** — every remote creation,
+    rename, copy, upload, and archive-extract probe now treats `-L` as occupied
+    alongside `-e`. A dangling destination link can no longer make `mkfile`
+    create its target outside the directory the user selected, or be silently
+    replaced by another operation that promises no overwrite.
