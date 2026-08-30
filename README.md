@@ -147,6 +147,7 @@ RUST_LOG=ember=debug cargo run
 ```bash
 ./scripts/install.sh              # build, then install binary + launcher entry
 ./scripts/install.sh --binary /path/to/ember  # install a prebuilt binary, skip Cargo
+./scripts/install.sh --data-dir /opt/ember/share  # choose the XDG data base
 ./scripts/install.sh --dry-run    # print every command without changing files
 ./scripts/install.sh --no-desktop # binary only
 ./scripts/uninstall.sh            # remove both; configuration is preserved
@@ -167,7 +168,7 @@ exit before rename clean up that uncommitted temp and retain the previous
 binary. Rename is the binary commit point; a later resource failure does not
 roll it back. This requires GNU coreutils `mktemp`/`mv` in addition to the
 prerequisites above. It composes
-with `--prefix`, `--bin-dir`, `--no-desktop`, and `DESTDIR`.
+with `--prefix`, `--bin-dir`, `--data-dir`, `--no-desktop`, and `DESTDIR`.
 Zero-byte prebuilt files are rejected before the old target changes. Desktop,
 AppStream, SVG, and PNG sources are all preflighted before build/write; public
 assets use mode-correct same-directory temps and atomic rename too. Under a
@@ -180,17 +181,19 @@ guarantee against a component replaced concurrently after the check.
 
 Install and uninstall derive their targets from the same runtime paths: the
 binary defaults to `PREFIX/bin/ember`, and the desktop entry and icons live
-under `PREFIX/share`. Re-running the installer updates the same targets.
-`--bin-dir` overrides only the binary directory; pass the same `--bin-dir`
-when uninstalling later. `DESTDIR` merely prepends a packaging root to these
-absolute runtime paths — the desktop entry's `Exec=` still points at the
-runtime path without `DESTDIR`.
+under `${XDG_DATA_HOME:-PREFIX/share}`. Re-running the installer updates the
+same targets. `--bin-dir` overrides only the binary directory; `--data-dir`
+overrides the shared-data base (and takes precedence over `XDG_DATA_HOME`).
+Pass the same overrides when uninstalling later. `DESTDIR` merely prepends a
+packaging root to these absolute runtime paths — the desktop entry's `Exec=`
+still points at the runtime path without `DESTDIR`.
 Those absolute runtime paths may contain spaces, Unicode and `.` components;
 empty values, control characters, and lexical `..` components are rejected.
 Only the `DESTDIR` spelling is lexically normalized as described above.
 
-This installs into `~/.local` by default (override with `--prefix`/`--bin-dir`,
-and `DESTDIR` for packaging):
+This installs into `~/.local` by default (override with
+`--prefix`/`--bin-dir`/`--data-dir`, `XDG_DATA_HOME`, and `DESTDIR` for
+packaging):
 
 | File | Path |
 | --- | --- |

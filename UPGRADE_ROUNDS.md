@@ -336,3 +336,10 @@ Toolchain gate maintenance adds round 71 (2026-08-30):
     `!is_some_and` predicate, but avoids the new `nonminimal_bool` warning that
     made the repository's `-D warnings` release check fail before reaching this
     round's code.
+
+Desktop-install parity with Anvil adds round 72 (2026-08-30):
+
+72. **XDG data-directory symmetry** — install and uninstall now honor
+    `XDG_DATA_HOME` and the explicit `--data-dir` override for launcher,
+    AppStream, and icon paths; the same validated runtime base is prepended by
+    `DESTDIR`, so packaging metadata never leaks the staging root.

@@ -12,6 +12,7 @@ if [[ -n "${DESTDIR}" ]]; then
 fi
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
+DATA_HOME=""
 DRY_RUN=0
 
 usage() {
@@ -21,11 +22,13 @@ Usage: ./scripts/uninstall.sh [options]
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
   --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
+  --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 
 Environment:
   DESTDIR                Optional staging root for packaging
+  XDG_DATA_HOME          Shared-data base (default: PREFIX/share)
 USAGE
 }
 
@@ -146,6 +149,17 @@ while (($# > 0)); do
             [[ -n "${BIN_DIR}" ]] || die "--bin-dir must not be empty"
             shift
             ;;
+        --data-dir)
+            (($# >= 2)) || die "--data-dir requires a path"
+            DATA_HOME="$2"
+            [[ -n "${DATA_HOME}" ]] || die "--data-dir must not be empty"
+            shift 2
+            ;;
+        --data-dir=*)
+            DATA_HOME="${1#*=}"
+            [[ -n "${DATA_HOME}" ]] || die "--data-dir must not be empty"
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -170,6 +184,10 @@ if [[ -z "${BIN_DIR}" ]]; then
     BIN_DIR="${PREFIX}/bin"
 fi
 validate_absolute_path "--bin-dir" "${BIN_DIR}"
+if [[ -z "${DATA_HOME}" ]]; then
+    DATA_HOME="${XDG_DATA_HOME:-${PREFIX}/share}"
+fi
+validate_absolute_path "--data-dir/XDG_DATA_HOME" "${DATA_HOME}"
 if ((DESTDIR_ACTIVE == 1)); then
     validate_absolute_path "DESTDIR" "${DESTDIR}"
     DESTDIR="$(normalize_absolute_path "${DESTDIR}")"
@@ -179,7 +197,7 @@ if ((DESTDIR_ACTIVE == 1)); then
     fi
 fi
 
-SHARE_DIR="${DESTDIR}${PREFIX}/share"
+SHARE_DIR="${DESTDIR}${DATA_HOME}"
 remove_file "${DESTDIR}${BIN_DIR}/ember"
 remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
 remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"

@@ -11,6 +11,10 @@ UNINSTALLER="${SCRIPT_DIR}/uninstall.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ember-install-paths.XXXXXX")"
 TEST_HOME="${TEST_ROOT}/home"
 TEST_PATH="/usr/bin:/bin"
+APP_ID="io.github.beamiter.ember"
+
+# Keep default-path assertions independent of the caller's desktop session.
+export XDG_DATA_HOME=
 
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT
 mkdir -p "${TEST_HOME}"
@@ -19,14 +23,14 @@ install_dry_run() {
     local destdir="$1"
     shift
     env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${destdir}" \
-        CARGO_TARGET_DIR= "${INSTALLER}" --dry-run "$@"
+        CARGO_TARGET_DIR= XDG_DATA_HOME= "${INSTALLER}" --dry-run "$@"
 }
 
 uninstall_dry_run() {
     local destdir="$1"
     shift
     env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${destdir}" \
-        "${UNINSTALLER}" --dry-run "$@"
+        XDG_DATA_HOME= "${UNINSTALLER}" --dry-run "$@"
 }
 
 assert_contains() {
@@ -107,6 +111,33 @@ assert_install_uninstall_pair \
     "combined overrides" "${combined_bin}/ember" \
     --prefix="${combined_prefix}" --bin-dir "${combined_bin}"
 
+custom_data="${TEST_ROOT}/custom-data"
+custom_data_install="$(install_dry_run "" --data-dir "${custom_data}")"
+assert_contains "explicit data dir install" "${custom_data_install}" \
+    "${custom_data}/applications/${APP_ID}.desktop"
+mkdir -p "${custom_data}/applications"
+touch "${custom_data}/applications/${APP_ID}.desktop"
+custom_data_uninstall="$(uninstall_dry_run "" --data-dir "${custom_data}")"
+assert_contains "explicit data dir uninstall" "${custom_data_uninstall}" \
+    "${custom_data}/applications/${APP_ID}.desktop"
+
+xdg_data="${TEST_ROOT}/xdg-data"
+xdg_data_install="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        CARGO_TARGET_DIR= XDG_DATA_HOME="${xdg_data}" \
+        "${INSTALLER}" --dry-run
+)"
+assert_contains "XDG data dir install" "${xdg_data_install}" \
+    "${xdg_data}/applications/${APP_ID}.desktop"
+mkdir -p "${xdg_data}/applications"
+touch "${xdg_data}/applications/${APP_ID}.desktop"
+xdg_data_uninstall="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_DATA_HOME="${xdg_data}" "${UNINSTALLER}" --dry-run
+)"
+assert_contains "XDG data dir uninstall" "${xdg_data_uninstall}" \
+    "${xdg_data}/applications/${APP_ID}.desktop"
+
 # DESTDIR changes only where files are staged. The launcher must retain the
 # runtime path, and uninstall must prepend the same staging root.
 stage_root="${TEST_ROOT}/stage"
@@ -152,8 +183,7 @@ prebuilt_binary="${prebuilt_dir}/ember"
 roundtrip_stage="${TEST_ROOT}/roundtrip-stage"
 roundtrip_prefix='/opt/ember release \dir $'
 roundtrip_bin="${roundtrip_prefix}/bin"
-roundtrip_share="${roundtrip_prefix}/share"
-app_id="io.github.beamiter.ember"
+roundtrip_share='/opt/ember data \dir $'
 mkdir -p "${prebuilt_dir}"
 printf '#!/bin/sh\nprintf "ember release fixture\\n"\n' >"${prebuilt_binary}"
 chmod 0600 "${prebuilt_binary}"
@@ -161,6 +191,7 @@ chmod 0600 "${prebuilt_binary}"
 roundtrip_install="$(
     env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
         "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${roundtrip_prefix}" \
+        --data-dir "${roundtrip_share}" \
         2>&1
 )"
 assert_contains "prebuilt install selects fixture" "${roundtrip_install}" \
@@ -169,11 +200,11 @@ assert_contains "prebuilt install skips staged cache refresh" "${roundtrip_insta
     "Staged install (DESTDIR set); skipping desktop cache refresh."
 
 installed_binary="${roundtrip_stage}${roundtrip_bin}/ember"
-installed_desktop="${roundtrip_stage}${roundtrip_share}/applications/${app_id}.desktop"
-installed_metainfo="${roundtrip_stage}${roundtrip_share}/metainfo/${app_id}.metainfo.xml"
-installed_svg="${roundtrip_stage}${roundtrip_share}/icons/hicolor/scalable/apps/${app_id}.svg"
-installed_png_128="${roundtrip_stage}${roundtrip_share}/icons/hicolor/128x128/apps/${app_id}.png"
-installed_png_256="${roundtrip_stage}${roundtrip_share}/icons/hicolor/256x256/apps/${app_id}.png"
+installed_desktop="${roundtrip_stage}${roundtrip_share}/applications/${APP_ID}.desktop"
+installed_metainfo="${roundtrip_stage}${roundtrip_share}/metainfo/${APP_ID}.metainfo.xml"
+installed_svg="${roundtrip_stage}${roundtrip_share}/icons/hicolor/scalable/apps/${APP_ID}.svg"
+installed_png_128="${roundtrip_stage}${roundtrip_share}/icons/hicolor/128x128/apps/${APP_ID}.png"
+installed_png_256="${roundtrip_stage}${roundtrip_share}/icons/hicolor/256x256/apps/${APP_ID}.png"
 
 for installed_file in \
     "${installed_binary}" \
@@ -210,7 +241,8 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
 fi
 
 env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
-    "${UNINSTALLER}" --prefix "${roundtrip_prefix}" >/dev/null
+    "${UNINSTALLER}" --prefix "${roundtrip_prefix}" \
+    --data-dir "${roundtrip_share}" >/dev/null
 for removed_file in \
     "${installed_binary}" \
     "${installed_desktop}" \
@@ -240,7 +272,7 @@ cmp -- "${prebuilt_binary}" "${installed_binary}" \
     || fail "atomically replaced binary differs from its source"
 shopt -s nullglob
 binary_temps=("${installed_binary}.install."*)
-desktop_temps=("${roundtrip_stage}${roundtrip_share}/applications/.${app_id}.desktop.install."*)
+desktop_temps=("${roundtrip_stage}${roundtrip_share}/applications/.${APP_ID}.desktop.install."*)
 shopt -u nullglob
 (( ${#binary_temps[@]} == 0 )) || fail "binary install left temporary files"
 (( ${#desktop_temps[@]} == 0 )) || fail "desktop install left temporary files"
@@ -283,7 +315,7 @@ assert_contains "staging ancestor diagnostic" "$(<"${TEST_ROOT}/ancestor.log")" 
 resource_stage="${TEST_ROOT}/resource-stage"
 resource_prefix="/opt/ember-resource"
 resource_victim="${TEST_ROOT}/resource-victim"
-resource_metainfo="${resource_stage}${resource_prefix}/share/metainfo/${app_id}.metainfo.xml"
+resource_metainfo="${resource_stage}${resource_prefix}/share/metainfo/${APP_ID}.metainfo.xml"
 printf 'resource victim\n' >"${resource_victim}"
 mkdir -p "$(dirname -- "${resource_metainfo}")"
 ln -s -- "${resource_victim}" "${resource_metainfo}"
@@ -410,11 +442,14 @@ assert_contains "DESTDIR parent diagnostic" "$(<"${TEST_ROOT}/bad-destdir.log")"
     "DESTDIR must not contain '..' path components"
 
 for command in install_dry_run uninstall_dry_run; do
-    if "${command}" "" --bin-dir= >"${TEST_ROOT}/empty-bin.log" 2>&1; then
-        fail "${command} accepted an empty --bin-dir"
-    fi
-    assert_contains "empty bin diagnostic" "$(<"${TEST_ROOT}/empty-bin.log")" \
-        "--bin-dir must not be empty"
+    for option in --bin-dir= --data-dir=; do
+        if "${command}" "" "${option}" >"${TEST_ROOT}/empty-option.log" 2>&1; then
+            fail "${command} accepted an empty ${option}"
+        fi
+        assert_contains "empty option diagnostic" \
+            "$(<"${TEST_ROOT}/empty-option.log")" \
+            "${option%=} must not be empty"
+    done
 done
 
 # `/` is a meaningful, explicitly supplied staging root even though removing

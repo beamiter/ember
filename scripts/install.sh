@@ -15,6 +15,7 @@ if [[ -n "${DESTDIR}" ]]; then
 fi
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
+DATA_HOME=""
 PREBUILT_BINARY=""
 PREBUILT_FD=""
 INSTALL_DESKTOP=1
@@ -28,6 +29,7 @@ Usage: ./scripts/install.sh [options]
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
   --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
+  --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
   --binary PATH          Install a prebuilt ember binary instead of building
   --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
@@ -35,6 +37,7 @@ Options:
 
 Environment:
   DESTDIR                Optional staging root for packaging
+  XDG_DATA_HOME          Shared-data base (default: PREFIX/share)
   CARGO_TARGET_DIR       Cargo target directory when building (default: <repo>/target)
 USAGE
 }
@@ -415,6 +418,17 @@ while (($# > 0)); do
             [[ -n "${BIN_DIR}" ]] || die "--bin-dir must not be empty"
             shift
             ;;
+        --data-dir)
+            (($# >= 2)) || die "--data-dir requires a path"
+            DATA_HOME="$2"
+            [[ -n "${DATA_HOME}" ]] || die "--data-dir must not be empty"
+            shift 2
+            ;;
+        --data-dir=*)
+            DATA_HOME="${1#*=}"
+            [[ -n "${DATA_HOME}" ]] || die "--data-dir must not be empty"
+            shift
+            ;;
         --binary)
             (($# >= 2)) || die "--binary requires a path"
             PREBUILT_BINARY="$2"
@@ -454,6 +468,10 @@ if [[ -z "${BIN_DIR}" ]]; then
     BIN_DIR="${PREFIX}/bin"
 fi
 validate_absolute_path "--bin-dir" "${BIN_DIR}"
+if [[ -z "${DATA_HOME}" ]]; then
+    DATA_HOME="${XDG_DATA_HOME:-${PREFIX}/share}"
+fi
+validate_absolute_path "--data-dir/XDG_DATA_HOME" "${DATA_HOME}"
 if ((DESTDIR_ACTIVE == 1)); then
     validate_absolute_path "DESTDIR" "${DESTDIR}"
     DESTDIR="$(normalize_absolute_path "${DESTDIR}")"
@@ -464,7 +482,7 @@ if ((DESTDIR_ACTIVE == 1)); then
 fi
 
 validate_staging_target "${DESTDIR}${BIN_DIR}"
-validate_staging_target "${DESTDIR}${PREFIX}/share"
+validate_staging_target "${DESTDIR}${DATA_HOME}"
 if ((INSTALL_DESKTOP == 1)); then
     require_source_file "${REPO_ROOT}/data/${APP_ID}.desktop"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.metainfo.xml"
@@ -516,7 +534,7 @@ if [[ -n "${PREBUILT_FD}" ]]; then
     exec {PREBUILT_FD}<&-
 fi
 
-SHARE_DIR="${DESTDIR}${PREFIX}/share"
+SHARE_DIR="${DESTDIR}${DATA_HOME}"
 if ((INSTALL_DESKTOP == 1)); then
     install_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
         "${SHARE_DIR}/applications/${APP_ID}.desktop"
@@ -536,7 +554,7 @@ fi
 
 printf 'Installed ember to %s\n' "${BIN_DIR}/ember"
 if ((INSTALL_DESKTOP == 1)); then
-    printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
+    printf 'Installed desktop integration under %s\n' "${DATA_HOME}"
     printf 'Launcher entry: %s (Exec=%s)\n' \
         "${SHARE_DIR}/applications/${APP_ID}.desktop" "$(desktop_exec_path)"
 fi
