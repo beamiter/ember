@@ -1924,6 +1924,77 @@ fn relay_temp_path(is_dir: bool) -> PathBuf {
     ))
 }
 
+/// Private same-parent extraction root for one downloaded directory. Tar never
+/// writes into the final namespace; Drop removes only this process-owned tree.
+struct ExtractionDir(PathBuf);
+
+impl ExtractionDir {
+    fn beside(dst: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let parent = dst
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for _ in 0..32 {
+            let path = parent.join(format!(
+                ".ember-fs-extract-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private directory extraction path",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ExtractionDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn extracted_top_level(staging: &Path, dst: &Path) -> io::Result<PathBuf> {
+    let expected_name = dst.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+    })?;
+    let mut entries = std::fs::read_dir(staging)?;
+    let entry = entries.next().transpose()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory archive extracted no top-level entry",
+        )
+    })?;
+    if entry.file_name() != expected_name || entries.next().transpose()?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory archive has an unexpected top-level shape",
+        ));
+    }
+    let path = entry.path();
+    if !std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory archive top-level entry is not a directory",
+        ));
+    }
+    Ok(path)
+}
+
 /// 部分文件通过原子 no-replace rename 就位；失败由调用方清理 temp。
 fn finalize_part(temp: &Path, dst: &Path) -> io::Result<()> {
     rename_noreplace(temp, dst)
@@ -2189,24 +2260,20 @@ fn download_dir(
     )
     .and_then(probe_output_empty);
     let outcome = downloaded.and_then(|()| {
-        let parent = dst.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "dst has no parent directory")
-        })?;
+        let staging = ExtractionDir::beside(dst)?;
         let argv = vec![
             "tar".to_string(),
             "xf".to_string(),
             path_str(&temp)?.to_string(),
             "-C".to_string(),
-            path_str(parent)?.to_string(),
+            path_str(staging.path())?.to_string(),
         ];
         run_capture_with_cancel(&argv, &[], TRANSFER_TIMEOUT, MAX_SMALL_OUTPUT, cancel)
-            .and_then(local_status)
+            .and_then(local_status)?;
+        let extracted = extracted_top_level(staging.path(), dst)?;
+        rename_noreplace(&extracted, dst)
     });
     let _ = std::fs::remove_file(&temp);
-    if outcome.is_err() && dst.exists() {
-        // 解包失败：开传前已确认 dst 不存在，这个解了一半的目录是我们的，清掉。
-        let _ = std::fs::remove_dir_all(dst);
-    }
     outcome
 }
 
@@ -3835,6 +3902,69 @@ docker = true
     }
 
     #[test]
+    fn directory_download_publishes_once_and_preserves_a_racing_destination() {
+        let remote = TestDir::new();
+        let source = remote.join("tree");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("downloaded.txt"), b"downloaded").unwrap();
+        let source_arg = source.to_str().unwrap().to_string();
+
+        let local = TestDir::new();
+        let dst = local.join("tree");
+        download_dir(
+            &sh_s_argv_locally("tar", &[&source_arg]),
+            &dst,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("downloaded.txt")).unwrap(),
+            b"downloaded"
+        );
+        std::fs::remove_dir_all(&dst).unwrap();
+
+        let tar_bytes = run_capture(
+            &sh_s_argv_locally("tar", &[&source_arg]),
+            PROBE_SCRIPT.as_bytes(),
+            Duration::from_secs(5),
+            MAX_LIST_OUTPUT,
+        )
+        .unwrap()
+        .stdout;
+        let tar_file = remote.join("tree.tar");
+        std::fs::write(&tar_file, tar_bytes).unwrap();
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "mkdir \"$1\" && printf keep > \"$1/marker\" && cat \"$2\"".to_string(),
+            "--".to_string(),
+            dst.to_str().unwrap().to_string(),
+            tar_file.to_str().unwrap().to_string(),
+        ];
+
+        let error = download_dir(
+            &producer,
+            &dst,
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .expect_err("the destination created during streaming must win");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"keep");
+        assert!(
+            !dst.join("downloaded.txt").exists(),
+            "archive content merged into the racing destination"
+        );
+        let entries: Vec<_> = std::fs::read_dir(local.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from("tree")]);
+    }
+
+    #[test]
     fn finalize_part_rechecks_existence_before_the_atomic_rename() {
         let dir = TestDir::new();
         let temp = dir.join(".name.fspart-test");
@@ -3877,6 +4007,16 @@ docker = true
             TransferControl::default(),
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&relay_temp).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "publishing must preserve the private staging mode"
+            );
+        }
         let dst_arg = final_path.to_str().unwrap().to_string();
         upload_file(
             &sh_c_argv_locally("put", &[&dst_arg]),

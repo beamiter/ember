@@ -380,4 +380,13 @@ Exclusive transfer staging adds round 77 (2026-08-30):
     owner-only `create_new` before its producer process starts. A preplanted
     hidden symlink is rejected rather than followed and cannot truncate its
     target; failure to reserve the name also cannot leave an unobserved child
-    process behind, and a permissive umask cannot expose partial content.
+    process behind, a permissive umask cannot expose partial content, and the
+    published regular file retains mode 0600.
+
+Transactional directory downloads add round 78 (2026-08-30):
+
+78. **Extract privately, publish once** — downloaded tar streams now unpack in
+    a fresh mode-0700 same-parent directory, require exactly one matching
+    directory root, and commit it with `RENAME_NOREPLACE`. A destination that
+    appears during the stream is neither merged with archive content nor
+    recursively removed by error cleanup; only private staging is cleaned.
