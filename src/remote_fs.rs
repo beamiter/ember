@@ -206,7 +206,7 @@ pub struct Capture {
     pub cancelled: bool,
 }
 
-/// 远端探针脚本协议 v6。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
+/// 远端探针脚本协议 v7。默认经 stdin 传给远端的 `sh -s -- <op> [args...]`；
 /// put/untar 例外，走 `sh -c` 内联脚本（stdin 整个留给上传载荷）：
 /// - `list` 的 stdout 是 NUL 分隔的 `<t>\0<name>\0` 对，t ∈ {d, f, l}，相对名。
 /// - v2 新增：`cat` 流式读文件、`put` 流式写新文件、
@@ -216,16 +216,17 @@ pub struct Capture {
 /// - `stat` 与 `list` 一样先识别符号链接，并且只读取普通文件的大小；FIFO、
 ///   socket/device 等现存叶节点返回 `f 0`，目标预检不会为求大小而阻塞。
 /// - v3：`untar` 改为 `untar <dir> <name>` —— 解包前先查 `<dir>/<name>` 是否
-///   已存在（17），目录上传/中转因此 fail-closed（检查与解包之间仍有微秒级
-///   TOCTOU 窗口，见代码注释；这是 tar 合并语义的协议极限）。新增 `stat`
+///   已存在（17）；该版本的检查→直接解包 TOCTOU 窗口后由 v7 关闭。新增 `stat`
 ///   打印 `<t> <size>`（普通文件为字节数，其余 0），取代 v2 的 list+cat 双探针预检。
 /// - v5：`put` 在同父级私有目录内接收 stdin，再以 hard-link no-replace 原子发布；
 ///   预植临时路径不会被跟随，最后检查后出现的目标也不会被 `mv` 覆盖。
 /// - v6：`put <path> <transfer-id>` 由客户端唯一令牌命名有界的候选目录，
 ///   取消/超时后只清理本次上传的 32 个可能候选。
+/// - v7：`untar <dir> <name> <transfer-id>` 只向同父级私有目录解包，
+///   校验唯一同名非链接根后用 GNU `mv --no-copy -nT` 原子发布。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
-pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v6 — runs under `sh -s -- <op> [args...]`.
+pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v7 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # Exit codes: 0 ok, 2 usage/bad path, 3 missing, 4 op failed, 13 permission,
 # 17 target exists, 20 not a directory.
@@ -239,6 +240,8 @@ pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v6 — runs under `sh -s -- 
 # an atomic no-replace hard link.
 # v6: put takes a client transfer id so cancel cleanup can enumerate only that
 # upload's bounded collision candidates.
+# v7: untar extracts into private same-parent staging, validates one matching
+# directory root, then publishes it with GNU mv's atomic no-replace rename.
 set -u
 op=${1:-}
 case "$op" in
@@ -353,14 +356,51 @@ case "$op" in
     tar cf - -C "$d" "${p##*/}" || exit 4
     ;;
   untar)
-    d=${2:-}
-    n=${3:-}
+    d=${2:-}; n=${3:-}; id=${4:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
-    case "$n" in ""|*/*) exit 2 ;; esac
+    case "$n" in ""|.|..|*/*) exit 2 ;; esac
+    case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
+    [ "${#id}" -le 96 ] || exit 2
     [ -d "$d" ] || exit 3
-    if [ -e "$d/$n" ] || [ -L "$d/$n" ]; then exit 17; fi
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
-    tar xf - -C "$d" || exit 4
+    command -v mv >/dev/null 2>&1 || { echo "remote-fs probe: mv is not available" >&2; exit 4; }
+    cd "$d" 2>/dev/null || exit 3
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
+    stage=
+    i=0
+    umask 077
+    while [ "$i" -lt 32 ]; do
+      candidate=".ember-fs-untar-$id-$i"
+      i=$((i + 1))
+      [ "$candidate" = "$n" ] && continue
+      if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+    done
+    [ -n "$stage" ] || exit 4
+    code=4
+    if (cd "$stage" && tar xf -); then
+      count=0
+      valid=1
+      source="$stage/$n"
+      for f in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+        if [ -e "$f" ] || [ -L "$f" ]; then
+          count=$((count + 1))
+          [ "$f" = "$source" ] || valid=0
+        fi
+      done
+      if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
+        if mv --no-copy -nT -- "$source" "$n" 2>/dev/null; then
+          if [ -e "$source" ] || [ -L "$source" ]; then
+            if [ -e "$n" ] || [ -L "$n" ]; then code=17; fi
+          else
+            code=0
+          fi
+        elif [ -e "$n" ] || [ -L "$n" ]; then
+          code=17
+        fi
+      fi
+    fi
+    rm -rf -- "$stage"
+    exit "$code"
     ;;
   stat)
     p=${2:-}
@@ -500,7 +540,7 @@ fn sq(s: &str) -> String {
 
 /// 进程内唯一、shell-safe 的上传令牌，同时绑定远端候选目录与
 /// 取消清理。远端探针会再独立校验字符集和长度。
-fn put_transfer_id() -> String {
+fn upload_transfer_id() -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let epoch_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -530,6 +570,21 @@ fn put_cleanup_command(dst: &str, transfer_id: &str) -> String {
         "i=0; while [ \"$i\" -lt 32 ]; do d={}$i; i=$((i + 1)); [ \"$d\" = {} ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done",
         sq(&prefix),
         sq(dst)
+    )
+}
+
+fn untar_cleanup_command(dst_dir: &str, name: &str, transfer_id: &str) -> String {
+    let dst_dir = Path::new(dst_dir);
+    let prefix = dst_dir.join(format!(".ember-fs-untar-{transfer_id}-"));
+    let target = dst_dir.join(name);
+    format!(
+        "i=0; while [ \"$i\" -lt 32 ]; do d={}$i; i=$((i + 1)); [ \"$d\" = {} ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done",
+        sq(prefix
+            .to_str()
+            .expect("joining UTF-8 upload operands preserves UTF-8")),
+        sq(target
+            .to_str()
+            .expect("joining UTF-8 upload operands preserves UTF-8"))
     )
 }
 
@@ -2467,17 +2522,17 @@ fn upload(
     } else {
         // put 在远端读流之前先给出友好的 17；最终 hard-link publication
         // 才是原子 no-replace 的权威检查。
-        let transfer_id = put_transfer_id();
+        let transfer_id = upload_transfer_id();
         let argv = checked_sh_c_probe_argv(host, "put", &[path_str(dst)?, &transfer_id])?;
         let result = upload_file(&argv, src, MAX_TRANSFER_BYTES, control);
-        if result.as_ref().is_err_and(put_cleanup_needed) {
+        if result.as_ref().is_err_and(upload_cleanup_needed) {
             cleanup_remote_put(host, dst, &transfer_id);
         }
         result
     }
 }
 
-fn put_cleanup_needed(error: &io::Error) -> bool {
+fn upload_cleanup_needed(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
@@ -2487,16 +2542,29 @@ fn put_cleanup_needed(error: &io::Error) -> bool {
 /// 探针正常失败会自行删除 staging；只有整个进程组被取消/超时
 /// kill 时才可能留下目录。此清理不继承已触发的取消令牌，错误仅记录。
 fn cleanup_remote_put(host: &RemoteHostConfig, dst: &Path, transfer_id: &str) {
-    if let Err(error) = validate_host_for_execution(host) {
-        log::warn!("remote upload staging cleanup rejected by execution gate: {error}");
-        return;
-    }
     let Ok(dst) = path_str(dst) else {
         log::warn!("remote upload staging cleanup skipped a non-UTF-8 path");
         return;
     };
     let command = put_cleanup_command(dst, transfer_id);
-    let argv = remote_shell_command_argv(host, &command);
+    run_remote_upload_cleanup(host, &command);
+}
+
+fn cleanup_remote_untar(host: &RemoteHostConfig, dst_dir: &Path, name: &str, transfer_id: &str) {
+    let Ok(dst_dir) = path_str(dst_dir) else {
+        log::warn!("remote directory staging cleanup skipped a non-UTF-8 path");
+        return;
+    };
+    let command = untar_cleanup_command(dst_dir, name, transfer_id);
+    run_remote_upload_cleanup(host, &command);
+}
+
+fn run_remote_upload_cleanup(host: &RemoteHostConfig, command: &str) {
+    if let Err(error) = validate_host_for_execution(host) {
+        log::warn!("remote upload staging cleanup rejected by execution gate: {error}");
+        return;
+    }
+    let argv = remote_shell_command_argv(host, command);
     match run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_SMALL_OUTPUT) {
         Ok(capture) if capture.status == Some(0) && !capture.timed_out && !capture.cancelled => {}
         Ok(capture) => log::warn!(
@@ -2562,21 +2630,29 @@ fn upload_dir(
     )
     .and_then(local_status);
     packed.and_then(|()| {
-        // 解包腿的字节数接着打包腿累计。untar v3 在解包前原子拒绝
-        // 已存在的 <dir>/<name>（检查与解包之间仍有微秒级 TOCTOU 窗口，
-        // 这是 tar 合并语义的协议极限，Friendly 错误由 17 映射给出）。
+        // 解包腿的字节数接着打包腿累计。v7 只在私有目录解包，
+        // 验证完整根后再原子 no-replace 发布。
         let base = std::fs::metadata(temp.path())
             .map(|meta| meta.len())
             .unwrap_or(0);
-        let untar_argv = checked_sh_c_probe_argv(host, "untar", &[path_str(dst_dir)?, name])?;
-        run_stream_from_file(
+        let transfer_id = upload_transfer_id();
+        let untar_argv = checked_sh_c_probe_argv(
+            host,
+            "untar",
+            &[path_str(dst_dir)?, name, transfer_id.as_str()],
+        )?;
+        let result = run_stream_from_file(
             &untar_argv,
             temp.path(),
             TRANSFER_TIMEOUT,
             max_bytes,
             legs.control_for(base),
         )
-        .and_then(probe_output_empty)
+        .and_then(probe_output_empty);
+        if result.as_ref().is_err_and(upload_cleanup_needed) {
+            cleanup_remote_untar(host, dst_dir, name, &transfer_id);
+        }
+        result
     })
 }
 
@@ -2616,7 +2692,7 @@ fn relay(
         let base = std::fs::metadata(temp.path())
             .map(|meta| meta.len())
             .unwrap_or(0);
-        let (upload_argv, transfer_id) = if src_is_dir {
+        let (upload_argv, transfer_id, directory_name) = if src_is_dir {
             // tar 流的顶层名就是 src 的 basename（tar 探针 -C 父目录打包）。
             let name = src
                 .file_name()
@@ -2624,15 +2700,21 @@ fn relay(
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "source has no UTF-8 file name")
                 })?;
+            let transfer_id = upload_transfer_id();
             (
-                checked_sh_c_probe_argv(dst_host, "untar", &[path_str(dst_dir)?, name])?,
-                None,
+                checked_sh_c_probe_argv(
+                    dst_host,
+                    "untar",
+                    &[path_str(dst_dir)?, name, transfer_id.as_str()],
+                )?,
+                transfer_id,
+                Some(name.to_string()),
             )
         } else {
-            let transfer_id = put_transfer_id();
+            let transfer_id = upload_transfer_id();
             let argv =
                 checked_sh_c_probe_argv(dst_host, "put", &[path_str(dst)?, transfer_id.as_str()])?;
-            (argv, Some(transfer_id))
+            (argv, transfer_id, None)
         };
         let result = run_stream_from_file(
             &upload_argv,
@@ -2642,9 +2724,11 @@ fn relay(
             legs.control_for(base),
         )
         .and_then(probe_output_empty);
-        if let (Some(transfer_id), Err(error)) = (&transfer_id, &result) {
-            if put_cleanup_needed(error) {
-                cleanup_remote_put(dst_host, dst, transfer_id);
+        if result.as_ref().is_err_and(upload_cleanup_needed) {
+            if let Some(name) = directory_name.as_deref() {
+                cleanup_remote_untar(dst_host, dst_dir, name, &transfer_id);
+            } else {
+                cleanup_remote_put(dst_host, dst, &transfer_id);
             }
         }
         result
@@ -2836,10 +2920,13 @@ docker = true
         );
         assert!(!argv.iter().any(|arg| arg == "-t"), "{argv:?}");
 
-        let argv = sh_c_probe_argv(&ssh_host(), "untar", &["/data"]);
+        let argv = sh_c_probe_argv(&ssh_host(), "untar", &["/data", "tree", "feed-2"]);
         let cmd = argv.last().unwrap();
         assert!(cmd.starts_with("sh -c '"), "{cmd}");
-        assert!(cmd.ends_with(" remote-fs-probe untar '/data'"), "{cmd}");
+        assert!(
+            cmd.ends_with(" remote-fs-probe untar '/data' 'tree' 'feed-2'"),
+            "{cmd}"
+        );
         // ssh 场景下远端命令仍必须是恰好一个 argv 元素。
         assert_eq!(argv.len(), 10);
     }
@@ -3715,7 +3802,7 @@ docker = true
         let link = extraction_dir.join("tree");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&extraction_arg, "tree"]),
+            &sh_c_argv_locally("untar", &[&extraction_arg, "tree", "feed-2"]),
             b"not consulted when the target is occupied",
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -3908,9 +3995,9 @@ docker = true
     }
 
     #[test]
-    fn put_transfer_ids_are_unique_shell_safe_and_bounded() {
-        let first = put_transfer_id();
-        let second = put_transfer_id();
+    fn upload_transfer_ids_are_unique_shell_safe_and_bounded() {
+        let first = upload_transfer_id();
+        let second = upload_transfer_id();
         assert_ne!(first, second);
         for id in [first, second] {
             assert!(id.len() <= 96);
@@ -3923,17 +4010,19 @@ docker = true
     }
 
     #[test]
-    fn put_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
-        assert!(put_cleanup_needed(&cancelled_error()));
-        assert!(put_cleanup_needed(&io::Error::new(
+    fn upload_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
+        assert!(upload_cleanup_needed(&cancelled_error()));
+        assert!(upload_cleanup_needed(&io::Error::new(
             io::ErrorKind::TimedOut,
             "timeout"
         )));
-        assert!(!put_cleanup_needed(&io::Error::new(
+        assert!(!upload_cleanup_needed(&io::Error::new(
             io::ErrorKind::AlreadyExists,
             "probe cleaned itself"
         )));
-        assert!(!put_cleanup_needed(&io::Error::other("ordinary failure")));
+        assert!(!upload_cleanup_needed(&io::Error::other(
+            "ordinary failure"
+        )));
     }
 
     #[test]
@@ -3995,6 +4084,62 @@ docker = true
     }
 
     #[test]
+    fn untar_cleanup_command_enumerates_only_token_candidates() {
+        assert_eq!(
+            untar_cleanup_command("/dst", "tree", "feed-e"),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.ember-fs-untar-feed-e-'$i; i=$((i + 1)); [ \"$d\" = '/dst/tree' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done"
+        );
+        assert_eq!(
+            untar_cleanup_command("/dst/don't", ".ember-fs-untar-feed-e-7", "feed-e"),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/don'\\''t/.ember-fs-untar-feed-e-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t/.ember-fs-untar-feed-e-7' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done"
+        );
+    }
+
+    #[test]
+    fn untar_cleanup_preserves_target_links_and_other_uploads() {
+        let dir = TestDir::new();
+        let stage =
+            |token: &str, index: usize| dir.path().join(format!(".ember-fs-untar-{token}-{index}"));
+        for index in [0, 31] {
+            std::fs::create_dir(stage("feed-e", index)).unwrap();
+            std::fs::create_dir(stage("feed-e", index).join("partial-tree")).unwrap();
+            std::fs::write(stage("feed-e", index).join("partial-tree/file"), b"partial").unwrap();
+        }
+        let outside_range = stage("feed-e", 32);
+        std::fs::create_dir(&outside_range).unwrap();
+        let other_transfer = stage("beef-f", 0);
+        std::fs::create_dir(&other_transfer).unwrap();
+
+        let victim = dir.join("victim-tree");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"victim").unwrap();
+        let planted_link = stage("feed-e", 5);
+        std::os::unix::fs::symlink(&victim, &planted_link).unwrap();
+
+        let name = ".ember-fs-untar-feed-e-7";
+        let target = dir.join(name);
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"target").unwrap();
+
+        let command = untar_cleanup_command(dir.path().to_str().unwrap(), name, "feed-e");
+        let capture = run_capture(
+            &["sh".to_string(), "-c".to_string(), command],
+            &[],
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"target");
+        assert!(!stage("feed-e", 0).exists());
+        assert!(!stage("feed-e", 31).exists());
+        assert!(outside_range.is_dir(), "indices outside retries survive");
+        assert!(other_transfer.is_dir(), "a concurrent upload survives");
+        assert!(planted_link.is_symlink(), "cleanup refuses planted links");
+        assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"victim");
+    }
+
+    #[test]
     fn probe_v2_tar_untar_round_trip_preserves_tree() {
         let dir = TestDir::new();
         let src = dir.join("tree");
@@ -4025,7 +4170,7 @@ docker = true
         .unwrap();
         assert_eq!(capture.status, Some(3));
 
-        // untar 解进已存在的目录（v3：参数为 <dir> <name>，name 是 tar 流顶层名）。
+        // untar 解进私有 staging（v7：<dir> <name> <transfer-id>）。
         let out = dir.join("out");
         std::fs::create_dir(&out).unwrap();
         let out_arg = out.to_str().unwrap().to_string();
@@ -4038,7 +4183,7 @@ docker = true
         .unwrap()
         .stdout;
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&out_arg, "tree"]),
+            &sh_c_argv_locally("untar", &[&out_arg, "tree", "feed-9"]),
             &tar_bytes,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -4051,9 +4196,9 @@ docker = true
         );
         assert_eq!(std::fs::read(out.join("tree/note.txt")).unwrap(), b"hello");
 
-        // v3：目标已存在 → 解包前直接 17，不合并不覆盖。
+        // 目标已存在 → 解包前直接 17，不合并不覆盖。
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&out_arg, "tree"]),
+            &sh_c_argv_locally("untar", &[&out_arg, "tree", "feed-a"]),
             &tar_bytes,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -4064,7 +4209,7 @@ docker = true
         // 目标目录缺失 → 3；name 带 / 或为空 → 2。
         let missing = dir.join("missing").to_str().unwrap().to_string();
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&missing, "tree"]),
+            &sh_c_argv_locally("untar", &[&missing, "tree", "feed-b"]),
             &tar_bytes,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -4072,7 +4217,7 @@ docker = true
         .unwrap();
         assert_eq!(capture.status, Some(3));
         let capture = run_capture(
-            &sh_c_argv_locally("untar", &[&out_arg, "a/b"]),
+            &sh_c_argv_locally("untar", &[&out_arg, "a/b", "feed-c"]),
             &tar_bytes,
             Duration::from_secs(5),
             MAX_SMALL_OUTPUT,
@@ -4087,6 +4232,164 @@ docker = true
         )
         .unwrap();
         assert_eq!(capture.status, Some(2));
+    }
+
+    #[test]
+    fn probe_v7_untar_rejects_extra_roots_without_partial_publication() {
+        let dir = TestDir::new();
+        let archive_root = dir.join("archive");
+        std::fs::create_dir(&archive_root).unwrap();
+        for name in ["tree", "extra"] {
+            std::fs::create_dir(archive_root.join(name)).unwrap();
+            std::fs::write(archive_root.join(name).join("file"), name).unwrap();
+        }
+        let archive = run_capture(
+            &[
+                "tar".to_string(),
+                "cf".to_string(),
+                "-".to_string(),
+                "-C".to_string(),
+                archive_root.to_str().unwrap().to_string(),
+                "tree".to_string(),
+                "extra".to_string(),
+            ],
+            &[],
+            Duration::from_secs(5),
+            MAX_LIST_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(archive.status, Some(0), "stderr: {:?}", archive.stderr);
+
+        let destination = dir.join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let destination_arg = destination.to_str().unwrap().to_string();
+        let capture = run_capture(
+            &sh_c_argv_locally("untar", &[&destination_arg, "tree", "feed-f"]),
+            &archive.stdout,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(4));
+        assert!(!destination.join("tree").exists());
+        assert!(!destination.join("extra").exists());
+        assert!(
+            std::fs::read_dir(&destination).unwrap().next().is_none(),
+            "invalid archives leave neither published nor staged trees"
+        );
+    }
+
+    #[test]
+    fn probe_untar_preserves_a_destination_created_after_preflight() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let source = dir.join("tree");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("archive-only"), b"archive").unwrap();
+        let source_arg = source.to_str().unwrap().to_string();
+        let archive = run_probe_locally(&["tar", &source_arg]);
+        assert_eq!(archive.status, Some(0));
+
+        let destination = dir.join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let destination_arg = destination.to_str().unwrap().to_string();
+        let collision_victim = dir.join("collision-victim");
+        std::fs::create_dir(&collision_victim).unwrap();
+        std::fs::write(collision_victim.join("keep"), b"collision").unwrap();
+        let planted_stage = destination.join(".ember-fs-untar-feed-8-0");
+        std::os::unix::fs::symlink(&collision_victim, &planted_stage).unwrap();
+        let shim_dir = dir.join("bin");
+        std::fs::create_dir(&shim_dir).unwrap();
+        let marker = dir.join("untar-started");
+        let gate = dir.join("untar-release");
+        let tar_shim = shim_dir.join("tar");
+        std::fs::write(
+            &tar_shim,
+            "#!/bin/sh\n: > \"$UNTAR_MARKER\"\nwhile [ ! -e \"$UNTAR_GATE\" ]; do sleep 0.01; done\nPATH=$ORIGINAL_PATH\nexport PATH\nexec tar \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tar_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(PROBE_SCRIPT)
+            .arg("remote-fs-probe")
+            .arg("untar")
+            .arg(&destination_arg)
+            .arg("tree")
+            .arg("feed-8")
+            .env("PATH", format!("{}:{original_path}", shim_dir.display()))
+            .env("ORIGINAL_PATH", &original_path)
+            .env("UNTAR_MARKER", &marker)
+            .env("UNTAR_GATE", &gate)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+
+        let started = std::time::Instant::now();
+        while !marker.exists() {
+            if started.elapsed() > Duration::from_secs(2) {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("untar probe did not reach extraction");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reserved: Vec<_> = std::fs::read_dir(&destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ember-fs-untar-feed-8-")
+            })
+            .collect();
+        assert_eq!(reserved.len(), 1, "one private staging directory is held");
+        assert_eq!(
+            reserved[0].metadata().unwrap().permissions().mode() & 0o077,
+            0,
+            "remote directory staging is owner-only"
+        );
+
+        let racing_target = destination.join("tree");
+        std::fs::create_dir(&racing_target).unwrap();
+        std::fs::write(racing_target.join("keep"), b"racer").unwrap();
+        std::fs::write(&gate, b"go").unwrap();
+        stdin.write_all(&archive.stdout).unwrap();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(std::fs::read(racing_target.join("keep")).unwrap(), b"racer");
+        assert!(!racing_target.join("archive-only").exists());
+        assert!(
+            planted_stage.is_symlink(),
+            "occupied staging is never removed"
+        );
+        assert_eq!(
+            std::fs::read(collision_victim.join("keep")).unwrap(),
+            b"collision"
+        );
+        assert!(
+            std::fs::read_dir(&destination)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path() != planted_stage)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ember-fs-untar-")),
+            "failed publication must clean private extraction staging"
+        );
     }
 
     #[test]
@@ -4649,7 +4952,7 @@ docker = true
         std::fs::create_dir(&remote_b).unwrap();
         let remote_b_arg = remote_b.to_str().unwrap().to_string();
         run_stream_from_file(
-            &sh_c_argv_locally("untar", &[&remote_b_arg, "tree"]),
+            &sh_c_argv_locally("untar", &[&remote_b_arg, "tree", "feed-d"]),
             &staging_path,
             TRANSFER_TIMEOUT,
             MAX_TRANSFER_BYTES,

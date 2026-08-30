@@ -1030,9 +1030,10 @@ local partial files are cleaned up, and the outcome is reported as a neutral
 已取消 rather than an error. The context menu also offers 复制路径, copying
 the row's full path (plain, unprefixed for remote rows) to the system
 clipboard. Root-level directories use `/` as their tar parent rather than an
-empty `-C` operand. The v4 probe refuses directory collisions atomically (`untar
-<dir> <name>` exits 17 before extracting) and answers `stat` for cheap remote
-existence checks without opening FIFOs or other special leaves for a size read.
+empty `-C` operand. The v7 probe receives directory archives in private staging,
+validates one matching directory root, and atomically publishes without replacing
+a racing destination; `stat` answers cheap remote existence checks without
+opening FIFOs or other special leaves for a size read.
 You can also drag files and folders from the OS file manager
 straight onto the tree: dropping onto a row targets that directory (a file row
 targets its parent, blank space the current root), a hover hint shows the
@@ -1074,6 +1075,11 @@ a destination created after preflight wins intact instead of being overwritten
 by `mv`. Direct uploads and remote relays carry a unique client transfer token;
 cancel/timeout cleanup enumerates only that upload's 32 candidates, refuses
 symbolic links, and cannot remove the final target or another concurrent upload.
+Remote directory uploads and relays follow the same token-scoped pattern: tar
+extracts only inside a private 0700 same-parent directory, one matching
+non-symlink root is required, and GNU `mv --no-copy -nT` performs the final
+no-replace rename. Unsupported/non-atomic publication fails closed; a collision,
+invalid archive, cancellation, or extraction error leaves no partial final tree.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
