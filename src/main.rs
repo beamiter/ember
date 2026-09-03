@@ -2606,8 +2606,6 @@ impl TerminalApp {
                     {
                         Ok(()) => {
                             self.ssh_files_follow.clear_failure();
-                            self.sidebar.visible = true;
-                            self.sidebar.view = sidebar::SidebarView::Files;
                             self.set_status_for(
                                 format!("Files 已验证并切换 SSH 连接：{label}"),
                                 Duration::from_secs(5),
@@ -2644,8 +2642,6 @@ impl TerminalApp {
                         {
                             Ok(scan_error) => {
                                 self.ssh_files_follow.clear_failure();
-                                self.sidebar.visible = true;
-                                self.sidebar.view = sidebar::SidebarView::Files;
                                 if let Some(error) = scan_error {
                                     self.set_status_for(
                                         format!("已连接 {label}，但文件树读取失败：{error}"),
@@ -2754,8 +2750,6 @@ impl TerminalApp {
                     ssh_files_follow::SameTargetAction::RevealExisting => {
                         self.ssh_files_follow.mark_handled(key);
                         self.ssh_files_follow.clear_failure();
-                        self.sidebar.visible = true;
-                        self.sidebar.view = sidebar::SidebarView::Files;
                         return;
                     }
                     ssh_files_follow::SameTargetAction::ProbeOverlayUpgrade => {
