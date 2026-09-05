@@ -428,3 +428,53 @@ Atomic remote file publication adds round 82 (2026-08-30):
     `mv` could still overwrite a destination created in between; all three
     paths now fail closed and private staging is cleaned without touching a
     colliding candidate.
+
+Shared-core repin to `9f94f77` (jagent `bdc8023`) adds rounds 83–87
+(2026-09-05):
+
+83. **Durable output is bound to the Start the terminal saw** — the shared
+    journal's `CompletedExecution` no longer carries a bare `id`; it carries an
+    `ExecutionLifecycle` whose only constructor demands `id`, `session_id`,
+    `seq` and `started_at_ms` from one OSC 133 `C` packet. Ember's decoder now
+    reads those three Start-identity slots, honours them on `C` only — jsh
+    emits none of them on `D`, and a token assembled at completion would name a
+    generation nobody observed — and carries them on `CommandRecord` and
+    `CompletedCommandOutput`. The identity is captured on the first `C` for a
+    record and never rebound by a second. Ember's own `local:{sequence}` ids
+    fail `is_valid_jsh_execution_id`, so a shell that reports no identity
+    produces no journal row rather than a mis-keyed one.
+84. **Every OSC 133 slot is single-assignment** — aliases name one semantic
+    slot, and a repeated slot now degrades to absent instead of last-wins, so a
+    second spelling of `id`, the command, the cwd or the duration cannot
+    overwrite the honest first one. The truncation disclosure fails closed the
+    other way: a repeat means truncated, because "absent" would re-enable
+    replay of a partial command through the block menu's re-run gate. An
+    unrecognised `cmd_truncated` value is inexact, not complete, and the
+    disclosure is now honoured on `A` and `B` as well as `C` and `D`. A second
+    exit slot reports no status at all, so `D;1;exit=0` can no longer turn a
+    reported failure into a reported success.
+85. **One set of OSC 133 budgets and one cwd rule** — per-field byte caps are
+    `jterm_core::parser`'s constants rather than a fourth per-app set, so
+    ember's decode and `CommandMeta` cannot disagree about whether a packet
+    carried a field. Recorded cwds — from OSC 133 `C`/`D` and from OSC 7 — go
+    through `is_valid_jsh_cwd`: 4 KiB, non-empty, no controls, no visual
+    spoofing. That value is drawn in the pane header, cloned onto every command
+    record and handed to a new session as its working directory, and it was
+    stored with no length bound and no character rule. Execution ids are held
+    to the shared parser's visual-spoofing rule too.
+86. **PTY-authored text is bounded and sanitised where it leaves the terminal**
+    — OSC 9/777 notification title and body are sanitised with the shared
+    review-input class before they reach `notify-send` and a desktop
+    notification server that applies none of this terminal's display rules; an
+    OSC 0/2 window title is bounded where it enters terminal state rather than
+    only where it is drawn, and is no longer deep-cloned under the terminal
+    mutex once a frame. `/etc/hostname` is resolved once per process instead of
+    on every OSC 7 naming a non-local host from the PTY parse loop, and the
+    Block Search overlay reads its id-to-sequence join from the cache built for
+    it instead of rebuilding it, with up to 1024 `String` clones, every frame.
+87. **A supply-chain gate ember did not have** — `deny.toml` and
+    `.cargo/audit.toml` state the licence, ban, source and advisory policy;
+    `scripts/security-check.sh` runs the locked-graph, cargo-deny, RustSec
+    (`--deny warnings`) and shellcheck passes that frost and forge already had,
+    and CI's audit job runs through it. The installer, uninstaller and their
+    path test are now shellchecked by the same entry point that ships them.

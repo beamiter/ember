@@ -1,0 +1,49 @@
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "NCSA",
+  # egui ships the Ubuntu Light and Hack faces inside `epaint_default_fonts`,
+  # which ember links through eframe. Both are font licences, not code
+  # licences, and neither reaches ember's own source or binary redistribution
+  # terms beyond the fonts themselves.
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[advisories]
+version = 2
+# `ttf-parser` is an unmaintained notice, not a vulnerability or an unsoundness
+# finding. It arrives twice and unavoidably: `fontdue` parses glyph outlines
+# with it, and `ab_glyph` does the same through `owned_ttf_parser`. Both are
+# ember's own rasterizer backends, and neither upstream has released against
+# `skrifa`. Keep this exact ID aligned with .cargo/audit.toml, so that any
+# *different* advisory still fails the gate closed.
+ignore = [
+  "RUSTSEC-2026-0192", # ttf-parser, through fontdue and ab_glyph
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  "https://github.com/beamiter/jagent.git?rev=bdc8023faa535ee00bb972cdb0adc11ba280fdc5",
+  "https://github.com/beamiter/jterm_core.git?rev=9f94f77b694ef5e0b20b9fd4bd776b98220360c4",
+]

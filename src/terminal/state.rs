@@ -55,6 +55,20 @@ enum Osc133DecodeError {
     InvalidUtf8,
 }
 
+/// The Start-identity slots an OSC 133 `C` packet may carry.
+///
+/// Grouped rather than passed as three more loose arguments because they are
+/// only ever meaningful together: `jterm_core::execution_journal::ExecutionLifecycle`
+/// refuses to exist unless all of them, plus a jsh-shaped execution id, arrived
+/// on the same `C`. Each field is independently `None` when the slot was
+/// absent, repeated, or failed its own validation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Osc133StartIdentity {
+    session_id: Option<String>,
+    seq: Option<u64>,
+    started_at_ms: Option<u64>,
+}
+
 /// Streaming UTF-8 head+tail collector. It retains the full value while it
 /// fits; only after the first overflow does it repartition into bounded head
 /// and rolling tail storage.
@@ -311,6 +325,7 @@ impl super::TerminalState {
             current_bg: Color::Default,
             current_flags: StyleFlags::default(),
             window_title: String::new(),
+            announced_jsh_session_id: None,
             current_working_dir: None,
             global_bg: Color::Default,
             utf8_buf: [0; 4],
@@ -527,12 +542,36 @@ impl super::TerminalState {
         }
     }
 
-    /// Decode OSC 7 working-directory payload to a local filesystem path.
-    /// Accepts either `file://host/path` (path is percent-encoded) or a raw
-    /// path. A non-local hostname is rejected: persisting an SSH server's
+    /// An OSC 7 payload longer than this cannot percent-decode to a directory
+    /// the shared cwd validator would accept: `%XX` is the densest encoding at
+    /// three raw bytes per decoded byte, so three times the 4 KiB cwd budget
+    /// plus a `file://<host>` prefix already exceeds any acceptable path. The
+    /// gate is checked before decoding, so a pending-escape payload of several
+    /// megabytes cannot buy an allocation of the same size on the PTY thread.
+    /// Same number as the shared parser's own OSC 7 budget.
+    pub(super) const MAX_OSC7_URI_BYTES: usize = 16 * 1024;
+
+    /// Decode one OSC 7 working-directory announcement to a local filesystem
+    /// path. Accepts either `file://host/path` (whose path is percent-encoded)
+    /// or a raw path, and returns `None` when the payload is empty or
+    /// malformed. A non-local hostname is rejected: persisting an SSH server's
     /// `/etc` as a local cwd would restore the next session in the wrong host
-    /// directory. Returns None if the payload is empty or malformed.
+    /// directory.
+    ///
+    /// The result is not display text: it is cloned onto every command record,
+    /// shaped into the pane header and bottom bar each frame, and handed to
+    /// `Pty::new_with_pinned_cwd` as the working directory of a session split
+    /// from this pane. It was stored with no length bound and no character
+    /// rule at all, so a PTY could park megabytes in terminal state and could
+    /// name a directory whose displayed spelling — via a bidi override or a
+    /// zero-width joiner — is not the directory a new shell would start in.
+    /// [`jterm_core::execution_journal::is_valid_jsh_cwd`] is the family's one
+    /// answer to "a cwd this terminal will record": 4 KiB, non-empty, no
+    /// controls, no visual spoofing. The OSC 133 cwd path already uses it.
     pub(super) fn decode_osc7_cwd(value: &str) -> Option<String> {
+        if value.len() > Self::MAX_OSC7_URI_BYTES {
+            return None;
+        }
         let path_part = if let Some(rest) = value.strip_prefix("file://") {
             let slash = rest.find('/')?;
             let host = &rest[..slash];
@@ -560,24 +599,31 @@ impl super::TerminalState {
                 i += 1;
             }
         }
-        let s = String::from_utf8(out).ok()?;
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
+        String::from_utf8(out)
+            .ok()
+            .filter(|cwd| jterm_core::execution_journal::is_valid_jsh_cwd(cwd))
     }
 
     fn osc7_host_is_local(host: &str) -> bool {
         if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
             return true;
         }
-        let local_hostname = std::env::var("HOSTNAME").ok().or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|hostname| hostname.trim().to_string())
+        // Resolved once per process, not once per packet. This runs on the PTY
+        // parse loop, and every OSC 7 naming any other host — which a remote
+        // shell emits on every prompt — opened and read `/etc/hostname` again.
+        // The machine's own name does not change under a running window, and a
+        // failed read stays failed rather than being retried per keystroke.
+        static LOCAL_HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let local_hostname = LOCAL_HOSTNAME.get_or_init(|| {
+            std::env::var("HOSTNAME").ok().or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|hostname| hostname.trim().to_string())
+            })
         });
-        local_hostname.is_some_and(|local| host.eq_ignore_ascii_case(&local))
+        local_hostname
+            .as_deref()
+            .is_some_and(|local| host.eq_ignore_ascii_case(local))
     }
 
     pub(super) fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
@@ -2318,7 +2364,18 @@ impl super::TerminalState {
 
     fn valid_osc_133_id(value: &str) -> Option<String> {
         let id = Self::percent_decode_osc_133(value, MAX_OSC_133_ID_BYTES).ok()?;
-        if id.is_empty() || id.chars().any(char::is_control) {
+        // An execution id is rendered — the Commands sidebar and the block
+        // export both print it — and it is a routing key the user is expected
+        // to be able to tell apart from a neighbour. The shared parser refuses
+        // the visual-spoofing class here for exactly that reason; ember checked
+        // only for controls, so a right-to-left override or an invisible
+        // joiner inside an id passed straight through to the UI.
+        if id.is_empty()
+            || id.chars().any(char::is_control)
+            || id
+                .chars()
+                .any(jterm_core::review_input::is_terminal_visual_spoofing_character)
+        {
             return None;
         }
         Some(id)
@@ -2388,18 +2445,45 @@ impl super::TerminalState {
         }
     }
 
+    /// Decode one OSC 133 `cwd`/`cwd_url` field into a directory this terminal
+    /// is willing to record and later spawn in.
+    ///
+    /// The shared journal validator bundles every rule that matters here — the
+    /// 4 KiB budget, non-emptiness, control rejection, and the visual-spoofing
+    /// class — and ember must apply the same one: a recorded cwd is shown in
+    /// the pane header and the Commands sidebar, is what `is_valid_jsh_cwd`
+    /// gates on the journal side, and becomes the working directory of a new
+    /// session split from this block. A path carrying a bidi override or an
+    /// invisible joiner would display as a directory the user did not choose.
+    fn decode_osc_133_cwd(value: &str) -> Option<String> {
+        Self::percent_decode_osc_133(value, MAX_OSC_133_CWD_BYTES)
+            .ok()
+            .filter(|cwd| jterm_core::execution_journal::is_valid_jsh_cwd(cwd))
+    }
+
     fn apply_record_metadata(
         &mut self,
         index: usize,
         id: Option<&str>,
         command: Option<&str>,
         cwd: Option<&str>,
+        command_truncated: bool,
     ) {
         self.adopt_record_id(index, id);
         let decoded_command =
             command.map(|value| Self::percent_decode_osc_133(value, MAX_OSC_133_COMMAND_BYTES));
-        let decoded_cwd = cwd.map(|value| Self::percent_decode_osc_133(value, 16 * 1024));
+        let decoded_cwd = cwd.and_then(Self::decode_osc_133_cwd);
         if let Some(record) = self.command_records.get_mut(index) {
+            // The disclosure is sticky and is honoured on whichever mark
+            // carries it, not only on `C`. A shell that discloses the
+            // shortening on `A` or `B` has said the recorded text cannot
+            // authorize a re-run; dropping the flag on those marks left the
+            // record looking like an ordinary complete command.
+            if command_truncated {
+                record.command = None;
+                record.command_exact = false;
+                record.command_truncated = true;
+            }
             match decoded_command {
                 Some(Ok(command)) => {
                     record.command = Some(command);
@@ -2417,18 +2501,20 @@ impl super::TerminalState {
                 ))
                 | None => {}
             }
-            if let Some(Ok(cwd)) = decoded_cwd {
+            if let Some(cwd) = decoded_cwd {
                 record.cwd = Some(cwd);
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_command_record(
         &mut self,
         anchor: BufferAnchor,
         id: Option<&str>,
         command: Option<&str>,
         cwd: Option<&str>,
+        command_truncated: bool,
         start_mark_seen: bool,
     ) -> Option<usize> {
         let (sequence, local_id) = self.next_command_identity()?;
@@ -2459,6 +2545,9 @@ impl super::TerminalState {
             command_truncated: false,
             cwd: self.current_working_dir.clone(),
             cwd_after: None,
+            session_id: None,
+            seq: None,
+            started_at_ms: None,
             prompt_start: anchor,
             command_start: None,
             output_start: None,
@@ -2477,7 +2566,7 @@ impl super::TerminalState {
             started_instant: None,
         });
         let index = self.command_records.len() - 1;
-        self.apply_record_metadata(index, id, command, cwd);
+        self.apply_record_metadata(index, id, command, cwd, command_truncated);
         Some(index)
     }
 
@@ -2486,7 +2575,7 @@ impl super::TerminalState {
             return Some(index);
         }
         let anchor = self.current_buffer_anchor();
-        let index = self.push_command_record(anchor, None, None, None, false)?;
+        let index = self.push_command_record(anchor, None, None, None, false, false)?;
         if self.command_marks.len() >= MAX_COMMAND_MARKS {
             self.command_marks.pop_front();
         }
@@ -2502,6 +2591,7 @@ impl super::TerminalState {
         id: Option<&str>,
         command: Option<&str>,
         cwd: Option<&str>,
+        command_truncated: bool,
     ) {
         // Bypass the alt buffer entirely (less / vim emit no marks; if they
         // did, they'd contaminate the primary-screen command history).
@@ -2527,7 +2617,7 @@ impl super::TerminalState {
                 })
                 .unwrap_or(false);
             if duplicate {
-                self.apply_record_metadata(index, id, command, cwd);
+                self.apply_record_metadata(index, id, command, cwd, command_truncated);
                 return;
             }
         }
@@ -2545,7 +2635,7 @@ impl super::TerminalState {
         }
 
         if self
-            .push_command_record(anchor, id, command, cwd, false)
+            .push_command_record(anchor, id, command, cwd, command_truncated, false)
             .is_some()
         {
             if self.command_marks.len() >= MAX_COMMAND_MARKS {
@@ -2558,14 +2648,20 @@ impl super::TerminalState {
         }
     }
 
-    fn record_command_start(&mut self, id: Option<&str>, command: Option<&str>, cwd: Option<&str>) {
+    fn record_command_start(
+        &mut self,
+        id: Option<&str>,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        command_truncated: bool,
+    ) {
         if self.use_alt_buffer {
             return;
         }
         let Some(index) = self.ensure_active_record() else {
             return;
         };
-        self.apply_record_metadata(index, id, command, cwd);
+        self.apply_record_metadata(index, id, command, cwd, command_truncated);
         let anchor = self.current_buffer_anchor();
         if let Some(record) = self.command_records.get_mut(index) {
             if matches!(record.state, CommandState::Prompt | CommandState::Editing) {
@@ -2581,6 +2677,7 @@ impl super::TerminalState {
         command: Option<&str>,
         cwd: Option<&str>,
         command_truncated: bool,
+        start_identity: Osc133StartIdentity,
     ) {
         if self.use_alt_buffer {
             return;
@@ -2592,20 +2689,15 @@ impl super::TerminalState {
         let reconstructed = self
             .command_records
             .get(index)
-            .filter(|record| record.command.is_none() && command.is_none())
+            .filter(|record| record.command.is_none() && command.is_none() && !command_truncated)
             .and_then(|record| record.command_start)
             .and_then(|start| self.extract_text_range(start, anchor, MAX_OSC_133_COMMAND_BYTES))
             .map(|extracted| extracted.text.trim_end_matches(['\r', '\n']).to_string())
             .filter(|command| !command.is_empty());
 
-        self.apply_record_metadata(index, id, command, cwd);
+        self.apply_record_metadata(index, id, command, cwd, command_truncated);
         let mut initialize_provenance = false;
         if let Some(record) = self.command_records.get_mut(index) {
-            if command_truncated {
-                record.command = None;
-                record.command_truncated = true;
-                record.command_exact = false;
-            }
             if record.command.is_none() && !record.command_truncated {
                 record.command = reconstructed;
             }
@@ -2614,6 +2706,16 @@ impl super::TerminalState {
                 initialize_provenance = true;
             }
             record.state = CommandState::Running;
+            // Start identity is captured once, on the first `C` this record
+            // sees. jsh emits exactly one `C` per execution; a repeated mark
+            // carrying a different session, sequence or start timestamp would
+            // otherwise rebind an already-observed Start generation to output
+            // that was captured for the first one.
+            if !record.start_mark_seen {
+                record.session_id = start_identity.session_id;
+                record.seq = start_identity.seq;
+                record.started_at_ms = start_identity.started_at_ms;
+            }
             record.start_mark_seen = true;
             record
                 .started_at
@@ -2739,6 +2841,9 @@ impl super::TerminalState {
                 completion_provenance: record.completion_provenance,
                 completed: CompletedCommandOutput {
                     id: record.id,
+                    session_id: record.session_id,
+                    seq: record.seq,
+                    started_at_ms: record.started_at_ms,
                     command: record.command,
                     cwd: record.cwd,
                     exit_code: record.exit_code,
@@ -2766,6 +2871,12 @@ impl super::TerminalState {
             completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
             completed: CompletedCommandOutput {
                 id,
+                // A boundary-inferred termination observed no `C` identity of
+                // its own; leaving these empty keeps such an event out of the
+                // journal by construction rather than by the trust check alone.
+                session_id: None,
+                seq: None,
+                started_at_ms: None,
                 command,
                 cwd,
                 exit_code: None,
@@ -2957,20 +3068,12 @@ impl super::TerminalState {
         }
         // D's cwd is the post-command directory. It must not overwrite the
         // cwd captured at C, which is the authority for Retry/task provenance.
-        self.apply_record_metadata(index, id, command, None);
-        if let Some(Ok(cwd_after)) = cwd.map(|value| Self::percent_decode_osc_133(value, 16 * 1024))
-        {
+        self.apply_record_metadata(index, id, command, None, command_truncated);
+        if let Some(cwd_after) = cwd.and_then(Self::decode_osc_133_cwd) {
             if let Some(record) = self.command_records.get_mut(index) {
                 record.cwd_after = Some(cwd_after.clone());
             }
             self.current_working_dir = Some(cwd_after);
-        }
-        if command_truncated {
-            if let Some(record) = self.command_records.get_mut(index) {
-                record.command = None;
-                record.command_truncated = true;
-                record.command_exact = false;
-            }
         }
         let anchor = self.current_buffer_anchor();
         self.finish_command_record(
@@ -2985,45 +3088,198 @@ impl super::TerminalState {
         }
     }
 
+    /// Decode the one outcome slot supported by an OSC 133 `D` packet.
+    ///
+    /// FinalTerm places the status positionally, while the family's own
+    /// integrations also spell it `exit`/`exit_code`/`exit_status`. A named
+    /// spelling is a slot even when its value is junk, so a trailing
+    /// `exit=oops` cannot quietly erase a status already read positionally;
+    /// an attempted *second* slot is ambiguous whichever way either value
+    /// parses, so it yields no status at all rather than letting a repeat flip
+    /// a failure badge to success. A bare non-numeric field is an unknown
+    /// extension flag, not an outcome.
+    ///
+    /// This mirrors `jterm_core::parser::parse_osc133_exit_status`; the two
+    /// decoders read the same packets and must agree about what a status is.
+    fn parse_osc_133_exit_status<'a>(fields: impl Iterator<Item = &'a str>) -> Option<i32> {
+        let mut seen = false;
+        let mut parsed = None;
+        for field in fields {
+            let candidate = match field.split_once('=') {
+                Some(("exit" | "exit_code" | "exit_status", value)) => {
+                    Some(value.trim().parse::<i32>().ok())
+                }
+                Some(_) => None,
+                None => field.trim().parse::<i32>().ok().map(Some),
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if std::mem::replace(&mut seen, true) {
+                return None;
+            }
+            parsed = candidate;
+        }
+        parsed
+    }
+
     /// Parse and apply one OSC 133 payload (the part after `133;`). Supports
     /// FinalTerm A/B/C/D, Kitty `cmdline_url`, and jsh correlation metadata.
+    ///
+    /// Aliases name one semantic slot, and every slot is single-assignment.
+    /// The payload is untrusted PTY output: last-wins would let a second
+    /// spelling of the same key overwrite a journal correlation id, a command,
+    /// a cwd or a truncation disclosure that the honest first spelling already
+    /// established. A repeated slot therefore degrades to "absent" — except the
+    /// truncation disclosure, where "absent" would mean "the command is
+    /// complete", so a repeat fails closed to truncated instead. This is
+    /// `jterm_core::parser::CommandMeta::from_fields`'s rule, and the two
+    /// decoders read the same packets.
     pub(super) fn handle_osc_133(&mut self, value: &str) {
         let mut parts = value.split(';');
         let kind = parts.next().unwrap_or("");
+        // `session_id`, `seq` and `started_at_ms` are Start identity: jsh sends
+        // them on `C` and never on `D`, so accepting them anywhere else would
+        // let a completion packet mint a lifecycle token for a Start generation
+        // this terminal never observed. Same gate as the shared parser's
+        // `accept_start_identity`.
+        let accept_start_identity = kind == "C";
+        let exit_code = (kind == "D")
+            .then(|| Self::parse_osc_133_exit_status(parts.clone()))
+            .flatten();
         let mut id = None;
+        let mut session_id = None;
+        let mut seq = None;
+        let mut started_at_ms = None;
         let mut command = None;
         let mut cwd = None;
-        let mut exit_code = None;
         let mut duration_ms = None;
         let mut command_truncated = false;
+        let mut seen_id = false;
+        let mut seen_session_id = false;
+        let mut seen_seq = false;
+        let mut seen_started_at_ms = false;
+        let mut seen_command = false;
+        let mut seen_cwd = false;
+        let mut seen_duration = false;
+        let mut seen_command_truncated = false;
 
         for part in parts {
-            if let Some((key, value)) = part.split_once('=') {
-                match key {
-                    "id" | "jsh_id" | "execution_id" | "command_id" => id = Some(value),
-                    "cmdline_url" | "command_url" | "command" | "cmdline" => command = Some(value),
-                    "cwd" | "cwd_url" => cwd = Some(value),
-                    "exit" | "exit_code" | "exit_status" => {
-                        exit_code = value.trim().parse::<i32>().ok()
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            match key {
+                "id" | "jsh_id" | "execution_id" | "command_id" => {
+                    if std::mem::replace(&mut seen_id, true) {
+                        id = None;
+                        continue;
                     }
-                    "duration" | "duration_ms" => duration_ms = value.trim().parse::<u64>().ok(),
-                    "cmd_truncated" | "command_truncated" => {
-                        command_truncated = matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "yes" | "on"
-                        )
-                    }
-                    _ => {}
+                    id = Some(value);
                 }
-            } else if kind == "D" && exit_code.is_none() {
-                exit_code = part.trim().parse::<i32>().ok();
+                "session_id" => {
+                    if !accept_start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_session_id, true) {
+                        session_id = None;
+                        continue;
+                    }
+                    // Percent-decoded, then held to jsh's exact session
+                    // grammar: this value becomes a journal routing key.
+                    session_id = Self::percent_decode_osc_133(value, MAX_OSC_133_SESSION_ID_BYTES)
+                        .ok()
+                        .filter(|id| jterm_core::execution_journal::is_valid_jsh_session_id(id));
+                }
+                "seq" => {
+                    if !accept_start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_seq, true) {
+                        seq = None;
+                        continue;
+                    }
+                    // Integers, not text: jsh emits them unencoded and the
+                    // shared parser reads them the same way.
+                    seq = value.parse::<u64>().ok();
+                }
+                "started_at_ms" => {
+                    if !accept_start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_started_at_ms, true) {
+                        started_at_ms = None;
+                        continue;
+                    }
+                    started_at_ms = value.parse::<u64>().ok();
+                }
+                "cmdline_url" | "command_url" | "command" | "cmdline" => {
+                    if std::mem::replace(&mut seen_command, true) {
+                        command = None;
+                        continue;
+                    }
+                    command = Some(value);
+                }
+                "cwd" | "cwd_url" => {
+                    if std::mem::replace(&mut seen_cwd, true) {
+                        cwd = None;
+                        continue;
+                    }
+                    cwd = Some(value);
+                }
+                "duration" | "duration_ms" => {
+                    if std::mem::replace(&mut seen_duration, true) {
+                        duration_ms = None;
+                        continue;
+                    }
+                    duration_ms = value.trim().parse::<u64>().ok();
+                }
+                "cmd_truncated" | "command_truncated" => {
+                    if std::mem::replace(&mut seen_command_truncated, true) {
+                        // A second disclosure is ambiguous. "Not truncated" is
+                        // the answer that re-enables replay of a partial
+                        // command, so it is the one a repeat may not produce.
+                        command_truncated = true;
+                        continue;
+                    }
+                    let value = value.trim();
+                    command_truncated = match value {
+                        "0" => false,
+                        "1" => true,
+                        value if value.eq_ignore_ascii_case("false") => false,
+                        value if value.eq_ignore_ascii_case("true") => true,
+                        // The producer chose to send the disclosure but did not
+                        // encode its state. That is inexact, not the default
+                        // `false` that claims the command is complete.
+                        _ => true,
+                    };
+                }
+                _ => {}
             }
         }
 
+        // jsh emits either an exact command or `cmd_truncated=1`, never both.
+        // A contradictory producer must not smuggle a partial prefix into the
+        // exact-command path merely by attaching the honest disclosure too.
+        if command_truncated {
+            command = None;
+        }
+
         match kind {
-            "A" => self.record_prompt_start_with_metadata(id, command, cwd),
-            "B" => self.record_command_start(id, command, cwd),
-            "C" => self.record_output_start(id, command, cwd, command_truncated),
+            "A" => {
+                self.record_prompt_start_with_metadata(id, command, cwd, command_truncated);
+            }
+            "B" => self.record_command_start(id, command, cwd, command_truncated),
+            "C" => self.record_output_start(
+                id,
+                command,
+                cwd,
+                command_truncated,
+                Osc133StartIdentity {
+                    session_id,
+                    seq,
+                    started_at_ms,
+                },
+            ),
             "D" => self.record_command_exit_with_metadata(
                 id,
                 command,

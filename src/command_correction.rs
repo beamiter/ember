@@ -60,6 +60,19 @@ use jterm_core::command_correction::{
     CorrectionRequestState, HelperStrategy, LocalEvidence, CORRECTION_REQUEST_TIMEOUT,
 };
 
+/// Label for the card's primary action.
+///
+/// Derived from exactly the value the accept path takes its run-versus-insert
+/// decision from, in the same frame, so the button cannot promise one thing
+/// and the effect do the other.
+const fn primary_action_label(run_allowed: bool) -> &'static str {
+    if run_allowed {
+        "Run verified command"
+    } else {
+        "Insert for review"
+    }
+}
+
 use crate::config::Config;
 use crate::terminal::CompletedCommandEvent;
 use crate::theme::ThemeExt as _;
@@ -204,8 +217,11 @@ impl CorrectionMonitor {
                 exit_code: completed.exit_code,
                 // Whole, not pre-sampled: the engine owns the head/tail bound,
                 // and sampling twice elides real content out of the middle of
-                // the first sample.
-                output: completed.output.clone(),
+                // the first sample. Borrowed, not cloned: the engine reads the
+                // slice and drops it, so a per-command copy of up to
+                // `MAX_COMPLETED_COMMAND_OUTPUT_BYTES` never lands on the UI
+                // thread just to be declined.
+                output: &completed.output,
                 cwd: completed.cwd.clone(),
                 // Ember sessions are local PTYs; there is no remote terminal
                 // backend whose cwd namespace would disqualify local evidence.
@@ -444,11 +460,7 @@ impl CorrectionMonitor {
                     // Asked after this frame's edit was applied, so the label
                     // and the action it triggers cannot disagree: any edit
                     // downgrades a verified proposal to insert-only.
-                    let primary_label = if card.proposal.run_allowed() {
-                        "Run verified command"
-                    } else {
-                        "Insert for review"
-                    };
+                    let primary_label = primary_action_label(card.proposal.run_allowed());
                     if ui.button(primary_label).clicked() {
                         accept = true;
                     }
@@ -594,6 +606,9 @@ mod tests {
         CompletedCommandEvent {
             completed: crate::terminal::CompletedCommandOutput {
                 id: "exec-1".to_string(),
+                session_id: None,
+                seq: None,
+                started_at_ms: None,
                 command: Some(command.to_string()),
                 cwd: Some("/tmp".to_string()),
                 exit_code,
@@ -866,6 +881,215 @@ mod tests {
                 .is_generation(generation),
             "an accepted generation must never execute twice"
         );
+    }
+
+    /// Drive one headless egui frame over the card.
+    ///
+    /// The previous handoff claimed this surface "needs an Xvfb harness".
+    /// It does not: `show` takes an `&egui::Context`, and a context with a
+    /// `screen_rect` lays out and hit-tests an `egui::Window` with no
+    /// windowing system at all. Ember already had two harnesses of exactly
+    /// this shape (`ai_command_suggestion::tests::run_frame` and
+    /// `ui::tests::run_frame`); this is the third, and the focus, arming and
+    /// run-versus-insert rules are now driven rather than read.
+    ///
+    /// AccessKit is enabled so the assertions can read the button's real
+    /// rendered label instead of a value the test computes for itself.
+    fn correction_frame(
+        monitor: &mut CorrectionMonitor,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        prompt_clean_idle: bool,
+    ) -> (CorrectionUiOutcome, Vec<String>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 768.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.begin_pass(input);
+        let outcome = monitor.show(
+            ctx,
+            &crate::theme::Theme::default(),
+            Some("session-a"),
+            prompt_clean_idle,
+        );
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        let labels = output
+            .platform_output
+            .accesskit_update
+            .map(|update| {
+                update
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+                    .filter_map(|(_, node)| node.label())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (outcome, labels)
+    }
+
+    /// A verified candidate, built through the engine's own fixture
+    /// constructor so it still passes the real `validate_candidate` gate.
+    fn verified_card(monitor: &mut CorrectionMonitor) {
+        let candidate = CorrectionCandidate::for_tests(
+            jterm_core::command_correction::Original("git statsu"),
+            jterm_core::command_correction::Candidate("git status"),
+            "git status is on this host's PATH",
+            jterm_core::command_correction::CorrectionEvidence::ExecutablePath,
+        )
+        .expect("a safe rename passes the real candidate gate");
+        let entry = monitor.sessions.entry("session-a".to_string()).or_default();
+        entry.generation = entry.request_state.advance();
+        entry.original_command = "git statsu".to_string();
+        entry.exit_code = 1;
+        entry.card = Some(CorrectionCard {
+            generation: entry.generation,
+            proposal: CorrectionProposal::new(candidate),
+            armed: false,
+            focus_pending: true,
+            focus_deadline: Instant::now() + Duration::from_secs(2),
+        });
+    }
+
+    #[test]
+    fn a_verified_candidate_runs_directly_and_any_edit_downgrades_it_to_insert() {
+        // Ember's suite covered only the unverified branch, where
+        // `run_allowed` is false for structural reasons and the card can only
+        // insert. The branch that actually submits a command to the PTY —
+        // locally verified, unedited, non-dangerous — was never exercised on
+        // this surface at all, and it is the one where a divergence between the
+        // button's promise and the effect's `run` flag executes something.
+        let mut monitor = CorrectionMonitor::default();
+        verified_card(&mut monitor);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        // Frame one presents and arms; it must not consume the same input
+        // batch's Enter as approval.
+        let (outcome, labels) = correction_frame(
+            &mut monitor,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        );
+        assert_eq!(outcome, CorrectionUiOutcome::None, "the first frame arms");
+        assert!(
+            labels.iter().any(|label| label == "Run verified command"),
+            "a verified proposal must offer the run action: {labels:?}"
+        );
+        assert_eq!(
+            primary_action_label(true),
+            "Run verified command",
+            "the label the frame drew is the one this function decides"
+        );
+
+        // Frame two: the field took focus on frame one's request, so Enter is
+        // the field's key and approves.
+        let (outcome, _) = correction_frame(
+            &mut monitor,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        );
+        let CorrectionUiOutcome::Accepted(effect) = outcome else {
+            panic!("an armed, focused card must accept Enter: {outcome:?}");
+        };
+        assert_eq!(effect.command, "git status");
+        assert!(
+            effect.run,
+            "an unedited verified candidate is the one case that may run"
+        );
+
+        // The same card, edited: the run permission belongs to the exact
+        // verified string and nothing else.
+        let mut edited = CorrectionMonitor::default();
+        verified_card(&mut edited);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (_, _) = correction_frame(&mut edited, &ctx, Vec::new(), true);
+        let card = edited.sessions.get_mut("session-a").unwrap().card.as_mut();
+        let draft = card.expect("presented").proposal.draft_mut();
+        draft.clear();
+        draft.push_str("git status --short");
+        let (outcome, labels) = correction_frame(
+            &mut edited,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        );
+        assert!(
+            labels.iter().any(|label| label == "Insert for review"),
+            "an edited draft is no longer the verified string: {labels:?}"
+        );
+        let CorrectionUiOutcome::Accepted(effect) = outcome else {
+            panic!("an edited card still accepts: {outcome:?}");
+        };
+        assert_eq!(effect.command, "git status --short");
+        assert!(!effect.run, "an edited command may only be inserted");
+    }
+
+    #[test]
+    fn the_card_never_steals_a_prompt_the_user_is_typing_into() {
+        // The focus rule was covered by reading only. Driven: with the prompt
+        // not clean and idle, the field never requests focus, so the card's
+        // own Enter routing cannot claim a keystroke meant for the shell.
+        let mut monitor = CorrectionMonitor::default();
+        verified_card(&mut monitor);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let enter = || {
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        for _ in 0..3 {
+            let (outcome, _) = correction_frame(&mut monitor, &ctx, enter(), false);
+            assert_eq!(
+                outcome,
+                CorrectionUiOutcome::None,
+                "a busy prompt keeps its own Enter"
+            );
+        }
+        assert!(monitor.presented_command("session-a").is_some());
+    }
+
+    #[test]
+    fn ember_names_the_probe_thread_it_would_have_to_debug() {
+        // The engine spawns the probe's stdout reader under this name, so a
+        // stuck reader is attributable to ember in `ps`. Asserted against a
+        // literal through the accessor: comparing it to `PROBE_THREAD_NAME`
+        // would hold whatever the policy did with the value it was handed.
+        let policy = correction_policy(&enabled_config());
+        assert_eq!(policy.probe_thread_name(), "ember-command-correction-probe");
+        assert_eq!(PROBE_THREAD_NAME, policy.probe_thread_name());
     }
 
     #[test]

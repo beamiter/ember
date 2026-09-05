@@ -4,8 +4,9 @@ use super::state::TerminalApp;
 use crate::config;
 use crate::history_persistence;
 use crate::session_persistence;
-
-const MAX_WINDOW_TITLE_CHARS: usize = 200;
+// Shared with the terminal's own OSC 0/2 ingest bound, so the parser cannot
+// retain more title than this function is ever willing to display.
+use crate::terminal::MAX_WINDOW_TITLE_CHARS;
 
 /// Window titles originate in untrusted OSC output. Keep them single-line,
 /// bounded, and free of bidi override/isolate controls that could make a

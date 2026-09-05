@@ -24,14 +24,25 @@ pub const MAX_RESULTS: usize = 15;
 /// 兄弟终端写进来的 4–16 KiB cwd 抹掉，连按目录模糊召回都找不到。
 const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 
+/// 共享历史文件里一条命令的上限，取自核心自己的写入契约：
+/// `jterm_core::command_history` 的 `MAX_COMMAND_BYTES` 就是
+/// `review_input::MAX_REVIEW_INPUT_BYTES`（256 KiB），这个常量是导出的，
+/// 所以这里直接引用而不是再抄一份数字。
+///
+/// 之前这里用的是 ember 自己的 64 KiB（`review_text::MAX_HISTORY_COMMAND_BYTES`，
+/// 那是 OSC 133 重放通道的预算，不是共享文件的）：兄弟终端写进来的
+/// 64 KiB–256 KiB 命令是合法记录，读取侧却把它们整条丢掉——既不显示也不
+/// 参与模糊匹配，用户只会看到历史里少了几条，没有任何提示。
+pub(crate) const MAX_SHARED_HISTORY_COMMAND_BYTES: usize =
+    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
+
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
 /// 多行命令）——家族的 review-only 历史格式拒绝控制字符，这类文本也无法
 /// 安全地回填到提示符。
 pub fn sanitized_command(command: &str) -> Option<&str> {
     let trimmed = command.trim_matches(' ');
-    crate::review_text::validate_single_line(trimmed, crate::review_text::MAX_HISTORY_COMMAND_BYTES)
-        .ok()
+    crate::review_text::validate_single_line(trimmed, MAX_SHARED_HISTORY_COMMAND_BYTES).ok()
 }
 
 pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
@@ -49,7 +60,7 @@ pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
 /// 回填到提示符的始终是完整命令文本。
 pub fn display_command(command: &str) -> String {
     const MAX_DISPLAY_CHARS: usize = 120;
-    if command.len() > crate::review_text::MAX_HISTORY_COMMAND_BYTES {
+    if command.len() > MAX_SHARED_HISTORY_COMMAND_BYTES {
         return "(command omitted: exceeds review limit)".to_string();
     }
     let visible = crate::review_text::visible_bounded(command, 4 * 1024);
@@ -251,9 +262,37 @@ mod tests {
         assert_eq!(sanitized_command("printf safe\u{202e}txt"), None);
         assert_eq!(sanitized_command("echo\u{00a0}not-a-separator"), None);
         assert_eq!(
-            sanitized_command(&"x".repeat(crate::review_text::MAX_HISTORY_COMMAND_BYTES + 1)),
+            sanitized_command(&"x".repeat(MAX_SHARED_HISTORY_COMMAND_BYTES + 1)),
             None
         );
+    }
+
+    #[test]
+    fn the_shared_history_command_budget_is_the_core_writers_own() {
+        // 上限必须来自共享文件的写入契约，而不是 ember 自己的 OSC 133 重放
+        // 预算。之前用 64 KiB：兄弟终端按核心的 256 KiB 合法写入的记录，在
+        // ember 这一侧被整条丢掉，既不显示也不参与模糊匹配。
+        //
+        // 写成字面量而不是它自己的定义式：这个常量*就是*
+        // `jterm_core::review_input::MAX_REVIEW_INPUT_BYTES`，两者相比是
+        // `assert_eq!(x, x)`，对核心将来采用的任何值都成立。写死数字，核心
+        // 挪动预算时这里会红，而不是无声跟随。
+        assert_eq!(MAX_SHARED_HISTORY_COMMAND_BYTES, 256 * 1024);
+        let over_embers_old_budget = format!("echo {}", "x".repeat(100 * 1024));
+        assert!(over_embers_old_budget.len() > 64 * 1024);
+        assert_eq!(
+            sanitized_command(&over_embers_old_budget),
+            Some(over_embers_old_budget.as_str())
+        );
+        // 显示侧用同一个上限，否则一条可召回的记录会显示成 "(command
+        // omitted)"，用户看得到却读不懂。
+        assert!(!display_command(&over_embers_old_budget).contains("omitted"));
+
+        let state = HistoryPickerState::new(vec![record(&over_embers_old_budget, None, 0)]);
+        assert_eq!(state.entries.len(), 1);
+        // 召回那一步在 `app::commands` 里钉住
+        // （`a_shared_history_row_the_picker_lists_is_one_the_prompt_will_accept`）：
+        // 展示这一条却在回填时条条拒绝，比过去直接不展示更糟。
     }
 
     #[test]

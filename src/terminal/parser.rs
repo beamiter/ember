@@ -1,6 +1,38 @@
 use super::*;
 
 impl super::TerminalState {
+    /// Sanitise one OSC 9 / OSC 777 notification field.
+    ///
+    /// These two strings are the only PTY-authored text ember hands to a
+    /// process outside itself: they go to `notify-send` and are drawn by the
+    /// desktop's notification server, which applies none of the terminal's
+    /// own display rules. They arrived with controls and bidi overrides
+    /// intact, so `printf '\e]777;notify;<RLO>Security Update;<RLO>approve\a'`
+    /// put attacker-reordered text into a system toast, outside ember's
+    /// sanitisation boundary and wearing the desktop's chrome rather than the
+    /// terminal's.
+    ///
+    /// Offending scalars become U+FFFD rather than disappearing, so a rewritten
+    /// field reads as rewritten instead of as a shorter honest one. This is the
+    /// shared parser's `bounded_notification_field` rule, on the terminal-strict
+    /// spoofing class, since a toast is a terminal-adjacent rendered surface.
+    fn safe_notification_field(raw: &str) -> String {
+        raw.chars()
+            .map(|ch| {
+                if ch.is_control()
+                    || jterm_core::review_input::is_terminal_visual_spoofing_character(ch)
+                {
+                    '\u{fffd}'
+                } else {
+                    ch
+                }
+            })
+            .take(jterm_core::parser::MAX_NOTIFICATION_CHARS)
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    }
+
     /// Carry an unfinished escape across PTY read batches, but cap total size
     /// to avoid unbounded growth on malformed/binary streams that never send a
     /// terminator. On overflow the buffer is dropped (parser drops back to a
@@ -207,8 +239,15 @@ impl super::TerminalState {
             // `;value` part — treat those as empty.
             if let Some((command, value)) = payload.split_once(';').or(Some((payload, ""))) {
                 if command == "0" || command == "2" {
+                    // Bounded at ingest. The payload arrives from the pending
+                    // escape buffer, which tolerates megabytes before it gives
+                    // up, and the title is read back once per frame; an
+                    // unbounded copy parked in terminal state is charged twice.
+                    // The window-manager sanitiser downstream still caps the
+                    // *displayed* title, but it can only cap what it is handed.
                     self.window_title.clear();
-                    self.window_title.push_str(value);
+                    self.window_title
+                        .extend(value.chars().take(MAX_WINDOW_TITLE_CHARS));
                 } else if command == "7" {
                     // OSC 7 — current working directory.
                     // Format: file://hostname/path (path is %-encoded).
@@ -245,19 +284,39 @@ impl super::TerminalState {
                 } else if command == "9" {
                     // Desktop notification (iTerm2/ConEmu)
                     if self.pending_notifications.len() < 8 {
-                        let title = "ember".to_string();
-                        let body = value.chars().take(256).collect();
+                        let title = jterm_core::identity::get().app_name.to_owned();
+                        let body = Self::safe_notification_field(value);
                         self.pending_notifications.push((title, body));
                     }
                 } else if command == "777" {
                     // rxvt notification: 777;notify;title;body
                     let parts: Vec<&str> = value.splitn(3, ';').collect();
                     if parts.len() >= 2 && parts[0] == "notify" {
-                        let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
-                        let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                        let title = Self::safe_notification_field(parts.get(1).unwrap_or(&""));
+                        let title = if title.is_empty() {
+                            jterm_core::identity::get().app_name.to_owned()
+                        } else {
+                            title
+                        };
+                        let body = Self::safe_notification_field(parts.get(2).unwrap_or(&""));
                         if self.pending_notifications.len() < 8 {
                             self.pending_notifications.push((title, body));
                         }
+                    }
+                } else if command == "7770" {
+                    // OSC 7770 ; <session-id> — jsh announces the session that
+                    // owns this pane's execution journal. Without it a pane can
+                    // only know a session id it passed in itself as
+                    // `--session`, so a jsh the user started by hand inside
+                    // some other shell writes a journal the Commands sidebar
+                    // then reads under the wrong key and shows as empty.
+                    //
+                    // Not trimmed, not repaired: jsh's grammar is an exact
+                    // 1-128 byte ASCII token, and salvaging an invalid payload
+                    // into a valid one would name a *different* session's
+                    // journal than the shell meant.
+                    if jterm_core::execution_journal::is_valid_jsh_session_id(value) {
+                        self.announced_jsh_session_id = Some(value.to_owned());
                     }
                 } else if command == "52" {
                     self.handle_osc_52(value);

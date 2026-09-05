@@ -10,7 +10,8 @@ use super::{
     ProjectionPolicy, ProjectionViewState, RawCellAnchor, RawRowId, ScrollbackLine, TerminalCell,
     TerminalState, UnderlineStyle, FINISHED_OUTPUT_EVICTION_ROW_CHECKS,
     MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMMAND_MARKS, MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-    MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE,
+    MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_CWD_BYTES, MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE,
+    MAX_WINDOW_TITLE_CHARS,
 };
 
 fn emit_completed_block(terminal: &mut TerminalState, index: usize) -> u64 {
@@ -5548,4 +5549,482 @@ fn wide_pairing_survives_random_in_place_redraws() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OSC 133 decoder parity with `jterm_core::parser::CommandMeta::from_fields`.
+//
+// Ember owns its decoder, and the shared parser's own doc says its key aliases
+// follow this one. Where the two disagree about the same packet, one of them is
+// wrong — and ember's half now also decides whether a durable journal
+// lifecycle token exists, so a divergence here is not cosmetic.
+// ---------------------------------------------------------------------------
+
+/// One live jsh `C` packet, byte-shaped like the ones jsh emits today.
+fn jsh_start_packet(id: &str) -> Vec<u8> {
+    format!(
+        "\x1b]133;C;id={id};session_id=probe-session-1;seq=7;\
+         started_at_ms=1788571993465;cmdline_url=echo%20hello-journal;\
+         cwd_url=%2Fhome%2Fyj%2Fprojects%2Fjsh\x07"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn osc_133_start_identity_is_read_only_from_the_c_mark() {
+    // jsh sends `session_id`, `seq` and `started_at_ms` on `C` and none of
+    // them on `D`. Reading them at `D` too would let a completion packet mint
+    // an `ExecutionLifecycle` for a Start generation this terminal never
+    // observed — and that token is the capability that authorizes writing the
+    // captured output into the shell's own journal.
+    let mut terminal = TerminalState::new(40, 6);
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    terminal.process_input(&jsh_start_packet("jsh-b8c6f0d1-1"));
+    terminal.process_input(b"hello-journal\r\n");
+    terminal.process_input(
+        b"\x1b]133;D;0;id=jsh-b8c6f0d1-1;session_id=attacker;seq=99;\
+          started_at_ms=1;duration_ms=0;cwd_url=%2Fhome%2Fyj%2Fprojects%2Fjsh\x07",
+    );
+
+    let record = terminal
+        .command_record("jsh-b8c6f0d1-1")
+        .expect("shell-named record");
+    assert_eq!(record.session_id.as_deref(), Some("probe-session-1"));
+    assert_eq!(record.seq, Some(7));
+    assert_eq!(record.started_at_ms, Some(1_788_571_993_465));
+
+    let events = terminal.take_completed_command_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].session_id.as_deref(), Some("probe-session-1"));
+    assert_eq!(events[0].seq, Some(7));
+    assert_eq!(events[0].started_at_ms, Some(1_788_571_993_465));
+
+    // The same three slots on a `D` whose `C` carried none of them stay
+    // absent: there is nothing for them to have come from.
+    let mut d_only = TerminalState::new(40, 6);
+    d_only.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=jsh-d-only-1\x07");
+    d_only.process_input(
+        b"\x1b]133;D;0;id=jsh-d-only-1;session_id=probe-session-1;seq=7;\
+          started_at_ms=1788571993465\x07",
+    );
+    let record = d_only
+        .command_record("jsh-d-only-1")
+        .expect("shell-named record");
+    assert_eq!(record.session_id, None);
+    assert_eq!(record.seq, None);
+    assert_eq!(record.started_at_ms, None);
+}
+
+#[test]
+fn a_repeated_c_mark_cannot_rebind_an_observed_start_identity() {
+    // jsh emits exactly one `C` per execution. A second one carrying a
+    // different identity would otherwise re-point the durable capability at a
+    // Start generation the already-running output does not belong to.
+    let mut terminal = TerminalState::new(40, 6);
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    terminal.process_input(&jsh_start_packet("jsh-b8c6f0d1-1"));
+    terminal.process_input(
+        b"\x1b]133;C;id=jsh-b8c6f0d1-1;session_id=other-session;seq=99;\
+          started_at_ms=2\x07",
+    );
+
+    let record = terminal
+        .command_record("jsh-b8c6f0d1-1")
+        .expect("shell-named record");
+    assert_eq!(record.session_id.as_deref(), Some("probe-session-1"));
+    assert_eq!(record.seq, Some(7));
+    assert_eq!(record.started_at_ms, Some(1_788_571_993_465));
+}
+
+#[test]
+fn a_repeated_truncation_disclosure_cannot_re_enable_replay() {
+    // `command_truncated` is ember's re-run gate. Last-wins let a second
+    // `cmd_truncated=0` clear a disclosure the honest first one had set, and
+    // the block-card menu then offered to re-run a command it only has a
+    // prefix of.
+    for payload in [
+        &b"\x1b]133;C;id=trunc;cmd_truncated=1;cmd_truncated=0\x07"[..],
+        &b"\x1b]133;C;id=trunc;cmd_truncated=1;command_truncated=0\x07"[..],
+        // Aliases in the other order are equally ambiguous.
+        &b"\x1b]133;C;id=trunc;command_truncated=0;cmd_truncated=1\x07"[..],
+    ] {
+        let mut terminal = TerminalState::new(24, 4);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(payload);
+        let record = terminal.command_record("trunc").expect("record");
+        assert!(record.command_truncated, "{payload:?}");
+        assert!(record.command.is_none(), "{payload:?}");
+        assert!(!record.command_exact, "{payload:?}");
+        assert_eq!(
+            crate::block_mode::rerun_disabled_reason(
+                record.command_exact,
+                record.command_truncated,
+                false,
+            ),
+            Some("The recorded command was shortened and cannot be re-run"),
+            "{payload:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_truncation_value_fails_closed_and_a_and_b_honour_the_disclosure() {
+    // "The producer sent the disclosure but did not encode its state" is not
+    // the same as "the command is complete". And the flag used to be parsed on
+    // every mark and applied on none but `C`/`D`, so a shell that disclosed the
+    // shortening at `A` or `B` left an ordinary-looking exact command behind.
+    let mut unknown = TerminalState::new(24, 4);
+    unknown.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=u;cmd_truncated=maybe\x07");
+    let record = unknown.command_record("u").expect("record");
+    assert!(record.command_truncated);
+    assert!(!record.command_exact);
+
+    for mark in ["A", "B"] {
+        let mut terminal = TerminalState::new(24, 4);
+        terminal.process_input(format!("\x1b]133;{mark};cmd_truncated=1\x07").as_bytes());
+        terminal.process_input(b"\x1b]133;C;id=late\x07");
+        let record = terminal.command_record("late").expect("record");
+        assert!(record.command_truncated, "mark {mark}");
+        assert!(record.command.is_none(), "mark {mark}");
+        assert!(!record.command_exact, "mark {mark}");
+    }
+
+    // An explicit, unrepeated `0` still means "complete".
+    let mut complete = TerminalState::new(24, 4);
+    complete.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;C;id=ok;cmd_truncated=0;cmdline_url=echo%20hi\x07",
+    );
+    let record = complete.command_record("ok").expect("record");
+    assert!(!record.command_truncated);
+    assert!(record.command_exact);
+    assert_eq!(record.command.as_deref(), Some("echo hi"));
+}
+
+#[test]
+fn a_repeated_osc_133_slot_degrades_to_absent_instead_of_last_wins() {
+    // Aliases name one semantic slot. The payload is untrusted PTY output, so
+    // a second spelling must not overwrite the first: that is how a journal
+    // correlation id, a command, a cwd or a duration gets replaced after the
+    // honest value has already been read.
+    let mut ids = TerminalState::new(24, 4);
+    ids.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=first;jsh_id=second\x07");
+    assert!(ids.command_record("first").is_none());
+    assert!(ids.command_record("second").is_none());
+    let record = ids.command_records().back().expect("record");
+    assert_eq!(record.id, "local:1", "a repeated id slot names nothing");
+
+    let mut commands = TerminalState::new(24, 4);
+    commands.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;C;id=c;cmdline_url=echo%20a;command=echo%20b\x07",
+    );
+    let record = commands.command_record("c").expect("record");
+    assert_eq!(record.command, None);
+    assert!(!record.command_exact);
+
+    let mut cwds = TerminalState::new(24, 4);
+    cwds.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=w;cwd=%2Fa;cwd_url=%2Fb\x07");
+    assert_eq!(cwds.command_record("w").expect("record").cwd, None);
+
+    // A single duration slot is the shell's measurement and beats the
+    // terminal's own timer; a repeated one is discarded, and the record falls
+    // back to the elapsed time this terminal measured itself.
+    let mut one_duration = TerminalState::new(24, 4);
+    one_duration.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=d\x07");
+    one_duration.process_input(b"\x1b]133;D;0;id=d;duration_ms=5\x07");
+    assert_eq!(
+        one_duration
+            .command_record("d")
+            .expect("record")
+            .duration_ms,
+        Some(5)
+    );
+
+    let mut durations = TerminalState::new(24, 4);
+    durations.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=d\x07");
+    durations.process_input(b"\x1b]133;D;0;id=d;duration_ms=5;duration=9\x07");
+    let reported = durations.command_record("d").expect("record").duration_ms;
+    assert!(
+        reported != Some(5) && reported != Some(9),
+        "a repeated duration slot must not be believed: {reported:?}"
+    );
+}
+
+#[test]
+fn a_second_exit_slot_reports_no_status_rather_than_the_later_one() {
+    // A repeated outcome slot is ambiguous however either value parses, so it
+    // must not leave an apparently authoritative status behind. `D;1;exit=0`
+    // used to turn a reported failure into a reported success.
+    let cases: [(&[u8], Option<i32>); 5] = [
+        (b"\x1b]133;D;1;exit=0\x07", None),
+        (b"\x1b]133;D;0;exit=1\x07", None),
+        // A named spelling is a slot even when its value is junk, so it can
+        // neither erase nor be skipped over in favour of the positional one.
+        (b"\x1b]133;D;exit=oops;5\x07", None),
+        (b"\x1b]133;D;0;exit=oops\x07", None),
+        // A bare non-numeric field is an unknown extension flag, not an
+        // outcome, and leaves the single positional status intact.
+        (b"\x1b]133;D;0;some-flag\x07", Some(0)),
+    ];
+    for (payload, expected) in cases {
+        let mut terminal = TerminalState::new(24, 4);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=x\x07");
+        terminal.process_input(payload);
+        assert_eq!(
+            terminal.command_record("x").expect("record").exit_code,
+            expected,
+            "{payload:?}"
+        );
+    }
+}
+
+#[test]
+fn osc_133_cwd_must_pass_the_shared_journal_validator() {
+    // A recorded cwd is drawn in the pane header and the Commands sidebar, is
+    // the directory a session split from this block starts in, and is what the
+    // journal validates on its own side. `is_valid_jsh_cwd` is the family's one
+    // answer: 4 KiB, non-empty, no controls, no visual spoofing.
+    let oversized = "x".repeat(MAX_OSC_133_CWD_BYTES + 1);
+    let rejected = [
+        "%2Ftmp%2F%1bevil".to_owned(),   // an ESC inside the path
+        "%2Ftmp%2F%E2%80%AE".to_owned(), // U+202E right-to-left override
+        "%2Ftmp%2F%EF%BF%B9".to_owned(), // U+FFF9, invisible in this terminal
+        format!("%2F{oversized}"),
+        String::new(),
+    ];
+    for value in rejected {
+        let mut start = TerminalState::new(24, 4);
+        start.process_input(
+            format!("\x1b]133;A\x07$ \x1b]133;C;id=c;cwd_url={value}\x07").as_bytes(),
+        );
+        assert_eq!(
+            start.command_record("c").expect("record").cwd,
+            None,
+            "cwd_url={value}"
+        );
+
+        // The `D` cwd additionally becomes the terminal's own working
+        // directory, which is handed to the next spawned session.
+        let mut finish = TerminalState::new(24, 4);
+        finish.process_input(b"\x1b]133;A\x07$ \x1b]133;C;id=c\x07");
+        finish.process_input(format!("\x1b]133;D;0;id=c;cwd_url={value}\x07").as_bytes());
+        assert_eq!(
+            finish.command_record("c").expect("record").cwd_after,
+            None,
+            "cwd_url={value}"
+        );
+        assert_eq!(finish.current_working_dir, None, "cwd_url={value}");
+    }
+
+    let mut accepted = TerminalState::new(24, 4);
+    accepted.process_input(
+        b"\x1b]133;A\x07$ \x1b]133;C;id=c;cwd_url=%2Fhome%2Fyj%2Fmy%20project%2F%E9%9B%AA\x07",
+    );
+    assert_eq!(
+        accepted.command_record("c").expect("record").cwd.as_deref(),
+        Some("/home/yj/my project/雪"),
+    );
+}
+
+#[test]
+fn osc_133_field_budgets_are_the_shared_parsers() {
+    // Ember kept a fourth set of per-field caps (64 KiB command, 16 KiB cwd,
+    // 256 B id). Diverging from the shared parser makes the two disagree about
+    // whether a packet carried a field at all, and ember's decode is now what
+    // the journal lifecycle is built from.
+    //
+    // Spelled as numbers rather than as the expressions that define them:
+    // these constants *are* `jterm_core::parser::MAX_OSC133_*`, so comparing
+    // the two is `assert_eq!(x, x)` and holds for whatever value the core
+    // adopts next — including one nobody here reviewed. The literals make a
+    // core budget move a failing test in ember rather than a silent follow.
+    assert_eq!(MAX_OSC_133_COMMAND_BYTES, 16 * 1024);
+    assert_eq!(MAX_OSC_133_ID_BYTES, 1024);
+    assert_eq!(MAX_OSC_133_CWD_BYTES, 4 * 1024);
+
+    let at_limit = "a".repeat(MAX_OSC_133_COMMAND_BYTES);
+    let mut exact = TerminalState::new(24, 4);
+    exact.process_input(
+        format!("\x1b]133;A\x07$ \x1b]133;C;id=c;cmdline_url={at_limit}\x07").as_bytes(),
+    );
+    let record = exact.command_record("c").expect("record");
+    assert_eq!(record.command.as_deref(), Some(at_limit.as_str()));
+    assert!(record.command_exact);
+
+    // One byte over is disclosed as truncated, never handed on as a prefix.
+    let over_limit = "a".repeat(MAX_OSC_133_COMMAND_BYTES + 1);
+    let mut over = TerminalState::new(24, 4);
+    over.process_input(
+        format!("\x1b]133;A\x07$ \x1b]133;C;id=c;cmdline_url={over_limit}\x07").as_bytes(),
+    );
+    let record = over.command_record("c").expect("record");
+    assert_eq!(record.command, None);
+    assert!(record.command_truncated);
+    assert!(!record.command_exact);
+
+    let long_id = "i".repeat(MAX_OSC_133_ID_BYTES);
+    let mut id_ok = TerminalState::new(24, 4);
+    id_ok.process_input(format!("\x1b]133;A\x07$ \x1b]133;C;id={long_id}\x07").as_bytes());
+    assert!(id_ok.command_record(&long_id).is_some());
+
+    let too_long_id = "i".repeat(MAX_OSC_133_ID_BYTES + 1);
+    let mut id_over = TerminalState::new(24, 4);
+    id_over.process_input(format!("\x1b]133;A\x07$ \x1b]133;C;id={too_long_id}\x07").as_bytes());
+    assert!(id_over.command_record(&too_long_id).is_none());
+}
+
+#[test]
+fn an_execution_id_carrying_invisible_text_is_refused() {
+    // Ids are rendered — the Commands sidebar and block export both print
+    // them — and are how a user tells one block from its neighbour. The shared
+    // parser refuses the visual-spoofing class here; ember checked only for
+    // control characters.
+    for encoded in ["jsh%E2%80%AE1", "jsh%E2%80%8B1", "jsh%EF%BF%B91"] {
+        let mut terminal = TerminalState::new(24, 4);
+        terminal.process_input(format!("\x1b]133;A\x07$ \x1b]133;C;id={encoded}\x07").as_bytes());
+        let record = terminal.command_records().back().expect("record");
+        assert_eq!(record.id, "local:1", "id={encoded}");
+    }
+}
+
+#[test]
+fn a_jsh_session_announce_is_learned_and_a_malformed_one_is_ignored() {
+    // OSC 7770 is how a pane learns which journal its shell writes when ember
+    // did not spawn that shell itself with `--session`. Without it the
+    // Commands sidebar reads under the pane's own id and finds nothing.
+    let mut terminal = TerminalState::new(24, 4);
+    assert_eq!(terminal.announced_jsh_session_id, None);
+    terminal.process_input(b"\x1b]7770;jsh-cbf29ce484222325-1c3a36\x07");
+    assert_eq!(
+        terminal.announced_jsh_session_id.as_deref(),
+        Some("jsh-cbf29ce484222325-1c3a36")
+    );
+
+    // Nothing here is trimmed or repaired into a valid id: salvaging a
+    // malformed payload would name a different session's journal than the
+    // shell meant, and the last valid announce stays authoritative.
+    let oversized = "s".repeat(jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES + 1);
+    for hostile in [
+        "",
+        " jsh-1 ",
+        "../other",
+        "jsh 1",
+        "jsh/1",
+        "jsh\u{202e}1",
+        oversized.as_str(),
+    ] {
+        terminal.process_input(format!("\x1b]7770;{hostile}\x07").as_bytes());
+        assert_eq!(
+            terminal.announced_jsh_session_id.as_deref(),
+            Some("jsh-cbf29ce484222325-1c3a36"),
+            "hostile={hostile:?}"
+        );
+    }
+}
+
+#[test]
+fn osc_7_cwd_is_bounded_and_refuses_ambiguous_paths() {
+    // This value is cloned onto every command record, text-shaped in the
+    // bottom bar and pane header each frame, and handed to the child of a new
+    // session as its working directory. It was stored with no length bound and
+    // no character rule at all.
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]7;file:///home/yj/work\x07");
+    assert_eq!(
+        terminal.current_working_dir.as_deref(),
+        Some("/home/yj/work")
+    );
+
+    let oversized = "x".repeat(MAX_OSC_133_CWD_BYTES + 1);
+    for hostile in [
+        format!("file:///{oversized}"),
+        // Longer than any path could decode to: refused before it is decoded.
+        format!(
+            "file:///{}",
+            "%41".repeat(TerminalState::MAX_OSC7_URI_BYTES)
+        ),
+        "file:///tmp/\u{202e}gnp.exe".to_owned(),
+        "file:///tmp/\u{200b}hidden".to_owned(),
+        "file:///tmp/%1bevil".to_owned(),
+        "file:".to_owned(),
+    ] {
+        terminal.process_input(b"\x1b]7;file:///home/yj/work\x07");
+        terminal.process_input(format!("\x1b]7;{hostile}\x07").as_bytes());
+        // A refused announcement clears rather than retains: the shell has
+        // just said it is somewhere else, so continuing to assert the previous
+        // directory would be a worse answer than having none. `None` is a
+        // defined state — the session manager falls back to `/proc/<pid>/cwd`.
+        assert_eq!(terminal.current_working_dir, None, "hostile={hostile:?}");
+    }
+}
+
+#[test]
+fn desktop_notification_fields_leave_the_terminal_sanitised() {
+    // OSC 9/777 text is the only PTY-authored string ember hands to another
+    // process: it goes to `notify-send` and is drawn by the desktop's
+    // notification server, which applies none of this terminal's display
+    // rules. It used to arrive there with controls and bidi overrides intact.
+    let app_name = jterm_core::identity::get().app_name;
+
+    let mut rxvt = TerminalState::new(24, 4);
+    rxvt.process_input("\x1b]777;notify;\u{202e}Security Update;\u{202e}approve\u{7}".as_bytes());
+    assert_eq!(
+        rxvt.pending_notifications,
+        vec![(
+            "\u{fffd}Security Update".to_owned(),
+            "\u{fffd}approve".to_owned()
+        )]
+    );
+
+    let mut iterm = TerminalState::new(24, 4);
+    iterm.process_input(b"\x1b]9;build \x07");
+    assert_eq!(
+        iterm.pending_notifications,
+        vec![(app_name.to_owned(), "build".to_owned())]
+    );
+
+    // An absent title still leaves the toast attributable to this app rather
+    // than to whatever the desktop decides to show for a blank one.
+    let mut anonymous = TerminalState::new(24, 4);
+    anonymous.process_input(b"\x1b]777;notify;;body\x07");
+    assert_eq!(
+        anonymous.pending_notifications,
+        vec![(app_name.to_owned(), "body".to_owned())]
+    );
+
+    // A title made only of invisible scalars keeps its replacement glyphs: the
+    // toast must read as rewritten, not as a shorter honest one. This is the
+    // shared parser's rule, and it is why a title is only *replaced* when it
+    // is genuinely empty.
+    let mut invisible = TerminalState::new(24, 4);
+    invisible.process_input("\x1b]777;notify;\u{200b};body\u{7}".as_bytes());
+    assert_eq!(
+        invisible.pending_notifications,
+        vec![("\u{fffd}".to_owned(), "body".to_owned())]
+    );
+
+    // Bounded at ingest, in characters, exactly as the shared parser bounds it.
+    let mut long = TerminalState::new(24, 4);
+    let body = "b".repeat(jterm_core::parser::MAX_NOTIFICATION_CHARS + 32);
+    long.process_input(format!("\x1b]9;{body}\x07").as_bytes());
+    assert_eq!(
+        long.pending_notifications[0].1.chars().count(),
+        jterm_core::parser::MAX_NOTIFICATION_CHARS
+    );
+}
+
+#[test]
+fn the_window_title_is_bounded_where_it_enters_terminal_state() {
+    // The OSC payload arrives from a pending-escape buffer that tolerates
+    // megabytes, and the title is read back once per frame. The displayed
+    // title was already capped; what was stored was not.
+    let mut terminal = TerminalState::new(24, 4);
+    let long = "t".repeat(MAX_WINDOW_TITLE_CHARS * 4);
+    terminal.process_input(format!("\x1b]2;{long}\x07").as_bytes());
+    assert_eq!(
+        terminal.window_title.chars().count(),
+        MAX_WINDOW_TITLE_CHARS
+    );
+
+    terminal.process_input(b"\x1b]0;short\x07");
+    assert_eq!(terminal.window_title, "short");
 }

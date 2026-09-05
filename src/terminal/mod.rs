@@ -87,8 +87,28 @@ struct ViewportMappingExactCache {
 /// separately, so even an untrusted process attached to the PTY cannot grow
 /// terminal state without limit.
 pub const MAX_COMMAND_MARKS: usize = 1024;
-const MAX_OSC_133_COMMAND_BYTES: usize = 64 * 1024;
-const MAX_OSC_133_ID_BYTES: usize = 256;
+/// Window titles are bounded where they enter terminal state, not only where
+/// they are drawn: `app::window::safe_window_title` caps the *displayed*
+/// title at the same number, but it can only cap the string it is handed, and
+/// an OSC 0/2 payload arrives from a pending-escape buffer that tolerates
+/// megabytes.
+pub(crate) const MAX_WINDOW_TITLE_CHARS: usize = 200;
+/// OSC 133 per-field byte budgets are the shared protocol's constants, not a
+/// fourth per-app set. Ember's decoder and `jterm_core::parser::CommandMeta`
+/// read the same packets, so a cap that differs makes the two disagree about
+/// whether a packet carried a command, a cwd or an id at all — and the journal
+/// lifecycle token minted from ember's decode would then bind durable output to
+/// identity the core writer re-derives differently. Ember's own numbers were
+/// looser than anything jsh emits (64 KiB command, 16 KiB cwd).
+///
+/// The id budget is core's generic-FinalTerm one, deliberately wider than the
+/// 192-byte `is_valid_jsh_execution_id` grammar: an opaque id from a non-jsh
+/// shell still names a block in the timeline, and only the journal path is
+/// gated on the narrower jsh token.
+const MAX_OSC_133_COMMAND_BYTES: usize = jterm_core::parser::MAX_OSC133_COMMAND_BYTES;
+const MAX_OSC_133_ID_BYTES: usize = jterm_core::parser::MAX_OSC133_ID_BYTES;
+const MAX_OSC_133_CWD_BYTES: usize = jterm_core::parser::MAX_OSC133_CWD_BYTES;
+const MAX_OSC_133_SESSION_ID_BYTES: usize = jterm_core::parser::MAX_OSC133_SESSION_ID_BYTES;
 const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
 const MAX_CONSUMED_COMMAND_IDS: usize = MAX_COMMAND_MARKS;
 pub const MAX_COMPLETED_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
@@ -147,6 +167,20 @@ pub struct CommandRecord {
     /// Working directory reported after the command finished (OSC 133 D).
     /// Kept separate so a stateful `cd` cannot rewrite execution provenance.
     pub cwd_after: Option<String>,
+    /// jsh's persistent session identity, observed on the OSC 133 `C` mark.
+    ///
+    /// This and the two fields below are the Start-identity triple that
+    /// [`jterm_core::execution_journal::ExecutionLifecycle`] demands alongside
+    /// `id` before durable output may be written. jsh emits all three on `C`
+    /// and none of them on `D`, and the shared parser accepts them only there,
+    /// so they are captured at output start and never minted or replaced at
+    /// completion: a token assembled from metadata seen at two different times
+    /// would bind captured output to a Start generation nobody observed.
+    pub session_id: Option<String>,
+    /// Shell-local sequence number of this exact Start generation.
+    pub seq: Option<u64>,
+    /// Wall-clock start identity copied from jsh's own journal Start.
+    pub started_at_ms: Option<u64>,
     pub prompt_start: BufferAnchor,
     pub command_start: Option<BufferAnchor>,
     pub output_start: Option<BufferAnchor>,
@@ -188,6 +222,12 @@ pub struct ExtractedText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedCommandOutput {
     pub id: String,
+    /// Start identity observed on this execution's OSC 133 `C` mark. All three
+    /// must be present, together with a jsh-shaped `id`, before the execution
+    /// journal will accept the captured output; see [`CommandRecord::session_id`].
+    pub session_id: Option<String>,
+    pub seq: Option<u64>,
+    pub started_at_ms: Option<u64>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub exit_code: Option<i32>,
@@ -504,7 +544,18 @@ pub struct TerminalState {
     current_fg: Color,
     current_bg: Color,
     current_flags: StyleFlags,
+    /// Window title from OSC 0/2, bounded at ingest to
+    /// [`MAX_WINDOW_TITLE_CHARS`]. Still untrusted text — the window-manager
+    /// sanitiser owns bidi/control filtering — but no longer unbounded.
     pub window_title: String,
+    /// jsh's own session identity as announced over OSC 7770, when the shell
+    /// in this pane announced one.
+    ///
+    /// Ember passes `--session <its own id>` when *it* spawns jsh, so this is
+    /// normally the same value. It is not when the shell reached jsh some
+    /// other way — a jsh started by hand inside bash, or over ssh — and then
+    /// this is the only key under which that pane's execution journal exists.
+    pub announced_jsh_session_id: Option<String>,
     /// Working directory reported by the shell via OSC 7
     /// (`ESC ] 7 ; file://host/path ST`). Optional because many shells need
     /// PROMPT_COMMAND wiring to emit it. When absent the session manager

@@ -919,6 +919,30 @@ the prompt, `C` when execution begins, and `D;<exit>` when it ends. Optional
 command/cwd/id fields improve replay and lifecycle diagnostics, but they never
 authorize execution unless Ember captured them exactly.
 
+Every metadata key names one slot, and a slot may be filled once. `id`,
+`jsh_id`, `execution_id` and `command_id` are the same slot; so are
+`cmdline_url`/`command_url`/`command`/`cmdline`, `cwd`/`cwd_url`,
+`duration`/`duration_ms` and `cmd_truncated`/`command_truncated`. A repeated
+slot is treated as absent rather than as its last value — except
+`cmd_truncated`, where a repeat means truncated, because "absent" would claim a
+shortened command is complete and re-enable Run Again on a prefix. A `D` packet
+may carry one exit status, positionally or named; a second one reports no
+status at all rather than letting `D;1;exit=0` show a failure as a success.
+
+Writing to jsh's durable execution journal needs more than an id. `C` must
+carry `id`, `session_id`, `seq` and `started_at_ms` together — jsh sends all
+four — and Ember captures that identity at `C` only. jsh sends none of the
+three extra slots on `D`, so a completion packet can never mint one; a
+lifecycle assembled there would name a start generation the terminal never
+saw. A shell that reports no identity still gets blocks, badges, history and
+replay; it just contributes no journal rows.
+
+jsh also announces which session owns its journal with `OSC 7770;<session-id>`.
+Ember passes `--session` when it launches jsh itself, but a jsh started by hand
+inside another shell owns a different journal; the announce is how the pane's
+Commands sidebar finds it instead of reading an empty history under the pane's
+own id.
+
 ## Installing and updating jsh
 
 ember prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
@@ -1244,7 +1268,16 @@ effects.
 - Instance locks and execution journals reject symbolic links, hard links and
   non-regular files before mutation.
 - Desktop notifications use a bounded worker and always reap or time out the
-  external `notify-send` helper.
+  external `notify-send` helper. OSC 9 and OSC 777 title and body are sanitised
+  and length-bounded where the terminal parses them: they are drawn by the
+  desktop's notification server, which applies none of the terminal's own
+  display rules, so control characters and bidi overrides are replaced with
+  U+FFFD rather than forwarded.
+- Working directories reported by the shell — OSC 7 and the OSC 133 `C`/`D`
+  `cwd` field — are bounded and refuse control characters and invisible or
+  bidirectional formatting. A recorded cwd is drawn in the pane header and is
+  the directory a session split from that block starts in, so its displayed
+  spelling has to be the directory it names.
 - Custom-theme names are restricted to one safe filename component; theme
   saves replace symlinks rather than following them outside the theme directory.
 - Link targets are shown before opening and require `Ctrl+Click`.
@@ -1310,7 +1343,20 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo build --workspace --release --all-features
 bash scripts/test-install-paths.sh
+bash scripts/security-check.sh
 ```
+
+`scripts/security-check.sh` is the dependency and shell-script gate. `--policy`
+runs `cargo metadata --locked`, `cargo deny --locked check` against
+[`deny.toml`](deny.toml) — licence allow-list, wildcard ban, and an `allow-git`
+list that pins the exact `jterm_core` and `jagent` revisions — and
+`cargo tree --locked --duplicates`. `--audit` runs `cargo audit --deny
+warnings`, so a new unmaintained, unsound or yanked advisory fails rather than
+being reported and ignored; the exceptions live in
+[`.cargo/audit.toml`](.cargo/audit.toml) and are held identical to
+`deny.toml`'s. `--shell` runs `bash -n` and `shellcheck` over every script
+below `scripts/`, including the installer ember ships. It needs `cargo-deny`
+0.20.2, `cargo-audit` 0.22.2 and the distribution's `shellcheck`.
 
 Criterion benchmarks, including deep-scrollback resize/reflow with a forced
 viewport cache miss, live in `benches/terminal_benchmark.rs`:
@@ -1319,7 +1365,9 @@ viewport cache miss, live in `benches/terminal_benchmark.rs`:
 cargo bench
 ```
 
-GitHub Actions runs formatting, Clippy, tests and a release build. Please add a
+GitHub Actions runs formatting, Clippy, tests and a release build, and a
+separate scheduled workflow runs the RustSec audit through
+`scripts/security-check.sh --audit`. Please add a
 focused regression test for parser, input or persistence changes whenever the
 behavior can be exercised without a desktop session.
 

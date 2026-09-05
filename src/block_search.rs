@@ -248,6 +248,20 @@ pub struct BlockSearchState {
     pub query_error: Option<String>,
     /// Bounded cache, oldest record first.
     pub cache: Vec<CachedBlockSearchRecord>,
+    /// Execution id → terminal-owned sequence, for every completed record of
+    /// the cached session. Bookmarks are keyed by sequence while hits and the
+    /// cache are keyed by id, so this is the join between them.
+    ///
+    /// Built with the cache, from the same locked pass over the record deque,
+    /// and invalidated with it. The overlay used to rebuild this map from
+    /// scratch on every rendered frame — up to `MAX_COMMAND_MARKS` `String`
+    /// clones under the terminal mutex, immediately beside the cache that
+    /// exists so exactly that work happens once per record change.
+    ///
+    /// Shared rather than owned so the render pass can hold a snapshot of it
+    /// across the picker window's closure, which needs `&mut self`, without
+    /// copying the ids back out again.
+    pub record_sequences: std::sync::Arc<std::collections::HashMap<String, u64>>,
     /// Session the current `hits` AND `cache` were computed against. A tab
     /// switch while the picker is open invalidates both.
     pub session_id: Option<String>,
@@ -308,6 +322,7 @@ impl BlockSearchState {
         self.older_not_indexed = false;
         self.query_error = None;
         self.cache = Vec::new();
+        self.record_sequences = std::sync::Arc::default();
         self.session_id = None;
         self.record_version = None;
         self.bookmark_revision = None;
@@ -325,6 +340,7 @@ impl BlockSearchState {
         // Retain only matching intent while closed. Results/cache can hold a
         // large slice of scrollback and pane identities are stale on reopen.
         self.cache = Vec::new();
+        self.record_sequences = std::sync::Arc::default();
         self.hits = Vec::new();
         self.capped = false;
         self.older_not_indexed = false;
@@ -394,6 +410,7 @@ impl BlockSearchState {
     /// reevaluate the user's current intent.
     pub fn release_index_for_rebuild(&mut self) {
         self.cache = Vec::new();
+        self.record_sequences = std::sync::Arc::default();
         self.hits = Vec::new();
         self.capped = false;
         self.older_not_indexed = false;
@@ -607,6 +624,55 @@ mod tests {
             match_span: None,
             line_text: String::new(),
             command_preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_record_sequence_join_is_released_with_the_index_it_joins_to() {
+        // Bookmarks are keyed by the terminal's monotonic sequence while hits
+        // and the cache are keyed by execution id, so the overlay needs this
+        // join on every frame it paints. It used to be rebuilt from the live
+        // record deque each frame — up to `MAX_COMMAND_MARKS` id clones under
+        // the terminal mutex — right beside the cache that exists so exactly
+        // that work happens once per record change.
+        //
+        // Moving it into the cache is only correct while the two are
+        // invalidated together, and there are three ways the cache goes away,
+        // not one. A join that outlived its cache would resolve a hit's id
+        // against a different generation of the record deque and the bookmark
+        // star would follow the wrong block; a join that outlived a *closed*
+        // picker is the same stale generation held resident for the rest of
+        // the process — up to `MAX_COMMAND_MARKS` ids of `MAX_OSC_133_ID_BYTES`
+        // each, which is exactly the retention `close` drops the cache to
+        // avoid.
+        let indexed = || BlockSearchState {
+            cache: vec![CachedBlockSearchRecord::new("kept", Some("build"), None)],
+            record_sequences: std::sync::Arc::new(std::collections::HashMap::from([(
+                "kept".to_string(),
+                7u64,
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(indexed().record_sequences.get("kept"), Some(&7));
+
+        for (name, release) in [
+            (
+                "release_index_for_rebuild",
+                BlockSearchState::release_index_for_rebuild as fn(&mut BlockSearchState),
+            ),
+            ("open", BlockSearchState::open as fn(&mut BlockSearchState)),
+            (
+                "close",
+                BlockSearchState::close as fn(&mut BlockSearchState),
+            ),
+        ] {
+            let mut state = indexed();
+            release(&mut state);
+            assert!(state.cache.is_empty(), "{name} must drop the cache");
+            assert!(
+                state.record_sequences.is_empty(),
+                "{name}: the id-to-sequence join must not survive the cache it belongs to"
+            );
         }
     }
 

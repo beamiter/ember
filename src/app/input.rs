@@ -2344,12 +2344,14 @@ impl TerminalApp {
         let window_title = if private_title {
             "Private — Ember".to_string()
         } else {
-            let reported_window_title = {
-                let terminal = session.terminal.lock();
-                terminal.window_title.clone()
-            };
+            // The fallback is computed first, outside the lock, because it
+            // reads `/proc/<pid>/cwd`. Inside the lock the reported title is
+            // only borrowed: it used to be deep-cloned every frame, on the
+            // terminal mutex the PTY thread also needs, purely so the very
+            // next call could throw all but 200 characters of it away.
             let fallback_title = format!("{} — Ember", Self::session_cwd_title(session));
-            super::window::safe_window_title(&reported_window_title, &fallback_title)
+            let terminal = session.terminal.lock();
+            super::window::safe_window_title(&terminal.window_title, &fallback_title)
         };
         if window_title != self.last_window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (visible workflow refusal diagnostics)
+Updated: 2026-09-05 (shared-core repin `9f94f77`; journal lifecycle tokens)
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
@@ -9,6 +9,163 @@ identities are checked, and terminal-controlled clipboard and link capabilities
 fail closed.
 
 ## Completed since the previous handoff
+
+- **The execution journal now takes a lifecycle token, not an id
+  (2026-09-05)**: `jterm_core::execution_journal::CompletedExecution` dropped
+  its `id: String` for an `ExecutionLifecycle` whose fields are private and
+  whose only constructor is `from_command_meta`, which returns `None` unless
+  `id` (valid per `is_valid_jsh_execution_id`), `session_id` (valid per
+  `is_valid_jsh_session_id`), `seq` and `started_at_ms` all arrived on one OSC
+  133 `C` packet. Ember owns its decoder, so it now reads those three
+  Start-identity slots and honours them on `C` only — mirroring the shared
+  parser's `accept_start_identity`. jsh emits none of the three on `D`, and the
+  core parser refuses them there, so a lifecycle minted at completion would
+  name a Start generation nobody observed; a `D` `id` may still be compared,
+  never used to mint. The triple is carried on `CommandRecord` (set only in
+  `record_output_start`) and on `CompletedCommandOutput`, and is captured on the
+  *first* `C` a record sees: jsh sends exactly one, and a second carrying a
+  different session, sequence or timestamp would otherwise rebind an
+  already-observed Start to output captured for the first. `src/execution_journal.rs`
+  builds a `CommandMeta` from those four fields and returns `Ok(())` when the
+  constructor declines, so ember's own `local:{sequence}` ids — which
+  `is_valid_jsh_execution_id` rejects for the colon — produce no journal row
+  rather than a mis-keyed one. Ember is the only app in the family that reads
+  the journal back (`request_history`, feeding the Commands sidebar), so this
+  is the app whose visible feature regresses if the binding is wrong.
+
+- **OSC 7770 is decoded, and the Commands sidebar reads the journal the shell
+  actually writes (2026-09-05)**: ember ignored jsh's session-id announce
+  entirely and asked the journal for its *own* pane id. That is only the right
+  key when ember spawned jsh itself with `--session`; a jsh started by hand
+  inside another shell owns a different journal, and the sidebar read an empty
+  history under a key nothing had ever written. The announce is validated with
+  `is_valid_jsh_session_id` and never trimmed or repaired — salvaging a
+  malformed payload would name a different session's journal than the shell
+  meant. The sidebar cache now keys on the pane id (which every `CommandTarget`
+  carries) *and* on the journal id it actually requested, so learning an
+  identity mid-life invalidates the cache rather than mixing two shells' rows.
+
+- **The OSC 133 decoder is single-assignment per slot (2026-09-05)**: aliases
+  name one semantic slot, and the payload is untrusted PTY output, so a
+  repeated slot now degrades to absent instead of last-wins. Concretely: a
+  second `cmd_truncated=0` used to clear a disclosure the honest first one had
+  set, and `command_truncated` is the block menu's re-run gate
+  (`rerun_disabled_reason`), so that re-enabled replay of a command ember only
+  has a prefix of — a repeat now means truncated, which is the direction that
+  fails closed. An unrecognised `cmd_truncated` value is inexact rather than
+  the default `false` that claims a command is complete, and the disclosure is
+  honoured on `A` and `B` too, where it used to be parsed and then dropped. A
+  second exit slot reports no status at all, so a trailing `exit=0` on
+  `D;1;…` can no longer flip a reported failure to success, and a named exit
+  spelling counts as a slot even when its value is junk while a bare
+  non-numeric field stays an unknown extension flag. This is
+  `CommandMeta::from_fields`'s rule; the shared parser's doc says its aliases
+  follow ember's decoder, so the two disagreeing was a defect in one of them.
+
+- **One set of OSC 133 budgets, and one rule for a recorded cwd (2026-09-05)**:
+  the per-field caps are now `jterm_core::parser::MAX_OSC133_*` rather than a
+  fourth per-app set (ember's were 64 KiB command, 16 KiB cwd, 256 B id — the
+  first two looser than anything jsh emits). A cap that differs from the shared
+  parser's makes the two disagree about whether a packet carried a field at
+  all, and ember's decode is now what a journal lifecycle is built from. The
+  id budget widens from 256 B to core's generic-FinalTerm 1 KiB; the durable
+  path is unaffected because `is_valid_jsh_execution_id` gates it at 192 B.
+  Every recorded cwd — OSC 133 `C` and `D`, and OSC 7 — goes through
+  `is_valid_jsh_cwd`, which bundles the 4 KiB budget, non-emptiness, control
+  rejection and the visual-spoofing rule. That value is drawn in the pane
+  header and Commands sidebar, cloned onto every command record, and handed to
+  a new session as the directory its shell starts in; OSC 7 stored it with no
+  length bound and no character rule at all. A refused announce clears the
+  recorded cwd rather than retaining the previous one: the session manager
+  falls back to `/proc/<pid>/cwd`, which is a better answer than continuing to
+  assert a directory the shell has just left. Execution ids are held to the
+  shared parser's visual-spoofing rule as well; ember checked only for
+  controls, and ids are printed in the sidebar and in block exports.
+
+- **Text that leaves the terminal is sanitised where it leaves (2026-09-05)**:
+  OSC 9 / OSC 777 notification title and body reached `notify-send` with
+  control and bidi-override characters intact —
+  `printf '\e]777;notify;<RLO>Security Update;<RLO>approve\a'` put
+  attacker-reordered text into a desktop toast wearing the desktop's chrome
+  and outside ember's own sanitisation boundary. Both fields now go through the
+  shared review-input class at ingest, with offending scalars replaced by
+  U+FFFD so a rewritten field reads as rewritten, bounded to the shared
+  `MAX_NOTIFICATION_CHARS`, and an absent title falls back to the app identity
+  so the toast stays attributable. The Commands-sidebar command preview moved
+  to `is_terminal_visual_spoofing_character`, newly public this round: it draws
+  shell-reported text beside a Run Again action, and `U+FFF9..=U+FFFB` render
+  as nothing in this family's surfaces exactly as a zero-width space does.
+
+- **Three per-frame costs on the terminal mutex (2026-09-05)**: the OSC 0/2
+  window title is bounded where it enters terminal state (the OSC arrives from
+  a pending-escape buffer that tolerates megabytes; only the *displayed* title
+  was capped) and is no longer deep-cloned under the lock once a frame — the
+  fallback is computed outside the lock and the reported title is borrowed.
+  `/etc/hostname` is resolved once per process instead of being opened and read
+  from the PTY parse loop for every OSC 7 naming a non-local host, which a
+  remote shell emits on every prompt. The Block Search overlay's
+  id-to-sequence join is built with the cache, in the same locked pass that
+  builds it, instead of being rebuilt from the live record deque — up to
+  `MAX_COMMAND_MARKS` `String` clones — on every rendered frame beside the
+  cache that exists to make that work happen once per record change. The one
+  question the cache cannot answer, "is any bookmark still on a live block?",
+  is answered by scanning the deque without allocating. The join is dropped on
+  every path that drops the cache — `release_index_for_rebuild`, `open` and
+  `close` — not only the rebuild one: a join that outlives its cache resolves a
+  hit's id against a different generation of the record deque, and after
+  `close` it is also the retention `close` exists to avoid, up to
+  `MAX_COMMAND_MARKS` ids of `MAX_OSC_133_ID_BYTES` each held for the rest of
+  the process.
+
+- **`CompletionFacts` borrows the captured output (2026-09-05)**: the field is
+  now `&'a str`, so the correction monitor no longer copies up to
+  `MAX_COMPLETED_COMMAND_OUTPUT_BYTES` on the UI thread for an engine that may
+  decline the command outright.
+
+- **The shared-history picker uses the core writer's budget (2026-09-05)**:
+  `sanitized_command` and `display_command` capped at ember's own 64 KiB OSC
+  133 replay budget, so records the sibling terminals write legally under
+  `jterm_core::command_history`'s 256 KiB limit were dropped whole on read —
+  neither shown nor fuzzy-matched, with no diagnostic. Same shape as the 4 KiB
+  → 16 KiB cwd correction already recorded in that file. The recall side moved
+  with the listing side: the prompt-fill funnel validates against
+  `app::commands::PROMPT_FILL_MAX_COMMAND_BYTES`, which is that same shared-file
+  contract, so a row the picker now lists is a row Enter can actually fill.
+  Widening only the listing budget would have replaced a silently dropped
+  record with a visible, selectable, permanently un-recallable one that answers
+  every Enter with "the command exceeds the 65536-byte limit". Block recall is
+  a different writer and keeps the journal's own 64 KiB budget, now spelled at
+  each `prepare_replay_command` call rather than baked into it.
+
+- **ember has a supply-chain gate (2026-09-05)**: `deny.toml`,
+  `.cargo/audit.toml` and `scripts/security-check.sh`, modelled on frost's.
+  The `allow-git` entries pin both new revisions, the licence allow-list adds
+  `OFL-1.1` and `Ubuntu-font-1.0` for the faces egui bundles in
+  `epaint_default_fonts`, and the single advisory exception is
+  `RUSTSEC-2026-0192` (`ttf-parser` unmaintained, reached twice and
+  unavoidably through `fontdue` and `ab_glyph`), held identical in both files
+  so a *different* advisory still fails closed. `cargo audit` runs with
+  `--deny warnings`, which ember's CI did not do, and the installer,
+  uninstaller and their path test are shellchecked by the same entry point
+  that ships them. The `jterm_core` dependency gained `version = "0.2.0"`
+  alongside its `rev`, matching forge and frost, so cargo-deny's wildcard ban
+  is satisfied.
+
+- **The correction card is driven, not read (2026-09-05)**: the previous
+  handoff's claim that this surface "needs an Xvfb harness" was wrong, and is
+  retracted. `show` takes an `&egui::Context`, and a context with a
+  `screen_rect` lays out and hit-tests an `egui::Window` with no windowing
+  system; ember already had two harnesses of exactly this shape
+  (`ai_command_suggestion::tests::run_frame`, `ui::tests::run_frame`). The new
+  third one enables AccessKit so the assertions read the button's real rendered
+  label. It drives the *verified* branch — the one that actually submits to the
+  PTY, and the one no app in the family covered — through
+  `CorrectionCandidate::for_tests`, which runs the real `validate_candidate`
+  gate: frame one presents and arms (and must not consume the same input
+  batch's Enter), frame two accepts on the focused field's Enter with
+  `run: true`, and an edited draft relabels to "Insert for review" and accepts
+  with `run: false`. A separate test drives the focus rule: with the prompt not
+  clean and idle, three frames of Enter change nothing.
 
 - **Rejected workflows are visible in the graphical session (2026-08-30)**:
   opening the picker now retains a bounded snapshot of candidate files the
@@ -814,6 +971,62 @@ fail closed.
 
 ## Remaining boundaries
 
+- **This round is uncommitted and unstaged.** `Cargo.toml`, `Cargo.lock`,
+  `deny.toml`, `.cargo/audit.toml`, `scripts/security-check.sh`,
+  `.github/workflows/security.yml`, `src/execution_journal.rs`,
+  `src/terminal/{mod,parser,state,tests}.rs`, `src/app/{commands,input,
+  rendering,window}.rs`, `src/block_search.rs`, `src/command_correction.rs`,
+  `src/history_picker.rs`, `src/main.rs`, `src/agent_panel.rs` and the three
+  docs are modified in the working tree. The core pin is *not* outstanding:
+  `jterm_core` moved to `9f94f77b694ef5e0b20b9fd4bd776b98220360c4` and
+  transitively `jagent` to `bdc8023faa535ee00bb972cdb0adc11ba280fdc5`, both
+  already published, and the lock moves those two source lines and nothing
+  else. No `path` or `[patch]` entry exists anywhere, and the gate below ran
+  `--locked` against the published revisions.
+
+- **Ember keeps no duplicate danger classification, and there was nothing to
+  delete.** The jagent classifier grew from 32 to 54 warning classes this
+  round, which reaches the Agent approval card for free. Both places ember
+  labels a destructive command — `agent_panel` and the correction card — call
+  `jterm_core::agent::is_dangerous`; a search for a local pattern list finds
+  only `configure_read_only_git` (git's own read-only flags, unrelated) and
+  `read_only_reason` (an AI-chat persistence state, unrelated).
+
+- **The OSC 133 command is not held to `is_valid_jsh_command`, deliberately.**
+  The shared parser drops a command carrying a control or spoofing scalar
+  outright; ember keeps it and escapes it where it is drawn
+  (`single_line_command_preview`, now on the terminal-strict class), while
+  every path that *acts* on the text re-validates: replay through
+  `sanitize_history_replay`, the shared-history write through
+  `history_picker::sanitized_command`, the Agent through `review_text`. Showing
+  the user `echo\u{202E}rat` is more useful than showing them a block with no
+  command at all, and it is not less safe. Recorded so the next reader does not
+  re-derive it as a divergence.
+
+- **The OSC 133 execution-id budget widened, from 256 B to core's 1 KiB.** That
+  is the shared parser's generic-FinalTerm constant and adopting it is the
+  point — ember's decode and `CommandMeta` must agree about whether a packet
+  carried an id. The durable side is unaffected and stricter:
+  `is_valid_jsh_execution_id` caps a journal key at 192 B. Worst case the
+  in-memory timeline holds 1024 records plus 1024 consumed-id tombstones at
+  1 KiB each rather than 256 B, against a 16 MiB captured-output budget in the
+  same structure.
+
+- **The OSC 7770 announce is trusted as far as choosing which of the current
+  user's journals to read.** Core validates the grammar, so it cannot traverse
+  or name a path outside the journal directory, and the file is the same user's
+  own. A hostile PTY can therefore make the sidebar show a *different* session
+  of the same user's history — the same authority a shell already has over
+  everything else it prints — and cannot reach another user's rows. anvil and
+  forge trust the same announce for the same reason.
+
+- **shellcheck was not available on the machine this round ran on.** The
+  binary was fetched from the distribution package and run out of a scratch
+  directory to complete the gate; the version used was 0.9.0 and every script
+  including the new `scripts/security-check.sh` passed clean. Anyone rerunning
+  the gate on a bare machine will hit `Error: shellcheck is required` from
+  `--shell` until the distro package is installed.
+
 - **This round is uncommitted.** `Cargo.toml`, `Cargo.lock`,
   `src/workflows.rs`, `src/workflow_picker.rs`, `src/app/rendering.rs`,
   `src/app/commands.rs` and `scripts/workflows/docker-tail-logs.yaml` are
@@ -890,14 +1103,16 @@ fail closed.
   `CorrectionPolicy::new` takes all three arguments positionally, and
   `CompletionFacts` is a struct literal whose fields are all required, so a
   missing `trusted_completion` is a compile error.
-- **The card is still not exercised through a real egui frame.** Unchanged from
-  before this round — ember's previous suite never drove `show()` either, since
-  that needs a real `egui::Context` with input and a focus surface. The new
-  rendering test asserts on the exact accessors the card body reads
-  (`display_title` / `display_badge` / `display_description` / `risk` /
-  `run_allowed`) rather than on pixels, which is as close as this surface gets
-  without an Xvfb harness. The focus, arming and 2 s retry rules therefore
-  remain covered by reading only.
+- ~~**The card is still not exercised through a real egui frame.**~~
+  **Retracted 2026-09-05.** The claim that this needed "an Xvfb harness" was
+  wrong: `show()` takes an `&egui::Context`, and a `RawInput` carrying a
+  `screen_rect` is enough for an `egui::Window` to lay out, hit-test and route
+  keys headlessly — which is what ember's two existing frame harnesses had
+  already been doing for other surfaces. `show()` is now driven, with AccessKit
+  enabled so the tests read the real rendered button label; the focus, arming
+  and run-versus-insert rules are asserted from behaviour rather than by
+  reading. The 2 s focus *deadline* is still not driven, because doing so would
+  mean sleeping in the suite; the clean-idle half of the same rule is.
 - The font-input descriptor boundary recorded above was the last item carried
   from the earlier handoffs; nothing else survives from them, and the items
   above are this round's own.
@@ -908,10 +1123,31 @@ fail closed.
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
-bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
-shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh \
+        scripts/security-check.sh
+shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh \
+           scripts/security-check.sh
 bash scripts/test-install-paths.sh
+bash scripts/security-check.sh
 ```
+
+`scripts/security-check.sh` is new this round and subsumes the last two shell
+lines: `--all` runs the locked-graph check, `cargo deny --locked check`,
+`cargo tree --locked --duplicates`, `cargo audit --deny warnings` and
+`bash -n` + `shellcheck` over every script below `scripts/`. It is listed
+separately above so the individual commands stay copy-pasteable, and CI's audit
+job now calls `--audit` rather than a bare `cargo audit`.
+
+Run on 2026-09-05 for the shared-core repin: `cargo fmt --all -- --check` and
+`cargo clippy --locked --all-targets --all-features -- -D warnings` are clean,
+and `cargo test --locked` reports 987 library tests plus 1,301 binary tests plus
+the native Codex worker end-to-end test — 2,289 in total — passing with zero
+failures against the published `9f94f77` core (jagent `bdc8023`). The counts
+rise by 13 and 22 against the previous round; nothing was removed. All four
+`security-check.sh` modes exit 0, and `bash scripts/test-install-paths.sh`
+passes. shellcheck is not installed on this machine: the 0.9.0 binary was
+fetched from the distribution package into a scratch directory to complete the
+gate, and every script including the new one passed clean.
 
 Run on 2026-08-29 for the workflow round: `cargo fmt --all -- --check` and
 `cargo clippy --locked --all-targets --all-features -- -D warnings` are clean,

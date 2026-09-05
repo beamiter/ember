@@ -2108,35 +2108,32 @@ impl TerminalApp {
 
             let active_index = self.session_manager.active_index();
             let picker_session_id = self.block_search.session_id.clone();
-            let (pane_has_prompt_marks, live_record_sequences) = self
-                .session_manager
-                .sessions()
-                .get(active_index)
-                .map(|session| {
-                    let terminal = session.terminal.lock();
-                    let sequences = if picker_session_id.as_deref()
-                        == Some(session.metadata.session_id.as_str())
-                    {
-                        terminal
-                            .command_records()
-                            .iter()
-                            .filter(|record| record.complete)
-                            .map(|record| (record.id.clone(), record.sequence))
-                            .collect::<std::collections::HashMap<_, _>>()
-                    } else {
-                        std::collections::HashMap::new()
-                    };
-                    (terminal.has_prompt_marks(), sequences)
-                })
-                .unwrap_or_default();
             let bookmarked_sequences = picker_session_id
                 .as_deref()
                 .and_then(|session_id| self.block_bookmarks.get(session_id))
                 .cloned()
                 .unwrap_or_default();
-            let has_live_bookmarks = live_record_sequences
-                .values()
-                .any(|sequence| bookmarked_sequences.contains(sequence));
+            // "Is any bookmark still on a live block?" is the one question the
+            // cache cannot answer: it distinguishes a bookmark whose block has
+            // been evicted from one whose text simply is not indexed, and the
+            // two produce different empty-state messages. Answer it by
+            // scanning the deque, which allocates nothing, instead of by
+            // materializing every completed record's id.
+            let (pane_has_prompt_marks, has_live_bookmarks) = self
+                .session_manager
+                .sessions()
+                .get(active_index)
+                .map(|session| {
+                    let terminal = session.terminal.lock();
+                    let live_bookmarks = picker_session_id.as_deref()
+                        == Some(session.metadata.session_id.as_str())
+                        && terminal.command_records().iter().any(|record| {
+                            record.complete && bookmarked_sequences.contains(&record.sequence)
+                        });
+                    (terminal.has_prompt_marks(), live_bookmarks)
+                })
+                .unwrap_or_default();
+            let live_record_sequences = std::sync::Arc::clone(&self.block_search.record_sequences);
             let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
                 &self.block_search.cache,
                 &live_record_sequences,

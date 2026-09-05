@@ -1687,6 +1687,9 @@ mod tests {
             completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
             completed: CompletedCommandOutput {
                 id: "test".into(),
+                session_id: None,
+                seq: None,
+                started_at_ms: None,
                 command: Some(command.to_string()),
                 cwd: None,
                 exit_code: Some(exit),

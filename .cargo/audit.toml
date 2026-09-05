@@ -1,0 +1,13 @@
+# Keep this exact exception aligned with deny.toml. `ttf-parser` is an
+# unmaintained notice in ember's font graph (fontdue and ab_glyph both parse
+# with it), not a vulnerability or an unsoundness finding.
+[advisories]
+ignore = [
+  "RUSTSEC-2026-0192",
+]
+
+# cargo-audit otherwise reports informational advisories but exits successfully.
+# New unmaintained, unsound, notice, or yanked findings must fail the gate.
+[output]
+deny = ["warnings"]
+quiet = false

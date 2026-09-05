@@ -7630,6 +7630,9 @@ mod tests {
             completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
             completed: crate::terminal::CompletedCommandOutput {
                 id: "bare-d".into(),
+                session_id: None,
+                seq: None,
+                started_at_ms: None,
                 command: Some("cargo build".into()),
                 cwd: None,
                 exit_code: Some(0),

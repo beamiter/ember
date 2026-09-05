@@ -222,7 +222,11 @@ pub struct CommandSidebarState {
     pub selected: Option<CommandTarget>,
     filter: CommandFilter,
     pending_action: Option<CommandAction>,
+    /// The pane whose history is cached below. `CommandTarget`s name this id.
     history_session_id: Option<String>,
+    /// The jsh session the cached rows were actually read from — the pane's own
+    /// id unless the shell announced a different one over OSC 7770.
+    history_journal_session_id: Option<String>,
     history: Vec<PersistedExecution>,
     history_load: Option<HistoryLoad>,
     history_loaded: bool,
@@ -455,7 +459,14 @@ impl TerminalApp {
     pub(crate) fn render_sidebar_commands(&mut self, ui: &mut egui::Ui) {
         let active_index = self.session_manager.active_index();
         let selected_before = self.command_sidebar.selected.clone();
-        let (session_id, session_title, mut rows, replay_guard, live_selected_detail) = {
+        let (
+            session_id,
+            journal_session_id,
+            session_title,
+            mut rows,
+            replay_guard,
+            live_selected_detail,
+        ) = {
             let Some(session) = self.session_manager.sessions().get(active_index) else {
                 ui.label("No active session");
                 return;
@@ -464,6 +475,16 @@ impl TerminalApp {
             let session_title = Self::session_cwd_title(session);
             let pending_input = !session.pending_input.is_empty();
             let terminal = session.terminal.lock();
+            // The journal is keyed by the *shell's* session, which is only the
+            // pane's own id when ember spawned jsh itself with `--session`. A
+            // jsh reached any other way — started by hand inside another shell,
+            // or re-execed — owns a different journal and announces it over
+            // OSC 7770; without that the sidebar reads an empty history under
+            // a key nothing ever wrote.
+            let journal_session_id = terminal
+                .announced_jsh_session_id
+                .clone()
+                .unwrap_or_else(|| session_id.clone());
             let replay_guard = ReplayGuardSnapshot {
                 prompt_ready: terminal.shell_is_prompt_ready(),
                 alternate_screen: terminal.is_alt_buffer(),
@@ -596,6 +617,7 @@ impl TerminalApp {
                 });
             (
                 session_id,
+                journal_session_id,
                 session_title,
                 rows,
                 replay_guard,
@@ -603,7 +625,7 @@ impl TerminalApp {
             )
         };
 
-        self.sync_command_sidebar_history(&session_id, ui.ctx());
+        self.sync_command_sidebar_history(&session_id, &journal_session_id, ui.ctx());
         let mut selected_detail = live_selected_detail;
         if let Some(session) = self.session_manager.sessions().get(active_index) {
             let terminal = session.terminal.lock();
@@ -897,9 +919,24 @@ impl TerminalApp {
         }
     }
 
-    fn sync_command_sidebar_history(&mut self, session_id: &str, ctx: &egui::Context) {
-        if self.command_sidebar.history_session_id.as_deref() != Some(session_id) {
+    /// `session_id` is the pane's own identity and keys the cache; every
+    /// [`CommandTarget`] carries it, so it stays the value the selection
+    /// machinery compares against. `journal_session_id` is what jsh writes its
+    /// execution journal under, which differs whenever this pane did not spawn
+    /// jsh with `--session`. Both invalidate the cache: the pane can learn a
+    /// journal identity over OSC 7770 partway through its own life.
+    fn sync_command_sidebar_history(
+        &mut self,
+        session_id: &str,
+        journal_session_id: &str,
+        ctx: &egui::Context,
+    ) {
+        if self.command_sidebar.history_session_id.as_deref() != Some(session_id)
+            || self.command_sidebar.history_journal_session_id.as_deref()
+                != Some(journal_session_id)
+        {
             self.command_sidebar.history_session_id = Some(session_id.to_owned());
+            self.command_sidebar.history_journal_session_id = Some(journal_session_id.to_owned());
             self.command_sidebar.history.clear();
             self.command_sidebar.history_load = None;
             self.command_sidebar.history_loaded = false;
@@ -914,7 +951,7 @@ impl TerminalApp {
         match polled {
             Some(Ok(Some(snapshot))) => {
                 self.command_sidebar.history_load = None;
-                if snapshot.session_id == session_id {
+                if snapshot.session_id == journal_session_id {
                     self.command_sidebar.history = snapshot.records;
                     self.command_sidebar.history_error = snapshot.error;
                     self.command_sidebar.history_loaded = true;
@@ -936,7 +973,7 @@ impl TerminalApp {
         if self.command_sidebar.history_loaded || self.command_sidebar.history_load.is_some() {
             return;
         }
-        match execution_journal::request_history(session_id.to_owned()) {
+        match execution_journal::request_history(journal_session_id.to_owned()) {
             Ok(load) => {
                 self.command_sidebar.history_load = Some(load);
                 ctx.request_repaint_after(Duration::from_millis(75));
@@ -2575,9 +2612,14 @@ impl TerminalApp {
 
     /// 历史选择器确认后的回填：把持久化历史里的命令写回活动 pane 的提示符，
     /// 绝不执行。与 block 召回共用同一组守卫（只读任务终端、alt-screen、
-    /// 提示符未就绪、括号粘贴关闭、待发送输入、非空提示符都拒绝）与同一个
-    /// payload（行首 Ctrl+U + 括号粘贴帧、无回车）；命令文本在加载、选择与
+    /// 提示符未就绪、括号粘贴关闭、待发送输入、非空提示符都拒绝），payload
+    /// 也同构（行首 Ctrl+U + 括号粘贴帧、无回车）；命令文本在加载、选择与
     /// 这里三处都经过单行校验。
+    ///
+    /// 唯一与 block 召回不同的是字节预算：走这条路的文本由共享历史文件或
+    /// 工作流文件写入，不是执行日志，所以校验用
+    /// [`PROMPT_FILL_MAX_COMMAND_BYTES`] 而不是 64 KiB 的日志预算——否则
+    /// 选择器刚开始展示的 64 KiB–256 KiB 记录会条条可选、条条被拒。
     pub(crate) fn fill_prompt_with_history_command(&mut self, command: &str) {
         let index = self.session_manager.active_index();
         let Some(session_id) = self
@@ -2625,7 +2667,7 @@ impl TerminalApp {
             } else if !prompt_empty {
                 ReplayOutcome::PromptNotEmpty
             } else {
-                match replay_payload(command, false) {
+                match prompt_fill_payload(command) {
                     Err(error) => ReplayOutcome::UnsafeCommand(error.to_string()),
                     Ok(payload) => match session.shell.write(&payload) {
                         Ok(()) => {
@@ -3839,6 +3881,17 @@ impl TerminalApp {
         self.block_search.release_index_for_rebuild();
         let session = self.session_manager.get_active_session_mut();
         let terminal = session.terminal.lock();
+        // Same locked pass, same completed-record set the sources come from.
+        // Bookmarks are stored by terminal sequence and hits carry ids, so the
+        // overlay needs this join on every frame it paints; building it here
+        // means the ids are cloned once per record change instead of once per
+        // frame.
+        let record_sequences = terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete)
+            .map(|record| (record.id.clone(), record.sequence))
+            .collect::<std::collections::HashMap<_, _>>();
         let snapshot = crate::block_mode::bounded_block_search_sources(
             terminal
                 .command_records()
@@ -3868,6 +3921,7 @@ impl TerminalApp {
             crate::block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
         );
         self.block_search.cache = build.records;
+        self.block_search.record_sequences = std::sync::Arc::new(record_sequences);
         self.block_search.older_not_indexed = build.older_not_indexed;
         self.block_search.session_id = Some(session_id.to_string());
         self.block_search.record_version = Some(record_version);
@@ -4116,7 +4170,10 @@ impl TerminalApp {
             let Some(command) = replay.0 else {
                 return self.set_status("Exact command text is unavailable");
             };
-            let command = match prepare_replay_command(&command) {
+            let command = match prepare_replay_command(
+                &command,
+                crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+            ) {
                 Ok(command) => command,
                 Err(error) => {
                     return self.set_status_for(
@@ -4947,7 +5004,8 @@ fn selected_commands_in_terminal_order<'a>(
             return Err(SelectedReplayError::ExactCommandUnavailable);
         }
         let command =
-            prepare_replay_command(raw_command).map_err(SelectedReplayError::UnsafeCommand)?;
+            prepare_replay_command(raw_command, crate::review_text::MAX_HISTORY_COMMAND_BYTES)
+                .map_err(SelectedReplayError::UnsafeCommand)?;
         let separator = usize::from(!text.is_empty());
         let Some(next_len) = text
             .len()
@@ -4994,8 +5052,38 @@ fn replay_payload(
     command: &str,
     run: bool,
 ) -> Result<Vec<u8>, crate::review_text::ReviewTextError> {
-    let command = prepare_replay_command(command)?;
+    let command = prepare_replay_command(command, crate::review_text::MAX_HISTORY_COMMAND_BYTES)?;
     Ok(replay_prepared_payload(&command, run))
+}
+
+/// Byte budget for the prompt-fill funnel
+/// ([`TerminalApp::fill_prompt_with_history_command`]), which serves the
+/// shared-history picker and the workflow picker.
+///
+/// Deliberately not the 64 KiB OSC 133 / execution-journal budget
+/// [`replay_payload`] uses, because neither of this funnel's writers is the
+/// journal. A history row was written by a *sibling* terminal under the shared
+/// file's own contract — `jterm_core::command_history`'s `MAX_COMMAND_BYTES`,
+/// which is [`jterm_core::review_input::MAX_REVIEW_INPUT_BYTES`] — and since
+/// this round the picker lists and fuzzy-matches every row that contract
+/// allows. Checking recall against the narrower journal budget would put a
+/// 64–256 KiB row on screen, let the user select it, and then refuse it with a
+/// byte-limit error every single time it was chosen: a permanently
+/// un-recallable entry, offered as an ordinary one. A rendered workflow is
+/// capped at `jterm_core::workflows::MAX_WORKFLOW_COMMAND_BYTES` (64 KiB) by
+/// `render` itself, so the wider budget here never becomes that path's binding
+/// cap; the aggregate a multi-block recall may insert is already this size
+/// ([`crate::review_text::MAX_PROMPT_INSERT_BYTES`]).
+const PROMPT_FILL_MAX_COMMAND_BYTES: usize =
+    crate::history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES;
+
+/// Bytes that fill — never run — a recalled command at the prompt.
+///
+/// Identical framing, de-fanging and sanitizer to [`replay_payload`]; only the
+/// budget differs, and [`PROMPT_FILL_MAX_COMMAND_BYTES`] says why.
+fn prompt_fill_payload(command: &str) -> Result<Vec<u8>, crate::review_text::ReviewTextError> {
+    let command = prepare_replay_command(command, PROMPT_FILL_MAX_COMMAND_BYTES)?;
+    Ok(replay_prepared_payload(&command, false))
 }
 
 /// Correction candidates are validated single-line commands, not OSC 133
@@ -5038,10 +5126,22 @@ fn replay_prepared_payload(command: &str, run: bool) -> Vec<u8> {
     .bytes
 }
 
-fn prepare_replay_command(command: &str) -> Result<String, crate::review_text::ReviewTextError> {
+/// Trim and sanitize one recorded command for Fill/Run.
+///
+/// `max_bytes` is the *writer's* contract for the text being recalled, and it
+/// is passed rather than assumed because this app recalls from two different
+/// writers. Everything that comes off a block — OSC 133 metadata or ember's
+/// own execution journal — is already bounded by
+/// [`crate::review_text::MAX_HISTORY_COMMAND_BYTES`] before it reaches here;
+/// a shared-history row was written by a sibling terminal under a much wider
+/// contract and carries [`PROMPT_FILL_MAX_COMMAND_BYTES`] instead.
+fn prepare_replay_command(
+    command: &str,
+    max_bytes: usize,
+) -> Result<String, crate::review_text::ReviewTextError> {
     crate::review_text::sanitize_history_replay(
         command.trim_end_matches(&['\r', '\n'][..]),
-        crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+        max_bytes,
     )
 }
 
@@ -5052,6 +5152,16 @@ fn replay_command_is_multiline(command: &str) -> bool {
         .any(|ch| matches!(ch, '\r' | '\n'))
 }
 
+/// One display line for a shell-reported command or cwd.
+///
+/// The escaping predicate is the terminal-strict one. This preview draws text
+/// whose spelling is correlated with the shell's own state — the OSC 133
+/// command and cwd — beside a menu that offers to run it again, so the
+/// interlinear annotation anchors `U+FFF9..=U+FFFB` matter here for the same
+/// reason a zero-width space does: this family's surfaces render them as
+/// nothing. They were passing through unescaped because the shared review
+/// predicate deliberately allows them and the stricter one used to be private
+/// to the core.
 fn single_line_command_preview(command: &str, max_chars: usize) -> String {
     let mut chars = command.chars().peekable();
     let mut preview = String::new();
@@ -5072,7 +5182,9 @@ fn single_line_command_preview(command: &str, max_chars: usize) -> String {
             '\t' => preview.push_str(" ⇥ "),
             unsafe_character
                 if unsafe_character.is_control()
-                    || jterm_core::review_input::is_visual_spoofing_character(unsafe_character) =>
+                    || jterm_core::review_input::is_terminal_visual_spoofing_character(
+                        unsafe_character,
+                    ) =>
             {
                 preview.push_str(&format!("\\u{{{:X}}}", unsafe_character as u32));
             }
@@ -5371,10 +5483,60 @@ mod tests {
     #[test]
     fn replay_normalizes_trailing_line_endings_without_trimming_spaces() {
         assert_eq!(
-            prepare_replay_command("printf 'a\\nb'\r\n\n").unwrap(),
+            prepare_replay_command(
+                "printf 'a\\nb'\r\n\n",
+                crate::review_text::MAX_HISTORY_COMMAND_BYTES
+            )
+            .unwrap(),
             "printf 'a\\nb'"
         );
-        assert_eq!(prepare_replay_command(" echo hi  ").unwrap(), " echo hi  ");
+        assert_eq!(
+            prepare_replay_command(" echo hi  ", crate::review_text::MAX_HISTORY_COMMAND_BYTES)
+                .unwrap(),
+            " echo hi  "
+        );
+    }
+
+    #[test]
+    fn a_shared_history_row_the_picker_lists_is_one_the_prompt_will_accept() {
+        // 100 KiB: a record a sibling terminal may legally write, since the
+        // shared file's contract is core's `command_history::MAX_COMMAND_BYTES`
+        // (256 KiB), and one that is past ember's own 64 KiB OSC 133 /
+        // execution-journal budget. Since this round the picker keeps such a
+        // row, renders it and lets it match, so the prompt-fill funnel has to
+        // take it too: a row that is listed, highlighted, chosen with Enter and
+        // then refused with a byte-limit status on every attempt is a worse
+        // outcome than the row that used to be dropped before display.
+        let row = format!("echo {}", "x".repeat(100 * 1024));
+        assert!(row.len() > crate::review_text::MAX_HISTORY_COMMAND_BYTES);
+        assert_eq!(
+            crate::history_picker::sanitized_command(&row),
+            Some(row.as_str()),
+            "the picker's own listing gate keeps this row"
+        );
+        assert!(
+            prompt_fill_payload(&row).is_ok(),
+            "the recall the picker offers for that row must not be refused"
+        );
+
+        // The block-recall path reads a different writer and keeps its own,
+        // narrower contract; adopting the shared file's budget for the picker
+        // must not have widened the journal's.
+        assert!(matches!(
+            replay_payload(&row, false),
+            Err(crate::review_text::ReviewTextError::TooLarge {
+                limit: crate::review_text::MAX_HISTORY_COMMAND_BYTES
+            })
+        ));
+
+        // And the funnel adopted that contract rather than dropping the bound:
+        // one byte past what the shared file may hold is still refused.
+        assert!(matches!(
+            prompt_fill_payload(&"x".repeat(PROMPT_FILL_MAX_COMMAND_BYTES + 1)),
+            Err(crate::review_text::ReviewTextError::TooLarge {
+                limit: PROMPT_FILL_MAX_COMMAND_BYTES
+            })
+        ));
     }
 
     #[test]
@@ -5956,6 +6118,14 @@ mod tests {
             "one ↵ two ↵ three"
         );
         assert_eq!(single_line_command_preview("abcdef", 3), "abc…");
+        // The terminal-strict class, not the shared review one: this preview
+        // renders shell-reported text beside a "Run Again" action, and the
+        // interlinear annotation anchors draw as nothing in this family's
+        // surfaces exactly as a zero-width space does.
+        assert_eq!(
+            single_line_command_preview("echo\u{202e}rat\u{fff9}hidden", 100),
+            "echo\\u{202E}rat\\u{FFF9}hidden"
+        );
     }
 
     #[test]
