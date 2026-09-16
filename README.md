@@ -1102,7 +1102,9 @@ symbolic links, and cannot remove the final target or another concurrent upload.
 Remote directory uploads and relays follow the same token-scoped pattern: tar
 extracts only inside a private 0700 same-parent directory, one matching
 non-symlink root is required, and GNU `mv --no-copy -nT` performs the final
-no-replace rename. Unsupported/non-atomic publication fails closed; a collision,
+no-replace rename (plain `mv -nT` on coreutils 8.30–9.0, which predate
+`--no-copy` but already rename with `RENAME_NOREPLACE` inside the same
+directory). Any other `mv` fails closed; a collision,
 invalid archive, cancellation, or extraction error leaves no partial final tree.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the

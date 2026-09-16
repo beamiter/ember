@@ -226,7 +226,9 @@ pub struct Capture {
 /// - v6：`put <path> <transfer-id>` 由客户端唯一令牌命名有界的候选目录，
 ///   取消/超时后只清理本次上传的 32 个可能候选。
 /// - v7：`untar <dir> <name> <transfer-id>` 只向同父级私有目录解包，
-///   校验唯一同名非链接根后用 GNU `mv --no-copy -nT` 原子发布。
+///   校验唯一同名非链接根后用 GNU `mv --no-copy -nT` 原子发布；coreutils
+///   8.30–9.0 没有 `--no-copy`，改用同样走 `renameat2(RENAME_NOREPLACE)` 的
+///   `mv -nT`（同目录内 rename，非特权进程无法让它跨设备），其他 `mv` 返回 4。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
 pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v7 — runs under `sh -s -- <op> [args...]`.
@@ -244,7 +246,8 @@ pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v7 — runs under `sh -s -- 
 # v6: put takes a client transfer id so cancel cleanup can enumerate only that
 # upload's bounded collision candidates.
 # v7: untar extracts into private same-parent staging, validates one matching
-# directory root, then publishes it with GNU mv's atomic no-replace rename.
+# directory root, then publishes it with GNU mv's atomic no-replace rename
+# (--no-copy where coreutils >= 9.1 has it; plain -nT on 8.30+).
 set -u
 op=${1:-}
 case "$op" in
@@ -367,6 +370,20 @@ case "$op" in
     [ -d "$d" ] || exit 3
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
     command -v mv >/dev/null 2>&1 || { echo "remote-fs probe: mv is not available" >&2; exit 4; }
+    # GNU mv -n is renameat2(RENAME_NOREPLACE) since coreutils 8.30; 9.1 added
+    # --no-copy to also refuse a cross-device copy. This rename stays inside
+    # one directory, out of a stage created just below, so only a privileged
+    # mount could make it cross devices. Other mv may emulate -n racily.
+    if mv --no-copy --version >/dev/null 2>&1; then
+      no_copy=--no-copy
+    else
+      no_copy=
+      case $(mv --version 2>/dev/null) in
+        "mv (GNU coreutils) "8.3[0-9]*|"mv (GNU coreutils) "8.[4-9][0-9]*) ;;
+        "mv (GNU coreutils) "9.*|"mv (GNU coreutils) "[1-9][0-9]*) ;;
+        *) echo "remote-fs probe: mv has no atomic no-replace rename" >&2; exit 4 ;;
+      esac
+    fi
     cd "$d" 2>/dev/null || exit 3
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     stage=
@@ -391,7 +408,7 @@ case "$op" in
         fi
       done
       if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
-        if mv --no-copy -nT -- "$source" "$n" 2>/dev/null; then
+        if mv ${no_copy:+"$no_copy"} -nT -- "$source" "$n" 2>/dev/null; then
           if [ -e "$source" ] || [ -L "$source" ]; then
             if [ -e "$n" ] || [ -L "$n" ]; then code=17; fi
           else
@@ -5610,6 +5627,102 @@ docker = true
                     .starts_with(".ember-fs-untar-")),
             "failed publication must clean private extraction staging"
         );
+    }
+
+    /// Run `untar` with `mv` resolved to `mv_shim` first on PATH. The shim can
+    /// reach the real mv through `$ORIGINAL_PATH` and log to `$MV_LOG`.
+    fn untar_with_mv_shim(dir: &TestDir, mv_shim: &str, id: &str) -> (Capture, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = dir.join("tree");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::write(source.join("sub/blob.bin"), binary_sample()).unwrap();
+        let archive = run_probe_locally(&["tar", source.to_str().unwrap()]);
+        assert_eq!(archive.status, Some(0));
+
+        let shim_dir = dir.join("bin");
+        std::fs::create_dir(&shim_dir).unwrap();
+        let shim = shim_dir.join("mv");
+        std::fs::write(&shim, mv_shim).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let destination = dir.join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let mv_log = dir.join("mv.log");
+        let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+
+        let mut argv = vec![
+            "env".to_string(),
+            format!("PATH={}:{original_path}", shim_dir.display()),
+            format!("ORIGINAL_PATH={original_path}"),
+            format!("MV_LOG={}", mv_log.display()),
+        ];
+        argv.extend(sh_c_argv_locally(
+            "untar",
+            &[destination.to_str().unwrap(), "tree", id],
+        ));
+        let capture = run_capture(
+            &argv,
+            &archive.stdout,
+            Duration::from_secs(5),
+            MAX_SMALL_OUTPUT,
+        )
+        .unwrap();
+        (capture, destination, mv_log)
+    }
+
+    fn untar_staging_left_in(destination: &Path) -> bool {
+        std::fs::read_dir(destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ember-fs-untar-")
+            })
+    }
+
+    #[test]
+    fn probe_untar_publishes_with_gnu_mv_that_predates_no_copy() {
+        // coreutils 8.30-9.0 (e.g. Ubuntu 22.04's 8.32) reject --no-copy but
+        // already rename with RENAME_NOREPLACE under -n.
+        let dir = TestDir::new();
+        let (capture, destination, mv_log) = untar_with_mv_shim(
+            &dir,
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --no-copy) echo \"mv: unrecognized option '--no-copy'\" >&2; exit 1 ;;\n    --version) echo 'mv (GNU coreutils) 8.32'; exit 0 ;;\n  esac\ndone\nprintf '%s\\n' \"$@\" >> \"$MV_LOG\"\nPATH=$ORIGINAL_PATH\nexport PATH\nexec mv \"$@\"\n",
+            "feed-e",
+        );
+
+        assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(
+            std::fs::read(destination.join("tree/sub/blob.bin")).unwrap(),
+            binary_sample()
+        );
+        let invocation = std::fs::read_to_string(&mv_log).unwrap();
+        let args: Vec<&str> = invocation.lines().collect();
+        assert_eq!(args[..2], ["-nT", "--"], "publication args: {args:?}");
+        assert!(!untar_staging_left_in(&destination));
+    }
+
+    #[test]
+    fn probe_untar_fails_closed_without_an_atomic_gnu_mv() {
+        // BusyBox-style mv: no --version, and -n is a check-then-rename.
+        let dir = TestDir::new();
+        let (capture, destination, mv_log) = untar_with_mv_shim(
+            &dir,
+            "#!/bin/sh\ncase \"$1\" in --*) echo \"mv: unrecognized option\" >&2; exit 1 ;; esac\n: > \"$MV_LOG\"\n",
+            "feed-f",
+        );
+
+        assert_eq!(capture.status, Some(4));
+        assert!(
+            String::from_utf8_lossy(&capture.stderr).contains("no atomic no-replace rename"),
+            "stderr: {:?}",
+            capture.stderr
+        );
+        assert!(!mv_log.exists(), "a racy mv must never publish");
+        assert!(!destination.join("tree").exists());
+        assert!(!untar_staging_left_in(&destination));
     }
 
     #[test]
