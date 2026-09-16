@@ -577,6 +577,13 @@ fn wait_for_review_turn(
 
 #[test]
 fn real_worker_two_turns_finish_reap_and_unlock_validation() {
+    // The shared agent subsystem expects the app-server to echo this app's
+    // name ("ember/0.147.0 ..."), which it reads from the identity main sets.
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "ember",
+        app_id: "io.github.beamiter.ember",
+        app_version: env!("CARGO_PKG_VERSION"),
+    });
     if let Some(reason) = unsupported_reason() {
         if std::env::var_os(REQUIRE_E2E_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
             panic!("required native Codex worker E2E prerequisites are unavailable: {reason}");
