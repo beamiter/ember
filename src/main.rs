@@ -54,7 +54,7 @@ mod workflows;
 use crate::theme::ThemeExt as _;
 use app::events::{
     normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
-    semantic_paste_modifiers, should_restore_terminal_shortcut_event,
+    semantic_paste_modifiers, semantic_shortcut_modifiers, should_restore_terminal_shortcut_event,
 };
 use base64::Engine;
 use clipboard::{ClipboardContent, ClipboardManager};
@@ -5040,21 +5040,13 @@ impl eframe::App for TerminalApp {
             self.paste_key_state.reset();
         }
 
-        // Event::Paste has no per-event modifiers. Recover Shift from V's
-        // release when a whole Ctrl+Shift+V chord lands in one input batch;
-        // the batch-level modifier snapshot may already be empty by now.
-        // egui 0.36 moved that snapshot into the event stream: the last
-        // Event::ModifiersChanged of the batch is the state at drain time.
-        let batch_modifiers = raw_input
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                egui::Event::ModifiersChanged(modifiers) => Some(*modifiers),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let shortcut_modifiers = semantic_paste_modifiers(&raw_input.events, batch_modifiers);
+        // Semantic clipboard events carry no modifiers of their own. egui 0.36
+        // only reports modifier *changes* in the event stream, so replay them
+        // from the state egui carried out of the previous frame. Paste then
+        // additionally recovers Shift from V's release, if it is in the batch.
+        let batch_start_modifiers = ctx.input(|input| input.modifiers);
+        let event_modifiers = semantic_shortcut_modifiers(&raw_input.events, batch_start_modifiers);
+        let shortcut_modifiers = semantic_paste_modifiers(&raw_input.events, event_modifiers);
 
         // egui-winit turns Ctrl/Cmd+C/X/V into semantic clipboard events and skips the
         // corresponding Key press. Restore those as Key events so the terminal can receive
@@ -7263,7 +7255,8 @@ mod tests {
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
-        semantic_paste_modifiers, shortcut_event_to_key_event, PasteKeyState,
+        semantic_paste_modifiers, semantic_shortcut_modifiers, shortcut_event_to_key_event,
+        should_restore_terminal_shortcut_event, PasteKeyState,
     };
     use base64::Engine as _;
     use eframe::egui;
@@ -8621,6 +8614,114 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, egui::Event::Paste(_))));
+    }
+
+    /// The raw_input_hook pipeline, minus the parts that need app state.
+    fn normalize_shortcut_batch(
+        events: &mut Vec<egui::Event>,
+        batch_start: egui::Modifiers,
+        preserve_paste_event: bool,
+    ) {
+        let event_modifiers = semantic_shortcut_modifiers(events, batch_start);
+        let modifiers = semantic_paste_modifiers(events, event_modifiers);
+        let restore = should_restore_terminal_shortcut_event(&egui::Context::default(), modifiers);
+        normalize_terminal_shortcut_events(events, modifiers, restore, preserve_paste_event, false);
+    }
+
+    fn restored_key(events: &[egui::Event], wanted: egui::Key) -> Option<egui::Modifiers> {
+        events.iter().find_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if *key == wanted => Some(*modifiers),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn clipboard_chords_held_since_an_earlier_frame_reach_the_keymap() {
+        // A typed chord: Ctrl and Shift went down in earlier frames, so this
+        // batch has the semantic event and no ModifiersChanged at all.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl
+        };
+
+        for (event, key, held) in [
+            (egui::Event::Copy, egui::Key::C, ctrl_shift),
+            (
+                egui::Event::Paste("text".to_owned()),
+                egui::Key::V,
+                ctrl_shift,
+            ),
+            // Plain Ctrl+C must still reach the PTY as an interrupt.
+            (egui::Event::Copy, egui::Key::C, ctrl),
+        ] {
+            for preserve_paste_event in [false, true] {
+                let mut events = vec![event.clone()];
+                normalize_shortcut_batch(&mut events, held, preserve_paste_event);
+                assert_eq!(
+                    restored_key(&events, key),
+                    Some(held),
+                    "{event:?} held={held:?} preserve={preserve_paste_event}: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_copy_chord_keeps_its_press_time_modifiers() {
+        // xdotool-style chord: presses and releases land in one batch, so the
+        // batch ends with modifiers already cleared.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl
+        };
+        let mut events = vec![
+            egui::Event::ModifiersChanged(ctrl),
+            egui::Event::ModifiersChanged(ctrl_shift),
+            egui::Event::Copy,
+            egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: Some(egui::Key::C),
+                pressed: false,
+                repeat: false,
+                modifiers: ctrl_shift,
+            },
+            egui::Event::ModifiersChanged(ctrl),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+        ];
+
+        normalize_shortcut_batch(&mut events, egui::Modifiers::NONE, false);
+
+        assert_eq!(restored_key(&events, egui::Key::C), Some(ctrl_shift));
+    }
+
+    #[test]
+    fn modifiers_do_not_survive_focus_loss_before_a_clipboard_event() {
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let events = [egui::Event::WindowFocused(false), egui::Event::Copy];
+        assert_eq!(
+            semantic_shortcut_modifiers(&events, ctrl_shift),
+            egui::Modifiers::NONE
+        );
     }
 
     #[test]

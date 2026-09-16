@@ -29,6 +29,33 @@ pub fn should_restore_terminal_shortcut_event(
     !ctx.text_edit_focused() && modifiers.command && !modifiers.alt
 }
 
+/// The modifier state in effect when egui-winit produced the batch's first
+/// semantic clipboard event (Copy/Cut/Paste).
+///
+/// egui 0.36 no longer snapshots modifiers on `RawInput`; egui-winit emits
+/// [`egui::Event::ModifiersChanged`] only when the state changes. A typed
+/// chord presses Ctrl/Shift a frame or more before C/V, so that batch usually
+/// carries no `ModifiersChanged` and the state has to start from the previous
+/// frame (`batch_start`). A fast chord can instead land in one batch together
+/// with its releases, where the *last* `ModifiersChanged` is already cleared,
+/// so the replay stops at the clipboard event rather than at the batch's end.
+pub fn semantic_shortcut_modifiers(
+    events: &[egui::Event],
+    batch_start: egui::Modifiers,
+) -> egui::Modifiers {
+    let mut modifiers = batch_start;
+    for event in events {
+        match event {
+            egui::Event::ModifiersChanged(changed) => modifiers = *changed,
+            // Mirrors egui's InputState, which drops modifiers on focus loss.
+            egui::Event::WindowFocused(false) => modifiers = egui::Modifiers::NONE,
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => return modifiers,
+            _ => {}
+        }
+    }
+    modifiers
+}
+
 /// Recover the modifiers that accompanied a semantic paste shortcut.
 ///
 /// `egui::Event::Paste` carries only clipboard text. If V and the modifiers
