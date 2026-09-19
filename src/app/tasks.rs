@@ -574,6 +574,9 @@ impl TerminalApp {
         if self.task_sidebar.pending_creation.is_some() {
             return Err("another task worktree is still being created".to_string());
         }
+        provider
+            .ensure_executable_available()
+            .map_err(|error| error.to_string())?;
         let worktree_root = dirs::data_local_dir()
             .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
             .join("ember")

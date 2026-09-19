@@ -1403,9 +1403,20 @@ impl ConfigPanel {
             ui.label("Preferred Fix agent:");
             for provider in crate::agent::AgentProvider::ALL {
                 let value = provider.config_value();
+                let on_path = jterm_core::host::find_executable_in_path(provider.executable_name())
+                    .is_some();
+                let label = if on_path {
+                    provider.display_name().to_string()
+                } else {
+                    format!("{} · missing", provider.display_name())
+                };
                 if ui
-                    .selectable_label(self.edit_preferred_fix_provider == value, provider.display_name())
-                    .on_hover_text(provider.install_hint())
+                    .selectable_label(self.edit_preferred_fix_provider == value, label)
+                    .on_hover_text(if on_path {
+                        format!("{} is on PATH", provider.executable_name())
+                    } else {
+                        provider.install_hint().to_string()
+                    })
                     .clicked()
                 {
                     self.edit_preferred_fix_provider = value.to_string();
