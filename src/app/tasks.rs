@@ -138,13 +138,18 @@ fn sort_rows(rows: &mut [TaskRowSnapshot]) {
 fn render_native_codex_view(
     ui: &mut egui::Ui,
     task_id: TaskId,
+    provider: AgentProvider,
     view: &CodexAppServerViewSnapshot,
     approvals_enabled: bool,
     pending: &mut Option<TaskSidebarAction>,
 ) {
     ui.group(|ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Native Codex").small().strong());
+            ui.label(
+                egui::RichText::new(format!("Native {}", provider.display_name()))
+                    .small()
+                    .strong(),
+            );
             ui.label(
                 egui::RichText::new(format!("{:?}", view.phase))
                     .small()
@@ -962,9 +967,9 @@ impl TerminalApp {
                                 && !native_idle
                                 && ui
                                     .button(if row.native_preparing {
-                                        "Cancel preparation"
+                                        "Cancel preparation".to_string()
                                     } else {
-                                        "Stop Codex"
+                                        format!("Stop {}", row.provider.display_name())
                                     })
                                     .on_hover_text(if row.native_preparing {
                                         "Discard this background preparation; no provider process has started"
@@ -972,9 +977,9 @@ impl TerminalApp {
                                         "Interrupt the turn, stop its process group, and wait for reap"
                                     })
                                     .clicked()
-                            {
-                                pending = Some(TaskSidebarAction::StopCodex(row.id));
-                            }
+                                {
+                                    pending = Some(TaskSidebarAction::StopCodex(row.id));
+                                }
                             if ui
                                 .add_enabled(
                                     row.has_agent_terminal,
@@ -1000,12 +1005,16 @@ impl TerminalApp {
                                     )
                                     .on_disabled_hover_text(if row.has_active_agent_stream {
                                         if native_idle {
-                                            "Finish Codex to end the native session and unlock validation"
+                                            format!(
+                                                "Finish {} to end the native session and unlock validation",
+                                                row.provider.display_name()
+                                            )
                                         } else {
                                             "Wait for the native Agent turn to reach review, then finish the session"
+                                                .to_string()
                                         }
                                     } else {
-                                        "Validation is already running"
+                                        "Validation is already running".to_string()
                                     })
                                     .clicked()
                             {
@@ -1056,6 +1065,7 @@ impl TerminalApp {
                             render_native_codex_view(
                                 ui,
                                 row.id,
+                                row.provider,
                                 view,
                                 self.agent_runtime.has_running(row.id)
                                     && row.has_active_agent_stream,
@@ -1063,88 +1073,126 @@ impl TerminalApp {
                             );
                         }
                         if native_idle {
+                            let provider_name = row.provider.display_name();
                             ui.group(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Review feedback")
+                                if row.provider == AgentProvider::Codex {
+                                    ui.label(
+                                        egui::RichText::new("Review feedback")
+                                            .small()
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Send another turn on this loaded {provider_name} thread, or finish the session to unlock validation.",
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                    let draft = self
+                                        .task_sidebar
+                                        .follow_up_drafts
+                                        .entry(row.id)
+                                        .or_default();
+                                    ui.add_enabled(
+                                        native_ai_enabled,
+                                        egui::TextEdit::multiline(draft)
+                                            .desired_rows(3)
+                                            .char_limit(MAX_NATIVE_FOLLOW_UP_CHARS)
+                                            .hint_text(format!(
+                                                "Describe what {provider_name} should change next…"
+                                            )),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Enable AI features and command-context sharing before sending another cloud turn",
+                                    );
+                                    let can_send = native_ai_enabled
+                                        && native_follow_up_can_send(
+                                            draft.as_str(),
+                                            native_view
+                                                .as_ref()
+                                                .map_or(0, |view| view.completed_turns),
+                                        );
+                                    let can_finish = draft
+                                        .trim_matches(|character| {
+                                            matches!(character, ' ' | '\n' | '\t')
+                                        })
+                                        .is_empty();
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                can_send,
+                                                egui::Button::new("Send follow-up"),
+                                            )
+                                            .on_disabled_hover_text(format!(
+                                                "Feedback must be non-empty, at most {NATIVE_AGENT_FOLLOW_UP_MAX_BYTES} UTF-8 bytes, and sent before the {CODEX_APP_SERVER_LIVE_TURN_MAX}-turn session limit",
+                                            ))
+                                            .clicked()
+                                        {
+                                            pending = Some(TaskSidebarAction::FollowUp(
+                                                row.id,
+                                                draft.clone(),
+                                            ));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                can_finish,
+                                                egui::Button::new(format!(
+                                                    "Finish {provider_name}"
+                                                )),
+                                            )
+                                            .on_hover_text(
+                                                "End this idle native session; validation unlocks only after containment is empty and the provider is reaped",
+                                            )
+                                            .on_disabled_hover_text(format!(
+                                                "Send or clear the draft before finishing {provider_name}"
+                                            ))
+                                            .clicked()
+                                        {
+                                            pending =
+                                                Some(TaskSidebarAction::FinishCodex(row.id));
+                                        }
+                                        if !can_finish && ui.small_button("Clear").clicked() {
+                                            draft.clear();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} / {} bytes · turn {} / {}",
+                                                draft.len(),
+                                                NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+                                                native_view
+                                                    .as_ref()
+                                                    .map_or(0, |view| view.completed_turns),
+                                                CODEX_APP_SERVER_LIVE_TURN_MAX,
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    });
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{provider_name} session"
+                                        ))
                                         .small()
                                         .strong(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Send another turn on this loaded Codex thread, or finish the session to unlock validation.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                                let draft = self
-                                    .task_sidebar
-                                    .follow_up_drafts
-                                    .entry(row.id)
-                                    .or_default();
-                                ui.add_enabled(
-                                    native_ai_enabled,
-                                    egui::TextEdit::multiline(draft)
-                                        .desired_rows(3)
-                                        .char_limit(MAX_NATIVE_FOLLOW_UP_CHARS)
-                                        .hint_text("Describe what Codex should change next…"),
-                                )
-                                .on_disabled_hover_text(
-                                    "Enable AI features and command-context sharing before sending another cloud turn",
-                                );
-                                let can_send = native_ai_enabled
-                                    && native_follow_up_can_send(
-                                        draft.as_str(),
-                                        native_view
-                                            .as_ref()
-                                            .map_or(0, |view| view.completed_turns),
                                     );
-                                let can_finish = draft
-                                    .trim_matches(|character| {
-                                        matches!(character, ' ' | '\n' | '\t')
-                                    })
-                                    .is_empty();
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add_enabled(can_send, egui::Button::new("Send follow-up"))
-                                        .on_disabled_hover_text(format!(
-                                            "Feedback must be non-empty, at most {NATIVE_AGENT_FOLLOW_UP_MAX_BYTES} UTF-8 bytes, and sent before the {CODEX_APP_SERVER_LIVE_TURN_MAX}-turn session limit",
-                                        ))
-                                        .clicked()
-                                    {
-                                        pending = Some(TaskSidebarAction::FollowUp(
-                                            row.id,
-                                            draft.clone(),
-                                        ));
-                                    }
-                                    if ui
-                                        .add_enabled(can_finish, egui::Button::new("Finish Codex"))
-                                        .on_hover_text(
-                                            "End this idle native session; validation unlocks only after containment is empty and the provider is reaped",
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "This native MVP is one-shot. Finish the session to unlock validation, or continue in Terminal fallback for interactive follow-up.",
                                         )
-                                        .on_disabled_hover_text(
-                                            "Send or clear the draft before finishing Codex",
+                                        .small()
+                                        .weak(),
+                                    );
+                                    if ui
+                                        .button(format!("Finish {provider_name}"))
+                                        .on_hover_text(
+                                            "End this idle native session; validation unlocks after the provider is reaped",
                                         )
                                         .clicked()
                                     {
                                         pending = Some(TaskSidebarAction::FinishCodex(row.id));
                                     }
-                                    if !can_finish && ui.small_button("Clear").clicked() {
-                                        draft.clear();
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} / {} bytes · turn {} / {}",
-                                            draft.len(),
-                                            NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
-                                            native_view
-                                                .as_ref()
-                                                .map_or(0, |view| view.completed_turns),
-                                            CODEX_APP_SERVER_LIVE_TURN_MAX,
-                                        ))
-                                        .small()
-                                        .weak(),
-                                    );
-                                });
+                                }
                             });
                         }
                         if row.validation_attempt > 0 {
