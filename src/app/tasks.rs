@@ -9,7 +9,7 @@ use crate::agent::{
     AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
     CodexAppServerPhase, CodexAppServerTurnHistory, CodexAppServerViewSnapshot, NativePromptPolicy,
     TaskId, TaskRuntimeKind, TaskStatus, TaskValidationStatus, CODEX_APP_SERVER_LIVE_TURN_MAX,
-    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES, PTY_TASK_BRIEF_RELATIVE,
 };
 use crate::app::state::TerminalApp;
 use crate::review_text::{sanitize_prompt_payload, visible_bounded, VisualSpoofDisposition};
@@ -1395,20 +1395,20 @@ impl TerminalApp {
         } else if let Some(completion) = report.completions.last() {
             let message = if report.completions.len() > 1 {
                 format!(
-                    "{} native Codex sessions stopped; open Tasks for individual results",
+                    "{} native Agent sessions stopped; open Tasks for individual results",
                     report.completions.len()
                 )
             } else {
                 match completion.outcome {
                     AgentSessionOutcome::Clean => {
-                        "Native Codex stopped cleanly; review its diff, then run validation"
+                        "Native Agent stopped cleanly; review its diff, then run validation"
                             .to_string()
                     }
                     AgentSessionOutcome::Cancelled => {
-                        "Native Codex was cancelled and fully stopped".to_string()
+                        "Native Agent was cancelled and fully stopped".to_string()
                     }
                     AgentSessionOutcome::Failed => format!(
-                        "Native Codex failed: {}",
+                        "Native Agent failed: {}",
                         completion
                             .detail
                             .as_deref()
@@ -1419,10 +1419,10 @@ impl TerminalApp {
             self.set_status_for(message, Duration::from_secs(8));
         } else if report.preparations_started > 0 {
             self.set_status(if report.preparations_started == 1 {
-                "Native Codex prerequisites verified; starting app-server…".to_string()
+                "Native Agent prerequisites verified; starting provider…".to_string()
             } else {
                 format!(
-                    "{} native Codex sessions finished preparation and are starting…",
+                    "{} native Agent sessions finished preparation and are starting…",
                     report.preparations_started
                 )
             });
@@ -1452,7 +1452,7 @@ impl TerminalApp {
                 .task_manager
                 .native_terminal_fallback_eligible(task_id)
                 .is_ok();
-        let launch = self.task_manager.get(task_id).and_then(|task| {
+        let launch_bits = self.task_manager.get(task_id).and_then(|task| {
             ((task.status == TaskStatus::Created && task.terminal_session_id.is_none())
                 || (native_recovery && task.terminal_session_id.is_none())
                 || failed_terminal_retry
@@ -1464,16 +1464,50 @@ impl TerminalApp {
                     task.title.clone(),
                     task.repo_root.clone(),
                     task.worktree_path.clone(),
+                    task.clone(),
                 )
             })
         });
-        let Some((provider, title, repository, worktree)) = launch else {
+        let Some((provider, title, repository, worktree, task_snapshot)) = launch_bits else {
             self.set_status("Task is no longer waiting for an Agent terminal");
             return;
         };
+        let policy = NativePromptPolicy {
+            share_command_context: self.config.ai_enabled && self.config.ai_share_command_context,
+            redact_secrets: self.config.ai_redact_secrets,
+        };
+        let brief_written = match crate::agent::write_pty_task_brief(&task_snapshot, policy) {
+            Ok(path) => path.is_some(),
+            Err(error) => {
+                // Missing/disabled context is expected; IO failures should surface.
+                if !matches!(
+                    error,
+                    crate::agent::NativePromptError::SharingDisabled
+                        | crate::agent::NativePromptError::MissingContext
+                        | crate::agent::NativePromptError::MissingCommand
+                        | crate::agent::NativePromptError::CommandNotExact
+                        | crate::agent::NativePromptError::CommandTruncated
+                        | crate::agent::NativePromptError::OutputUnavailable
+                ) {
+                    self.set_status_for(
+                        format!("Could not write task brief: {error}"),
+                        Duration::from_secs(6),
+                    );
+                }
+                false
+            }
+        };
         let launch = match crate::agent::AgentLaunchSpec::resolve(provider, &repository, &worktree)
         {
-            Ok(launch) => launch,
+            Ok(launch) => {
+                if brief_written {
+                    launch.with_pty_seed_prompt(&format!(
+                        "Read {PTY_TASK_BRIEF_RELATIVE} and fix the failed command described there. Stay inside this worktree."
+                    ))
+                } else {
+                    launch
+                }
+            }
             Err(error) => {
                 if failed_terminal_retry.is_none() && !native_recovery {
                     // update_status preserves TerminalFallback provenance, so
@@ -1566,10 +1600,17 @@ impl TerminalApp {
         self.tabs.insert_tab_after_active(created.session_index);
         self.activate_session(created.session_index);
         self.schedule_session_save();
-        self.set_status(format!(
-            "Opened {} in an isolated task terminal; task context remains in Ember",
-            provider.display_name()
-        ));
+        self.set_status(if brief_written {
+            format!(
+                "Opened {} in an isolated task terminal; failed-command brief is at {PTY_TASK_BRIEF_RELATIVE}",
+                provider.display_name()
+            )
+        } else {
+            format!(
+                "Opened {} in an isolated task terminal; enable AI context sharing to attach a brief",
+                provider.display_name()
+            )
+        });
     }
 
     fn start_task_validation(&mut self, task_id: TaskId) {
