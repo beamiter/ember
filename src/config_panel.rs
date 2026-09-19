@@ -1394,7 +1394,7 @@ impl ConfigPanel {
         }
         ui.label(
             RichText::new(
-                "Enables isolated task worktrees and Fix with Codex / Claude / OpenCode / Kimi. Native Codex and Claude sessions do not resume after they stop. This does not grant cloud command-context sharing.",
+                "Enables isolated task worktrees and Fix with Codex / Claude / OpenCode / Kimi. Native Codex, Claude, and Kimi sessions do not resume after they stop. This does not grant cloud command-context sharing.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),

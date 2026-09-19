@@ -689,9 +689,9 @@ impl TerminalApp {
                                         "Created an isolated {provider_name} task; choose Start {provider_name}"
                                     ));
                                 } else {
-                                    // OpenCode / Kimi: PTY is the only path
-                                    // today — start it immediately so Fix is
-                                    // one click from failed command to CLI.
+                                    // OpenCode: PTY is the only path today —
+                                    // start it immediately so Fix is one click
+                                    // from failed command to CLI.
                                     self.set_status(format!(
                                         "Created an isolated {provider_name} task; starting {provider_name}…"
                                     ));
@@ -870,7 +870,10 @@ impl TerminalApp {
                                         AgentProvider::Claude => {
                                             "Start a native Claude Code print/stream-json session. This MVP does not use Codex-style private home or cgroup containment; prefer Terminal fallback when stronger isolation is required."
                                         }
-                                        AgentProvider::OpenCode | AgentProvider::Kimi => {
+                                        AgentProvider::Kimi => {
+                                            "Start a native Kimi Code print/stream-json session. Print mode uses auto tool permission; this MVP does not use Codex-style private home or cgroup containment."
+                                        }
+                                        AgentProvider::OpenCode => {
                                             "Start the native provider session."
                                         }
                                     };
@@ -1381,7 +1384,10 @@ impl TerminalApp {
             AgentProvider::Claude => self
                 .agent_runtime
                 .start_claude(&mut self.task_manager, task_id, policy),
-            AgentProvider::OpenCode | AgentProvider::Kimi => {
+            AgentProvider::Kimi => self
+                .agent_runtime
+                .start_kimi(&mut self.task_manager, task_id, policy),
+            AgentProvider::OpenCode => {
                 self.set_status_for(
                     format!(
                         "{} has no native driver yet; use Start {}",

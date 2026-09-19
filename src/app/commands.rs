@@ -1305,7 +1305,7 @@ impl TerminalApp {
     ) {
         // With the Tasks dashboard enabled, fixing a failed command takes the
         // provider path: first create the isolated worktree, then start the
-        // chosen CLI (native Codex/Claude, or Terminal/PTY for OpenCode/Kimi).
+        // chosen CLI (native Codex/Claude/Kimi, or Terminal/PTY for OpenCode).
         // Explain remains a read-only request in the legacy inline panel.
         let create_is_local_worktree =
             self.config.experimental_task_sidebar && intent == AgentTaskIntent::Fix;
