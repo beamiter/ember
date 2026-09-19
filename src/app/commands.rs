@@ -721,6 +721,10 @@ impl TerminalApp {
 
         let mut action = None;
         let mut clear_selection = false;
+        let preferred_fix_provider = crate::agent::AgentProvider::from_config_value(
+            &self.config.preferred_fix_provider,
+        )
+        .unwrap_or(crate::agent::AgentProvider::Codex);
         if visible_rows.is_empty() {
             ui.add_space(8.0);
             ui.label(
@@ -860,7 +864,7 @@ impl TerminalApp {
                             if completed_command_row_is_failed(row) {
                                 ui.separator();
                                 let disabled = agent_task_disabled_reason(row);
-                                for provider in crate::agent::AgentProvider::ALL {
+                                for provider in fix_providers_ordered(preferred_fix_provider) {
                                     command_menu_item(
                                         ui,
                                         &mut action,
@@ -898,6 +902,7 @@ impl TerminalApp {
                                     row,
                                     detail,
                                     replay_guard,
+                                    preferred_fix_provider,
                                     &mut action,
                                     &mut clear_selection,
                                 );
@@ -1013,11 +1018,17 @@ impl TerminalApp {
             }
             CommandActionKind::Fill => self.replay_sidebar_command(&action.target, false, false),
             CommandActionKind::RunAgain => self.replay_sidebar_command(&action.target, true, false),
-            CommandActionKind::FixWithAgent(provider) => self.start_agent_task_for_command(
-                &action.target,
-                AgentTaskIntent::Fix,
-                Some(provider),
-            ),
+            CommandActionKind::FixWithAgent(provider) => {
+                if self.config.preferred_fix_provider != provider.config_value() {
+                    self.config.preferred_fix_provider = provider.config_value().to_string();
+                    self.schedule_config_save();
+                }
+                self.start_agent_task_for_command(
+                    &action.target,
+                    AgentTaskIntent::Fix,
+                    Some(provider),
+                )
+            }
             CommandActionKind::ExplainWithAgent => {
                 self.start_agent_task_for_command(&action.target, AgentTaskIntent::Explain, None)
             }
@@ -1385,7 +1396,12 @@ impl TerminalApp {
             return;
         }
         if create_is_local_worktree {
-            let provider = provider.unwrap_or(crate::agent::AgentProvider::Codex);
+            let provider = provider.unwrap_or_else(|| {
+                crate::agent::AgentProvider::from_config_value(
+                    &self.config.preferred_fix_provider,
+                )
+                .unwrap_or(crate::agent::AgentProvider::Codex)
+            });
             match self.begin_command_worktree_task(semantic, provider) {
                 Ok(()) => {}
                 Err(error) => self.set_status_for(
@@ -4485,6 +4501,16 @@ fn enrich_live_detail_from_history(
         .is_some_and(|output| !output.text.is_empty());
 }
 
+fn fix_providers_ordered(
+    preferred: crate::agent::AgentProvider,
+) -> [crate::agent::AgentProvider; 4] {
+    let mut providers = crate::agent::AgentProvider::ALL;
+    if let Some(index) = providers.iter().position(|provider| *provider == preferred) {
+        providers.swap(0, index);
+    }
+    providers
+}
+
 fn command_menu_item(
     ui: &mut egui::Ui,
     action: &mut Option<CommandAction>,
@@ -4548,6 +4574,7 @@ fn render_command_detail(
     row: &CommandRowSnapshot,
     detail: &CommandDetailSnapshot,
     replay_guard: ReplayGuardSnapshot,
+    preferred_fix_provider: crate::agent::AgentProvider,
     action: &mut Option<CommandAction>,
     clear_selection: &mut bool,
 ) {
@@ -4680,7 +4707,7 @@ fn render_command_detail(
                             .color(ui.visuals().weak_text_color()),
                     );
                     let disabled = agent_task_disabled_reason(row);
-                    for provider in crate::agent::AgentProvider::ALL {
+                    for provider in fix_providers_ordered(preferred_fix_provider) {
                         command_detail_action_button(
                             ui,
                             action,

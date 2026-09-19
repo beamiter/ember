@@ -145,6 +145,7 @@ pub struct ConfigPanel {
     ai_key_store_status: Option<Result<String, String>>,
     edit_agent_max_turns: u32,
     edit_experimental_task_sidebar: bool,
+    edit_preferred_fix_provider: String,
     edit_remote_hosts: Vec<RemoteHostDraft>,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
@@ -208,6 +209,7 @@ impl ConfigPanel {
             ai_key_store_status: None,
             edit_agent_max_turns: 20,
             edit_experimental_task_sidebar: false,
+            edit_preferred_fix_provider: "codex".to_string(),
             edit_remote_hosts: Vec::new(),
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
@@ -304,6 +306,7 @@ impl ConfigPanel {
         self.ai_key_store_status = None;
         self.edit_agent_max_turns = config.agent_max_turns;
         self.edit_experimental_task_sidebar = config.experimental_task_sidebar;
+        self.edit_preferred_fix_provider = config.preferred_fix_provider.clone();
         self.edit_remote_hosts = config
             .remote_hosts
             .iter()
@@ -359,6 +362,7 @@ impl ConfigPanel {
             Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
         config.experimental_task_sidebar = self.edit_experimental_task_sidebar;
+        config.preferred_fix_provider = self.edit_preferred_fix_provider.clone();
         config.remote_hosts = self
             .edit_remote_hosts
             .iter()
@@ -1390,7 +1394,28 @@ impl ConfigPanel {
         }
         ui.label(
             RichText::new(
-                "Enables isolated task worktrees and the native Codex app-server dashboard. A live session can run sequential review-feedback turns but cannot resume after it stops. This does not grant cloud command-context sharing.",
+                "Enables isolated task worktrees and Fix with Codex / Claude / OpenCode / Kimi. Native Codex and Claude sessions do not resume after they stop. This does not grant cloud command-context sharing.",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preferred Fix agent:");
+            for provider in crate::agent::AgentProvider::ALL {
+                let value = provider.config_value();
+                if ui
+                    .selectable_label(self.edit_preferred_fix_provider == value, provider.display_name())
+                    .on_hover_text(provider.install_hint())
+                    .clicked()
+                {
+                    self.edit_preferred_fix_provider = value.to_string();
+                    self.has_changes = true;
+                }
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Used as the default Fix target and remembered when you pick another agent from a failed command.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),

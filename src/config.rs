@@ -160,6 +160,10 @@ pub struct Config {
     #[serde(default)]
     pub experimental_task_sidebar: bool,
 
+    /// Last / preferred Fix-with Agent CLI (`codex`, `claude`, `opencode`, `kimi`).
+    #[serde(default = "default_preferred_fix_provider")]
+    pub preferred_fix_provider: String,
+
     /// Remote destinations for the host picker (Ctrl+Shift+S). Grammar,
     /// validation and the argv a tab runs are the family-shared
     /// `jterm_core::jsh_remote::RemoteHostConfig`. A file with no key at all
@@ -397,6 +401,10 @@ fn default_ai_max_tokens() -> u32 {
     1_024
 }
 
+fn default_preferred_fix_provider() -> String {
+    "codex".to_string()
+}
+
 fn default_agent_max_turns() -> u32 {
     20
 }
@@ -581,6 +589,7 @@ impl Default for Config {
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
             experimental_task_sidebar: false,
+            preferred_fix_provider: default_preferred_fix_provider(),
             remote_hosts: default_remote_hosts(),
             font_size: default_font_size(),
             font_family: default_font_family(),
@@ -1011,6 +1020,17 @@ impl Config {
                 "ai_model is empty, oversized, or contains controls or invisible formatting; using default"
                     .into(),
             );
+        }
+        match crate::agent::AgentProvider::from_config_value(&self.preferred_fix_provider) {
+            Some(provider) => {
+                self.preferred_fix_provider = provider.config_value().to_string();
+            }
+            None => {
+                self.preferred_fix_provider = default_preferred_fix_provider();
+                warnings.push(
+                    "preferred_fix_provider is unknown or invalid; using codex".into(),
+                );
+            }
         }
         if normalize_optional_text(&mut self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES) {
             warnings.push(
@@ -1490,9 +1510,11 @@ mod tests {
     fn experimental_task_sidebar_defaults_off_and_round_trips() {
         let defaults = Config::default();
         assert!(!defaults.experimental_task_sidebar);
+        assert_eq!(defaults.preferred_fix_provider, "codex");
 
         let omitted: Config = toml::from_str("").expect("empty config parses");
         assert!(!omitted.experimental_task_sidebar);
+        assert_eq!(omitted.preferred_fix_provider, "codex");
 
         let enabled: Config =
             toml::from_str("experimental_task_sidebar = true\n").expect("task sidebar flag parses");
@@ -1500,6 +1522,23 @@ mod tests {
         let serialized = toml::to_string_pretty(&enabled).expect("config serializes");
         let reparsed: Config = toml::from_str(&serialized).expect("serialized config reparses");
         assert!(reparsed.experimental_task_sidebar);
+    }
+
+    #[test]
+    fn preferred_fix_provider_sanitizes_unknown_values() {
+        let mut config: Config = toml::from_str("preferred_fix_provider = \"kimi\"\n")
+            .expect("preferred provider parses");
+        let warnings = config.normalize();
+        assert!(warnings.is_empty());
+        assert_eq!(config.preferred_fix_provider, "kimi");
+
+        let mut bad: Config =
+            toml::from_str("preferred_fix_provider = \"nope\"\n").expect("unknown parses");
+        let warnings = bad.normalize();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("preferred_fix_provider")));
+        assert_eq!(bad.preferred_fix_provider, "codex");
     }
 
     #[test]
