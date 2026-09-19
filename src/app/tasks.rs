@@ -36,7 +36,7 @@ const MAX_NATIVE_FOLLOW_UP_CHARS: usize = NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSidebarAction {
-    StartCodex(TaskId),
+    StartNative(TaskId),
     StartTerminal(TaskId),
     StopCodex(TaskId),
     FollowUp(TaskId, String),
@@ -661,11 +661,12 @@ impl TerminalApp {
                         Duration::from_secs(8),
                     ),
                     Ok(prepared) => {
-                        let provider_name = prepared.provider.display_name();
+                        let provider = prepared.provider;
+                        let provider_name = provider.display_name();
                         let worktree = prepared.worktree;
                         let task = crate::agent::NewTask {
                             title: prepared.title,
-                            provider: prepared.provider,
+                            provider,
                             repo_root: worktree.repository,
                             worktree_path: worktree.path,
                             branch: worktree.branch,
@@ -675,9 +676,19 @@ impl TerminalApp {
                         match self.task_manager.create(task) {
                             Ok(task_id) => {
                                 self.task_sidebar.selected = Some(task_id);
-                                self.set_status(format!(
-                                    "Created an isolated {provider_name} task; choose Start Codex"
-                                ));
+                                if provider.supports_native_driver() {
+                                    self.set_status(format!(
+                                        "Created an isolated {provider_name} task; choose Start {provider_name}"
+                                    ));
+                                } else {
+                                    // OpenCode / Kimi: PTY is the only path
+                                    // today — start it immediately so Fix is
+                                    // one click from failed command to CLI.
+                                    self.set_status(format!(
+                                        "Created an isolated {provider_name} task; starting {provider_name}…"
+                                    ));
+                                    self.start_task_agent_terminal(task_id);
+                                }
                             }
                             Err(error) => self.set_status_for(
                                 format!(
@@ -755,10 +766,10 @@ impl TerminalApp {
             ui.label(egui::RichText::new("No Agent tasks yet").strong());
             ui.label(
                 egui::RichText::new(
-                    "Create one from a failed command block. Each task gets its own Git worktree and Agent terminal.",
+                    "Create one from a failed command block: Fix with Codex, Claude, OpenCode, or Kimi. Each task gets its own Git worktree and Agent terminal.",
                 )
                 .small()
-                .weak(),
+                .color(ui.visuals().weak_text_color()),
             );
             return;
         }
@@ -842,26 +853,47 @@ impl TerminalApp {
                                 && row.runtime_kind == TaskRuntimeKind::Unassigned
                                 && !row.native_preparing
                             {
-                                if ui
-                                    .add_enabled(
-                                        native_ai_enabled,
-                                        egui::Button::new("Start Codex"),
-                                    )
-                                    .on_disabled_hover_text(
-                                        "Enable AI features and cloud command-context sharing in Settings → AI first",
-                                    )
-                                    .on_hover_text(
-                                        "Start a native Codex app-server session. Review points can continue on the same loaded thread; finish the session before validation. Agent tool writes are restricted to this worktree, while the current Codex sandbox may read other host files.",
-                                    )
-                                    .clicked()
-                                {
-                                    pending = Some(TaskSidebarAction::StartCodex(row.id));
-                                }
-                                if ui
-                                    .button("Terminal fallback")
-                                    .on_hover_text(
-                                        "Open the provider CLI in a PTY without Ember-native events or approval cards; the provider TUI owns its prompts",
-                                    )
+                                let start_label = format!("Start {}", row.provider.display_name());
+                                if row.provider.supports_native_driver() {
+                                    let native_hover = match row.provider {
+                                        AgentProvider::Codex => {
+                                            "Start a native Codex app-server session. Review points can continue on the same loaded thread; finish the session before validation. Agent tool writes are restricted to this worktree, while the current Codex sandbox may read other host files."
+                                        }
+                                        AgentProvider::Claude => {
+                                            "Start a native Claude Code print/stream-json session. This MVP does not use Codex-style private home or cgroup containment; prefer Terminal fallback when stronger isolation is required."
+                                        }
+                                        AgentProvider::OpenCode | AgentProvider::Kimi => {
+                                            "Start the native provider session."
+                                        }
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            native_ai_enabled,
+                                            egui::Button::new(&start_label),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "Enable AI features and cloud command-context sharing in Settings → AI first",
+                                        )
+                                        .on_hover_text(native_hover)
+                                        .clicked()
+                                    {
+                                        pending = Some(TaskSidebarAction::StartNative(row.id));
+                                    }
+                                    if ui
+                                        .button("Terminal fallback")
+                                        .on_hover_text(
+                                            "Open the provider CLI in a PTY without Ember-native events or approval cards; the provider TUI owns its prompts",
+                                        )
+                                        .clicked()
+                                    {
+                                        pending = Some(TaskSidebarAction::StartTerminal(row.id));
+                                    }
+                                } else if ui
+                                    .button(&start_label)
+                                    .on_hover_text(format!(
+                                        "Open {} in a PTY inside this isolated worktree. Native structured events are not available for this provider yet; the CLI TUI owns its prompts and approvals.",
+                                        row.provider.display_name()
+                                    ))
                                     .clicked()
                                 {
                                     pending = Some(TaskSidebarAction::StartTerminal(row.id));
@@ -1154,7 +1186,7 @@ impl TerminalApp {
             return;
         };
         match action {
-            TaskSidebarAction::StartCodex(task_id) => self.start_task_native_codex(task_id),
+            TaskSidebarAction::StartNative(task_id) => self.start_task_native_agent(task_id),
             TaskSidebarAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
             TaskSidebarAction::StopCodex(task_id) => match self.agent_runtime.cancel(task_id) {
                 Ok(()) => {
@@ -1281,18 +1313,45 @@ impl TerminalApp {
         }
     }
 
-    fn start_task_native_codex(&mut self, task_id: TaskId) {
+    fn start_task_native_agent(&mut self, task_id: TaskId) {
+        let provider = self.task_manager.get(task_id).map(|task| task.provider);
+        let Some(provider) = provider else {
+            self.set_status("Task is no longer available");
+            return;
+        };
         let policy = NativePromptPolicy {
             share_command_context: self.config.ai_enabled && self.config.ai_share_command_context,
             redact_secrets: self.config.ai_redact_secrets,
         };
-        match self
-            .agent_runtime
-            .start_codex(&mut self.task_manager, task_id, policy)
-        {
-            Ok(()) => self.set_status("Preparing native Codex prerequisites in the background…"),
+        let result = match provider {
+            AgentProvider::Codex => self
+                .agent_runtime
+                .start_codex(&mut self.task_manager, task_id, policy),
+            AgentProvider::Claude => self
+                .agent_runtime
+                .start_claude(&mut self.task_manager, task_id, policy),
+            AgentProvider::OpenCode | AgentProvider::Kimi => {
+                self.set_status_for(
+                    format!(
+                        "{} has no native driver yet; use Start {}",
+                        provider.display_name(),
+                        provider.display_name()
+                    ),
+                    Duration::from_secs(6),
+                );
+                return;
+            }
+        };
+        match result {
+            Ok(()) => self.set_status(format!(
+                "Preparing native {} prerequisites in the background…",
+                provider.display_name()
+            )),
             Err(error) => self.set_status_for(
-                format!("Could not start native Codex: {error}"),
+                format!(
+                    "Could not start native {}: {error}",
+                    provider.display_name()
+                ),
                 Duration::from_secs(8),
             ),
         }

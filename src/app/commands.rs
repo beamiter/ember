@@ -308,7 +308,8 @@ enum CommandActionKind {
     CopyCombined,
     Fill,
     RunAgain,
-    FixWithAgent,
+    /// Create an isolated worktree task for the chosen CLI backend.
+    FixWithAgent(crate::agent::AgentProvider),
     ExplainWithAgent,
     CreateAgentTask,
 }
@@ -858,21 +859,24 @@ impl TerminalApp {
                             );
                             if completed_command_row_is_failed(row) {
                                 ui.separator();
-                                command_menu_item(
-                                    ui,
-                                    &mut action,
-                                    row,
-                                    "Fix with Agent",
-                                    CommandActionKind::FixWithAgent,
-                                    agent_task_disabled_reason(row),
-                                );
+                                let disabled = agent_task_disabled_reason(row);
+                                for provider in crate::agent::AgentProvider::ALL {
+                                    command_menu_item(
+                                        ui,
+                                        &mut action,
+                                        row,
+                                        &format!("Fix with {}", provider.display_name()),
+                                        CommandActionKind::FixWithAgent(provider),
+                                        disabled,
+                                    );
+                                }
                                 command_menu_item(
                                     ui,
                                     &mut action,
                                     row,
                                     "Explain with Agent",
                                     CommandActionKind::ExplainWithAgent,
-                                    agent_task_disabled_reason(row),
+                                    disabled,
                                 );
                                 command_menu_item(
                                     ui,
@@ -880,7 +884,7 @@ impl TerminalApp {
                                     row,
                                     "Create Agent Task",
                                     CommandActionKind::CreateAgentTask,
-                                    agent_task_disabled_reason(row),
+                                    disabled,
                                 );
                             }
                         });
@@ -1009,14 +1013,16 @@ impl TerminalApp {
             }
             CommandActionKind::Fill => self.replay_sidebar_command(&action.target, false, false),
             CommandActionKind::RunAgain => self.replay_sidebar_command(&action.target, true, false),
-            CommandActionKind::FixWithAgent => {
-                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Fix)
-            }
+            CommandActionKind::FixWithAgent(provider) => self.start_agent_task_for_command(
+                &action.target,
+                AgentTaskIntent::Fix,
+                Some(provider),
+            ),
             CommandActionKind::ExplainWithAgent => {
-                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Explain)
+                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Explain, None)
             }
             CommandActionKind::CreateAgentTask => {
-                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Compose)
+                self.start_agent_task_for_command(&action.target, AgentTaskIntent::Compose, None)
             }
         }
     }
@@ -1280,10 +1286,15 @@ impl TerminalApp {
         Ok(merged)
     }
 
-    fn start_agent_task_for_command(&mut self, target: &CommandTarget, intent: AgentTaskIntent) {
+    fn start_agent_task_for_command(
+        &mut self,
+        target: &CommandTarget,
+        intent: AgentTaskIntent,
+        provider: Option<crate::agent::AgentProvider>,
+    ) {
         // With the Tasks dashboard enabled, fixing a failed command takes the
-        // provider-native path: first create the isolated worktree, then let
-        // the user explicitly start Codex with the configured sharing policy.
+        // provider path: first create the isolated worktree, then start the
+        // chosen CLI (native Codex/Claude, or Terminal/PTY for OpenCode/Kimi).
         // Explain remains a read-only request in the legacy inline panel.
         let create_is_local_worktree =
             self.config.experimental_task_sidebar && intent == AgentTaskIntent::Fix;
@@ -1374,7 +1385,8 @@ impl TerminalApp {
             return;
         }
         if create_is_local_worktree {
-            match self.begin_command_worktree_task(semantic, crate::agent::AgentProvider::Codex) {
+            let provider = provider.unwrap_or(crate::agent::AgentProvider::Codex);
+            match self.begin_command_worktree_task(semantic, provider) {
                 Ok(()) => {}
                 Err(error) => self.set_status_for(
                     format!("Could not create Agent task: {error}"),
@@ -4663,19 +4675,29 @@ fn render_command_detail(
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new("Agent task")
+                        egui::RichText::new("Fix with")
                             .small()
                             .color(ui.visuals().weak_text_color()),
                     );
                     let disabled = agent_task_disabled_reason(row);
-                    command_detail_action_button(
-                        ui,
-                        action,
-                        row,
-                        "Fix",
-                        CommandActionKind::FixWithAgent,
-                        disabled,
+                    for provider in crate::agent::AgentProvider::ALL {
+                        command_detail_action_button(
+                            ui,
+                            action,
+                            row,
+                            provider.display_name(),
+                            CommandActionKind::FixWithAgent(provider),
+                            disabled,
+                        );
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Agent")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
                     );
+                    let disabled = agent_task_disabled_reason(row);
                     command_detail_action_button(
                         ui,
                         action,
