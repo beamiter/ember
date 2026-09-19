@@ -1106,13 +1106,13 @@ impl ConfigPanel {
         ui.separator();
 
         ui.label(
-            RichText::new("Inline AI provider (does not configure native Codex)")
+            RichText::new("Inline AI (chat / explain / correction)")
                 .small()
                 .strong(),
         );
         ui.label(
             RichText::new(
-                "Native tasks use the installed, ChatGPT-authenticated Codex CLI in an isolated empty config; inline provider/model settings and user Codex extensions do not carry into that live runtime.",
+                "These settings feed Ember's inline AI panels only. Tasks → Fix with Codex/Claude/OpenCode/Kimi launches the installed CLIs separately; Claude Code is not the same as the Anthropic API provider below.",
             )
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
@@ -1121,7 +1121,7 @@ impl ConfigPanel {
         ui.horizontal(|ui| {
             ui.label("Provider:");
             for (value, label) in [
-                ("anthropic", "Anthropic"),
+                ("anthropic", "Anthropic API"),
                 ("openai-compatible", "OpenAI-compatible"),
                 ("ollama", "Ollama"),
             ] {
@@ -1130,6 +1130,62 @@ impl ConfigPanel {
                     .clicked()
                 {
                     self.edit_ai_provider = value.to_string();
+                    self.has_changes = true;
+                }
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Presets:")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            for (label, provider, base_url, model, hover) in [
+                (
+                    "Anthropic",
+                    "anthropic",
+                    "https://api.anthropic.com",
+                    "claude-sonnet-4-6",
+                    "Anthropic Messages API for inline chat / explain",
+                ),
+                (
+                    "OpenAI",
+                    "openai-compatible",
+                    "https://api.openai.com/v1",
+                    "gpt-4o-mini",
+                    "OpenAI Chat Completions",
+                ),
+                (
+                    "Kimi CN",
+                    "openai-compatible",
+                    "https://api.moonshot.cn/v1",
+                    "kimi-k2.5",
+                    "Moonshot China endpoint; accepts MOONSHOT_API_KEY or KIMI_API_KEY",
+                ),
+                (
+                    "Kimi Intl",
+                    "openai-compatible",
+                    "https://api.moonshot.ai/v1",
+                    "kimi-k2.5",
+                    "Moonshot international endpoint; accepts MOONSHOT_API_KEY or KIMI_API_KEY",
+                ),
+                (
+                    "Ollama",
+                    "ollama",
+                    "http://127.0.0.1:11434",
+                    "llama3.2",
+                    "Local Ollama /api/chat",
+                ),
+            ] {
+                if ui
+                    .small_button(label)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.edit_ai_provider = provider.to_string();
+                    self.edit_ai_base_url = base_url.to_string();
+                    self.edit_ai_model = model.to_string();
                     self.has_changes = true;
                 }
             }
@@ -1227,7 +1283,7 @@ impl ConfigPanel {
         });
         ui.label(
             RichText::new(format!(
-                "Keys entered here are saved to {default_key_path} with owner-only permissions. The value is masked and is never written to config.toml. Environment API key variables still take precedence."
+                "Keys entered here are saved to {default_key_path} with owner-only permissions. The value is masked and is never written to config.toml. Environment variables take precedence: EMBER_AI_API_KEY, then ANTHROPIC_API_KEY / OPENAI_API_KEY / MOONSHOT_API_KEY / KIMI_API_KEY / OLLAMA_API_KEY."
             ))
             .size(11.0)
             .color(ui.visuals().weak_text_color()),
