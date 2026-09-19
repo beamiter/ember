@@ -684,18 +684,30 @@ impl TerminalApp {
                         match self.task_manager.create(task) {
                             Ok(task_id) => {
                                 self.task_sidebar.selected = Some(task_id);
-                                if provider.supports_native_driver() {
-                                    self.set_status(format!(
-                                        "Created an isolated {provider_name} task; choose Start {provider_name}"
-                                    ));
-                                } else {
-                                    // OpenCode: PTY is the only path today —
-                                    // start it immediately so Fix is one click
-                                    // from failed command to CLI.
-                                    self.set_status(format!(
-                                        "Created an isolated {provider_name} task; starting {provider_name}…"
-                                    ));
-                                    self.start_task_agent_terminal(task_id);
+                                match provider {
+                                    AgentProvider::Codex => {
+                                        // Multi-turn / approvals: wait for an
+                                        // explicit Start so the user can review
+                                        // context before spawning app-server.
+                                        self.set_status(format!(
+                                            "Created an isolated {provider_name} task; choose Start {provider_name}"
+                                        ));
+                                    }
+                                    AgentProvider::Claude | AgentProvider::Kimi => {
+                                        self.set_status(format!(
+                                            "Created an isolated {provider_name} task; starting native {provider_name}…"
+                                        ));
+                                        self.start_task_native_agent(task_id);
+                                    }
+                                    AgentProvider::OpenCode => {
+                                        // PTY is the only path today — start it
+                                        // immediately so Fix is one click from
+                                        // failed command to CLI.
+                                        self.set_status(format!(
+                                            "Created an isolated {provider_name} task; starting {provider_name}…"
+                                        ));
+                                        self.start_task_agent_terminal(task_id);
+                                    }
                                 }
                             }
                             Err(error) => self.set_status_for(
