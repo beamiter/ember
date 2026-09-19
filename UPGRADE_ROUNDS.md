@@ -478,3 +478,59 @@ Shared-core repin to `9f94f77` (jagent `bdc8023`) adds rounds 83–87
     (`--deny warnings`) and shellcheck passes that frost and forge already had,
     and CI's audit job runs through it. The installer, uninstaller and their
     path test are now shellchecked by the same entry point that ships them.
+
+Agent-TUI fidelity and family parity adds rounds 88–105 (2026-09-19). Real
+Claude Code 2.1.278, Codex 0.155 and Kimi Code 0.36 sessions were recorded
+through ember's emulator (which answered their queries live), then replayed
+into ember and into libvte 0.76 as the reference, snapshot by snapshot across
+startup, typing, slash menus, a 120x40→100x30→120x40 resize and a streamed
+reply. Screen text matched libvte everywhere, so these rounds address what
+the recordings and a line-by-line audit against frost showed was still wrong:
+query answers, control handling and resize.
+
+88. **Mode 2031 is a theme notification, not a keyboard mode** — Claude Code
+    and neovim send `CSI ? 2031 h` to hear about light/dark flips; ember read
+    it as Kitty "report all keys" and overrode the keyboard flags those apps
+    had just pushed (frost fixed the same bug earlier). A flip of the theme's
+    default background now sends `CSI ? 997 ; 1|2 n` to subscribers.
+89. **DECRQM answers every implemented mode** — `CSI ? Ps $ p` answered only
+    5522, so Claude Code's startup probes for 2026 (synchronized output) and
+    1016 went unanswered. Private and ANSI (IRM) modes now report set/reset,
+    and unmodelled modes report 0 rather than inviting an app to enable them.
+90. **Colour queries report the theme** — OSC 10/11/12 and OSC 4 (0–15)
+    answered hard-coded white/black, so Codex and Kimi picked palettes for the
+    wrong background. The session manager pushes the active theme into every
+    emulator; explicit OSC sets still win.
+91. **Replies use the query's terminator** — a BEL-terminated OSC query now
+    gets a BEL-terminated reply (xterm and VTE do this; Kimi queries with BEL),
+    including OSC 52 and 5522 status replies.
+92. **DSR 996 and DECXCPR** — `CSI ? 996 n` reports dark/light from the
+    effective default background; `CSI ? 6 n` keeps its `?`.
+93. **XTWINOPS 16t** — the cell size in pixels, which Claude Code requests
+    for image layout, is reported from the same metrics as 14t.
+94. **DECSCUSR uses xterm numbering** — 2 was drawn as an underline and 6 as
+    a block, inverting neovim's normal/insert cursors.
+95. **Shrinking a pane drops blank rows first** — a height shrink (a pane
+    split, a window drag) evicted every row above the cursor into scrollback
+    and jumped the prompt to the top even with blank rows below; like xterm,
+    VTE and alacritty, blank rows below the cursor now go first.
+96. **Stray C0 controls are ignored** — NUL, ENQ, CAN/SUB outside a sequence
+    and 0x1c–0x1f printed U+FFFD; VT and FF now act as LF.
+97. **Escape sequences are consumed whole** — NEL and DECALN are
+    implemented, and an unknown `ESC [intermediates] final` (e.g. `ESC % G`,
+    a stray `ESC \`) no longer prints its trailing bytes.
+98. **Zero counts mean one** — CUU/CUD/CUF/CUB/CNL/CPL/IL/DL/ICH/DCH/ECH/SU/
+    SD/CHT/CBT/REP with parameter 0 act as 1, as in xterm.
+99. **DECCARA is not DECSTBM** — `CSI … $ r` no longer resets margins.
+100. **Index and tab controls clear pending wrap** — RI, IND, NEL, CHT and
+     CBT at the last column no longer leave the next glyph wrapping.
+101. **1048 has its own save slot** — it no longer clobbers the cursor 1049
+     restores.
+102. **DECSTR soft reset** — `CSI ! p` restores margins, modes, SGR and the
+     saved cursor.
+103. **urxvt and UTF-8 mouse encodings** — 1015 and 1005 are encoded as
+     requested instead of falling back to X10 bytes; 1006 keeps priority.
+104. **The alternate screen restores the cursor shape** on exit.
+105. **A Fix-menu provider pick survives an open Settings panel** — the
+     panel's draft adopts the menu's choice unless the user changed it there,
+     so Save no longer silently reverts it.

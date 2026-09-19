@@ -3,7 +3,7 @@ use crate::session_persistence;
 use crate::shell::{ShellEvent, ShellSession, ShellWriteError};
 use crate::terminal::{
     clamp_terminal_dimensions, ClipboardReadRequest, CompletedCommandEvent, CompletedCommandOutput,
-    TerminalState,
+    TerminalDefaultColors, TerminalState,
 };
 use eframe::egui;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
@@ -314,6 +314,24 @@ pub struct SessionManager {
     /// Starting point for background-session output processing. Rotating this
     /// cursor prevents a noisy early tab from starving later hidden tabs.
     background_pump_cursor: usize,
+    /// Theme colours every terminal reports to OSC 10/11/12/4 queries and
+    /// DSR 996. `None` until the app first pushes the theme.
+    terminal_default_colors: Option<TerminalDefaultColors>,
+}
+
+/// The theme's terminal colours in the form `TerminalState` reports them.
+pub fn terminal_default_colors(theme: &crate::theme::Theme) -> TerminalDefaultColors {
+    let rgb = |c: [u8; 3]| (c[0], c[1], c[2]);
+    let mut ansi = [(0, 0, 0); 16];
+    for (slot, color) in ansi.iter_mut().zip(theme.terminal.ansi_colors) {
+        *slot = rgb(color);
+    }
+    TerminalDefaultColors {
+        foreground: rgb(theme.terminal.foreground),
+        background: rgb(theme.terminal.background),
+        cursor: rgb(theme.terminal.cursor),
+        ansi,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -484,7 +502,29 @@ impl SessionManager {
             configured_shell,
             previous_session_id: None,
             background_pump_cursor: 0,
+            terminal_default_colors: None,
         }
+    }
+
+    /// Push the theme's colours into every terminal, and remember them for
+    /// sessions created later. Cheap when unchanged, so the app calls it every
+    /// frame instead of hooking each of its theme-switch paths.
+    pub fn set_terminal_default_colors(&mut self, colors: TerminalDefaultColors) {
+        if self.terminal_default_colors == Some(colors) {
+            return;
+        }
+        self.terminal_default_colors = Some(colors);
+        for session in &self.sessions {
+            session.terminal.lock().set_default_colors(colors);
+        }
+    }
+
+    fn new_terminal_state(&self, cols: usize, rows: usize) -> TerminalState {
+        let mut terminal = TerminalState::new(cols, rows);
+        if let Some(colors) = self.terminal_default_colors {
+            terminal.set_default_colors(colors);
+        }
+        terminal
     }
 
     /// Fairly parse PTY output for every non-active session within one shared
@@ -910,7 +950,7 @@ impl SessionManager {
             pinned_cwd,
             self.repaint_ctx.clone(),
         )?;
-        let mut terminal = TerminalState::new(cols, rows);
+        let mut terminal = self.new_terminal_state(cols, rows);
         terminal.set_max_scrollback(scrollback_lines);
         let terminal = Arc::new(ParkingMutex::new(terminal));
         let mut session =
@@ -1175,7 +1215,7 @@ impl SessionManager {
             }
             match shell_result {
                 Ok(shell) => {
-                    let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
+                    let terminal = Arc::new(ParkingMutex::new(self.new_terminal_state(80, 24)));
                     let mut session =
                         Session::new_with_session_id(name, tags, terminal, shell, session_id);
                     session.metadata.custom_name = custom_name;

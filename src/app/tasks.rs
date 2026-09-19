@@ -1390,15 +1390,18 @@ impl TerminalApp {
             redact_secrets: self.config.ai_redact_secrets,
         };
         let result = match provider {
-            AgentProvider::Codex => self
-                .agent_runtime
-                .start_codex(&mut self.task_manager, task_id, policy),
-            AgentProvider::Claude => self
-                .agent_runtime
-                .start_claude(&mut self.task_manager, task_id, policy),
-            AgentProvider::Kimi => self
-                .agent_runtime
-                .start_kimi(&mut self.task_manager, task_id, policy),
+            AgentProvider::Codex => {
+                self.agent_runtime
+                    .start_codex(&mut self.task_manager, task_id, policy)
+            }
+            AgentProvider::Claude => {
+                self.agent_runtime
+                    .start_claude(&mut self.task_manager, task_id, policy)
+            }
+            AgentProvider::Kimi => {
+                self.agent_runtime
+                    .start_kimi(&mut self.task_manager, task_id, policy)
+            }
             AgentProvider::OpenCode => {
                 self.set_status_for(
                     format!(

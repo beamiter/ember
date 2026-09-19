@@ -1789,10 +1789,15 @@ const MAX_OSC52_CLIPBOARD_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const OSC52_READ_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_OSC52_READS_PER_WINDOW: usize = 2;
 
-fn osc52_clipboard_response_with_limit(content: &str, max_response_bytes: usize) -> Vec<u8> {
+/// `terminator` is the one the query ended with (BEL or ST); xterm and VTE end
+/// the reply the same way.
+fn osc52_clipboard_response_with_limit(
+    content: &str,
+    max_response_bytes: usize,
+    terminator: &[u8],
+) -> Vec<u8> {
     const PREFIX: &[u8] = b"\x1b]52;c;";
-    const TERMINATOR: &[u8] = b"\x1b\\";
-    let overhead = PREFIX.len() + TERMINATOR.len();
+    let overhead = PREFIX.len() + terminator.len();
     if max_response_bytes < overhead {
         return Vec::new();
     }
@@ -1813,7 +1818,7 @@ fn osc52_clipboard_response_with_limit(content: &str, max_response_bytes: usize)
     let mut response = Vec::with_capacity(overhead + encoded.len());
     response.extend_from_slice(PREFIX);
     response.extend_from_slice(encoded.as_bytes());
-    response.extend_from_slice(TERMINATOR);
+    response.extend_from_slice(terminator);
     response
 }
 
@@ -1841,8 +1846,9 @@ fn service_osc52_clipboard_query(
     window_started: &mut std::time::Instant,
     reads_in_window: &mut usize,
 ) {
+    let terminator = terminal.lock().osc52_query_terminator();
     let empty_response =
-        || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES);
+        || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
     if !osc52_read_rate_limit_allows(std::time::Instant::now(), window_started, reads_in_window)
         || !clipboard_available
     {
@@ -1876,10 +1882,16 @@ fn service_osc52_clipboard_query(
             let content = ClipboardManager::new()
                 .and_then(|clipboard| clipboard.paste())
                 .unwrap_or_default();
-            let response =
-                osc52_clipboard_response_with_limit(&content, MAX_OSC52_CLIPBOARD_RESPONSE_BYTES);
-            let fallback =
-                osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES);
+            let response = osc52_clipboard_response_with_limit(
+                &content,
+                MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
+                terminator,
+            );
+            let fallback = osc52_clipboard_response_with_limit(
+                "",
+                MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
+                terminator,
+            );
             enqueue_worker_protocol_response(&response_tx, response, fallback, "OSC 52");
         });
     if let Err(error) = spawn_result {
@@ -5083,6 +5095,12 @@ impl eframe::App for TerminalApp {
         }
 
         self.debug_panel.record_frame();
+        // Terminals answer OSC 10/11/12/4 and DSR 996 from the theme colours;
+        // a no-op unless the theme changed or a session has not seen it yet.
+        self.session_manager
+            .set_terminal_default_colors(session_manager::terminal_default_colors(
+                &self.current_theme,
+            ));
         self.poll_task_creation(ctx);
         self.poll_native_agent_runtime(ctx);
         self.poll_session_export(ctx);
@@ -8043,13 +8061,15 @@ mod tests {
 
     #[test]
     fn osc52_response_is_bounded_before_base64_allocation() {
-        let normal = osc52_clipboard_response_with_limit("hello", 64);
+        let normal = osc52_clipboard_response_with_limit("hello", 64, b"\x1b\\");
         assert_eq!(normal, b"\x1b]52;c;aGVsbG8=\x1b\\");
+        let bel = osc52_clipboard_response_with_limit("hello", 64, b"\x07");
+        assert_eq!(bel, b"\x1b]52;c;aGVsbG8=\x07");
 
-        let capped = osc52_clipboard_response_with_limit(&"x".repeat(128), 16);
+        let capped = osc52_clipboard_response_with_limit(&"x".repeat(128), 16, b"\x1b\\");
         assert_eq!(capped, b"\x1b]52;c;\x1b\\");
         assert!(capped.len() <= 16);
-        assert!(osc52_clipboard_response_with_limit("x", 4).is_empty());
+        assert!(osc52_clipboard_response_with_limit("x", 4, b"\x1b\\").is_empty());
     }
 
     #[test]

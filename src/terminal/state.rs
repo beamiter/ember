@@ -328,6 +328,7 @@ impl super::TerminalState {
             alt_cursor_row: 0,
             alt_cursor_col: 0,
             cursor_shape: CursorShape::default(),
+            saved_primary_cursor_shape: None,
             saved_state: None,
             saved_primary_screen_state: None,
             insert_mode: false,
@@ -394,6 +395,9 @@ impl super::TerminalState {
             last_synced_primary_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
+            osc52_query_terminator: b"\x1b\\",
+            osc_reply_terminator: b"\x1b\\",
+            default_colors: TerminalDefaultColors::default(),
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor_color: None,
@@ -430,6 +434,53 @@ impl super::TerminalState {
         b"\x1b\\"
     }
 
+    /// The terminator a reply to an OSC ending in BEL (`bel == true`) or ST
+    /// must use: xterm and VTE mirror the query's, and a client that sent BEL
+    /// may not recognise ST at all.
+    pub(super) fn osc_reply_terminator_for(bel: bool) -> &'static [u8] {
+        if bel {
+            b"\x07"
+        } else {
+            Self::osc_terminator()
+        }
+    }
+
+    /// Theme colours for OSC 10/11/12/4 queries and DSR 996. The app calls
+    /// this when a session is created and whenever the theme changes.
+    pub fn set_default_colors(&mut self, colors: TerminalDefaultColors) {
+        let before = self.color_scheme_report();
+        self.default_colors = colors;
+        // Mode 2031 subscribers learn about a dark/light flip unprompted, with
+        // the same report DSR 996 answers.
+        if self.modes.contains(&2031) && self.color_scheme_report() != before {
+            let report = format!("\x1b[?997;{}n", self.color_scheme_report());
+            self.output_buffer.extend_from_slice(report.as_bytes());
+        }
+    }
+
+    /// Terminator the pending OSC 52 query ended with; its reply must match.
+    pub fn osc52_query_terminator(&self) -> &'static [u8] {
+        self.osc52_query_terminator
+    }
+
+    /// The background actually painted behind `Color::Default` cells: an
+    /// OSC 11 override, else the theme default.
+    pub(super) fn effective_default_background(&self) -> (u8, u8, u8) {
+        self.dynamic_bg.unwrap_or(self.default_colors.background)
+    }
+
+    /// DSR 996 colour-scheme classification (1 = dark, 2 = light), by the
+    /// relative luminance of the effective default background.
+    pub(super) fn color_scheme_report(&self) -> u8 {
+        let (r, g, b) = self.effective_default_background();
+        let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+        if luma < 128.0 {
+            1
+        } else {
+            2
+        }
+    }
+
     pub(super) fn append_osc_5522_status(&mut self, metadata: &str, payload: Option<&str>) {
         self.output_buffer.extend_from_slice(b"\x1b]5522;");
         self.output_buffer.extend_from_slice(metadata.as_bytes());
@@ -437,26 +488,32 @@ impl super::TerminalState {
             self.output_buffer.extend_from_slice(b";");
             self.output_buffer.extend_from_slice(payload.as_bytes());
         }
-        self.output_buffer.extend_from_slice(Self::osc_terminator());
+        self.output_buffer
+            .extend_from_slice(self.osc_reply_terminator);
     }
 
     pub(super) fn handle_osc_color(&mut self, command: &str, value: &str) {
         if value == "?" {
-            // Query: respond with current color
+            // Query: report what is painted — the OSC override if one is set,
+            // else the theme default the app pushed in.
             let color = match command {
-                "10" => self.dynamic_fg.unwrap_or((255, 255, 255)),
-                "11" => self.dynamic_bg.unwrap_or((0, 0, 0)),
-                "12" => self.dynamic_cursor_color.unwrap_or((255, 255, 255)),
+                "10" => self.dynamic_fg.unwrap_or(self.default_colors.foreground),
+                "11" => self.effective_default_background(),
+                "12" => self
+                    .dynamic_cursor_color
+                    .unwrap_or(self.default_colors.cursor),
                 _ => return,
             };
             let response = format!(
-                "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
                 command,
                 (color.0 as u16) * 257,
                 (color.1 as u16) * 257,
                 (color.2 as u16) * 257,
             );
             self.output_buffer.extend_from_slice(response.as_bytes());
+            self.output_buffer
+                .extend_from_slice(self.osc_reply_terminator);
         } else if let Some(rgb) = Self::parse_color_spec(value) {
             match command {
                 "10" => self.dynamic_fg = Some(rgb),
@@ -488,8 +545,15 @@ impl super::TerminalState {
                 continue;
             };
             if color_s == "?" {
-                let color = self.dynamic_palette[idx as usize]
-                    .unwrap_or_else(|| Self::default_256_color(idx));
+                let color = self.dynamic_palette[idx as usize].unwrap_or_else(|| {
+                    // The 16 ANSI slots are theme colours; the cube and
+                    // grey ramp are not themed.
+                    self.default_colors
+                        .ansi
+                        .get(idx as usize)
+                        .copied()
+                        .unwrap_or_else(|| Self::default_256_color(idx))
+                });
                 self.append_osc_palette_response(idx, color);
             } else if let Some(rgb) = Self::parse_color_spec(color_s) {
                 self.dynamic_palette[idx as usize] = Some(rgb);
@@ -512,17 +576,19 @@ impl super::TerminalState {
 
     fn append_osc_palette_response(&mut self, idx: u8, color: (u8, u8, u8)) {
         let response = format!(
-            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}",
             idx,
             (color.0 as u16) * 257,
             (color.1 as u16) * 257,
             (color.2 as u16) * 257,
         );
         self.output_buffer.extend_from_slice(response.as_bytes());
+        self.output_buffer
+            .extend_from_slice(self.osc_reply_terminator);
     }
 
     /// Standard xterm defaults for palette queries when no override is set.
-    fn default_256_color(idx: u8) -> (u8, u8, u8) {
+    pub(super) fn default_256_color(idx: u8) -> (u8, u8, u8) {
         const ANSI: [(u8, u8, u8); 16] = [
             (0, 0, 0),
             (205, 0, 0),
@@ -695,6 +761,7 @@ impl super::TerminalState {
         if let Some((_sel, data)) = value.split_once(';') {
             if data == "?" {
                 self.pending_osc52_clipboard_query = true;
+                self.osc52_query_terminator = self.osc_reply_terminator;
             } else if !data.is_empty() {
                 if data.len() > OSC52_MAX_BYTES.saturating_mul(4) / 3 + 8 {
                     // Reject before even attempting to decode.
@@ -1690,12 +1757,15 @@ impl super::TerminalState {
         let rows = self.grid.rows();
         let max_scrollback = self.max_scrollback;
         let cell_size = self.kitty_graphics.cell_size_pixels();
+        // Theme colours belong to the app, not to the program that sent RIS.
+        let default_colors = self.default_colors;
         let next_raw_row_id = self.next_raw_row_id;
         let row_identity_revision = self.row_identity_revision;
         let next_command_sequence = self.next_command_sequence;
         *self = Self::new(cols, rows);
         self.pending_completed_command_outputs = pending_completed_command_outputs;
         self.consumed_command_ids = consumed_command_ids;
+        self.default_colors = default_colors;
         // A reset replaces every physical row but must never restart the
         // allocator and let an old external origin retarget into the new grid.
         self.next_raw_row_id = next_raw_row_id;
@@ -4304,6 +4374,8 @@ impl super::TerminalState {
         }
 
         // SGR format (mode 1006) is preferred: CSI < button ; col ; row M/m
+        // urxvt format (mode 1015): CSI button+32 ; col ; row M (decimal)
+        // UTF-8 format (mode 1005): X10 frame with UTF-8 encoded coordinates
         // Standard format (mode 1000/1002): CSI M button col row (3 bytes)
 
         if self.modes.contains(&1006) {
@@ -4314,16 +4386,51 @@ impl super::TerminalState {
             let x = col.saturating_add(1);
             let y = row.saturating_add(1);
             Some(format!("\x1b[<{};{};{}M", button, x, y).into_bytes())
+        } else if self.modes.contains(&1015) {
+            Some(Self::urxvt_mouse_report(button, col, row))
+        } else if self.modes.contains(&1005) {
+            Some(Self::utf8_mouse_report(button, col, row))
         } else {
-            // Standard xterm format: CSI M button col row (raw bytes)
-            // Coordinates are 1-indexed, offset by 32, and capped at 223 so
-            // the encoded value fits in one byte. Clamp before narrowing to
-            // u8; casting first makes coordinates >= 256 wrap around.
-            let button_byte = button.saturating_add(32);
-            let col_byte = 32 + col.saturating_add(1).min(223) as u8;
-            let row_byte = 32 + row.saturating_add(1).min(223) as u8;
-            Some(vec![b'\x1b', b'[', b'M', button_byte, col_byte, row_byte])
+            Some(Self::x10_mouse_report(button, col, row))
         }
+    }
+
+    /// Standard xterm format: CSI M button col row (raw bytes).
+    /// Coordinates are 1-indexed, offset by 32, and capped at 223 so the
+    /// encoded value fits in one byte. Clamp before narrowing to u8; casting
+    /// first makes coordinates >= 256 wrap around.
+    fn x10_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
+        let button_byte = button.saturating_add(32);
+        let col_byte = 32 + col.saturating_add(1).min(223) as u8;
+        let row_byte = 32 + row.saturating_add(1).min(223) as u8;
+        vec![b'\x1b', b'[', b'M', button_byte, col_byte, row_byte]
+    }
+
+    /// Mode 1005 keeps the X10 frame but writes each coordinate+32 as a UTF-8
+    /// scalar, which lifts the 223-column cap to xterm's 2015.
+    fn utf8_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(12);
+        output.extend_from_slice(b"\x1b[M");
+        output.push(button.saturating_add(32));
+        for value in [col, row] {
+            let codepoint = 32 + value.saturating_add(1).min(2015) as u32;
+            if let Some(ch) = char::from_u32(codepoint) {
+                let mut buf = [0u8; 4];
+                output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        output
+    }
+
+    /// Mode 1015 (urxvt): decimal fields, button still offset by 32.
+    fn urxvt_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
+        format!(
+            "\x1b[{};{};{}M",
+            u16::from(button) + 32,
+            col.saturating_add(1),
+            row.saturating_add(1)
+        )
+        .into_bytes()
     }
 
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
@@ -4337,12 +4444,13 @@ impl super::TerminalState {
             let x = col.saturating_add(1);
             let y = row.saturating_add(1);
             Some(format!("\x1b[<{};{};{}m", button, x, y).into_bytes())
+        } else if self.modes.contains(&1015) {
+            // Legacy encodings cannot name the released button: it is 3.
+            Some(Self::urxvt_mouse_report(3, col, row))
+        } else if self.modes.contains(&1005) {
+            Some(Self::utf8_mouse_report(3, col, row))
         } else {
-            // Standard xterm: release is button 3
-            let button_byte = 32 + 3u8;
-            let col_byte = 32 + col.saturating_add(1).min(223) as u8;
-            let row_byte = 32 + row.saturating_add(1).min(223) as u8;
-            Some(vec![b'\x1b', b'[', b'M', button_byte, col_byte, row_byte])
+            Some(Self::x10_mouse_report(3, col, row))
         }
     }
 
@@ -4384,8 +4492,13 @@ impl super::TerminalState {
         self.xterm_format_other_keys
     }
 
+    /// True only when the app asked for every key press as an escape code, i.e.
+    /// the Kitty "report all keys" flag (0b1000). Private mode 2031 is *not* a
+    /// keyboard mode: it is the in-band light/dark theme-change notification
+    /// (VTE/foot/contour), which Claude Code and neovim enable on startup.
+    /// Reading it as a keyboard mode overrode the flags those apps did push.
     pub fn is_report_all_keys_enabled(&self) -> bool {
-        self.modes.contains(&2031) || (self.keyboard_enhancement_flags & 0b1000) != 0
+        (self.keyboard_enhancement_flags & 0b1000) != 0
     }
 
     fn sanitized_osc_5522_mimes(mime_types: &[String]) -> Vec<String> {
@@ -6916,9 +7029,22 @@ impl super::TerminalState {
         // 备用屏应用会在 SIGWINCH 后自行重绘,无需保留。
         if rows < old_rows && !self.use_alt_buffer && !self.grid.is_empty() {
             let need = old_rows - rows;
+            // Blank rows below the cursor go first, as in xterm/VTE/alacritty:
+            // they are what grid.resize truncates. Evicting from the top while
+            // blank space remained below pushed a fresh prompt's rows into
+            // scrollback on every pane split, and growing back never restored
+            // them.
+            let blank_below = (self.cursor_row + 1..old_rows)
+                .rev()
+                .take_while(|&r| {
+                    self.grid[r]
+                        .iter()
+                        .all(TerminalCell::is_reflow_trimmable_blank)
+                })
+                .count();
             // 最多从顶部移除到光标所在行,避免把光标行本身推入 scrollback;
-            // 剩余需移除的行位于光标下方,由随后的 grid.resize 截断(通常为空白)。
-            let from_top = need.min(self.cursor_row);
+            // 剩余需移除的行位于光标下方,由随后的 grid.resize 截断。
+            let from_top = need.saturating_sub(blank_below).min(self.cursor_row);
             if from_top > 0 {
                 for r in 0..from_top {
                     let mut line =

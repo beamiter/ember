@@ -721,10 +721,9 @@ impl TerminalApp {
 
         let mut action = None;
         let mut clear_selection = false;
-        let preferred_fix_provider = crate::agent::AgentProvider::from_config_value(
-            &self.config.preferred_fix_provider,
-        )
-        .unwrap_or(crate::agent::AgentProvider::Codex);
+        let preferred_fix_provider =
+            crate::agent::AgentProvider::from_config_value(&self.config.preferred_fix_provider)
+                .unwrap_or(crate::agent::AgentProvider::Codex);
         if visible_rows.is_empty() {
             ui.add_space(8.0);
             ui.label(
@@ -1020,7 +1019,12 @@ impl TerminalApp {
             CommandActionKind::RunAgain => self.replay_sidebar_command(&action.target, true, false),
             CommandActionKind::FixWithAgent(provider) => {
                 if self.config.preferred_fix_provider != provider.config_value() {
-                    self.config.preferred_fix_provider = provider.config_value().to_string();
+                    let previous = std::mem::replace(
+                        &mut self.config.preferred_fix_provider,
+                        provider.config_value().to_string(),
+                    );
+                    self.config_panel
+                        .adopt_preferred_fix_provider(&previous, provider.config_value());
                     self.schedule_config_save();
                 }
                 self.start_agent_task_for_command(
@@ -1397,10 +1401,8 @@ impl TerminalApp {
         }
         if create_is_local_worktree {
             let provider = provider.unwrap_or_else(|| {
-                crate::agent::AgentProvider::from_config_value(
-                    &self.config.preferred_fix_provider,
-                )
-                .unwrap_or(crate::agent::AgentProvider::Codex)
+                crate::agent::AgentProvider::from_config_value(&self.config.preferred_fix_provider)
+                    .unwrap_or(crate::agent::AgentProvider::Codex)
             });
             match self.begin_command_worktree_task(semantic, provider) {
                 Ok(()) => {}

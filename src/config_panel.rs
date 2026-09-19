@@ -240,6 +240,16 @@ impl ConfigPanel {
         self.available_themes = themes;
     }
 
+    /// The Fix menu saves its provider choice straight to the config while the
+    /// panel may be open on an older draft; carry the choice into the draft
+    /// unless the user has already picked something else there, so Save does
+    /// not silently revert it.
+    pub fn adopt_preferred_fix_provider(&mut self, previous: &str, chosen: &str) {
+        if self.edit_preferred_fix_provider == previous {
+            self.edit_preferred_fix_provider = chosen.to_string();
+        }
+    }
+
     pub fn open(&mut self, config: &Config) {
         self.is_open = true;
         self.sync_from_config(config);
@@ -1182,11 +1192,7 @@ impl ConfigPanel {
                     "Local Ollama /api/chat",
                 ),
             ] {
-                if ui
-                    .small_button(label)
-                    .on_hover_text(hover)
-                    .clicked()
-                {
+                if ui.small_button(label).on_hover_text(hover).clicked() {
                     self.edit_ai_provider = provider.to_string();
                     self.edit_ai_base_url = base_url.to_string();
                     self.edit_ai_model = model.to_string();
@@ -1403,8 +1409,8 @@ impl ConfigPanel {
             ui.label("Preferred Fix agent:");
             for provider in crate::agent::AgentProvider::ALL {
                 let value = provider.config_value();
-                let on_path = jterm_core::host::find_executable_in_path(provider.executable_name())
-                    .is_some();
+                let on_path =
+                    jterm_core::host::find_executable_in_path(provider.executable_name()).is_some();
                 let label = if on_path {
                     provider.display_name().to_string()
                 } else {
@@ -1882,6 +1888,24 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 mod tests {
     use super::{ConfigPanel, RemoteHostDraft};
     use crate::config::Config;
+
+    /// A Fix-menu pick made while Settings is open must survive the panel's
+    /// Save, but must not overwrite a different choice the user made there.
+    #[test]
+    fn fix_menu_provider_choice_survives_an_open_settings_panel() {
+        let mut config = Config::default();
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        let previous = config.preferred_fix_provider.clone();
+        config.preferred_fix_provider = "claude".to_string();
+        panel.adopt_preferred_fix_provider(&previous, "claude");
+        panel.apply_to_config(&mut config);
+        assert_eq!(config.preferred_fix_provider, "claude");
+
+        panel.edit_preferred_fix_provider = "kimi".to_string();
+        panel.adopt_preferred_fix_provider("claude", "opencode");
+        assert_eq!(panel.edit_preferred_fix_provider, "kimi");
+    }
 
     #[test]
     fn clipboard_security_settings_round_trip_through_panel_buffer() {

@@ -1027,9 +1027,7 @@ impl Config {
             }
             None => {
                 self.preferred_fix_provider = default_preferred_fix_provider();
-                warnings.push(
-                    "preferred_fix_provider is unknown or invalid; using codex".into(),
-                );
+                warnings.push("preferred_fix_provider is unknown or invalid; using codex".into());
             }
         }
         if normalize_optional_text(&mut self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES) {

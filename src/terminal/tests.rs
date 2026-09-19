@@ -5,13 +5,13 @@ use super::state::{
     VISIBLE_CELLS_RECYCLE_COUNT,
 };
 use super::{
-    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, DisplayPoint, ExtractedText,
-    HistoryProjection, HyperlinkId, ProjectedBufferAnchorLocation, ProjectedRowKind,
+    ClipboardReadKind, ClipboardReadRequest, Color, CommandState, CursorShape, DisplayPoint,
+    ExtractedText, HistoryProjection, HyperlinkId, ProjectedBufferAnchorLocation, ProjectedRowKind,
     ProjectionPolicy, ProjectionViewState, RawCellAnchor, RawRowId, ScrollbackLine, StyleFlags,
-    TerminalCell, TerminalState, UnderlineStyle, FINISHED_OUTPUT_EVICTION_ROW_CHECKS,
-    MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMMAND_MARKS, MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-    MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_CWD_BYTES, MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE,
-    MAX_TITLE_STACK_DEPTH, MAX_WINDOW_TITLE_CHARS,
+    TerminalCell, TerminalDefaultColors, TerminalState, UnderlineStyle,
+    FINISHED_OUTPUT_EVICTION_ROW_CHECKS, MAX_CAPTURED_COMMAND_OUTPUT_BYTES, MAX_COMMAND_MARKS,
+    MAX_COMPLETED_COMMAND_OUTPUT_BYTES, MAX_OSC_133_COMMAND_BYTES, MAX_OSC_133_CWD_BYTES,
+    MAX_OSC_133_ID_BYTES, MAX_PENDING_ESCAPE, MAX_TITLE_STACK_DEPTH, MAX_WINDOW_TITLE_CHARS,
 };
 
 fn emit_completed_block(terminal: &mut TerminalState, index: usize) -> u64 {
@@ -1765,11 +1765,10 @@ fn fragmented_dcs_advances_its_scan_cursor_and_stays_bounded() {
     assert!(terminal.pending_string.is_empty());
     assert_eq!(terminal.pending_string_scan_from, 0);
     terminal.process_input(b"\x1b\\no");
-    // Ground state treats ESC <unhandled> as a lone ESC skip, so `\` is
-    // printed as ordinary text — this is the pre-existing parser behavior.
-    assert_eq!(terminal.grid[0][1].character, '\\');
-    assert_eq!(terminal.grid[0][2].character, 'n');
-    assert_eq!(terminal.grid[0][3].character, 'o');
+    // In ground state a stray ST is a complete ESC sequence and is consumed;
+    // it must not print its `\`.
+    assert_eq!(terminal.grid[0][1].character, 'n');
+    assert_eq!(terminal.grid[0][2].character, 'o');
 }
 
 #[test]
@@ -3658,13 +3657,17 @@ fn xtmodkeys_and_xtfmtkeys_state_is_tracked() {
 }
 
 #[test]
-fn vte_report_all_keys_mode_is_tracked() {
+fn report_all_keys_follows_the_kitty_flag_not_mode_2031() {
     let mut terminal = TerminalState::new(8, 2);
 
-    terminal.process_input(b"\x1b[?2031h");
-    assert!(terminal.is_report_all_keys_enabled());
+    // 2031 is tracked (DECRQM reports it) but is the theme-notification mode.
+    terminal.process_input(b"\x1b[?2031h\x1b[?2031$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?2031;1$y");
+    assert!(!terminal.is_report_all_keys_enabled());
 
-    terminal.process_input(b"\x1b[?2031l");
+    terminal.process_input(b"\x1b[>8u");
+    assert!(terminal.is_report_all_keys_enabled());
+    terminal.process_input(b"\x1b[<u");
     assert!(!terminal.is_report_all_keys_enabled());
 }
 
@@ -4176,37 +4179,48 @@ fn finished_output_range_follows_identity_preserving_partial_line_moves() {
     assert_eq!(terminal.grid[2][0].character, 'O');
 }
 
+/// A zero count means one (xterm), so `CSI 0 M` must leave exactly the grid
+/// and finished-output provenance that `CSI M` leaves.
 #[test]
-fn zero_count_delete_lines_keeps_finished_output_provenance() {
-    let mut terminal = TerminalState::new(8, 4);
-    terminal
-        .process_input(b"\x1b]133;A\x07\x1b]133;C;id=zero-dl\x07OUT\x1b]133;D;0;id=zero-dl\x07");
-    let sequence = terminal.command_record("zero-dl").unwrap().sequence;
-    let exact = terminal.finished_output_range(sequence).unwrap();
+fn zero_count_delete_lines_matches_a_count_of_one() {
+    let run = |control: &[u8]| {
+        let mut terminal = TerminalState::new(8, 4);
+        terminal.process_input(
+            b"\x1b]133;A\x07\x1b]133;C;id=zero-dl\x07OUT\x1b]133;D;0;id=zero-dl\x07",
+        );
+        let sequence = terminal.command_record("zero-dl").unwrap().sequence;
+        terminal.process_input(b"\x1b[1;1H");
+        terminal.process_input(control);
+        (
+            terminal.finished_output_range(sequence),
+            row_text(&terminal, 0),
+        )
+    };
 
-    terminal.process_input(b"\x1b[1;1H\x1b[0M");
-
-    assert_eq!(terminal.finished_output_range(sequence), Some(exact));
+    assert_eq!(run(b"\x1b[0M"), run(b"\x1b[M"));
 }
 
 #[test]
-fn zero_count_character_shifts_keep_finished_output_provenance() {
-    for (label, control) in [("zero-ich", "\x1b[0@"), ("zero-dch", "\x1b[0P")] {
-        let mut terminal = TerminalState::new(8, 4);
-        let lifecycle =
-            format!("\x1b]133;A\x07\x1b]133;C;id={label}\x07OUT\x1b]133;D;0;id={label}\x07");
-        terminal.process_input(lifecycle.as_bytes());
-        let sequence = terminal.command_record(label).unwrap().sequence;
-        let exact = terminal.finished_output_range(sequence).unwrap();
+fn zero_count_character_shifts_match_a_count_of_one() {
+    for (label, zero, one) in [
+        ("zero-ich", "\x1b[0@", "\x1b[@"),
+        ("zero-dch", "\x1b[0P", "\x1b[P"),
+    ] {
+        let run = |control: &str| {
+            let mut terminal = TerminalState::new(8, 4);
+            let lifecycle =
+                format!("\x1b]133;A\x07\x1b]133;C;id={label}\x07OUT\x1b]133;D;0;id={label}\x07");
+            terminal.process_input(lifecycle.as_bytes());
+            let sequence = terminal.command_record(label).unwrap().sequence;
+            terminal.process_input(b"\r");
+            terminal.process_input(control.as_bytes());
+            (
+                terminal.finished_output_range(sequence),
+                row_text(&terminal, 0),
+            )
+        };
 
-        terminal.process_input(b"\r");
-        terminal.process_input(control.as_bytes());
-
-        assert_eq!(
-            terminal.finished_output_range(sequence),
-            Some(exact),
-            "{label}"
-        );
+        assert_eq!(run(zero), run(one), "{label}");
     }
 }
 
@@ -6299,4 +6313,366 @@ fn the_window_title_is_bounded_where_it_enters_terminal_state() {
 
     terminal.process_input(b"\x1b]0;short\x07");
     assert_eq!(terminal.window_title, "short");
+}
+
+fn row_text(terminal: &TerminalState, row: usize) -> String {
+    terminal.grid[row]
+        .iter()
+        .map(|cell| cell.character)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// DECSCUSR is 0-2 block, 3-4 underline, 5-6 bar (odd blinking, even steady).
+/// ember read 2 as underline and 3 as bar, so vim's insert-mode `CSI 6 SP q`
+/// came out as a block and `CSI 2 SP q` as an underline.
+#[test]
+fn decscusr_uses_the_xterm_shape_numbering() {
+    let mut terminal = TerminalState::new(8, 2);
+    for (param, expected) in [
+        (0, "Block"),
+        (1, "Block"),
+        (2, "Block"),
+        (3, "Underline"),
+        (4, "Underline"),
+        (5, "Beam"),
+        (6, "Beam"),
+    ] {
+        terminal.process_input(format!("\x1b[{param} q").as_bytes());
+        let shape = match terminal.cursor_shape {
+            CursorShape::Block => "Block",
+            CursorShape::Underline => "Underline",
+            CursorShape::Beam => "Beam",
+        };
+        assert_eq!(shape, expected, "DECSCUSR {param}");
+    }
+}
+
+/// Claude Code probes `CSI ? 2026 $ p` and `CSI ? 1016 $ p` at startup; ember
+/// only ever answered 5522, so every other probe cost the caller a timeout.
+#[test]
+fn decrqm_answers_every_mode_ember_implements() {
+    let mut terminal = TerminalState::new(8, 2);
+
+    terminal.process_input(b"\x1b[?2026$p\x1b[?7$p\x1b[?1049$p\x1b[?1016$p\x1b[?6$p");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b[?2026;2$y\x1b[?7;1$y\x1b[?1049;2$y\x1b[?1016;0$y\x1b[?6;2$y"
+    );
+
+    terminal.process_input(b"\x1b[?2004h\x1b[?1000;1006h\x1b[?2004$p\x1b[?1006$p\x1b[?1002$p");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b[?2004;1$y\x1b[?1006;1$y\x1b[?1002;2$y"
+    );
+
+    // ANSI modes: IRM is implemented, LNM is not.
+    terminal.process_input(b"\x1b[4$p\x1b[4h\x1b[4$p\x1b[20$p");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b[4;2$y\x1b[4;1$y\x1b[20;0$y"
+    );
+}
+
+/// Stray C0 controls have no effect in xterm/VTE, except VT and FF which act
+/// as LF. They used to print U+FFFD.
+#[test]
+fn stray_c0_controls_are_ignored_and_vt_ff_feed_lines() {
+    let mut terminal = TerminalState::new(8, 4);
+
+    terminal.process_input(b"A\x00\x05\x1c\x1f\x18\x1aB\x0bC\x0cD");
+
+    assert_eq!(row_text(&terminal, 0), "AB");
+    assert_eq!(row_text(&terminal, 1), "  C");
+    assert_eq!(row_text(&terminal, 2), "   D");
+}
+
+/// Unsupported ESC sequences are consumed whole instead of printing their
+/// final byte; NEL and DECALN are implemented.
+#[test]
+fn esc_sequences_swallow_their_bytes_and_nel_decaln_work() {
+    let mut terminal = TerminalState::new(6, 3);
+
+    terminal.process_input(b"A\x1bN\x1bO\x1b\\\x1b%G\x1b#3\x1b(B\x1b");
+    terminal.process_input(b"%GB\x1bEC");
+    assert_eq!(row_text(&terminal, 0), "AB");
+    assert_eq!(row_text(&terminal, 1), "C");
+
+    terminal.process_input(b"\x1b[2;3r\x1b[2;4H\x1b#8");
+    for row in 0..3 {
+        assert_eq!(row_text(&terminal, row), "EEEEEE");
+    }
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 0));
+    assert_eq!(
+        (terminal.scroll_region_top, terminal.scroll_region_bottom),
+        (0, 2)
+    );
+}
+
+/// 1015 (urxvt) reports decimal fields with the button offset by 32; 1005
+/// keeps the X10 frame with UTF-8 coordinates. 1006 still wins over both.
+#[test]
+fn mouse_reports_honour_urxvt_and_utf8_encodings() {
+    let mut terminal = TerminalState::new(400, 4);
+
+    terminal.process_input(b"\x1b[?1000h\x1b[?1015h");
+    assert_eq!(
+        terminal.get_mouse_report(0, 299, 2),
+        Some(b"\x1b[32;300;3M".to_vec())
+    );
+    assert_eq!(
+        terminal.get_mouse_release_report(0, 299, 2),
+        Some(b"\x1b[35;300;3M".to_vec())
+    );
+
+    terminal.process_input(b"\x1b[?1015l\x1b[?1005h");
+    let mut expected = b"\x1b[M ".to_vec();
+    expected.extend_from_slice("\u{14c}#".as_bytes());
+    assert_eq!(terminal.get_mouse_report(0, 299, 2), Some(expected));
+
+    terminal.process_input(b"\x1b[?1006h");
+    assert_eq!(
+        terminal.get_mouse_report(0, 299, 2),
+        Some(b"\x1b[<0;300;3M".to_vec())
+    );
+}
+
+/// DECSTR resets margins, DECOM, DECAWM, IRM, DECTCEM, DECCKM, SGR, charsets
+/// and the saved cursor, but not the screen or the cursor position.
+#[test]
+fn decstr_soft_reset_restores_the_defined_state() {
+    let mut terminal = TerminalState::new(8, 6);
+    terminal.process_input(
+        b"\x1b7\x1b[2;4r\x1b[?6h\x1b[4h\x1b[?7l\x1b[?25l\x1b[?1h\x1b[1;31m\x1b(0\x1b[2;3HX",
+    );
+
+    terminal.process_input(b"\x1b[!p");
+
+    assert_eq!(
+        (terminal.scroll_region_top, terminal.scroll_region_bottom),
+        (0, 5)
+    );
+    assert!(!terminal.origin_mode);
+    assert!(!terminal.insert_mode);
+    assert!(terminal.modes.contains(&7));
+    assert!(terminal.modes.contains(&25));
+    assert!(!terminal.is_application_cursor_keys());
+    assert_eq!(terminal.current_fg, Color::Default);
+    assert!(terminal.saved_state.is_none());
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 3));
+    terminal.process_input(b"q");
+    assert_eq!(terminal.grid[2][3].character, 'q');
+}
+
+/// An explicit 0 count means 1 (xterm): `CSI 0 A` used to be a no-op and
+/// `CSI 0 P` deleted nothing.
+#[test]
+fn zero_count_parameters_mean_one() {
+    let mut terminal = TerminalState::new(8, 4);
+
+    terminal.process_input(b"ABCD\x1b[3;3H\x1b[0A\x1b[0C");
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 3));
+
+    terminal.process_input(b"\x1b[1;1H\x1b[0P\x1b[0X");
+    assert_eq!(row_text(&terminal, 0), " CD");
+}
+
+/// `CSI … $ r` is DECCARA, not DECSTBM: it must neither set margins nor home
+/// the cursor.
+#[test]
+fn deccara_is_not_executed_as_decstbm() {
+    let mut terminal = TerminalState::new(8, 6);
+    terminal.process_input(b"\x1b[4;5H");
+
+    terminal.process_input(b"\x1b[2;3;4;5;1$r");
+
+    assert_eq!(
+        (terminal.scroll_region_top, terminal.scroll_region_bottom),
+        (0, 5)
+    );
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (3, 4));
+}
+
+/// RI, IND, NEL, CHT and CBT move the cursor, so they clear the DEC
+/// last-column flag; the next glyph must land where the cursor went.
+#[test]
+fn index_and_tab_controls_clear_pending_wrap() {
+    for (sequence, row, col) in [
+        (&b"\x1bM"[..], 0, 4),
+        (&b"\x1bD"[..], 2, 4),
+        (&b"\x1bE"[..], 2, 0),
+        (&b"\x1b[Z"[..], 1, 0),
+        (&b"\x1b[I"[..], 1, 4),
+    ] {
+        let mut terminal = TerminalState::new(5, 4);
+        terminal.process_input(b"\r\nABCDE");
+        assert!(terminal.pending_wrap);
+
+        terminal.process_input(sequence);
+        terminal.process_input(b"x");
+
+        assert_eq!(terminal.grid[row][col].character, 'x', "after {sequence:?}");
+    }
+}
+
+/// 1048 is DECSC/DECRC; it must not overwrite the slot 1049 restores from.
+#[test]
+fn mode_1048_does_not_share_the_1049_cursor_slot() {
+    let mut terminal = TerminalState::new(10, 8);
+    terminal.process_input(b"\x1b[2;2H\x1b[?1049h\x1b[5;5H\x1b[?1048h\x1b[6;6H\x1b[?1048l");
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (4, 4));
+
+    terminal.process_input(b"\x1b[?1049l");
+
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 1));
+}
+
+/// DECXCPR carries the `?`; DSR 996 reports dark/light from the default
+/// background actually in force.
+#[test]
+fn decxcpr_and_color_scheme_reports() {
+    let mut terminal = TerminalState::new(10, 4);
+    terminal.process_input(b"\x1b[2;3H\x1b[?6n\x1b[?996n");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b[?2;3R\x1b[?997;1n"
+    );
+
+    terminal.set_default_colors(TerminalDefaultColors {
+        background: (250, 250, 245),
+        ..TerminalDefaultColors::default()
+    });
+    terminal.process_input(b"\x1b[?996n");
+    terminal.process_input(b"\x1b]11;#101010\x07\x1b[?996n");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b[?997;2n\x1b[?997;1n"
+    );
+}
+
+/// OSC 10/11/12/4 queries report the theme colours the app pushed in (not a
+/// fixed white-on-black), overrides still win, RIS keeps the theme, and every
+/// reply ends with the terminator its query used.
+#[test]
+fn osc_color_queries_report_theme_colors_with_the_query_terminator() {
+    let mut terminal = TerminalState::new(10, 4);
+    let mut ansi = TerminalDefaultColors::default().ansi;
+    ansi[1] = (0xaa, 0x11, 0x22);
+    terminal.set_default_colors(TerminalDefaultColors {
+        foreground: (0x10, 0x20, 0x30),
+        background: (0xf0, 0xe0, 0xd0),
+        cursor: (0x01, 0x02, 0x03),
+        ansi,
+    });
+    terminal.process_input(b"\x1bc");
+
+    terminal.process_input(b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\x1b]4;1;?\x07");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        concat!(
+            "\x1b]10;rgb:1010/2020/3030\x07",
+            "\x1b]11;rgb:f0f0/e0e0/d0d0\x1b\\",
+            "\x1b]12;rgb:0101/0202/0303\x07",
+            "\x1b]4;1;rgb:aaaa/1111/2222\x07",
+        )
+    );
+
+    // A fragmented BEL-terminated query is answered with BEL too.
+    terminal.process_input(b"\x1b]11;#000000\x07\x1b]11;");
+    terminal.process_input(b"?\x07");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1b]11;rgb:0000/0000/0000\x07"
+    );
+
+    terminal.process_input(b"\x1b]52;c;?\x07");
+    assert!(terminal.take_osc52_clipboard_query());
+    assert_eq!(terminal.osc52_query_terminator(), b"\x07");
+}
+
+/// XTWINOPS 16 reports the cell size in pixels, from the same metrics as 14.
+#[test]
+fn xtwinops_reports_the_cell_size_in_pixels() {
+    let mut terminal = TerminalState::new(20, 4);
+    terminal.kitty_graphics.set_cell_size_pixels(9, 18);
+
+    terminal.process_input(b"\x1b[16t");
+
+    assert_eq!(terminal.output_buffer.as_slice(), b"\x1b[6;18;9t");
+}
+
+/// A TUI's cursor shape belongs to the alternate screen it ran on.
+#[test]
+fn leaving_the_alternate_screen_restores_the_cursor_shape() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal.process_input(b"\x1b[4 q\x1b[?1049h\x1b[6 q");
+    assert!(matches!(terminal.cursor_shape, CursorShape::Beam));
+
+    terminal.process_input(b"\x1b[?1049l");
+
+    assert!(matches!(terminal.cursor_shape, CursorShape::Underline));
+}
+
+/// Shrinking the primary screen drops blank rows below the cursor before it
+/// evicts anything from the top (xterm/VTE/alacritty). A pane split used to
+/// push a fresh prompt's rows into scrollback for good.
+#[test]
+fn shrinking_drops_blank_rows_below_the_cursor_first() {
+    let mut terminal = TerminalState::new(60, 20);
+    terminal.process_input(b"\x1b[H\x1b[J\r\nline two\r\nline three\r\n$ ");
+
+    terminal.on_resize(60, 12);
+
+    assert_eq!(row_text(&terminal, 1), "line two");
+    assert_eq!(row_text(&terminal, 2), "line three");
+    assert_eq!(row_text(&terminal, 3), "$");
+    assert_eq!(terminal.cursor_row, 3);
+    assert_eq!(terminal.scrollback_len(), 0);
+}
+
+#[test]
+fn shrinking_a_full_screen_still_evicts_from_the_top() {
+    let mut terminal = TerminalState::new(10, 4);
+    terminal.process_input(b"l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5");
+    let before = terminal.scrollback_len();
+
+    terminal.on_resize(10, 2);
+
+    assert_eq!(terminal.scrollback_len(), before + 2);
+    assert_eq!(row_text(&terminal, 0), "l4");
+    assert_eq!(row_text(&terminal, 1), "l5");
+    assert_eq!(terminal.cursor_row, 1);
+}
+
+/// Claude Code and neovim enable private mode 2031 for theme-change
+/// notifications. It must leave key encoding alone and, on a dark/light flip,
+/// send the DSR 996 report unprompted.
+#[test]
+fn mode_2031_is_a_theme_notification_not_a_keyboard_mode() {
+    let mut terminal = TerminalState::new(20, 4);
+    terminal.process_batch(b"\x1b[?2031h");
+    assert!(!terminal.is_report_all_keys_enabled());
+    assert!(terminal.get_output().is_empty());
+
+    let dark = TerminalDefaultColors {
+        background: (0x10, 0x10, 0x10),
+        ..TerminalDefaultColors::default()
+    };
+    terminal.set_default_colors(dark);
+    // Default background is already dark: no flip, no report.
+    assert!(terminal.get_output().is_empty());
+
+    let light = TerminalDefaultColors {
+        background: (0xf5, 0xf5, 0xf0),
+        ..dark
+    };
+    terminal.set_default_colors(light);
+    assert_eq!(terminal.get_output(), b"\x1b[?997;2n");
+    terminal.set_default_colors(light);
+    assert!(terminal.get_output().is_empty());
+
+    terminal.process_batch(b"\x1b[?2031l");
+    terminal.set_default_colors(dark);
+    assert!(terminal.get_output().is_empty());
 }

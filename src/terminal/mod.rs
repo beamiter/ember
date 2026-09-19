@@ -462,6 +462,14 @@ impl TerminalModes {
             2026 => Some(10),
             2031 => Some(11),
             5522 => Some(12),
+            // Kept as bits so DECRQM can answer them truthfully: 47/1047 enter
+            // the alternate screen, 1048 is the DECSC-style save, and 1005/1015
+            // select the UTF-8 and urxvt mouse encodings.
+            47 => Some(14),
+            1047 => Some(15),
+            1048 => Some(16),
+            1005 => Some(17),
+            1015 => Some(18),
             _ => None,
         }
     }
@@ -513,6 +521,34 @@ struct SavedCursorState {
 /// 256-slot dynamic palette: `None` slots fall through to the theme/default.
 pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
 
+/// The theme colours the renderer paints `Color::Default` and the 16 ANSI
+/// slots with. The app pushes them in (`TerminalState::set_default_colors`) so
+/// OSC 10/11/12/4 queries and DSR 996 describe what is actually on screen:
+/// answering a fixed white-on-black made light-theme users' TUIs pick dark
+/// palettes. OSC 10/11/12/4 overrides still win over these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalDefaultColors {
+    pub foreground: (u8, u8, u8),
+    pub background: (u8, u8, u8),
+    pub cursor: (u8, u8, u8),
+    pub ansi: [(u8, u8, u8); 16],
+}
+
+impl Default for TerminalDefaultColors {
+    fn default() -> Self {
+        let mut ansi = [(0, 0, 0); 16];
+        for (idx, slot) in ansi.iter_mut().enumerate() {
+            *slot = TerminalState::default_256_color(idx as u8);
+        }
+        Self {
+            foreground: (255, 255, 255),
+            background: (0, 0, 0),
+            cursor: (255, 255, 255),
+            ansi,
+        }
+    }
+}
+
 pub struct TerminalState {
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
@@ -531,6 +567,9 @@ pub struct TerminalState {
     alt_cursor_row: usize,
     alt_cursor_col: usize,
     pub cursor_shape: CursorShape,
+    /// The primary screen's cursor shape, restored when the alternate screen
+    /// is left so a TUI's insert-mode beam does not outlive it (as frost).
+    saved_primary_cursor_shape: Option<CursorShape>,
 
     // DECSC/DECRC 完整保存状态
     saved_state: Option<SavedCursorState>,
@@ -673,6 +712,13 @@ pub struct TerminalState {
     pub pending_osc52_clipboard_set: Option<String>,
     // OSC 52 clipboard query pending (needs clipboard read + response)
     pub pending_osc52_clipboard_query: bool,
+    /// Terminator of the pending OSC 52 query, echoed by its reply.
+    osc52_query_terminator: &'static [u8],
+    /// Terminator of the OSC being dispatched. xterm and VTE end a reply the
+    /// way the query ended, and BEL-only parsers never see an ST reply end.
+    osc_reply_terminator: &'static [u8],
+    /// Theme colours reported by queries when no OSC override is set.
+    default_colors: TerminalDefaultColors,
 
     // OSC 10/11/12 dynamic colors
     pub dynamic_fg: Option<(u8, u8, u8)>,
