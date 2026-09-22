@@ -710,10 +710,10 @@ pub struct TerminalState {
 
     // OSC 52 clipboard set requests (selection_param, decoded_text)
     pub pending_osc52_clipboard_set: Option<String>,
-    // OSC 52 clipboard query pending (needs clipboard read + response)
-    pub pending_osc52_clipboard_query: bool,
-    /// Terminator of the pending OSC 52 query, echoed by its reply.
-    osc52_query_terminator: &'static [u8],
+    // OSC 52 clipboard queries pending (each needs one read/refusal response).
+    // Keep the terminator per request: a PTY batch may contain both BEL- and
+    // ST-terminated queries. Eight matches the extended-clipboard queue cap.
+    pending_osc52_clipboard_queries: VecDeque<&'static [u8]>,
     /// Terminator of the OSC being dispatched. xterm and VTE end a reply the
     /// way the query ended, and BEL-only parsers never see an ST reply end.
     osc_reply_terminator: &'static [u8],

@@ -345,7 +345,7 @@ pub struct BackgroundPumpResult {
     pub errors: Vec<(usize, String)>,
     pub clipboard_requests: Vec<(usize, Vec<ClipboardReadRequest>)>,
     pub osc52_writes: Vec<(usize, String)>,
-    pub osc52_queries: Vec<usize>,
+    pub osc52_queries: Vec<(usize, &'static [u8])>,
     pub notifications: Vec<(usize, String, String)>,
     /// Source-compatible shell-reported OSC 133 output snapshots. New app code
     /// consumes the provenance-aware field below; this one remains available
@@ -687,8 +687,8 @@ impl SessionManager {
             if let Some(text) = terminal.take_osc52_clipboard_set() {
                 result.osc52_writes.push((session_idx, text));
             }
-            if terminal.take_osc52_clipboard_query() {
-                result.osc52_queries.push(session_idx);
+            while let Some(terminator) = terminal.take_osc52_clipboard_query() {
+                result.osc52_queries.push((session_idx, terminator));
             }
             for (title, body) in terminal.pending_notifications.drain(..) {
                 result.notifications.push((session_idx, title, body));

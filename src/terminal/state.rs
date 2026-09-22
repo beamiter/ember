@@ -394,8 +394,7 @@ impl super::TerminalState {
             last_archived_screen_snapshot: Vec::new(),
             last_synced_primary_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
-            pending_osc52_clipboard_query: false,
-            osc52_query_terminator: b"\x1b\\",
+            pending_osc52_clipboard_queries: VecDeque::new(),
             osc_reply_terminator: b"\x1b\\",
             default_colors: TerminalDefaultColors::default(),
             dynamic_fg: None,
@@ -456,11 +455,6 @@ impl super::TerminalState {
             let report = format!("\x1b[?997;{}n", self.color_scheme_report());
             self.output_buffer.extend_from_slice(report.as_bytes());
         }
-    }
-
-    /// Terminator the pending OSC 52 query ended with; its reply must match.
-    pub fn osc52_query_terminator(&self) -> &'static [u8] {
-        self.osc52_query_terminator
     }
 
     /// The background actually painted behind `Color::Default` cells: an
@@ -760,8 +754,10 @@ impl super::TerminalState {
         const OSC52_MAX_BYTES: usize = 100 * 1024;
         if let Some((_sel, data)) = value.split_once(';') {
             if data == "?" {
-                self.pending_osc52_clipboard_query = true;
-                self.osc52_query_terminator = self.osc_reply_terminator;
+                if self.pending_osc52_clipboard_queries.len() < 8 {
+                    self.pending_osc52_clipboard_queries
+                        .push_back(self.osc_reply_terminator);
+                }
             } else if !data.is_empty() {
                 if data.len() > OSC52_MAX_BYTES.saturating_mul(4) / 3 + 8 {
                     // Reject before even attempting to decode.
@@ -1681,10 +1677,8 @@ impl super::TerminalState {
         self.pending_osc52_clipboard_set.take()
     }
 
-    pub fn take_osc52_clipboard_query(&mut self) -> bool {
-        let q = self.pending_osc52_clipboard_query;
-        self.pending_osc52_clipboard_query = false;
-        q
+    pub fn take_osc52_clipboard_query(&mut self) -> Option<&'static [u8]> {
+        self.pending_osc52_clipboard_queries.pop_front()
     }
 
     /// Check if sync output timed out (>1s) and auto-clear if so

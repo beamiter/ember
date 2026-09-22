@@ -6587,8 +6587,27 @@ fn osc_color_queries_report_theme_colors_with_the_query_terminator() {
     );
 
     terminal.process_input(b"\x1b]52;c;?\x07");
-    assert!(terminal.take_osc52_clipboard_query());
-    assert_eq!(terminal.osc52_query_terminator(), b"\x07");
+    assert_eq!(
+        terminal.take_osc52_clipboard_query(),
+        Some(b"\x07".as_slice())
+    );
+
+    terminal.process_input(b"\x1b]52;c;?\x07\x1b]52;c;?\x1b\\");
+    assert_eq!(
+        terminal.take_osc52_clipboard_query(),
+        Some(b"\x07".as_slice())
+    );
+    assert_eq!(
+        terminal.take_osc52_clipboard_query(),
+        Some(b"\x1b\\".as_slice())
+    );
+    assert_eq!(terminal.take_osc52_clipboard_query(), None);
+
+    terminal.process_input(b"\x1b]52;c;?\x07".repeat(10).as_slice());
+    assert_eq!(
+        std::iter::from_fn(|| terminal.take_osc52_clipboard_query()).count(),
+        8
+    );
 }
 
 /// XTWINOPS 16 reports the cell size in pixels, from the same metrics as 14.

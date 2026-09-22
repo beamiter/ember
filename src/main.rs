@@ -1843,10 +1843,10 @@ fn service_osc52_clipboard_query(
     in_flight: &Arc<AtomicBool>,
     terminal: Arc<ParkingMutex<TerminalState>>,
     response_tx: ProtocolResponseSender,
+    terminator: &'static [u8],
     window_started: &mut std::time::Instant,
     reads_in_window: &mut usize,
 ) {
-    let terminator = terminal.lock().osc52_query_terminator();
     let empty_response =
         || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
     if !osc52_read_rate_limit_allows(std::time::Instant::now(), window_started, reads_in_window)
@@ -5228,7 +5228,7 @@ impl eframe::App for TerminalApp {
             }
         }
         if self.config.osc52_clipboard_read {
-            for session_idx in background_pump.osc52_queries.drain(..) {
+            for (session_idx, terminator) in background_pump.osc52_queries.drain(..) {
                 let response_route = self
                     .session_manager
                     .protocol_response_sender(session_idx)
@@ -5244,6 +5244,7 @@ impl eframe::App for TerminalApp {
                         &self.clipboard_request_in_flight,
                         terminal,
                         response_tx,
+                        terminator,
                         &mut self.osc52_read_window_started,
                         &mut self.osc52_reads_in_window,
                     );
@@ -6030,20 +6031,24 @@ impl eframe::App for TerminalApp {
                     );
                 }
             }
-            let osc52_query = terminal.take_osc52_clipboard_query();
+            let osc52_queries: Vec<_> =
+                std::iter::from_fn(|| terminal.take_osc52_clipboard_query()).collect();
             drop(terminal);
             // Reading the clipboard exposes user data to a terminal program,
             // so it remains opt-in. Even when enabled, the external helper
             // and base64 encoding run only on the bounded background path.
-            if osc52_query && self.config.osc52_clipboard_read {
-                service_osc52_clipboard_query(
-                    self.clipboard.is_some(),
-                    &self.clipboard_request_in_flight,
-                    Arc::clone(&session.terminal),
-                    active_protocol_responses.clone(),
-                    &mut self.osc52_read_window_started,
-                    &mut self.osc52_reads_in_window,
-                );
+            if self.config.osc52_clipboard_read {
+                for terminator in osc52_queries {
+                    service_osc52_clipboard_query(
+                        self.clipboard.is_some(),
+                        &self.clipboard_request_in_flight,
+                        Arc::clone(&session.terminal),
+                        active_protocol_responses.clone(),
+                        terminator,
+                        &mut self.osc52_read_window_started,
+                        &mut self.osc52_reads_in_window,
+                    );
+                }
             }
         }
 
