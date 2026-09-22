@@ -10,6 +10,7 @@ use parking_lot::{Condvar, Mutex as ParkingMutex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Protocol replies must survive transient PTY-writer backpressure. Keep a
@@ -245,6 +246,27 @@ impl ProtocolResponseSender {
     /// woken by a successful flush or session close. Callers must themselves
     /// be single-flight or hold only a small, bounded response while waiting.
     pub fn enqueue_blocking(&self, response: Vec<u8>) -> Result<(), ProtocolResponseQueueError> {
+        self.enqueue_blocking_with_permission(response, None)
+    }
+
+    /// Recheck clipboard permission on every retry, including after a full
+    /// queue wakes the worker. Revocation substitutes the protocol refusal in
+    /// the same FIFO position without blocking the UI thread.
+    pub fn enqueue_clipboard_response(
+        &self,
+        response: Vec<u8>,
+        refusal: Vec<u8>,
+        allowed: &AtomicBool,
+    ) -> Result<(), ProtocolResponseQueueError> {
+        self.validate(refusal.len())?;
+        self.enqueue_blocking_with_permission(response, Some((allowed, refusal)))
+    }
+
+    fn enqueue_blocking_with_permission(
+        &self,
+        mut response: Vec<u8>,
+        mut permission: Option<(&AtomicBool, Vec<u8>)>,
+    ) -> Result<(), ProtocolResponseQueueError> {
         if response.is_empty() {
             return Ok(());
         }
@@ -253,6 +275,12 @@ impl ProtocolResponseSender {
         loop {
             if state.closed {
                 return Err(ProtocolResponseQueueError::Closed);
+            }
+            if permission
+                .as_ref()
+                .is_some_and(|(allowed, _)| !allowed.load(Ordering::Acquire))
+            {
+                response = permission.take().expect("permission exists").1;
             }
             if self.has_capacity(&state, response.len(), true) {
                 self.enqueue_locked(&mut state, response);
@@ -297,6 +325,19 @@ impl ProtocolResponseSender {
                 }
             }
         }
+    }
+
+    /// Snapshot the bounded FIFO for binary UI-service regression tests.
+    #[cfg(test)]
+    pub(crate) fn pending_bytes_for_test(&self) -> Vec<u8> {
+        self.queue
+            .state
+            .lock()
+            .pending
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
     }
 
     pub fn has_pending(&self) -> bool {
@@ -1576,50 +1617,6 @@ mod tests {
     }
 
     #[test]
-    fn osc52_slow_read_precedes_later_batch_refusals_on_its_own_route() {
-        use std::sync::atomic::AtomicBool;
-        let responses = ProtocolResponseSender::new(egui::Context::default());
-        let other = ProtocolResponseSender::new(egui::Context::default());
-        let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
-        let busy = Arc::new(AtomicBool::new(true));
-        let mut window = std::time::Instant::now();
-        let mut count = 0;
-        responses.begin_osc52_read();
-
-        // Exercise the real UI service across separate pump calls. Even a
-        // rate/availability refusal belongs behind the older clipboard read.
-        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
-            crate::service_osc52_clipboard_query(
-                false,
-                &busy,
-                Arc::clone(&terminal),
-                responses.clone(),
-                terminator,
-                &mut window,
-                &mut count,
-            );
-        }
-        assert!(!responses.has_pending(), "no refusal may overtake the read");
-        assert!(!other.defer_osc52_query(b"\x07"));
-        crate::finish_osc52_clipboard_read(&responses, "first", b"\x1b\\");
-        let bytes: Vec<u8> = responses
-            .queue
-            .state
-            .lock()
-            .pending
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
-        assert_eq!(
-            bytes,
-            b"\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;c;\x07\x1b]52;c;\x1b\\"
-        );
-        assert!(!responses.defer_osc52_query(b"\x07"));
-        assert!(!other.has_pending());
-    }
-
-    #[test]
     fn osc52_deferred_refusals_stay_bounded_and_closed_routes_discard_them() {
         let responses = ProtocolResponseSender::new(egui::Context::default());
         responses.begin_osc52_read();
@@ -1627,14 +1624,20 @@ mod tests {
             assert!(responses.defer_osc52_query(b"\x07"));
         }
         assert_eq!(responses.queue.state.lock().osc52_refusals.len(), 8);
-        crate::finish_osc52_clipboard_read(&responses, "first", b"\x1b\\");
-        assert_eq!(responses.queue.state.lock().pending.len(), 9);
+        for _ in 0..8 {
+            assert_eq!(responses.next_osc52_refusal(), Some(b"\x07".as_slice()));
+        }
+        assert_eq!(responses.next_osc52_refusal(), None);
+        assert!(!responses.defer_osc52_query(b"\x07"));
 
         responses.begin_osc52_read();
         assert!(responses.defer_osc52_query(b"\x07"));
         responses.close();
-        crate::finish_osc52_clipboard_read(&responses, "secret", b"\x1b\\");
-        assert!(!responses.has_pending());
+        assert_eq!(
+            responses.enqueue_blocking(b"secret".to_vec()),
+            Err(ProtocolResponseQueueError::Closed)
+        );
+        assert!(responses.pending_bytes_for_test().is_empty());
         assert!(responses.queue.state.lock().osc52_refusals.is_empty());
     }
 
@@ -1790,6 +1793,50 @@ mod tests {
             waiter.join().unwrap(),
             Err(ProtocolResponseQueueError::Closed)
         );
+    }
+
+    #[test]
+    fn clipboard_enqueue_rechecks_revocation_after_capacity_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sender = ProtocolResponseSender::new_with_limits(
+            egui::Context::default(),
+            tiny_protocol_limits(),
+        );
+        sender.try_enqueue(vec![1; 8]).unwrap();
+        sender.try_enqueue_critical(vec![2; 2]).unwrap();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let waiting_sender = sender.clone();
+        let waiting_allowed = Arc::clone(&allowed);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = waiting_sender.enqueue_clipboard_response(
+                b"secret".to_vec(),
+                b"no".to_vec(),
+                &waiting_allowed,
+            );
+            done_tx.send(result).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        allowed.store(false, Ordering::Release);
+        {
+            let mut state = sender.queue.state.lock();
+            let flushed = state.pending.pop_front().unwrap();
+            state.accounted_bytes -= flushed.len();
+            state.accounted_messages -= 1;
+            sender.queue.capacity_available.notify_all();
+        }
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            sender.close();
+        }
+        waiter.join().unwrap();
+        result.unwrap().unwrap();
+        let state = sender.queue.state.lock();
+        assert_eq!(
+            state.pending.iter().cloned().collect::<Vec<_>>(),
+            vec![vec![2; 2], b"no".to_vec()]
+        );
+        assert_eq!(state.accounted_bytes, 4);
     }
 
     #[test]

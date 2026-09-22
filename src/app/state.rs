@@ -147,6 +147,8 @@ pub struct TerminalApp {
     /// processes, so allowing the PTY to spawn overlapping reads would turn a
     /// harmless MIME-list query into an unbounded thread/process DoS.
     pub clipboard_request_in_flight: Arc<AtomicBool>,
+    /// Runtime permission shared with asynchronous OSC 52 readers.
+    pub osc52_read_allowed: Arc<AtomicBool>,
     /// Holds user input for the originating session until an asynchronous OSC
     /// 5522 paste notification has entered that session's protocol-response
     /// FIFO. Stable IDs keep tab switches and background pumping correctly
@@ -161,8 +163,7 @@ pub struct TerminalApp {
     /// OSC 52 clipboard reads are opt-in but still originate from untrusted
     /// PTY output. These counters bound accepted queries independently of
     /// frame rate; `clipboard_request_in_flight` serializes the actual helper.
-    pub osc52_read_window_started: std::time::Instant,
-    pub osc52_reads_in_window: usize,
+    pub(crate) osc52_read_rate_limit: crate::Osc52ReadRateLimit,
     pub cols: usize,
     pub rows: usize,
     pub next_cursor_blink_time: std::time::Instant,

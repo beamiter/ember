@@ -1822,30 +1822,42 @@ fn osc52_clipboard_response_with_limit(
     response
 }
 
-fn osc52_read_rate_limit_allows(
-    now: std::time::Instant,
-    window_started: &mut std::time::Instant,
-    reads_in_window: &mut usize,
-) -> bool {
-    if now.duration_since(*window_started) >= OSC52_READ_RATE_WINDOW {
-        *window_started = now;
-        *reads_in_window = 0;
+struct Osc52ReadRateLimit {
+    window_started: std::time::Instant,
+    reads_in_window: usize,
+}
+
+impl Default for Osc52ReadRateLimit {
+    fn default() -> Self {
+        Self {
+            window_started: std::time::Instant::now(),
+            reads_in_window: 0,
+        }
     }
-    if *reads_in_window >= MAX_OSC52_READS_PER_WINDOW {
-        return false;
+}
+
+impl Osc52ReadRateLimit {
+    fn allows(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window_started) >= OSC52_READ_RATE_WINDOW {
+            self.window_started = now;
+            self.reads_in_window = 0;
+        }
+        if self.reads_in_window >= MAX_OSC52_READS_PER_WINDOW {
+            return false;
+        }
+        self.reads_in_window += 1;
+        true
     }
-    *reads_in_window += 1;
-    true
 }
 
 fn service_osc52_clipboard_query(
     clipboard_available: bool,
+    read_allowed: &Arc<AtomicBool>,
     in_flight: &Arc<AtomicBool>,
     terminal: Arc<ParkingMutex<TerminalState>>,
     response_tx: ProtocolResponseSender,
     terminator: &'static [u8],
-    window_started: &mut std::time::Instant,
-    reads_in_window: &mut usize,
+    rate_limit: &mut Osc52ReadRateLimit,
 ) {
     // This check precedes rate/availability refusals: all accepted replies
     // for this session must remain behind its outstanding untagged read.
@@ -1854,9 +1866,7 @@ fn service_osc52_clipboard_query(
     }
     let empty_response =
         || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
-    if !osc52_read_rate_limit_allows(std::time::Instant::now(), window_started, reads_in_window)
-        || !clipboard_available
-    {
+    if !rate_limit.allows(std::time::Instant::now()) || !clipboard_available {
         enqueue_terminal_protocol_response(
             &response_tx,
             &terminal,
@@ -1879,6 +1889,7 @@ fn service_osc52_clipboard_query(
     }
 
     response_tx.begin_osc52_read();
+    let read_allowed = Arc::clone(read_allowed);
     let in_flight_for_thread = Arc::clone(in_flight);
     let error_tx = response_tx.clone();
     let spawn_result = std::thread::Builder::new()
@@ -1888,7 +1899,7 @@ fn service_osc52_clipboard_query(
             let content = ClipboardManager::new()
                 .and_then(|clipboard| clipboard.paste())
                 .unwrap_or_default();
-            finish_osc52_clipboard_read(&response_tx, &content, terminator);
+            finish_osc52_clipboard_read(&response_tx, &read_allowed, &content, terminator);
         });
     if let Err(error) = spawn_result {
         in_flight.store(false, Ordering::Release);
@@ -1907,6 +1918,7 @@ fn service_osc52_clipboard_query(
 
 fn finish_osc52_clipboard_read(
     response_tx: &ProtocolResponseSender,
+    read_allowed: &AtomicBool,
     content: &str,
     terminator: &'static [u8],
 ) {
@@ -1917,7 +1929,12 @@ fn finish_osc52_clipboard_read(
     );
     let fallback =
         osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
-    enqueue_worker_protocol_response(response_tx, response, fallback, "OSC 52");
+    if let Err(error) =
+        response_tx.enqueue_clipboard_response(response, fallback.clone(), read_allowed)
+    {
+        log::debug!("OSC 52 response refused or cancelled: {error}");
+        enqueue_worker_protocol_response(response_tx, fallback.clone(), fallback, "OSC 52");
+    }
     while let Some(terminator) = response_tx.next_osc52_refusal() {
         let refusal =
             osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
@@ -2310,12 +2327,12 @@ impl TerminalApp {
             renderer,
             clipboard,
             clipboard_request_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            osc52_read_allowed: Arc::new(AtomicBool::new(cfg.osc52_clipboard_read)),
             osc_paste_input_barriers: crate::session_manager::SessionInputBarriers::default(),
             osc52_clipboard_write_tx,
             osc52_write_window_started: std::time::Instant::now(),
             osc52_writes_in_window: 0,
-            osc52_read_window_started: std::time::Instant::now(),
-            osc52_reads_in_window: 0,
+            osc52_read_rate_limit: Osc52ReadRateLimit::default(),
             cols,
             rows,
             next_cursor_blink_time: std::time::Instant::now() + Duration::from_millis(1000),
@@ -2422,6 +2439,8 @@ impl TerminalApp {
     }
 
     fn apply_runtime_config(&mut self, ctx: &egui::Context) {
+        self.osc52_read_allowed
+            .store(self.config.osc52_clipboard_read, Ordering::Release);
         if !self.config.block_mode {
             self.clear_block_selection();
         }
@@ -5265,12 +5284,12 @@ impl eframe::App for TerminalApp {
                 if let Some((response_tx, terminal)) = response_route {
                     service_osc52_clipboard_query(
                         self.clipboard.is_some(),
+                        &self.osc52_read_allowed,
                         &self.clipboard_request_in_flight,
                         terminal,
                         response_tx,
                         terminator,
-                        &mut self.osc52_read_window_started,
-                        &mut self.osc52_reads_in_window,
+                        &mut self.osc52_read_rate_limit,
                     );
                 }
             }
@@ -6065,12 +6084,12 @@ impl eframe::App for TerminalApp {
                 for terminator in osc52_queries {
                     service_osc52_clipboard_query(
                         self.clipboard.is_some(),
+                        &self.osc52_read_allowed,
                         &self.clipboard_request_in_flight,
                         Arc::clone(&session.terminal),
                         active_protocol_responses.clone(),
                         terminator,
-                        &mut self.osc52_read_window_started,
-                        &mut self.osc52_reads_in_window,
+                        &mut self.osc52_read_rate_limit,
                     );
                 }
             }
@@ -7291,23 +7310,26 @@ mod tests {
         link_at_pointer, maybe_notify_long_command, mouse_capture_accepts_new_press,
         mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
         mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
-        normalized_paste_body, osc52_clipboard_response_with_limit, osc52_read_rate_limit_allows,
-        paste_policy, paste_requires_confirmation, primary_copy_route, queue_mouse_control,
+        normalized_paste_body, osc52_clipboard_response_with_limit, paste_policy,
+        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, snapshot_age_label, take_tagged_cursor_move,
-        workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification, PasteOrigin,
-        PasteWriteError, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
-        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
-        OSC_5522_DATA_CHUNK_BYTES,
+        workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification,
+        Osc52ReadRateLimit, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
+        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
+        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
         semantic_paste_modifiers, semantic_shortcut_modifiers, shortcut_event_to_key_event,
         should_restore_terminal_shortcut_event, PasteKeyState,
     };
+    use crate::{ProtocolResponseSender, TerminalState};
     use base64::Engine as _;
     use eframe::egui;
     use image::ImageEncoder as _;
+    use parking_lot::Mutex as ParkingMutex;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -8089,6 +8111,62 @@ mod tests {
     }
 
     #[test]
+    fn osc52_slow_read_precedes_later_batch_refusals_on_its_own_route() {
+        use std::sync::atomic::AtomicBool;
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let other = ProtocolResponseSender::new(egui::Context::default());
+        let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
+        let busy = Arc::new(AtomicBool::new(true));
+        let mut rate_limit = Osc52ReadRateLimit::default();
+        responses.begin_osc52_read();
+
+        // Exercise the real UI service across separate pump calls. Even a
+        // rate/availability refusal belongs behind the older clipboard read.
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            crate::service_osc52_clipboard_query(
+                false,
+                &Arc::new(AtomicBool::new(true)),
+                &busy,
+                Arc::clone(&terminal),
+                responses.clone(),
+                terminator,
+                &mut rate_limit,
+            );
+        }
+        assert!(!responses.has_pending(), "no refusal may overtake the read");
+        assert!(!other.defer_osc52_query(b"\x07"));
+        crate::finish_osc52_clipboard_read(
+            &responses,
+            &std::sync::atomic::AtomicBool::new(true),
+            "first",
+            b"\x1b\\",
+        );
+        let bytes = responses.pending_bytes_for_test();
+        assert_eq!(
+            bytes,
+            b"\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;c;\x07\x1b]52;c;\x1b\\"
+        );
+        assert!(!responses.defer_osc52_query(b"\x07"));
+        assert!(!other.has_pending());
+    }
+
+    #[test]
+    fn osc52_permission_revoked_while_reading_refuses_secret_in_fifo_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let read_allowed = AtomicBool::new(true);
+        responses.begin_osc52_read();
+        assert!(responses.defer_osc52_query(b"\x07"));
+        // Config changes while the external clipboard owner is still serving
+        // the read. Its eventual nonempty result must not cross the PTY.
+        read_allowed.store(false, Ordering::Release);
+        crate::finish_osc52_clipboard_read(&responses, &read_allowed, "secret", b"\x1b\\");
+        let bytes = responses.pending_bytes_for_test();
+        assert_eq!(bytes, b"\x1b]52;c;\x1b\\\x1b]52;c;\x07");
+        assert!(!responses.defer_osc52_query(b"\x07"));
+    }
+
+    #[test]
     fn osc52_response_is_bounded_before_base64_allocation() {
         let normal = osc52_clipboard_response_with_limit("hello", 64, b"\x1b\\");
         assert_eq!(normal, b"\x1b]52;c;aGVsbG8=\x1b\\");
@@ -8104,18 +8182,16 @@ mod tests {
     #[test]
     fn osc52_read_rate_limit_resets_after_its_window() {
         let base = std::time::Instant::now();
-        let mut window = base;
-        let mut count = 0;
+        let mut rate_limit = Osc52ReadRateLimit {
+            window_started: base,
+            reads_in_window: 0,
+        };
         for _ in 0..MAX_OSC52_READS_PER_WINDOW {
-            assert!(osc52_read_rate_limit_allows(base, &mut window, &mut count));
+            assert!(rate_limit.allows(base));
         }
-        assert!(!osc52_read_rate_limit_allows(base, &mut window, &mut count));
-        assert!(osc52_read_rate_limit_allows(
-            base + OSC52_READ_RATE_WINDOW,
-            &mut window,
-            &mut count,
-        ));
-        assert_eq!(count, 1);
+        assert!(!rate_limit.allows(base));
+        assert!(rate_limit.allows(base + OSC52_READ_RATE_WINDOW));
+        assert_eq!(rate_limit.reads_in_window, 1);
     }
 
     #[test]
