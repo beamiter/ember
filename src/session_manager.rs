@@ -77,6 +77,10 @@ struct ProtocolResponseState {
     accounted_bytes: usize,
     accounted_messages: usize,
     closed: bool,
+    // OSC 52 has no request IDs: busy refusals must follow the older read.
+    // Persist across parser batches, scoped to this exact session route.
+    osc52_read_pending: bool,
+    osc52_refusals: VecDeque<&'static [u8]>,
 }
 
 struct ProtocolResponseQueue {
@@ -110,12 +114,44 @@ impl ProtocolResponseSender {
                     accounted_bytes: 0,
                     accounted_messages: 0,
                     closed: false,
+                    osc52_read_pending: false,
+                    osc52_refusals: VecDeque::new(),
                 }),
                 capacity_available: Condvar::new(),
                 limits,
                 repaint_ctx,
             }),
         }
+    }
+
+    /// Return true when an older OSC 52 read owns this route. Keep only a
+    /// bounded suffix of refusals; dropping overflow is preferable to sending
+    /// an uncorrelated reply ahead of that read or retaining unbounded work.
+    pub fn defer_osc52_query(&self, terminator: &'static [u8]) -> bool {
+        let mut state = self.queue.state.lock();
+        if !state.osc52_read_pending {
+            return false;
+        }
+        if !state.closed && state.osc52_refusals.len() < 8 {
+            state.osc52_refusals.push_back(terminator);
+        }
+        true
+    }
+
+    pub fn begin_osc52_read(&self) {
+        self.queue.state.lock().osc52_read_pending = true;
+    }
+
+    /// Called only after the read response (and then each preceding refusal)
+    /// entered the protocol FIFO. Release ownership atomically with observing
+    /// an empty suffix so a UI query cannot overtake the worker's final reply.
+    pub fn next_osc52_refusal(&self) -> Option<&'static [u8]> {
+        let mut state = self.queue.state.lock();
+        let next = state.osc52_refusals.pop_front();
+        if next.is_none() {
+            state.osc52_read_pending = false;
+        }
+        next
     }
 
     fn effective_capacity(&self, critical: bool) -> (usize, usize) {
@@ -270,6 +306,7 @@ impl ProtocolResponseSender {
     fn close_locked(queue: &ProtocolResponseQueue, state: &mut ProtocolResponseState) {
         state.closed = true;
         state.pending.clear();
+        state.osc52_refusals.clear();
         state.accounted_bytes = 0;
         state.accounted_messages = 0;
         queue.capacity_available.notify_all();
@@ -1536,6 +1573,69 @@ mod tests {
             Some("mouse-session"),
             &protocol_barriers
         ));
+    }
+
+    #[test]
+    fn osc52_slow_read_precedes_later_batch_refusals_on_its_own_route() {
+        use std::sync::atomic::AtomicBool;
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let other = ProtocolResponseSender::new(egui::Context::default());
+        let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
+        let busy = Arc::new(AtomicBool::new(true));
+        let mut window = std::time::Instant::now();
+        let mut count = 0;
+        responses.begin_osc52_read();
+
+        // Exercise the real UI service across separate pump calls. Even a
+        // rate/availability refusal belongs behind the older clipboard read.
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            crate::service_osc52_clipboard_query(
+                false,
+                &busy,
+                Arc::clone(&terminal),
+                responses.clone(),
+                terminator,
+                &mut window,
+                &mut count,
+            );
+        }
+        assert!(!responses.has_pending(), "no refusal may overtake the read");
+        assert!(!other.defer_osc52_query(b"\x07"));
+        crate::finish_osc52_clipboard_read(&responses, "first", b"\x1b\\");
+        let bytes: Vec<u8> = responses
+            .queue
+            .state
+            .lock()
+            .pending
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            bytes,
+            b"\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;c;\x07\x1b]52;c;\x1b\\"
+        );
+        assert!(!responses.defer_osc52_query(b"\x07"));
+        assert!(!other.has_pending());
+    }
+
+    #[test]
+    fn osc52_deferred_refusals_stay_bounded_and_closed_routes_discard_them() {
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        responses.begin_osc52_read();
+        for _ in 0..100 {
+            assert!(responses.defer_osc52_query(b"\x07"));
+        }
+        assert_eq!(responses.queue.state.lock().osc52_refusals.len(), 8);
+        crate::finish_osc52_clipboard_read(&responses, "first", b"\x1b\\");
+        assert_eq!(responses.queue.state.lock().pending.len(), 9);
+
+        responses.begin_osc52_read();
+        assert!(responses.defer_osc52_query(b"\x07"));
+        responses.close();
+        crate::finish_osc52_clipboard_read(&responses, "secret", b"\x1b\\");
+        assert!(!responses.has_pending());
+        assert!(responses.queue.state.lock().osc52_refusals.is_empty());
     }
 
     #[test]

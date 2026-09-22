@@ -1847,6 +1847,11 @@ fn service_osc52_clipboard_query(
     window_started: &mut std::time::Instant,
     reads_in_window: &mut usize,
 ) {
+    // This check precedes rate/availability refusals: all accepted replies
+    // for this session must remain behind its outstanding untagged read.
+    if response_tx.defer_osc52_query(terminator) {
+        return;
+    }
     let empty_response =
         || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
     if !osc52_read_rate_limit_allows(std::time::Instant::now(), window_started, reads_in_window)
@@ -1873,6 +1878,7 @@ fn service_osc52_clipboard_query(
         return;
     }
 
+    response_tx.begin_osc52_read();
     let in_flight_for_thread = Arc::clone(in_flight);
     let error_tx = response_tx.clone();
     let spawn_result = std::thread::Builder::new()
@@ -1882,17 +1888,7 @@ fn service_osc52_clipboard_query(
             let content = ClipboardManager::new()
                 .and_then(|clipboard| clipboard.paste())
                 .unwrap_or_default();
-            let response = osc52_clipboard_response_with_limit(
-                &content,
-                MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
-                terminator,
-            );
-            let fallback = osc52_clipboard_response_with_limit(
-                "",
-                MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
-                terminator,
-            );
-            enqueue_worker_protocol_response(&response_tx, response, fallback, "OSC 52");
+            finish_osc52_clipboard_read(&response_tx, &content, terminator);
         });
     if let Err(error) = spawn_result {
         in_flight.store(false, Ordering::Release);
@@ -1902,6 +1898,34 @@ fn service_osc52_clipboard_query(
             &terminal,
             empty_response(),
             "OSC 52 spawn-error response",
+        );
+        // No other UI query can run before this synchronous spawn failure.
+        let pending = error_tx.next_osc52_refusal();
+        debug_assert!(pending.is_none());
+    }
+}
+
+fn finish_osc52_clipboard_read(
+    response_tx: &ProtocolResponseSender,
+    content: &str,
+    terminator: &'static [u8],
+) {
+    let response = osc52_clipboard_response_with_limit(
+        content,
+        MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
+        terminator,
+    );
+    let fallback =
+        osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
+    enqueue_worker_protocol_response(response_tx, response, fallback, "OSC 52");
+    while let Some(terminator) = response_tx.next_osc52_refusal() {
+        let refusal =
+            osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
+        enqueue_worker_protocol_response(
+            response_tx,
+            refusal.clone(),
+            refusal,
+            "OSC 52 deferred refusal",
         );
     }
 }
