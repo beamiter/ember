@@ -198,24 +198,35 @@ fn fontconfig_match_file(family: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// fontconfig's SemiBold/DemiBold weight (OS/2 600).
+#[cfg(target_os = "linux")]
+const FC_WEIGHT_SEMIBOLD: u32 = 180;
+/// fontconfig's Medium weight (OS/2 500); anything at or below it reads as regular.
+#[cfg(any(target_os = "linux", test))]
+const FC_WEIGHT_MEDIUM: f64 = 100.0;
+
+/// Resolve the face used for bold cells.
+///
+/// A full Bold (700) cut renders heavy at terminal sizes, so ask for SemiBold
+/// (600) instead. fontconfig picks the nearest weight, so a family without a
+/// SemiBold cut still lands on its Bold file.
 #[cfg(target_os = "linux")]
 fn fontconfig_match_bold_file(family: &str) -> Option<String> {
-    let query = format!("{}:style=Bold", family);
-    let output = jterm_core::helper::fc_match(&["-f", "%{file}\n", &query]).ok()?;
+    let query = format!("{}:weight={}", family, FC_WEIGHT_SEMIBOLD);
+    let output = jterm_core::helper::fc_match(&["-f", "%{weight}\t%{file}\n", &query]).ok()?;
+    parse_bold_match(&String::from_utf8(output.stdout).ok()?)
+}
 
-    let path = String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .find(|path| !path.is_empty())
-        .map(ToOwned::to_owned)?;
-
-    // Verify it's actually a bold variant (not the same as regular)
-    if path.to_lowercase().contains("bold") {
-        Some(path)
-    } else {
-        None
-    }
+/// Accept an `fc-match` answer only when it is really a heavier face.
+///
+/// A family with no bold cut answers with its regular file, and a variable font
+/// reports a weight range instead of one weight; neither can stand in for bold.
+#[cfg(any(target_os = "linux", test))]
+fn parse_bold_match(stdout: &str) -> Option<String> {
+    let (weight, path) = stdout.lines().find_map(|line| line.split_once('\t'))?;
+    let weight: f64 = weight.trim().parse().ok()?;
+    let path = path.trim();
+    (weight > FC_WEIGHT_MEDIUM && !path.is_empty()).then(|| path.to_owned())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -7310,7 +7321,7 @@ mod tests {
         link_at_pointer, maybe_notify_long_command, mouse_capture_accepts_new_press,
         mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
         mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
-        normalized_paste_body, osc52_clipboard_response_with_limit, paste_policy,
+        normalized_paste_body, osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
         paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
         show_desktop_notification, snapshot_age_label, take_tagged_cursor_move,
@@ -9013,5 +9024,24 @@ mod tests {
             fontconfig_match_family_file("Definitely Not An Installed Family 4f2b"),
             None
         );
+    }
+
+    /// Bold cells take the SemiBold cut when one exists, fall back to Bold,
+    /// and never take a regular or variable face that only looks like an answer.
+    #[test]
+    fn bold_lookup_accepts_only_a_heavier_single_weight_face() {
+        assert_eq!(
+            parse_bold_match("180\t/fonts/SauceCodeProNerdFont-SemiBold.ttf\n"),
+            Some("/fonts/SauceCodeProNerdFont-SemiBold.ttf".to_owned())
+        );
+        assert_eq!(
+            parse_bold_match("200\t/fonts/DejaVuSansMono-Bold.ttf\n"),
+            Some("/fonts/DejaVuSansMono-Bold.ttf".to_owned())
+        );
+        assert_eq!(parse_bold_match("80\t/fonts/NotoMono-Regular.ttf\n"), None);
+        assert_eq!(parse_bold_match("100\t/fonts/Mono-Medium.ttf\n"), None);
+        assert_eq!(parse_bold_match("[0 210]\t/fonts/Mono[wght].ttf\n"), None);
+        assert_eq!(parse_bold_match("200\t\n"), None);
+        assert_eq!(parse_bold_match(""), None);
     }
 }
