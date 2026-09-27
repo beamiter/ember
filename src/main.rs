@@ -5257,17 +5257,35 @@ impl eframe::App for TerminalApp {
         for (session_idx, error) in background_pump.errors.drain(..) {
             log::warn!("background session {}: {}", session_idx + 1, error);
         }
-        for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
-            let response_tx = self.session_manager.protocol_response_sender(session_idx);
-            if let Some(session) = self.session_manager.get_session_mut(session_idx) {
-                if let Some(response_tx) = response_tx {
-                    service_osc5522_clipboard_requests(
-                        self.clipboard.is_some(),
-                        &self.clipboard_request_in_flight,
-                        Arc::clone(&session.terminal),
-                        response_tx,
-                        requests,
-                    );
+        if self.config.osc52_clipboard_read {
+            for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
+                let response_tx = self.session_manager.protocol_response_sender(session_idx);
+                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                    if let Some(response_tx) = response_tx {
+                        service_osc5522_clipboard_requests(
+                            self.clipboard.is_some(),
+                            &self.clipboard_request_in_flight,
+                            Arc::clone(&session.terminal),
+                            response_tx,
+                            requests,
+                        );
+                    }
+                }
+            }
+        } else {
+            for (session_idx, requests) in background_pump.clipboard_requests.drain(..) {
+                let response_tx = self.session_manager.protocol_response_sender(session_idx);
+                if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                    if let Some(response_tx) = response_tx {
+                        for _ in &requests {
+                            enqueue_terminal_protocol_response(
+                                &response_tx,
+                                &session.terminal,
+                                osc_5522_packet("type=read:status=EPERM", None),
+                                "OSC 5522 read-disabled response",
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6063,13 +6081,24 @@ impl eframe::App for TerminalApp {
                     log::warn!("terminal protocol response queue stopped: {error}");
                 }
             }
-            service_osc5522_clipboard_requests(
-                self.clipboard.is_some(),
-                &self.clipboard_request_in_flight,
-                Arc::clone(&session.terminal),
-                active_protocol_responses.clone(),
-                clipboard_requests,
-            );
+            if self.config.osc52_clipboard_read {
+                service_osc5522_clipboard_requests(
+                    self.clipboard.is_some(),
+                    &self.clipboard_request_in_flight,
+                    Arc::clone(&session.terminal),
+                    active_protocol_responses.clone(),
+                    clipboard_requests,
+                );
+            } else if !clipboard_requests.is_empty() {
+                for _ in &clipboard_requests {
+                    enqueue_terminal_protocol_response(
+                        &active_protocol_responses,
+                        &session.terminal,
+                        osc_5522_packet("type=read:status=EPERM", None),
+                        "OSC 5522 read-disabled response",
+                    );
+                }
+            }
         }
 
         // OSC 52 clipboard handling
@@ -9103,6 +9132,31 @@ mod tests {
         assert_eq!(
             enqueue_in_gates, 2,
             "both background and foreground OSC 52 SET paths must honor the write permission"
+        );
+    }
+
+    #[test]
+    fn an_osc_5522_clipboard_read_is_served_only_behind_the_read_permission() {
+        let full = ember_main_source();
+        let source = full
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(full.as_str());
+        let service = "service_osc5522_clipboard_requests(";
+        let gate = "if self.config.osc52_clipboard_read {";
+        let mut service_in_gates = 0usize;
+        for (offset, _) in source.match_indices(gate) {
+            let block = braced_block_after(&source[offset..], gate);
+            service_in_gates += block.matches(service).count();
+        }
+        assert_eq!(
+            service_in_gates, 2,
+            "background and foreground OSC 5522 read paths must honor the read permission"
+        );
+        let disabled = "osc_5522_packet(\"type=read:status=EPERM\", None)";
+        assert!(
+            source.matches(disabled).count() >= 2,
+            "read-disabled paths must answer EPERM instead of touching the host clipboard"
         );
     }
 }

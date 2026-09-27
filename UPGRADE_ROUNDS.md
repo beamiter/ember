@@ -544,3 +544,10 @@ query answers, control handling and resize.
      structural regression counts the two call sites inside that gate so a
      future refactor cannot apply PTY-authored clipboard data unconditionally
      again.
+
+108. **OSC 5522 reads stay behind the read permission** — extended clipboard
+     MIME reads default off with OSC 52, but both the background pump and the
+     per-frame path previously called `service_osc5522_clipboard_requests`
+     unconditionally. They now honor `osc52_clipboard_read`, answering EPERM
+     when disabled, and a structural regression pins both gated call sites plus
+     the read-disabled refusal path.
