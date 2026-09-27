@@ -568,3 +568,8 @@ query answers, control handling and resize.
      empty before the read rate limiter runs, so refused OSC 52 GETs no longer
      consume the per-window budget. A unit regression pins zero consumption
      across a full rate window of clipboard-unavailable queries.
+
+112. **OSC 52 busy rate budget** — an in-flight host read refuses later GETs
+     before the rate limiter runs, and a lost compare-exchange race refunds the
+     slot, so busy refusals no longer consume the per-window budget. A unit
+     regression pins zero consumption across a full rate window of busy queries.

@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 7)
+Updated: 2026-09-28 (wave 8)
+
+## 2026-09-28 (wave 8)
+
+- **OSC 52 busy rate budget** — in-flight host reads refuse later GETs before
+  the read rate limiter runs (and refund if a race loses after), so busy
+  refusals no longer consume the per-window budget (UPGRADE_ROUNDS 112).
 
 ## 2026-09-28 (wave 7)
 

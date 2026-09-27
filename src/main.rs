@@ -1886,6 +1886,18 @@ fn service_osc52_clipboard_query(
         );
         return;
     }
+    // Busy refusals must not spend the rate budget: an in-flight host read is
+    // temporary, and burning slots here would let a burst of GETs during that
+    // window starve later accepted reads after it completes.
+    if in_flight.load(Ordering::Acquire) {
+        enqueue_terminal_protocol_response(
+            &response_tx,
+            &terminal,
+            empty_response(),
+            "OSC 52 busy response",
+        );
+        return;
+    }
     if !rate_limit.allows(std::time::Instant::now()) {
         enqueue_terminal_protocol_response(
             &response_tx,
@@ -1899,6 +1911,9 @@ fn service_osc52_clipboard_query(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        // Lost the race after the rate check; refund so a busy refusal still
+        // cannot consume the per-window budget.
+        rate_limit.reads_in_window = rate_limit.reads_in_window.saturating_sub(1);
         enqueue_terminal_protocol_response(
             &response_tx,
             &terminal,
@@ -9213,6 +9228,31 @@ mod tests {
         assert_eq!(
             rate_limit.reads_in_window, 0,
             "clipboard-unavailable OSC 52 GET must not consume the read rate budget"
+        );
+    }
+
+    #[test]
+    fn osc52_busy_clipboard_does_not_consume_read_rate_limit() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
+        let busy = Arc::new(AtomicBool::new(true));
+        let mut rate_limit = Osc52ReadRateLimit::default();
+        for _ in 0..MAX_OSC52_READS_PER_WINDOW {
+            crate::service_osc52_clipboard_query(
+                true,
+                &Arc::new(AtomicBool::new(true)),
+                &busy,
+                Arc::clone(&terminal),
+                responses.clone(),
+                b"\x1b\\",
+                &mut rate_limit,
+            );
+        }
+        assert_eq!(
+            rate_limit.reads_in_window, 0,
+            "busy OSC 52 GET refusals must not consume the read rate budget"
         );
     }
 
