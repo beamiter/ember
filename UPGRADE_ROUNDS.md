@@ -563,3 +563,8 @@ query answers, control handling and resize.
      available, both OSC 5522 read paths answer ENOSYS instead of spawning a
      worker that can never succeed. A structural regression pins the ENOSYS
      refusal inside `service_osc5522_clipboard_requests` before any host access.
+
+111. **OSC 52 rate budget without clipboard** — unavailable backends answer
+     empty before the read rate limiter runs, so refused OSC 52 GETs no longer
+     consume the per-window budget. A unit regression pins zero consumption
+     across a full rate window of clipboard-unavailable queries.

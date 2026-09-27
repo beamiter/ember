@@ -1877,7 +1877,16 @@ fn service_osc52_clipboard_query(
     }
     let empty_response =
         || osc52_clipboard_response_with_limit("", MAX_OSC52_CLIPBOARD_RESPONSE_BYTES, terminator);
-    if !rate_limit.allows(std::time::Instant::now()) || !clipboard_available {
+    if !clipboard_available {
+        enqueue_terminal_protocol_response(
+            &response_tx,
+            &terminal,
+            empty_response(),
+            "OSC 52 empty response",
+        );
+        return;
+    }
+    if !rate_limit.allows(std::time::Instant::now()) {
         enqueue_terminal_protocol_response(
             &response_tx,
             &terminal,
@@ -9183,6 +9192,30 @@ mod tests {
     }
 
     #[test]
+    fn osc52_unavailable_clipboard_does_not_consume_read_rate_limit() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let terminal = Arc::new(ParkingMutex::new(TerminalState::new(80, 24)));
+        let busy = Arc::new(AtomicBool::new(false));
+        let mut rate_limit = Osc52ReadRateLimit::default();
+        for _ in 0..MAX_OSC52_READS_PER_WINDOW {
+            crate::service_osc52_clipboard_query(
+                false,
+                &Arc::new(AtomicBool::new(true)),
+                &busy,
+                Arc::clone(&terminal),
+                responses.clone(),
+                b"\x1b\\",
+                &mut rate_limit,
+            );
+        }
+        assert_eq!(
+            rate_limit.reads_in_window, 0,
+            "clipboard-unavailable OSC 52 GET must not consume the read rate budget"
+        );
+    }
+
     #[test]
     fn service_osc5522_without_clipboard_answers_enosys_before_host_access() {
         let full = ember_main_source();

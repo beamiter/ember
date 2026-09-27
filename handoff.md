@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 6)
+Updated: 2026-09-28 (wave 7)
+
+## 2026-09-28 (wave 7)
+
+- **OSC 52 rate budget without clipboard** — unavailable backends answer empty
+  before the read rate limiter runs, so refused GETs no longer consume the
+  per-window budget (UPGRADE_ROUNDS 111).
 
 ## 2026-09-28 (wave 6)
 
