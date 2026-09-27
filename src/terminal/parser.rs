@@ -611,11 +611,15 @@ impl super::TerminalState {
         }
     }
 
-    /// DECRQM answer for an ANSI mode. IRM is the only one ember implements.
+    /// DECRQM answer for an ANSI mode. IRM is the only one ember switches;
+    /// LNM is answered as permanently reset (4) because a line feed here
+    /// never implies a carriage return — matching frost and avoiding the
+    /// silent-timeout Claude Code hits when an unimplemented mode replies 0.
     fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
         match mode {
             4 if self.insert_mode => 1,
             4 => 2,
+            20 => 4,
             _ => 0,
         }
     }

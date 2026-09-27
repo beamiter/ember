@@ -534,3 +534,13 @@ query answers, control handling and resize.
 105. **A Fix-menu provider pick survives an open Settings panel** — the
      panel's draft adopts the menu's choice unless the user changed it there,
      so Save no longer silently reverts it.
+106. **LNM DECRQM is permanently reset** — `CSI 20 $ p` answers
+     `CSI 20 ; 4 $ y` instead of unrecognised `0`, matching frost so probes
+     that ask about line-feed/carriage-return coupling get a decisive reply.
+
+106. **OSC 52 SET stays behind the write permission** — remote clipboard writes
+     default off, but both the background pump and the per-frame path must
+     consult `osc52_clipboard_write` before enqueueing a host write. A
+     structural regression counts the two call sites inside that gate so a
+     future refactor cannot apply PTY-authored clipboard data unconditionally
+     again.

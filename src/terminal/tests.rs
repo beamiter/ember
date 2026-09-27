@@ -6367,11 +6367,11 @@ fn decrqm_answers_every_mode_ember_implements() {
         "\x1b[?2004;1$y\x1b[?1006;1$y\x1b[?1002;2$y"
     );
 
-    // ANSI modes: IRM is implemented, LNM is not.
+    // ANSI modes: IRM is switchable; LNM is permanently reset (never implies CR).
     terminal.process_input(b"\x1b[4$p\x1b[4h\x1b[4$p\x1b[20$p");
     assert_eq!(
         String::from_utf8(terminal.get_output()).unwrap(),
-        "\x1b[4;2$y\x1b[4;1$y\x1b[20;0$y"
+        "\x1b[4;2$y\x1b[4;1$y\x1b[20;4$y"
     );
 }
 
