@@ -538,7 +538,7 @@ query answers, control handling and resize.
      `CSI 20 ; 4 $ y` instead of unrecognised `0`, matching frost so probes
      that ask about line-feed/carriage-return coupling get a decisive reply.
 
-106. **OSC 52 SET stays behind the write permission** — remote clipboard writes
+107. **OSC 52 SET stays behind the write permission** — remote clipboard writes
      default off, but both the background pump and the per-frame path must
      consult `osc52_clipboard_write` before enqueueing a host write. A
      structural regression counts the two call sites inside that gate so a

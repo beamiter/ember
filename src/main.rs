@@ -9044,4 +9044,65 @@ mod tests {
         assert_eq!(parse_bold_match("200\t\n"), None);
         assert_eq!(parse_bold_match(""), None);
     }
+
+    fn ember_main_source() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("ember's own source is readable from its manifest directory")
+    }
+
+    fn braced_block_after(source: &str, opener: &str) -> String {
+        let rest = source
+            .split_once(opener)
+            .unwrap_or_else(|| panic!("{opener} appears in ember's source"))
+            .1;
+        let code = rest
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut depth = 1usize;
+        for (offset, character) in code.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return code[..offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the block {opener} opens is closed");
+    }
+
+    /// OSC 52 SET is PTY output asking to replace the host clipboard. Ember
+    /// defaults the permission off, but a default only matters where it is
+    /// consulted — both enqueue sites must stay inside the config gate.
+    #[test]
+    fn an_osc_52_clipboard_set_is_enqueued_only_behind_the_write_permission() {
+        let full = ember_main_source();
+        let source = full
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(full.as_str());
+        let enqueue = "enqueue_osc52_clipboard_write(";
+        assert_eq!(
+            source.matches(enqueue).count(),
+            3,
+            "one definition and two call sites, or the gate below is incomplete"
+        );
+        let gate = "if self.config.osc52_clipboard_write {";
+        let mut enqueue_in_gates = 0usize;
+        for (offset, _) in source.match_indices(gate) {
+            let block = braced_block_after(&source[offset..], gate);
+            enqueue_in_gates += block.matches(enqueue).count();
+        }
+        assert_eq!(
+            enqueue_in_gates, 2,
+            "both background and foreground OSC 52 SET paths must honor the write permission"
+        );
+    }
 }
