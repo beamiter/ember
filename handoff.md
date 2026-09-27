@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-27 (wave 5)
+Updated: 2026-09-28 (wave 6)
+
+## 2026-09-28 (wave 6)
+
+- **OSC 5522 ENOSYS without host clipboard** — unavailable clipboard backends
+  now get ENOSYS from both read paths before any worker spawn. Structural
+  regression pins the early ENOSYS branch (UPGRADE_ROUNDS 110).
 
 ## 2026-09-27 (wave 5)
 

@@ -9183,6 +9183,28 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn service_osc5522_without_clipboard_answers_enosys_before_host_access() {
+        let full = ember_main_source();
+        let source = full
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(full.as_str());
+        let service = "fn service_osc5522_clipboard_requests(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("service_osc5522_clipboard_requests must exist");
+        let enosys = service_body.find("type=read:status=ENOSYS")
+            .expect("OSC 5522 service must answer ENOSYS without a clipboard");
+        let spawn = service_body.find("thread::spawn").unwrap_or(service_body.len());
+        assert!(
+            enosys < spawn,
+            "ENOSYS must be returned before any clipboard worker is spawned"
+        );
+    }
+
+    #[test]
     fn an_osc_5522_clipboard_read_is_served_only_behind_the_read_permission() {
         let full = ember_main_source();
         let source = full

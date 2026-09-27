@@ -558,3 +558,8 @@ query answers, control handling and resize.
      mirror the 5522 EPERM/empty contract, and a structural regression pins both
      gated `service_osc52_clipboard_query` call sites plus the read-disabled
      refusal path.
+
+110. **OSC 5522 ENOSYS without host clipboard** — when no clipboard backend is
+     available, both OSC 5522 read paths answer ENOSYS instead of spawning a
+     worker that can never succeed. A structural regression pins the ENOSYS
+     refusal inside `service_osc5522_clipboard_requests` before any host access.
