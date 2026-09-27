@@ -5299,18 +5299,18 @@ impl eframe::App for TerminalApp {
                 );
             }
         }
-        if self.config.osc52_clipboard_read {
-            for (session_idx, terminator) in background_pump.osc52_queries.drain(..) {
-                let response_route = self
-                    .session_manager
-                    .protocol_response_sender(session_idx)
-                    .zip(
-                        self.session_manager
-                            .sessions()
-                            .get(session_idx)
-                            .map(|session| Arc::clone(&session.terminal)),
-                    );
-                if let Some((response_tx, terminal)) = response_route {
+        for (session_idx, terminator) in background_pump.osc52_queries.drain(..) {
+            let response_route = self
+                .session_manager
+                .protocol_response_sender(session_idx)
+                .zip(
+                    self.session_manager
+                        .sessions()
+                        .get(session_idx)
+                        .map(|session| Arc::clone(&session.terminal)),
+                );
+            if let Some((response_tx, terminal)) = response_route {
+                if self.config.osc52_clipboard_read {
                     service_osc52_clipboard_query(
                         self.clipboard.is_some(),
                         &self.osc52_read_allowed,
@@ -5319,6 +5319,17 @@ impl eframe::App for TerminalApp {
                         response_tx,
                         terminator,
                         &mut self.osc52_read_rate_limit,
+                    );
+                } else {
+                    enqueue_terminal_protocol_response(
+                        &response_tx,
+                        &terminal,
+                        osc52_clipboard_response_with_limit(
+                            "",
+                            MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
+                            terminator,
+                        ),
+                        "OSC 52 read-disabled response",
                     );
                 }
             }
@@ -6120,8 +6131,8 @@ impl eframe::App for TerminalApp {
             // Reading the clipboard exposes user data to a terminal program,
             // so it remains opt-in. Even when enabled, the external helper
             // and base64 encoding run only on the bounded background path.
-            if self.config.osc52_clipboard_read {
-                for terminator in osc52_queries {
+            for terminator in osc52_queries {
+                if self.config.osc52_clipboard_read {
                     service_osc52_clipboard_query(
                         self.clipboard.is_some(),
                         &self.osc52_read_allowed,
@@ -6130,6 +6141,17 @@ impl eframe::App for TerminalApp {
                         active_protocol_responses.clone(),
                         terminator,
                         &mut self.osc52_read_rate_limit,
+                    );
+                } else {
+                    enqueue_terminal_protocol_response(
+                        &active_protocol_responses,
+                        &session.terminal,
+                        osc52_clipboard_response_with_limit(
+                            "",
+                            MAX_OSC52_CLIPBOARD_RESPONSE_BYTES,
+                            terminator,
+                        ),
+                        "OSC 52 read-disabled response",
                     );
                 }
             }
@@ -9132,6 +9154,31 @@ mod tests {
         assert_eq!(
             enqueue_in_gates, 2,
             "both background and foreground OSC 52 SET paths must honor the write permission"
+        );
+    }
+
+    #[test]
+    fn an_osc_52_clipboard_get_is_served_only_behind_the_read_permission() {
+        let full = ember_main_source();
+        let source = full
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(full.as_str());
+        let service = "service_osc52_clipboard_query(";
+        let gate = "if self.config.osc52_clipboard_read {";
+        let mut service_in_gates = 0usize;
+        for (offset, _) in source.match_indices(gate) {
+            let block = braced_block_after(&source[offset..], gate);
+            service_in_gates += block.matches(service).count();
+        }
+        assert_eq!(
+            service_in_gates, 2,
+            "background and foreground OSC 52 GET paths must honor the read permission"
+        );
+        let disabled = "OSC 52 read-disabled response";
+        assert!(
+            source.matches(disabled).count() >= 2,
+            "read-disabled OSC 52 GET paths must answer without starting a host read"
         );
     }
 

@@ -551,3 +551,10 @@ query answers, control handling and resize.
      unconditionally. They now honor `osc52_clipboard_read`, answering EPERM
      when disabled, and a structural regression pins both gated call sites plus
      the read-disabled refusal path.
+
+109. **OSC 52 GET stays behind the read permission** — OSC 52 clipboard queries
+     default off with OSC 5522, but both paths previously dropped GET requests
+     when read was disabled instead of answering with an empty refusal. They now
+     mirror the 5522 EPERM/empty contract, and a structural regression pins both
+     gated `service_osc52_clipboard_query` call sites plus the read-disabled
+     refusal path.

@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-05 (shared-core repin `9f94f77`; journal lifecycle tokens)
+Updated: 2026-09-27 (wave 5)
+
+## 2026-09-27 (wave 5)
+
+- **OSC 52 GET read permission** — disabled reads now answer with an empty
+  refusal on both background and foreground paths instead of dropping queries
+  silently. Structural regression pins gated `service_osc52_clipboard_query`
+  call sites and the read-disabled refusal path (UPGRADE_ROUNDS 109).
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, terminal parsing, configuration, persistence, sidebar/history, links,
