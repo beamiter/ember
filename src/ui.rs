@@ -887,6 +887,26 @@ fn block_stripe_rect(card_rect: egui::Rect, requested_width: f32) -> egui::Rect 
     )
 }
 
+/// Clip for one collapsed-summary label centered on `center_y`. The label is
+/// indented one cell from the card's left edge, and it stops one cell short of
+/// the right edge too: a label cut off in a narrow pane otherwise paints over
+/// the card's border stroke and rounded bottom corner, which both sit on
+/// `content_rect.right()`. `None` when no cell of text fits between them.
+fn collapsed_summary_clip(
+    content_rect: egui::Rect,
+    center_y: f32,
+    row_height: f32,
+    char_width: f32,
+) -> Option<egui::Rect> {
+    let right = content_rect.right() - char_width;
+    (right > content_rect.left() + char_width).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(content_rect.left(), center_y - row_height * 0.5),
+            egui::pos2(right, center_y + row_height * 0.5),
+        )
+    })
+}
+
 fn block_menu_button(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
@@ -2085,10 +2105,10 @@ impl TerminalRenderer {
         for summary in summaries {
             let (_, row_height) = snapped_span(content_rect.top(), summary.row, line_height);
             let y = content_rect.top() + summary.row as f32 * line_height + row_height * 0.5;
-            let clip = egui::Rect::from_min_max(
-                egui::pos2(content_rect.left(), y - row_height * 0.5),
-                egui::pos2(content_rect.right(), y + row_height * 0.5),
-            );
+            let Some(clip) = collapsed_summary_clip(content_rect, y, row_height, self.char_width)
+            else {
+                continue;
+            };
             painter.with_clip_rect(clip).text(
                 egui::pos2(content_rect.left() + self.char_width, y),
                 egui::Align2::LEFT_CENTER,
@@ -7115,6 +7135,31 @@ mod tests {
         assert_eq!(compact.rect.bottom(), 59.5);
         assert_eq!(compact.rounding.nw, 0);
         assert_eq!(compact.rounding.se, BLOCK_CARD_COMPACT_RADIUS);
+    }
+
+    #[test]
+    fn collapsed_summary_label_stops_short_of_the_card_border() {
+        let content = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 200.0));
+        // A collapsed block whose summary is the card's last, rounded row.
+        let span = crate::block_mode::VisibleBlockSpan {
+            record_index: 1,
+            first_row: 0,
+            last_row: 3,
+            starts_in_viewport: true,
+            ends_in_viewport: true,
+        };
+        let card = block_card_geometry(content, span, 20.0, false, true).expect("card geometry");
+        let (row_top, row_height) = snapped_span(content.top(), 3, 20.0);
+        let center_y = row_top + row_height * 0.5;
+        let clip = collapsed_summary_clip(content, center_y, row_height, 12.0).expect("room");
+        // Thickest border (active selection) is 2px, centered on the edge.
+        assert!(clip.right() <= card.rect.right() - 2.0);
+        assert_eq!(clip.right(), content.right() - 12.0);
+        assert_eq!(clip.left(), content.left());
+        assert_eq!((clip.top(), clip.bottom()), (row_top, row_top + row_height));
+
+        let narrow = egui::Rect::from_min_size(content.min, egui::vec2(24.0, 200.0));
+        assert!(collapsed_summary_clip(narrow, center_y, row_height, 12.0).is_none());
     }
 
     #[test]

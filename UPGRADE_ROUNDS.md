@@ -573,3 +573,11 @@ query answers, control handling and resize.
      before the rate limiter runs, and a lost compare-exchange race refunds the
      slot, so busy refusals no longer consume the per-window budget. A unit
      regression pins zero consumption across a full rate window of busy queries.
+
+113. **Collapsed-summary labels stop inside the card** — in a narrow pane the
+     `▸ N output rows hidden — click to expand` label was clipped at
+     `content_rect.right()`, the same edge the card's border stroke and rounded
+     bottom corner sit on, so its last glyph was painted over the border. It
+     now stops one cell short of that edge, mirroring its one-cell left indent,
+     and is skipped when no cell fits. A unit regression pins the clip inside
+     `block_card_geometry`'s rect less the thickest (2px) border.

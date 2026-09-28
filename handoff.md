@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 8)
+Updated: 2026-09-28 (wave 9)
+
+## 2026-09-28 (wave 9)
+
+- **Collapsed-summary label clears the card border** — narrow panes cut the
+  label one cell short of the card's right edge instead of painting its last
+  glyph over the border and rounded corner (UPGRADE_ROUNDS 113). Checked in a
+  running window on an isolated Xvfb (420px pane, collapsed `seq 1 30`); the
+  same pass replayed long soft-wrapped link paths and found ember already keeps
+  them on their rows, unlike frost's iced text-cache wrap fixed in 198aa77.
 
 ## 2026-09-28 (wave 8)
 
