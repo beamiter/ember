@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-26 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-27 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-27 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `3003434` + jagent `192b839`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after STAGE 67 classify `--` peel,
+  daemonize flag-only `-a`/`-v`, leftover `s6-envdir` pin, anvil/forge STAGE
+  67 docs (rounds 88 / 122), and prior waves. Round 26 already sat on the
+  handoff tip. Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-26 smoke)
 
