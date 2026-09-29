@@ -4,7 +4,7 @@ Updated: 2026-09-29 (evolve round-56 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-56 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD `5fa0f0b04f36`;
+- **Smoke** (path-patched local `jterm_core` HEAD `5fa0f0b` + jagent `2204f36`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after anvil 192–195 / forge 241–245 sticky
   1802/comma + 1801 find + MAX-8 cancel + Unknown→GuardRecovery beside anvil
