@@ -667,3 +667,10 @@ query answers, control handling and resize.
      forge 164–166 sticky punct/thin/hair + find empty-query + notice
      catch-up beside STAGE 71 / between() 93 / prior waves. Manifests stay on
      published pins.
+
+129. **Evolve round-41 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after anvil 131–132 /
+     forge 167–169 sticky quad-space/RLI/FSI + find All empty+stale + notice
+     catch-up beside STAGE 71 / between() 93 / prior waves. Manifests stay on
+     published pins.
+
