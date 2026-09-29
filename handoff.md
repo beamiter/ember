@@ -11,6 +11,17 @@ Updated: 2026-09-29 (evolve round-26 smoke on path-patched core tip)
   s6-sudo/multilog/runsv, and prior waves. Core/jagent tips still **pending
   push/repin**.
 
+Updated: 2026-09-29 (evolve round-25 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-25 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `f2d2ce0` + jagent `a7474e9`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after `between()` 70→76 (error/unknown→Rest
+  + Watch*→Idle), Find continue bookmark-empty copy, STAGE 64 handoff sync
+  through wave 23 (len 67 on tip), flock `--` end-of-options, and prior
+  waves. Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-24 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-24 smoke)
