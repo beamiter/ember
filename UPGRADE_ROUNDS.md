@@ -754,3 +754,9 @@ query answers, control handling and resize.
      `e8272a4` after anvil 188–191 / forge 236–240 sticky 1801 + FE07 find +
      MAX-7 cancel + GuardRecovery UI sync beside prior waves. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
+
+143. **Evolve round-56 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `ede61f3` + jagent
+     `1655e0b` after anvil 192–195 / forge 241–245 sticky 1802 + 1801 find +
+     MAX-8 cancel + Unknown→GuardRecovery beside prior waves. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
