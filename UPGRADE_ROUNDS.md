@@ -766,3 +766,9 @@ query answers, control handling and resize.
      `8825c4f` after anvil 196–199 / forge 246–250 sticky 1803 + 1802 find +
      MAX-9 cancel + Unknown→GuardCautious beside prior waves. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
+
+145. **Evolve round-59 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `d30081c` + jagent
+     `945e59f` after anvil 200–203 / forge 251–255 sticky 1804 + 1803 find +
+     MAX-10 cancel + Unknown→GuardStuck beside prior waves. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
