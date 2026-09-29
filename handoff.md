@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-37 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-37 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `04cc282` + jagent `ef296ac`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after openvt STAGE 71 + timeout/nice nest,
+  Inspect/Sit→Unknown `between()` 93, anvil 117–121 / forge 151–155
+  sticky/find/organism edges, and prior waves. Core/jagent tips still
+  **pending push/repin**.
+
+
 Updated: 2026-09-29 (evolve round-36 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-36 smoke)
