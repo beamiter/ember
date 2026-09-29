@@ -581,3 +581,8 @@ query answers, control handling and resize.
      now stops one cell short of that edge, mirroring its one-cell left indent,
      and is skipped when no cell fits. A unit regression pins the clip inside
      `block_card_geometry`'s rect less the thickest (2px) border.
+
+114. **Evolve round-25 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `f2d2ce0` + jagent
+     `a7474e9` after `between()` 76, Find continue bookmark-empty, and STAGE
+     64 handoff sync. Manifests stay on published pins.
