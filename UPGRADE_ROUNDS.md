@@ -731,17 +731,9 @@ query answers, control handling and resize.
      Rest→Unknown beside anvil 171–174 / forge 215–219, STAGE 71 /
      between() 93, and prior waves. Manifests stay on published pins.
 
-139. **Evolve round-52 path-patch smoke** — 
-running 6 tests
-test workflows::tests::discovery_and_load_order_state_every_policy_this_app_owns ... ok
-test workflows::tests::the_directory_the_empty_picker_names_is_the_one_read_first ... ok
-test workflows::tests::workflow_dirs_are_unique_bounded_and_end_at_the_source_tree ... ok
-test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
-test workflows::tests::load_all_applies_this_app_s_pinned_name_order ... ok
-test workflows::tests::scan_keeps_healthy_entries_and_reports_the_broken_candidate ... ok
-
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 852 filtered out; finished in 0.00s — 7 passed against path-patched local jterm_core
-      + jagent  after anvil 179–183 / forge 225–230 sticky
-     FE06/FE05/MAX-5/Celebrate-Rest/SitNear-Inspect beside prior waves (fills
-     gap wave-34 skipped). STAGE 71 / between() 93 held.
+139. **Evolve round-52 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `4c5700c` + jagent
+     `d62a9da` after anvil 179–183 / forge 225–230 sticky FE06/FE05/MAX-5/
+     Celebrate-Rest/SitNear-Inspect beside prior waves (fills gap wave-34
+     skipped). STAGE 71 / between() 93 held. Manifests stay on published pins.
 
