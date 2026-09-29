@@ -4,7 +4,7 @@ Updated: 2026-09-29 (evolve round-55 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-55 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD `b4f5ae6` + jagent `9a1447f`;
+- **Smoke** (path-patched local `jterm_core` HEAD `f530cfb` + jagent `e8272a4`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after anvil 188–191 / forge 236–240 sticky
   1801/ellipsis + FE07 find + MAX-7 cancel + GuardRecovery UI sync beside anvil
@@ -15,7 +15,7 @@ Updated: 2026-09-29 (evolve round-54 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-54 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD `263340e` + jagent `9a1447f`;
+- **Smoke** (path-patched local `jterm_core` HEAD `f530cfb` + jagent `e8272a4`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after wave-35 host/hw inventory leftover pin
   + chrt/ionice STAGE deepen beside prior sticky/round-52/53 cohort, STAGE 71 /
@@ -26,7 +26,7 @@ Updated: 2026-09-29 (evolve round-53 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-53 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD `263340e` + jagent `9a1447f`;
+- **Smoke** (path-patched local `jterm_core` HEAD `f530cfb` + jagent `e8272a4`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after anvil 184–187 / forge 231–235 sticky
   FE07/birga + FE06 find + MAX-6 cancel + GuardRecovery→Unknown beside anvil
