@@ -693,3 +693,18 @@ query answers, control handling and resize.
      FVS/NBSP pins, STAGE 71 / between() 93, and prior waves. Manifests stay
      on published pins.
 
+
+133. **Evolve round-45 path-patch smoke** — 
+running 6 tests
+test workflows::tests::discovery_and_load_order_state_every_policy_this_app_owns ... ok
+test workflows::tests::the_directory_the_empty_picker_names_is_the_one_read_first ... ok
+test workflows::tests::workflow_dirs_are_unique_bounded_and_end_at_the_source_tree ... ok
+test workflows::tests::load_all_applies_this_app_s_pinned_name_order ... ok
+test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
+test workflows::tests::scan_keeps_healthy_entries_and_reports_the_broken_candidate ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 852 filtered out; finished in 0.00s (7) against local  after anvil 152–154 /
+     forge 192–195 bidi sticky/find/notice + ambient disposition completeness
+     beside anvil 148–151 / forge 188–191 Idle/Rest Guard pins, wave-32 PATH
+     leftovers + aa-exec/socket-activate deepen, STAGE 71 / between() 93, and
+     prior waves. Manifests stay on published pins.
