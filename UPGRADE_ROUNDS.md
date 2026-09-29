@@ -791,3 +791,9 @@ query answers, control handling and resize.
      MAX-11 cancel + Unknown→GuardFailure beside round-61. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
 
+149. **Evolve round-63 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `cb3c8e6` + jagent
+     `d05c9cf` after anvil 208–211 / forge 261–265 sticky FF1A + 1805 find +
+     MAX-12 cancel + Unknown→Idle beside round-62. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
+
