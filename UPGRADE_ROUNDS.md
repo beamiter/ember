@@ -737,3 +737,9 @@ query answers, control handling and resize.
      Celebrate-Rest/SitNear-Inspect beside prior waves (fills gap wave-34
      skipped). STAGE 71 / between() 93 held. Manifests stay on published pins.
 
+140. **Evolve round-53 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `94f01b3` + jagent
+     `d5be714` after anvil 184–187 / forge 231–235 sticky FE07/birga + FE06
+     find + MAX-6 cancel + GuardRecovery→Unknown beside prior waves. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
+
