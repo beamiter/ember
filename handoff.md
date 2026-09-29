@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-17 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-18 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-18 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `0213c28` + jagent `804c320`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after dbus-run-session/runcon/xvfb-run
+  STAGE_PREFIXES (len 58), WatchAgent→UnknownOutcome None pin, agent
+  Celebrate (not Big) UI pins, and prior waves. Core/jagent tips still
+  **pending push/repin**.
 
 ## 2026-09-29 (evolve round-17 smoke)
 
