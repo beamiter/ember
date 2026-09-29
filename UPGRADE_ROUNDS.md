@@ -592,3 +592,9 @@ query answers, control handling and resize.
      classify `--` peel, daemonize flag-only `-a`/`-v`, leftover `s6-envdir`
      pin, and anvil/forge STAGE 67 docs (rounds 88 / 122). Round 26 already
      sat on the handoff tip. Manifests stay on published pins.
+
+116. **Evolve round-28 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after STAGE 68
+     (`gnome-session-inhibit`), fail-closed nest/transparency deepen, Find/
+     organism polish (stale bookmark + error→Watch None), and anvil/forge
+     STAGE 68 docs (rounds 92 / 126). Manifests stay on published pins.
