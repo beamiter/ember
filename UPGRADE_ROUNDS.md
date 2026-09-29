@@ -762,7 +762,7 @@ query answers, control handling and resize.
      between() 93 held. Manifests stay on published pins.
 
 144. **Evolve round-58 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` `2422ec0` + jagent
-     `8752794` after anvil 196–199 / forge 246–250 sticky 1803 + 1802 find +
+     command_correction` (7) against local `jterm_core` `8a8e607` + jagent
+     `8825c4f` after anvil 196–199 / forge 246–250 sticky 1803 + 1802 find +
      MAX-9 cancel + Unknown→GuardCautious beside prior waves. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
