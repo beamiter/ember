@@ -1,5 +1,25 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-50 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-50 smoke)
+
+- **Smoke** (path-patched local  HEAD  + jagent ;
+  manifests still published pins): 
+running 6 tests
+test workflows::tests::discovery_and_load_order_state_every_policy_this_app_owns ... ok
+test workflows::tests::the_directory_the_empty_picker_names_is_the_one_read_first ... ok
+test workflows::tests::workflow_dirs_are_unique_bounded_and_end_at_the_source_tree ... ok
+test workflows::tests::load_all_applies_this_app_s_pinned_name_order ... ok
+test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
+test workflows::tests::scan_keeps_healthy_entries_and_reports_the_broken_candidate ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 852 filtered out; finished in 0.00s — 7 passed after anvil 171–174 / forge 215–219 sticky
+  FE04/syllable + FE03 find + MAX-3 cancel + Celebrate→Unknown beside anvil
+  165–170 / forge 208–214 FE03/FVS/Retry/tier, STAGE 71 / between() 93, and
+  prior waves. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (evolve round-48 smoke on path-patched core tip; gap before 49)
 
 ## 2026-09-29 (evolve round-48 smoke)
