@@ -1,5 +1,94 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-54 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-54 smoke)
+
+- **Smoke** (path-patched local  HEAD  + jagent ;
+  manifests still published pins): 
+running 76 tests
+test workflows::discovery::tests::an_app_spec_derives_its_override_variable_from_its_segment ... ok
+test workflows::discovery::tests::the_current_app_spec_refuses_an_unregistered_identity ... ok
+test workflows::discovery::tests::missing_tiers_are_skipped_rather_than_guessed ... ok
+test workflows::discovery::tests::search_path_lists_every_tier_in_precedence_order ... ok
+test workflows::discovery::tests::duplicate_tiers_collapse_to_the_highest_precedence_one ... ok
+test workflows::discovery::tests::a_relative_directory_source_contributes_nothing ... ok
+test workflows::discovery::tests::the_environment_variable_adds_a_tier_below_user_config ... ok
+test workflows::discovery::tests::the_search_path_is_bounded_before_deduplication ... ok
+test workflows::loader::tests::a_logged_path_is_sanitised_and_bounded ... ok
+test workflows::loader::tests::a_missing_directory_is_not_an_error ... ok
+test workflows::loader::tests::a_logged_reason_is_sanitised_and_bounded_like_a_path ... ok
+test workflows::loader::tests::a_fifo_is_rejected_without_blocking ... ok
+test workflows::loader::tests::an_empty_default_is_legal_because_the_file_declared_it ... ok
+test workflows::loader::tests::a_minimal_workflow_needs_only_a_name_and_a_command ... ok
+test workflows::loader::tests::a_blank_argument_name_is_rejected_in_both_formats ... ok
+test workflows::loader::tests::a_skip_line_sanitises_the_reason_as_well_as_the_path ... ok
+test workflows::loader::tests::a_padded_argument_name_is_rejected_rather_than_left_unbindable ... ok
+test workflows::loader::tests::metadata_rejects_duplicate_arguments_and_visual_spoofing ... ok
+test workflows::loader::tests::listed_files_are_filtered_and_sorted ... ok
+test workflows::loader::tests::the_file_predicate_is_shared_rather_than_re_derived ... ok
+test workflows::loader::tests::the_refresh_latch_admits_one_scan_and_re_arms ... ok
+test workflows::loader::tests::loads_toml_and_preserves_every_declared_field ... ok
+test workflows::loader::tests::a_type_wrong_field_rejects_the_whole_file ... ok
+test workflows::picker::tests::a_query_matches_name_description_and_tags ... ok
+test workflows::picker::tests::an_empty_library_navigates_without_panicking ... ok
+test workflows::loader::tests::validation_bounds_every_field_it_accepts ... ok
+test workflows::loader::tests::earlier_directories_win_when_names_collide_across_formats ... ok
+test workflows::picker::tests::an_unchanged_normalized_query_resets_without_rebuilding ... ok
+test workflows::picker::tests::an_empty_query_keeps_the_library_order_it_was_given ... ok
+test workflows::picker::tests::results_are_capped_so_navigation_matches_the_drawn_list ... ok
+test workflows::loader::tests::a_symlinked_workflow_is_refused_at_open ... ok
+test workflows::picker::tests::selection_wraps_and_click_indices_resolve ... ok
+test workflows::picker::tests::the_highlight_returns_to_the_first_row_on_every_query_change ... ok
+test workflows::picker::tests::typed_text_is_filtered_to_printable_characters ... ok
+test workflows::loader::tests::loads_yaml_through_the_same_derive_as_toml ... ok
+test workflows::picker::tests::whether_the_command_is_searchable_is_the_policy_s_call ... ok
+test workflows::loader::tests::oversized_files_are_rejected_by_the_reader ... ok
+test workflows::render::tests::a_declared_default_fills_an_argument_the_caller_left_out ... ok
+test workflows::render::tests::a_padded_declared_name_never_reaches_the_prompt_as_a_placeholder ... ok
+test workflows::loader::tests::load_all_skips_invalid_files_but_returns_the_good_ones ... ok
+test workflows::render::tests::a_padded_value_key_is_rejected_rather_than_binding_nothing ... ok
+test workflows::loader::tests::load_order_is_the_callers_choice_and_has_no_default ... ok
+test workflows::render::tests::a_single_placeholder_takes_the_supplied_value ... ok
+test workflows::loader::tests::unknown_keys_are_ignored_so_one_library_can_serve_four_apps ... ok
+test workflows::render::tests::a_value_the_workflow_never_declared_still_binds ... ok
+test workflows::loader::tests::load_one_reports_why_rather_than_vanishing ... ok
+test workflows::render::tests::a_zero_argument_workflow_still_goes_through_the_template_engine ... ok
+test workflows::render::tests::an_args_form_for_a_zero_argument_workflow_renders_immediately ... ok
+test workflows::render::tests::an_args_form_ignores_a_stale_row_index ... ok
+test workflows::render::tests::an_args_form_emptied_by_the_user_is_still_a_missing_value ... ok
+test workflows::render::tests::an_args_form_reports_unsafe_input_rather_than_inserting_it ... ok
+test workflows::loader::tests::multiline_and_escape_sequence_commands_are_rejected ... ok
+test workflows::render::tests::an_empty_value_renders_when_the_file_declared_a_default ... ok
+test workflows::render::tests::an_args_form_seeds_declared_defaults_and_leaves_the_rest_unset ... ok
+test workflows::picker::tests::a_query_is_bounded_and_stays_valid_utf8 ... ok
+test workflows::render::tests::an_unfilled_argument_with_no_default_is_a_missing_value ... ok
+test workflows::render::tests::an_oversized_template_is_refused_before_it_is_walked ... ok
+test workflows::render::tests::an_unknown_single_brace_placeholder_stays_visible ... ok
+test workflows::render::tests::an_unterminated_double_brace_survives_a_placeholder_later_in_the_template ... ok
+test workflows::render::tests::an_unterminated_double_brace_survives_verbatim ... ok
+test workflows::render::tests::missing_values_are_aggregated_and_only_for_referenced_placeholders ... ok
+test workflows::render::tests::nested_literal_braces_still_escape_as_a_pair ... ok
+test workflows::render::tests::placeholder_names_are_trimmed ... ok
+test workflows::render::tests::render_revalidates_the_workflow_it_is_given ... ok
+test workflows::render::tests::the_same_argument_can_appear_more_than_once ... ok
+test workflows::render::tests::the_values_map_omits_unset_slots ... ok
+test workflows::render::tests::unicode_survives_both_placeholder_styles_and_literal_braces ... ok
+test workflows::render::tests::values_cross_the_review_only_boundary ... ok
+test workflows::tests::the_public_seam_composes_the_way_a_shim_will_use_it ... ok
+test workflows::picker::tests::all_read_paths_share_the_cached_filtered_order ... ok
+test workflows::render::tests::rendering_is_bounded_against_binding_amplification ... ok
+test workflows::render::tests::an_input_budget_of_unmatched_openers_stays_a_literal_command ... ok
+test workflows::render::tests::an_input_budget_of_unmatched_single_placeholders_is_linear_and_literal ... ok
+test workflows::loader::tests::the_per_directory_cap_keeps_the_first_sorted_workflow_files ... ok
+test workflows::render::tests::precomputed_double_brace_closes_match_the_old_scanner_exactly ... ok
+test workflows::loader::tests::one_directory_contributes_at_most_the_per_directory_cap ... ok
+
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 1265 filtered out; finished in 0.03s — 7 passed after wave-35 host/hw inventory leftover pin
+  + chrt/ionice STAGE deepen beside prior sticky/round-52 cohort, STAGE 71 /
+  between() 93. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (evolve round-53 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-53 smoke)
