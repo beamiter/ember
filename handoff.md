@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-19 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-20 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-20 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `2e867b8` + jagent `17a89b7`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after strace/scriptlive STAGE_PREFIXES
+  (len 60), classify_command see-through, and prior waves. Core/jagent tips
+  still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-19 smoke)
 
