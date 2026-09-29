@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align: core cohort `33093da` + jagent `628811b`; local path-patch)
+Updated: 2026-09-29 (family pin align smoke on path-patched core `99e24c0`)
 
 ## 2026-09-29 (family pin align)
 
@@ -9,6 +9,8 @@ Updated: 2026-09-29 (family pin align: core cohort `33093da` + jagent `628811b`;
   so builds see organism vigil HEAD `99e24c0` without publishing those commits.
 - **Transitive jagent → `628811b`** via path-patched core. Secondary repin to
   `99e24c0` remains **pending push** of core.
+- **Smoke**: `cargo test --lib -- workflows` (6) and path-patched compile against
+  local core HEAD after the xargs-delimiter / organism heal-settle waves.
 
 Updated: 2026-09-28 (wave 9)
 
