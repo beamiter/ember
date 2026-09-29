@@ -779,17 +779,9 @@ query answers, control handling and resize.
      softlimit/cgexec STAGE deepen beside sticky 1804/MAX-10 / round-59.
      STAGE 71 / between() 93 held. Manifests stay on published pins.
 
-147. **Evolve round-61 path-patch smoke** — 
-running 6 tests
-test workflows::tests::discovery_and_load_order_state_every_policy_this_app_owns ... ok
-test workflows::tests::the_directory_the_empty_picker_names_is_the_one_read_first ... ok
-test workflows::tests::workflow_dirs_are_unique_bounded_and_end_at_the_source_tree ... ok
-test workflows::tests::load_all_applies_this_app_s_pinned_name_order ... ok
-test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
-test workflows::tests::scan_keeps_healthy_entries_and_reports_the_broken_candidate ... ok
-
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 852 filtered out; finished in 0.00s (7) against local   + jagent
-      after anvil 200–203 / forge 251–255 sticky 1804 + 1803 find +
+147. **Evolve round-61 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` `bbb361e` + jagent
+     `cbbe241` after anvil 200–203 / forge 251–255 sticky 1804 + 1803 find +
      MAX-10 cancel + Unknown→GuardStuck beside round-60 wave-38. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
 
