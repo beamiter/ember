@@ -603,3 +603,9 @@ query answers, control handling and resize.
      `jterm_core` `ee39a12` + jagent `543415b` after STAGE 70 (`uclampset`/
      `gamemoderun`), Guard*→Celebrate* None survey, and anvil/forge sticky/
      find polish (rounds 95–97 / 129–130). Manifests stay on published pins.
+
+118. **Evolve round-30 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after
+     gnome-session-inhibit STAGE arity edges, timeout/nice classify/jagent
+     nest, and membership/DISPATCHES/CLASSIFY_FORMS len-70 lockstep. Round
+     29 already sat on the handoff tip. Manifests stay on published pins.
