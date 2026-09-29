@@ -650,3 +650,8 @@ query answers, control handling and resize.
      + timeout/nice nest, Inspect/Sit→Unknown `between()` 93, anvil 117–121 /
      forge 151–155 sticky/find/organism edges, and prior waves. Manifests stay
      on published pins.
+
+126. **Evolve round-39 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after openvt/daemonize
+     busybox applet + pipe-to-bash deepenings, DISPATCHES STAGE 71 set-eq
+     beside CLASSIFY_FORMS, and prior waves. Manifests stay on published pins.
