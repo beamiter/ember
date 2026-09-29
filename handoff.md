@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-4 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-5 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-5 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD; manifest still `33093da`):
+  `cargo test --lib -- workflows command_correction` — 7 passed after bwrap
+  two-arg bind arity. No ember code changes. Core tip still **pending
+  push/repin**.
 
 ## 2026-09-29 (evolve round-4 smoke)
 
