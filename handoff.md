@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-47 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-47 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `bedcc55` + jagent `cf9cb68`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after anvil 155–157 / forge 196–199 sticky
+  VS/FVS4 + find marks + GlanceAside ambient beside anvil 152–154 / forge
+  192–195 bidi/ambient, STAGE 71 / between() 93, and prior waves.
+  Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (evolve round-45 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-45 smoke)
