@@ -1,3 +1,15 @@
+# Engineering handoff
+
+Updated: 2026-09-29 (evolve round-35 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-35 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `d919902` + jagent `746040c`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after PATH wave-28 systemd inspector leftovers,
+  systemd-cat/inhibit busybox + timeout/nice nest deepenings, and prior waves.
+  Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-34 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-34 smoke)
