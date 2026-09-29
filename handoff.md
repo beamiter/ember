@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-29 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-29 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `ee39a12` + jagent `543415b`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after STAGE 70 (`uclampset`/`gamemoderun`),
+  Guard*→Celebrate* None survey pin, anvil sticky near-miss + find mixed
+  stale/live (rounds 95–97 / forge 129–130), and prior waves. Core/jagent tips
+  still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-28 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-28 smoke)
