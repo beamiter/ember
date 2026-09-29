@@ -712,16 +712,8 @@ query answers, control handling and resize.
      158–160 / forge 200–202 CrossBlock cancel + Celebrate survey, STAGE 71 /
      between() 93, and prior waves. Manifests stay on published pins.
 
-136. **Evolve round-48 path-patch smoke** — 
-running 6 tests
-test workflows::tests::discovery_and_load_order_state_every_policy_this_app_owns ... ok
-test workflows::tests::the_directory_the_empty_picker_names_is_the_one_read_first ... ok
-test workflows::tests::workflow_dirs_are_unique_bounded_and_end_at_the_source_tree ... ok
-test workflows::tests::scan_keeps_healthy_entries_and_reports_the_broken_candidate ... ok
-test workflows::tests::load_all_applies_this_app_s_pinned_name_order ... ok
-test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
-
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 852 filtered out; finished in 0.00s (7) against local  after anvil 161–164 /
+136. **Evolve round-48 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after anvil 161–164 /
      forge 203–207 sticky FE02/nirugu + Hangul find + Watch* Unknown +
      near-wrap finished beside anvil 158–160 / forge 200–202, STAGE 71 /
      between() 93, and prior waves (fills gap before round-49). Manifests stay
