@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-30 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-30 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `ee39a12` + jagent `543415b`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after gnome-session-inhibit STAGE arity
+  edges (`-l`/`-h`/`--inhibit-only`/missing meta), timeout/nice classify +
+  jagent nest deepen, membership/DISPATCHES/CLASSIFY_FORMS len-70 lockstep,
+  and round 29's STAGE 70 tip. Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-29 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-29 smoke)
