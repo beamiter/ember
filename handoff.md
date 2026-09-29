@@ -4,17 +4,9 @@ Updated: 2026-09-29 (evolve round-48 smoke on path-patched core tip; gap before 
 
 ## 2026-09-29 (evolve round-48 smoke)
 
-- **Smoke** (path-patched local  HEAD  + jagent ;
-  manifests still published pins): 
-running 6 tests
-test workflows::tests::discovery_and_load_order_state_every_policy_this_app_owns ... ok
-test workflows::tests::the_directory_the_empty_picker_names_is_the_one_read_first ... ok
-test workflows::tests::workflow_dirs_are_unique_bounded_and_end_at_the_source_tree ... ok
-test workflows::tests::load_all_applies_this_app_s_pinned_name_order ... ok
-test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
-test workflows::tests::scan_keeps_healthy_entries_and_reports_the_broken_candidate ... ok
-
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 852 filtered out; finished in 0.00s — 7 passed after anvil 161–164 / forge 203–207 sticky
+- **Smoke** (path-patched local `jterm_core` HEAD `81cccb6` + jagent `564f716`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after anvil 161–164 / forge 203–207 sticky
   FE02/nirugu + Hangul find + Watch* Unknown + near-wrap finished beside anvil
   158–160 / forge 200–202 cancel/Celebrate, STAGE 71 / between() 93, and prior
   waves (fills gap before round-49). Core/jagent tips still **pending push/repin**.
