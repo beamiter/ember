@@ -674,3 +674,9 @@ query answers, control handling and resize.
      catch-up beside STAGE 71 / between() 93 / prior waves. Manifests stay on
      published pins.
 
+130. **Evolve round-43 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after PATH wave-31
+     ctl/utility leftovers out of STAGE beside CLASSIFY/DISPATCHES lockstep
+     at 71, anvil 133–136 / forge 170–174 Hangul/whitespace/Watch* pins, and
+     prior waves. Manifests stay on published pins.
+
