@@ -774,8 +774,8 @@ query answers, control handling and resize.
      between() 93 held. Manifests stay on published pins.
 
 146. **Evolve round-60 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` `4844296` + jagent
-     `cedee08` after PATH wave-38 process-table monitor leftovers +
+     command_correction` (7) against local `jterm_core` `d442073` + jagent
+     `f85723f` after PATH wave-38 process-table monitor leftovers +
      softlimit/cgexec STAGE deepen beside sticky 1804/MAX-10 / round-59.
      STAGE 71 / between() 93 held. Manifests stay on published pins.
 
