@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (evolve round-60 smoke on path-patched core tip)
+
+## 2026-09-30 (evolve round-60 smoke)
+
+- **Smoke** (path-patched local  HEAD  + jagent ;
+  manifests still published pins):  — 7 passed after PATH wave-38 process-table monitor
+  leftovers + softlimit/cgexec STAGE deepen beside anvil 200–203 / forge 251–255
+  sticky 1804/MAX-10 / round-59, STAGE 71 / between() 93, and prior waves.
+  Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-30 (evolve round-59 smoke on path-patched core tip)
 
 ## 2026-09-30 (evolve round-59 smoke)
