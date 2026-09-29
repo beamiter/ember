@@ -732,8 +732,8 @@ query answers, control handling and resize.
      between() 93, and prior waves. Manifests stay on published pins.
 
 139. **Evolve round-52 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` `4c5700c` + jagent
-     `d62a9da` after anvil 179–183 / forge 225–230 sticky FE06/FE05/MAX-5/
+     command_correction` (7) against local `jterm_core` `a4d3b5d` + jagent
+     `1c3d308` after anvil 179–183 / forge 225–230 sticky FE06/FE05/MAX-5/
      Celebrate-Rest/SitNear-Inspect beside prior waves (fills gap wave-34
      skipped). STAGE 71 / between() 93 held. Manifests stay on published pins.
 
