@@ -655,3 +655,9 @@ query answers, control handling and resize.
      command_correction` (7) against local `jterm_core` after openvt/daemonize
      busybox applet + pipe-to-bash deepenings, DISPATCHES STAGE 71 set-eq
      beside CLASSIFY_FORMS, and prior waves. Manifests stay on published pins.
+
+126. **Evolve round-38 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after STAGE 71
+     busybox/DISPATCHES set-eq + openvt pipe nests, anvil 122–125 / forge
+     156–160 sticky/find/cancel/notice + STAGE 71 tip docs, and
+     Inspect/Sit→Unknown `between()` 93. Manifests stay on published pins.
