@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-22 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-22 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `60c7378` + jagent `5e09180`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after classify_command STAGE membership
+  pin (all 62 prefixes), systemd-cat/aa-exec edge-case hardening, and prior
+  waves. Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-21 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-21 smoke)
