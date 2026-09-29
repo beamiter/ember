@@ -632,3 +632,9 @@ query answers, control handling and resize.
      vigil/celebrate None, PATH wave-27 identity/agent leftovers out of
      STAGE, and anvil 105–107 / forge 139–141 organism/find/history edges.
      Manifests stay on published pins.
+
+123. **Evolve round-35 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after PATH wave-28
+     systemd inspector leftovers out of STAGE, systemd-cat/inhibit busybox +
+     timeout/nice nest deepenings, and prior waves. Manifests stay on
+     published pins.
