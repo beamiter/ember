@@ -663,7 +663,7 @@ query answers, control handling and resize.
      beside CLASSIFY_FORMS, and prior waves. Manifests stay on published pins.
 
 128. **Evolve round-40 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` after anvil 126–127 /
-     forge 161–163 sticky punct/thin/hair + find empty-query + notice
+     command_correction` (7) against local `jterm_core` after anvil 129–130 /
+     forge 164–166 sticky punct/thin/hair + find empty-query + notice
      catch-up beside STAGE 71 / between() 93 / prior waves. Manifests stay on
      published pins.
