@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-9 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-10 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-10 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD + jagent `10eca1a`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after cgexec/schedtool STAGE_PREFIXES,
+  classify_command see-through, shared CrossBlockSearchCursor lift, and prior
+  organism bridges. Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-9 smoke)
 
