@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-39 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-39 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `ef2727c` + jagent `aefca5f`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after openvt/daemonize busybox applet +
+  pipe-to-bash deepenings, DISPATCHES STAGE 71 set-eq beside CLASSIFY_FORMS,
+  and prior waves. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (evolve round-37 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-37 smoke)
