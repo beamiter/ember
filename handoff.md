@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-12 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-13 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-13 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD + jagent `1aaad24`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after UnknownOutcome→Guard* vigil settle
+  bridges, FIND_OVERLAY_SCAN_* export, STAGE_PREFIXES parity note (54
+  prefixes; unshare/nsenter stay PIPE_INTERPRETERS), and prior waves.
+  Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-12 smoke)
 
