@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-31 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-31 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `511aec1` + jagent `3a11135`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after wave-26 PATH non-launcher leftover
+  pins (`snice`/`skill`/`run-mailcap`/`xdg-open`), anvil sticky whitespace
+  (round 100) + forge file-tree permission/missing (round 134), STAGE 70
+  docs already present (97/130), and prior waves. Core/jagent tips still
+  **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-30 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-30 smoke)
