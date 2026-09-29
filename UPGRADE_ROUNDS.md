@@ -626,3 +626,9 @@ query answers, control handling and resize.
      command_correction` (7) against local `jterm_core` HEAD `68982a3` +
      jagent `9cd0211` (busybox/pipe nest + CLASSIFY/STAGE 70 set-eq; anvil
      101–104 / forge 135–138 pins). Manifests stay on published pins.
+
+122. **Evolve round-34 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after ambient→
+     vigil/celebrate None, PATH wave-27 identity/agent leftovers out of
+     STAGE, and anvil 105–107 / forge 139–141 organism/find/history edges.
+     Manifests stay on published pins.
