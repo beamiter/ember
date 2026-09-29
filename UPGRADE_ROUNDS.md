@@ -680,3 +680,8 @@ query answers, control handling and resize.
      at 71, anvil 133–136 / forge 170–174 Hangul/whitespace/Watch* pins, and
      prior waves. Manifests stay on published pins.
 
+131. **Evolve round-42 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after anvil 137–140 /
+     forge 175–179 Ogham sticky + All whitespace find + Guard/Celebrate
+     Full-motion + notice catch-up beside STAGE 71 / between() 93 / prior
+     waves (fills gap before round-43). Manifests stay on published pins.
