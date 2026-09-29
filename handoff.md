@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-14 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-15 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-15 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `c18bc5b` + jagent
+  `04a6934`; manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after `bubblewrap` STAGE_PREFIXES alias,
+  bare `linux32`/`linux64` PIPE regressions, forge↔anvil upgrade-round parity
+  note (anvil 65), and prior waves. Core/jagent tips still **pending
+  push/repin**.
 
 ## 2026-09-29 (evolve round-14 smoke)
 
