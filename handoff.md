@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-2 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-3 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-3 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD; manifest still `33093da`):
+  `cargo test --lib -- workflows command_correction` — 7 passed after
+  util-linux/container-init stage prefixes + organism push/celebrate bridges.
+  No ember code changes; organism UI remains anvil/forge-only. Core tip still
+  **pending push/repin**.
 
 ## 2026-09-29 (evolve round-2 smoke)
 
