@@ -586,3 +586,9 @@ query answers, control handling and resize.
      command_correction` (7) against local `jterm_core` `f2d2ce0` + jagent
      `a7474e9` after `between()` 76, Find continue bookmark-empty, and STAGE
      64 handoff sync. Manifests stay on published pins.
+
+115. **Evolve round-27 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after STAGE 67
+     classify `--` peel, daemonize flag-only `-a`/`-v`, leftover `s6-envdir`
+     pin, and anvil/forge STAGE 67 docs (rounds 88 / 122). Round 26 already
+     sat on the handoff tip. Manifests stay on published pins.
