@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-26 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-26 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `a442971` + jagent `a7474e9`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after daemonize/setlock/s6-setuidgid
+  STAGE_PREFIXES (len 67), classify see-through, leftover outs for
+  s6-sudo/multilog/runsv, and prior waves. Core/jagent tips still **pending
+  push/repin**.
+
 Updated: 2026-09-29 (evolve round-24 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-24 smoke)
