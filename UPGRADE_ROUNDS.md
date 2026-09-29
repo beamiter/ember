@@ -609,3 +609,9 @@ query answers, control handling and resize.
      gnome-session-inhibit STAGE arity edges, timeout/nice classify/jagent
      nest, and membership/DISPATCHES/CLASSIFY_FORMS len-70 lockstep. Round
      29 already sat on the handoff tip. Manifests stay on published pins.
+
+119. **Evolve round-31 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after wave-26 PATH
+     non-launcher leftover pins, anvil sticky whitespace (100) + forge
+     file-tree permission/missing (134), and STAGE 70 docs already present.
+     Manifests stay on published pins.
