@@ -4,7 +4,7 @@ Updated: 2026-09-30 (evolve round-60 smoke on path-patched core tip)
 
 ## 2026-09-30 (evolve round-60 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD `4844296` + jagent `cedee08`;
+- **Smoke** (path-patched local `jterm_core` HEAD `d442073` + jagent `f85723f`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after PATH wave-38 process-table monitor
   leftovers + softlimit/cgexec STAGE deepen beside anvil 200–203 / forge 251–255
