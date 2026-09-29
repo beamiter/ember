@@ -705,3 +705,9 @@ query answers, control handling and resize.
      forge 196–199 sticky VS/FVS4 + find marks + GlanceAside ambient beside
      anvil 152–154 / forge 192–195 bidi/ambient, STAGE 71 / between() 93, and
      prior waves. Manifests stay on published pins.
+
+135. **Evolve round-49 path-patch smoke** — `cargo test --lib -- workflows
+     command_correction` (7) against local `jterm_core` after PATH wave-33
+     device/sysctl leftovers + setsid busybox/timeout/nice deepen beside anvil
+     158–160 / forge 200–202 CrossBlock cancel + Celebrate survey, STAGE 71 /
+     between() 93, and prior waves. Manifests stay on published pins.
