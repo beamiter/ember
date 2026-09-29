@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-24 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-24 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `1391c88` + jagent `af4f101`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after systemd-socket-activate STAGE_PREFIXES
+  (len 64), classify see-through, leftover outs for dbus-launch/flatpak-spawn/
+  snap, anvil/forge STAGE docs rounds 83–84 / 117–118, and prior waves.
+  Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-23 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-23 smoke)
