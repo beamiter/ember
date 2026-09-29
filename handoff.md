@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-17 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-17 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `476c015`;
+  manifests still published pins): `cargo test --lib -- workflows
+  command_correction` — 7 passed after WatchAgent→CelebrateBig None pin,
+  STAGE_PREFIXES len == 55, anvil Block-history sticky deferred note, forge
+  idle cross-block TODO close, and prior waves. Core/jagent tips still
+  **pending push/repin**.
 
 ## 2026-09-29 (evolve round-16 smoke)
 
@@ -21,7 +30,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-14 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `2e6f5ca`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `2e6f5ca`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after busybox `--` applet end-of-options
   regression, FIND_OVERLAY / output_notice forge pins, unshare/nsenter
@@ -30,7 +39,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-13 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `1aaad24`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `1aaad24`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after UnknownOutcome→Guard* vigil settle
   bridges, FIND_OVERLAY_SCAN_* export, STAGE_PREFIXES parity note (54
@@ -39,7 +48,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-12 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `a16f79f`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `a16f79f`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after annotate-output STAGE_PREFIXES,
   classify_command see-through, WatchAgent/WatchSettled→RestAfterPush
@@ -48,7 +57,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-11 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `3b7ebda`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `3b7ebda`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after torsocks/proxychains STAGE_PREFIXES,
   classify_command see-through, UnknownOutcome Full-motion bridges, and prior
@@ -56,7 +65,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-10 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `10eca1a`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `10eca1a`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after cgexec/schedtool STAGE_PREFIXES,
   classify_command see-through, shared CrossBlockSearchCursor lift, and prior
@@ -64,7 +73,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-9 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `2e966a9`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `2e966a9`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after fakeroot/proot/firejail
   STAGE_PREFIXES, classify_command see-through, and prior organism bridges.
@@ -72,7 +81,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-8 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `323119c`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `323119c`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after softlimit/chpst/setuidgid/envdir
   STAGE_PREFIXES, classify_command see-through, and prior organism bridges.
@@ -80,7 +89,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-7 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `9471b1b`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `9471b1b`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after rlwrap STAGE_PREFIXES and
   WatchCommand/WatchAgent finish bridges. Core/jagent tips still **pending
@@ -88,7 +97,7 @@ Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-6 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD + jagent `bde9376`;
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `bde9376`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after eatmydata/chronic/numactl/flock prefixes
   and WatchSettled/idle organism bridges. Core/jagent tips still **pending
