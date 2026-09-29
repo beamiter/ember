@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align smoke on path-patched core `99e24c0`)
+Updated: 2026-09-29 (evolve round-2 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-2 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD; manifest still `33093da`):
+  `cargo test --lib -- workflows command_correction` — 7 passed. No ember code
+  changes; organism UI remains anvil/forge-only. Core tip still **pending
+  push/repin** before a family-wide secondary pin.
 
 ## 2026-09-29 (family pin align)
 
