@@ -738,19 +738,19 @@ query answers, control handling and resize.
      skipped). STAGE 71 / between() 93 held. Manifests stay on published pins.
 
 140. **Evolve round-53 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` `263340e` + jagent
-     `9a1447f` after anvil 184–187 / forge 231–235 sticky FE07/birga + FE06
+     command_correction` (7) against local `jterm_core` `f530cfb` + jagent
+     `e8272a4` after anvil 184–187 / forge 231–235 sticky FE07/birga + FE06
      find + MAX-6 cancel + GuardRecovery→Unknown beside prior waves. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
 
 141. **Evolve round-54 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` `263340e` + jagent
-     `9a1447f` after wave-35 host/hw inventory leftovers + chrt/ionice STAGE
+     command_correction` (7) against local `jterm_core` `f530cfb` + jagent
+     `e8272a4` after wave-35 host/hw inventory leftovers + chrt/ionice STAGE
      deepen beside prior waves. STAGE 71 / between() 93 held. Manifests stay
      on published pins.
 
 142. **Evolve round-55 path-patch smoke** — `cargo test --lib -- workflows
-     command_correction` (7) against local `jterm_core` `b4f5ae6` + jagent
-     `9a1447f` after anvil 188–191 / forge 236–240 sticky 1801 + FE07 find +
+     command_correction` (7) against local `jterm_core` `f530cfb` + jagent
+     `e8272a4` after anvil 188–191 / forge 236–240 sticky 1801 + FE07 find +
      MAX-7 cancel + GuardRecovery UI sync beside prior waves. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
