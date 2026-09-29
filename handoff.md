@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (family pin align: core cohort `33093da` + jagent `628811b`; local path-patch)
+
+## 2026-09-29 (family pin align)
+
+- **jterm_core pin `6a15dda` → `33093da`** (Cargo.toml / lock / deny) to match
+  anvil/forge. Local `.cargo/config.toml` path-patches `../jterm_core` (gitignored)
+  so builds see organism vigil HEAD `99e24c0` without publishing those commits.
+- **Transitive jagent → `628811b`** via path-patched core. Secondary repin to
+  `99e24c0` remains **pending push** of core.
+
 Updated: 2026-09-28 (wave 9)
 
 ## 2026-09-28 (wave 9)
