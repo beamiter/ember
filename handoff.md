@@ -4,7 +4,7 @@ Updated: 2026-09-29 (evolve round-54 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-54 smoke)
 
-- **Smoke** (path-patched local `jterm_core` HEAD `858ccf6` + jagent `a4ee569`;
+- **Smoke** (path-patched local `jterm_core` HEAD `8268d7a` + jagent `7284159`;
   manifests still published pins): `cargo test --lib -- workflows
   command_correction` — 7 passed after wave-35 host/hw inventory leftover pin
   + chrt/ionice STAGE deepen beside prior sticky/round-52/53 cohort, STAGE 71 /
