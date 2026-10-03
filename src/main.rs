@@ -1590,6 +1590,19 @@ fn reported_capture_button(capture: Option<(bool, u8)>) -> Option<u8> {
 
 const MAX_MOUSE_WHEEL_REPORTS_PER_FRAME: isize = 64;
 
+fn bounded_line_wheel_accumulate(
+    acc: &mut jterm_core::wheel::WheelAccumulator,
+    current: isize,
+    delta: f32,
+) -> isize {
+    current
+        .saturating_add(acc.push(delta as f64, false) as isize)
+        .clamp(
+            -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+            MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+        )
+}
+
 fn bounded_wheel_step_accumulate(current: isize, delta: f32, multiplier: usize) -> isize {
     let multiplier = isize::try_from(multiplier).unwrap_or(isize::MAX);
     current
@@ -2454,6 +2467,8 @@ impl TerminalApp {
             session_persistence_blocked,
             _lock_file: lock_file,
             mouse_scroll_accumulator: 0.0,
+            mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
+            mouse_wheel_alt_screen: None,
             terminal_mouse_capture: None,
             last_terminal_mouse_motion: None,
             font_size_accumulator: 0.0,
@@ -5830,6 +5845,7 @@ impl eframe::App for TerminalApp {
                 xterm_modify_other_keys,
                 xterm_format_other_keys,
                 application_cursor_keys,
+                _application_keypad,
                 alt_screen,
             ) = {
                 let terminal = session.terminal.lock();
@@ -5839,6 +5855,7 @@ impl eframe::App for TerminalApp {
                     terminal.xterm_modify_other_keys(),
                     terminal.xterm_format_other_keys(),
                     terminal.is_application_cursor_keys(),
+                    terminal.is_application_keypad(),
                     terminal.is_alt_buffer_active(),
                 )
             };
@@ -6697,11 +6714,15 @@ impl eframe::App for TerminalApp {
             || (pointer_pos.is_none() && fallback_cell.is_none())
         {
             self.mouse_scroll_accumulator = 0.0;
+            self.mouse_line_wheel.reset();
+            self.mouse_wheel_alt_screen = None;
             Vec::new()
         } else {
             let terminal = mouse_terminal.lock();
             if !terminal.is_mouse_enabled() {
                 self.mouse_scroll_accumulator = 0.0;
+                self.mouse_line_wheel.reset();
+                self.mouse_wheel_alt_screen = None;
                 // The application disabled mouse reporting while a sequence was
                 // active. An unaccepted press can be retired, but a release
                 // already encoded behind backpressure must still follow its
@@ -6716,6 +6737,14 @@ impl eframe::App for TerminalApp {
                 Vec::new()
             } else {
                 let mut reports = Vec::new();
+                let alt_screen = terminal.is_alt_buffer();
+                if self.mouse_wheel_alt_screen != Some(alt_screen) {
+                    if self.mouse_wheel_alt_screen.is_some() {
+                        self.mouse_scroll_accumulator = 0.0;
+                        self.mouse_line_wheel.reset();
+                    }
+                    self.mouse_wheel_alt_screen = Some(alt_screen);
+                }
                 let (_, mouse_rows) = terminal.get_dimensions();
                 let projected_pointer_cell = mouse_uses_active_projection.then(|| {
                     pointer_pos.and_then(|pointer| {
@@ -6764,10 +6793,10 @@ impl eframe::App for TerminalApp {
                                 }
                                 match unit {
                                     egui::MouseWheelUnit::Line => {
-                                        discrete_scroll_steps = bounded_wheel_step_accumulate(
+                                        discrete_scroll_steps = bounded_line_wheel_accumulate(
+                                            &mut self.mouse_line_wheel,
                                             discrete_scroll_steps,
                                             delta.y,
-                                            1,
                                         );
                                     }
                                     egui::MouseWheelUnit::Page => {
@@ -6869,6 +6898,8 @@ impl eframe::App for TerminalApp {
                     // display coordinates as the old PTY's raw grid. Do not
                     // retain wheel fractions that could fire on re-entry.
                     self.mouse_scroll_accumulator = 0.0;
+                    self.mouse_line_wheel.reset();
+                    self.mouse_wheel_alt_screen = None;
                 }
 
                 // A release is emitted exactly once and only for a press
@@ -7394,7 +7425,8 @@ impl Drop for TerminalApp {
 mod tests {
     use super::{
         app_mouse_frame_route, app_mouse_press_reports_from_snapshot, application_cell_at_pointer,
-        bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
+        bounded_line_wheel_accumulate, bounded_wheel_step_accumulate, captured_release_button,
+        clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, fontconfig_match_family_file, kitty_graphics_payload,
@@ -8171,6 +8203,17 @@ mod tests {
         assert_eq!(bounded_wheel_step_accumulate(63, 1000.0, 512), 64);
         assert_eq!(bounded_wheel_step_accumulate(-63, -1000.0, 512), -64);
         assert_eq!(bounded_wheel_step_accumulate(7, f32::NAN, 512), 7);
+    }
+
+    #[test]
+    fn line_wheel_fractions_emit_after_a_full_notch() {
+        let mut acc = jterm_core::wheel::WheelAccumulator::default();
+        assert_eq!(bounded_line_wheel_accumulate(&mut acc, 0, 0.4), 0);
+        assert_eq!(bounded_line_wheel_accumulate(&mut acc, 0, 0.4), 0);
+        assert_eq!(bounded_line_wheel_accumulate(&mut acc, 0, 0.4), 1);
+        acc.reset();
+        assert_eq!(bounded_line_wheel_accumulate(&mut acc, 63, 1000.0), 64);
+        assert_eq!(bounded_line_wheel_accumulate(&mut acc, -63, -1000.0), -64);
     }
     fn encoded_test_png(width: u32, height: u32) -> Vec<u8> {
         let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);

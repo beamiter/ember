@@ -940,13 +940,13 @@ impl super::TerminalState {
     }
 
     fn emit_focus_in(&mut self) {
-        if self.modes.contains(&1004) {
+        if self.is_focus_event_mode() {
             self.output_buffer.extend_from_slice(b"\x1b[I");
         }
     }
 
     fn emit_focus_out(&mut self) {
-        if self.modes.contains(&1004) {
+        if self.is_focus_event_mode() {
             self.output_buffer.extend_from_slice(b"\x1b[O");
         }
     }

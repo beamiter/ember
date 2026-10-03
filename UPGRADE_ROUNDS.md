@@ -825,3 +825,9 @@ query answers, control handling and resize.
      numpad Enter from the main Enter (egui collapses both), so encoding
      `\x1bOM` waits on a location-aware key event.
 
+155. **Line-unit app-mouse wheel keeps remainder** — Line deltas used
+     `.round()`, so three 0.4-line ticks never became a report. They now
+     go through `jterm_core::wheel::WheelAccumulator` (point units still
+     use the pixel accumulator). Switching the alt screen, closing mouse
+     reporting, or landing on a synthetic row resets both remainders.
+

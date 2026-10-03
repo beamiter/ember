@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 155 — line-wheel remainder)
+
+## 2026-10-03 (line-unit app-mouse WheelAccumulator)
+
+- Line-unit application mouse wheel now uses
+  `jterm_core::wheel::WheelAccumulator` instead of rounding each tick.
+  Three 0.4-line events report one notch. Point units stay on
+  `mouse_scroll_accumulator`. Alt-screen changes and mouse-route close
+  drop leftover remainder. Unique round **155**. Test:
+  `line_wheel_fractions_emit_after_a_full_notch`.
+
 Updated: 2026-10-03 (upgrade round 154 — DECKPAM)
 
 ## 2026-10-03 (DECKPAM mode 66)

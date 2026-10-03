@@ -379,6 +379,14 @@ pub struct TerminalApp {
 
     // 鼠标报告模式下的滚轮累积器
     pub mouse_scroll_accumulator: f32,
+    /// Line-unit app-mouse wheel remainder. Point units keep
+    /// `mouse_scroll_accumulator`; mixing the two would convert fractions
+    /// through the wrong unit.
+    pub mouse_line_wheel: jterm_core::wheel::WheelAccumulator,
+    /// Last `is_alt_buffer()` seen while app-mouse was live. Changing
+    /// screens drops leftover line/point wheel remainder so vim cannot
+    /// inherit a fraction from the shell (and vice versa).
+    pub mouse_wheel_alt_screen: Option<bool>,
     /// Stable session identity and routing decision for the current drag.
     pub terminal_mouse_capture: Option<TerminalMouseCapture>,
     pub last_terminal_mouse_motion: Option<(String, usize, usize)>,
