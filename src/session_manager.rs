@@ -619,6 +619,7 @@ impl SessionManager {
         visible_session_indices: &[usize],
         mouse_barrier_session_id: Option<&str>,
         protocol_input_barriers: &SessionInputBarriers,
+        window_focused: bool,
     ) -> BackgroundPumpResult {
         let order = background_pump_order(
             self.active_index,
@@ -685,7 +686,7 @@ impl SessionManager {
                     }
                 }
             }
-            if visible_session_indices.contains(&session_idx) {
+            if visible_session_indices.contains(&session_idx) && window_focused {
                 session.metadata.unseen_output = false;
             }
             let mut data = std::mem::take(&mut session.pending_output);
@@ -776,7 +777,9 @@ impl SessionManager {
                 result.notifications.push((session_idx, title, body));
             }
             if terminal.take_pending_bell() {
-                if !visible_session_indices.contains(&session_idx) {
+                // Inactive sessions are never the focused pane. An unfocused
+                // window also badges a visible split, matching anvil.
+                if bell_sets_unseen(window_focused, false) {
                     session.metadata.unseen_output = true;
                 }
                 result.bells.push(session_idx);
@@ -1364,6 +1367,12 @@ fn background_pump_order(
     order
 }
 
+/// Whether a BEL should light the tab unread dot. Same rule as anvil:
+/// badge unless this pane is current *and* the window is focused.
+pub fn bell_sets_unseen(window_focused: bool, pane_is_current: bool) -> bool {
+    !window_focused || !pane_is_current
+}
+
 fn refreshed_unseen_output(
     current: bool,
     is_active: bool,
@@ -1380,7 +1389,7 @@ fn refreshed_unseen_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        background_pump_order, refreshed_unseen_output, restored_or_fresh_session_id,
+        background_pump_order, bell_sets_unseen, refreshed_unseen_output, restored_or_fresh_session_id,
         retry_pending_input, user_input_flush_block, user_input_is_blocked, ProtocolResponseLimits,
         ProtocolResponseQueueError, ProtocolResponseSender, SessionInputBarriers, SessionManager,
         UserInputFlushBlock,
@@ -1554,6 +1563,14 @@ mod tests {
         assert!(!refreshed_unseen_output(false, false, true, true));
         assert!(refreshed_unseen_output(false, false, false, true));
         assert!(refreshed_unseen_output(true, false, false, false));
+    }
+
+    #[test]
+    fn bell_badges_unfocused_windows_and_non_current_panes() {
+        assert!(!bell_sets_unseen(true, true));
+        assert!(bell_sets_unseen(true, false));
+        assert!(bell_sets_unseen(false, true));
+        assert!(bell_sets_unseen(false, false));
     }
 
     #[test]

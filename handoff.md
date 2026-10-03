@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 161 — BEL tab badge)
+
+## 2026-10-03 (BEL unread dot)
+
+- Visible panes no longer wipe `unseen_output` while the window is
+  unfocused. A BEL in the current tab of a background window lights the
+  tab, and inactive panes badge even when focused. Unique round **161**.
+  Test: `bell_badges_unfocused_windows_and_non_current_panes`.
+
 Updated: 2026-10-03 (upgrade round 160 — find scan budget)
 
 ## 2026-10-03 (find overlay scan budget)

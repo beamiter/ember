@@ -861,3 +861,8 @@ query answers, control handling and resize.
      After 8 MiB of line text it now stops and reports truncated, so a
      rare needle in a huge buffer cannot freeze the UI.
 
+161. **BEL badges the tab when the window is unfocused** — visible panes
+     used to clear `unseen_output` every frame, so a ring in the current
+     tab of a background window never left a dot. Unfocused windows and
+     non-current panes now keep the unread mark, matching anvil.
+

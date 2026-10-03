@@ -5282,14 +5282,15 @@ impl eframe::App for TerminalApp {
             0
         };
         let background_parse_started = std::time::Instant::now();
+        let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         let mut background_pump = self.session_manager.pump_inactive_sessions(
             background_budget,
             &visible_sessions,
             mouse_input_barrier_session_id.as_deref(),
             &self.osc_paste_input_barriers,
+            window_focused,
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
-        let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         for session in self.session_manager.sessions() {
             session
                 .terminal
@@ -6109,6 +6110,9 @@ impl eframe::App for TerminalApp {
                 self.last_activity_time = std::time::Instant::now();
                 drop(terminal);
                 if rang_bell {
+                    if crate::session_manager::bell_sets_unseen(window_focused, true) {
+                        session.metadata.unseen_output = true;
+                    }
                     maybe_notify_bell(
                         window_focused,
                         &mut session.last_bell_toast,
@@ -6258,6 +6262,9 @@ impl eframe::App for TerminalApp {
                 );
             }
             if rang_bell {
+                if crate::session_manager::bell_sets_unseen(window_focused, true) {
+                    session.metadata.unseen_output = true;
+                }
                 maybe_notify_bell(
                     window_focused,
                     &mut session.last_bell_toast,
