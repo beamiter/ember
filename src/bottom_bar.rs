@@ -12,7 +12,8 @@
 
 use crate::theme::{Theme, ThemeExt as _};
 use egui::{Color32, FontId, Sense, Stroke, Vec2};
-use jterm_core::bottom_bar::{Content, Segment, BAR_HEIGHT};
+use jterm_core::bottom_bar::{Content, Segment, SegmentKind, BAR_HEIGHT};
+use std::path::PathBuf;
 
 /// Gap between adjacent segments, per the family renderer contract (~12px).
 const SEGMENT_GAP: f32 = 12.0;
@@ -23,56 +24,75 @@ const EDGE_PADDING: f32 = 8.0;
 
 /// Resolve a segment's tone against the theme, through the shared
 /// `Tone::color` mapping so all four terminals agree on the palette.
+fn segment_kind_salt(kind: SegmentKind) -> u8 {
+    match kind {
+        SegmentKind::Cwd => 0,
+        SegmentKind::Git => 1,
+        SegmentKind::LastCommand => 2,
+        SegmentKind::Grid => 3,
+        SegmentKind::Tabs => 4,
+    }
+}
+
 fn segment_color(segment: &Segment, theme: &Theme) -> Color32 {
     Theme::rgb_to_color32(segment.tone.color(theme))
 }
 
 /// Draw the bar across the full width handed to `ui` (the enclosing bottom
-/// panel spans the window). The colors follow the pane header's precedent:
-/// opaque theme chrome over the transparent window clear color, with no extra
-/// per-element opacity — the bar has no faded states.
-pub fn draw(ui: &mut egui::Ui, theme: &Theme, content: &Content) {
+/// panel spans the window). Returns the segment the pointer clicked, if any,
+/// so the app can attach behavior (Files navigation for cwd) without the
+/// painter owning filesystem policy.
+pub fn draw(ui: &mut egui::Ui, theme: &Theme, content: &Content) -> Option<SegmentKind> {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), BAR_HEIGHT), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        egui::CornerRadius::ZERO,
-        Theme::rgb_to_color32(theme.tabbar.bg),
-    );
-    painter.hline(
-        rect.left()..=rect.right(),
-        rect.top() + 0.5,
-        Stroke::new(1.0, Theme::rgb_to_color32(theme.ui.border)),
-    );
+    {
+        let painter = ui.painter();
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::ZERO,
+            Theme::rgb_to_color32(theme.tabbar.bg),
+        );
+        painter.hline(
+            rect.left()..=rect.right(),
+            rect.top() + 0.5,
+            Stroke::new(1.0, Theme::rgb_to_color32(theme.ui.border)),
+        );
+    }
 
     let font = FontId::proportional(11.0);
     let center_y = rect.center().y;
+    let mut clicked = None;
 
     // Right group first: it keeps its compose order reading left-to-right but
     // ends at the right edge, and its extent caps how far the left group may
     // run before eliding.
-    let right_galleys: Vec<_> = content
-        .right
-        .iter()
-        .map(|segment| {
-            let color = segment_color(segment, theme);
-            (
-                painter.layout_no_wrap(segment.text.clone(), font.clone(), color),
-                color,
-            )
-        })
-        .collect();
+    let right_galleys: Vec<_> = {
+        let painter = ui.painter();
+        content
+            .right
+            .iter()
+            .map(|segment| {
+                let color = segment_color(segment, theme);
+                (
+                    painter.layout_no_wrap(segment.text.clone(), font.clone(), color),
+                    color,
+                    segment.kind,
+                )
+            })
+            .collect()
+    };
     let right_width: f32 = right_galleys
         .iter()
-        .map(|(galley, _)| galley.size().x)
+        .map(|(galley, _, _)| galley.size().x)
         .sum::<f32>()
         + SEGMENT_GAP * right_galleys.len().saturating_sub(1) as f32;
     let right_start = (rect.right() - EDGE_PADDING - right_width).max(rect.left() + EDGE_PADDING);
     let mut cursor_x = right_start;
-    for (galley, color) in right_galleys {
+    for (index, (galley, color, kind)) in right_galleys.into_iter().enumerate() {
         let size = galley.size();
-        painter.galley(egui::pos2(cursor_x, center_y - size.y / 2.0), galley, color);
+        if paint_clickable_segment(ui, cursor_x, center_y, galley, color, kind, index) {
+            clicked = Some(kind);
+        }
         cursor_x += size.x + SEGMENT_GAP;
     }
 
@@ -84,21 +104,83 @@ pub fn draw(ui: &mut egui::Ui, theme: &Theme, content: &Content) {
         right_start - SEGMENT_GAP
     };
     let mut cursor_x = rect.left() + EDGE_PADDING;
-    for segment in &content.left {
+    for (index, segment) in content.left.iter().enumerate() {
         let available = left_limit - cursor_x;
         if available <= 0.0 {
             break;
         }
         let color = segment_color(segment, theme);
-        let galley = crate::pane_header::clipped_galley(
-            painter,
-            &segment.text,
-            font.clone(),
-            color,
-            available,
-        );
+        let galley = {
+            let painter = ui.painter();
+            crate::pane_header::clipped_galley(
+                painter,
+                &segment.text,
+                font.clone(),
+                color,
+                available,
+            )
+        };
         let size = galley.size();
-        painter.galley(egui::pos2(cursor_x, center_y - size.y / 2.0), galley, color);
+        if paint_clickable_segment(
+            ui,
+            cursor_x,
+            center_y,
+            galley,
+            color,
+            segment.kind,
+            index,
+        ) {
+            clicked = Some(segment.kind);
+        }
         cursor_x += size.x + SEGMENT_GAP;
+    }
+    clicked
+}
+
+fn paint_clickable_segment(
+    ui: &mut egui::Ui,
+    cursor_x: f32,
+    center_y: f32,
+    galley: std::sync::Arc<egui::Galley>,
+    color: Color32,
+    kind: SegmentKind,
+    index: usize,
+) -> bool {
+    let size = galley.size();
+    let pos = egui::pos2(cursor_x, center_y - size.y / 2.0);
+    let rect = egui::Rect::from_min_size(pos, size);
+    let id = ui.id().with(("bottom_bar_segment", segment_kind_salt(kind), index));
+    let mut response = ui.interact(rect, id, Sense::click());
+    if kind == SegmentKind::Cwd {
+        response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        response = response.on_hover_text("Open this directory in Files");
+    }
+    ui.painter().galley(pos, galley, color);
+    response.clicked()
+}
+
+/// Absolute local path a cwd-segment click may open in Files. Relative
+/// reports and the bar's `~` display text are rejected so a click never
+/// treats an abbreviated label as a tree root.
+pub fn local_files_path(reported_cwd: Option<&str>) -> Option<PathBuf> {
+    let path = PathBuf::from(reported_cwd.filter(|cwd| !cwd.is_empty())?);
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_files_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cwd_click_opens_only_an_absolute_reported_path() {
+        assert_eq!(
+            local_files_path(Some("/home/u/src")),
+            Some(PathBuf::from("/home/u/src"))
+        );
+        assert_eq!(local_files_path(Some("~/src")), None);
+        assert_eq!(local_files_path(Some("src")), None);
+        assert_eq!(local_files_path(Some("")), None);
+        assert_eq!(local_files_path(None), None);
     }
 }

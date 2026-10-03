@@ -851,3 +851,8 @@ query answers, control handling and resize.
      `jterm_core::notify::long_block_should_notify` so the line cannot
      drift from anvil/forge.
 
+159. **Bottom-bar cwd opens Files** — the cwd segment is a click target.
+     It shows the Files sidebar at the OSC 7 / process cwd, after switching
+     the tree to the local endpoint. Abbreviated `~` labels are not used as
+     paths; only an absolute report navigates.
+

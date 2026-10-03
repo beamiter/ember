@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 159 — bottom-bar cwd click)
+
+## 2026-10-03 (cwd segment opens Files)
+
+- Clicking the bottom-bar cwd shows Files at the pane's absolute OSC 7 /
+  `/proc` directory and forces the local endpoint. Unique round **159**.
+  Test: `cwd_click_opens_only_an_absolute_reported_path`.
+
 Updated: 2026-10-03 (upgrade round 158 — long_block_should_notify)
 
 ## 2026-10-03 (shared long-block notify gate)

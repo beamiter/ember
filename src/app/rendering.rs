@@ -378,13 +378,44 @@ impl TerminalApp {
         };
         let content = jterm_core::bottom_bar::compose(&snapshot);
 
-        egui::Panel::bottom("bottom_bar")
+        let clicked = egui::Panel::bottom("bottom_bar")
             .exact_size(jterm_core::bottom_bar::BAR_HEIGHT)
             .frame(egui::Frame::NONE)
             .show_separator_line(false)
             .show(root_ui, |ui| {
-                crate::bottom_bar::draw(ui, &self.current_theme, &content);
-            });
+                crate::bottom_bar::draw(ui, &self.current_theme, &content)
+            })
+            .inner;
+        if clicked == Some(jterm_core::bottom_bar::SegmentKind::Cwd) {
+            self.reveal_files_at_active_cwd();
+        }
+    }
+
+    fn reveal_files_at_active_cwd(&mut self) {
+        let session = self.session_manager.get_active_session_mut();
+        let reported = session
+            .terminal
+            .lock()
+            .current_working_dir
+            .clone()
+            .or_else(|| jterm_core::process::process_cwd(session.get_shell_pid()));
+        let Some(path) = crate::bottom_bar::local_files_path(reported.as_deref()) else {
+            self.set_status("Working directory is not an absolute local path");
+            return;
+        };
+        self.sidebar.note_files_user_intent();
+        self.sidebar.visible = true;
+        self.sidebar.view = crate::sidebar::SidebarView::Files;
+        if let Some(error) = self.sidebar.set_location(crate::remote_fs::FsLocation::Local) {
+            self.set_status_for(format!("文件树切换失败：{error}"), std::time::Duration::from_secs(5));
+            return;
+        }
+        if let Some(error) = self.sidebar.set_current_dir(path) {
+            self.set_status_for(
+                format!("文件树目录切换失败：{error}"),
+                std::time::Duration::from_secs(5),
+            );
+        }
     }
 
     /// Draw the per-pane header strips and run the drag-to-rearrange gesture.
