@@ -797,3 +797,12 @@ query answers, control handling and resize.
      MAX-12 cancel + Unknown→Idle beside round-62. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
 
+150. **Click-to-caret waits for an unmoved release** — Ember was the last
+     frontend still treating toolkit `clicked()` as “place the shell caret”.
+     It now uses the shared `ClickTracker`: a plain left press arms the
+     gesture, leaving the pressed cell turns it into a selection drag, and
+     only a same-cell release synthesises arrows. Scrollbar, wheel, card
+     chrome, modifiers, and mouse-reporting applications never arm it. A
+     renderer reused on another PTY drops an in-flight gesture instead of
+     delivering leftover arrows.
+

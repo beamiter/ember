@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 150 — ClickTracker click-to-caret)
+
+## 2026-10-03 (click-to-caret ClickTracker)
+
+- Ember now uses `jterm_core::click_cursor::ClickTracker` for click-to-place-
+  cursor, matching anvil/forge/frost. Toolkit `clicked()` no longer synthesises
+  arrows: leaving the pressed cell is a selection drag; only a same-cell
+  release moves the caret. Wheel, scrollbar, card chrome, modifiers, and
+  mouse-reporting apps cancel/never arm the gesture. Unique upgrade round
+  **150**.
+- Tests: `click_cursor_drag_off_cell_does_not_synthesize_arrows`,
+  `click_cursor_press_is_plain_only_for_unmodified_local_body`,
+  `accepted_semantic_paste_suppresses_renderer_pointer_suffix`.
+
 Updated: 2026-09-30 (evolve round-63 smoke on path-patched core tip)
 
 ## 2026-09-30 (evolve round-63 smoke)

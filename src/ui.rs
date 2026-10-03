@@ -258,6 +258,46 @@ fn should_clear_selection_on_click(
         && pointer_in_content
 }
 
+/// Whether a primary press may arm the family click-to-caret tracker.
+///
+/// Anything else belongs to selection, card chrome, scrollbar, or a
+/// mouse-reporting application. The tracker still waits for release, and
+/// leaving the pressed cell turns the gesture into a drag.
+fn click_cursor_press_is_plain(
+    interaction_enabled: bool,
+    pointer_in_content: bool,
+    dragging_scrollbar: bool,
+    modifiers: egui::Modifiers,
+    app_owns_mouse: bool,
+    block_header_owns_press: bool,
+    summary_owns_press: bool,
+) -> bool {
+    interaction_enabled
+        && pointer_in_content
+        && !dragging_scrollbar
+        && !(modifiers.ctrl
+            || modifiers.alt
+            || modifiers.shift
+            || modifiers.mac_cmd
+            || modifiers.command)
+        && !app_owns_mouse
+        && !block_header_owns_press
+        && !summary_owns_press
+}
+
+fn display_cell_from_content(
+    pos: egui::Pos2,
+    content_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    cols: usize,
+    rows: usize,
+) -> jterm_core::click_cursor::Cell {
+    let (row, col) =
+        grid_position_from_content(pos, content_rect, char_width, line_height, cols, rows);
+    jterm_core::click_cursor::Cell::new(row as i64, col as i64)
+}
+
 fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -999,6 +1039,13 @@ pub struct TerminalRenderer {
     /// Renderers are reused when tabs/panes switch, so bytes without this tag
     /// could otherwise be delivered to the replacement PTY next frame.
     pub cursor_move_terminal_ptr: Option<usize>,
+    /// Press/drag/release bookkeeping for click-to-place-cursor. Shared with
+    /// the other jterm frontends so a selection drag cannot walk the shell
+    /// caret just because the toolkit still called the gesture a click.
+    click_tracker: jterm_core::click_cursor::ClickTracker,
+    /// Terminal identity that armed `click_tracker`. A reused renderer that
+    /// starts drawing a different PTY must drop the in-flight gesture.
+    click_tracker_terminal: Option<usize>,
     /// Sub-line pixel offset for smooth scrolling animation
     pub scroll_pixel_offset: f32,
 
@@ -1100,6 +1147,8 @@ impl TerminalRenderer {
             gpu_surface_id: gpu::callback::GridSurfaceId::allocate(),
             cursor_move_input: Vec::new(),
             cursor_move_terminal_ptr: None,
+            click_tracker: jterm_core::click_cursor::ClickTracker::default(),
+            click_tracker_terminal: None,
             scroll_pixel_offset: 0.0,
             cached_links: std::sync::Arc::new(Vec::new()),
             cached_links_projection_key: None,
@@ -3710,6 +3759,70 @@ impl TerminalRenderer {
         }
         self.show_block_context_menu(&response, terminal, rendered_terminal);
 
+        // Click-to-place-cursor is press/drag/release, not toolkit `clicked()`.
+        // A press is ambiguous until the pointer either leaves the cell
+        // (selection drag) or releases in the same cell (caret move).
+        let pointer_latest = ctx.input(|input| input.pointer.latest_pos());
+        let pointer_display_cell = pointer_latest.and_then(|pos| {
+            (pos.x < scrollbar_x && content_rect.contains(pos)).then(|| {
+                display_cell_from_content(pos, content_rect, char_width, line_height, cols, rows)
+            })
+        });
+        let scrolled = ui.input(|input| {
+            input.smooth_scroll_delta != Vec2::ZERO
+                || input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+        });
+        if scrolled || self.dragging_scrollbar {
+            self.click_tracker.cancel();
+            self.click_tracker_terminal = None;
+        }
+        if primary_pressed {
+            let press_cell = click_pos.filter(|pos| pos.x < scrollbar_x).map(|pos| {
+                display_cell_from_content(pos, content_rect, char_width, line_height, cols, rows)
+            });
+            let plain = press_cell.is_some()
+                && click_cursor_press_is_plain(
+                    interaction_enabled,
+                    pointer_in_content,
+                    self.dragging_scrollbar,
+                    modifiers,
+                    mouse_enabled && press_app_mouse_eligible,
+                    primary_block_gesture.is_some(),
+                    self.summary_primary_press.is_some(),
+                );
+            if let Some(cell) = press_cell {
+                self.click_tracker.press(cell, plain);
+                self.click_tracker_terminal = Some(rendered_terminal);
+            } else {
+                self.click_tracker
+                    .press(jterm_core::click_cursor::Cell::new(0, 0), false);
+                self.click_tracker_terminal = None;
+            }
+        } else if self.click_tracker_terminal != Some(rendered_terminal) {
+            self.click_tracker.cancel();
+            self.click_tracker_terminal = None;
+        } else if let Some(cell) = pointer_display_cell {
+            self.click_tracker.pointer_at(cell);
+        } else if pointer_latest.is_some() {
+            // The pointer is known to have left the terminal content.
+            self.click_tracker.cancel();
+            self.click_tracker_terminal = None;
+        }
+        if response.double_clicked() || response.triple_clicked() {
+            self.click_tracker.cancel();
+            self.click_tracker_terminal = None;
+        }
+        let tracker_click = if primary_released {
+            let cell = self.click_tracker.release();
+            self.click_tracker_terminal = None;
+            cell
+        } else {
+            None
+        };
+
         // A plain local body click dismisses the previous selection. Scrollbar
         // navigation preserves it; header/modifier gestures above own their
         // edge; double/triple clicks replace text selection below.
@@ -3718,7 +3831,7 @@ impl TerminalRenderer {
             && should_clear_selection_on_click(
                 local_selection_enabled,
                 modifiers.ctrl,
-                response.clicked(),
+                tracker_click.is_some(),
                 response.double_clicked(),
                 response.triple_clicked(),
                 self.dragging_scrollbar,
@@ -3730,15 +3843,9 @@ impl TerminalRenderer {
             self.block_click = Some(crate::block_mode::BlockClick::Clear);
             terminal.clear_text_selection();
 
-            if let Some(pos) = click_pos {
-                let (click_row, click_col) = grid_position_from_content(
-                    pos,
-                    content_rect,
-                    char_width,
-                    line_height,
-                    cols,
-                    rows,
-                );
+            if let Some(cell) = tracker_click.filter(|cell| cell.row >= 0 && cell.col >= 0) {
+                let click_row = cell.row as usize;
+                let click_col = cell.col as usize;
 
                 // A newer click supersedes any prior not-yet-routed synthetic
                 // movement, including a click the terminal declines to act on.
@@ -6323,6 +6430,84 @@ mod tests {
     }
 
     #[test]
+    fn click_cursor_drag_off_cell_does_not_synthesize_arrows() {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut terminal = crate::terminal::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
+        let press = egui::pos2(32.0, 10.0);
+        let dragged = egui::pos2(96.0, 10.0);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
+        fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+            let mut output = ctx.run_ui(input, f);
+            output.textures_delta.clear();
+        }
+        let paint = |renderer: &mut TerminalRenderer,
+                     terminal: &mut crate::terminal::TerminalState,
+                     events: Vec<egui::Event>| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = renderer.render(
+                        ui,
+                        terminal,
+                        true,
+                        true,
+                        &crate::search::SearchState::default(),
+                        &[],
+                        &None,
+                    );
+                },
+            );
+        };
+        paint(&mut renderer, &mut terminal, Vec::new());
+        paint(
+            &mut renderer,
+            &mut terminal,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        renderer.cursor_move_input.clear();
+        paint(
+            &mut renderer,
+            &mut terminal,
+            vec![egui::Event::PointerMoved(dragged)],
+        );
+        paint(
+            &mut renderer,
+            &mut terminal,
+            vec![egui::Event::PointerButton {
+                pos: dragged,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            renderer.cursor_move_input.is_empty(),
+            "leaving the pressed cell is a selection drag, not caret movement"
+        );
+    }
+
+    #[test]
     fn accepted_semantic_paste_suppresses_renderer_pointer_suffix() {
         // Prove the synthetic click is actionable without the frame gate, so
         // the negative assertions below exercise renderer integration rather
@@ -7356,6 +7541,42 @@ mod tests {
             local_selection_capture_after_press(None, terminal_b, false, true, true, true, false,),
             Some(terminal_b)
         );
+    }
+
+    #[test]
+    fn click_cursor_press_is_plain_only_for_unmodified_local_body() {
+        let none = egui::Modifiers::NONE;
+        assert!(click_cursor_press_is_plain(
+            true, true, false, none, false, false, false
+        ));
+        for rejected in [
+            click_cursor_press_is_plain(false, true, false, none, false, false, false),
+            click_cursor_press_is_plain(true, false, false, none, false, false, false),
+            click_cursor_press_is_plain(true, true, true, none, false, false, false),
+            click_cursor_press_is_plain(true, true, false, none, true, false, false),
+            click_cursor_press_is_plain(true, true, false, none, false, true, false),
+            click_cursor_press_is_plain(true, true, false, none, false, false, true),
+            click_cursor_press_is_plain(
+                true,
+                true,
+                false,
+                egui::Modifiers::SHIFT,
+                false,
+                false,
+                false,
+            ),
+            click_cursor_press_is_plain(
+                true,
+                true,
+                false,
+                egui::Modifiers::CTRL,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            assert!(!rejected);
+        }
     }
 
     #[test]

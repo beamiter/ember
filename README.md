@@ -296,6 +296,10 @@ show_repo_strip = true
 # status/duration, grid size and tab position. Same key in every jterm.
 bottom_bar = true
 
+# Click the prompt to place the shell caret (arrow-key synthesis). A press
+# that leaves the cell is a selection drag and never moves the caret.
+click_moves_cursor = true
+
 # Command-card chrome (Warp-style): theme-relative cards, a colored outcome
 # stripe and a status badge per OSC 133 command block. Running blocks show a
 # compact live elapsed-time badge when it fits without covering terminal text.

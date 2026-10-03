@@ -9268,9 +9268,12 @@ mod tests {
             .split_once(service)
             .and_then(|(_, rest)| rest.split("\nfn ").next())
             .expect("service_osc5522_clipboard_requests must exist");
-        let enosys = service_body.find("type=read:status=ENOSYS")
+        let enosys = service_body
+            .find("type=read:status=ENOSYS")
             .expect("OSC 5522 service must answer ENOSYS without a clipboard");
-        let spawn = service_body.find("thread::spawn").unwrap_or(service_body.len());
+        let spawn = service_body
+            .find("thread::spawn")
+            .unwrap_or(service_body.len());
         assert!(
             enosys < spawn,
             "ENOSYS must be returned before any clipboard worker is spawned"
