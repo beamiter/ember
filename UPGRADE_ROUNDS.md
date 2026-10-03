@@ -845,3 +845,9 @@ query answers, control handling and resize.
      Head-loss / both-ends variants wait on a dropped-front flag Ember
      does not yet record.
 
+158. **Long-command toasts use the shared duration gate** — Ember still
+     decides config/empty-command, but whether the measured duration and
+     "user was watching" state fire a toast now goes through
+     `jterm_core::notify::long_block_should_notify` so the line cannot
+     drift from anvil/forge.
+

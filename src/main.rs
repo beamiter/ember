@@ -1496,13 +1496,24 @@ fn should_notify_long_command(
     duration_ms: Option<u64>,
     watched: bool,
 ) -> bool {
-    if !config.notify_long_blocks || watched {
+    if !config.notify_long_blocks {
         return false;
     }
     if command.map(str::trim).is_none_or(str::is_empty) {
         return false;
     }
-    duration_ms.is_some_and(|ms| ms >= config.notify_long_block_threshold_ms)
+    let Some(ms) = duration_ms else {
+        return false;
+    };
+    // `watched` is "window focused and this pane is on screen". The family
+    // gate is duration + (!window_active || !pane_mapped); a watched
+    // completion is both active and mapped.
+    jterm_core::notify::long_block_should_notify(
+        ms,
+        config.notify_long_block_threshold_ms,
+        watched,
+        true,
+    )
 }
 
 /// Post the long-command-finished notification when the gates above and the
@@ -7880,6 +7891,10 @@ mod tests {
             Some(60_000),
             true,
         ));
+        assert_eq!(
+            should_notify_long_command(&config, Some("cargo build"), Some(10_000), false),
+            jterm_core::notify::long_block_should_notify(10_000, 10_000, false, true)
+        );
 
         let degraded = crate::terminal::CompletedCommandEvent {
             start_mark_seen: false,

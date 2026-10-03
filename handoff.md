@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 158 — long_block_should_notify)
+
+## 2026-10-03 (shared long-block notify gate)
+
+- `should_notify_long_command` still rejects disabled config and empty
+  command lines, then asks `long_block_should_notify` for duration vs
+  threshold and watched-pane silence. Unique round **158**.
+
 Updated: 2026-10-03 (upgrade round 157 — finished output notice)
 
 ## 2026-10-03 (family output-loss notice)
