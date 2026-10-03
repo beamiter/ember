@@ -128,6 +128,10 @@ pub struct Session {
     #[allow(dead_code)]
     // Used by the binary app; the library Session type is built separately.
     pub(crate) collapse_availability_cache: Option<(u64, u64)>,
+    /// Last time this pane posted a BEL desktop toast. Shared
+    /// `bell_should_notify` spacing is per pane, not global.
+    #[allow(dead_code)] // binary app reads this when draining BEL
+    pub last_bell_toast: Option<std::time::Instant>,
 }
 
 impl Session {
@@ -192,6 +196,7 @@ impl Session {
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),
             collapse_availability_cache: None,
+            last_bell_toast: None,
         }
     }
 

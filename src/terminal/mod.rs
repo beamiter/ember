@@ -733,6 +733,9 @@ pub struct TerminalState {
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,
+    /// A BEL arrived since the last `take_pending_bell`. Multiple rings in
+    /// one batch collapse: the toast path is rate-limited per pane.
+    pending_bell: bool,
 
     /// Total lines ever pushed into `scrollback` (does not decrement on
     /// `pop_front`). Combined with current `scrollback.len()`, lets us

@@ -696,7 +696,7 @@ impl super::TerminalState {
                     i += 1;
                 }
                 b'\x07' => {
-                    // Bell - ignore
+                    self.pending_bell = true;
                     i += 1;
                 }
                 // The remaining C0 controls (NUL, ENQ, CAN, SUB outside a

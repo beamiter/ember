@@ -1471,6 +1471,19 @@ fn show_desktop_notification(
     }
 }
 
+fn maybe_notify_bell(
+    window_focused: bool,
+    last_bell_toast: &mut Option<std::time::Instant>,
+    title: &str,
+) {
+    let now = std::time::Instant::now();
+    if !jterm_core::notify::bell_should_notify(window_focused, *last_bell_toast, now) {
+        return;
+    }
+    *last_bell_toast = Some(now);
+    jterm_core::notify::attention(title, "The terminal rang the bell");
+}
+
 /// anvil-parity gate for the long-command desktop toast
 /// (`block_view`'s `notify_long_blocks` check): the command must be a real
 /// foreground command (anvil skips background blocks, whose command line is
@@ -5388,6 +5401,12 @@ impl eframe::App for TerminalApp {
                 body,
             );
         }
+        for session_idx in background_pump.bells.drain(..) {
+            if let Some(session) = self.session_manager.get_session_mut(session_idx) {
+                let title = session.metadata.name.clone();
+                maybe_notify_bell(window_focused, &mut session.last_bell_toast, &title);
+            }
+        }
         // 按稳定 ID 而不是索引关闭:关掉一个会话会让它之后的索引整体左移,
         // 而关掉一个只剩一个窗格的 tab 还会连带关掉该 tab 的其他会话,索引
         // 可能往任意方向漂移。ID 查不到就说明它已经被前一次关闭带走了。
@@ -6072,11 +6091,19 @@ impl eframe::App for TerminalApp {
                 terminal_parse_time += active_parse_started.elapsed();
                 active_processed_bytes = accumulated_data.len();
                 let completed_outputs = terminal.take_completed_command_events();
+                let rang_bell = terminal.take_pending_bell();
                 // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
                 // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
                 // 有输出时更新最后活动时间
                 self.last_activity_time = std::time::Instant::now();
                 drop(terminal);
+                if rang_bell {
+                    maybe_notify_bell(
+                        window_focused,
+                        &mut session.last_bell_toast,
+                        &session.metadata.name,
+                    );
+                }
                 for completed in completed_outputs {
                     self.agent_panel
                         .handle_completed(&session.metadata.session_id, &completed);
@@ -6208,6 +6235,7 @@ impl eframe::App for TerminalApp {
         {
             let mut terminal = session.terminal.lock();
             let notifications: Vec<_> = terminal.pending_notifications.drain(..).collect();
+            let rang_bell = terminal.take_pending_bell();
             drop(terminal);
             for (title, body) in notifications {
                 show_desktop_notification(
@@ -6216,6 +6244,13 @@ impl eframe::App for TerminalApp {
                     &mut self.notifications_in_window,
                     title,
                     body,
+                );
+            }
+            if rang_bell {
+                maybe_notify_bell(
+                    window_focused,
+                    &mut session.last_bell_toast,
+                    &session.metadata.name,
                 );
             }
         }

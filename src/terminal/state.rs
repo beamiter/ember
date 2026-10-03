@@ -403,6 +403,7 @@ impl super::TerminalState {
             dynamic_cursor_color: None,
             dynamic_palette: [None; 256],
             pending_notifications: Vec::new(),
+            pending_bell: false,
             total_lines_scrolled: 0,
             next_raw_row_id,
             row_identity_revision: 1,
@@ -1711,6 +1712,11 @@ impl super::TerminalState {
 
     pub fn take_osc52_clipboard_set(&mut self) -> Option<String> {
         self.pending_osc52_clipboard_set.take()
+    }
+
+    /// True when at least one BEL arrived since the previous take.
+    pub fn take_pending_bell(&mut self) -> bool {
+        std::mem::take(&mut self.pending_bell)
     }
 
     pub fn take_osc52_clipboard_query(&mut self) -> Option<&'static [u8]> {

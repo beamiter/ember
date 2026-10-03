@@ -831,3 +831,9 @@ query answers, control handling and resize.
      use the pixel accumulator). Switching the alt screen, closing mouse
      reporting, or landing on a synthetic row resets both remainders.
 
+156. **BEL from an unfocused pane toasts** — a lone `\x07` is how Codex
+     and Claude say "your turn". Ember dropped it. The parser now latches
+     a pending bell; hidden tabs badge as unseen; an unfocused window
+     posts the shared `notify::attention` toast, rate-limited per pane
+     through `bell_should_notify`. OSC 9/777 BEL terminators are not bells.
+

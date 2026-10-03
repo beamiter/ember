@@ -425,6 +425,10 @@ pub struct BackgroundPumpResult {
     pub osc52_writes: Vec<(usize, String)>,
     pub osc52_queries: Vec<(usize, &'static [u8])>,
     pub notifications: Vec<(usize, String, String)>,
+    /// Sessions that rang BEL during this pump. One entry per session even
+    /// if the PTY emitted many bells in the batch.
+    #[allow(dead_code)] // binary app drains this beside OSC 9/777
+    pub bells: Vec<usize>,
     /// Source-compatible shell-reported OSC 133 output snapshots. New app code
     /// consumes the provenance-aware field below; this one remains available
     /// to integrations compiled against the original public payload.
@@ -770,6 +774,12 @@ impl SessionManager {
             }
             for (title, body) in terminal.pending_notifications.drain(..) {
                 result.notifications.push((session_idx, title, body));
+            }
+            if terminal.take_pending_bell() {
+                if !visible_session_indices.contains(&session_idx) {
+                    session.metadata.unseen_output = true;
+                }
+                result.bells.push(session_idx);
             }
             for event in terminal.take_completed_command_events() {
                 if event.completion_provenance

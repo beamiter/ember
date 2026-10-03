@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 156 — BEL toast)
+
+## 2026-10-03 (unfocused BEL)
+
+- A C0 BEL latches `pending_bell`. The pump drains it: hidden tabs get
+  `unseen_output`, and `jterm_core::notify::bell_should_notify` plus
+  `attention` post a per-pane 30s-spaced toast when the window is
+  unfocused. OSC 9/777 still consume BEL as a terminator, not a ring.
+  Unique round **156**. Test:
+  `bel_coalesces_until_taken_and_is_not_an_osc_terminator`.
+
 Updated: 2026-10-03 (upgrade round 155 — line-wheel remainder)
 
 ## 2026-10-03 (line-unit app-mouse WheelAccumulator)

@@ -6324,6 +6324,19 @@ fn osc_7_cwd_is_bounded_and_refuses_ambiguous_paths() {
 }
 
 #[test]
+fn bel_coalesces_until_taken_and_is_not_an_osc_terminator() {
+    let mut terminal = TerminalState::new(24, 4);
+    assert!(!terminal.take_pending_bell());
+    terminal.process_input(b"\x07\x07");
+    assert!(terminal.take_pending_bell());
+    assert!(!terminal.take_pending_bell());
+
+    terminal.process_input(b"\x1b]9;build \x07");
+    assert!(!terminal.take_pending_bell());
+    assert_eq!(terminal.pending_notifications.len(), 1);
+}
+
+#[test]
 fn desktop_notification_fields_leave_the_terminal_sanitised() {
     // OSC 9/777 text is the only PTY-authored string ember hands to another
     // process: it goes to `notify-send` and is drawn by the desktop's
