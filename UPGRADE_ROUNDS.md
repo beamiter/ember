@@ -866,3 +866,8 @@ query answers, control handling and resize.
      tab of a background window never left a dot. Unfocused windows and
      non-current panes now keep the unread mark, matching anvil.
 
+162. **Point-unit app-mouse wheel keeps remainder in cell rows** — pixel
+     deltas divided by line height with `as isize`, dropping sub-row
+     fractions. They now share `WheelAccumulator` (separate from Line
+     units) so three 0.4-row swipes report one notch.
+

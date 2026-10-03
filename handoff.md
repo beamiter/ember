@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 162 — point-wheel remainder)
+
+## 2026-10-03 (point-unit app-mouse WheelAccumulator)
+
+- Pixel wheel events accumulate as `delta / line_height` through a
+  dedicated `WheelAccumulator`, not a float that truncated toward zero.
+  Unique round **162**. Test:
+  `point_wheel_fractions_use_cell_height_as_a_notch`.
+
 Updated: 2026-10-03 (upgrade round 161 — BEL tab badge)
 
 ## 2026-10-03 (BEL unread dot)

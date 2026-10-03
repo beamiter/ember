@@ -1627,6 +1627,24 @@ fn bounded_line_wheel_accumulate(
         )
 }
 
+fn bounded_point_wheel_accumulate(
+    acc: &mut jterm_core::wheel::WheelAccumulator,
+    current: isize,
+    delta_px: f32,
+    line_height: f32,
+) -> isize {
+    if delta_px.is_finite() && line_height.is_finite() && line_height > 0.0 {
+        current
+            .saturating_add(acc.push((delta_px as f64) / (line_height as f64), false) as isize)
+            .clamp(
+                -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+            )
+    } else {
+        current
+    }
+}
+
 fn bounded_wheel_step_accumulate(current: isize, delta: f32, multiplier: usize) -> isize {
     let multiplier = isize::try_from(multiplier).unwrap_or(isize::MAX);
     current
@@ -2490,8 +2508,8 @@ impl TerminalApp {
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             session_persistence_blocked,
             _lock_file: lock_file,
-            mouse_scroll_accumulator: 0.0,
             mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
+            mouse_point_wheel: jterm_core::wheel::WheelAccumulator::default(),
             mouse_wheel_alt_screen: None,
             terminal_mouse_capture: None,
             last_terminal_mouse_motion: None,
@@ -6766,15 +6784,15 @@ impl eframe::App for TerminalApp {
             || (terminal_pointer_input_blocked && reported_capture_release.is_none()))
             || (pointer_pos.is_none() && fallback_cell.is_none())
         {
-            self.mouse_scroll_accumulator = 0.0;
             self.mouse_line_wheel.reset();
+            self.mouse_point_wheel.reset();
             self.mouse_wheel_alt_screen = None;
             Vec::new()
         } else {
             let terminal = mouse_terminal.lock();
             if !terminal.is_mouse_enabled() {
-                self.mouse_scroll_accumulator = 0.0;
                 self.mouse_line_wheel.reset();
+                self.mouse_point_wheel.reset();
                 self.mouse_wheel_alt_screen = None;
                 // The application disabled mouse reporting while a sequence was
                 // active. An unaccepted press can be retired, but a release
@@ -6793,8 +6811,8 @@ impl eframe::App for TerminalApp {
                 let alt_screen = terminal.is_alt_buffer();
                 if self.mouse_wheel_alt_screen != Some(alt_screen) {
                     if self.mouse_wheel_alt_screen.is_some() {
-                        self.mouse_scroll_accumulator = 0.0;
                         self.mouse_line_wheel.reset();
+                        self.mouse_point_wheel.reset();
                     }
                     self.mouse_wheel_alt_screen = Some(alt_screen);
                 }
@@ -6830,7 +6848,6 @@ impl eframe::App for TerminalApp {
                     // 处理鼠标滚轮（当启用鼠标报告时）
                     let line_h = line_height.max(1.0);
                     let mut discrete_scroll_steps: isize = 0;
-                    let mut point_scroll_delta: f32 = 0.0;
 
                     ctx.input(|i| {
                         for event in &i.events {
@@ -6860,37 +6877,19 @@ impl eframe::App for TerminalApp {
                                         );
                                     }
                                     egui::MouseWheelUnit::Point => {
-                                        if delta.y.is_finite() {
-                                            let limit =
-                                                line_h * MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as f32;
-                                            point_scroll_delta =
-                                                (point_scroll_delta + delta.y).clamp(-limit, limit);
-                                        }
+                                        discrete_scroll_steps = bounded_point_wheel_accumulate(
+                                            &mut self.mouse_point_wheel,
+                                            discrete_scroll_steps,
+                                            delta.y,
+                                            line_h,
+                                        );
                                     }
                                 }
                             }
                         }
                     });
 
-                    if point_scroll_delta != 0.0 {
-                        let limit = line_h * MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as f32;
-                        self.mouse_scroll_accumulator = (self.mouse_scroll_accumulator
-                            + point_scroll_delta)
-                            .clamp(-limit, limit);
-                    }
-
-                    let point_scroll_steps = ((self.mouse_scroll_accumulator / line_h) as isize)
-                        .clamp(
-                            -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
-                            MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
-                        );
-                    if point_scroll_steps != 0 {
-                        self.mouse_scroll_accumulator -= point_scroll_steps as f32 * line_h;
-                    }
-
-                    let total_scroll_steps = discrete_scroll_steps
-                        .saturating_add(point_scroll_steps)
-                        .clamp(
+                    let total_scroll_steps = discrete_scroll_steps.clamp(
                             -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
                             MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
                         );
@@ -6950,8 +6949,8 @@ impl eframe::App for TerminalApp {
                     // release-only as well: never reinterpret the new pane's
                     // display coordinates as the old PTY's raw grid. Do not
                     // retain wheel fractions that could fire on re-entry.
-                    self.mouse_scroll_accumulator = 0.0;
                     self.mouse_line_wheel.reset();
+                    self.mouse_point_wheel.reset();
                     self.mouse_wheel_alt_screen = None;
                 }
 
@@ -7478,8 +7477,8 @@ impl Drop for TerminalApp {
 mod tests {
     use super::{
         app_mouse_frame_route, app_mouse_press_reports_from_snapshot, application_cell_at_pointer,
-        bounded_line_wheel_accumulate, bounded_wheel_step_accumulate, captured_release_button,
-        clipboard_5522_response_for_mime,
+        bounded_line_wheel_accumulate, bounded_point_wheel_accumulate, bounded_wheel_step_accumulate,
+        captured_release_button, clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, fontconfig_match_family_file, kitty_graphics_payload,
@@ -8271,6 +8270,16 @@ mod tests {
         acc.reset();
         assert_eq!(bounded_line_wheel_accumulate(&mut acc, 63, 1000.0), 64);
         assert_eq!(bounded_line_wheel_accumulate(&mut acc, -63, -1000.0), -64);
+    }
+
+    #[test]
+    fn point_wheel_fractions_use_cell_height_as_a_notch() {
+        let mut acc = jterm_core::wheel::WheelAccumulator::default();
+        assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 0);
+        assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 0);
+        assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 1);
+        assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, f32::NAN, 10.0), 7);
+        assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, 4.0, 0.0), 7);
     }
     fn encoded_test_png(width: u32, height: u32) -> Vec<u8> {
         let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
