@@ -20,6 +20,14 @@ pub use jterm_core::block_contract::{
     assess_lifecycle, BlockLifecycleHealth, CompletionProvenance,
 };
 
+/// Family finished-card notice when capture stopped at the byte budget.
+/// Ember currently has a single truncation flag (the tail is lost), so this
+/// is always [`FinishedOutputNotice::TextTruncated`], never the head-loss
+/// or both-ends variants.
+pub fn finished_output_notice(truncated: bool) -> Option<&'static str> {
+    truncated.then_some(jterm_core::output_notice::FinishedOutputNotice::TextTruncated.as_str())
+}
+
 /// Compatibility adapter used by JSON and diagnostics.
 pub const fn completion_provenance_schema_name(value: CompletionProvenance) -> &'static str {
     value.schema_name()
@@ -1642,8 +1650,10 @@ pub fn block_markdown_with_lifecycle(
     } else if command.is_some() && !block.command_exact {
         meta.push_str("- Note: command reconstructed from screen\n");
     }
-    if block.output_truncated {
-        meta.push_str("- Note: output truncated\n");
+    if let Some(notice) = finished_output_notice(block.output_truncated) {
+        meta.push_str("- Note: ");
+        meta.push_str(notice);
+        meta.push('\n');
     }
     if has_command_provenance {
         match (start_mark_seen, provenance) {
@@ -3027,7 +3037,7 @@ mod tests {
                 "- Exit: 0",
                 "- Cwd: /src",
                 "- Note: command reconstructed from screen",
-                "- Note: output truncated",
+                "- Note: Output text truncated",
             ]
         );
         // A background block (no command) never carries the reconstruction
@@ -3277,5 +3287,20 @@ mod tests {
             None
         );
         assert_eq!(oldest_failed_index(&[]), None);
+    }
+
+    #[test]
+    fn truncated_output_uses_the_family_finished_notice() {
+        assert_eq!(finished_output_notice(false), None);
+        assert_eq!(
+            finished_output_notice(true),
+            Some(jterm_core::output_notice::OUTPUT_TEXT_TRUNCATED)
+        );
+        assert_eq!(
+            jterm_core::output_notice::known_output_notice(
+                finished_output_notice(true).unwrap()
+            ),
+            Some(jterm_core::output_notice::OUTPUT_TEXT_TRUNCATED)
+        );
     }
 }

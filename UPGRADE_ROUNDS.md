@@ -837,3 +837,11 @@ query answers, control handling and resize.
      posts the shared `notify::attention` toast, rate-limited per pane
      through `bell_should_notify`. OSC 9/777 BEL terminators are not bells.
 
+157. **Finished-card truncation uses the family notice** — markdown and the
+     command-detail pane said "output truncated" in Ember-only wording.
+     Capture that stops at the byte budget now shows
+     `Output text truncated` (and its tooltip) through
+     `jterm_core::output_notice`, so restore/export gates match anvil/forge.
+     Head-loss / both-ends variants wait on a dropped-front flag Ember
+     does not yet record.
+

@@ -4774,6 +4774,19 @@ fn render_command_detail(
                             .small()
                             .strong(),
                     );
+                    if let Some(notice) = crate::block_mode::finished_output_notice(output.truncated)
+                    {
+                        ui.label(
+                            egui::RichText::new(notice)
+                                .small()
+                                .italics()
+                                .color(ui.visuals().weak_text_color()),
+                        )
+                        .on_hover_text(
+                            jterm_core::output_notice::output_notice_tooltip(notice)
+                                .unwrap_or_default(),
+                        );
+                    }
                     egui::ScrollArea::vertical()
                         .id_salt((
                             "semantic_command_detail_output",

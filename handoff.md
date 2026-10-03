@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 157 — finished output notice)
+
+## 2026-10-03 (family output-loss notice)
+
+- Markdown Note and command-detail now use
+  `FinishedOutputNotice::TextTruncated` (`Output text truncated`) instead
+  of the Ember-only "output truncated" line. Unique round **157**. Test:
+  `truncated_output_uses_the_family_finished_notice`.
+
 Updated: 2026-10-03 (upgrade round 156 — BEL toast)
 
 ## 2026-10-03 (unfocused BEL)
