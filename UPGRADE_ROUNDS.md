@@ -856,3 +856,8 @@ query answers, control handling and resize.
      the tree to the local endpoint. Abbreviated `~` labels are not used as
      paths; only an absolute report navigates.
 
+160. **Find walks a byte budget** — overlay search already capped match
+     count at 20_000 but still scanned an unbounded scrollback each frame.
+     After 8 MiB of line text it now stops and reports truncated, so a
+     rare needle in a huge buffer cannot freeze the UI.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 160 — find scan budget)
+
+## 2026-10-03 (find overlay scan budget)
+
+- `SearchEngine` stops after `MAX_SEARCH_SCAN_BYTES` (8 MiB) of line
+  text and marks the result truncated. Unique round **160**. Test:
+  `find_scan_budget_stops_before_later_lines`.
+
 Updated: 2026-10-03 (upgrade round 159 — bottom-bar cwd click)
 
 ## 2026-10-03 (cwd segment opens Files)

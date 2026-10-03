@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 /// Bound both renderer work and memory when a broad query (notably a single
 /// space) is run against a very large scrollback.
 pub const MAX_SEARCH_MATCHES: usize = 20_000;
+/// Stop walking the buffer after this many UTF-8 bytes of line text so a
+/// huge scrollback cannot stall the find overlay for one frame.
+pub const MAX_SEARCH_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
 /// 编译后的正则缓存槽。由 `SearchState` 持有,这样搜索面板打开期间
 /// 每次刷新(PTY 输出、按键)只要 pattern 与大小写标志未变,就复用同一个
@@ -279,15 +282,33 @@ impl SearchEngine {
         case_sensitive: bool,
         regex_cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, Option<String>, bool) {
+        Self::search_with_scan_budget(
+            terminal,
+            query,
+            use_regex,
+            case_sensitive,
+            regex_cache,
+            MAX_SEARCH_SCAN_BYTES,
+        )
+    }
+
+    pub(crate) fn search_with_scan_budget(
+        terminal: &crate::terminal::TerminalState,
+        query: &str,
+        use_regex: bool,
+        case_sensitive: bool,
+        regex_cache: &mut Option<RegexCache>,
+        scan_budget: usize,
+    ) -> (Vec<SearchMatch>, Option<String>, bool) {
         if query.is_empty() {
             return (Vec::new(), None, false);
         }
 
         if use_regex {
-            Self::search_regex(terminal, query, case_sensitive, regex_cache)
+            Self::search_regex(terminal, query, case_sensitive, regex_cache, scan_budget)
         } else {
             let (matches, truncated) =
-                Self::search_plaintext(terminal, query, case_sensitive, regex_cache);
+                Self::search_plaintext(terminal, query, case_sensitive, regex_cache, scan_budget);
             (matches, None, truncated)
         }
     }
@@ -330,14 +351,20 @@ impl SearchEngine {
     /// decompress → 重建字符串的往返。
     fn for_each_line(
         terminal: &crate::terminal::TerminalState,
+        scan_budget: usize,
         mut f: impl FnMut(u64, &str, Option<&[usize]>, usize) -> bool,
     ) -> bool {
+        let mut scanned = 0usize;
         if !terminal.is_alt_buffer() {
             let first_line_id = terminal
                 .total_lines_scrolled
                 .saturating_sub(terminal.scrollback.len() as u64);
             for (line_idx, compressed) in terminal.scrollback.iter().enumerate() {
+                if scanned >= scan_budget {
+                    return true;
+                }
                 let (line_str, col_map, total_cols) = compressed.search_text();
+                scanned = scanned.saturating_add(line_str.len());
                 if f(
                     first_line_id.saturating_add(line_idx as u64),
                     &line_str,
@@ -350,7 +377,11 @@ impl SearchEngine {
         }
 
         for (line_idx, line) in terminal.grid.iter().enumerate() {
+            if scanned >= scan_budget {
+                return true;
+            }
             let (line_str, col_map, total_cols) = crate::terminal::searchable_line_text(line);
+            scanned = scanned.saturating_add(line_str.len());
             if f(
                 terminal
                     .total_lines_scrolled
@@ -380,6 +411,7 @@ impl SearchEngine {
         query: &str,
         case_sensitive: bool,
         regex_cache: &mut Option<RegexCache>,
+        scan_budget: usize,
     ) -> (Vec<SearchMatch>, bool) {
         let mut matches = Vec::new();
 
@@ -387,7 +419,7 @@ impl SearchEngine {
         // 连转义字面量正则的编译都省掉。
         if case_sensitive {
             let truncated =
-                Self::for_each_line(terminal, |line_id, line_str, col_map, total_cols| {
+                Self::for_each_line(terminal, scan_budget, |line_id, line_str, col_map, total_cols| {
                     Self::append_substring_matches(
                         &mut matches,
                         line_id,
@@ -406,7 +438,7 @@ impl SearchEngine {
         // 编译结果经 RegexCache 在搜索面板打开期间跨刷新复用。
         let regex = Self::cached_regex(regex_cache, &regex::escape(query), false)
             .expect("an escaped literal must compile as a regex");
-        let truncated = Self::for_each_line(terminal, |line_id, line_str, col_map, total_cols| {
+        let truncated = Self::for_each_line(terminal, scan_budget, |line_id, line_str, col_map, total_cols| {
             Self::append_plaintext_regex_matches(
                 &mut matches,
                 line_id,
@@ -488,6 +520,7 @@ impl SearchEngine {
         pattern: &str,
         case_sensitive: bool,
         regex_cache: &mut Option<RegexCache>,
+        scan_budget: usize,
     ) -> (Vec<SearchMatch>, Option<String>, bool) {
         let mut matches = Vec::new();
 
@@ -495,7 +528,7 @@ impl SearchEngine {
             Ok(regex) => regex,
             Err(e) => return (Vec::new(), Some(e), false),
         };
-        let truncated = Self::for_each_line(terminal, |line_id, line_str, col_map, total_cols| {
+        let truncated = Self::for_each_line(terminal, scan_budget, |line_id, line_str, col_map, total_cols| {
             Self::append_regex_matches(&mut matches, line_id, line_str, col_map, total_cols, regex)
         });
         (matches, None, truncated)
@@ -790,6 +823,28 @@ mod tests {
         assert!(error.is_none());
         assert!(!truncated);
         assert!(padding_matches.is_empty());
+    }
+
+    #[test]
+    fn find_scan_budget_stops_before_later_lines() {
+        let mut terminal = crate::terminal::TerminalState::new(8, 3);
+        terminal.process_input(b"aaaa\r\nzzzz\r\n");
+        let (matches, error, truncated) = SearchEngine::search_with_scan_budget(
+            &terminal,
+            "zzzz",
+            false,
+            true,
+            &mut None,
+            4,
+        );
+        assert!(error.is_none());
+        assert!(truncated);
+        assert!(matches.is_empty());
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "zzzz", false, true, &mut None);
+        assert!(error.is_none());
+        assert!(!truncated);
+        assert_eq!(matches.len(), 1);
     }
 
     #[test]
