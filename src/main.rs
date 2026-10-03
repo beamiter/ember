@@ -5251,6 +5251,12 @@ impl eframe::App for TerminalApp {
         );
         let mut terminal_parse_time = background_parse_started.elapsed();
         let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        for session in self.session_manager.sessions() {
+            session
+                .terminal
+                .lock()
+                .set_host_window_focused(window_focused);
+        }
         for (session_idx, completed) in background_pump.completed_command_events.drain(..) {
             if let Some(session) = self.session_manager.sessions().get(session_idx) {
                 self.agent_panel

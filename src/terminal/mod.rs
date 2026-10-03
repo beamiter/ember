@@ -658,6 +658,9 @@ pub struct TerminalState {
     pub preedit_cursor: usize,
 
     modes: TerminalModes,
+    /// Last observed host-window focus. DECSET 1004 reports CSI I/O against
+    /// this, and enabling 1004 while focused emits CSI I immediately.
+    host_window_focused: bool,
 
     // Output buffer for DSR/CPR responses to be sent back to PTY
     pub output_buffer: Vec<u8>,

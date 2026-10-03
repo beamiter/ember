@@ -2285,8 +2285,14 @@ impl super::TerminalState {
                 self.modes.insert(25);
             }
             1004 => {
-                // Focus event reporting
+                // Focus event reporting (CSI I / CSI O). If the window is
+                // already focused, report that immediately so a client that
+                // probes then waits for the first I is not stuck until Alt-Tab.
+                let newly = !self.modes.contains(&1004);
                 self.modes.insert(1004);
+                if newly && self.host_window_focused {
+                    self.output_buffer.extend_from_slice(b"\x1b[I");
+                }
             }
             2004 => {
                 // Bracketed paste mode

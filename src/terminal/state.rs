@@ -366,6 +366,7 @@ impl super::TerminalState {
             scroll_region_top: 0,
             scroll_region_bottom: rows.saturating_sub(1),
             modes,
+            host_window_focused: false,
             output_buffer: Vec::new(),
             keyboard_enhancement_flags: 0,
             keyboard_enhancement_stack: Vec::new(),
@@ -912,6 +913,41 @@ impl super::TerminalState {
                     break;
                 }
             }
+        }
+    }
+
+    fn reset_keyboard_enhancement(&mut self) {
+        self.keyboard_enhancement_flags = 0;
+        self.keyboard_enhancement_stack.clear();
+    }
+
+    pub fn is_focus_event_mode(&self) -> bool {
+        self.modes.contains(&1004)
+    }
+
+    /// Remember whether the host window is focused and emit CSI I/O when
+    /// DECSET 1004 is active and the value actually changed.
+    pub fn set_host_window_focused(&mut self, focused: bool) {
+        if self.host_window_focused == focused {
+            return;
+        }
+        self.host_window_focused = focused;
+        if focused {
+            self.emit_focus_in();
+        } else {
+            self.emit_focus_out();
+        }
+    }
+
+    fn emit_focus_in(&mut self) {
+        if self.modes.contains(&1004) {
+            self.output_buffer.extend_from_slice(b"\x1b[I");
+        }
+    }
+
+    fn emit_focus_out(&mut self) {
+        if self.modes.contains(&1004) {
+            self.output_buffer.extend_from_slice(b"\x1b[O");
         }
     }
 
@@ -2699,6 +2735,9 @@ impl super::TerminalState {
         // local input and any approval that never reached command start.
         self.agent_prompt_input_tainted = false;
         self.record_abandoned_armed_agent_command(true);
+        // A client that exits without popping kitty keyboard flags must not
+        // leave the next prompt encoding CSI-u / Shift+Enter-as-newline.
+        self.reset_keyboard_enhancement();
         let anchor = self.current_buffer_anchor();
 
         // Only coalesce truly duplicated A markers. A new A on the same row

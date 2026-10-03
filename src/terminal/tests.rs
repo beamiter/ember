@@ -3671,6 +3671,66 @@ fn report_all_keys_follows_the_kitty_flag_not_mode_2031() {
     assert!(!terminal.is_report_all_keys_enabled());
 }
 
+#[test]
+fn kitty_keyboard_flags_are_forgotten_at_the_shell_prompt() {
+    let mut terminal = TerminalState::new(8, 2);
+
+    terminal.process_input(b"\x1b[>1u");
+    assert_eq!(terminal.keyboard_enhancement_flags(), 1);
+
+    terminal.process_input(b"\x1b]133;A\x1b\\");
+    assert_eq!(
+        terminal.keyboard_enhancement_flags(),
+        0,
+        "OSC 133 A must drop a client that exited without popping"
+    );
+
+    terminal.process_input(b"\x1b[?u");
+    assert_eq!(terminal.get_output(), b"\x1b[?0u");
+}
+
+#[test]
+fn focus_event_mode_reports_csi_i_and_o() {
+    let mut terminal = TerminalState::new(8, 2);
+
+    terminal.process_input(b"\x1b[?1004h");
+    assert!(terminal.get_output().is_empty());
+
+    terminal.set_host_window_focused(true);
+    assert_eq!(terminal.get_output(), b"\x1b[I");
+
+    terminal.set_host_window_focused(true);
+    assert!(
+        terminal.get_output().is_empty(),
+        "unchanged focus must not re-report"
+    );
+
+    terminal.set_host_window_focused(false);
+    assert_eq!(terminal.get_output(), b"\x1b[O");
+
+    terminal.process_input(b"\x1b[?1004l");
+    terminal.set_host_window_focused(true);
+    assert!(
+        terminal.get_output().is_empty(),
+        "disabled 1004 reports nothing"
+    );
+}
+
+#[test]
+fn enabling_focus_events_while_focused_reports_csi_i() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.set_host_window_focused(true);
+    assert!(terminal.get_output().is_empty());
+
+    terminal.process_input(b"\x1b[?1004h");
+    assert_eq!(terminal.get_output(), b"\x1b[I");
+    terminal.process_input(b"\x1b[?1004h");
+    assert!(
+        terminal.get_output().is_empty(),
+        "re-enabling an already-set mode must not duplicate CSI I"
+    );
+}
+
 fn paste_token_from_event(event: &[u8]) -> String {
     use base64::Engine as _;
 

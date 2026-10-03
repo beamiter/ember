@@ -1,5 +1,20 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade rounds 151–153)
+
+## 2026-10-03 (focus, kitty prompt, PointerGone)
+
+- **151** ClickTracker cancels on `PointerGone` / window-focus loss so a
+  release after leaving the window cannot walk the caret.
+- **152** OSC 133 `A` resets kitty keyboard flags/stack so a crashed TUI
+  cannot leave CSI-u encoding on the next prompt.
+- **153** DECSET 1004 emits CSI I/O on host-window focus changes, and
+  enabling it while focused reports CSI I immediately.
+- Tests: `click_cursor_pointer_gone_does_not_synthesize_arrows`,
+  `kitty_keyboard_flags_are_forgotten_at_the_shell_prompt`,
+  `focus_event_mode_reports_csi_i_and_o`,
+  `enabling_focus_events_while_focused_reports_csi_i`.
+
 Updated: 2026-10-03 (upgrade round 150 — ClickTracker click-to-caret)
 
 ## 2026-10-03 (click-to-caret ClickTracker)

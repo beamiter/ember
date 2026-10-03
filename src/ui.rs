@@ -3775,7 +3775,15 @@ impl TerminalRenderer {
                     .iter()
                     .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
         });
-        if scrolled || self.dragging_scrollbar {
+        let pointer_left_window = ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerGone | egui::Event::WindowFocused(false)
+                )
+            })
+        });
+        if scrolled || self.dragging_scrollbar || pointer_left_window {
             self.click_tracker.cancel();
             self.click_tracker_terminal = None;
         }
@@ -6504,6 +6512,79 @@ mod tests {
         assert!(
             renderer.cursor_move_input.is_empty(),
             "leaving the pressed cell is a selection drag, not caret movement"
+        );
+    }
+
+    #[test]
+    fn click_cursor_pointer_gone_does_not_synthesize_arrows() {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let mut terminal = crate::terminal::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
+        let press = egui::pos2(32.0, 10.0);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
+        fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+            let mut output = ctx.run_ui(input, f);
+            output.textures_delta.clear();
+        }
+        let paint = |renderer: &mut TerminalRenderer,
+                     terminal: &mut crate::terminal::TerminalState,
+                     events: Vec<egui::Event>| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = renderer.render(
+                        ui,
+                        terminal,
+                        true,
+                        true,
+                        &crate::search::SearchState::default(),
+                        &[],
+                        &None,
+                    );
+                },
+            );
+        };
+        paint(&mut renderer, &mut terminal, Vec::new());
+        paint(
+            &mut renderer,
+            &mut terminal,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        renderer.cursor_move_input.clear();
+        paint(&mut renderer, &mut terminal, vec![egui::Event::PointerGone]);
+        paint(
+            &mut renderer,
+            &mut terminal,
+            vec![egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            renderer.cursor_move_input.is_empty(),
+            "PointerGone must cancel click-to-caret before a later release"
         );
     }
 

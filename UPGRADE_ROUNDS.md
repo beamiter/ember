@@ -806,3 +806,16 @@ query answers, control handling and resize.
      renderer reused on another PTY drops an in-flight gesture instead of
      delivering leftover arrows.
 
+151. **Click-to-caret cancels on PointerGone** — leaving the window without a
+     last pointer position used to keep the press armed, so a later release
+     could still walk the caret. `PointerGone` and `WindowFocused(false)` now
+     cancel the tracker like anvil's motion-leave.
+152. **Kitty keyboard flags die at OSC 133 A** — a crashed Codex/Claude that
+     pushed `CSI > 1 u` without popping no longer leaves the next jsh prompt
+     encoding CSI-u / Shift+Enter-as-newline. The stack is forgotten when the
+     shell reclaims the prompt, matching the family contract.
+153. **DECSET 1004 reports CSI I / CSI O** — focus-event mode was stored and
+     answered by DECRQM but never wrote the sequences vim/tmux/neovim wait
+     for. Window focus changes emit them, and enabling 1004 while already
+     focused reports CSI I immediately so a probe is not stuck until Alt-Tab.
+
