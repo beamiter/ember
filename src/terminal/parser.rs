@@ -585,10 +585,12 @@ impl super::TerminalState {
         self.saved_state = None;
         self.origin_mode = false;
         self.insert_mode = false;
-        // DECTCEM and DECAWM on, DECCKM (application cursor keys) off.
+        // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
+        // DECKPAM (application keypad) off.
         self.modes.insert(25);
         self.modes.insert(7);
         self.modes.remove(&1);
+        self.modes.remove(&66);
         self.pending_wrap = false;
     }
 
@@ -599,7 +601,7 @@ impl super::TerminalState {
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
             6 => self.origin_mode,
-            1 | 7 | 25 | 47 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
+            1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
                 self.modes.contains(&mode)
             }
             _ => return 0,
@@ -820,18 +822,18 @@ impl super::TerminalState {
                             }
                         }
                         b'>' => {
-                            // ESC > - DECKPNM (Keypad Numeric Mode) or other private sequence
-                            // Just skip it and any following bytes that are part of it
-                            i += 2;
-                        }
-                        b'<' => {
-                            // ESC < - DECKPM (Keypad Application Mode) or other private sequence
-                            // Just skip it
+                            // ESC > - DECKPNM (numeric keypad)
+                            self.modes.remove(&66);
                             i += 2;
                         }
                         b'=' => {
-                            // ESC = - DECKPAM (Keypad Application Mode)
-                            // Just skip it
+                            // ESC = - DECKPAM (application keypad)
+                            self.modes.insert(66);
+                            i += 2;
+                        }
+                        b'<' => {
+                            // ESC < — not DECKPAM; consume so the following
+                            // byte is not printed.
                             i += 2;
                         }
                         b'(' | b')' => {
@@ -2344,6 +2346,9 @@ impl super::TerminalState {
                 self.cursor_row = self.scroll_region_top;
                 self.cursor_col = 0;
             }
+            66 => {
+                self.modes.insert(66);
+            }
             _ => {
                 // Unknown mode, just store it
                 self.modes.insert(mode);
@@ -2436,6 +2441,9 @@ impl super::TerminalState {
                 self.origin_mode = false;
                 self.cursor_row = 0;
                 self.cursor_col = 0;
+            }
+            66 => {
+                self.modes.remove(&66);
             }
             _ => {
                 // Unknown mode, just remove it

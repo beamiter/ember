@@ -819,3 +819,9 @@ query answers, control handling and resize.
      for. Window focus changes emit them, and enabling 1004 while already
      focused reports CSI I immediately so a probe is not stuck until Alt-Tab.
 
+154. **DECKPAM is a real keypad mode** — `ESC =` / `ESC >` and `CSI ? 66 h/l`
+     now set and clear mode 66, DECRQM answers 1/2 instead of unrecognised 0,
+     and DECSTR returns the keypad to numeric mode. Ember cannot yet tell a
+     numpad Enter from the main Enter (egui collapses both), so encoding
+     `\x1bOM` waits on a location-aware key event.
+

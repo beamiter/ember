@@ -470,6 +470,7 @@ impl TerminalModes {
             1048 => Some(16),
             1005 => Some(17),
             1015 => Some(18),
+            66 => Some(19),
             _ => None,
         }
     }

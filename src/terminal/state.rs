@@ -4509,6 +4509,10 @@ impl super::TerminalState {
         self.modes.contains(&1)
     }
 
+    pub fn is_application_keypad(&self) -> bool {
+        self.modes.contains(&66)
+    }
+
     pub fn is_paste_events_enabled(&self) -> bool {
         self.modes.contains(&5522)
     }

@@ -3731,6 +3731,26 @@ fn enabling_focus_events_while_focused_reports_csi_i() {
     );
 }
 
+#[test]
+fn deckpam_and_deckpnm_toggle_application_keypad() {
+    let mut terminal = TerminalState::new(8, 2);
+
+    terminal.process_input(b"\x1b[?66$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?66;2$y");
+
+    terminal.process_input(b"\x1b=");
+    assert!(terminal.is_application_keypad());
+    terminal.process_input(b"\x1b[?66$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?66;1$y");
+
+    terminal.process_input(b"\x1b>");
+    assert!(!terminal.is_application_keypad());
+    terminal.process_input(b"\x1b[?66h");
+    assert!(terminal.is_application_keypad());
+    terminal.process_input(b"\x1b[?66l");
+    assert!(!terminal.is_application_keypad());
+}
+
 fn paste_token_from_event(event: &[u8]) -> String {
     use base64::Engine as _;
 
@@ -6504,7 +6524,7 @@ fn mouse_reports_honour_urxvt_and_utf8_encodings() {
 fn decstr_soft_reset_restores_the_defined_state() {
     let mut terminal = TerminalState::new(8, 6);
     terminal.process_input(
-        b"\x1b7\x1b[2;4r\x1b[?6h\x1b[4h\x1b[?7l\x1b[?25l\x1b[?1h\x1b[1;31m\x1b(0\x1b[2;3HX",
+        b"\x1b7\x1b[2;4r\x1b[?6h\x1b[4h\x1b[?7l\x1b[?25l\x1b[?1h\x1b=\x1b[1;31m\x1b(0\x1b[2;3HX",
     );
 
     terminal.process_input(b"\x1b[!p");
@@ -6523,6 +6543,10 @@ fn decstr_soft_reset_restores_the_defined_state() {
     assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 3));
     terminal.process_input(b"q");
     assert_eq!(terminal.grid[2][3].character, 'q');
+    assert!(
+        !terminal.is_application_keypad(),
+        "DECSTR returns the keypad to numeric mode"
+    );
 }
 
 /// An explicit 0 count means 1 (xterm): `CSI 0 A` used to be a no-op and

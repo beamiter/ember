@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 154 — DECKPAM)
+
+## 2026-10-03 (DECKPAM mode 66)
+
+- `ESC =` / `ESC >` and `CSI ? 66 h/l` toggle application keypad. DECRQM
+  answers 1/2. DECSTR clears it. Numpad Enter `\x1bOM` is not encoded yet:
+  egui maps NumpadEnter to `Key::Enter` with no location. Unique round **154**.
+
 Updated: 2026-10-03 (upgrade rounds 151–153)
 
 ## 2026-10-03 (focus, kitty prompt, PointerGone)
