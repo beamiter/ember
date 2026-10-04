@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 175 — custom theme names)
+
+## 2026-10-04 (themes)
+
+- Custom theme name drafts drop path syntax and rewrite spoofing; save
+  refuses U+FFFD. Unique round **175**. Test:
+  `custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope`.
+
 Updated: 2026-10-04 (upgrade round 174 — typed text spoofing)
 
 ## 2026-10-04 (keyboard)

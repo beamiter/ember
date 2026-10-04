@@ -1,6 +1,5 @@
 use crate::config::{AppRendererType, Config, TabBarPosition};
-use crate::theme::Theme;
-use crate::theme::ThemeExt as _;
+use crate::theme::{bound_custom_theme_name, validate_saved_custom_theme_name, Theme, ThemeExt as _};
 use egui::{Color32, RichText};
 use jterm_core::jsh_remote::RemoteHostConfig;
 
@@ -927,8 +926,11 @@ fn render_theme_editor(
 
     if should_save {
         if let Some(theme) = editing_theme.as_mut() {
-            theme.name.clone_from(custom_theme_name);
-            if let Err(e) = theme.save_custom_theme() {
+            theme.name = bound_custom_theme_name(custom_theme_name.clone());
+            custom_theme_name.clone_from(&theme.name);
+            if let Err(error) = validate_saved_custom_theme_name(&theme.name) {
+                *custom_theme_error = Some(error);
+            } else if let Err(e) = theme.save_custom_theme() {
                 eprintln!("[Theme] Failed to save: {}", e);
                 *custom_theme_error = Some(format!("Failed to save theme: {e}"));
             } else {
@@ -955,6 +957,7 @@ fn render_theme_editor(
 
     ui.horizontal(|ui| {
         ui.label("Name:");
+        *custom_theme_name = bound_custom_theme_name(std::mem::take(custom_theme_name));
         if ui.text_edit_singleline(custom_theme_name).changed() {
             *custom_theme_error = None;
         }

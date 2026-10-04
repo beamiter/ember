@@ -6,6 +6,44 @@ use egui::Color32;
 
 pub use jterm_core::theme::*;
 
+/// Matches core's custom-theme filename envelope so the editor cannot hold
+/// more than `Theme::validate_custom_theme_name` will accept.
+#[allow(dead_code)] // consumed by the binary-only settings theme editor
+pub(crate) const MAX_CUSTOM_THEME_NAME_BYTES: usize = 160;
+
+#[allow(dead_code)] // consumed by the binary-only settings theme editor
+pub(crate) fn bound_custom_theme_name(name: impl Into<String>) -> String {
+    let mut bounded = String::new();
+    for ch in name.into().chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\') {
+            continue;
+        }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if bounded.len().saturating_add(ch.len_utf8()) > MAX_CUSTOM_THEME_NAME_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
+/// Persist-time check: the editor may show U+FFFD after ingest, but a
+/// replacement character must not become a theme filename.
+#[allow(dead_code)] // consumed by the binary-only settings theme editor
+pub(crate) fn validate_saved_custom_theme_name(name: &str) -> Result<(), String> {
+    if name.contains('\u{fffd}') {
+        return Err(
+            "Name cannot contain path separators, controls, or invisible formatting characters"
+                .to_string(),
+        );
+    }
+    Theme::validate_custom_theme_name(name)
+}
+
 /// egui color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color32;
@@ -62,5 +100,26 @@ impl ThemeExt for Theme {
         } else {
             Self::rgb_to_color32(self.terminal.foreground)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope() {
+        assert_eq!(bound_custom_theme_name("dusk\n\u{1b}/night\\"), "dusknight");
+        let spoofed = bound_custom_theme_name("ok\u{202e}");
+        assert_eq!(spoofed, "ok\u{fffd}");
+        assert!(!spoofed.contains('\u{202e}'));
+        let filled =
+            bound_custom_theme_name(format!("{}y", "x".repeat(MAX_CUSTOM_THEME_NAME_BYTES)));
+        assert_eq!(filled.len(), MAX_CUSTOM_THEME_NAME_BYTES);
+        assert!(!filled.contains('y'));
+        assert!(Theme::validate_custom_theme_name(&filled).is_ok());
+        assert!(validate_saved_custom_theme_name(&filled).is_ok());
+        assert!(validate_saved_custom_theme_name("ok\u{fffd}").is_err());
+        assert!(validate_saved_custom_theme_name("ok\u{202e}").is_err());
     }
 }

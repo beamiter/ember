@@ -933,3 +933,8 @@ query answers, control handling and resize.
      could reach the child as keystrokes. They are now filtered the way frost
      skips spoofing in committed modifyOtherKeys text.
 
+175. **Custom theme names refuse U+FFFD filenames** — the editor stored a
+     spoofed or replacement-glyph name that core's validator does not catch.
+     Drafts now drop path syntax and rewrite spoofing; save refuses U+FFFD
+     so a theme file cannot be named with a replacement glyph.
+
