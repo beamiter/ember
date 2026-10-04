@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 177 — find history restore)
+
+## 2026-10-04 (find history)
+
+- Persisted find queries are sanitised on restore. Unique round **177**.
+  Test: `restored_find_history_drops_empty_and_rewrites_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 176 — find query bound)
 
 ## 2026-10-04 (find)

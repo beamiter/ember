@@ -943,3 +943,7 @@ query answers, control handling and resize.
      and sat in search history. Queries now drop controls, rewrite spoofing
      as U+FFFD, and truncate on a UTF-8 boundary like frost.
 
+177. **Restored find history is sanitised** — `ui_history.json` could put a
+     control or bidi query back into the overlay. Restore now uses the same
+     bound as live typing and drops entries that sanitise to empty.
+

@@ -181,6 +181,18 @@ impl SearchState {
         }
     }
 
+    /// Load persisted find history. Each query is run through the same bound
+    /// as the overlay field so a hostile `ui_history.json` cannot put controls
+    /// back into the search box.
+    pub fn restore_history(&mut self, entries: impl IntoIterator<Item = SearchHistoryEntry>) {
+        for mut entry in entries.into_iter().take(50) {
+            entry.query = bound_query_text(entry.query);
+            if !entry.query.is_empty() {
+                self.history.push_back(entry);
+            }
+        }
+    }
+
     pub fn clear_projection_diagnostic(&mut self) {
         self.projection_message = None;
         self.hidden_projection_zone = None;
@@ -623,6 +635,28 @@ mod tests {
         assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
         assert!(!state.query.contains('z'));
         assert!(state.query.is_char_boundary(state.query.len()));
+    }
+
+    #[test]
+    fn restored_find_history_drops_empty_and_rewrites_spoofing() {
+        let mut state = SearchState::new();
+        state.restore_history([
+            SearchHistoryEntry {
+                query: "\n\u{1b}".to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                timestamp: "1".to_string(),
+            },
+            SearchHistoryEntry {
+                query: "ok\u{202e}needle".to_string(),
+                is_regex: true,
+                case_sensitive: true,
+                timestamp: "2".to_string(),
+            },
+        ]);
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].query, "ok\u{fffd}needle");
+        assert!(state.history[0].is_regex);
     }
 
     #[test]

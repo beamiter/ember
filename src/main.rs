@@ -2425,9 +2425,7 @@ impl TerminalApp {
         let mut command_palette = command_palette::CommandPalette::new();
         command_palette.restore_recent_commands(history.recent_commands);
         let mut search_state = search::SearchState::new();
-        for entry in history.search_history.into_iter().take(50) {
-            search_state.history.push_back(entry);
-        }
+        search_state.restore_history(history.search_history);
         // 配置读不出来时优先报告它:此后所有保存都被拒绝(见 Config::load_error),
         // 不说的话用户只会看到"设置改了但重启就没了"。
         let startup_notice = match &cfg.load_error {
