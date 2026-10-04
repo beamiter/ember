@@ -3528,7 +3528,7 @@ fn decrqss_reports_cursor_style_and_scroll_region() {
         "\x1bP1$r2;4r\x1b\\"
     );
 
-    terminal.process_input(b"\x1bP$q\"q\x1b\\");
+    terminal.process_input(b"\x1bP$q\"p\x1b\\");
     assert_eq!(
         String::from_utf8(terminal.get_output()).unwrap(),
         "\x1bP0$r\x1b\\"
@@ -3539,6 +3539,21 @@ fn decrqss_reports_cursor_style_and_scroll_region() {
     assert_eq!(
         String::from_utf8(terminal.get_output()).unwrap(),
         "\x1bP1$r6 q\x1b\\"
+    );
+}
+
+#[test]
+fn decrqss_reports_decsca() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1bP$q\"q\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r0\"q\x1b\\"
+    );
+    terminal.process_input(b"\x1b[\"1q\x1bP$q\"q\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r1\"q\x1b\\"
     );
 }
 

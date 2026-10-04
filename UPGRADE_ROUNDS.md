@@ -986,3 +986,7 @@ query answers, control handling and resize.
      marked protected. The attribute now rides on the cell flags; erase
      skips those cells, while a later glyph still overwrites them.
 
+186. **DECRQSS DECSCA** — DCS `$q"q` was invalid even after CSI `"q` was
+     honoured. Ember now reports `0"q` or `1"q` from the current protection
+     attribute.
+

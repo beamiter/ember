@@ -557,6 +557,10 @@ impl super::TerminalState {
                 self.scroll_region_top + 1,
                 self.scroll_region_bottom + 1
             ),
+            b"\"q" => {
+                let n = if self.current_flags.protected() { 1 } else { 0 };
+                format!("\x1bP1$r{n}\"q\x1b\\")
+            }
             _ => "\x1bP0$r\x1b\\".to_string(),
         };
         self.output_buffer.extend_from_slice(reply.as_bytes());

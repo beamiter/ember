@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 186 — DECRQSS DECSCA)
+
+## 2026-10-04 (DECRQSS DECSCA)
+
+- DCS `$q"q` reports the current DECSCA. Unique round **186**. Test:
+  `decrqss_reports_decsca`.
+
 Updated: 2026-10-04 (upgrade round 185 — DECSCA)
 
 ## 2026-10-04 (DECSCA)
