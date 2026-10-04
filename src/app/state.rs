@@ -453,7 +453,7 @@ impl TerminalApp {
     }
 
     pub fn set_status_for<S: Into<String>>(&mut self, msg: S, dur: std::time::Duration) {
-        self.status_message = msg.into();
+        self.status_message = crate::review_text::bound_toast_text(msg.into());
         self.status_expires_at = Some(std::time::Instant::now() + dur);
     }
 

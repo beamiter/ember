@@ -1007,3 +1007,8 @@ query answers, control handling and resize.
      verbatim, so a bidi mark sat in chrome until commit. Drafts now drop
      controls, rewrite spoofing, and cap at the persisted title budget.
 
+191. **Status toasts are bounded** — `set_status` painted interpolated paths
+     and errors verbatim over the terminal. Toasts now go through the same
+     inline-display envelope as frost (controls dropped, spoofing rewritten,
+     256-byte cap).
+

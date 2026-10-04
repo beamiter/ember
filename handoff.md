@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 191 — status toast bound)
+
+## 2026-10-04 (status toast)
+
+- Status toasts are bounded and rewrite spoofing. Unique round **191**.
+  Test: `toast_text_is_bounded_and_rewrites_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 190 — tab-rename draft)
 
 ## 2026-10-04 (tab rename)

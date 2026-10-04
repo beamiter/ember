@@ -190,6 +190,16 @@ pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
     visible
 }
 
+#[allow(dead_code)] // consumed by the binary-only status toast path
+pub(crate) const MAX_TOAST_BYTES: usize = 256;
+
+/// Transient status chrome: interpolated paths and errors must not restyle
+/// the overlay or grow without bound.
+#[allow(dead_code)] // consumed by the binary-only status toast path
+pub(crate) fn bound_toast_text(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_TOAST_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +280,15 @@ mod tests {
         let shown = visible_bounded("safe\u{202e}\ttext", 64);
         assert_eq!(shown, "safe\\u{202E}\\ttext");
         assert!(visible_bounded(&"\u{202e}".repeat(100), 32).len() <= 32);
+    }
+
+    #[test]
+    fn toast_text_is_bounded_and_rewrites_spoofing() {
+        let shown = bound_toast_text("ok\n\u{1b}done\u{202e}");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(!shown.contains('\n'));
+        let overflow = format!("{}z", "x".repeat(MAX_TOAST_BYTES));
+        assert!(bound_toast_text(overflow).len() <= MAX_TOAST_BYTES);
     }
 }
