@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 190 — tab-rename draft)
+
+## 2026-10-04 (tab rename)
+
+- Live tab-rename drafts are bounded and rewrite spoofing. Unique round
+  **190**. Test: `tab_title_draft_is_bounded_and_rewrites_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 189 — Files new-name spoofing)
 
 ## 2026-10-04 (Files new-name)

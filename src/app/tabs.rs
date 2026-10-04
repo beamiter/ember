@@ -555,16 +555,18 @@ impl TerminalApp {
                             }
                             if is_renaming_this {
                                 // 重命名输入框:取出当前 buf,绘制 TextEdit,事件落入 commit/cancel
-                                let mut buf = self
-                                    .renaming_tab
-                                    .as_ref()
-                                    .map(|(_, b)| b.clone())
-                                    .unwrap_or_default();
+                                let mut buf = crate::session_persistence::bound_tab_title_draft(
+                                    self.renaming_tab
+                                        .as_ref()
+                                        .map(|(_, b)| b.clone())
+                                        .unwrap_or_default(),
+                                );
                                 let edit = egui::TextEdit::singleline(&mut buf)
                                     .desired_width(ui.available_width())
                                     .hint_text("(空=清除自定义名)");
                                 let r = ui.add_sized([ui.available_width(), row_h], edit);
                                 r.request_focus();
+                                buf = crate::session_persistence::bound_tab_title_draft(buf);
                                 // 同步回 self
                                 if let Some((_, ref mut existing)) = self.renaming_tab {
                                     *existing = buf.clone();
@@ -2138,11 +2140,12 @@ impl TerminalApp {
         // 渲染重命名输入框:Area 覆盖在 tab 矩形上方,foreground 层级保证可见。
         // commit(Enter)写入 custom_name + 持久化;cancel(Esc/失焦)放弃。
         if let (Some((idx, _)), Some(rect)) = (self.renaming_tab.clone(), renaming_rect) {
-            let mut buf = self
-                .renaming_tab
-                .as_ref()
-                .map(|(_, b)| b.clone())
-                .unwrap_or_default();
+            let mut buf = crate::session_persistence::bound_tab_title_draft(
+                self.renaming_tab
+                    .as_ref()
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_default(),
+            );
             let mut do_commit = false;
             let mut do_cancel = false;
             egui::Area::new(egui::Id::new(("tab_rename_overlay", idx)))
@@ -2176,7 +2179,7 @@ impl TerminalApp {
             } else if do_cancel {
                 self.renaming_tab = None;
             } else if let Some((_, ref mut existing)) = self.renaming_tab {
-                *existing = buf;
+                *existing = crate::session_persistence::bound_tab_title_draft(buf);
             }
         }
 

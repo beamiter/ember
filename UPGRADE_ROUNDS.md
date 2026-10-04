@@ -1003,3 +1003,7 @@ query answers, control handling and resize.
      drop slashes and controls, rewrite spoofing, and validate fail-closed
      on a rewritten needle.
 
+190. **Tab-rename drafts are bounded** — the live rename field stored paste
+     verbatim, so a bidi mark sat in chrome until commit. Drafts now drop
+     controls, rewrite spoofing, and cap at the persisted title budget.
+

@@ -1775,6 +1775,27 @@ pub fn bounded_session_name(value: &str) -> String {
     value
 }
 
+/// Bound the live tab-rename field to the snapshot title envelope so a paste
+/// cannot sit unbounded next to a 256-byte persisted label.
+pub fn bound_tab_title_draft(raw: impl Into<String>) -> String {
+    let mut bounded = String::new();
+    for ch in raw.into().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if bounded.len().saturating_add(ch.len_utf8()) > MAX_SESSION_NAME_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
 fn validate_instance_lock_file(file: &std::fs::File) -> std::io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -2870,6 +2891,16 @@ mod tests {
             bounded_session_name("safe\n\u{202e}spoof\u{7f}"),
             "safespoof"
         );
+    }
+
+    #[test]
+    fn tab_title_draft_is_bounded_and_rewrites_spoofing() {
+        assert_eq!(bound_tab_title_draft("ok\n\u{1b}name"), "okname");
+        assert_eq!(bound_tab_title_draft("ok\u{202e}"), "ok\u{fffd}");
+        let overflow = format!("{}z", "x".repeat(MAX_SESSION_NAME_BYTES));
+        let bounded = bound_tab_title_draft(overflow);
+        assert_eq!(bounded.len(), MAX_SESSION_NAME_BYTES);
+        assert!(!bounded.contains('z'));
     }
 
     #[test]
