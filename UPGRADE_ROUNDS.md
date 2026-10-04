@@ -923,3 +923,8 @@ query answers, control handling and resize.
      spoofed `id=` parameter still interned a clickable target. Those now
      close the current link instead of arming it.
 
+173. **Files listings skip spoofed names** — remote `list` kept newline names
+     and local `read_dir` kept lossy U+FFFD labels, so a click could send a
+     different operand than the one shown. Controls, replacement glyphs, and
+     visual spoofing are now skipped the way frost skips them.
+

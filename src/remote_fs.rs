@@ -2180,6 +2180,9 @@ fn parse_list_with_hidden(bytes: &[u8], dir: &Path, show_hidden: bool) -> Vec<En
         let Ok(name) = std::str::from_utf8(name) else {
             continue;
         };
+        if !listing_name_is_safe(name) {
+            continue;
+        }
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -2208,6 +2211,18 @@ fn parse_list_with_hidden(bytes: &[u8], dir: &Path, show_hidden: bool) -> Vec<En
     entries
 }
 
+fn listing_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.chars().any(|character| {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
+}
+
 /// 与 sidebar::scan_dir 相同的排序：目录在前，名称大小写不敏感。
 fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
@@ -2228,6 +2243,9 @@ fn local_list_dir_with_hidden(dir: &Path, show_hidden: bool) -> io::Result<Vec<E
         }
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !listing_name_is_safe(&name) {
+            continue;
+        }
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -4118,11 +4136,13 @@ docker = true
         bytes.extend_from_slice(b"f\0line\nbreak\0");
         bytes.extend_from_slice(b"f\0bad\xffname\0");
         bytes.extend_from_slice(b"f\0duplicate\0d\0duplicate\0");
+        bytes.extend_from_slice("f\0ok\u{202e}name\0".as_bytes());
         let entries = parse_list(&bytes, Path::new("/base"));
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["line\nbreak", "my file.txt"]);
+        assert_eq!(names, vec!["my file.txt"]);
         assert!(entries.iter().all(|entry| !entry.name.contains('\u{fffd}')));
         assert!(entries.iter().all(|entry| entry.name != "duplicate"));
+        assert!(entries.iter().all(|entry| !entry.name.contains('\n')));
     }
 
     #[test]

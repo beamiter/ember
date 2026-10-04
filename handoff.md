@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 173 — Files listing names)
+
+## 2026-10-04 (Files)
+
+- Directory listings skip control, U+FFFD, and visual-spoofing names.
+  Unique round **173**. Test: `parse_list_keeps_exact_utf8_names_and_rejects_ambiguous_operands`.
+
 Updated: 2026-10-04 (upgrade round 172 — OSC 8 hyperlinks)
 
 ## 2026-10-04 (OSC 8)
