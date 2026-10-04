@@ -773,9 +773,11 @@ impl super::TerminalState {
                     return;
                 }
                 if let Some(decoded) = Self::decode_base64(data) {
-                    if decoded.len() <= OSC52_MAX_BYTES {
+                    if decoded.len() <= OSC52_MAX_BYTES
+                        && !Self::osc52_clipboard_text_is_unsafe(&decoded)
+                    {
                         self.pending_osc52_clipboard_set = Some(decoded);
-                    } else {
+                    } else if decoded.len() > OSC52_MAX_BYTES {
                         crate::debug_log!(
                             "[OSC52] rejecting clipboard set: decoded {} bytes exceeds {}",
                             decoded.len(),
@@ -785,6 +787,18 @@ impl super::TerminalState {
                 }
             }
         }
+    }
+
+    fn osc52_clipboard_text_is_unsafe(text: &str) -> bool {
+        text.chars().any(|character| {
+            if matches!(character, '\n' | '\t' | '\r') {
+                false
+            } else {
+                character.is_control()
+                    || character == '\u{fffd}'
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
+            }
+        })
     }
 
     pub(super) fn handle_osc_5522(&mut self, metadata: &str, payload: Option<&str>) {

@@ -6752,6 +6752,25 @@ fn osc_color_queries_report_theme_colors_with_the_query_terminator() {
     );
 }
 
+#[test]
+fn osc52_set_rejects_visual_spoofing_and_odd_controls() {
+    use base64::Engine as _;
+    let mut terminal = TerminalState::new(8, 2);
+    let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+
+    terminal.process_input(format!("\x1b]52;c;{}\x07", encode("line\nbreak")).as_bytes());
+    assert_eq!(
+        terminal.take_osc52_clipboard_set().as_deref(),
+        Some("line\nbreak")
+    );
+
+    terminal.process_input(format!("\x1b]52;c;{}\x07", encode("ok\u{202e}hidden")).as_bytes());
+    assert_eq!(terminal.take_osc52_clipboard_set(), None);
+
+    terminal.process_input(format!("\x1b]52;c;{}\x07", encode("ok\u{1b}hidden")).as_bytes());
+    assert_eq!(terminal.take_osc52_clipboard_set(), None);
+}
+
 /// XTWINOPS 16 reports the cell size in pixels, from the same metrics as 14.
 #[test]
 fn xtwinops_reports_the_cell_size_in_pixels() {

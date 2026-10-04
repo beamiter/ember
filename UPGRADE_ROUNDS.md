@@ -893,3 +893,8 @@ query answers, control handling and resize.
      replacement-glyph toast in desktop chrome. Frost already refuses those;
      Ember now matches: only an unrewritten title and body reach notify-send.
 
+167. **OSC 52 sets refuse spoofed clipboard text** — a decoded payload with
+     bidi marks, replacement glyphs, or odd C0 (other than CR/LF/TAB) used
+     to land on the host clipboard. Frost already gates this; Ember now
+     rejects those sets and still accepts ordinary multiline text.
+

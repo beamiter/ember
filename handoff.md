@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 167 — OSC 52 spoofing)
+
+## 2026-10-04 (OSC 52)
+
+- Clipboard sets that decode to visual spoofing or odd controls are dropped.
+  Unique round **167**. Test: `osc52_set_rejects_visual_spoofing_and_odd_controls`.
+
 Updated: 2026-10-04 (upgrade round 166 — drop rewritten OSC 9/777)
 
 ## 2026-10-04 (OSC 9/777)
