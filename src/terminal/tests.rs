@@ -3038,6 +3038,23 @@ fn dsr_6_still_reports_the_cursor_position() {
     assert_eq!(terminal.output_buffer.as_slice(), b"\x1b[2;3R");
 }
 
+#[test]
+fn cpr_counts_from_the_origin_and_reports_a_pending_wrap() {
+    let mut terminal = TerminalState::new(4, 6);
+    terminal.process_input(b"\x1b[3;5r\x1b[?6h\x1b[6n");
+    assert_eq!(terminal.get_output(), b"\x1b[1;1R");
+
+    let mut wrapped = TerminalState::new(4, 2);
+    wrapped.process_input(b"abcd\x1b[6n");
+    assert_eq!(
+        wrapped.get_output(),
+        b"\x1b[1;5R",
+        "a wrap pending on the last column reports one past the width"
+    );
+    wrapped.process_input(b"\x1b[?6n");
+    assert_eq!(wrapped.get_output(), b"\x1b[?1;5R");
+}
+
 /// terminfo hands every child `rep`, `cht` and `cbt` for the TERM we set, so a
 /// dispatch that drops CSI b / CSI I / CSI Z renders runs, tab jumps and
 /// back-tabs wrong. frost implements all three; these pin ember to the same.

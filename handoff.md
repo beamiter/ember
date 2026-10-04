@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 164 — CPR origin and wrap)
+
+## 2026-10-04 (CPR / DECXCPR)
+
+- Cursor-position reports count from the scrolling region's top under
+  DECOM, and a deferred wrap answers column `width+1`. Unique round
+  **164**. Test: `cpr_counts_from_the_origin_and_reports_a_pending_wrap`.
+
 Updated: 2026-10-04 (upgrade round 163 — alternate scroll)
 
 ## 2026-10-04 (DECSET 1007 alternate scroll)

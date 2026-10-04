@@ -4528,6 +4528,25 @@ impl super::TerminalState {
         self.modes.contains(&1007)
     }
 
+    /// 1-indexed (row, col) for CPR / DECXCPR. Origin mode counts from the
+    /// top margin; a deferred wrap reports one past the last column so a
+    /// client that wrote the last cell is not told it is still on it.
+    pub fn reported_cursor_position(&self) -> (usize, usize) {
+        let row = if self.origin_mode {
+            self.cursor_row
+                .saturating_sub(self.scroll_region_top)
+                .saturating_add(1)
+        } else {
+            self.cursor_row.saturating_add(1)
+        };
+        let col = if self.pending_wrap {
+            self.grid.row_len().saturating_add(1)
+        } else {
+            self.cursor_col.saturating_add(1)
+        };
+        (row.max(1), col.max(1))
+    }
+
     pub fn is_paste_events_enabled(&self) -> bool {
         self.modes.contains(&5522)
     }

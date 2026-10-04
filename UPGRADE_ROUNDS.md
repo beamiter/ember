@@ -878,3 +878,8 @@ query answers, control handling and resize.
      reporting still owns the wheel; Shift leaves it with the host.
      DECRQM answers 1/2; DECSTR restores the default.
 
+164. **CPR honours origin mode and a pending wrap** — `CSI 6 n` / DECXCPR
+     always used the raw 0-based cell. With DECOM the row is relative to
+     the top margin, and after writing the last column the report is one
+     past the width so the client is not told it is still on that cell.
+

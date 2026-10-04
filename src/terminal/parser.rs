@@ -1530,8 +1530,8 @@ impl super::TerminalState {
             'n' if private_prefix == Some(b'?') => match params.first().copied().unwrap_or(0) {
                 // DECXCPR: like CPR, but the reply carries the `?`.
                 6 => {
-                    let response =
-                        format!("\x1b[?{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+                    let (row, col) = self.reported_cursor_position();
+                    let response = format!("\x1b[?{row};{col}R");
                     self.output_buffer.extend(response.as_bytes());
                 }
                 // Colour-scheme query (contour/kitty/foot): 1 = dark, 2 = light.
@@ -1553,12 +1553,8 @@ impl super::TerminalState {
                     }
                     6 => {
                         // Respond with CPR (Cursor Position Report): ESC[row;colR
-                        // Row and Col are 1-indexed
-                        let row = (self.cursor_row + 1) as u16;
-                        let col = (self.cursor_col + 1) as u16;
-
-                        // Send cursor position response back to PTY
-                        let response = format!("\x1b[{};{}R", row, col);
+                        let (row, col) = self.reported_cursor_position();
+                        let response = format!("\x1b[{row};{col}R");
                         self.output_buffer.extend(response.as_bytes());
                     }
                     _ => {}
