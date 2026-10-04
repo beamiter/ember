@@ -5306,6 +5306,8 @@ impl TerminalRenderer {
         xterm_format_other_keys: u16,
         application_cursor_keys: bool,
         _alt_screen: bool,
+        meta_sends_escape: bool,
+        alt_held: bool,
         events: &[egui::Event],
     ) {
         let report_all_keys = report_all_keys_mode || (keyboard_enhancement_flags & 0b1000) != 0;
@@ -5337,6 +5339,9 @@ impl TerminalRenderer {
                         continue;
                     }
                     if let Some(filtered) = pty_text_payload(text) {
+                        if meta_sends_escape && alt_held && !report_all_keys {
+                            input.push(0x1b);
+                        }
                         input.extend(filtered.as_bytes());
                     }
                 }
@@ -6836,6 +6841,8 @@ mod tests {
             0,
             false,
             false,
+            true,
+            false,
             std::slice::from_ref(&ctrl_left),
         );
         assert_eq!(encoded, b"\x1b[1;5D");
@@ -6874,6 +6881,8 @@ mod tests {
             0,
             false,
             false,
+            true,
+            false,
             std::slice::from_ref(&ctrl_shift_c),
         );
         assert_eq!(encoded, b"\x1b[99;6u");
@@ -6889,6 +6898,8 @@ mod tests {
             0,
             0,
             false,
+            false,
+            true,
             false,
             &[ctrl_shift_c],
         );
@@ -6914,6 +6925,8 @@ mod tests {
             0,
             0,
             false,
+            false,
+            true,
             false,
             &[ctrl_d],
         );
@@ -6952,6 +6965,8 @@ mod tests {
             0,
             false,
             false,
+            true,
+            false,
             &events,
         );
         assert_eq!(encoded, "a你\r".as_bytes());
@@ -6982,10 +6997,59 @@ mod tests {
             0,
             false,
             false,
+            true,
+            false,
             &events,
         );
         assert_eq!(encoded, "okhidden你好".as_bytes());
         assert!(!encoded.contains(&0x1b));
+    }
+
+    #[test]
+    fn alt_text_sends_escape_when_meta_sends_escape_is_set() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let events = [egui::Event::Text("x".to_owned())];
+        let mut encoded = Vec::new();
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0,
+            false,
+            0,
+            0,
+            false,
+            false,
+            true,
+            true,
+            &events,
+        );
+        assert_eq!(encoded, b"\x1bx");
+
+        encoded.clear();
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0,
+            false,
+            0,
+            0,
+            false,
+            false,
+            false,
+            true,
+            &events,
+        );
+        assert_eq!(encoded, b"x");
     }
 
     #[test]

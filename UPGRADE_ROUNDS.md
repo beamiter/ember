@@ -1020,3 +1020,8 @@ query answers, control handling and resize.
      eightBitInput. 1036 now defaults on (xterm), 1034 stays reset (ember
      does not emit C1), and both report set/reset.
 
+194. **Alt text prefixes ESC when 1036 is set** — DECRQM tracked
+     metaSendsEscape but Alt+letter still typed a bare character. With 1036
+     on (the default), a Text event while Alt is held now sends `ESC` then
+     the glyph; CSI-u report-all-keys is left alone.
+

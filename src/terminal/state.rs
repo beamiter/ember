@@ -4546,6 +4546,10 @@ impl super::TerminalState {
         self.modes.contains(&1007)
     }
 
+    pub fn is_meta_sends_escape(&self) -> bool {
+        self.modes.contains(&1036)
+    }
+
     /// 1-indexed (row, col) for CPR / DECXCPR. Origin mode counts from the
     /// top margin; a deferred wrap reports one past the last column so a
     /// client that wrote the last cell is not told it is still on it.

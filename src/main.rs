@@ -5933,6 +5933,7 @@ impl eframe::App for TerminalApp {
                 application_cursor_keys,
                 _application_keypad,
                 alt_screen,
+                meta_sends_escape,
             ) = {
                 let terminal = session.terminal.lock();
                 (
@@ -5943,6 +5944,7 @@ impl eframe::App for TerminalApp {
                     terminal.is_application_cursor_keys(),
                     terminal.is_application_keypad(),
                     terminal.is_alt_buffer_active(),
+                    terminal.is_meta_sends_escape(),
                 )
             };
             // 转换 consumed_keys 为需要的格式（HashSet<&str>）
@@ -5962,6 +5964,8 @@ impl eframe::App for TerminalApp {
                 xterm_format_other_keys,
                 application_cursor_keys,
                 alt_screen,
+                meta_sends_escape,
+                meta_sends_escape && ctx.input(|input| input.modifiers.alt),
                 &terminal_keyboard_events,
             );
             if pointer_over_active_terminal

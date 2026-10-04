@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 194 — metaSendsEscape input)
+
+## 2026-10-04 (metaSendsEscape)
+
+- Alt+text prefixes ESC while DECSET 1036 is set. Unique round **194**.
+  Test: `alt_text_sends_escape_when_meta_sends_escape_is_set`.
+
 Updated: 2026-10-04 (upgrade round 193 — DECSET 1036/1034)
 
 ## 2026-10-04 (DECSET 1036/1034)
