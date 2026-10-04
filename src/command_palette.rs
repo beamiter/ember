@@ -10,6 +10,37 @@ use std::collections::VecDeque;
 /// model with a hole in it and the review card presents the resulting command
 /// as an ordinary suggestion. Refusing is the only honest answer.
 pub const MAX_AI_QUERY_BYTES: usize = 64 * 1024;
+/// One-line overlay query budget, shared with the workflow and history
+/// pickers so a paste cannot grow the field and the fuzzy haystack without bound.
+pub(crate) const MAX_PALETTE_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+fn palette_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
+fn bound_palette_query(query: impl Into<String>) -> String {
+    let mut query: String = query
+        .into()
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
+    if query.len() > MAX_PALETTE_QUERY_BYTES {
+        let mut end = MAX_PALETTE_QUERY_BYTES;
+        while end > 0 && !query.is_char_boundary(end) {
+            end -= 1;
+        }
+        query.truncate(end);
+    }
+    query
+}
 
 /// 命令类别
 #[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -616,7 +647,11 @@ impl CommandPalette {
     pub fn ask_ai_request(&self) -> Option<String> {
         let rest = self.search_query.trim_start().strip_prefix('?')?;
         let rest = rest.trim();
-        if rest.is_empty() || rest.len() > MAX_AI_QUERY_BYTES {
+        if rest.is_empty()
+            || rest.len() > MAX_AI_QUERY_BYTES
+            || rest.contains('\u{fffd}')
+            || jterm_core::review_input::contains_visual_spoofing(rest)
+        {
             None
         } else {
             Some(rest.to_string())
@@ -642,6 +677,15 @@ impl CommandPalette {
     /// 关闭调色板
     pub fn close(&mut self) {
         self.is_open = false;
+    }
+
+    /// Replace the palette query. Control characters are dropped and the byte
+    /// budget is enforced on a char boundary so the overlay field and Ask-AI
+    /// path share one contract.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.search_query = bound_palette_query(query);
+        self.selected_index = 0;
+        self.update_search_results();
     }
 
     /// 更新搜索结果
@@ -681,6 +725,9 @@ impl CommandPalette {
                 self.search_results.push((cmd, 50));
             }
         } else {
+            if palette_query_is_unsafe(&self.search_query) {
+                return;
+            }
             // 使用模糊匹配
             for cmd in &self.all_commands {
                 let search_str = format!("{} {}", cmd.name, cmd.description);
@@ -778,6 +825,23 @@ mod tests {
             .search_results
             .iter()
             .any(|(cmd, _)| { cmd.name.to_lowercase().contains("session") }));
+    }
+
+    #[test]
+    fn palette_query_is_bounded_and_rewritten_queries_do_not_match() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("session\n\u{1b}");
+        assert_eq!(palette.search_query, "session");
+        assert!(!palette.search_results.is_empty());
+        palette.set_query("session\u{202e}");
+        assert_eq!(palette.search_query, "session\u{fffd}");
+        assert!(palette.search_results.is_empty());
+        palette.set_query(format!("{}z", "x".repeat(MAX_PALETTE_QUERY_BYTES)));
+        assert_eq!(palette.search_query.len(), MAX_PALETTE_QUERY_BYTES);
+        assert!(!palette.search_query.contains('z'));
+        palette.set_query("? ok\u{202e}request");
+        assert!(palette.ask_ai_mode());
+        assert_eq!(palette.ask_ai_request(), None);
     }
 
     #[test]

@@ -1379,10 +1379,13 @@ impl TerminalApp {
                     // 搜索输入框
                     ui.horizontal(|ui| {
                         ui.label(if ask_ai_mode { "✨" } else { "🔍" });
+                        let query = std::mem::take(&mut self.command_palette.search_query);
+                        self.command_palette.set_query(query);
                         let search_response =
                             ui.text_edit_singleline(&mut self.command_palette.search_query);
                         if search_response.changed() {
-                            self.command_palette.update_search_results();
+                            let query = std::mem::take(&mut self.command_palette.search_query);
+                            self.command_palette.set_query(query);
                         }
                         if self.command_palette.needs_focus {
                             search_response.request_focus();

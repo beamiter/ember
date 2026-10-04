@@ -957,3 +957,9 @@ query answers, control handling and resize.
      needle. Frost refuses those queries; Ember now reports the same error
      and returns no matches.
 
+180. **Command palette queries are bounded and fail closed** — the overlay
+     stored paste verbatim, so a bidi mark fuzzy-matched commands and an
+     Ask-AI `?` request could carry spoofing into the review path. Queries
+     now drop controls, rewrite spoofing, cap at the picker budget, and
+     refuse rewritten Ask-AI requests.
+

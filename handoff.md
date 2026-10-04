@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 180 — command palette query)
+
+## 2026-10-04 (command palette)
+
+- Palette queries are bounded and rewritten; Ask-AI refuses spoofed requests.
+  Unique round **180**. Test:
+  `palette_query_is_bounded_and_rewritten_queries_do_not_match`.
+
 Updated: 2026-10-04 (upgrade round 179 — find rewritten query)
 
 ## 2026-10-04 (find)
