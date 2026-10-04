@@ -990,3 +990,7 @@ query answers, control handling and resize.
      honoured. Ember now reports `0"q` or `1"q` from the current protection
      attribute.
 
+187. **DECSET 12** — ATT610 cursor-blink was unrecognised (`DECRQM 0`), so
+     a host that probed then enabled blink thought the terminal ignored it.
+     Mode 12 is now tracked and DECRQM reports set/reset.
+

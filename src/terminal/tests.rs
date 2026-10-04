@@ -3877,6 +3877,21 @@ fn alternate_scroll_mode_defaults_on_and_answers_decrqm() {
     );
 }
 
+#[test]
+fn cursor_blink_mode_answers_decrqm() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[?12$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?12;2$y");
+
+    terminal.process_input(b"\x1b[?12h");
+    terminal.process_input(b"\x1b[?12$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?12;1$y");
+
+    terminal.process_input(b"\x1b[?12l");
+    terminal.process_input(b"\x1b[?12$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?12;2$y");
+}
+
 fn paste_token_from_event(event: &[u8]) -> String {
     use base64::Engine as _;
 

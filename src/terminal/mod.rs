@@ -474,6 +474,9 @@ impl TerminalModes {
             // Alternate Scroll: wheel on the alt screen becomes cursor keys
             // when mouse reporting is off (xterm 1007 / alternateScroll).
             1007 => Some(20),
+            // ATT610 / DECSET 12: cursor blink. Ember stores the request so
+            // DECRQM answers truthfully even though the renderer is steady.
+            12 => Some(21),
             _ => None,
         }
     }

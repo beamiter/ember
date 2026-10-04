@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 187 — DECSET 12)
+
+## 2026-10-04 (DECSET 12)
+
+- Cursor-blink mode 12 is tracked and DECRQM answers it. Unique round
+  **187**. Test: `cursor_blink_mode_answers_decrqm`.
+
 Updated: 2026-10-04 (upgrade round 186 — DECRQSS DECSCA)
 
 ## 2026-10-04 (DECRQSS DECSCA)
