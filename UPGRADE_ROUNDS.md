@@ -947,3 +947,8 @@ query answers, control handling and resize.
      control or bidi query back into the overlay. Restore now uses the same
      bound as live typing and drops entries that sanitise to empty.
 
+178. **Cross-block search queries refuse spoofing** — the picker bounded
+     length but kept bidi and C0, so a paste compiled as regex against
+     every block. Frost already rewrites those at ingest and returns
+     `Unsafe` instead of a false empty result; Ember now matches.
+

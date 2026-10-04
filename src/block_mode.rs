@@ -841,6 +841,18 @@ pub const BLOCK_SEARCH_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// `TooLong` and lets Backspace recover, without retaining an arbitrarily
 /// large clipboard paste in picker state.
 pub fn bounded_block_search_query(query: String) -> String {
+    let query: String = query
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
     if query.len() <= BLOCK_SEARCH_QUERY_MAX_BYTES {
         return query;
     }
@@ -861,6 +873,10 @@ pub fn bounded_block_search_query(query: String) -> String {
 pub fn validated_block_search_query(query: &str) -> Result<&str, BlockSearchQueryError> {
     if query.len() > BLOCK_SEARCH_QUERY_MAX_BYTES {
         Err(BlockSearchQueryError::TooLong)
+    } else if query.contains('\u{fffd}')
+        || jterm_core::review_input::contains_visual_spoofing(query)
+    {
+        Err(BlockSearchQueryError::Unsafe)
     } else {
         Ok(query.trim())
     }
@@ -907,6 +923,7 @@ impl BlockSearchScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockSearchQueryError {
     TooLong,
+    Unsafe,
     InvalidRegex(String),
 }
 
@@ -917,6 +934,10 @@ impl std::fmt::Display for BlockSearchQueryError {
                 formatter,
                 "Query is too long (maximum {} bytes)",
                 BLOCK_SEARCH_QUERY_MAX_BYTES
+            ),
+            Self::Unsafe => write!(
+                formatter,
+                "Query contains control or visual-spoofing characters"
             ),
             Self::InvalidRegex(error) => write!(formatter, "Invalid regular expression: {error}"),
         }
@@ -2845,6 +2866,23 @@ mod tests {
             ),
             Err(BlockSearchQueryError::InvalidRegex(_))
         ));
+        let hostile = match search_blocks_with_options(
+            &records,
+            "(\u{1b}[31m\u{202e}",
+            BlockSearchOptions {
+                case_sensitive: false,
+                regex: true,
+                whole_word: false,
+            },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid regex"),
+        };
+        assert_eq!(hostile, BlockSearchQueryError::Unsafe);
+        let shown = hostile.to_string();
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(!shown.contains('\u{fffd}'));
         let oversized = "x".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
         assert!(matches!(
             search_blocks_with_options(
@@ -2886,6 +2924,14 @@ mod tests {
         assert!(compact.len() > BLOCK_SEARCH_QUERY_MAX_BYTES);
         assert_eq!(compact.capacity(), compact.len());
         assert!(validated_block_search_query(&compact).is_err());
+        assert_eq!(
+            bounded_block_search_query("ok\n\u{1b}\u{202e}needle".to_string()),
+            "ok\u{fffd}needle"
+        );
+        assert_eq!(
+            validated_block_search_query("ok\u{fffd}needle"),
+            Err(BlockSearchQueryError::Unsafe)
+        );
     }
 
     #[test]

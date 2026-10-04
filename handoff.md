@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 178 — block search query)
+
+## 2026-10-04 (block search)
+
+- Cross-block search queries drop controls, rewrite spoofing, and fail
+  closed as `Unsafe`. Unique round **178**.
+
 Updated: 2026-10-04 (upgrade round 177 — find history restore)
 
 ## 2026-10-04 (find history)
