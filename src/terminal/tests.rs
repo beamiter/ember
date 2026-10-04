@@ -3558,6 +3558,21 @@ fn decrqss_reports_decsca() {
 }
 
 #[test]
+fn decrqss_reports_sgr() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r0m\x1b\\"
+    );
+    terminal.process_input(b"\x1b[1;31;48;5;17m\x1bP$qm\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r1;31;48;5;17m\x1b\\"
+    );
+}
+
+#[test]
 fn primary_and_secondary_device_attributes_are_reported() {
     let mut terminal = TerminalState::new(8, 2);
 

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 188 — DECRQSS SGR)
+
+## 2026-10-04 (DECRQSS SGR)
+
+- DCS `$qm` reports the current SGR. Unique round **188**. Test:
+  `decrqss_reports_sgr`.
+
 Updated: 2026-10-04 (upgrade round 187 — DECSET 12)
 
 ## 2026-10-04 (DECSET 12)

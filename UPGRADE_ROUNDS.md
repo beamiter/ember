@@ -994,3 +994,7 @@ query answers, control handling and resize.
      a host that probed then enabled blink thought the terminal ignored it.
      Mode 12 is now tracked and DECRQM reports set/reset.
 
+188. **DECRQSS SGR** — DCS `$qm` was invalid, so a host that queried the
+     current rendition heard silence. Ember now reports `0m` or the
+     active flags and colors.
+

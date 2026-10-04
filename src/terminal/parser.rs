@@ -561,9 +561,88 @@ impl super::TerminalState {
                 let n = if self.current_flags.protected() { 1 } else { 0 };
                 format!("\x1bP1$r{n}\"q\x1b\\")
             }
+            b"m" => format!("\x1bP1$r{}\x1b\\", self.decrqss_sgr_payload()),
             _ => "\x1bP0$r\x1b\\".to_string(),
         };
         self.output_buffer.extend_from_slice(reply.as_bytes());
+    }
+
+    fn decrqss_sgr_payload(&self) -> String {
+        let mut params: Vec<String> = Vec::new();
+        if self.current_flags.bold() {
+            params.push("1".into());
+        }
+        if self.current_flags.dim() {
+            params.push("2".into());
+        }
+        if self.current_flags.italic() {
+            params.push("3".into());
+        }
+        match self.current_flags.underline() {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => params.push("4".into()),
+            UnderlineStyle::Double => params.push("21".into()),
+            UnderlineStyle::Curly => params.push("4:3".into()),
+            UnderlineStyle::Dotted => params.push("4:4".into()),
+            UnderlineStyle::Dashed => params.push("4:5".into()),
+        }
+        if self.current_flags.blink() {
+            params.push("5".into());
+        }
+        if self.current_flags.inverse() {
+            params.push("7".into());
+        }
+        if self.current_flags.strikethrough() {
+            params.push("9".into());
+        }
+        params.extend(Self::sgr_color_params(self.current_fg, true));
+        params.extend(Self::sgr_color_params(self.current_bg, false));
+        if params.is_empty() {
+            "0m".into()
+        } else {
+            format!("{}m", params.join(";"))
+        }
+    }
+
+    fn sgr_color_params(color: Color, foreground: bool) -> Vec<String> {
+        let named = |n: u8| {
+            vec![if foreground {
+                n.to_string()
+            } else {
+                (n + 10).to_string()
+            }]
+        };
+        match color {
+            Color::Default => Vec::new(),
+            Color::Black => named(30),
+            Color::Red => named(31),
+            Color::Green => named(32),
+            Color::Yellow => named(33),
+            Color::Blue => named(34),
+            Color::Magenta => named(35),
+            Color::Cyan => named(36),
+            Color::White => named(37),
+            Color::BrightBlack => named(90),
+            Color::BrightRed => named(91),
+            Color::BrightGreen => named(92),
+            Color::BrightYellow => named(93),
+            Color::BrightBlue => named(94),
+            Color::BrightMagenta => named(95),
+            Color::BrightCyan => named(96),
+            Color::BrightWhite => named(97),
+            Color::Indexed(index) => vec![
+                if foreground { "38" } else { "48" }.into(),
+                "5".into(),
+                index.to_string(),
+            ],
+            Color::Rgb(red, green, blue) => vec![
+                if foreground { "38" } else { "48" }.into(),
+                "2".into(),
+                red.to_string(),
+                green.to_string(),
+                blue.to_string(),
+            ],
+        }
     }
 
     /// LF / IND (and VT, FF, NEL's second half): move down one row, scrolling
