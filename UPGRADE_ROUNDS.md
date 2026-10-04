@@ -982,3 +982,7 @@ query answers, control handling and resize.
      DECSCUSR / DECSTBM got silence. Ember now replies `DCS 1 $ r … ST`
      for ` q` and `r`, and `DCS 0 $ r ST` for anything else.
 
+185. **DECSCA** — CSI `"q` was ignored, so ED/EL/ECH wiped cells a host had
+     marked protected. The attribute now rides on the cell flags; erase
+     skips those cells, while a later glyph still overwrites them.
+

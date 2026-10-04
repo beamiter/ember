@@ -239,6 +239,7 @@ pub enum UnderlineStyle {
 ///   bit 8: strikethrough
 ///   bit 9: wide
 ///   bit 10: wide_continuation
+///   bit 11: protected (DECSCA)
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct StyleFlags(u16);
@@ -253,6 +254,7 @@ impl std::fmt::Debug for StyleFlags {
             .field("dim", &self.dim())
             .field("blink", &self.blink())
             .field("strikethrough", &self.strikethrough())
+            .field("protected", &self.protected())
             .finish()
     }
 }
@@ -267,6 +269,7 @@ const BLINK_BIT: u16 = 1 << 7;
 const STRIKETHROUGH_BIT: u16 = 1 << 8;
 const WIDE_BIT: u16 = 1 << 9;
 const WIDE_CONT_BIT: u16 = 1 << 10;
+const PROTECTED_BIT: u16 = 1 << 11;
 
 impl StyleFlags {
     #[inline(always)]
@@ -316,6 +319,10 @@ impl StyleFlags {
     #[inline(always)]
     pub fn wide_continuation(&self) -> bool {
         self.0 & WIDE_CONT_BIT != 0
+    }
+    #[inline(always)]
+    pub fn protected(&self) -> bool {
+        self.0 & PROTECTED_BIT != 0
     }
 
     #[inline(always)]
@@ -384,6 +391,14 @@ impl StyleFlags {
             self.0 |= WIDE_CONT_BIT;
         } else {
             self.0 &= !WIDE_CONT_BIT;
+        }
+    }
+    #[inline(always)]
+    pub fn set_protected(&mut self, v: bool) {
+        if v {
+            self.0 |= PROTECTED_BIT;
+        } else {
+            self.0 &= !PROTECTED_BIT;
         }
     }
 

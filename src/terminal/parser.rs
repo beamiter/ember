@@ -1824,6 +1824,12 @@ impl super::TerminalState {
                         _ => CursorShape::Block,
                     };
                 }
+
+                // DECSCA - Select Character Protection Attribute.
+                if private_prefix.is_none() && intermediates == *b"\"" {
+                    let protect = params.first().copied().unwrap_or(0) == 1;
+                    self.current_flags.set_protected(protect);
+                }
             }
             'I' => {
                 // CHT - cursor forward tabulation (n tab stops)
@@ -2065,6 +2071,9 @@ impl super::TerminalState {
         self.invalidate_grid_mutation_spans(&spans);
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
+                if cell.flags.protected() {
+                    continue;
+                }
                 *cell = TerminalCell {
                     character: ' ',
                     foreground: Color::Default,
@@ -2082,7 +2091,24 @@ impl super::TerminalState {
 
     /// 擦除屏幕并把光标归位到左上角。供切换备用缓冲区等场景使用。
     pub(super) fn clear_screen(&mut self) {
-        self.erase_screen();
+        let bg_color = self.current_bg;
+        let cols = self.grid.row_len();
+        let spans: Vec<_> = (0..self.grid.rows()).map(|row| (row, 0, cols)).collect();
+        self.invalidate_grid_mutation_spans(&spans);
+        for row in self.grid.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = TerminalCell {
+                    character: ' ',
+                    foreground: Color::Default,
+                    background: bg_color,
+                    flags: StyleFlags::default(),
+                    hyperlink_id: HyperlinkId::NONE,
+                };
+            }
+        }
+        self.dirty_region.mark_all(self.grid.rows());
+        self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+        self.kitty_graphics.clear_placements();
         self.cursor_row = 0;
         self.cursor_col = 0;
     }

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 185 — DECSCA)
+
+## 2026-10-04 (DECSCA)
+
+- CSI `"q` marks cells protected from ED/EL/ECH. Unique round **185**.
+  Test: `decsca_protects_cells_from_ed_and_el`.
+
 Updated: 2026-10-04 (upgrade round 184 — DECRQSS)
 
 ## 2026-10-04 (DECRQSS)

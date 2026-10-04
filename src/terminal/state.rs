@@ -1666,6 +1666,9 @@ impl super::TerminalState {
     }
 
     pub(super) fn clear_cell_unchecked(&mut self, row: usize, col: usize) {
+        if self.grid.get(row, col).flags.protected() {
+            return;
+        }
         let cols = self.grid.row_len();
         let bg_color = self.current_bg;
         let blank_cell = TerminalCell {

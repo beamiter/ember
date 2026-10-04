@@ -3405,6 +3405,20 @@ fn hpb_and_vpb_are_the_relative_cursor_backs() {
 }
 
 #[test]
+fn decsca_protects_cells_from_ed_and_el() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[\"1qABC\x1b[\"0qDEF\x1b[2J");
+    assert_eq!(terminal.grid[0][0].character, 'A');
+    assert_eq!(terminal.grid[0][1].character, 'B');
+    assert_eq!(terminal.grid[0][2].character, 'C');
+    assert_eq!(terminal.grid[0][3].character, ' ');
+    assert_eq!(terminal.grid[0][4].character, ' ');
+
+    terminal.process_input(b"\x1b[1;1H\x1b[\"1qX\x1b[\"2q\x1b[0K");
+    assert_eq!(terminal.grid[0][0].character, 'X');
+}
+
+#[test]
 fn trailing_escape_is_buffered_until_next_chunk() {
     let mut terminal = TerminalState::new(8, 2);
 
