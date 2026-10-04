@@ -1244,6 +1244,8 @@ impl TerminalApp {
                     ui.horizontal(|ui| {
                         // 搜索输入框
                         ui.label("Search:");
+                        let query = std::mem::take(&mut self.search_state.query);
+                        self.search_state.set_query(query);
                         let search_response = ui.text_edit_singleline(&mut self.search_state.query);
 
                         // 自动 focus 搜索框
@@ -1268,6 +1270,10 @@ impl TerminalApp {
                         }
 
                         if search_response.changed() || case_btn.clicked() || regex_btn.clicked() {
+                            if search_response.changed() {
+                                let query = std::mem::take(&mut self.search_state.query);
+                                self.search_state.set_query(query);
+                            }
                             self.refresh_search_matches();
                         }
 

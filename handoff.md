@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 176 — find query bound)
+
+## 2026-10-04 (find)
+
+- Overlay find queries drop controls, rewrite spoofing, and stay inside the
+  picker byte budget. Unique round **176**. Test:
+  `find_query_drops_controls_and_rewrites_visual_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 175 — custom theme names)
 
 ## 2026-10-04 (themes)

@@ -9,6 +9,33 @@ pub const MAX_SEARCH_MATCHES: usize = 20_000;
 /// Stop walking the buffer after this many UTF-8 bytes of line text so a
 /// huge scrollback cannot stall the find overlay for one frame.
 pub const MAX_SEARCH_SCAN_BYTES: usize = 8 * 1024 * 1024;
+/// One-line find query budget, matching the overlay pickers so a paste cannot
+/// compile an unbounded regex against scrollback.
+pub(crate) const MAX_SEARCH_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+fn bound_query_text(query: impl Into<String>) -> String {
+    let mut query: String = query
+        .into()
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
+    if query.len() > MAX_SEARCH_QUERY_BYTES {
+        let mut end = MAX_SEARCH_QUERY_BYTES;
+        while end > 0 && !query.is_char_boundary(end) {
+            end -= 1;
+        }
+        query.truncate(end);
+    }
+    query
+}
 
 /// 编译后的正则缓存槽。由 `SearchState` 持有,这样搜索面板打开期间
 /// 每次刷新(PTY 输出、按键)只要 pattern 与大小写标志未变,就复用同一个
@@ -182,6 +209,18 @@ impl SearchState {
         }
     }
 
+    /// Replace the find query. Control characters are dropped and the byte
+    /// budget is enforced on a char boundary so the overlay field and history
+    /// restore share one contract.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        let bounded = bound_query_text(query);
+        if bounded != self.query {
+            self.query = bounded;
+            self.history_nav_index = None;
+            self.current_match_index = 0;
+        }
+    }
+
     /// 移动到下一个匹配项
     pub fn next_match(&mut self) {
         if !self.matches.is_empty() {
@@ -237,14 +276,14 @@ impl SearchState {
             if idx + 1 < self.history.len() {
                 self.history_nav_index = Some(idx + 1);
                 let entry = &self.history[idx + 1];
-                self.query = entry.query.clone();
+                self.query = bound_query_text(entry.query.clone());
                 self.use_regex = entry.is_regex;
                 self.case_sensitive = entry.case_sensitive;
             }
         } else {
             self.history_nav_index = Some(0);
             let entry = &self.history[0];
-            self.query = entry.query.clone();
+            self.query = bound_query_text(entry.query.clone());
             self.use_regex = entry.is_regex;
             self.case_sensitive = entry.case_sensitive;
         }
@@ -256,7 +295,7 @@ impl SearchState {
             if idx > 0 {
                 self.history_nav_index = Some(idx - 1);
                 let entry = &self.history[idx - 1];
-                self.query = entry.query.clone();
+                self.query = bound_query_text(entry.query.clone());
                 self.use_regex = entry.is_regex;
                 self.case_sensitive = entry.case_sensitive;
             } else {
@@ -571,6 +610,19 @@ mod tests {
         assert!(state.is_open);
         state.close();
         assert!(!state.is_open);
+    }
+
+    #[test]
+    fn find_query_drops_controls_and_rewrites_visual_spoofing() {
+        let mut state = SearchState::new();
+        state.set_query("ok\n\u{1b}\u{202e}needle");
+        assert_eq!(state.query, "ok\u{fffd}needle");
+        assert!(!state.query.contains('\n'));
+        let overflow = format!("{}z", "x".repeat(MAX_SEARCH_QUERY_BYTES));
+        state.set_query(overflow);
+        assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
+        assert!(!state.query.contains('z'));
+        assert!(state.query.is_char_boundary(state.query.len()));
     }
 
     #[test]

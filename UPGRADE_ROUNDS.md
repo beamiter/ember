@@ -938,3 +938,8 @@ query answers, control handling and resize.
      Drafts now drop path syntax and rewrite spoofing; save refuses U+FFFD
      so a theme file cannot be named with a replacement glyph.
 
+176. **Find queries are bounded and spoof-safe** — the overlay field stored
+     paste verbatim, so a control or bidi mark compiled against scrollback
+     and sat in search history. Queries now drop controls, rewrite spoofing
+     as U+FFFD, and truncate on a UTF-8 boundary like frost.
+
