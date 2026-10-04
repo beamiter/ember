@@ -898,3 +898,8 @@ query answers, control handling and resize.
      to land on the host clipboard. Frost already gates this; Ember now
      rejects those sets and still accepts ordinary multiline text.
 
+168. **OSC titles are sanitised at ingest** — window and icon titles stored
+     the raw payload, so a BEL/ESC or bidi override sat in terminal state
+     (tabs, title stack) until a later display filter. They now drop
+     controls and replace visual spoofing with U+FFFD, matching frost.
+

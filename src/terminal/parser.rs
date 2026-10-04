@@ -255,14 +255,10 @@ impl super::TerminalState {
                     // 2 the window title only. The icon title is separate
                     // because XTWINOPS reports and saves the two independently.
                     if command != "1" {
-                        self.window_title.clear();
-                        self.window_title
-                            .extend(value.chars().take(MAX_WINDOW_TITLE_CHARS));
+                        self.window_title = Self::sanitized_title(value);
                     }
                     if command != "2" {
-                        self.icon_title.clear();
-                        self.icon_title
-                            .extend(value.chars().take(MAX_WINDOW_TITLE_CHARS));
+                        self.icon_title = Self::sanitized_title(value);
                     }
                 } else if command == "7" {
                     // OSC 7 — current working directory.
@@ -2170,6 +2166,25 @@ impl super::TerminalState {
             *row_ver = self.grid_version;
         }
         self.dirty_region.mark_all(self.grid.rows());
+    }
+
+    /// Titles are rendered in trusted app chrome (tabs, window manager,
+    /// XTWINOPS replies). Drop line/layout controls and replace visual
+    /// spoofing so PTY output cannot create multiline labels or reorder them.
+    fn sanitized_title(title: &str) -> String {
+        title
+            .chars()
+            .filter_map(|ch| {
+                if ch.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(ch) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(ch)
+                }
+            })
+            .take(MAX_WINDOW_TITLE_CHARS)
+            .collect()
     }
 
     /// A title on its way back out to the PTY, with anything that could break

@@ -1679,13 +1679,13 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"cd\x07");
-    assert_eq!(terminal.window_title, "ab\x1bcd");
+    assert_eq!(terminal.window_title, "abcd");
 
-    // ESC ESC \: the first ESC is content, the second pair terminates.
+    // ESC ESC \: the first ESC is content (dropped as a control), the second pair terminates.
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"\x1b\\");
-    assert_eq!(terminal.window_title, "ab\x1b");
+    assert_eq!(terminal.window_title, "ab");
 }
 
 #[test]
@@ -6451,6 +6451,14 @@ fn the_window_title_is_bounded_where_it_enters_terminal_state() {
 
     terminal.process_input(b"\x1b]0;short\x07");
     assert_eq!(terminal.window_title, "short");
+}
+
+#[test]
+fn osc_titles_drop_controls_and_replace_visual_spoofing() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input("\x1b]2;ok\u{1b}\u{202e}done\x07".as_bytes());
+    assert_eq!(terminal.window_title, "ok\u{fffd}done");
+    assert!(terminal.icon_title.is_empty());
 }
 
 fn row_text(terminal: &TerminalState, row: usize) -> String {

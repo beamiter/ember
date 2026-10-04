@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 168 — OSC title ingest)
+
+## 2026-10-04 (OSC titles)
+
+- Window and icon titles drop controls and replace visual spoofing at ingest.
+  Unique round **168**. Test: `osc_titles_drop_controls_and_replace_visual_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 167 — OSC 52 spoofing)
 
 ## 2026-10-04 (OSC 52)
