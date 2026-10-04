@@ -1016,3 +1016,7 @@ query answers, control handling and resize.
      and backend errors verbatim into the tree. Notices now drop controls,
      rewrite spoofing, and cap at 192 bytes.
 
+193. **DECSET 1036 / 1034** — DECRQM answered unknown for metaSendsEscape and
+     eightBitInput. 1036 now defaults on (xterm), 1034 stays reset (ember
+     does not emit C1), and both report set/reset.
+

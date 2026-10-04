@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 193 — DECSET 1036/1034)
+
+## 2026-10-04 (DECSET 1036/1034)
+
+- metaSendsEscape defaults on; eightBitInput stays reset; DECRQM answers
+  both. Unique round **193**. Test:
+  `meta_sends_escape_defaults_on_and_answers_decrqm`.
+
 Updated: 2026-10-04 (upgrade round 192 — Files notices)
 
 ## 2026-10-04 (Files notices)

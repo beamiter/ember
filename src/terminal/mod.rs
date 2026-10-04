@@ -477,6 +477,10 @@ impl TerminalModes {
             // ATT610 / DECSET 12: cursor blink. Ember stores the request so
             // DECRQM answers truthfully even though the renderer is steady.
             12 => Some(21),
+            // 1036 metaSendsEscape: Alt/Meta prefixes ESC. Default on, as in xterm.
+            1036 => Some(22),
+            // 1034 eightBitInput: we stay UTF-8 7-bit C1, but DECRQM must answer.
+            1034 => Some(23),
             _ => None,
         }
     }

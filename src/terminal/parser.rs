@@ -740,8 +740,8 @@ impl super::TerminalState {
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
             6 => self.origin_mode,
-            1 | 7 | 12 | 25 | 47 | 66 | 1000..=1007 | 1015 | 1047..=1049 | 2004 | 2026 | 2031
-            | 5522 => {
+            1 | 7 | 12 | 25 | 47 | 66 | 1000..=1007 | 1015 | 1034 | 1036 | 1047..=1049 | 2004
+            | 2026 | 2031 | 5522 => {
                 self.modes.contains(&mode)
             }
             _ => return 0,

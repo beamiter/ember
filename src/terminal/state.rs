@@ -307,6 +307,7 @@ impl super::TerminalState {
         // xterm's alternateScroll resource defaults on: wheel in less/vim
         // (alt screen, no mouse reporting) is cursor keys, not a no-op.
         modes.insert(1007);
+        modes.insert(1036);
 
         let mut dirty_region = DirtyRegion::new();
         // Mark all rows as dirty on initialization to ensure first frame renders correctly
