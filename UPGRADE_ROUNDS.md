@@ -928,3 +928,8 @@ query answers, control handling and resize.
      different operand than the one shown. Controls, replacement glyphs, and
      visual spoofing are now skipped the way frost skips them.
 
+174. **Typed text skips visual spoofing before the PTY** — egui Text and IME
+     commits were written verbatim, so a bidi override or C0 in a compose
+     could reach the child as keystrokes. They are now filtered the way frost
+     skips spoofing in committed modifyOtherKeys text.
+

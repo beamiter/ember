@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 174 — typed text spoofing)
+
+## 2026-10-04 (keyboard)
+
+- Text and IME commits drop controls and visual spoofing before the PTY.
+  Unique round **174**. Test: `typed_text_and_ime_drop_controls_and_visual_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 173 — Files listing names)
 
 ## 2026-10-04 (Files)

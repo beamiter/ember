@@ -462,6 +462,17 @@ fn kitty_text_key_code(key: egui::Key) -> Option<u32> {
     }
 }
 
+fn pty_text_payload(text: &str) -> Option<String> {
+    let filtered: String = text
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(*character)
+        })
+        .collect();
+    (!filtered.is_empty()).then_some(filtered)
+}
+
 fn text_key_code(key: egui::Key, modifiers: egui::Modifiers) -> Option<u32> {
     let codepoint = kitty_text_key_code(key)?;
     if modifiers.shift {
@@ -5311,8 +5322,8 @@ impl TerminalRenderer {
         if report_all_keys {
             for evt in events {
                 if let egui::Event::Text(t) = evt {
-                    if !t.is_empty() && t.as_bytes()[0] >= 32 {
-                        text_from_events = Some(t.clone());
+                    if let Some(filtered) = pty_text_payload(t) {
+                        text_from_events = Some(filtered);
                         break;
                     }
                 }
@@ -5325,19 +5336,14 @@ impl TerminalRenderer {
                     if suppress_text_events {
                         continue;
                     }
-                    if !text.is_empty() && text.as_bytes()[0] < 32 {
-                        continue;
+                    if let Some(filtered) = pty_text_payload(text) {
+                        input.extend(filtered.as_bytes());
                     }
-                    // Text events already contain the correctly shifted character from the OS.
-                    // Always send them - they handle Shift, Caps Lock, etc. correctly.
-                    input.extend(text.as_bytes());
                 }
-                // Most IME commits are queued in app/input at their exact
-                // ordered position and removed from this event slice. A commit
-                // left here follows older deferred Text/key input, so encode it
-                // inline to preserve byte order instead of overtaking that FIFO.
                 egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
-                    input.extend(text.as_bytes());
+                    if let Some(filtered) = pty_text_payload(text) {
+                        input.extend(filtered.as_bytes());
+                    }
                 }
                 egui::Event::Key {
                     key,
@@ -6949,6 +6955,37 @@ mod tests {
             &events,
         );
         assert_eq!(encoded, "a你\r".as_bytes());
+    }
+
+    #[test]
+    fn typed_text_and_ime_drop_controls_and_visual_spoofing() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let events = [
+            egui::Event::Text("ok\u{202e}hidden".to_owned()),
+            egui::Event::Ime(egui::ImeEvent::Commit("你\u{1b}好".to_owned())),
+        ];
+        let mut encoded = Vec::new();
+        renderer.handle_keyboard_input(
+            &egui::Context::default(),
+            &mut encoded,
+            &std::collections::HashSet::new(),
+            false,
+            0,
+            false,
+            0,
+            0,
+            false,
+            false,
+            &events,
+        );
+        assert_eq!(encoded, "okhidden你好".as_bytes());
+        assert!(!encoded.contains(&0x1b));
     }
 
     #[test]
