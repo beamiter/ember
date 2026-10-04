@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 172 — OSC 8 hyperlinks)
+
+## 2026-10-04 (OSC 8)
+
+- OSC 8 `id=` parameters and U+FFFD URIs fail closed instead of interned.
+  Unique round **172**. Tests: `only_plain_http_targets_with_an_authority_become_clickable`,
+  `table_deduplicates_targets_and_rejects_invalid_metadata`.
+
 Updated: 2026-10-04 (upgrade round 171 — Kitty graphics errors)
 
 ## 2026-10-04 (Kitty graphics)

@@ -918,3 +918,8 @@ query answers, control handling and resize.
      C0 but still echoed bidi overrides into the PTY. Frost rewrites those
      scalars to U+FFFD and caps the message; Ember now shares that bound.
 
+172. **OSC 8 ids and U+FFFD URIs fail closed** — the shared opener already
+     refuses bidi in the URL, but a replacement glyph in the path or a
+     spoofed `id=` parameter still interned a clickable target. Those now
+     close the current link instead of arming it.
+

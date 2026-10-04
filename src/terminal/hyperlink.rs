@@ -43,11 +43,14 @@ impl HyperlinkId {
 /// starts a network client), or `https://user:token@host` (a credential the
 /// user never typed) — fails closed there rather than at the opener.
 pub(crate) fn is_supported_hyperlink_uri(uri: &str) -> bool {
-    jterm_core::link::is_openable_url(uri)
+    !uri.contains('\u{fffd}') && jterm_core::link::is_openable_url(uri)
 }
 
 fn params_are_valid(params: &str) -> bool {
-    params.len() <= MAX_OSC8_PARAMS_BYTES && !params.chars().any(char::is_control)
+    params.len() <= MAX_OSC8_PARAMS_BYTES
+        && !params.contains('\u{fffd}')
+        && !params.chars().any(char::is_control)
+        && !jterm_core::review_input::contains_visual_spoofing(params)
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +118,7 @@ mod tests {
             "https://example.com/\u{202e}path",
             "https://example.com/a b",
             "https://example.com\\evil",
+            "https://example.com/\u{fffd}",
         ] {
             assert!(
                 !is_supported_hyperlink_uri(rejected),
@@ -135,6 +139,12 @@ mod tests {
             .intern(&"p".repeat(MAX_OSC8_PARAMS_BYTES + 1), "https://safe.test")
             .is_none());
         assert!(table.intern("id=bad\nparam", "https://safe.test").is_none());
+        assert!(table
+            .intern("id=\u{202e}spoof", "https://safe.test")
+            .is_none());
+        assert!(table
+            .intern("id=ok\u{fffd}", "https://safe.test")
+            .is_none());
         assert!(table
             .intern(
                 "",
