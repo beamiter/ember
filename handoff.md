@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 170 — restored session cwd)
+
+## 2026-10-04 (session persistence)
+
+- Restored session working directories drop bidi/ZWSP/U+FFFD and other
+  spoofing, not only oversized or NUL paths. Unique round **170**.
+  Test: `restored_cwds_reject_visual_spoofing_and_replacement_glyphs`.
+
 Updated: 2026-10-04 (upgrade round 169 — history U+FFFD)
 
 ## 2026-10-04 (history picker)

@@ -909,3 +909,8 @@ query answers, control handling and resize.
      path/command the disk never had. Frost already drops those records'
      cwd (and the command); Ember now matches.
 
+170. **Restored session cwds refuse spoofing and U+FFFD** — snapshot cwd
+     only dropped on length or NUL, so a bidi override or replacement glyph
+     became the PTY working directory after restart. Frost already blanks
+     those; Ember now matches before spawn.
+

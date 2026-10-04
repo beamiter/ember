@@ -230,6 +230,16 @@ impl serde::de::Visitor<'_> for SnapshotFieldVisitor {
     }
 }
 
+fn restored_cwd_is_unsafe(cwd: &str) -> bool {
+    cwd.len() > MAX_SESSION_CWD_BYTES
+        || cwd.as_bytes().contains(&0)
+        || cwd.contains('\u{fffd}')
+        || cwd.chars().any(|character| {
+            character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
+}
+
 fn bounded_display_value(value: &str, limit: usize) -> String {
     // Locate the trim range after filtering controls, then copy at most the
     // retained byte ceiling. A final trim makes the operation idempotent when
@@ -365,8 +375,7 @@ impl OptionalTextValueVisitor<'_> {
         let (field, retained) = match self.kind {
             OptionalTextKind::Cwd => (
                 "cwd",
-                (value.len() <= MAX_SESSION_CWD_BYTES && !value.as_bytes().contains(&0))
-                    .then(|| value.to_owned()),
+                (!restored_cwd_is_unsafe(value)).then(|| value.to_owned()),
             ),
             OptionalTextKind::SessionId => (
                 "session_id",
@@ -1559,7 +1568,7 @@ impl SessionsSnapshot {
             if session
                 .cwd
                 .as_ref()
-                .is_some_and(|cwd| cwd.len() > MAX_SESSION_CWD_BYTES || cwd.as_bytes().contains(&0))
+                .is_some_and(|cwd| restored_cwd_is_unsafe(cwd))
             {
                 session.cwd = None;
                 repaired_fields += 1;
@@ -2216,6 +2225,50 @@ mod tests {
                 .as_ref()
                 .is_some_and(|name| name.len() <= MAX_SESSION_NAME_BYTES));
         }
+    }
+
+    #[test]
+    fn restored_cwds_reject_visual_spoofing_and_replacement_glyphs() {
+        let mut snapshot = SessionsSnapshot::from_snapshots(
+            vec![
+                SessionSnapshot {
+                    name: "bidi".to_string(),
+                    tags: vec![],
+                    cwd: Some("/tmp/\u{202e}hidden".to_string()),
+                    session_id: None,
+                    custom_name: None,
+                },
+                SessionSnapshot {
+                    name: "zwsp".to_string(),
+                    tags: vec![],
+                    cwd: Some("/tmp/\u{200b}zwsp".to_string()),
+                    session_id: None,
+                    custom_name: None,
+                },
+                SessionSnapshot {
+                    name: "fffd".to_string(),
+                    tags: vec![],
+                    cwd: Some("/tmp/\u{fffd}spoof".to_string()),
+                    session_id: None,
+                    custom_name: None,
+                },
+                SessionSnapshot {
+                    name: "ok".to_string(),
+                    tags: vec![],
+                    cwd: Some("/tmp/safe".to_string()),
+                    session_id: None,
+                    custom_name: None,
+                },
+            ],
+            Some(0),
+            Vec::new(),
+            None,
+        );
+        snapshot.sanitize();
+        assert_eq!(snapshot.sessions[0].cwd, None);
+        assert_eq!(snapshot.sessions[1].cwd, None);
+        assert_eq!(snapshot.sessions[2].cwd, None);
+        assert_eq!(snapshot.sessions[3].cwd.as_deref(), Some("/tmp/safe"));
     }
 
     #[test]
