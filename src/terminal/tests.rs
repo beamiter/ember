@@ -3375,6 +3375,21 @@ fn cuu_does_not_scroll_at_top_margin() {
 }
 
 #[test]
+fn hpr_and_vpr_are_the_relative_cursor_moves() {
+    let mut terminal = TerminalState::new(8, 6);
+    terminal.process_input(b"\x1b[2;3H\x1b[2a\x1b[3eX");
+    assert_eq!(terminal.cursor_row, 4);
+    assert_eq!(terminal.cursor_col, 5);
+    assert_eq!(terminal.grid[4][4].character, 'X');
+
+    terminal.process_input(b"\x1b[3;5r\x1b[3;1H\x1b[20e");
+    assert_eq!(
+        terminal.cursor_row, 4,
+        "VPR stops at the bottom margin the same way CUD does"
+    );
+}
+
+#[test]
 fn trailing_escape_is_buffered_until_next_chunk() {
     let mut terminal = TerminalState::new(8, 2);
 

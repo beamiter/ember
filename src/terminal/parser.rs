@@ -1108,13 +1108,13 @@ impl super::TerminalState {
         // (CHT/CBT) moves the cursor too, so it clears the flag as well.
         if matches!(
             cmd,
-            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`' | 'I' | 'Z'
+            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`' | 'I' | 'Z' | 'a' | 'e'
         ) {
             self.pending_wrap = false;
         }
-        if matches!(cmd, 'A' | 'B' | 'E' | 'F' | 'H' | 'f' | 'd') {
+        if matches!(cmd, 'A' | 'B' | 'E' | 'F' | 'H' | 'f' | 'd' | 'e') {
             self.note_output_cursor_reposition(true);
-        } else if matches!(cmd, 'C' | 'D' | 'G' | '`' | 'I' | 'Z') {
+        } else if matches!(cmd, 'C' | 'D' | 'G' | '`' | 'I' | 'Z' | 'a') {
             self.note_output_cursor_reposition(false);
         }
         // xterm semantics: an explicit 0 count means 1 for every movement,
@@ -1132,8 +1132,8 @@ impl super::TerminalState {
                 };
                 self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
             }
-            'B' => {
-                // CUD - Cursor Down:区内止于底边距,区外止于屏幕底部;不滚动。
+            'B' | 'e' => {
+                // CUD / VPR - Cursor Down:区内止于底边距,区外止于屏幕底部;不滚动。
                 let n = count;
                 let ceil = if self.cursor_row <= self.scroll_region_bottom {
                     self.scroll_region_bottom
@@ -1142,7 +1142,8 @@ impl super::TerminalState {
                 };
                 self.cursor_row = (self.cursor_row + n).min(ceil);
             }
-            'C' => {
+            'C' | 'a' => {
+                // CUF / HPR
                 let n = count;
                 self.cursor_col = (self.cursor_col + n).min(self.grid.row_len() - 1);
             }

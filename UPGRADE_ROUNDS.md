@@ -883,3 +883,8 @@ query answers, control handling and resize.
      the top margin, and after writing the last column the report is one
      past the width so the client is not told it is still on that cell.
 
+165. **HPR and VPR move like CUF and CUD** — `CSI a` / `CSI e` were dropped,
+     so terminfo `hpr` / `vpr` never moved the cursor. They now share the
+     CUF / CUD clamps, including the scrolling-region floor and ceiling,
+     and clear a pending wrap the same way the named moves do.
+

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 165 — HPR / VPR)
+
+## 2026-10-04 (HPR / VPR)
+
+- `CSI a` and `CSI e` are the relative cursor moves (HPR / VPR). Unique
+  round **165**. Test: `hpr_and_vpr_are_the_relative_cursor_moves`.
+
 Updated: 2026-10-04 (upgrade round 164 — CPR origin and wrap)
 
 ## 2026-10-04 (CPR / DECXCPR)
