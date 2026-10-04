@@ -471,6 +471,9 @@ impl TerminalModes {
             1005 => Some(17),
             1015 => Some(18),
             66 => Some(19),
+            // Alternate Scroll: wheel on the alt screen becomes cursor keys
+            // when mouse reporting is off (xterm 1007 / alternateScroll).
+            1007 => Some(20),
             _ => None,
         }
     }

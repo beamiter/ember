@@ -386,6 +386,10 @@ pub struct TerminalApp {
     /// screens drops leftover line/point wheel remainder so vim cannot
     /// inherit a fraction from the shell (and vice versa).
     pub mouse_wheel_alt_screen: Option<bool>,
+    /// Line/point remainder for DECSET 1007 alternate-scroll cursor keys.
+    /// Kept off the app-mouse accumulators so a vim session cannot inherit
+    /// a leftover fraction from htop's mouse reports.
+    pub alternate_scroll_wheel: jterm_core::wheel::WheelAccumulator,
     /// Stable session identity and routing decision for the current drag.
     pub terminal_mouse_capture: Option<TerminalMouseCapture>,
     pub last_terminal_mouse_motion: Option<(String, usize, usize)>,

@@ -304,6 +304,9 @@ impl super::TerminalState {
         let mut modes = TerminalModes::default();
         modes.insert(25);
         modes.insert(7);
+        // xterm's alternateScroll resource defaults on: wheel in less/vim
+        // (alt screen, no mouse reporting) is cursor keys, not a no-op.
+        modes.insert(1007);
 
         let mut dirty_region = DirtyRegion::new();
         // Mark all rows as dirty on initialization to ensure first frame renders correctly
@@ -4517,6 +4520,12 @@ impl super::TerminalState {
 
     pub fn is_application_keypad(&self) -> bool {
         self.modes.contains(&66)
+    }
+
+    /// DECSET 1007: wheel on the alternate screen becomes cursor keys while
+    /// mouse reporting is off. Defaults on, matching xterm `alternateScroll`.
+    pub fn is_alternate_scroll(&self) -> bool {
+        self.modes.contains(&1007)
     }
 
     pub fn is_paste_events_enabled(&self) -> bool {

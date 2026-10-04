@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 163 — alternate scroll)
+
+## 2026-10-04 (DECSET 1007 alternate scroll)
+
+- Wheel on the alt screen without mouse reporting is cursor keys.
+  Mode 1007 defaults on. Unique round **163**. Tests:
+  `alternate_scroll_mode_defaults_on_and_answers_decrqm`,
+  `alternate_scroll_sends_cursor_keys_only_on_an_unfocused_mouse_alt_screen`.
+
 Updated: 2026-10-03 (upgrade round 162 — point-wheel remainder)
 
 ## 2026-10-03 (point-unit app-mouse WheelAccumulator)

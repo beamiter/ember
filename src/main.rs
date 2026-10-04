@@ -1645,6 +1645,33 @@ fn bounded_point_wheel_accumulate(
     }
 }
 
+/// Wheel on the alt screen becomes cursor keys when 1007 is on, mouse
+/// reporting is off, Shift is not held, and the pointer is on the pane.
+fn should_send_alternate_scroll(
+    alt_screen: bool,
+    alternate_scroll: bool,
+    mouse_enabled: bool,
+    shift: bool,
+    pointer_over_terminal: bool,
+) -> bool {
+    alt_screen && alternate_scroll && !mouse_enabled && !shift && pointer_over_terminal
+}
+
+/// Positive steps are wheel-up / toward history → cursor up, matching the
+/// X10 button-64 mapping used by application mouse reports.
+fn alternate_scroll_cursor_bytes(steps: isize, application_cursor_keys: bool) -> Vec<u8> {
+    if steps == 0 {
+        return Vec::new();
+    }
+    let seq: &[u8] = match (steps > 0, application_cursor_keys) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    seq.repeat(steps.unsigned_abs().min(MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as usize))
+}
+
 fn bounded_wheel_step_accumulate(current: isize, delta: f32, multiplier: usize) -> isize {
     let multiplier = isize::try_from(multiplier).unwrap_or(isize::MAX);
     current
@@ -2511,6 +2538,7 @@ impl TerminalApp {
             mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
             mouse_point_wheel: jterm_core::wheel::WheelAccumulator::default(),
             mouse_wheel_alt_screen: None,
+            alternate_scroll_wheel: jterm_core::wheel::WheelAccumulator::default(),
             terminal_mouse_capture: None,
             last_terminal_mouse_motion: None,
             font_size_accumulator: 0.0,
@@ -5887,6 +5915,7 @@ impl eframe::App for TerminalApp {
         // 当搜索面板或配置面板打开时，不处理普通键盘输入（面板会处理输入）
         // 复用缓冲区减少内存分配
         self.keyboard_input_buffer.clear();
+        let mut alternate_scroll_owns_wheel = false;
         if !terminal_input_blocked || semantic_paste_claims_rest {
             let (
                 keyboard_enhancement_flags,
@@ -5927,6 +5956,81 @@ impl eframe::App for TerminalApp {
                 alt_screen,
                 &terminal_keyboard_events,
             );
+            if pointer_over_active_terminal
+                && !ctx.input(|input| input.modifiers.shift || input.modifiers.ctrl)
+            {
+                let (
+                    alt_screen,
+                    alternate_scroll,
+                    mouse_enabled,
+                    application_cursor_keys,
+                    mouse_rows,
+                ) = {
+                    let terminal = session.terminal.lock();
+                    (
+                        terminal.is_alt_buffer_active(),
+                        terminal.is_alternate_scroll(),
+                        session.purpose != crate::session::SessionPurpose::RetainedCommand
+                            && terminal.is_mouse_enabled(),
+                        terminal.is_application_cursor_keys(),
+                        terminal.get_dimensions().1,
+                    )
+                };
+                if should_send_alternate_scroll(
+                    alt_screen,
+                    alternate_scroll,
+                    mouse_enabled,
+                    false,
+                    true,
+                ) {
+                    alternate_scroll_owns_wheel = true;
+                    let line_h = input_renderer.line_height.max(1.0);
+                    let mut steps: isize = 0;
+                    ctx.input(|input| {
+                        for event in &input.events {
+                            if let egui::Event::MouseWheel {
+                                unit,
+                                delta,
+                                modifiers,
+                                ..
+                            } = event
+                            {
+                                if modifiers.ctrl || modifiers.shift {
+                                    continue;
+                                }
+                                match unit {
+                                    egui::MouseWheelUnit::Line => {
+                                        steps = bounded_line_wheel_accumulate(
+                                            &mut self.alternate_scroll_wheel,
+                                            steps,
+                                            delta.y,
+                                        );
+                                    }
+                                    egui::MouseWheelUnit::Page => {
+                                        steps = bounded_wheel_step_accumulate(
+                                            steps,
+                                            delta.y,
+                                            mouse_rows.max(1),
+                                        );
+                                    }
+                                    egui::MouseWheelUnit::Point => {
+                                        steps = bounded_point_wheel_accumulate(
+                                            &mut self.alternate_scroll_wheel,
+                                            steps,
+                                            delta.y,
+                                            line_h,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    self.keyboard_input_buffer
+                        .extend(alternate_scroll_cursor_bytes(steps, application_cursor_keys));
+                } else {
+                    self.alternate_scroll_wheel.reset();
+                }
+            }
         }
 
         let has_keyboard_input = !self.keyboard_input_buffer.is_empty();
@@ -6583,6 +6687,7 @@ impl eframe::App for TerminalApp {
             && scroll_delta != 0.0
             && !ctrl_scroll_this_frame
             && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
+            && !alternate_scroll_owns_wheel
         {
             const SCROLL_VELOCITY_DAMPING: f32 = 0.35;
             self.smooth_scroll_velocity +=
@@ -7479,6 +7584,7 @@ mod tests {
         app_mouse_frame_route, app_mouse_press_reports_from_snapshot, application_cell_at_pointer,
         bounded_line_wheel_accumulate, bounded_point_wheel_accumulate, bounded_wheel_step_accumulate,
         captured_release_button, clipboard_5522_response_for_mime,
+        alternate_scroll_cursor_bytes, should_send_alternate_scroll,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, fontconfig_match_family_file, kitty_graphics_payload,
@@ -8280,6 +8386,22 @@ mod tests {
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 1);
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, f32::NAN, 10.0), 7);
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, 4.0, 0.0), 7);
+    }
+
+    #[test]
+    fn alternate_scroll_sends_cursor_keys_only_on_an_unfocused_mouse_alt_screen() {
+        assert!(should_send_alternate_scroll(true, true, false, false, true));
+        assert!(!should_send_alternate_scroll(false, true, false, false, true));
+        assert!(!should_send_alternate_scroll(true, false, false, false, true));
+        assert!(!should_send_alternate_scroll(true, true, true, false, true));
+        assert!(!should_send_alternate_scroll(true, true, false, true, true));
+        assert!(!should_send_alternate_scroll(true, true, false, false, false));
+        assert_eq!(
+            alternate_scroll_cursor_bytes(2, false),
+            b"\x1b[A\x1b[A"
+        );
+        assert_eq!(alternate_scroll_cursor_bytes(-1, true), b"\x1bOB");
+        assert!(alternate_scroll_cursor_bytes(0, false).is_empty());
     }
     fn encoded_test_png(width: u32, height: u32) -> Vec<u8> {
         let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);

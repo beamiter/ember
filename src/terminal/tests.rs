@@ -3751,6 +3751,27 @@ fn deckpam_and_deckpnm_toggle_application_keypad() {
     assert!(!terminal.is_application_keypad());
 }
 
+#[test]
+fn alternate_scroll_mode_defaults_on_and_answers_decrqm() {
+    let mut terminal = TerminalState::new(8, 2);
+    assert!(terminal.is_alternate_scroll());
+    terminal.process_input(b"\x1b[?1007$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?1007;1$y");
+
+    terminal.process_input(b"\x1b[?1007l");
+    assert!(!terminal.is_alternate_scroll());
+    terminal.process_input(b"\x1b[?1007$p");
+    assert_eq!(terminal.get_output(), b"\x1b[?1007;2$y");
+
+    terminal.process_input(b"\x1b[?1007h");
+    assert!(terminal.is_alternate_scroll());
+    terminal.process_input(b"\x1b[?1007l\x1b[!p");
+    assert!(
+        terminal.is_alternate_scroll(),
+        "DECSTR restores xterm's alternateScroll default"
+    );
+}
+
 fn paste_token_from_event(event: &[u8]) -> String {
     use base64::Engine as _;
 

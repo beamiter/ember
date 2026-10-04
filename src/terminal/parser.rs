@@ -586,9 +586,11 @@ impl super::TerminalState {
         self.origin_mode = false;
         self.insert_mode = false;
         // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
-        // DECKPAM (application keypad) off.
+        // DECKPAM (application keypad) off. Alternate Scroll returns to the
+        // xterm-resource default (enabled).
         self.modes.insert(25);
         self.modes.insert(7);
+        self.modes.insert(1007);
         self.modes.remove(&1);
         self.modes.remove(&66);
         self.pending_wrap = false;
@@ -601,7 +603,7 @@ impl super::TerminalState {
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
             6 => self.origin_mode,
-            1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
+            1 | 7 | 25 | 47 | 66 | 1000..=1007 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
                 self.modes.contains(&mode)
             }
             _ => return 0,
@@ -2349,6 +2351,9 @@ impl super::TerminalState {
             66 => {
                 self.modes.insert(66);
             }
+            1007 => {
+                self.modes.insert(1007);
+            }
             _ => {
                 // Unknown mode, just store it
                 self.modes.insert(mode);
@@ -2444,6 +2449,9 @@ impl super::TerminalState {
             }
             66 => {
                 self.modes.remove(&66);
+            }
+            1007 => {
+                self.modes.remove(&1007);
             }
             _ => {
                 // Unknown mode, just remove it

@@ -871,3 +871,10 @@ query answers, control handling and resize.
      fractions. They now share `WheelAccumulator` (separate from Line
      units) so three 0.4-row swipes report one notch.
 
+163. **Alt-screen wheel is cursor keys (DECSET 1007)** — less/vim on the
+     alternate screen with mouse reporting off used to eat the wheel.
+     Mode 1007 now defaults on (xterm `alternateScroll`): wheel-up is
+     CSI A / SS3 A, wheel-down CSI B / SS3 B, using DECCKM. Mouse
+     reporting still owns the wheel; Shift leaves it with the host.
+     DECRQM answers 1/2; DECSTR restores the default.
+
