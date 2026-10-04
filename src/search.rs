@@ -37,6 +37,10 @@ fn bound_query_text(query: impl Into<String>) -> String {
     query
 }
 
+fn find_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
 /// 编译后的正则缓存槽。由 `SearchState` 持有,这样搜索面板打开期间
 /// 每次刷新(PTY 输出、按键)只要 pattern 与大小写标志未变,就复用同一个
 /// `Regex`,而不是每次都付出一次完整的 `RegexBuilder::build()`。
@@ -354,6 +358,13 @@ impl SearchEngine {
         if query.is_empty() {
             return (Vec::new(), None, false);
         }
+        if find_query_is_unsafe(query) {
+            return (
+                Vec::new(),
+                Some("Query contains control or visual-spoofing characters".to_string()),
+                false,
+            );
+        }
 
         if use_regex {
             Self::search_regex(terminal, query, case_sensitive, regex_cache, scan_budget)
@@ -635,6 +646,19 @@ mod tests {
         assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
         assert!(!state.query.contains('z'));
         assert!(state.query.is_char_boundary(state.query.len()));
+    }
+
+    #[test]
+    fn find_does_not_search_a_rewritten_query() {
+        let terminal = crate::terminal::TerminalState::new(8, 2);
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "ok\u{fffd}needle", false, true, &mut None);
+        assert!(matches.is_empty());
+        assert!(!truncated);
+        assert_eq!(
+            error.as_deref(),
+            Some("Query contains control or visual-spoofing characters")
+        );
     }
 
     #[test]

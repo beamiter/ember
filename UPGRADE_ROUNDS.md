@@ -952,3 +952,8 @@ query answers, control handling and resize.
      every block. Frost already rewrites those at ingest and returns
      `Unsafe` instead of a false empty result; Ember now matches.
 
+179. **Find does not search a rewritten query** — overlay ingest rewrites
+     spoofing to U+FFFD, then the engine still treated that glyph as a
+     needle. Frost refuses those queries; Ember now reports the same error
+     and returns no matches.
+

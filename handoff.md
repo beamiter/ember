@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 179 — find rewritten query)
+
+## 2026-10-04 (find)
+
+- A find query that sanitised to U+FFFD is not compiled against scrollback.
+  Unique round **179**. Test: `find_does_not_search_a_rewritten_query`.
+
 Updated: 2026-10-04 (upgrade round 178 — block search query)
 
 ## 2026-10-04 (block search)
