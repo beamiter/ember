@@ -3390,6 +3390,21 @@ fn hpr_and_vpr_are_the_relative_cursor_moves() {
 }
 
 #[test]
+fn hpb_and_vpb_are_the_relative_cursor_backs() {
+    let mut terminal = TerminalState::new(8, 6);
+    terminal.process_input(b"\x1b[4;5H\x1b[2j\x1b[2kX");
+    assert_eq!(terminal.cursor_row, 1);
+    assert_eq!(terminal.cursor_col, 3);
+    assert_eq!(terminal.grid[1][2].character, 'X');
+
+    terminal.process_input(b"\x1b[3;5r\x1b[3;1H\x1b[20k");
+    assert_eq!(
+        terminal.cursor_row, 2,
+        "VPB stops at the top margin the same way CUU does"
+    );
+}
+
+#[test]
 fn trailing_escape_is_buffered_until_next_chunk() {
     let mut terminal = TerminalState::new(8, 2);
 

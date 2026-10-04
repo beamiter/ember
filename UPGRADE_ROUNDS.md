@@ -974,3 +974,7 @@ query answers, control handling and resize.
      rewrite spoofing, and `apply` refuses rewritten find, replace, or
      output.
 
+183. **HPB and VPB** — CSI `j` / CSI `k` were ignored, so ECMA-48 relative
+     backs did not move the cursor. They now share CUB / CUU clamps
+     (horizontal wrap-off, vertical margin).
+

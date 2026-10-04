@@ -1117,17 +1117,17 @@ impl super::TerminalState {
         ) {
             self.pending_wrap = false;
         }
-        if matches!(cmd, 'A' | 'B' | 'E' | 'F' | 'H' | 'f' | 'd' | 'e') {
+        if matches!(cmd, 'A' | 'B' | 'E' | 'F' | 'H' | 'f' | 'd' | 'e' | 'k') {
             self.note_output_cursor_reposition(true);
-        } else if matches!(cmd, 'C' | 'D' | 'G' | '`' | 'I' | 'Z' | 'a') {
+        } else if matches!(cmd, 'C' | 'D' | 'G' | '`' | 'I' | 'Z' | 'a' | 'j') {
             self.note_output_cursor_reposition(false);
         }
         // xterm semantics: an explicit 0 count means 1 for every movement,
         // insert/delete, erase-character and scroll control below.
         let count = params.first().copied().unwrap_or(1).max(1) as usize;
         match cmd {
-            'A' => {
-                // CUU - Cursor Up:仅移动光标,绝不滚动。
+            'A' | 'k' => {
+                // CUU / VPB - Cursor Up:仅移动光标,绝不滚动。
                 // 区内止于上边距,区外(上边距上方)止于屏幕顶部。
                 let n = count;
                 let floor = if self.cursor_row >= self.scroll_region_top {
@@ -1152,7 +1152,8 @@ impl super::TerminalState {
                 let n = count;
                 self.cursor_col = (self.cursor_col + n).min(self.grid.row_len() - 1);
             }
-            'D' => {
+            'D' | 'j' => {
+                // CUB / HPB
                 let n = count;
                 self.cursor_col = self.cursor_col.saturating_sub(n);
             }

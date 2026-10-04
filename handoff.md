@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 183 — HPB/VPB)
+
+## 2026-10-04 (HPB/VPB)
+
+- CSI `j`/`k` share CUB/CUU clamps. Unique round **183**. Test:
+  `hpb_and_vpb_are_the_relative_cursor_backs`.
+
 Updated: 2026-10-04 (upgrade round 182 — search-replace spoofing)
 
 ## 2026-10-04 (search-replace)
