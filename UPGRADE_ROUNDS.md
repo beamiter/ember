@@ -1025,3 +1025,6 @@ query answers, control handling and resize.
      on (the default), a Text event while Alt is held now sends `ESC` then
      the glyph; CSI-u report-all-keys is left alone.
 
+195. **DECRQSS DECSCL** — DCS `$q"p` was invalid. Ember now reports
+     `65;1"p`, matching the VT220-class DA it already advertises.
+

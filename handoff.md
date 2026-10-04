@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 195 — DECRQSS DECSCL)
+
+## 2026-10-04 (DECRQSS DECSCL)
+
+- DCS `$q"p` reports 65;1. Unique round **195**. Test:
+  `decrqss_reports_decscl`.
+
 Updated: 2026-10-04 (upgrade round 194 — metaSendsEscape input)
 
 ## 2026-10-04 (metaSendsEscape)

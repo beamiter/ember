@@ -562,6 +562,7 @@ impl super::TerminalState {
                 format!("\x1bP1$r{n}\"q\x1b\\")
             }
             b"m" => format!("\x1bP1$r{}\x1b\\", self.decrqss_sgr_payload()),
+            b"\"p" => "\x1bP1$r65;1\"p\x1b\\".to_string(),
             _ => "\x1bP0$r\x1b\\".to_string(),
         };
         self.output_buffer.extend_from_slice(reply.as_bytes());
