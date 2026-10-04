@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 181 — history picker query)
+
+## 2026-10-04 (history picker)
+
+- History overlay queries are bounded and fail closed when rewritten.
+  Unique round **181**. Test:
+  `history_query_is_bounded_and_rewritten_queries_do_not_match`.
+
 Updated: 2026-10-04 (upgrade round 180 — command palette query)
 
 ## 2026-10-04 (command palette)

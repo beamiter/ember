@@ -35,6 +35,35 @@ const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 /// 参与模糊匹配，用户只会看到历史里少了几条，没有任何提示。
 pub(crate) const MAX_SHARED_HISTORY_COMMAND_BYTES: usize =
     jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
+pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+fn history_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
+fn bound_history_query(query: impl Into<String>) -> String {
+    let mut query: String = query
+        .into()
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
+    if query.len() > MAX_HISTORY_QUERY_BYTES {
+        let mut end = MAX_HISTORY_QUERY_BYTES;
+        while end > 0 && !query.is_char_boundary(end) {
+            end -= 1;
+        }
+        query.truncate(end);
+    }
+    query
+}
 
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
@@ -128,6 +157,9 @@ impl HistoryPickerState {
         if self.query.is_empty() {
             return self.entries.iter().take(MAX_RESULTS).collect();
         }
+        if history_query_is_unsafe(&self.query) {
+            return Vec::new();
+        }
         let mut scored: Vec<(i64, &CommandHistoryRecord)> = self
             .entries
             .iter()
@@ -147,6 +179,12 @@ impl HistoryPickerState {
             .take(MAX_RESULTS)
             .map(|(_, record)| record)
             .collect()
+    }
+
+    /// Replace the query; the highlight returns to the first row.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.query = bound_history_query(query);
+        self.selected = 0;
     }
 
     /// 高亮项下移（在过滤结果中循环）。
@@ -364,6 +402,20 @@ mod tests {
         let filtered = state.filtered();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].cwd.as_deref(), Some("/home/u/myproj"));
+    }
+
+    #[test]
+    fn history_query_is_bounded_and_rewritten_queries_do_not_match() {
+        let mut state = HistoryPickerState::new(vec![record("cargo test", None, 0)]);
+        state.set_query("cargo\n\u{1b}");
+        assert_eq!(state.query, "cargo");
+        assert_eq!(state.filtered().len(), 1);
+        state.set_query("cargo\u{202e}");
+        assert_eq!(state.query, "cargo\u{fffd}");
+        assert!(state.filtered().is_empty());
+        state.set_query(format!("{}z", "x".repeat(MAX_HISTORY_QUERY_BYTES)));
+        assert_eq!(state.query.len(), MAX_HISTORY_QUERY_BYTES);
+        assert!(!state.query.contains('z'));
     }
 
     #[test]

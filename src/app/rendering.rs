@@ -1648,9 +1648,12 @@ impl TerminalApp {
                     // 搜索输入框：编辑即重置高亮（与 frost 的 on_input 一致）。
                     ui.horizontal(|ui| {
                         ui.label("↺");
+                        let query = std::mem::take(&mut state.query);
+                        state.set_query(query);
                         let search_response = ui.text_edit_singleline(&mut state.query);
                         if search_response.changed() {
-                            state.selected = 0;
+                            let query = std::mem::take(&mut state.query);
+                            state.set_query(query);
                         }
                         if state.needs_focus {
                             search_response.request_focus();

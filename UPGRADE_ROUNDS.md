@@ -963,3 +963,8 @@ query answers, control handling and resize.
      now drop controls, rewrite spoofing, cap at the picker budget, and
      refuse rewritten Ask-AI requests.
 
+181. **History picker queries are bounded and fail closed** — Ctrl+Shift+H
+     stored paste verbatim, so a bidi mark fuzzy-matched commands and cwd
+     labels. Queries now drop controls, rewrite spoofing, cap at the picker
+     budget, and return no rows for a rewritten needle.
+
