@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 166 — drop rewritten OSC 9/777)
+
+## 2026-10-04 (OSC 9/777)
+
+- A notification whose title or body sanitised to U+FFFD is not queued.
+  Unique round **166**. Test: `desktop_notification_fields_leave_the_terminal_sanitised`.
+
 Updated: 2026-10-04 (upgrade round 165 — HPR / VPR)
 
 ## 2026-10-04 (HPR / VPR)

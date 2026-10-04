@@ -6399,12 +6399,9 @@ fn desktop_notification_fields_leave_the_terminal_sanitised() {
 
     let mut rxvt = TerminalState::new(24, 4);
     rxvt.process_input("\x1b]777;notify;\u{202e}Security Update;\u{202e}approve\u{7}".as_bytes());
-    assert_eq!(
-        rxvt.pending_notifications,
-        vec![(
-            "\u{fffd}Security Update".to_owned(),
-            "\u{fffd}approve".to_owned()
-        )]
+    assert!(
+        rxvt.pending_notifications.is_empty(),
+        "a rewritten OSC 777 toast must not reach notify-send as U+FFFD"
     );
 
     let mut iterm = TerminalState::new(24, 4);
@@ -6423,16 +6420,11 @@ fn desktop_notification_fields_leave_the_terminal_sanitised() {
         vec![(app_name.to_owned(), "body".to_owned())]
     );
 
-    // A title made only of invisible scalars keeps its replacement glyphs: the
-    // toast must read as rewritten, not as a shorter honest one. This is the
-    // shared parser's rule, and it is why a title is only *replaced* when it
-    // is genuinely empty.
+    // A title made only of invisible scalars is refused rather than shown as
+    // replacement glyphs in desktop chrome.
     let mut invisible = TerminalState::new(24, 4);
     invisible.process_input("\x1b]777;notify;\u{200b};body\u{7}".as_bytes());
-    assert_eq!(
-        invisible.pending_notifications,
-        vec![("\u{fffd}".to_owned(), "body".to_owned())]
-    );
+    assert!(invisible.pending_notifications.is_empty());
 
     // Bounded at ingest, in characters, exactly as the shared parser bounds it.
     let mut long = TerminalState::new(24, 4);

@@ -33,6 +33,10 @@ impl super::TerminalState {
             .to_owned()
     }
 
+    fn notification_field_is_rewritten(field: &str) -> bool {
+        field.contains('\u{fffd}')
+    }
+
     /// Carry an unfinished escape across PTY read batches, but cap total size
     /// to avoid unbounded growth on malformed/binary streams that never send a
     /// terminator. On overflow the buffer is dropped (parser drops back to a
@@ -298,7 +302,9 @@ impl super::TerminalState {
                     if self.pending_notifications.len() < 8 {
                         let title = jterm_core::identity::get().app_name.to_owned();
                         let body = Self::safe_notification_field(value);
-                        self.pending_notifications.push((title, body));
+                        if !Self::notification_field_is_rewritten(&body) {
+                            self.pending_notifications.push((title, body));
+                        }
                     }
                 } else if command == "777" {
                     // rxvt notification: 777;notify;title;body
@@ -311,7 +317,10 @@ impl super::TerminalState {
                             title
                         };
                         let body = Self::safe_notification_field(parts.get(2).unwrap_or(&""));
-                        if self.pending_notifications.len() < 8 {
+                        if self.pending_notifications.len() < 8
+                            && !Self::notification_field_is_rewritten(&title)
+                            && !Self::notification_field_is_rewritten(&body)
+                        {
                             self.pending_notifications.push((title, body));
                         }
                     }

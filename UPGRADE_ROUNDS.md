@@ -888,3 +888,8 @@ query answers, control handling and resize.
      CUF / CUD clamps, including the scrolling-region floor and ceiling,
      and clear a pending wrap the same way the named moves do.
 
+166. **Rewritten OSC 9/777 toasts are dropped** — sanitising a notification
+     field to U+FFFD used to still enqueue it, so a bidi override became a
+     replacement-glyph toast in desktop chrome. Frost already refuses those;
+     Ember now matches: only an unrewritten title and body reach notify-send.
+
