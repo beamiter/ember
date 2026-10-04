@@ -968,3 +968,9 @@ query answers, control handling and resize.
      labels. Queries now drop controls, rewrite spoofing, cap at the picker
      budget, and return no rows for a rewritten needle.
 
+182. **Search-replace fields refuse spoofing** — Find/Replace stored paste
+     verbatim, so a bidi find needle or replacement could copy spoofed text
+     to the clipboard or type it into the PTY. Fields now drop controls,
+     rewrite spoofing, and `apply` refuses rewritten find, replace, or
+     output.
+

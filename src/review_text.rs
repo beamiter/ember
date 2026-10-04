@@ -16,7 +16,6 @@ pub(crate) const MAX_AGENT_COMMAND_BYTES: usize = 16 * 1024;
 /// Existing OSC 133 / execution-journal command budget.
 #[allow(dead_code)] // consumed by the binary-only command timeline module
 pub(crate) const MAX_HISTORY_COMMAND_BYTES: usize = 64 * 1024;
-#[allow(dead_code)] // consumed by binary-only prompt insertion paths
 pub(crate) const MAX_PROMPT_INSERT_BYTES: usize = 256 * 1024;
 
 #[allow(dead_code)] // consumed by binary-only prompt insertion paths

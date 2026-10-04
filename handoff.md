@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 182 — search-replace spoofing)
+
+## 2026-10-04 (search-replace)
+
+- Find/Replace fields are bounded; apply refuses rewritten needles and
+  replacements. Unique round **182**. Test:
+  `find_replace_fields_bound_and_apply_refuses_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 181 — history picker query)
 
 ## 2026-10-04 (history picker)
