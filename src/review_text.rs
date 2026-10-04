@@ -69,7 +69,7 @@ pub(crate) fn validate_single_line(text: &str, max_bytes: usize) -> Result<&str,
     if text.chars().any(char::is_control) {
         return Err(ReviewTextError::ControlCharacter);
     }
-    if contains_visual_spoofing(text) {
+    if text.contains('\u{fffd}') || contains_visual_spoofing(text) {
         return Err(ReviewTextError::VisualSpoof);
     }
     Ok(text)
@@ -199,7 +199,11 @@ mod tests {
     fn strict_validator_delegates_spoofing_to_core_and_keeps_ember_budgets() {
         // The full character class is covered by jterm_core::review_input;
         // here only the wiring and ember's parameterized budget are checked.
-        for spoofed in ["echo safe\u{202e}txt", "echo\u{00a0}not-a-space"] {
+        for spoofed in [
+            "echo safe\u{202e}txt",
+            "echo\u{00a0}not-a-space",
+            "printf ok\u{fffd}",
+        ] {
             assert_eq!(
                 validate_single_line(spoofed, 64 * 1024),
                 Err(ReviewTextError::VisualSpoof),

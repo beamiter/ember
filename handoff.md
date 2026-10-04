@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 169 — history U+FFFD)
+
+## 2026-10-04 (history picker)
+
+- Restored history commands and cwds that contain U+FFFD are refused.
+  Unique round **169**. Tests: `cwd_bound_matches_the_shared_history_writer`,
+  `sanitized_command_trims_and_rejects_unsafe_text`.
+
 Updated: 2026-10-04 (upgrade round 168 — OSC title ingest)
 
 ## 2026-10-04 (OSC titles)

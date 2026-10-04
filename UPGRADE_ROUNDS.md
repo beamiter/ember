@@ -901,5 +901,11 @@ query answers, control handling and resize.
 168. **OSC titles are sanitised at ingest** — window and icon titles stored
      the raw payload, so a BEL/ESC or bidi override sat in terminal state
      (tabs, title stack) until a later display filter. They now drop
-     controls and replace visual spoofing with U+FFFD, matching frost.
+     controls and replace visual spoofing with U+FFFD,      matching frost.
+
+169. **History cwd and commands refuse U+FFFD** — a replacement glyph in a
+     restored working directory or command is not visual spoofing by the
+     core class, so it used to survive the picker and get replayed as a
+     path/command the disk never had. Frost already drops those records'
+     cwd (and the command); Ember now matches.
 
