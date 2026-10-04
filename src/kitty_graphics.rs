@@ -23,11 +23,28 @@ const MAX_KITTY_IMAGES: usize = 100;
 const MAX_KITTY_CACHE_MB: u64 = 256;
 const MAX_KITTY_PLACEMENTS: usize = 4096;
 const MAX_PENDING_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_MESSAGE_CHARS: usize = 160;
 /// ember keeps a live screen image store, so a single image may legitimately
 /// cover a whole window: the shared `SCREEN` budget is ember's historical
 /// 64 MiB / 16384 px limits.
 const CAPS: Caps = Caps::SCREEN;
 static NEXT_IMAGE_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn bound_protocol_message(message: &str) -> String {
+    message
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .take(MAX_RESPONSE_MESSAGE_CHARS)
+        .collect()
+}
 
 /// Render a structural failure from [`jterm_core::kitty_graphics`] as this
 /// module's error text. The responder classifies its own messages by
@@ -503,11 +520,7 @@ impl KittyGraphicsState {
                 } else {
                     "EINVAL"
                 };
-                let message: String = error
-                    .chars()
-                    .filter(|ch| !ch.is_control())
-                    .take(160)
-                    .collect();
+                let message = bound_protocol_message(error);
                 format!("{code}:{message}")
             }
         };
@@ -1886,6 +1899,19 @@ mod tests {
             state.pending_responses.len(),
             MAX_PENDING_RESPONSE_BYTES - 1
         );
+    }
+
+    #[test]
+    fn protocol_error_text_strips_controls_and_visual_spoofing() {
+        let shown = bound_protocol_message("failed \u{1b}[31m\u{202e}png");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.starts_with("failed "));
+        let overflow =
+            bound_protocol_message(&format!("{}z", "x".repeat(MAX_RESPONSE_MESSAGE_CHARS)));
+        assert_eq!(overflow.chars().count(), MAX_RESPONSE_MESSAGE_CHARS);
+        assert!(!overflow.contains('z'));
     }
 
     #[test]

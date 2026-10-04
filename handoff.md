@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 171 — Kitty graphics errors)
+
+## 2026-10-04 (Kitty graphics)
+
+- Protocol error replies drop controls and replace visual spoofing, capped
+  at 160 characters. Unique round **171**. Test:
+  `protocol_error_text_strips_controls_and_visual_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 170 — restored session cwd)
 
 ## 2026-10-04 (session persistence)

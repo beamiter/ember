@@ -914,3 +914,7 @@ query answers, control handling and resize.
      became the PTY working directory after restart. Frost already blanks
      those; Ember now matches before spawn.
 
+171. **Kitty graphics error replies strip spoofing** — APC error text dropped
+     C0 but still echoed bidi overrides into the PTY. Frost rewrites those
+     scalars to U+FFFD and caps the message; Ember now shares that bound.
+
