@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 189 — Files new-name spoofing)
+
+## 2026-10-04 (Files new-name)
+
+- New File / Rename names are bounded and fail closed on spoofing.
+  Unique round **189**. Test: `new_name_validation`.
+
 Updated: 2026-10-04 (upgrade round 188 — DECRQSS SGR)
 
 ## 2026-10-04 (DECRQSS SGR)

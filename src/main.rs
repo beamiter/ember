@@ -4931,6 +4931,7 @@ impl TerminalApp {
                     let response = ui.text_edit_singleline(&mut dialog.input);
                     if response.changed() {
                         files_dialog_interacted = true;
+                        dialog.input = remote_fs::bound_new_name(std::mem::take(&mut dialog.input));
                         dialog.error = None;
                     }
                     if let Some(error) = &dialog.error {

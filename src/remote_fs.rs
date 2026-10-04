@@ -441,12 +441,38 @@ exit 0
 "#;
 
 /// 新名称（New File / New Folder / Rename 对话框共用）校验：
-/// 非空、≤255 字节、不含 `/`/NUL、不是 `.`/`..`。
+/// 非空、≤255 字节、不含 `/`/NUL、不是 `.`/`..`、不含控制或视觉欺骗字符。
+pub const MAX_NEW_NAME_BYTES: usize = 255;
+
+pub fn bound_new_name(name: impl Into<String>) -> String {
+    let mut name: String = name
+        .into()
+        .chars()
+        .filter_map(|character| {
+            if character == '/' || character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
+    if name.len() > MAX_NEW_NAME_BYTES {
+        let mut end = MAX_NEW_NAME_BYTES;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    name
+}
+
 pub fn validate_new_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("名称不能为空".to_string());
     }
-    if name.len() > 255 {
+    if name.len() > MAX_NEW_NAME_BYTES {
         return Err("名称过长（超过 255 字节）".to_string());
     }
     if name == "." || name == ".." {
@@ -454,6 +480,13 @@ pub fn validate_new_name(name: &str) -> Result<(), String> {
     }
     if name.contains('/') || name.contains('\0') {
         return Err("名称不能包含 / 或 NUL".to_string());
+    }
+    if name.chars().any(|character| {
+        character.is_control()
+            || character == '\u{fffd}'
+            || jterm_core::review_input::is_visual_spoofing_character(character)
+    }) {
+        return Err("名称不能包含控制或视觉欺骗字符".to_string());
     }
     Ok(())
 }
@@ -4176,6 +4209,10 @@ docker = true
         assert!(validate_new_name("a\0b").is_err());
         assert!(validate_new_name(".").is_err());
         assert!(validate_new_name("..").is_err());
+        assert_eq!(bound_new_name("ok\n/\u{1b}name"), "okname");
+        assert_eq!(bound_new_name("ok\u{202e}"), "ok\u{fffd}");
+        assert!(validate_new_name("ok\u{fffd}").is_err());
+        assert!(validate_new_name("ok\u{202e}").is_err());
     }
 
     #[test]

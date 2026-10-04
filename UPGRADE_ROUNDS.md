@@ -998,3 +998,8 @@ query answers, control handling and resize.
      current rendition heard silence. Ember now reports `0m` or the
      active flags and colors.
 
+189. **New-file names refuse spoofing** — New File / Rename stored paste
+     verbatim, so a bidi mark could become a filesystem name. Names now
+     drop slashes and controls, rewrite spoofing, and validate fail-closed
+     on a rewritten needle.
+
