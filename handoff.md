@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 192 — Files notices)
+
+## 2026-10-04 (Files notices)
+
+- Files-panel error chrome is bounded. Unique round **192**. Test:
+  `sidebar_notices_are_bounded_and_rewrite_spoofing`.
+
 Updated: 2026-10-04 (upgrade round 191 — status toast bound)
 
 ## 2026-10-04 (status toast)

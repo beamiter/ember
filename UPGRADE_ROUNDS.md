@@ -1012,3 +1012,7 @@ query answers, control handling and resize.
      inline-display envelope as frost (controls dropped, spoofing rewritten,
      256-byte cap).
 
+192. **Files notices are bounded** — scan-failure chrome interpolated paths
+     and backend errors verbatim into the tree. Notices now drop controls,
+     rewrite spoofing, and cap at 192 bytes.
+

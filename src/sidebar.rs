@@ -10,6 +10,25 @@ use jterm_core::jsh_remote::RemoteHostConfig;
 
 use crate::remote_fs::{self, FsLocation};
 
+/// Files-panel status/error chrome: interpolated names and backend errors
+/// must not restyle the tree or grow without bound.
+pub const MAX_SIDEBAR_NOTICE_BYTES: usize = 192;
+
+pub fn bound_sidebar_notice(text: impl AsRef<str>) -> String {
+    let text =
+        jterm_core::review_input::safe_inline_display(text.as_ref(), MAX_SIDEBAR_NOTICE_BYTES);
+    if text.is_empty() {
+        "Files panel notice".to_string()
+    } else {
+        text
+    }
+}
+
+/// Filenames drawn as Files-panel chrome (dialog path, delete list).
+pub fn bound_sidebar_path_label(path: impl AsRef<std::path::Path>) -> String {
+    bound_sidebar_notice(path.as_ref().display().to_string())
+}
+
 /// Keep directory rendering bounded while still allowing every entry to be
 /// reached through the explicit "show more" row.
 pub const DIRECTORY_PAGE_SIZE: usize = 64;
@@ -177,14 +196,14 @@ struct DirectoryFailure {
 impl DirectoryFailure {
     fn retryable(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: bound_sidebar_notice(message.into()),
             retryable: true,
         }
     }
 
     fn from_io(error: &io::Error) -> Self {
         Self {
-            message: remote_fs::user_facing_error(error),
+            message: bound_sidebar_notice(remote_fs::user_facing_error(error)),
             retryable: remote_fs::is_retryable_error(error),
         }
     }
@@ -1783,6 +1802,10 @@ impl Sidebar {
         self.location_error.as_deref()
     }
 
+    fn set_location_error(&mut self, text: impl Into<String>) {
+        self.location_error = Some(bound_sidebar_notice(text.into()));
+    }
+
     /// 远程位置的起始目录还在 worker 上解析。
     pub fn is_starting(&self) -> bool {
         self.start_dir_pending
@@ -2079,7 +2102,7 @@ impl Sidebar {
             self.pending_navigation = None;
             self.start_dir_pending = false;
             self.failure_states.remove(&target);
-            self.location_error = Some(format!(
+            self.set_location_error(format!(
                 "无法进入 {endpoint_label}：{error}；原文件树保持不变"
             ));
             return Some(error);
@@ -2442,7 +2465,7 @@ impl Sidebar {
                                 Err(error) => {
                                     self.start_dir_pending = false;
                                     let label = pending.location.label(&self.remote_hosts);
-                                    self.location_error = Some(format!(
+                                    self.set_location_error(format!(
                                         "无法进入 {label}：{error}；原文件树保持不变"
                                     ));
                                     messages.push(
@@ -3090,7 +3113,7 @@ impl Sidebar {
                                     self.start_dir_pending = false;
                                     self.pending_location_probe = None;
                                     self.failure_states.remove(&completed_path);
-                                    self.location_error = Some(format!(
+                                    self.set_location_error(format!(
                                         "无法进入 {}：{}（仍显示 {}）",
                                         endpoint.location.label(&self.remote_hosts),
                                         message,
@@ -3098,7 +3121,7 @@ impl Sidebar {
                                     ));
                                 } else {
                                     self.record_scan_failure(&completed_path, &error);
-                                    self.location_error = Some(format!(
+                                    self.set_location_error(format!(
                                         "{}（仍显示 {}）",
                                         message,
                                         pending.origin.display()
@@ -3160,7 +3183,7 @@ impl Sidebar {
                 }
             }
         }
-        errors
+        errors.into_iter().map(bound_sidebar_notice).collect()
     }
 
     pub fn has_pending_scan(&self) -> bool {
@@ -6040,5 +6063,17 @@ mod tests {
             .expect("clipboard kept on partial");
         assert_eq!(clipboard.items.len(), 1);
         assert_eq!(clipboard.items[0].path, b);
+    }
+
+    #[test]
+    fn sidebar_notices_are_bounded_and_rewrite_spoofing() {
+        assert_eq!(bound_sidebar_notice("ok"), "ok");
+        let shown = bound_sidebar_notice("fail\n\u{1b}host\u{202e}");
+        assert!(!shown.contains('\n'));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert_eq!(bound_sidebar_notice(""), "Files panel notice");
+        let overflow = format!("{}z", "x".repeat(MAX_SIDEBAR_NOTICE_BYTES));
+        assert!(bound_sidebar_notice(overflow).len() <= MAX_SIDEBAR_NOTICE_BYTES);
     }
 }

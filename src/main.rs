@@ -4922,10 +4922,16 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     match dialog.kind {
                         FsNameDialogKind::NewFile | FsNameDialogKind::NewFolder => {
-                            ui.label(format!("在 {} 中创建：", dialog.base.display()));
+                            ui.label(format!(
+                                "在 {} 中创建：",
+                                crate::sidebar::bound_sidebar_path_label(&dialog.base)
+                            ));
                         }
                         FsNameDialogKind::Rename => {
-                            ui.label(format!("重命名 {}：", dialog.base.display()));
+                            ui.label(format!(
+                                "重命名 {}：",
+                                crate::sidebar::bound_sidebar_path_label(&dialog.base)
+                            ));
                         }
                     }
                     let response = ui.text_edit_singleline(&mut dialog.input);
@@ -4982,7 +4988,10 @@ impl TerminalApp {
                         ui.label(format!("确定删除以下 {} 项吗？", dialog.paths.len()));
                     }
                     for path in dialog.paths.iter().take(5) {
-                        ui.label(egui::RichText::new(path.display().to_string()).monospace());
+                        ui.label(
+                            egui::RichText::new(crate::sidebar::bound_sidebar_path_label(path))
+                                .monospace(),
+                        );
                     }
                     if dialog.paths.len() > 5 {
                         ui.label(format!("… 等 {} 项", dialog.paths.len()));
