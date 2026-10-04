@@ -978,3 +978,7 @@ query answers, control handling and resize.
      backs did not move the cursor. They now share CUB / CUU clamps
      (horizontal wrap-off, vertical margin).
 
+184. **DECRQSS** — DCS `$q` was dropped, so vim and others that query
+     DECSCUSR / DECSTBM got silence. Ember now replies `DCS 1 $ r … ST`
+     for ` q` and `r`, and `DCS 0 $ r ST` for anything else.
+

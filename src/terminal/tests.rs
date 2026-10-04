@@ -3500,6 +3500,35 @@ fn dcs_sequence_is_consumed_without_leaking_text() {
 }
 
 #[test]
+fn decrqss_reports_cursor_style_and_scroll_region() {
+    let mut terminal = TerminalState::new(8, 6);
+    terminal.process_input(b"\x1b[6 q\x1bP$q q\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r6 q\x1b\\"
+    );
+
+    terminal.process_input(b"\x1b[2;4r\x1bP$qr\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r2;4r\x1b\\"
+    );
+
+    terminal.process_input(b"\x1bP$q\"q\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP0$r\x1b\\"
+    );
+
+    terminal.process_input(b"\x1bP$q");
+    terminal.process_input(b" q\x1b\\");
+    assert_eq!(
+        String::from_utf8(terminal.get_output()).unwrap(),
+        "\x1bP1$r6 q\x1b\\"
+    );
+}
+
+#[test]
 fn primary_and_secondary_device_attributes_are_reported() {
     let mut terminal = TerminalState::new(8, 2);
 

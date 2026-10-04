@@ -488,8 +488,30 @@ impl super::TerminalState {
         };
 
         if let Some(consumed) = terminator {
+            let split_st = scan_from + 1 == self.pending_string.len()
+                && self.pending_string.get(scan_from) == Some(&0x1b)
+                && input.first() == Some(&b'\\');
+            let dcs_payload = if self.pending_string.get(1) == Some(&b'P') {
+                let mut payload = if self.pending_string.len() >= 2 {
+                    self.pending_string[2..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                if split_st {
+                    payload.pop();
+                } else {
+                    let body_end = consumed.saturating_sub(2);
+                    payload.extend_from_slice(&input[..body_end]);
+                }
+                Some(payload)
+            } else {
+                None
+            };
             self.pending_string.clear();
             self.pending_string_scan_from = 0;
+            if let Some(payload) = dcs_payload {
+                self.handle_dcs_payload(&payload);
+            }
             if consumed < input.len() {
                 self.process_input(&input[consumed..]);
             }
@@ -511,6 +533,33 @@ impl super::TerminalState {
         self.pending_string.extend_from_slice(input);
         self.pending_string_scan_from = self.pending_string.len().saturating_sub(1);
         true
+    }
+
+    /// DCS `$q` is DECRQSS. Other DCS payloads stay opaque (no reply).
+    fn handle_dcs_payload(&mut self, payload: &[u8]) {
+        if let Some(pt) = payload.strip_prefix(b"$q") {
+            self.handle_decrqss(pt);
+        }
+    }
+
+    fn handle_decrqss(&mut self, pt: &[u8]) {
+        let reply = match pt {
+            b" q" => {
+                let n = match self.cursor_shape {
+                    CursorShape::Underline => 4,
+                    CursorShape::Beam => 6,
+                    _ => 2,
+                };
+                format!("\x1bP1$r{n} q\x1b\\")
+            }
+            b"r" => format!(
+                "\x1bP1$r{};{}r\x1b\\",
+                self.scroll_region_top + 1,
+                self.scroll_region_bottom + 1
+            ),
+            _ => "\x1bP0$r\x1b\\".to_string(),
+        };
+        self.output_buffer.extend_from_slice(reply.as_bytes());
     }
 
     /// LF / IND (and VT, FF, NEL's second half): move down one row, scrolling
@@ -793,10 +842,11 @@ impl super::TerminalState {
                             // ECMA-48 string introducers share the same ST
                             // terminator, but Kitty graphics is specifically an
                             // APC (`ESC _`) whose body starts with the literal
-                            // protocol discriminator `G`. DCS/SOS/PM contents
-                            // must remain opaque even when they happen to contain
-                            // strings such as `a=`.
-                            let is_apc = data_slice[i + 1] == b'_';
+                            // protocol discriminator `G`. DCS `$q` is DECRQSS;
+                            // other DCS/SOS/PM contents stay opaque.
+                            let introducer = data_slice[i + 1];
+                            let is_apc = introducer == b'_';
+                            let is_dcs = introducer == b'P';
                             i += 2;
 
                             let mut terminated = false;
@@ -810,6 +860,8 @@ impl super::TerminalState {
 
                                     if is_apc {
                                         self.handle_kitty_apc_payload(payload);
+                                    } else if is_dcs {
+                                        self.handle_dcs_payload(payload);
                                     }
 
                                     i += 2;

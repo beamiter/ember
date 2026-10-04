@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 184 — DECRQSS)
+
+## 2026-10-04 (DECRQSS)
+
+- DCS `$q` reports DECSCUSR and DECSTBM; unknown Pt is invalid.
+  Unique round **184**. Test: `decrqss_reports_cursor_style_and_scroll_region`.
+
 Updated: 2026-10-04 (upgrade round 183 — HPB/VPB)
 
 ## 2026-10-04 (HPB/VPB)
