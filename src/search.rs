@@ -480,8 +480,10 @@ impl SearchEngine {
         // 大小写敏感时直接做子串查找(std 的 str::find 走 memmem),
         // 连转义字面量正则的编译都省掉。
         if case_sensitive {
-            let truncated =
-                Self::for_each_line(terminal, scan_budget, |line_id, line_str, col_map, total_cols| {
+            let truncated = Self::for_each_line(
+                terminal,
+                scan_budget,
+                |line_id, line_str, col_map, total_cols| {
                     Self::append_substring_matches(
                         &mut matches,
                         line_id,
@@ -490,7 +492,8 @@ impl SearchEngine {
                         total_cols,
                         query,
                     )
-                });
+                },
+            );
             return (matches, truncated);
         }
 
@@ -500,16 +503,20 @@ impl SearchEngine {
         // 编译结果经 RegexCache 在搜索面板打开期间跨刷新复用。
         let regex = Self::cached_regex(regex_cache, &regex::escape(query), false)
             .expect("an escaped literal must compile as a regex");
-        let truncated = Self::for_each_line(terminal, scan_budget, |line_id, line_str, col_map, total_cols| {
-            Self::append_plaintext_regex_matches(
-                &mut matches,
-                line_id,
-                line_str,
-                col_map,
-                total_cols,
-                regex,
-            )
-        });
+        let truncated = Self::for_each_line(
+            terminal,
+            scan_budget,
+            |line_id, line_str, col_map, total_cols| {
+                Self::append_plaintext_regex_matches(
+                    &mut matches,
+                    line_id,
+                    line_str,
+                    col_map,
+                    total_cols,
+                    regex,
+                )
+            },
+        );
         (matches, truncated)
     }
 
@@ -590,9 +597,20 @@ impl SearchEngine {
             Ok(regex) => regex,
             Err(e) => return (Vec::new(), Some(e), false),
         };
-        let truncated = Self::for_each_line(terminal, scan_budget, |line_id, line_str, col_map, total_cols| {
-            Self::append_regex_matches(&mut matches, line_id, line_str, col_map, total_cols, regex)
-        });
+        let truncated = Self::for_each_line(
+            terminal,
+            scan_budget,
+            |line_id, line_str, col_map, total_cols| {
+                Self::append_regex_matches(
+                    &mut matches,
+                    line_id,
+                    line_str,
+                    col_map,
+                    total_cols,
+                    regex,
+                )
+            },
+        );
         (matches, None, truncated)
     }
 
@@ -939,14 +957,8 @@ mod tests {
     fn find_scan_budget_stops_before_later_lines() {
         let mut terminal = crate::terminal::TerminalState::new(8, 3);
         terminal.process_input(b"aaaa\r\nzzzz\r\n");
-        let (matches, error, truncated) = SearchEngine::search_with_scan_budget(
-            &terminal,
-            "zzzz",
-            false,
-            true,
-            &mut None,
-            4,
-        );
+        let (matches, error, truncated) =
+            SearchEngine::search_with_scan_budget(&terminal, "zzzz", false, true, &mut None, 4);
         assert!(error.is_none());
         assert!(truncated);
         assert!(matches.is_empty());

@@ -3343,9 +3343,7 @@ mod tests {
             Some(jterm_core::output_notice::OUTPUT_TEXT_TRUNCATED)
         );
         assert_eq!(
-            jterm_core::output_notice::known_output_notice(
-                finished_output_notice(true).unwrap()
-            ),
+            jterm_core::output_notice::known_output_notice(finished_output_notice(true).unwrap()),
             Some(jterm_core::output_notice::OUTPUT_TEXT_TRUNCATED)
         );
     }

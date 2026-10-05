@@ -1113,6 +1113,9 @@ impl super::TerminalState {
             *cont_cell = blank_cell;
             cont_cell.hyperlink_id = self.current_hyperlink;
             cont_cell.flags.set_wide_continuation(true);
+            cont_cell
+                .flags
+                .set_protected(self.current_flags.protected());
         }
 
         self.cursor_col += width;
@@ -1666,10 +1669,41 @@ impl super::TerminalState {
         (start, end)
     }
 
-    pub(super) fn clear_cell_unchecked(&mut self, row: usize, col: usize) {
-        if self.grid.get(row, col).flags.protected() {
-            return;
+    /// Erase only the eligible runs, so selective erase does not invalidate
+    /// completed-command provenance for protected cells that remain intact.
+    pub(super) fn erase_grid_span(
+        &mut self,
+        row: usize,
+        start: usize,
+        end: usize,
+        selective: bool,
+    ) {
+        let mut col = start;
+        while col < end {
+            if selective && self.grid.get(row, col).flags.protected() {
+                col += 1;
+                continue;
+            }
+            let run_start = col;
+            col += 1;
+            while col < end && !(selective && self.grid.get(row, col).flags.protected()) {
+                col += 1;
+            }
+            let (mutation_start, mutation_end) =
+                self.expanded_cell_mutation_span(row, run_start, col);
+            // Like xterm's ClearInLine, actual erasure cancels the Last Column
+            // Flag. A protected-only selective erase leaves it untouched.
+            self.pending_wrap = false;
+            self.invalidate_finished_output_span(row, mutation_start, mutation_end);
+            for erased_col in run_start..col {
+                self.clear_cell_unchecked(row, erased_col);
+            }
+            self.dirty_region.mark_row(row);
+            self.mark_row_dirty(row);
         }
+    }
+
+    pub(super) fn clear_cell_unchecked(&mut self, row: usize, col: usize) {
         let cols = self.grid.row_len();
         let bg_color = self.current_bg;
         let blank_cell = TerminalCell {

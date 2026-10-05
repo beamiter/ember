@@ -741,10 +741,21 @@ impl super::TerminalState {
     fn decrqm_private_mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
             6 => self.origin_mode,
-            1 | 7 | 12 | 25 | 47 | 66 | 1000..=1007 | 1015 | 1034 | 1036 | 1047..=1049 | 2004
-            | 2026 | 2031 | 5522 => {
-                self.modes.contains(&mode)
-            }
+            1
+            | 7
+            | 12
+            | 25
+            | 47
+            | 66
+            | 1000..=1007
+            | 1015
+            | 1034
+            | 1036
+            | 1047..=1049
+            | 2004
+            | 2026
+            | 2031
+            | 5522 => self.modes.contains(&mode),
             _ => return 0,
         };
         if set {
@@ -1250,7 +1261,22 @@ impl super::TerminalState {
         // (CHT/CBT) moves the cursor too, so it clears the flag as well.
         if matches!(
             cmd,
-            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'd' | '`' | 'I' | 'Z' | 'a' | 'e'
+            'A' | 'B'
+                | 'C'
+                | 'D'
+                | 'E'
+                | 'F'
+                | 'G'
+                | 'H'
+                | 'f'
+                | 'd'
+                | '`'
+                | 'I'
+                | 'Z'
+                | 'a'
+                | 'e'
+                | 'j'
+                | 'k'
         ) {
             self.pending_wrap = false;
         }
@@ -1362,68 +1388,37 @@ impl super::TerminalState {
                     self.set_cursor_position(row, col);
                 }
             }
-            'J' => {
+            'J' if intermediates.is_empty() && matches!(private_prefix, None | Some(b'?')) => {
+                let selective = private_prefix == Some(b'?');
                 match params.first().copied().unwrap_or(0) {
                     0 => {
                         // Clear from cursor to end of display
+                        // ClearRight cancels wrap even if the tail is protected.
+                        self.pending_wrap = false;
                         let cols = self.grid.row_len();
-                        let spans: Vec<_> = (self.cursor_row..self.grid.rows())
-                            .map(|row| {
-                                (
-                                    row,
-                                    if row == self.cursor_row {
-                                        self.cursor_col
-                                    } else {
-                                        0
-                                    },
-                                    cols,
-                                )
-                            })
-                            .collect();
-                        self.invalidate_grid_mutation_spans(&spans);
-                        for col in self.cursor_col..self.grid.row_len() {
-                            self.clear_cell_unchecked(self.cursor_row, col);
-                        }
+                        self.erase_grid_span(self.cursor_row, self.cursor_col, cols, selective);
                         for row in (self.cursor_row + 1)..self.grid.rows() {
-                            for col in 0..self.grid.row_len() {
-                                self.clear_cell_unchecked(row, col);
-                            }
+                            self.erase_grid_span(row, 0, cols, selective);
                         }
-                        // Mark affected rows as dirty
-                        self.dirty_region
-                            .mark_rows(self.cursor_row, self.grid.rows().saturating_sub(1));
-                        self.mark_rows_dirty(self.cursor_row, self.grid.rows().saturating_sub(1));
                     }
                     1 => {
                         // Clear from start to cursor
                         let cols = self.grid.row_len();
-                        let spans: Vec<_> = (0..=self.cursor_row)
-                            .map(|row| {
-                                (
-                                    row,
-                                    0,
-                                    if row == self.cursor_row {
-                                        self.cursor_col.saturating_add(1).min(cols)
-                                    } else {
-                                        cols
-                                    },
-                                )
-                            })
-                            .collect();
-                        self.invalidate_grid_mutation_spans(&spans);
                         for row in 0..=self.cursor_row {
                             let end_col = if row == self.cursor_row {
                                 self.cursor_col + 1
                             } else {
-                                self.grid.row_len()
+                                cols
                             };
-                            for col in 0..end_col {
-                                self.clear_cell_unchecked(row, col);
-                            }
+                            self.erase_grid_span(row, 0, end_col, selective);
                         }
-                        // Mark affected rows as dirty
-                        self.dirty_region.mark_rows(0, self.cursor_row);
-                        self.mark_rows_dirty(0, self.cursor_row);
+                    }
+                    2 if selective => {
+                        // DECSED preserves protected text and does not archive
+                        // a partially retained screen or delete Kitty images.
+                        for row in 0..self.grid.rows() {
+                            self.erase_grid_span(row, 0, self.grid.row_len(), true);
+                        }
                     }
                     2 => {
                         // ED 擦除显示不移动光标(VT 规范)
@@ -1448,53 +1443,17 @@ impl super::TerminalState {
                     _ => {}
                 }
             }
-            'K' => {
-                // Clear line
-                match params.first().copied().unwrap_or(0) {
+            'K' if intermediates.is_empty() && matches!(private_prefix, None | Some(b'?')) => {
+                let (start, end) = match params.first().copied().unwrap_or(0) {
                     0 => {
-                        // Clear from cursor to end of line
-                        self.invalidate_grid_mutation_spans(&[(
-                            self.cursor_row,
-                            self.cursor_col,
-                            self.grid.row_len(),
-                        )]);
-                        for col in self.cursor_col..self.grid.row_len() {
-                            self.clear_cell_unchecked(self.cursor_row, col);
-                        }
-                        // Mark the line as dirty
-                        self.dirty_region.mark_row(self.cursor_row);
-                        self.mark_row_dirty(self.cursor_row);
+                        self.pending_wrap = false;
+                        (self.cursor_col, self.grid.row_len())
                     }
-                    1 => {
-                        // Clear from start of line to cursor
-                        self.invalidate_grid_mutation_spans(&[(
-                            self.cursor_row,
-                            0,
-                            self.cursor_col.saturating_add(1),
-                        )]);
-                        for col in 0..=self.cursor_col {
-                            self.clear_cell_unchecked(self.cursor_row, col);
-                        }
-                        // Mark the line as dirty
-                        self.dirty_region.mark_row(self.cursor_row);
-                        self.mark_row_dirty(self.cursor_row);
-                    }
-                    2 => {
-                        // Clear entire line
-                        self.invalidate_grid_mutation_spans(&[(
-                            self.cursor_row,
-                            0,
-                            self.grid.row_len(),
-                        )]);
-                        for col in 0..self.grid.row_len() {
-                            self.clear_cell_unchecked(self.cursor_row, col);
-                        }
-                        // Mark the line as dirty
-                        self.dirty_region.mark_row(self.cursor_row);
-                        self.mark_row_dirty(self.cursor_row);
-                    }
-                    _ => {}
-                }
+                    1 => (0, self.cursor_col + 1),
+                    2 => (0, self.grid.row_len()),
+                    _ => return,
+                };
+                self.erase_grid_span(self.cursor_row, start, end, private_prefix == Some(b'?'));
             }
             'L' => {
                 // IL — insert N blank lines at cursor. After (region_height)
@@ -1809,7 +1768,7 @@ impl super::TerminalState {
                 self.cursor_col = 0;
                 self.pending_wrap = false;
             }
-            '@' => {
+            '@' if private_prefix.is_none() && intermediates.is_empty() => {
                 // ICH - Insert Character(s). Cap N to remaining columns; further
                 // iterations would just keep dropping the rightmost cell.
                 let n = count;
@@ -1820,6 +1779,7 @@ impl super::TerminalState {
                     if n == 0 {
                         return;
                     }
+                    self.pending_wrap = false;
                     self.invalidate_grid_mutation_spans(&[(
                         self.cursor_row,
                         self.cursor_col,
@@ -1845,7 +1805,7 @@ impl super::TerminalState {
                     self.mark_row_dirty(self.cursor_row);
                 }
             }
-            'P' => {
+            'P' if private_prefix.is_none() && intermediates.is_empty() => {
                 // DCH - Delete Character(s). Cap N to remaining columns.
                 let n = count;
                 let cols = self.grid.row_len();
@@ -1855,6 +1815,7 @@ impl super::TerminalState {
                     if n == 0 {
                         return;
                     }
+                    self.pending_wrap = false;
                     self.invalidate_grid_mutation_spans(&[(
                         self.cursor_row,
                         self.cursor_col,
@@ -1878,16 +1839,11 @@ impl super::TerminalState {
                     self.mark_row_dirty(self.cursor_row);
                 }
             }
-            'X' => {
+            'X' if private_prefix.is_none() && intermediates.is_empty() => {
                 // ECH - Erase Character(s)
                 let n = count;
                 let end = self.cursor_col.saturating_add(n).min(self.grid.row_len());
-                self.invalidate_grid_mutation_spans(&[(self.cursor_row, self.cursor_col, end)]);
-                for col in self.cursor_col..end {
-                    self.clear_cell_unchecked(self.cursor_row, col);
-                }
-                // Mark row as dirty after modification
-                self.mark_row_dirty(self.cursor_row);
+                self.erase_grid_span(self.cursor_row, self.cursor_col, end, false);
             }
             'q' => {
                 if private_prefix == Some(b'>')
@@ -1912,8 +1868,11 @@ impl super::TerminalState {
 
                 // DECSCA - Select Character Protection Attribute.
                 if private_prefix.is_none() && intermediates == *b"\"" {
-                    let protect = params.first().copied().unwrap_or(0) == 1;
-                    self.current_flags.set_protected(protect);
+                    match params.first().copied().unwrap_or(0) {
+                        0 | 2 => self.current_flags.set_protected(false),
+                        1 => self.current_flags.set_protected(true),
+                        _ => {}
+                    }
                 }
             }
             'I' => {
@@ -2001,8 +1960,11 @@ impl super::TerminalState {
     }
 
     pub(super) fn handle_sgr(&mut self, params: &[u16], colon_flags: &[bool]) {
+        // DECSCA is independent of the visual rendition reset by SGR 0.
+        let protected = self.current_flags.protected();
         if params.is_empty() {
             self.current_flags = StyleFlags::default();
+            self.current_flags.set_protected(protected);
             self.current_fg = Color::Default;
             self.current_bg = Color::Default;
             return;
@@ -2014,6 +1976,7 @@ impl super::TerminalState {
             match param {
                 0 => {
                     self.current_flags = StyleFlags::default();
+                    self.current_flags.set_protected(protected);
                     self.current_fg = Color::Default;
                     self.current_bg = Color::Default;
                 }
@@ -2150,15 +2113,13 @@ impl super::TerminalState {
     /// 擦除整个屏幕单元格(保留当前背景色),不移动光标。
     /// 供 ED(`CSI 2J`)使用 —— 按 VT 规范擦除显示不得移动光标。
     pub(super) fn erase_screen(&mut self) {
+        self.pending_wrap = false;
         let bg_color = self.current_bg;
         let cols = self.grid.row_len();
         let spans: Vec<_> = (0..self.grid.rows()).map(|row| (row, 0, cols)).collect();
         self.invalidate_grid_mutation_spans(&spans);
         for row in self.grid.iter_mut() {
             for cell in row.iter_mut() {
-                if cell.flags.protected() {
-                    continue;
-                }
                 *cell = TerminalCell {
                     character: ' ',
                     foreground: Color::Default,

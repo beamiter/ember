@@ -142,9 +142,7 @@ mod tests {
         assert!(table
             .intern("id=\u{202e}spoof", "https://safe.test")
             .is_none());
-        assert!(table
-            .intern("id=ok\u{fffd}", "https://safe.test")
-            .is_none());
+        assert!(table.intern("id=ok\u{fffd}", "https://safe.test").is_none());
         assert!(table
             .intern(
                 "",

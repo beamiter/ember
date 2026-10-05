@@ -121,15 +121,7 @@ pub fn draw(ui: &mut egui::Ui, theme: &Theme, content: &Content) -> Option<Segme
             )
         };
         let size = galley.size();
-        if paint_clickable_segment(
-            ui,
-            cursor_x,
-            center_y,
-            galley,
-            color,
-            segment.kind,
-            index,
-        ) {
+        if paint_clickable_segment(ui, cursor_x, center_y, galley, color, segment.kind, index) {
             clicked = Some(segment.kind);
         }
         cursor_x += size.x + SEGMENT_GAP;
@@ -149,7 +141,9 @@ fn paint_clickable_segment(
     let size = galley.size();
     let pos = egui::pos2(cursor_x, center_y - size.y / 2.0);
     let rect = egui::Rect::from_min_size(pos, size);
-    let id = ui.id().with(("bottom_bar_segment", segment_kind_salt(kind), index));
+    let id = ui
+        .id()
+        .with(("bottom_bar_segment", segment_kind_salt(kind), index));
     let mut response = ui.interact(rect, id, Sense::click());
     if kind == SegmentKind::Cwd {
         response = response.on_hover_cursor(egui::CursorIcon::PointingHand);

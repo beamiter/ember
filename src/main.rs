@@ -1669,7 +1669,11 @@ fn alternate_scroll_cursor_bytes(steps: isize, application_cursor_keys: bool) ->
         (false, true) => b"\x1bOB",
         (false, false) => b"\x1b[B",
     };
-    seq.repeat(steps.unsigned_abs().min(MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as usize))
+    seq.repeat(
+        steps
+            .unsigned_abs()
+            .min(MAX_MOUSE_WHEEL_REPORTS_PER_FRAME as usize),
+    )
 }
 
 fn bounded_wheel_step_accumulate(current: isize, delta: f32, multiplier: usize) -> isize {
@@ -6038,7 +6042,10 @@ impl eframe::App for TerminalApp {
                         }
                     });
                     self.keyboard_input_buffer
-                        .extend(alternate_scroll_cursor_bytes(steps, application_cursor_keys));
+                        .extend(alternate_scroll_cursor_bytes(
+                            steps,
+                            application_cursor_keys,
+                        ));
                 } else {
                     self.alternate_scroll_wheel.reset();
                 }
@@ -7007,9 +7014,9 @@ impl eframe::App for TerminalApp {
                     });
 
                     let total_scroll_steps = discrete_scroll_steps.clamp(
-                            -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
-                            MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
-                        );
+                        -MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                        MAX_MOUSE_WHEEL_REPORTS_PER_FRAME,
+                    );
                     if total_scroll_steps != 0 {
                         let button = if total_scroll_steps > 0 { 64 } else { 65 };
 
@@ -7593,10 +7600,10 @@ impl Drop for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_mouse_frame_route, app_mouse_press_reports_from_snapshot, application_cell_at_pointer,
-        bounded_line_wheel_accumulate, bounded_point_wheel_accumulate, bounded_wheel_step_accumulate,
-        captured_release_button, clipboard_5522_response_for_mime,
-        alternate_scroll_cursor_bytes, should_send_alternate_scroll,
+        alternate_scroll_cursor_bytes, app_mouse_frame_route,
+        app_mouse_press_reports_from_snapshot, application_cell_at_pointer,
+        bounded_line_wheel_accumulate, bounded_point_wheel_accumulate,
+        bounded_wheel_step_accumulate, captured_release_button, clipboard_5522_response_for_mime,
         clipboard_5522_response_for_mime_with_limit, desktop_notification_channel,
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, fontconfig_match_family_file, kitty_graphics_payload,
@@ -7607,9 +7614,9 @@ mod tests {
         normalized_paste_body, osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
         paste_requires_confirmation, primary_copy_route, queue_mouse_control,
         reported_capture_button, roll_notification_rate_window, should_notify_long_command,
-        show_desktop_notification, snapshot_age_label, take_tagged_cursor_move,
-        workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification,
-        Osc52ReadRateLimit, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
+        should_send_alternate_scroll, show_desktop_notification, snapshot_age_label,
+        take_tagged_cursor_move, workspace_drag_pointer_cancelled, ClipboardRequestGuard,
+        DesktopNotification, Osc52ReadRateLimit, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
         DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
         OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
@@ -8396,22 +8403,28 @@ mod tests {
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 0);
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 0);
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 0, 4.0, 10.0), 1);
-        assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, f32::NAN, 10.0), 7);
+        assert_eq!(
+            bounded_point_wheel_accumulate(&mut acc, 7, f32::NAN, 10.0),
+            7
+        );
         assert_eq!(bounded_point_wheel_accumulate(&mut acc, 7, 4.0, 0.0), 7);
     }
 
     #[test]
     fn alternate_scroll_sends_cursor_keys_only_on_an_unfocused_mouse_alt_screen() {
         assert!(should_send_alternate_scroll(true, true, false, false, true));
-        assert!(!should_send_alternate_scroll(false, true, false, false, true));
-        assert!(!should_send_alternate_scroll(true, false, false, false, true));
+        assert!(!should_send_alternate_scroll(
+            false, true, false, false, true
+        ));
+        assert!(!should_send_alternate_scroll(
+            true, false, false, false, true
+        ));
         assert!(!should_send_alternate_scroll(true, true, true, false, true));
         assert!(!should_send_alternate_scroll(true, true, false, true, true));
-        assert!(!should_send_alternate_scroll(true, true, false, false, false));
-        assert_eq!(
-            alternate_scroll_cursor_bytes(2, false),
-            b"\x1b[A\x1b[A"
-        );
+        assert!(!should_send_alternate_scroll(
+            true, true, false, false, false
+        ));
+        assert_eq!(alternate_scroll_cursor_bytes(2, false), b"\x1b[A\x1b[A");
         assert_eq!(alternate_scroll_cursor_bytes(-1, true), b"\x1bOB");
         assert!(alternate_scroll_cursor_bytes(0, false).is_empty());
     }

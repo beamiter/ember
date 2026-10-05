@@ -406,8 +406,14 @@ impl TerminalApp {
         self.sidebar.note_files_user_intent();
         self.sidebar.visible = true;
         self.sidebar.view = crate::sidebar::SidebarView::Files;
-        if let Some(error) = self.sidebar.set_location(crate::remote_fs::FsLocation::Local) {
-            self.set_status_for(format!("文件树切换失败：{error}"), std::time::Duration::from_secs(5));
+        if let Some(error) = self
+            .sidebar
+            .set_location(crate::remote_fs::FsLocation::Local)
+        {
+            self.set_status_for(
+                format!("文件树切换失败：{error}"),
+                std::time::Duration::from_secs(5),
+            );
             return;
         }
         if let Some(error) = self.sidebar.set_current_dir(path) {

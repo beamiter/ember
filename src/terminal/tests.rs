@@ -3404,18 +3404,209 @@ fn hpb_and_vpb_are_the_relative_cursor_backs() {
     );
 }
 
-#[test]
-fn decsca_protects_cells_from_ed_and_el() {
-    let mut terminal = TerminalState::new(8, 2);
-    terminal.process_input(b"\x1b[\"1qABC\x1b[\"0qDEF\x1b[2J");
-    assert_eq!(terminal.grid[0][0].character, 'A');
-    assert_eq!(terminal.grid[0][1].character, 'B');
-    assert_eq!(terminal.grid[0][2].character, 'C');
-    assert_eq!(terminal.grid[0][3].character, ' ');
-    assert_eq!(terminal.grid[0][4].character, ' ');
+fn protected_erase_fixture() -> TerminalState {
+    let mut terminal = TerminalState::new(6, 3);
+    for row in 1..=3 {
+        terminal
+            .process_input(format!("\x1b[{row};1H\x1b[1\"qAB\x1b[0\"qcd\x1b[1\"qEF").as_bytes());
+    }
+    terminal.process_input(b"\x1b[2;3H\x1b[44m");
+    terminal
+}
 
-    terminal.process_input(b"\x1b[1;1H\x1b[\"1qX\x1b[\"2q\x1b[0K");
-    assert_eq!(terminal.grid[0][0].character, 'X');
+fn assert_erase_rows(terminal: &TerminalState, expected: [&str; 3], sequence: &str) {
+    for (row, text) in terminal.grid.iter().zip(expected) {
+        assert_eq!(
+            row.iter().map(|cell| cell.character).collect::<String>(),
+            text,
+            "{sequence:?}"
+        );
+        for cell in row.iter().filter(|cell| cell.character == ' ') {
+            assert_eq!(cell.background, Color::Blue, "{sequence:?}");
+            assert!(!cell.flags.protected(), "erased blanks must be unprotected");
+            assert_eq!(cell.hyperlink_id, HyperlinkId::NONE);
+        }
+    }
+    assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 2));
+    assert!(terminal.current_flags.protected());
+}
+
+#[test]
+fn decsca_does_not_protect_cells_from_ordinary_ed_el_or_ech() {
+    for (sequence, expected) in [
+        ("\x1b[J", ["ABcdEF", "AB    ", "      "]),
+        ("\x1b[1J", ["      ", "   dEF", "ABcdEF"]),
+        ("\x1b[2J", ["      ", "      ", "      "]),
+        ("\x1b[K", ["ABcdEF", "AB    ", "ABcdEF"]),
+        ("\x1b[1K", ["ABcdEF", "   dEF", "ABcdEF"]),
+        ("\x1b[2K", ["ABcdEF", "      ", "ABcdEF"]),
+        ("\x1b[2X", ["ABcdEF", "AB  EF", "ABcdEF"]),
+        ("\x1b[4X", ["ABcdEF", "AB    ", "ABcdEF"]),
+    ] {
+        let mut terminal = protected_erase_fixture();
+        terminal.process_input(sequence.as_bytes());
+        assert_erase_rows(&terminal, expected, sequence);
+    }
+}
+
+#[test]
+fn decsca_protects_cells_only_from_selective_ed_and_el() {
+    for (sequence, expected) in [
+        ("\x1b[?J", ["ABcdEF", "AB  EF", "AB  EF"]),
+        ("\x1b[?1J", ["AB  EF", "AB dEF", "ABcdEF"]),
+        ("\x1b[?2J", ["AB  EF", "AB  EF", "AB  EF"]),
+        ("\x1b[?K", ["ABcdEF", "AB  EF", "ABcdEF"]),
+        ("\x1b[?1K", ["ABcdEF", "AB dEF", "ABcdEF"]),
+        ("\x1b[?2K", ["ABcdEF", "AB  EF", "ABcdEF"]),
+    ] {
+        let mut terminal = protected_erase_fixture();
+        terminal.process_input(sequence.as_bytes());
+        assert_erase_rows(&terminal, expected, sequence);
+        assert!(terminal.scrollback.is_empty(), "{sequence:?}");
+        assert_eq!(terminal.total_lines_scrolled, 0);
+    }
+}
+
+#[test]
+fn decsca_survives_sgr_reset_but_resets_on_decstr() {
+    for sgr in ["\x1b[m", "\x1b[0m", "\x1b[0;31m"] {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[1\"q\x1b[1;44m");
+        terminal.process_input(sgr.as_bytes());
+        terminal.process_input(b"A\x1bP$q\"q\x1b\\");
+        assert!(terminal.grid[0][0].flags.protected(), "{sgr:?}");
+        assert!(!terminal.grid[0][0].flags.bold());
+        assert_eq!(terminal.grid[0][0].background, Color::Default);
+        assert_eq!(terminal.get_output(), b"\x1bP1$r1\"q\x1b\\");
+        terminal.process_input(b"\x1b[!pB");
+        assert!(!terminal.grid[0][1].flags.protected());
+        assert!(!terminal.current_flags.protected());
+    }
+}
+
+#[test]
+fn decsca_valid_parameters_and_saved_cursor_control_protection() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.process_input(b"\x1b[1\"q\x1b[99\"qA\x1b7\x1b[2\"qB\x1b8C");
+    assert!(
+        terminal.grid[0][0].flags.protected(),
+        "unknown Ps must be ignored"
+    );
+    assert!(
+        terminal.grid[0][1].flags.protected(),
+        "DECRC restores DECSCA"
+    );
+    terminal.process_input(b"\x1b[0\"qD\x1b[1\"qE\x1b[\"qF\x1b[1\"qG\x1b[2\"qH");
+    for col in [2, 4, 6] {
+        assert!(!terminal.grid[0][col].flags.protected());
+    }
+    for col in [3, 5] {
+        assert!(terminal.grid[0][col].flags.protected());
+    }
+    terminal.process_input(b"\x1b[1\"q\x1bc");
+    assert!(!terminal.current_flags.protected(), "RIS resets DECSCA");
+}
+
+#[test]
+fn selective_erase_keeps_protected_wide_pairs_at_both_boundaries() {
+    for sequence in ["\x1b[1;2H\x1b[?K", "\x1b[1;1H\x1b[?1K", "\x1b[?2J"] {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input("\x1b[1\"q界\x1b[0\"q文Z".as_bytes());
+        assert!(terminal.grid[0][1].flags.protected());
+        terminal.process_input(sequence.as_bytes());
+        assert_eq!(terminal.grid[0][0].character, '界', "{sequence:?}");
+        assert!(terminal.grid[0][0].flags.wide());
+        assert!(terminal.grid[0][1].flags.wide_continuation());
+        if sequence != "\x1b[1;1H\x1b[?1K" {
+            for col in 2..=4 {
+                assert_eq!(terminal.grid[0][col].character, ' ');
+                assert!(!terminal.grid[0][col].flags.wide());
+                assert!(!terminal.grid[0][col].flags.wide_continuation());
+            }
+        }
+        terminal.process_input(b"\x1b[1;2H\x1b[X");
+        assert_eq!(terminal.grid[0][0].character, ' ');
+        assert_eq!(terminal.grid[0][1].character, ' ');
+        assert!(!terminal.grid[0][0].flags.wide());
+        assert!(!terminal.grid[0][1].flags.wide_continuation());
+    }
+}
+
+#[test]
+fn selective_erase_invalidates_only_erased_finished_output() {
+    let mut terminal = TerminalState::new(16, 3);
+    terminal.process_input(
+        b"\x1b]133;A\x07\x1b]133;C;id=protected\x07\x1b[1\"qOUT\x1b]133;D;0;id=protected\x07\x1b[0\"q\x1b]133;A\x07\x1b]133;C;id=erasable\x07TEXT\x1b]133;D;0;id=erasable\x07",
+    );
+    let protected = terminal.command_record("protected").unwrap().sequence;
+    let erasable = terminal.command_record("erasable").unwrap().sequence;
+    let range = terminal.finished_output_range(protected).unwrap();
+    assert!(terminal.finished_output_range(erasable).is_some());
+    terminal.process_input(b"\x1b[?2J");
+    assert_eq!(terminal.finished_output_range(protected), Some(range));
+    assert_eq!(terminal.finished_output_range(erasable), None);
+    terminal.process_input(b"\x1b[1;1H\x1b[2K");
+    assert_eq!(terminal.finished_output_range(protected), None);
+}
+
+#[test]
+fn selective_erase_does_not_archive_screens_or_remove_graphics() {
+    for mode in [
+        b"".as_slice(),
+        b"\x1b[?2026h",
+        b"\x1b[?1049h",
+        b"\x1b[?1049h\x1b[?2026h",
+    ] {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input(mode);
+        terminal
+            .process_input(b"\x1b[1\"qABC\x1b[0\"qDEF\x1b_Ga=T,i=51,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        let placements = terminal.kitty_graphics.get_placements().len();
+        assert!(placements > 0);
+        terminal.process_input(b"\x1b[?2J");
+        assert!(terminal.scrollback.is_empty());
+        assert_eq!(terminal.total_lines_scrolled, 0);
+        assert_eq!(terminal.kitty_graphics.get_placements().len(), placements);
+        assert_eq!(terminal.grid[0][0].character, 'A');
+        assert_eq!(terminal.grid[0][3].character, ' ');
+    }
+}
+
+#[test]
+fn erase_ignores_unknown_prefixes_intermediates_and_parameters() {
+    for sequence in [
+        "\x1b[>2J", "\x1b[>2K", "\x1b[?2X", "\x1b[2$J", "\x1b[2$K", "\x1b[2$X", "\x1b[?9J",
+        "\x1b[?9K",
+    ] {
+        let mut terminal = protected_erase_fixture();
+        let before = terminal.grid.to_vec();
+        terminal.process_input(sequence.as_bytes());
+        assert_cell_grids_equal(&terminal.grid.to_vec(), &before, sequence);
+        assert!(terminal.scrollback.is_empty());
+    }
+}
+
+#[test]
+fn selective_erase_is_invariant_under_pty_fragmentation() {
+    let data = "\x1b[1\"q界AB\x1b[0\"qcd\x1b[1;2H\x1b[?K\x1b[?2J".as_bytes();
+    let mut whole = TerminalState::new(8, 2);
+    whole.process_input(data);
+    for boundary in 0..=data.len() {
+        let mut fragmented = TerminalState::new(8, 2);
+        fragmented.process_input(&data[..boundary]);
+        fragmented.process_input(&data[boundary..]);
+        assert_cell_grids_equal(
+            &fragmented.grid.to_vec(),
+            &whole.grid.to_vec(),
+            &format!("PTY split at {boundary}"),
+        );
+        assert_eq!(fragmented.current_flags, whole.current_flags);
+        assert_eq!(
+            (fragmented.cursor_row, fragmented.cursor_col),
+            (whole.cursor_row, whole.cursor_col)
+        );
+        assert!(fragmented.scrollback.is_empty());
+    }
 }
 
 #[test]
@@ -3550,7 +3741,7 @@ fn decrqss_reports_decsca() {
         String::from_utf8(terminal.get_output()).unwrap(),
         "\x1bP1$r0\"q\x1b\\"
     );
-    terminal.process_input(b"\x1b[\"1q\x1bP$q\"q\x1b\\");
+    terminal.process_input(b"\x1b[1\"q\x1bP$q\"q\x1b\\");
     assert_eq!(
         String::from_utf8(terminal.get_output()).unwrap(),
         "\x1bP1$r1\"q\x1b\\"
@@ -4154,6 +4345,173 @@ fn carriage_return_cancels_pending_wrap() {
     assert_eq!(terminal.cursor_row, 0);
     assert_eq!(terminal.cursor_col, 1);
     assert_eq!(terminal.grid[0][0].character, 'd');
+}
+
+#[test]
+fn right_margin_edits_cancel_pending_wrap_without_moving_the_cursor() {
+    for alternate in [false, true] {
+        for text in ["ABCDEFGH", "abcdef界"] {
+            for sequence in [
+                "\x1b[J",
+                "\x1b[1J",
+                "\x1b[2J",
+                "\x1b[K",
+                "\x1b[1K",
+                "\x1b[2K",
+                "\x1b[X",
+                "\x1b[0X",
+                "\x1b[65535X",
+                "\x1b[@",
+                "\x1b[0@",
+                "\x1b[65535@",
+                "\x1b[P",
+                "\x1b[0P",
+                "\x1b[65535P",
+            ] {
+                let mut terminal = TerminalState::new(8, 3);
+                if alternate {
+                    terminal.process_input(b"\x1b[?1049h");
+                }
+                terminal.process_input(b"\x1b[3;1H");
+                terminal.process_input(text.as_bytes());
+                assert!(terminal.pending_wrap);
+                let cursor = (terminal.cursor_row, terminal.cursor_col);
+                terminal.process_input(sequence.as_bytes());
+                assert!(!terminal.pending_wrap, "{sequence:?} after {text:?}");
+                assert_eq!((terminal.cursor_row, terminal.cursor_col), cursor);
+                terminal.process_input(b"\x1b[6n");
+                assert_eq!(
+                    terminal.get_output(),
+                    format!("\x1b[3;{}R", cursor.1 + 1).as_bytes(),
+                    "CPR must no longer report a pending wrap"
+                );
+                let scrolled = terminal.total_lines_scrolled;
+                let history = terminal.scrollback.len();
+                terminal.process_input(b"x");
+                assert_eq!(terminal.grid[cursor.0][cursor.1].character, 'x');
+                assert_eq!(terminal.cursor_row, cursor.0);
+                assert_eq!(terminal.total_lines_scrolled, scrolled);
+                assert_eq!(terminal.scrollback.len(), history);
+            }
+        }
+    }
+}
+
+#[test]
+fn cursor_back_aliases_cancel_pending_wrap_like_cub_and_cuu() {
+    for (alias, canonical) in [('j', 'D'), ('k', 'A')] {
+        for count in [0, 1, 65535] {
+            let mut expected = TerminalState::new(8, 5);
+            let mut actual = TerminalState::new(8, 5);
+            for terminal in [&mut expected, &mut actual] {
+                terminal.process_input(b"\x1b[2;4r\x1b[2;1HABCDEFGH");
+                assert!(terminal.pending_wrap);
+            }
+            expected.process_input(format!("\x1b[{count}{canonical}").as_bytes());
+            actual.process_input(format!("\x1b[{count}{alias}").as_bytes());
+            assert!(!actual.pending_wrap, "{count}{alias}");
+            expected.process_input(b"x");
+            actual.process_input(b"x");
+            assert_cell_grids_equal(
+                &actual.grid.to_vec(),
+                &expected.grid.to_vec(),
+                "cursor back",
+            );
+            assert_eq!(
+                (actual.cursor_row, actual.cursor_col),
+                (expected.cursor_row, expected.cursor_col)
+            );
+        }
+    }
+}
+
+#[test]
+fn selective_erase_pending_wrap_depends_on_the_erased_runs() {
+    for (sequence, cancels_protected_only) in [
+        ("\x1b[?K", true),
+        ("\x1b[?J", true),
+        ("\x1b[?1K", false),
+        ("\x1b[?2K", false),
+        ("\x1b[?1J", false),
+        ("\x1b[?2J", false),
+    ] {
+        for fully_protected in [true, false] {
+            let mut terminal = TerminalState::new(8, 3);
+            for row in 1..=3 {
+                terminal.process_input(format!("\x1b[{row};1H\x1b[1\"qABCDEFGH").as_bytes());
+            }
+            terminal.process_input(b"\x1b[2;1H");
+            if !fully_protected {
+                terminal.process_input(b"\x1b[0\"q");
+            }
+            terminal.process_input(b"ABCDEFGH");
+            assert!(terminal.pending_wrap);
+            terminal.process_input(sequence.as_bytes());
+            assert_eq!(
+                terminal.pending_wrap,
+                fully_protected && !cancels_protected_only,
+                "{sequence:?}, protected={fully_protected}"
+            );
+            assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 7));
+            assert!(terminal.scrollback.is_empty());
+            if fully_protected {
+                assert_eq!(row_text(&terminal, 1), "ABCDEFGH");
+            }
+        }
+    }
+}
+
+#[test]
+fn ignored_edits_and_scrollback_clear_preserve_pending_wrap() {
+    for sequence in [
+        "\x1b[9J", "\x1b[9K", "\x1b[>2J", "\x1b[>2K", "\x1b[?X", "\x1b[2$J", "\x1b[2$K",
+        "\x1b[2$X", "\x1b[?@", "\x1b[?P", "\x1b[1$@", "\x1b[1$P", "\x1b[3J", "\x1b[?3J",
+    ] {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.process_input(b"ABCDEFGH");
+        let before = terminal.grid.to_vec();
+        terminal.process_input(sequence.as_bytes());
+        assert!(terminal.pending_wrap, "{sequence:?}");
+        assert_cell_grids_equal(&terminal.grid.to_vec(), &before, sequence);
+        terminal.process_input(b"x");
+        assert_eq!(terminal.grid[1][0].character, 'x', "{sequence:?}");
+    }
+}
+
+#[test]
+fn saved_pending_wrap_is_independent_of_live_erase_state() {
+    let mut before_erase = TerminalState::new(8, 3);
+    before_erase.process_input(b"ABCDEFGH\x1b7\x1b[K\x1b8x");
+    assert_eq!(before_erase.grid[1][0].character, 'x');
+
+    let mut after_erase = TerminalState::new(8, 3);
+    after_erase.process_input(b"ABCDEFGH\x1b[K\x1b7\r12345678\x1b8x");
+    assert_eq!(after_erase.grid[0][7].character, 'x');
+    assert_eq!(after_erase.cursor_row, 0);
+    assert_eq!(row_text(&after_erase, 1), "");
+}
+
+#[test]
+fn pending_wrap_edits_are_invariant_under_pty_fragmentation() {
+    let data = b"\x1b[3;1HABCDEFGH\x1b[2Kx\x1b[6n";
+    let mut whole = TerminalState::new(8, 3);
+    whole.process_input(data);
+    assert_eq!(whole.grid[2][7].character, 'x');
+    assert_eq!(whole.total_lines_scrolled, 0);
+    let reply = whole.get_output();
+    for boundary in 0..=data.len() {
+        let mut fragmented = TerminalState::new(8, 3);
+        fragmented.process_input(&data[..boundary]);
+        fragmented.process_input(&data[boundary..]);
+        assert_cell_grids_equal(
+            &fragmented.grid.to_vec(),
+            &whole.grid.to_vec(),
+            &format!("PTY split at {boundary}"),
+        );
+        assert_eq!(fragmented.pending_wrap, whole.pending_wrap);
+        assert_eq!(fragmented.total_lines_scrolled, whole.total_lines_scrolled);
+        assert_eq!(fragmented.get_output(), reply);
+    }
 }
 
 #[test]

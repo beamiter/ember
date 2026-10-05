@@ -1,5 +1,53 @@
 # Engineering handoff
 
+Updated: 2026-10-05 (upgrade round 197 — deferred wrap after editing)
+
+## 2026-10-05 (right-margin editing)
+
+- Unique round **197** fixes a right-margin redraw bug: ED/EL/ECH and ICH/DCH
+  cancel live deferred wrap, so the next glyph overwrites at the retained
+  cursor instead of wrapping and possibly scrolling. HPB/VPB now cancel it
+  like their CUB/CUU aliases, including when a count clamps at a margin.
+- Selective erase cancels wrap when an eligible run is erased. DECSED/DECSEL
+  erase-to-right cancels it even on a fully protected tail; protected-only
+  erase-above/all/left remains a no-op for wrap. These cases follow
+  [xterm's erase implementation](https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/util.c).
+  Invalid erase operands, unsupported ICH/DCH prefixes/intermediates and
+  ED 3 leave pending wrap unchanged. Saved cursor state retains its own flag.
+- Six new regression tests all failed before the implementation fix; all 15
+  focused pending-wrap tests now pass. Coverage includes ASCII and wide
+  glyphs at the bottom margin on main/alt screens, explicit-zero/large counts,
+  cursor-position reports, protected-only selective erases, ignored packets,
+  save/restore and every two-chunk PTY split of a redraw stream.
+- Verification: the locked all-target/all-feature test run passed (910 library
+  tests, 1243 application tests and all benchmark smoke cases); the standalone
+  native worker E2E also passed with `--nocapture` and no prerequisite skip.
+  Repository-wide Rustfmt, warning-denying Clippy, `git diff --check` and the
+  locked release build passed.
+
+Updated: 2026-10-05 (upgrade round 196 — selective erase compatibility)
+
+## 2026-10-05 (DECSED / DECSEL)
+
+- Unique round **196** corrects round 185: DECSCA protects against DECSED /
+  DECSEL (`CSI ? Ps J/K`, Ps 0–2), while ordinary ED/EL/ECH always erase.
+  This follows the [xterm control-sequence contract](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
+- SGR reset preserves DECSCA, unknown protection parameters are ignored, and
+  wide continuations inherit the lead cell's protection. DECSTR/RIS still
+  reset protection; saved cursor state still restores it.
+- Selective erase keeps protected completed-output ownership, invalidates
+  only erased runs, preserves Kitty placements and avoids screen archival
+  on main, alternate and synchronized screens. Unsupported erase prefixes /
+  intermediates are ignored. Nine regression tests replace the old test that
+  incorrectly expected ordinary erase to preserve protected text.
+- Verification: `cargo test --workspace --all-targets --all-features --locked`
+  passed (904 library tests, 1237 application tests, one native worker E2E,
+  and all benchmark smoke cases). The native worker test also passed with
+  `--nocapture`, confirming it did not take the missing-prerequisite skip.
+  Rustfmt, warning-denying Clippy, `git diff --check` and the locked release
+  build passed. Existing formatting differences in eight other source files
+  were normalized to make the repository-wide Rustfmt gate pass.
+
 Updated: 2026-10-04 (upgrade round 195 — DECRQSS DECSCL)
 
 ## 2026-10-04 (DECRQSS DECSCL)

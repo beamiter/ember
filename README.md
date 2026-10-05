@@ -21,6 +21,11 @@ claimed.
   the running command, plus desktop notifications when a long command
   finishes unwatched (OSC 133)
 - Unicode width handling, combining characters, ligatures and font fallback
+- VT220 selective erase (`CSI ? J` / `CSI ? K`) honors character protection,
+  including both halves of wide characters; ordinary clear operations still
+  erase every cell, and color/style resets preserve the protection attribute
+- Erasing, inserting or deleting characters at a line's right edge cancels
+  deferred wrap, keeping the next character on that row without extra scrolling
 - Full-scrollback search with auto-reveal navigation, bounded live refresh,
   selection-aware replace, and a continuous-grid
   [semantic command timeline](docs/jsh-semantic-executions.md) (OSC 133)

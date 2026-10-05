@@ -1389,10 +1389,10 @@ fn refreshed_unseen_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        background_pump_order, bell_sets_unseen, refreshed_unseen_output, restored_or_fresh_session_id,
-        retry_pending_input, user_input_flush_block, user_input_is_blocked, ProtocolResponseLimits,
-        ProtocolResponseQueueError, ProtocolResponseSender, SessionInputBarriers, SessionManager,
-        UserInputFlushBlock,
+        background_pump_order, bell_sets_unseen, refreshed_unseen_output,
+        restored_or_fresh_session_id, retry_pending_input, user_input_flush_block,
+        user_input_is_blocked, ProtocolResponseLimits, ProtocolResponseQueueError,
+        ProtocolResponseSender, SessionInputBarriers, SessionManager, UserInputFlushBlock,
     };
     use crate::session::{Session, SessionPurpose};
     use crate::shell::{ShellSession, ShellWriteError};

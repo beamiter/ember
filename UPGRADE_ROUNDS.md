@@ -982,9 +982,9 @@ query answers, control handling and resize.
      DECSCUSR / DECSTBM got silence. Ember now replies `DCS 1 $ r … ST`
      for ` q` and `r`, and `DCS 0 $ r ST` for anything else.
 
-185. **DECSCA** — CSI `"q` was ignored, so ED/EL/ECH wiped cells a host had
-     marked protected. The attribute now rides on the cell flags; erase
-     skips those cells, while a later glyph still overwrites them.
+185. **DECSCA** — CSI `"q` was ignored. The attribute now rides on the cell
+     flags. This first pass incorrectly applied protection to ordinary
+     ED/EL/ECH; round 196 corrects that scope to DECSED/DECSEL.
 
 186. **DECRQSS DECSCA** — DCS `$q"q` was invalid even after CSI `"q` was
      honoured. Ember now reports `0"q` or `1"q` from the current protection
@@ -1028,3 +1028,23 @@ query answers, control handling and resize.
 195. **DECRQSS DECSCL** — DCS `$q"p` was invalid. Ember now reports
      `65;1"p`, matching the VT220-class DA it already advertises.
 
+196. **Correct selective erase and character protection** — ordinary ED/EL/ECH
+     now erase protected cells, while DECSED/DECSEL (`CSI ? Ps J/K`, Ps 0–2)
+     preserve them. SGR resets retain DECSCA, invalid DECSCA parameters leave
+     it unchanged, and wide-character continuations inherit protection.
+     Selective erase invalidates completed-output provenance only for erased
+     spans and neither archives the retained screen nor deletes Kitty images.
+     Unknown erase prefixes/intermediates are ignored. Nine regression tests
+     cover erase ranges, background colors, state resets/restores, wide pairs,
+     command provenance, alternate/synchronized screens and PTY fragmentation.
+
+197. **Right-margin editing cancels deferred wrap** — ED/EL/ECH and ICH/DCH
+     now clear the live Last Column Flag when they edit cells; HPB/VPB match
+     CUB/CUU's wrap cancellation. This keeps the next glyph on its intended
+     row and prevents a spurious scroll at the bottom margin. Selective
+     erasure follows xterm's actual-run behavior, with erase-to-right cancelling
+     wrap even on a protected-only tail. Unsupported ICH/DCH prefixes and
+     intermediates are ignored; invalid erases and saved-line clearing leave
+     wrap pending. Six regression tests cover ASCII/wide characters, main/alt
+     screens, clamped counts/margins, cursor reports, protected-only erases,
+     saved cursor state and PTY fragmentation.

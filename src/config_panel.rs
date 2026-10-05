@@ -1,5 +1,7 @@
 use crate::config::{AppRendererType, Config, TabBarPosition};
-use crate::theme::{bound_custom_theme_name, validate_saved_custom_theme_name, Theme, ThemeExt as _};
+use crate::theme::{
+    bound_custom_theme_name, validate_saved_custom_theme_name, Theme, ThemeExt as _,
+};
 use egui::{Color32, RichText};
 use jterm_core::jsh_remote::RemoteHostConfig;
 
