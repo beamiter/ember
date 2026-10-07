@@ -10,6 +10,607 @@ const MAX_FRAME_BUDGET: usize = 256 * 1024;
 const TARGET_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
 const MIN_ADAPTIVE_SAMPLE_BYTES: usize = 4 * 1024;
 
+// Keep this height independent of selection, status and command length. A
+// toolbar state change must never reflow the PTY or move a pointer hit target.
+const BLOCK_WORKSPACE_HEIGHT: f32 = 64.0;
+const BLOCK_WORKSPACE_ROW_HEIGHT: f32 = 24.0;
+
+#[derive(Clone, Default)]
+struct BlockWorkspaceFocus {
+    controls: Vec<egui::Id>,
+    control_rects: Vec<egui::Rect>,
+    popups: Vec<egui::Id>,
+}
+
+fn block_workspace_focus_id() -> egui::Id {
+    egui::Id::new("block-workspace-focus")
+}
+
+/// Keyboard ownership is intentionally separate from terminal pointer
+/// interaction. Clicking the terminal must still be able to leave the toolbar.
+pub(crate) fn block_workspace_has_focus(ctx: &egui::Context) -> bool {
+    let Some(state) =
+        ctx.data(|data| data.get_temp::<BlockWorkspaceFocus>(block_workspace_focus_id()))
+    else {
+        return false;
+    };
+    let focused = ctx.memory(|memory| memory.focused());
+    state.controls.iter().any(|id| {
+        focused == Some(*id)
+            || ctx.input(|input| {
+                input.has_accesskit_action_request(*id, egui::accesskit::Action::Focus)
+                    || input.has_accesskit_action_request(*id, egui::accesskit::Action::Click)
+            })
+    }) || state
+        .popups
+        .iter()
+        .any(|id| egui::Popup::is_id_open(ctx, *id))
+        || ctx.input(|input| {
+            input.pointer.button_pressed(egui::PointerButton::Primary)
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|pos| state.control_rects.iter().any(|rect| rect.contains(pos)))
+        })
+}
+
+fn block_workspace_has_room(available: egui::Vec2, line_height: f32) -> bool {
+    available.x >= 180.0 && available.y >= BLOCK_WORKSPACE_HEIGHT + line_height.max(1.0) * 4.0
+}
+
+#[derive(Clone, Debug, Default)]
+struct BlockWorkspaceSnapshot {
+    session_id: String,
+    completed_count: usize,
+    selected_count: usize,
+    active_record_id: Option<String>,
+    command_preview: String,
+    status: String,
+    failed: bool,
+    bookmarked: bool,
+    collapsed: bool,
+    collapse_available: bool,
+    in_history: bool,
+    prompt_ready: bool,
+    has_prompt_marks: bool,
+    read_only: bool,
+    alternate_screen: bool,
+    search_shortcut: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BlockWorkspaceAction {
+    Command(crate::keybindings::Command),
+    Target(crate::block_mode::BlockMenuAction),
+    Deselect,
+    Live,
+}
+
+/// Scope selection to the focused session; a selection left in another pane
+/// is never described as the current toolbar's batch.
+fn block_workspace_selection<'a>(
+    selection: Option<&'a crate::block_mode::BlockSelection>,
+    session_id: &str,
+) -> Option<&'a crate::block_mode::BlockSelection> {
+    selection.filter(|selection| selection.session_id == session_id)
+}
+
+fn block_workspace_status(record: &crate::terminal::CommandRecord, newest: bool) -> (String, bool) {
+    use crate::block_mode::BlockOutcome;
+    let outcome = crate::block_mode::classify_outcome(
+        record.command.as_deref(),
+        record.command_truncated,
+        record.exit_code,
+        record.state,
+        record.complete,
+        newest,
+    );
+    let label = match outcome {
+        BlockOutcome::Prompt => "Prompt ready".to_owned(),
+        BlockOutcome::Running => "Running".to_owned(),
+        BlockOutcome::Background => "Background output".to_owned(),
+        BlockOutcome::Success => "Succeeded".to_owned(),
+        BlockOutcome::Failed(code) => format!("Failed · exit {code}"),
+        BlockOutcome::Unknown => "Exit status unknown".to_owned(),
+    };
+    let duration = if outcome == BlockOutcome::Running {
+        record
+            .started_at
+            .and_then(|start| start.elapsed().ok())
+            .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+    } else {
+        record.duration_ms
+    };
+    let label = if let Some(duration) = duration {
+        format!(
+            "{label} · {}",
+            crate::block_mode::format_block_duration(duration)
+        )
+    } else {
+        label
+    };
+    (label, matches!(outcome, BlockOutcome::Failed(_)))
+}
+
+fn block_workspace_control(
+    ui: &mut egui::Ui,
+    focus: &mut BlockWorkspaceFocus,
+    label: &str,
+    enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let response = ui
+        .push_id(label, |ui| {
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(label).min_size(egui::vec2(0.0, 24.0)),
+            )
+        })
+        .inner;
+    focus.controls.push(response.id);
+    if response.enabled() {
+        focus.control_rects.push(response.rect);
+    }
+    response
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip)
+}
+
+fn block_workspace_menu_item(
+    ui: &mut egui::Ui,
+    focus: &mut BlockWorkspaceFocus,
+    action: &mut Option<BlockWorkspaceAction>,
+    label: &str,
+    enabled: bool,
+    tooltip: &str,
+    choice: BlockWorkspaceAction,
+) {
+    if block_workspace_control(ui, focus, label, enabled, tooltip).clicked() {
+        *action = Some(choice);
+        ui.close();
+    }
+}
+
+fn block_workspace_selection_menu(
+    ui: &mut egui::Ui,
+    focus: &mut BlockWorkspaceFocus,
+    snapshot: &BlockWorkspaceSnapshot,
+    action: &mut Option<BlockWorkspaceAction>,
+) {
+    use crate::block_mode::BlockMenuAction as Target;
+    let valid = snapshot.active_record_id.is_some();
+    ui.set_min_width(220.0);
+    ui.label(egui::RichText::new(format!("{} selected", snapshot.selected_count)).strong());
+    if !snapshot.command_preview.is_empty() {
+        ui.add(egui::Label::new(&snapshot.command_preview).wrap());
+    }
+    if !snapshot.status.is_empty() {
+        ui.weak(&snapshot.status);
+    }
+    ui.separator();
+    for (label, choice, tooltip) in [
+        (
+            "Copy commands",
+            Target::CopyCommands,
+            "Copy selected commands in terminal order",
+        ),
+        (
+            "Copy output",
+            Target::CopyOutputs,
+            "Copy output from the selected blocks",
+        ),
+        (
+            "Copy blocks",
+            Target::CopyBlocks,
+            "Copy selected commands and output as plain text",
+        ),
+        (
+            "Copy as Markdown",
+            Target::CopyMarkdown,
+            "Copy the selection as a Markdown document",
+        ),
+    ] {
+        block_workspace_menu_item(
+            ui,
+            focus,
+            action,
+            label,
+            valid,
+            tooltip,
+            BlockWorkspaceAction::Target(choice),
+        );
+    }
+    ui.separator();
+    block_workspace_menu_item(ui, focus, action, "Fill prompt", valid && !snapshot.read_only,
+        "Insert selected commands at an empty prompt for review. Nothing is executed. Safe replay checks still apply.",
+        BlockWorkspaceAction::Target(Target::Reinput));
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        if snapshot.bookmarked {
+            "Remove bookmark"
+        } else {
+            "Bookmark active block"
+        },
+        valid,
+        "Toggle the bookmark on the active block in this selection",
+        BlockWorkspaceAction::Target(Target::ToggleBookmark),
+    );
+    block_workspace_menu_item(ui, focus, action,
+        if snapshot.collapsed { "Expand active output" } else { "Collapse active output" },
+        valid && (snapshot.collapsed || snapshot.collapse_available),
+        "Collapse or expand exact retained output for the active block; terminal output is preserved",
+        BlockWorkspaceAction::Target(if snapshot.collapsed { Target::ExpandOutput } else { Target::CollapseOutput }));
+    for (label, choice) in [
+        ("Go to block start", Target::ScrollTop),
+        ("Go to block end", Target::ScrollBottom),
+    ] {
+        block_workspace_menu_item(
+            ui,
+            focus,
+            action,
+            label,
+            valid,
+            "Reveal the active block's edge in the terminal",
+            BlockWorkspaceAction::Target(choice),
+        );
+    }
+    ui.separator();
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        "Deselect blocks",
+        true,
+        "Clear the selection and return keyboard control to the terminal",
+        BlockWorkspaceAction::Deselect,
+    );
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        "Return to live terminal",
+        true,
+        "Clear selection and follow the newest output",
+        BlockWorkspaceAction::Live,
+    );
+}
+
+fn block_workspace_overflow(
+    ui: &mut egui::Ui,
+    focus: &mut BlockWorkspaceFocus,
+    snapshot: &BlockWorkspaceSnapshot,
+    action: &mut Option<BlockWorkspaceAction>,
+) {
+    use crate::keybindings::Command;
+    ui.set_min_width(220.0);
+    ui.weak("Focused pane");
+    for (label, command, needs_blocks, tooltip) in [
+        (
+            "Search blocks",
+            Command::BlockSearchToggle,
+            false,
+            "Find commands and captured output in this session",
+        ),
+        (
+            "Previous block",
+            Command::BlockSelectPrev,
+            true,
+            "Select and reveal an older completed block",
+        ),
+        (
+            "Next block",
+            Command::BlockSelectNext,
+            true,
+            "Select and reveal a newer completed block",
+        ),
+        (
+            "First failed command",
+            Command::BlockJumpFirstFailed,
+            true,
+            "Jump to the oldest retained failed command",
+        ),
+        (
+            "Previous bookmark",
+            Command::BlockJumpPrevBookmark,
+            true,
+            "Navigate to an older bookmarked command",
+        ),
+        (
+            "Next bookmark",
+            Command::BlockJumpNextBookmark,
+            true,
+            "Navigate to a newer bookmarked command",
+        ),
+        (
+            "Select all blocks",
+            Command::BlockSelectAll,
+            true,
+            "Select completed blocks in this pane; live input stays separate",
+        ),
+    ] {
+        block_workspace_menu_item(
+            ui,
+            focus,
+            action,
+            label,
+            !needs_blocks || snapshot.completed_count > 0,
+            tooltip,
+            BlockWorkspaceAction::Command(command),
+        );
+    }
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        "Return to live terminal",
+        true,
+        "Clear block selection and follow the newest terminal output",
+        BlockWorkspaceAction::Live,
+    );
+    ui.separator();
+    for (label, command) in [
+        (
+            "Export session as Markdown",
+            Command::BlockExportSessionMarkdown,
+        ),
+        ("Export session as JSON", Command::BlockExportSessionJson),
+    ] {
+        block_workspace_menu_item(
+            ui,
+            focus,
+            action,
+            label,
+            snapshot.completed_count > 0,
+            "Export retained completed blocks to a private file",
+            BlockWorkspaceAction::Command(command),
+        );
+    }
+    ui.separator();
+    block_workspace_menu_item(ui, focus, action, "Clear completed blocks", snapshot.completed_count > 0,
+        "Clear completed block cards in this pane. Terminal text remains, and Undo clear restores the cards.",
+        BlockWorkspaceAction::Command(Command::BlockClear));
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        "Undo clear",
+        true,
+        "Restore the most recently cleared blocks in this pane",
+        BlockWorkspaceAction::Command(Command::BlockUndoClear),
+    );
+    ui.separator();
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        "Block appearance settings",
+        true,
+        "Open Settings to change block mode and compact spacing",
+        BlockWorkspaceAction::Command(Command::ConfigOpen),
+    );
+}
+
+/// Paint two fixed rows into an already allocated rectangle. Long text is
+/// truncated; controls move into menus before they can overlap terminal cells.
+fn draw_block_workspace(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    snapshot: &BlockWorkspaceSnapshot,
+    focus: &mut BlockWorkspaceFocus,
+    accent: egui::Color32,
+) -> Option<BlockWorkspaceAction> {
+    use crate::block_mode::BlockMenuAction as Target;
+    use crate::keybindings::Command;
+    let mut action = None;
+    let inner = rect.shrink2(egui::vec2(8.0, 6.0));
+    let roomy = inner.width() >= 650.0;
+    let compact = inner.width() < 340.0;
+    for row in 0..2 {
+        let row_rect = egui::Rect::from_min_size(
+            inner.min + egui::vec2(0.0, row as f32 * (BLOCK_WORKSPACE_ROW_HEIGHT + 4.0)),
+            egui::vec2(inner.width(), BLOCK_WORKSPACE_ROW_HEIGHT),
+        );
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("block-workspace-row", row))
+                .max_rect(row_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        row_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        row_ui.spacing_mut().item_spacing.x = 6.0;
+        let ui = &mut row_ui;
+        if row == 0 {
+            ui.label(egui::RichText::new("Blocks").strong().color(accent))
+                .on_hover_text("Command history for the focused pane");
+            if roomy {
+                ui.weak(format!("{} retained", snapshot.completed_count));
+                ui.separator();
+            }
+            let search_tip = if snapshot.search_shortcut.is_empty() {
+                "Search command text and captured output".to_owned()
+            } else {
+                format!(
+                    "Search command text and captured output · {}",
+                    snapshot.search_shortcut
+                )
+            };
+            if block_workspace_control(ui, focus, "Search", true, &search_tip).clicked() {
+                action = Some(BlockWorkspaceAction::Command(Command::BlockSearchToggle));
+            }
+            if roomy {
+                for (label, command, tip) in [
+                    (
+                        "Previous",
+                        Command::BlockSelectPrev,
+                        "Select an older completed block",
+                    ),
+                    (
+                        "Next",
+                        Command::BlockSelectNext,
+                        "Select a newer completed block",
+                    ),
+                ] {
+                    if block_workspace_control(ui, focus, label, snapshot.completed_count > 0, tip)
+                        .clicked()
+                    {
+                        action = Some(BlockWorkspaceAction::Command(command));
+                    }
+                }
+            }
+            if !compact
+                && block_workspace_control(
+                    ui,
+                    focus,
+                    if snapshot.in_history || snapshot.selected_count > 0 {
+                        "Go live"
+                    } else {
+                        "Live"
+                    },
+                    snapshot.in_history || snapshot.selected_count > 0,
+                    "Return to the newest output and clear block selection. No command is run.",
+                )
+                .clicked()
+            {
+                action = Some(BlockWorkspaceAction::Live);
+            }
+            let response = block_workspace_control(
+                ui,
+                focus,
+                "More",
+                true,
+                "Block navigation, bookmarks, session export and appearance",
+            );
+            focus
+                .popups
+                .push(egui::Popup::default_response_id(&response));
+            egui::Popup::menu(&response)
+                .show(|ui| block_workspace_overflow(ui, focus, snapshot, &mut action));
+            if roomy {
+                let status = if snapshot.in_history {
+                    "Browsing history"
+                } else if snapshot.read_only {
+                    "Retained session"
+                } else if snapshot.prompt_ready {
+                    "Prompt ready"
+                } else {
+                    "Live terminal"
+                };
+                ui.add(egui::Label::new(egui::RichText::new(status).weak()).truncate());
+            }
+        } else if snapshot.alternate_screen {
+            ui.add(egui::Label::new(egui::RichText::new("Full-screen app · Block tools resume at the shell").weak()).truncate())
+                .on_hover_text("Block controls are paused while this pane is using the alternate screen. Other panes keep their current size.");
+        } else if snapshot.selected_count > 0 {
+            ui.label(
+                egui::RichText::new(format!("{} selected", snapshot.selected_count))
+                    .strong()
+                    .color(accent),
+            )
+            .on_hover_text("Actions apply to the selected completed blocks in this pane");
+            let valid = snapshot.active_record_id.is_some();
+            if inner.width() >= 480.0 {
+                if block_workspace_control(
+                    ui,
+                    focus,
+                    "Copy",
+                    valid,
+                    "Copy selected commands and output as plain text",
+                )
+                .clicked()
+                {
+                    action = Some(BlockWorkspaceAction::Target(Target::CopyBlocks));
+                }
+                if block_workspace_control(
+                    ui,
+                    focus,
+                    "Fill prompt",
+                    valid && !snapshot.read_only,
+                    "Insert selected commands at an empty prompt for review. Nothing is executed.",
+                )
+                .clicked()
+                {
+                    action = Some(BlockWorkspaceAction::Target(Target::Reinput));
+                }
+            }
+            let response = block_workspace_control(
+                ui,
+                focus,
+                "Actions",
+                true,
+                "Copy formats, fill prompt, bookmarks and active-block output",
+            );
+            focus
+                .popups
+                .push(egui::Popup::default_response_id(&response));
+            egui::Popup::menu(&response)
+                .show(|ui| block_workspace_selection_menu(ui, focus, snapshot, &mut action));
+            if !compact
+                && block_workspace_control(
+                    ui,
+                    focus,
+                    "Deselect",
+                    true,
+                    "Clear the block selection and return keyboard control to the terminal",
+                )
+                .clicked()
+            {
+                action = Some(BlockWorkspaceAction::Deselect);
+            }
+            if roomy {
+                let status = if valid {
+                    snapshot.status.as_str()
+                } else {
+                    "Selection no longer retained"
+                };
+                let color = if snapshot.failed {
+                    ui.visuals().error_fg_color
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.add(egui::Label::new(egui::RichText::new(status).color(color)).truncate())
+                    .on_hover_text(format!("{status}\n{}", snapshot.command_preview));
+                if inner.width() >= 960.0 {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&snapshot.command_preview)
+                                .monospace()
+                                .small(),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&snapshot.command_preview);
+                }
+            }
+        } else {
+            let hint = if snapshot.read_only {
+                "Retained session · Select a block to copy or export"
+            } else if !snapshot.has_prompt_marks {
+                "Waiting for shell integration"
+            } else if snapshot.completed_count == 0 {
+                "Run a command to create your first block"
+            } else if snapshot.in_history {
+                "Browsing history · Go live to follow new output"
+            } else {
+                "Select a block for copy, bookmarks and safe reuse"
+            };
+            if roomy && !snapshot.status.is_empty() {
+                let color = if snapshot.failed {
+                    ui.visuals().error_fg_color
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.label(egui::RichText::new(&snapshot.status).color(color));
+                ui.separator();
+            }
+            ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate())
+                .on_hover_text("Click a command header to select it; use the left ⋯ button for actions. Shift-click extends a range; Ctrl+Shift-click toggles a block. Block cards require OSC 133 shell integration.");
+        }
+    }
+    action
+}
+
 fn prune_permanently_unavailable_collapses(
     policy: &mut crate::terminal::ProjectionPolicy,
     terminal: &crate::terminal::TerminalState,
@@ -747,6 +1348,157 @@ impl TerminalApp {
         }
     }
 
+    fn render_block_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, enabled: bool) {
+        let active_index = self.session_manager.active_index();
+        let Some(session) = self.session_manager.sessions().get(active_index) else {
+            return;
+        };
+        let terminal = session.terminal.lock();
+        if !self.config.block_mode
+            || !block_workspace_has_room(ui.available_size(), self.renderer.line_height)
+        {
+            drop(terminal);
+            if block_workspace_has_focus(ctx) {
+                self.return_focus_to_terminal(ctx);
+            }
+            ctx.data_mut(|data| data.remove::<BlockWorkspaceFocus>(block_workspace_focus_id()));
+            return;
+        }
+        let session_id = &session.metadata.session_id;
+        let selection = block_workspace_selection(self.block_selection.as_ref(), session_id);
+        let records = terminal.command_records();
+        let selected_count = selection.map_or(0, |selection| selection.selected_ids.len());
+        let retained_ids: std::collections::HashSet<&str> = records
+            .iter()
+            .filter(|record| record.complete)
+            .map(|record| record.id.as_str())
+            .collect();
+        let active = selection
+            .filter(|selection| {
+                selection
+                    .selected_ids
+                    .iter()
+                    .all(|id| retained_ids.contains(id.as_str()))
+            })
+            .and_then(|selection| terminal.command_record(&selection.active_id))
+            .filter(|record| record.complete);
+        let running = records.back().filter(|record| {
+            record.state == crate::terminal::CommandState::Running && !record.complete
+        });
+        let status_record = active
+            .or(running)
+            .or_else(|| records.iter().rev().find(|record| record.complete));
+        let (status, failed) = status_record.map_or_else(
+            || (String::new(), false),
+            |record| block_workspace_status(record, active.is_none()),
+        );
+        if running.is_some() && active.is_none() && !terminal.is_alt_buffer_active() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let snapshot = BlockWorkspaceSnapshot {
+            session_id: session_id.clone(),
+            completed_count: retained_ids.len(),
+            selected_count,
+            active_record_id: active.map(|record| record.id.clone()),
+            command_preview: active
+                .and_then(|record| record.command.as_deref())
+                .map(|command| {
+                    crate::review_text::visible_bounded(command, 240).replace(['\n', '\r'], " ")
+                })
+                .unwrap_or_else(|| "Background output".to_owned()),
+            status,
+            failed,
+            bookmarked: active.is_some_and(|record| {
+                self.block_bookmarks
+                    .get(session_id)
+                    .is_some_and(|bookmarks| bookmarks.contains(&record.sequence))
+            }),
+            collapsed: active
+                .is_some_and(|record| session.projection_policy.is_collapsed(record.sequence)),
+            collapse_available: active
+                .is_some_and(|record| terminal.finished_output_range(record.sequence).is_some()),
+            in_history: if session.projection_policy.is_identity() {
+                terminal.scroll_offset > 0
+            } else {
+                session.projection_view_state.offset_from_bottom() > 0
+            },
+            prompt_ready: terminal.shell_is_prompt_ready(),
+            has_prompt_marks: terminal.has_prompt_marks(),
+            read_only: session.purpose == crate::session::SessionPurpose::RetainedCommand,
+            alternate_screen: terminal.is_alt_buffer_active(),
+            search_shortcut: self
+                .keybindings
+                .pretty_bindings_for("block:search")
+                .join(" / "),
+        };
+        drop(retained_ids);
+        drop(terminal);
+        if snapshot.alternate_screen && self.block_chrome_owns_keyboard(ctx) {
+            self.return_focus_to_terminal(ctx);
+        }
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), BLOCK_WORKSPACE_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let fill = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg);
+        let border = crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border);
+        let accent = crate::theme::Theme::rgb_to_color32(self.current_theme.tabbar.active_border);
+        ui.painter().rect_filled(rect, 0.0, fill);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            egui::Stroke::new(1.0, border),
+        );
+        let mut focus = BlockWorkspaceFocus::default();
+        let mut toolbar_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("block-workspace", &snapshot.session_id))
+                .max_rect(rect),
+        );
+        if !enabled || snapshot.alternate_screen {
+            toolbar_ui.disable();
+        }
+        let action = draw_block_workspace(&mut toolbar_ui, rect, &snapshot, &mut focus, accent);
+        ctx.data_mut(|data| data.insert_temp(block_workspace_focus_id(), focus));
+        let Some(action) = action else {
+            return;
+        };
+        match action {
+            BlockWorkspaceAction::Command(command) => {
+                self.dispatch_command(ctx, command);
+            }
+            BlockWorkspaceAction::Target(action) => {
+                if let Some(record_id) = snapshot.active_record_id {
+                    self.execute_block_menu_action(
+                        &snapshot.session_id,
+                        crate::block_mode::BlockMenuRequest { record_id, action },
+                    );
+                    if action == crate::block_mode::BlockMenuAction::Reinput
+                        && self.block_selection.is_none()
+                    {
+                        self.return_focus_to_terminal(ctx);
+                    }
+                }
+            }
+            BlockWorkspaceAction::Deselect | BlockWorkspaceAction::Live => {
+                self.clear_block_selection();
+                if action == BlockWorkspaceAction::Live {
+                    let session = self.session_manager.get_active_session_mut();
+                    session.terminal.lock().scroll_to_bottom();
+                    session.projection_view_state.scroll_to_bottom();
+                    self.smooth_scroll_velocity = 0.0;
+                    self.smooth_scroll_pixel_offset = 0.0;
+                    self.renderer.scroll_pixel_offset = 0.0;
+                    for renderer in &mut self.pane_renderers {
+                        renderer.scroll_pixel_offset = 0.0;
+                    }
+                }
+                self.return_focus_to_terminal(ctx);
+            }
+        }
+        ctx.request_repaint();
+    }
+
     pub fn render_terminal_content(
         &mut self,
         ui: &mut egui::Ui,
@@ -764,6 +1516,14 @@ impl TerminalApp {
         }
         // 终端显示区域
         self.renderer.sync_font_metrics(ctx);
+        // Toolbar space is reserved before BOTH pane layout and PTY sizing;
+        // renderer hit testing and shell rows therefore use the same geometry.
+        self.render_block_workspace(ui, ctx, terminal_interaction_enabled);
+        // A toolbar action can open Search/Settings in this very frame. Keep
+        // earlier blocking sticky and prevent the remaining terminal render
+        // from accepting input beneath the newly opened surface.
+        let interaction_enabled = interaction_enabled && !self.terminal_input_blocked(ctx);
+        let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
         let available_rect = ui.available_rect_before_wrap();
         // Keep the focused pane's geometry current even in single-pane mode,
         // so split commands can validate the resulting child sizes before
@@ -3575,6 +4335,199 @@ mod tests {
     }
 
     #[test]
+    fn block_workspace_selection_is_scoped_to_focused_session() {
+        let selection =
+            crate::block_mode::BlockSelection::single("left".to_owned(), "record".to_owned());
+        assert_eq!(
+            block_workspace_selection(Some(&selection), "left"),
+            Some(&selection)
+        );
+        assert!(block_workspace_selection(Some(&selection), "right").is_none());
+        assert!(block_workspace_selection(None, "left").is_none());
+    }
+
+    #[test]
+    fn block_workspace_preserves_minimum_terminal_room() {
+        assert!(block_workspace_has_room(egui::vec2(180.0, 144.0), 20.0));
+        assert!(!block_workspace_has_room(egui::vec2(179.0, 500.0), 20.0));
+        assert!(!block_workspace_has_room(egui::vec2(800.0, 143.0), 20.0));
+        assert!(!block_workspace_has_room(egui::vec2(800.0, 180.0), 32.0));
+        assert!(!block_workspace_has_room(egui::vec2(f32::NAN, 500.0), 20.0));
+    }
+
+    #[test]
+    fn block_workspace_status_keeps_unknown_failed_and_running_distinct() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;C;id=status\x07output\r\n\x1b]133;D;0;id=status\x07",
+        );
+        let mut record = terminal
+            .command_records()
+            .back()
+            .expect("completed record")
+            .clone();
+        record.command = Some("cargo test".to_owned());
+        record.duration_ms = Some(1234);
+        record.exit_code = Some(0);
+        assert_eq!(
+            block_workspace_status(&record, true),
+            ("Succeeded · 1.2s".to_owned(), false)
+        );
+        record.exit_code = None;
+        assert_eq!(
+            block_workspace_status(&record, true),
+            ("Exit status unknown · 1.2s".to_owned(), false)
+        );
+        record.exit_code = Some(2);
+        assert_eq!(
+            block_workspace_status(&record, true),
+            ("Failed · exit 2 · 1.2s".to_owned(), true)
+        );
+        record.state = crate::terminal::CommandState::Running;
+        record.complete = false;
+        record.started_at = None;
+        assert_eq!(
+            block_workspace_status(&record, true),
+            ("Running".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn block_workspace_controls_fit_narrow_and_wide_rows_without_changing_grid_rect() {
+        for width in [180.0, 240.0, 360.0, 500.0, 720.0, 1200.0] {
+            for selected_count in [0, 1, 1024] {
+                for alternate_screen in [false, true] {
+                    let ctx = egui::Context::default();
+                    let snapshot = BlockWorkspaceSnapshot {
+                        selected_count,
+                        active_record_id: (selected_count > 0).then(|| "stable-record".to_owned()),
+                        completed_count: 1024,
+                        command_preview: "long command ".repeat(20),
+                        status: "Failed · exit 255 · 1h25m".to_owned(),
+                        has_prompt_marks: true,
+                        alternate_screen,
+                        ..Default::default()
+                    };
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width + 16.0, 400.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let _output = run_frame(&ctx, input, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let top = ui.available_rect_before_wrap().top();
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(width, BLOCK_WORKSPACE_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        let terminal_rect = ui.available_rect_before_wrap();
+                        let mut focus = BlockWorkspaceFocus::default();
+                        let mut toolbar_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                        if alternate_screen {
+                            toolbar_ui.disable();
+                        }
+                        assert_eq!(
+                            draw_block_workspace(
+                                &mut toolbar_ui,
+                                rect,
+                                &snapshot,
+                                &mut focus,
+                                egui::Color32::WHITE
+                            ),
+                            None
+                        );
+                        assert_eq!(ui.available_rect_before_wrap(), terminal_rect);
+                        assert_eq!(terminal_rect.top(), top + BLOCK_WORKSPACE_HEIGHT);
+                        for control in &focus.control_rects {
+                            assert!(
+                                rect.contains_rect(*control),
+                                "control {control:?} outside {rect:?} at width {width}"
+                            );
+                        }
+                        for (index, control) in focus.control_rects.iter().enumerate() {
+                            for next in &focus.control_rects[index + 1..] {
+                                assert!(
+                                    !control.intersects(*next),
+                                    "overlapping controls at width {width}"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_workspace_search_is_a_real_accessible_button_and_claims_focus() {
+        use std::cell::{Cell, RefCell};
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let id = Cell::new(None);
+        let action = RefCell::new(None);
+        let snapshot = BlockWorkspaceSnapshot::default();
+        let render = |ui: &mut egui::Ui| {
+            let mut focus = BlockWorkspaceFocus::default();
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(500.0, BLOCK_WORKSPACE_HEIGHT),
+                egui::Sense::hover(),
+            );
+            *action.borrow_mut() =
+                draw_block_workspace(ui, rect, &snapshot, &mut focus, egui::Color32::WHITE);
+            id.set(focus.controls.first().copied());
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(block_workspace_focus_id(), focus));
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let first = run_frame(&ctx, input.clone(), render);
+        let id = id.get().expect("search control");
+        let update = first
+            .platform_output
+            .accesskit_update
+            .expect("accessible toolbar tree");
+        let node = update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| (*node_id == id.accesskit_id()).then_some(node))
+            .expect("search node");
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+        assert_eq!(node.label(), Some("Search"));
+        assert!(node.supports_action(egui::accesskit::Action::Click));
+        assert!(node.supports_action(egui::accesskit::Action::Focus));
+        let mut clicked = input.clone();
+        clicked.events.push(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: id.accesskit_id(),
+                data: None,
+            },
+        ));
+        let _clicked = run_frame(&ctx, clicked, render);
+        assert_eq!(
+            *action.borrow(),
+            Some(BlockWorkspaceAction::Command(
+                crate::keybindings::Command::BlockSearchToggle
+            ))
+        );
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        assert!(block_workspace_has_focus(&ctx));
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("unrelated-terminal")));
+        // Move to a clean frame; the previous AccessKit click correctly owns
+        // its original frame even after focus has changed.
+        let _clean = run_frame(&ctx, input, render);
+        assert!(!block_workspace_has_focus(&ctx));
+    }
+
+    #[test]
     fn duplicate_search_hits_share_one_sequence_bookmark_state() {
         let live = std::collections::HashMap::from([
             ("same-record".to_string(), 42),
@@ -4037,5 +4990,141 @@ mod tests {
             policy.revision(),
             0
         ));
+    }
+    /// Set EMBER_UI_SNAPSHOT_DIR to export actual egui/CPU-terminal meshes.
+    /// The fixture intentionally needs no display server or GPU socket.
+    #[test]
+    fn block_workspace_offscreen_visual_smoke() {
+        let destination = std::env::var_os("EMBER_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
+        if let Some(path) = &destination {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for (name, width, selected, running) in [
+            ("wide-empty", 1000, 0, false),
+            ("wide-idle", 1000, 0, false),
+            ("wide-collapsed", 1000, 1, false),
+            ("wide-failed", 1000, 1, false),
+            ("wide-menu", 1000, 1, false),
+            ("wide-multiple", 1000, 2, false),
+            ("wide-running", 1000, 0, true),
+            ("narrow-failed", 360, 1, false),
+            ("narrow-running", 360, 0, true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let theme = crate::theme::Theme::default();
+            crate::apply_theme_visuals(&ctx, &theme);
+            let accent = crate::theme::Theme::rgb_to_color32(theme.tabbar.active_border);
+            let mut renderer = crate::ui::TerminalRenderer::new(
+                14.0,
+                8.0,
+                1.35,
+                crate::config::ScrollbarVisibility::Always,
+                theme.clone(),
+            );
+            renderer.gpu_rendering = false;
+            let mut terminal = None;
+            let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+            let mut action_node = None;
+            for pass in 0..3 {
+                let mut output = ctx.run_ui(egui::RawInput {
+                    time: Some(pass as f64 * 0.25),
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, 640.0))),
+                    events: if name == "wide-menu" && pass == 1 {
+                        vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Click,
+                            target_tree: egui::accesskit::TreeId::ROOT,
+                            target_node: action_node.expect("completed command has an accessible action button"),
+                            data: None,
+                        })]
+                    } else { Vec::new() },
+                    ..Default::default()
+                }, |ui| {
+                    let size = ui.available_size() - egui::vec2(0.0, BLOCK_WORKSPACE_HEIGHT + ui.spacing().item_spacing.y);
+                    let (cols, rows) = renderer.grid_dimensions(size);
+                    let terminal = terminal.get_or_insert_with(|| {
+                        let mut terminal = crate::terminal::TerminalState::new(cols, rows);
+                        if name != "wide-empty" {
+                        terminal.process_input(b"\x1b]133;A\x07\x1b[36m~/projects/ember\x1b[0m $ \x1b]133;B;jsh_id=setup\x07git status --short\r\n\x1b]133;C;jsh_id=setup;cmdline_url=git%20status%20--short\x07 M src/ui.rs\r\n M src/app/rendering.rs\r\n\x1b]133;D;0;jsh_id=setup\x07\r\n");
+                        terminal.process_input(b"\x1b]133;A\x07\x1b[36m~/projects/ember\x1b[0m $ \x1b]133;B;jsh_id=test\x07cargo test --lib\r\n\x1b]133;C;jsh_id=test;cmdline_url=cargo%20test%20--lib\x07running 42 tests\r\n\x1b[32mtest block_layout ... ok\x1b[0m\r\n\x1b[31mtest narrow_toolbar ... FAILED\x1b[0m\r\nExpected: controls stay inside the pane\r\n\x1b]133;D;101;jsh_id=test\x07\r\n");
+                        }
+                        terminal.process_input(b"\x1b]133;A\x07\x1b[36m~/projects/ember\x1b[0m $ \x1b]133;B;jsh_id=live\x07");
+                        if running {
+                            terminal.process_input(b"cargo build\r\n\x1b]133;C;jsh_id=live;cmdline_url=cargo%20build\x07   Compiling ember v0.4.0\r\n");
+                        }
+                        terminal
+                    });
+                    let selection = if selected > 0 {
+                        let mut selection = crate::block_mode::BlockSelection::single("visual".into(), "test".into());
+                        if selected > 1 { selection.selected_ids.insert(0, "setup".into()); }
+                        Some(selection)
+                    } else { None };
+                    renderer.set_block_selection(selection.as_ref());
+                    let status_record = if selected > 0 { terminal.command_record("test") }
+                        else if running { terminal.command_record("live") }
+                        else { terminal.command_records().iter().rev().find(|record| record.complete) };
+                    let (status, failed) = status_record.map_or_else(|| (String::new(), false), |record| block_workspace_status(record, running));
+                    let snapshot = BlockWorkspaceSnapshot {
+                        session_id: "visual".into(), completed_count: if name == "wide-empty" { 0 } else { 2 }, selected_count: selected,
+                        active_record_id: (selected > 0).then(|| "test".into()),
+                        command_preview: "cargo test --lib".into(),
+                        status, failed, prompt_ready: !running, has_prompt_marks: true,
+                        collapsed: name == "wide-collapsed",
+                        collapse_available: true, search_shortcut: "Ctrl+Shift+F".into(),
+                        ..Default::default()
+                    };
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BLOCK_WORKSPACE_HEIGHT), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 0.0, crate::theme::Theme::rgb_to_color32(theme.ui.panel_bg));
+                    let mut focus = BlockWorkspaceFocus::default();
+                    draw_block_workspace(ui, rect, &snapshot, &mut focus, accent);
+                    assert!(focus.control_rects.iter().all(|control| rect.contains_rect(*control)), "{name}: toolbar targets must remain in their reserved area");
+                    if name == "wide-collapsed" {
+                        let mut policy = crate::terminal::ProjectionPolicy::default();
+                        policy.collapse(terminal.command_record("test").unwrap().sequence);
+                        let mut view_state = crate::terminal::ProjectionViewState::default();
+                        let viewport = renderer.projected_viewport_with_state(terminal, &policy, &mut view_state);
+                        renderer.set_projection_frame(terminal, viewport, &policy);
+                    }
+                    renderer.render(ui, terminal, true, true, &crate::search::SearchState::default(), &[], &None);
+                    assert!(renderer.last_content_rect.unwrap().top() >= rect.bottom(), "{name}: chrome must never overlap terminal rows");
+                });
+                assert!(!output.shapes.is_empty());
+                if pass == 0 {
+                    action_node =
+                        output
+                            .platform_output
+                            .accesskit_update
+                            .as_ref()
+                            .and_then(|update| {
+                                update.nodes.iter().find_map(|(id, node)| {
+                                    node.label()
+                                        .is_some_and(|label| {
+                                            label.starts_with("Block actions for cargo test")
+                                        })
+                                        .then_some(*id)
+                                })
+                            });
+                }
+                if name == "wide-menu" && pass > 0 {
+                    assert!(
+                        egui::Popup::is_any_open(&ctx),
+                        "the real card actions menu must open and remain stable"
+                    );
+                }
+                if let Some(path) = &destination {
+                    capture.save(
+                        &ctx,
+                        &mut output,
+                        [width, 640],
+                        &path.join(format!("{name}.png")),
+                    );
+                } else {
+                    output.textures_delta.clear();
+                }
+                if pass == 1 {
+                    assert!(output.platform_output.accesskit_update.is_some());
+                }
+            }
+        }
     }
 }

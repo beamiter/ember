@@ -686,6 +686,30 @@ fn block_selection_key_action(
     }
 }
 
+/// A focused block control owns keyboard and clipboard intent, but not the
+/// terminal pointer route. Keep egui's original input untouched so buttons,
+/// menu traversal and assistive activation still work.
+fn block_chrome_claims_event(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Ime(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+    )
+}
+
+fn block_chrome_escape_requested(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(event,
+            egui::Event::Key { key: egui::Key::Escape, pressed: true, modifiers, .. }
+                if !modifiers.any()
+        )
+    })
+}
+
 fn block_selection_context_available(
     block_mode: bool,
     block_canvas_visible: bool,
@@ -695,6 +719,23 @@ fn block_selection_context_available(
 }
 
 impl TerminalApp {
+    pub(crate) fn block_chrome_owns_keyboard(&self, ctx: &egui::Context) -> bool {
+        self.config.block_mode
+            && (super::rendering::block_workspace_has_focus(ctx)
+                || crate::ui::block_action_has_focus(ctx))
+    }
+
+    pub(crate) fn return_focus_to_terminal(&mut self, ctx: &egui::Context) {
+        egui::Popup::close_all(ctx);
+        if let Some(id) = ctx.memory(|memory| memory.focused()) {
+            ctx.memory_mut(|memory| memory.surrender_focus(id));
+        }
+        self.renderer.request_keyboard_focus();
+        for renderer in &mut self.pane_renderers {
+            renderer.request_keyboard_focus();
+        }
+    }
+
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
         should_block_terminal_input(
             self.search_state.is_open,
@@ -2112,6 +2153,25 @@ impl TerminalApp {
             self.clear_block_selection();
         }
 
+        // Do not fold chrome focus into terminal_input_blocked: main.rs also
+        // uses that flag to suppress pointer input. Buttons would then disable
+        // themselves and users could not click back into the terminal.
+        if !ui_input_blocked && self.block_chrome_owns_keyboard(ctx) {
+            if block_chrome_escape_requested(&self.frame_events) {
+                self.return_focus_to_terminal(ctx);
+            }
+            self.session_manager
+                .get_active_session_mut()
+                .terminal
+                .lock()
+                .clear_preedit();
+            self.frame_events
+                .retain(|event| !block_chrome_claims_event(event));
+            // Even Escape + Enter in one OS batch belongs to the UI. The next
+            // frame resumes ordinary block-selection or terminal key handling.
+            return (false, false, false);
+        }
+
         let batch = ordered_key_presses(&self.frame_events, &self.keybindings);
         let mut terminal_input_seen = false;
         let mut selection_postdates_terminal_input = false;
@@ -2414,6 +2474,76 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_chrome_claims_terminal_keys_clipboard_and_ime_but_leaves_pointer_input() {
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for event in [
+            key(egui::Key::Enter),
+            key(egui::Key::Space),
+            key(egui::Key::Tab),
+            key(egui::Key::ArrowUp),
+            egui::Event::Text(" ".to_owned()),
+            egui::Event::Paste("dangerous command\n".to_owned()),
+            egui::Event::Copy,
+            egui::Event::Cut,
+            egui::Event::Ime(egui::ImeEvent::Commit("入力".to_owned())),
+        ] {
+            assert!(block_chrome_claims_event(&event));
+        }
+        for event in [
+            egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(10.0, 10.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ] {
+            assert!(!block_chrome_claims_event(&event));
+        }
+    }
+
+    #[test]
+    fn block_chrome_escape_claims_its_entire_keyboard_batch() {
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut events = vec![
+            key(egui::Key::Escape),
+            key(egui::Key::Enter),
+            egui::Event::Text("later text".to_owned()),
+            egui::Event::PointerGone,
+        ];
+        assert!(block_chrome_escape_requested(&events));
+        events.retain(|event| !block_chrome_claims_event(event));
+        assert_eq!(events, vec![egui::Event::PointerGone]);
+        assert!(!block_chrome_escape_requested(&events));
+        let modified_escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        assert!(!block_chrome_escape_requested(&[modified_escape]));
+    }
 
     #[test]
     fn block_search_refresh_owns_only_plain_non_repeated_f5() {

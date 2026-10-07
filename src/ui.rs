@@ -800,7 +800,127 @@ pub enum ProjectedScrollRequest {
 
 /// Layout-owned space before terminal column zero while Block Mode is on.
 /// The outcome stripe and card border live here and cannot cover glyphs.
-const BLOCK_GUTTER_WIDTH: f32 = 8.0;
+const BLOCK_GUTTER_WIDTH: f32 = 34.0;
+const BLOCK_ACTION_WIDTH: f32 = 24.0;
+
+/// Card controls own keyboard input while focused or while their menu is open.
+/// The remembered IDs are checked against current egui state, so switching panes
+/// cannot leave an unrelated terminal permanently blocked.
+pub fn block_action_has_focus(ctx: &egui::Context) -> bool {
+    let frame = ctx.cumulative_frame_nr();
+    let controls = ctx
+        .data(|data| {
+            data.get_temp::<(u64, Vec<(egui::Id, egui::Rect)>)>(egui::Id::new("block-action-rects"))
+        })
+        .filter(|(saved_frame, _)| saved_frame.saturating_add(1) >= frame)
+        .map(|(_, controls)| controls)
+        .unwrap_or_default();
+    let pending_focus = ctx.input(|input| {
+        input.events.iter().any(|event| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } => controls.iter().any(|(_, rect)| rect.contains(*pos)),
+            egui::Event::AccessKitActionRequest(request) => {
+                matches!(
+                    request.action,
+                    egui::accesskit::Action::Focus | egui::accesskit::Action::Click
+                ) && controls
+                    .iter()
+                    .any(|(id, _)| id.accesskit_id() == request.target_node)
+            }
+            _ => false,
+        })
+    });
+    pending_focus
+        || ctx
+            .data(|data| data.get_temp::<egui::Id>(egui::Id::new("block-action-focus")))
+            .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
+        || ctx
+            .data(|data| data.get_temp::<egui::Id>(egui::Id::new("block-action-popup")))
+            .is_some_and(|id| egui::Popup::is_id_open(ctx, id))
+}
+
+fn block_action_button(
+    ui: &mut Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    emphasized: bool,
+    label: &str,
+) -> Response {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if ui.is_enabled() {
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.ctx().data_mut(|data| {
+            let key = egui::Id::new("block-action-rects");
+            let mut state = data
+                .get_temp::<(u64, Vec<(egui::Id, egui::Rect)>)>(key)
+                .unwrap_or_default();
+            if state.0 != frame {
+                state = (frame, Vec::new());
+            }
+            state.1.push((id, rect));
+            data.insert_temp(key, state);
+        });
+    }
+    let visuals = ui.style().interact_selectable(&response, emphasized);
+    if emphasized || response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+    }
+    // Paint the affordance instead of depending on a font's ellipsis glyph.
+    let radius = (rect.height() * 0.07).clamp(0.75, 1.25);
+    for offset in [-4.0, 0.0, 4.0] {
+        ui.painter().circle_filled(
+            rect.center() + egui::vec2(offset, 0.0),
+            radius,
+            visuals.text_color(),
+        );
+    }
+    if response.has_focus() {
+        ui.painter()
+            .rect_stroke(rect, 4.0, visuals.fg_stroke, egui::StrokeKind::Inside);
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("block-action-focus"), id));
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    response
+}
+
+/// Outcome words remain legible even when the configured UI font omits symbols.
+fn block_badge_display_text(text: &str) -> String {
+    for (symbol, word) in [("✓", "OK"), ("✗", "Fail"), ("▶", "Run"), ("↻", "BG")] {
+        if let Some(rest) = text.strip_prefix(symbol) {
+            return if symbol == "↻" && !rest.is_empty() {
+                rest.trim_start().to_owned()
+            } else {
+                format!("{word}{rest}")
+            };
+        }
+    }
+    text.to_owned()
+}
+
+fn block_action_rect(
+    content: egui::Rect,
+    card: egui::Rect,
+    pane: egui::Rect,
+    line_height: f32,
+) -> Option<egui::Rect> {
+    if !line_height.is_finite() || line_height <= 0.0 {
+        return None;
+    }
+    let height = line_height.min(card.height()).min(BLOCK_ACTION_WIDTH);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(content.left() - BLOCK_GUTTER_WIDTH, card.top()),
+        egui::vec2(BLOCK_ACTION_WIDTH, height),
+    );
+    (height >= 8.0 && rect.left() >= pane.left() && rect.right() <= content.left() - 8.0)
+        .then_some(rect)
+}
 const BLOCK_CARD_NORMAL_GAP: f32 = 2.0;
 const BLOCK_CARD_COMPACT_GAP: f32 = 0.5;
 const BLOCK_CARD_NORMAL_RADIUS: u8 = 10;
@@ -1031,6 +1151,7 @@ pub struct TerminalRenderer {
     pub block_menu_action: Option<crate::block_mode::BlockMenuRequest>,
     context_block_id: Option<String>,
     context_block_terminal: Option<usize>,
+    context_action_popup: Option<egui::Id>,
     /// Press-time whole-card ownership. Gesture, modifiers and stable target
     /// never get recomputed from the release position.
     block_primary_press: Option<BlockPrimaryPress>,
@@ -1147,6 +1268,7 @@ impl TerminalRenderer {
             block_menu_action: None,
             context_block_id: None,
             context_block_terminal: None,
+            context_action_popup: None,
             block_primary_press: None,
             summary_primary_press: None,
             projected_scroll_request: None,
@@ -1233,6 +1355,11 @@ impl TerminalRenderer {
 
     pub fn cancel_local_selection_capture(&mut self) {
         self.local_selection_terminal = None;
+    }
+
+    /// Return focus from block chrome to the next active terminal frame.
+    pub fn request_keyboard_focus(&mut self) {
+        self.requested_initial_focus = false;
     }
 
     /// Mirror app-level block selection without cloning up to 1024 record ids
@@ -2215,7 +2342,7 @@ impl TerminalRenderer {
             entry.live,
             entry.outcome,
         ) {
-            BlockCardEmphasis::ActiveSelection => (accent, 36), // 0.14
+            BlockCardEmphasis::ActiveSelection => (accent, 42), // active edge
             BlockCardEmphasis::Selected => (accent, 20),        // 0.08
             // 悬停绝不能把失败/未知块的结果色抹掉:保持结果色,并且比未悬停
             // 时更亮,这样"悬停"仍然可读,而"失败"不会消失。
@@ -2225,10 +2352,10 @@ impl TerminalRenderer {
                 (self.block_outcome_color(entry.outcome), 40) // 0.16
             }
             BlockCardEmphasis::Hovered => (foreground, 13), // 0.05
-            BlockCardEmphasis::Live => (accent, 9),         // 0.035
+            BlockCardEmphasis::Live => (accent, 12),        // live input
             BlockCardEmphasis::Failed => (self.block_outcome_color(entry.outcome), 28), // 0.11
             BlockCardEmphasis::Background => (accent, 18),  // 0.07
-            BlockCardEmphasis::Neutral => (foreground, 8),  // 0.03
+            BlockCardEmphasis::Neutral => (foreground, 5),  // quiet history
         };
         let alpha = (f32::from(alpha) * self.opacity.clamp(0.0, 1.0)).round() as u8;
         Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
@@ -2596,15 +2723,108 @@ impl TerminalRenderer {
         entry.hovered = hover_rect.contains(pos);
     }
 
+    /// A stable action lane outside terminal cells. Menu controls remain visible
+    /// when a command fills every column and never steal output selection space.
+    #[allow(clippy::too_many_arguments)]
+    fn show_block_action_rail(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &TerminalState,
+        entries: &[BlockChromeEntry],
+        content_rect: egui::Rect,
+        pane_rect: egui::Rect,
+        line_height: f32,
+        rows: usize,
+        interaction_enabled: bool,
+    ) {
+        let rendered_terminal = terminal as *const TerminalState as usize;
+        if self
+            .context_block_id
+            .as_deref()
+            .is_some_and(|id| !entries.iter().any(|entry| entry.id == id))
+        {
+            if let Some(id) = self.context_action_popup.take() {
+                egui::Popup::close_id(ui.ctx(), id);
+                self.context_block_id = None;
+            }
+        }
+        let mut action_target_visible = false;
+        for entry in entries
+            .iter()
+            .filter(|entry| !entry.live && entry.outcome != crate::block_mode::BlockOutcome::Prompt)
+        {
+            let Some(geometry) = self.card_geometry(entry, content_rect, line_height, rows) else {
+                continue;
+            };
+            let Some(rect) = block_action_rect(content_rect, geometry.rect, pane_rect, line_height)
+            else {
+                continue;
+            };
+            let id = ui
+                .id()
+                .with(("block-actions", rendered_terminal, &entry.id));
+            let command = terminal
+                .command_records()
+                .iter()
+                .find(|record| record.id == entry.id)
+                .and_then(|record| record.command.as_deref())
+                .unwrap_or("background output");
+            let status = crate::block_mode::badge_text_with_lifecycle(
+                entry.outcome,
+                entry.duration_ms,
+                entry.start_mark_seen,
+                entry.completion_provenance,
+            )
+            .unwrap_or_default();
+            let label = format!(
+                "Block actions for {}; {}",
+                command.chars().take(100).collect::<String>(),
+                status
+            );
+            let response = ui
+                .scope_builder(egui::UiBuilder::new().id_salt(id).max_rect(rect), |ui| {
+                    ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+                    ui.add_enabled_ui(interaction_enabled, |ui| {
+                        block_action_button(ui, id, rect, entry.active || entry.hovered, &label)
+                    })
+                    .inner
+                })
+                .inner;
+            if response.clicked() {
+                self.context_block_id = Some(entry.id.clone());
+                self.context_block_terminal = Some(rendered_terminal);
+                self.block_click = Some(crate::block_mode::BlockClick::Select {
+                    record_id: entry.id.clone(),
+                    gesture: crate::block_mode::BlockSelectionGesture::Activate,
+                });
+            }
+            if self.context_block_id.as_deref() == Some(entry.id.as_str()) {
+                action_target_visible = true;
+                self.show_block_context_menu(&response, terminal, rendered_terminal, true);
+            }
+            response.on_hover_text(format!("{label}\nCopy, insert, collapse or bookmark\nSelect a command header, or press Ctrl+↑, for keyboard navigation"));
+        }
+        if !action_target_visible {
+            if let Some(id) = self.context_action_popup.take() {
+                egui::Popup::close_id(ui.ctx(), id);
+                self.context_block_id = None;
+            }
+        }
+    }
+
     fn show_block_context_menu(
         &mut self,
         response: &egui::Response,
         terminal: &TerminalState,
         rendered_terminal: usize,
+        from_action_button: bool,
     ) {
         if self.context_block_terminal != Some(rendered_terminal) {
             self.context_block_id = None;
             self.context_block_terminal = Some(rendered_terminal);
+            if let Some(id) = self.context_action_popup.take() {
+                egui::Popup::close_id(&response.ctx, id);
+            }
             egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
         }
         let Some(target_id) = self.context_block_id.clone() else {
@@ -2613,6 +2833,9 @@ impl TerminalRenderer {
         let records = terminal.command_records();
         let Some(clicked_index) = records.iter().position(|record| record.id == target_id) else {
             self.context_block_id = None;
+            if let Some(id) = self.context_action_popup.take() {
+                egui::Popup::close_id(&response.ctx, id);
+            }
             egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
             return;
         };
@@ -2644,6 +2867,9 @@ impl TerminalRenderer {
         let clicked = &records[clicked_index];
         if !clicked.complete {
             self.context_block_id = None;
+            if let Some(id) = self.context_action_popup.take() {
+                egui::Popup::close_id(&response.ctx, id);
+            }
             egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
             return;
         }
@@ -2705,175 +2931,221 @@ impl TerminalRenderer {
                 });
         let mut chosen = None;
 
-        response.context_menu(|ui| {
-            ui.set_min_width(220.0);
-            if let Some(detail) = lifecycle_warning {
-                ui.colored_label(
-                    self.block_outcome_color(crate::block_mode::BlockOutcome::Unknown),
-                    detail,
-                );
-                ui.separator();
-            }
-            if block_menu_button(
-                ui,
-                if plural {
-                    "Copy Commands"
-                } else {
-                    "Copy Command"
-                },
-                has_commands,
-                "The selected block has no command",
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::CopyCommands);
-                ui.close();
-            }
-            if block_menu_button(
-                ui,
-                "Ask Agent About Block",
-                can_ask_agent,
-                ask_agent_disabled_reason.unwrap_or("Agent context is unavailable"),
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::AskAgent);
-                ui.close();
-            }
-            // frost 的 "Ask AI about block"：宽松附加路径，任何已完成块都能
-            // 作为不可信证据附加到 Agent 面板的当前对话，因此始终可用；
-            // AI 未启用等失败在派发时用状态栏说明。
-            if ui.button("Ask AI About Block").clicked() {
-                chosen = Some(crate::block_mode::BlockMenuAction::AskAi);
-                ui.close();
-            }
-            if block_menu_button(
-                ui,
-                if plural {
-                    "Copy Outputs"
-                } else {
-                    "Copy Output"
-                },
-                has_outputs,
-                "The selected block has no captured output",
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::CopyOutputs);
-                ui.close();
-            }
-            if block_menu_button(
-                ui,
-                if plural { "Copy Blocks" } else { "Copy Block" },
-                has_commands || has_outputs,
-                "The selected block has no copyable text",
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::CopyBlocks);
-                ui.close();
-            }
-            if block_menu_button(
-                ui,
-                if plural {
-                    "Copy Blocks as Markdown"
-                } else {
-                    "Copy Block as Markdown"
-                },
-                has_commands || has_outputs,
-                "The selected block has no exportable text",
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::CopyMarkdown);
-                ui.close();
-            }
-            if block_menu_button(
-                ui,
-                if plural {
-                    "Insert Commands at Prompt"
-                } else {
-                    "Insert Command at Prompt"
-                },
-                has_commands,
-                "The selection has no command to insert",
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::Reinput);
-                ui.close();
-            }
-            // Re-execute. Deliberately single-target and gated on exact shell
-            // metadata; every other refusal (no prompt, no bracketed paste,
-            // pending input, multiline) belongs to the replay guard and is
-            // reported through the status line, exactly as the sidebar's
-            // "Run again" does.
-            let rerun_disabled_reason = crate::block_mode::rerun_disabled_reason(
-                clicked.command_exact,
-                clicked.command_truncated,
-                plural,
-            );
-            if block_menu_button(
-                ui,
-                crate::block_mode::rerun_menu_label(clicked_outcome),
-                has_commands && rerun_disabled_reason.is_none(),
-                rerun_disabled_reason.unwrap_or("The selected block has no command"),
-            ) {
-                chosen = Some(crate::block_mode::BlockMenuAction::Rerun);
-                ui.close();
-            }
-            let collapse_label = crate::block_mode::output_collapse_menu_label(collapse_requested);
-            if block_menu_button(
-                ui,
-                collapse_label,
-                collapse_requested || collapse_available,
-                "This block has no exact retained output to collapse",
-            ) {
-                chosen = Some(if collapse_requested {
-                    crate::block_mode::BlockMenuAction::ExpandOutput
-                } else {
-                    crate::block_mode::BlockMenuAction::CollapseOutput
+        let popup = if from_action_button {
+            egui::Popup::menu(response)
+        } else {
+            egui::Popup::context_menu(response)
+        };
+        let popup_id = popup.get_id();
+        let shown = popup.show(|ui| {
+            let viewport = ui.ctx().viewport_rect();
+            ui.set_min_width(240.0_f32.min((viewport.width() - 24.0).max(96.0)));
+            ui.set_max_width(360.0_f32.min((viewport.width() - 24.0).max(96.0)));
+            egui::ScrollArea::vertical()
+                .max_height((viewport.height() - 32.0).max(64.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(if plural {
+                            format!("{selected_count} blocks selected")
+                        } else {
+                            format!("Block {}", clicked.sequence)
+                        })
+                        .strong(),
+                    );
+                    if let Some(command) = clicked
+                        .command
+                        .as_deref()
+                        .filter(|command| !command.trim().is_empty())
+                    {
+                        ui.label(
+                            egui::RichText::new(command.chars().take(160).collect::<String>())
+                                .monospace(),
+                        );
+                    }
+                    if let Some(badge) = crate::block_mode::badge_text_with_lifecycle(
+                        clicked_outcome,
+                        clicked.duration_ms,
+                        clicked.start_mark_seen,
+                        clicked.completion_provenance,
+                    ) {
+                        ui.colored_label(
+                            self.block_outcome_color(clicked_outcome),
+                            block_badge_display_text(&badge),
+                        );
+                    }
+                    if let Some(cwd) = clicked.cwd.as_deref() {
+                        ui.label(egui::RichText::new(cwd).small().weak());
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("COPY & SHARE").small().weak());
+                    if let Some(detail) = lifecycle_warning {
+                        ui.colored_label(
+                            self.block_outcome_color(crate::block_mode::BlockOutcome::Unknown),
+                            detail,
+                        );
+                        ui.separator();
+                    }
+                    if block_menu_button(
+                        ui,
+                        if plural {
+                            "Copy Commands"
+                        } else {
+                            "Copy Command"
+                        },
+                        has_commands,
+                        "The selected block has no command",
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::CopyCommands);
+                        ui.close();
+                    }
+                    if block_menu_button(
+                        ui,
+                        if plural {
+                            "Copy Outputs"
+                        } else {
+                            "Copy Output"
+                        },
+                        has_outputs,
+                        "The selected block has no captured output",
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::CopyOutputs);
+                        ui.close();
+                    }
+                    if block_menu_button(
+                        ui,
+                        if plural { "Copy Blocks" } else { "Copy Block" },
+                        has_commands || has_outputs,
+                        "The selected block has no copyable text",
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::CopyBlocks);
+                        ui.close();
+                    }
+                    if block_menu_button(
+                        ui,
+                        if plural {
+                            "Copy Blocks as Markdown"
+                        } else {
+                            "Copy Block as Markdown"
+                        },
+                        has_commands || has_outputs,
+                        "The selected block has no exportable text",
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::CopyMarkdown);
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("REUSE").small().weak());
+                    if block_menu_button(
+                        ui,
+                        if plural {
+                            "Insert Commands at Prompt"
+                        } else {
+                            "Insert Command at Prompt"
+                        },
+                        has_commands,
+                        "The selection has no command to insert",
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::Reinput);
+                        ui.close();
+                    }
+                    // Re-execute. Deliberately single-target and gated on exact shell
+                    // metadata; every other refusal (no prompt, no bracketed paste,
+                    // pending input, multiline) belongs to the replay guard and is
+                    // reported through the status line, exactly as the sidebar's
+                    // "Run again" does.
+                    let rerun_disabled_reason = crate::block_mode::rerun_disabled_reason(
+                        clicked.command_exact,
+                        clicked.command_truncated,
+                        plural,
+                    );
+                    if block_menu_button(
+                        ui,
+                        crate::block_mode::rerun_menu_label(clicked_outcome),
+                        has_commands && rerun_disabled_reason.is_none(),
+                        rerun_disabled_reason.unwrap_or("The selected block has no command"),
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::Rerun);
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("ORGANIZE & NAVIGATE").small().weak());
+                    let collapse_label =
+                        crate::block_mode::output_collapse_menu_label(collapse_requested);
+                    if block_menu_button(
+                        ui,
+                        collapse_label,
+                        collapse_requested || collapse_available,
+                        "This block has no exact retained output to collapse",
+                    ) {
+                        chosen = Some(if collapse_requested {
+                            crate::block_mode::BlockMenuAction::ExpandOutput
+                        } else {
+                            crate::block_mode::BlockMenuAction::CollapseOutput
+                        });
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Scroll to Top of Block").clicked() {
+                        chosen = Some(crate::block_mode::BlockMenuAction::ScrollTop);
+                        ui.close();
+                    }
+                    if long_block && ui.button("Jump to Bottom of Block").clicked() {
+                        chosen = Some(crate::block_mode::BlockMenuAction::ScrollBottom);
+                        ui.close();
+                    }
+                    if ui.button("Search Across Blocks…").clicked() {
+                        chosen = Some(crate::block_mode::BlockMenuAction::Search);
+                        ui.close();
+                    }
+                    if ui
+                        .button(if bookmarked {
+                            "Remove Bookmark"
+                        } else {
+                            "Bookmark Block"
+                        })
+                        .clicked()
+                    {
+                        chosen = Some(crate::block_mode::BlockMenuAction::ToggleBookmark);
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.menu_button("Advanced…", |ui| {
+                        if block_menu_button(
+                            ui,
+                            "Ask Agent About Block",
+                            can_ask_agent,
+                            ask_agent_disabled_reason.unwrap_or("Agent context is unavailable"),
+                        ) {
+                            chosen = Some(crate::block_mode::BlockMenuAction::AskAgent);
+                            ui.close();
+                        }
+                        // frost 的 "Ask AI about block"：宽松附加路径，任何已完成块都能
+                        // 作为不可信证据附加到 Agent 面板的当前对话，因此始终可用；
+                        // AI 未启用等失败在派发时用状态栏说明。
+                        if ui.button("Ask AI About Block").clicked() {
+                            chosen = Some(crate::block_mode::BlockMenuAction::AskAi);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Copy This Block as JSON").clicked() {
+                            chosen = Some(crate::block_mode::BlockMenuAction::CopyJson);
+                            ui.close();
+                        }
+                    });
                 });
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Scroll to Top of Block").clicked() {
-                chosen = Some(crate::block_mode::BlockMenuAction::ScrollTop);
-                ui.close();
-            }
-            if long_block && ui.button("Jump to Bottom of Block").clicked() {
-                chosen = Some(crate::block_mode::BlockMenuAction::ScrollBottom);
-                ui.close();
-            }
-            if ui.button("Search Across Blocks…").clicked() {
-                chosen = Some(crate::block_mode::BlockMenuAction::Search);
-                ui.close();
-            }
-            let _ = block_menu_button(
-                ui,
-                "Toggle Output Filter",
-                false,
-                "Per-block filtering is unavailable on Ember's continuous terminal grid",
-            );
-            if ui
-                .button(if bookmarked {
-                    "Remove Bookmark"
-                } else {
-                    "Bookmark Block"
-                })
-                .clicked()
-            {
-                chosen = Some(crate::block_mode::BlockMenuAction::ToggleBookmark);
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Copy This Block as JSON").clicked() {
-                chosen = Some(crate::block_mode::BlockMenuAction::CopyJson);
-                ui.close();
-            }
-            let _ = block_menu_button(
-                ui,
-                "Export Block to File…",
-                false,
-                "File export is not yet available in Ember",
-            );
-            let _ = block_menu_button(
-                ui,
-                "Delete Block",
-                false,
-                "A single block cannot be safely deleted from Ember's continuous terminal grid",
-            );
         });
 
+        if shown.is_some() {
+            response
+                .ctx
+                .data_mut(|data| data.insert_temp(egui::Id::new("block-action-popup"), popup_id));
+            if from_action_button {
+                self.context_action_popup = Some(popup_id);
+            }
+        }
         if let Some(action) = chosen {
+            egui::Popup::close_id(&response.ctx, popup_id);
+            self.context_action_popup = None;
             self.block_menu_action = Some(crate::block_mode::BlockMenuRequest {
                 record_id: target_id,
                 action,
@@ -3140,7 +3412,11 @@ impl TerminalRenderer {
             {
                 let badge_font = FontId::proportional(font_size);
                 for text in &candidates {
-                    let galley = painter.layout_no_wrap(text.clone(), badge_font.clone(), color);
+                    let galley = painter.layout_no_wrap(
+                        block_badge_display_text(text),
+                        badge_font.clone(),
+                        color,
+                    );
                     let text_size = galley.size();
                     let bg_size = egui::vec2(
                         text_size.x + 2.0 * BADGE_PAD_X,
@@ -3423,6 +3699,12 @@ impl TerminalRenderer {
         // `None` while chrome is gated off (config, alt screen, reflow).
         let summaries = Self::projected_summary_rows(terminal, &viewport);
         let mut block_chrome = self.block_chrome_snapshot(terminal, &viewport, rows);
+        if block_chrome.is_none() || !interaction_enabled {
+            if let Some(id) = self.context_action_popup.take() {
+                egui::Popup::close_id(ui.ctx(), id);
+                self.context_block_id = None;
+            }
+        }
         if let Some(entries) = block_chrome.as_deref_mut() {
             self.update_block_hover(
                 entries,
@@ -3530,7 +3812,10 @@ impl TerminalRenderer {
             rendered_terminal,
             mouse_enabled && press_app_mouse_eligible,
             interaction_enabled,
-            response.hovered(),
+            response.hovered()
+                && ui
+                    .input(|input| input.pointer.latest_pos())
+                    .is_some_and(|pos| content_rect.contains(pos)),
             primary_pressed,
             ui.input(|input| input.modifiers.shift),
         );
@@ -3768,7 +4053,7 @@ impl TerminalRenderer {
                 egui::Popup::close_id(ctx, egui::Popup::default_response_id(&response));
             }
         }
-        self.show_block_context_menu(&response, terminal, rendered_terminal);
+        self.show_block_context_menu(&response, terminal, rendered_terminal, false);
 
         // Click-to-place-cursor is press/drag/release, not toolkit `clicked()`.
         // A press is ambiguous until the pointer either leaves the cell
@@ -4092,6 +4377,18 @@ impl TerminalRenderer {
             );
         }
         self.draw_collapsed_summaries(&painter, &summaries, content_rect, line_height);
+        if let Some(entries) = &block_chrome {
+            self.show_block_action_rail(
+                ui,
+                terminal,
+                entries,
+                content_rect,
+                rect,
+                line_height,
+                rows,
+                interaction_enabled,
+            );
+        }
 
         // Zero/positive z-index images are above terminal text and UI chrome;
         // a terminal graphic must not be washed by a later translucent card
@@ -6336,7 +6633,7 @@ mod tests {
         );
         let mut terminal = crate::terminal::TerminalState::new(40, 8);
         terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
-        let click = egui::pos2(32.0, 10.0);
+        let click = egui::pos2(BLOCK_GUTTER_WIDTH + 24.0, 10.0);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
         // egui 0.36 debug-asserts when a TexturesDelta with unapplied deltas is
         // dropped. These tests own no texture atlas, so clear it explicitly.
@@ -6460,8 +6757,8 @@ mod tests {
         );
         let mut terminal = crate::terminal::TerminalState::new(40, 8);
         terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
-        let press = egui::pos2(32.0, 10.0);
-        let dragged = egui::pos2(96.0, 10.0);
+        let press = egui::pos2(BLOCK_GUTTER_WIDTH + 24.0, 10.0);
+        let dragged = egui::pos2(BLOCK_GUTTER_WIDTH + 88.0, 10.0);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
         fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
             let mut output = ctx.run_ui(input, f);
@@ -6538,7 +6835,7 @@ mod tests {
         );
         let mut terminal = crate::terminal::TerminalState::new(40, 8);
         terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
-        let press = egui::pos2(32.0, 10.0);
+        let press = egui::pos2(BLOCK_GUTTER_WIDTH + 24.0, 10.0);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
         fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
             let mut output = ctx.run_ui(input, f);
@@ -7118,6 +7415,191 @@ mod tests {
     }
 
     #[test]
+    fn badge_display_words_do_not_depend_on_symbol_font_coverage() {
+        assert_eq!(block_badge_display_text("✓ 743ms"), "OK 743ms");
+        assert_eq!(block_badge_display_text("✗ exit:101"), "Fail exit:101");
+        assert_eq!(block_badge_display_text("▶ 2.4s"), "Run 2.4s");
+        assert_eq!(block_badge_display_text("↻ Background"), "Background");
+        assert_eq!(block_badge_display_text("? exit:?"), "? exit:?");
+    }
+
+    #[test]
+    fn action_lane_never_overlaps_cells_stripes_or_neighboring_cards() {
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let content = egui::Rect::from_min_max(egui::pos2(36.0, 2.0), egui::pos2(388.0, 198.0));
+        for height in [1.0, 8.0, 15.0, 16.0, 20.0, 40.0, 120.0] {
+            let card = egui::Rect::from_min_size(content.min, egui::vec2(content.width(), height));
+            if let Some(action) = block_action_rect(content, card, pane, 20.0) {
+                assert!(action.left() >= pane.left());
+                assert!(action.right() <= content.left() - crate::block_mode::GUTTER_CLICK_BAND_PX);
+                assert!(action.top() >= card.top() && action.bottom() <= card.bottom());
+                assert!(!action.intersects(content));
+            } else {
+                assert!(height < 8.0);
+            }
+        }
+        let clipped = egui::Rect::from_min_max(egui::pos2(10.0, 2.0), content.max);
+        assert!(block_action_rect(clipped, clipped, pane, 20.0).is_none());
+        assert!(block_action_rect(content, content, pane, f32::NAN).is_none());
+    }
+
+    #[test]
+    fn block_action_control_exposes_one_accessible_click_and_owns_focus() {
+        use std::cell::Cell;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let id = egui::Id::new("test-block-actions");
+        let clicked = Cell::new(false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 80.0),
+            )),
+            ..Default::default()
+        };
+        let render = |ui: &mut Ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(24.0, 24.0));
+            clicked.set(
+                block_action_button(ui, id, rect, false, "Block actions for cargo test; failed")
+                    .clicked(),
+            );
+        };
+        let mut output = ctx.run_ui(input.clone(), render);
+        output.textures_delta.clear();
+        let node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| (*node_id == id.accesskit_id()).then_some(node))
+            .unwrap();
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+        assert_eq!(node.label(), Some("Block actions for cargo test; failed"));
+        assert!(node.supports_action(egui::accesskit::Action::Focus));
+        assert!(node.supports_action(egui::accesskit::Action::Click));
+        for action in [
+            egui::accesskit::Action::Click,
+            egui::accesskit::Action::Focus,
+        ] {
+            let mut next = input.clone();
+            next.events.push(egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: id.accesskit_id(),
+                    data: None,
+                },
+            ));
+            let mut output = ctx.run_ui(next, render);
+            output.textures_delta.clear();
+            assert!(block_action_has_focus(&ctx));
+            if action == egui::accesskit::Action::Click {
+                assert!(clicked.get());
+                assert_eq!(output.platform_output.events.len(), 1);
+            }
+        }
+        ctx.memory_mut(|memory| memory.surrender_focus(id));
+        let mut output = ctx.run_ui(input, |_| {});
+        output.textures_delta.clear();
+        assert!(
+            !block_action_has_focus(&ctx),
+            "a stale focus marker must not block the shell"
+        );
+    }
+    #[test]
+    fn action_lane_claims_same_batch_pointer_and_keyboard_without_stale_targets() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("same-batch-block-actions");
+        let rect = egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(24.0, 20.0));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 80.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input.clone(), |ui| {
+            block_action_button(ui, id, rect, false, "Block actions");
+        });
+        output.textures_delta.clear();
+        let mut pressed = input.clone();
+        pressed.events = vec![
+            egui::Event::PointerMoved(rect.center()),
+            egui::Event::PointerButton {
+                pos: rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let mut output = ctx.run_ui(pressed, |ui| {
+            assert!(
+                block_action_has_focus(ui.ctx()),
+                "the prepass must claim Enter before pointer focus is rendered"
+            );
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(input.clone(), |_| {});
+        output.textures_delta.clear();
+        let mut stale = input;
+        stale.events.push(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: id.accesskit_id(),
+                data: None,
+            },
+        ));
+        let mut output = ctx.run_ui(stale, |ui| {
+            assert!(
+                !block_action_has_focus(ui.ctx()),
+                "offscreen controls expire rather than accumulating focus markers"
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn action_menu_closes_when_its_card_leaves_the_viewport() {
+        let ctx = egui::Context::default();
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            2.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let terminal = crate::terminal::TerminalState::new(40, 8);
+        let popup = egui::Id::new("offscreen-block-popup");
+        renderer.context_block_id = Some("offscreen".to_owned());
+        renderer.context_action_popup = Some(popup);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 160.0));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                egui::Popup::open_id(ui.ctx(), popup);
+                renderer.show_block_action_rail(ui, &terminal, &[], rect, rect, 20.0, 8, true);
+                assert!(!egui::Popup::is_id_open(ui.ctx(), popup));
+            },
+        );
+        output.textures_delta.clear();
+        assert!(renderer.context_block_id.is_none());
+        assert!(renderer.context_action_popup.is_none());
+    }
+
+    #[test]
     fn block_gutter_moves_column_zero_and_grid_size_together() {
         let mut renderer = TerminalRenderer::new(
             14.0,
@@ -7133,17 +7615,17 @@ mod tests {
 
         renderer.block_mode = true;
         let (with_content, _) = renderer.layout_rects(pane);
-        assert_eq!(renderer.grid_dimensions(available), (10, 5));
+        assert_eq!(renderer.grid_dimensions(available), (6, 5));
         assert_eq!(with_content.left(), 2.0 + BLOCK_GUTTER_WIDTH);
-        assert_eq!(with_content.width(), 80.0);
+        assert_eq!(with_content.width(), 54.0);
 
         // Compact is paint density only: toggling it cannot resize the PTY.
         renderer.block_compact = true;
-        assert_eq!(renderer.grid_dimensions(available), (10, 5));
+        assert_eq!(renderer.grid_dimensions(available), (6, 5));
         assert_eq!(renderer.layout_rects(pane).0, with_content);
 
         // Disabling Block Mode removes the layout-owned gutter and recovers
-        // exactly one eight-pixel column. Mouse/cursor/Kitty all consume this
+        // the layout-owned action lane. Mouse/cursor/Kitty all consume this
         // same content rect, so there is no independent coordinate offset.
         renderer.block_mode = false;
         let (without_content, _) = renderer.layout_rects(pane);
