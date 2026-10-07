@@ -187,6 +187,54 @@ pub fn validate_remote_navigation_text(input: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(normalized))
 }
 
+/// Local Files path editor: absolute, UTF-8, no control/bidi, lexically
+/// normalized, no root escape.
+pub fn validate_local_navigation_text(input: &str) -> Result<PathBuf, String> {
+    if input.is_empty() {
+        return Err("Files path cannot be empty".to_string());
+    }
+    if input.len() > MAX_REMOTE_PATH_BYTES {
+        return Err(format!(
+            "Files path is too long (maximum {MAX_REMOTE_PATH_BYTES} bytes)"
+        ));
+    }
+    if !input.starts_with('/') {
+        return Err("Files navigation requires an absolute path".to_string());
+    }
+    if input.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }) {
+        return Err("Files path contains control or bidirectional text".to_string());
+    }
+
+    let mut components: Vec<&str> = Vec::new();
+    for component in input.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err("Files path attempts to escape the filesystem root".to_string());
+                }
+            }
+            value => components.push(value),
+        }
+    }
+    let normalized = if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    };
+    Ok(PathBuf::from(normalized))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DirectoryFailure {
     message: String,
@@ -519,6 +567,8 @@ enum NavigationCause {
     Ordinary,
     Back,
     Forward,
+    /// Shell cwd follow: change the local root without recording history.
+    Follow,
 }
 
 #[derive(Clone, Debug)]
@@ -745,22 +795,22 @@ impl FsOpKind {
     /// 状态栏的失败前缀（完整消息由 poll_op_results 拼上具体错误）。
     fn verb(&self) -> &'static str {
         match self {
-            FsOpKind::CreateDir(_) => "新建文件夹失败",
-            FsOpKind::CreateFile(_) => "新建文件失败",
-            FsOpKind::Delete(_) => "删除失败",
-            FsOpKind::Rename { .. } => "重命名失败",
-            FsOpKind::Copy { .. } => "粘贴失败",
+            FsOpKind::CreateDir(_) => "Failed to create folder",
+            FsOpKind::CreateFile(_) => "Failed to create file",
+            FsOpKind::Delete(_) => "Failed to delete",
+            FsOpKind::Rename { .. } => "Failed to rename",
+            FsOpKind::Copy { .. } => "Failed to paste",
         }
     }
 
     /// 状态栏的成功消息。
     fn success_message(&self) -> String {
         match self {
-            FsOpKind::CreateDir(path) => format!("已创建文件夹 {}", path.display()),
-            FsOpKind::CreateFile(path) => format!("已创建文件 {}", path.display()),
-            FsOpKind::Delete(path) => format!("已删除 {}", path.display()),
-            FsOpKind::Rename { dst, .. } => format!("已重命名为 {}", dst.display()),
-            FsOpKind::Copy { dst, .. } => format!("已粘贴到 {}", dst.display()),
+            FsOpKind::CreateDir(path) => format!("Created folder {}", path.display()),
+            FsOpKind::CreateFile(path) => format!("Created file {}", path.display()),
+            FsOpKind::Delete(path) => format!("Deleted {}", path.display()),
+            FsOpKind::Rename { dst, .. } => format!("Renamed to {}", dst.display()),
+            FsOpKind::Copy { dst, .. } => format!("Pasted to {}", dst.display()),
         }
     }
 }
@@ -784,9 +834,9 @@ impl FsTransfer {
             self.src_endpoint.location.is_remote(),
             self.dst_endpoint.location.is_remote(),
         ) {
-            (true, false) => "下载",
-            (false, true) => "上传",
-            _ => "传输",
+            (true, false) => "download",
+            (false, true) => "upload",
+            _ => "transfer",
         }
     }
 }
@@ -830,18 +880,18 @@ impl BatchOutcome {
                 .unwrap_or_else(|| path.display().to_string())
         }
         let mut message = if self.failed.is_empty() {
-            format!("已{verb} {total} 项")
+            format!("Finished {verb} of {total} items")
         } else {
             let first = &self.failed[0];
             format!(
-                "{total} 项中 {} 项失败：{}：{}",
+                "{} of {total} items failed: {}: {}",
                 self.failed.len(),
                 display(&first.0),
                 first.1
             )
         };
         for warning in &self.warnings {
-            message.push_str(&format!("；{warning}"));
+            message.push_str(&format!("; {warning}"));
         }
         message
     }
@@ -1047,7 +1097,7 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                 let Some(name) = src.file_name() else {
                     outcome
                         .failed
-                        .push((src.clone(), "源路径没有文件名".to_string()));
+                        .push((src.clone(), "source path has no file name".to_string()));
                     continue;
                 };
                 let dst = dst_dir.join(name);
@@ -1103,7 +1153,7 @@ fn execute_batch(hosts: &[RemoteHostConfig], batch: &BatchIntent) -> BatchOutcom
                                 src,
                             ) {
                                 outcome.warnings.push(format!(
-                                    "{name}：源删除失败（已保留）：{}",
+                                    "{name}: source delete failed (kept): {}",
                                     remote_fs::user_facing_error(&error)
                                 ));
                             }
@@ -1199,7 +1249,7 @@ fn execute_op(request: &FsOpRequest, events: &Sender<OpEvent>) -> io::Result<OpD
                     &transfer.src,
                 ) {
                     warning = Some(format!(
-                        "源删除失败（已保留）：{}",
+                        "source delete failed (kept): {}",
                         remote_fs::user_facing_error(&error)
                     ));
                 }
@@ -1360,6 +1410,8 @@ pub struct Sidebar {
     /// Runtime-only dotfile policy. Switching it starts a generation-stamped
     /// rescan, so a result from the previous policy cannot repopulate the tree.
     show_hidden: bool,
+    /// Runtime-only: when true, local Files tracks the focused shell cwd.
+    follow_local_cwd: bool,
     /// 当前侧边栏视图。
     pub view: SidebarView,
     /// 文件操作剪贴板（Copy/Cut → Paste；同位置 copy/rename，跨位置传输）。
@@ -1472,6 +1524,7 @@ impl Sidebar {
             filter_open: false,
             filter: String::new(),
             show_hidden: false,
+            follow_local_cwd: true,
             view: SidebarView::default(),
             clipboard: None,
             clipboard_intent: None,
@@ -1521,7 +1574,31 @@ impl Sidebar {
         FileTreeNode::directory(path.to_path_buf(), name, true)
     }
 
+    pub fn follow_local_cwd(&self) -> bool {
+        self.follow_local_cwd
+    }
+
+    pub fn set_follow_local_cwd(&mut self, follow: bool) {
+        self.follow_local_cwd = follow;
+    }
+
+    pub fn pause_local_cwd_follow(&mut self) {
+        self.follow_local_cwd = false;
+    }
+
+    pub fn follow_to_dir(&mut self, path: PathBuf) -> Option<String> {
+        self.set_current_dir_with_cause(path, NavigationCause::Follow)
+    }
+
     pub fn set_current_dir(&mut self, path: PathBuf) -> Option<String> {
+        self.set_current_dir_with_cause(path, NavigationCause::Ordinary)
+    }
+
+    fn set_current_dir_with_cause(
+        &mut self,
+        path: PathBuf,
+        cause: NavigationCause,
+    ) -> Option<String> {
         if !path.is_absolute() {
             return Some("Files navigation requires an absolute path".to_string());
         }
@@ -1533,10 +1610,41 @@ impl Sidebar {
                 Ok(path) => path,
                 Err(error) => return Some(error),
             };
-            return self.request_navigation(path, NavigationCause::Ordinary);
+            let cause = if cause == NavigationCause::Follow {
+                NavigationCause::Ordinary
+            } else {
+                cause
+            };
+            return self.request_navigation(path, cause);
         }
+        let path = match validate_local_navigation_text(&path.to_string_lossy()) {
+            Ok(path) => path,
+            Err(error) => return Some(error),
+        };
         if self.current_dir == path {
             return None;
+        }
+        if cause != NavigationCause::Follow {
+            self.pause_local_cwd_follow();
+        }
+        match cause {
+            NavigationCause::Ordinary => {
+                Self::push_history(&mut self.navigation_back, self.current_dir.clone());
+                self.navigation_forward.clear();
+            }
+            NavigationCause::Back => {
+                if self.navigation_back.back() == Some(&path) {
+                    self.navigation_back.pop_back();
+                    Self::push_history(&mut self.navigation_forward, self.current_dir.clone());
+                }
+            }
+            NavigationCause::Forward => {
+                if self.navigation_forward.back() == Some(&path) {
+                    self.navigation_forward.pop_back();
+                    Self::push_history(&mut self.navigation_back, self.current_dir.clone());
+                }
+            }
+            NavigationCause::Follow => {}
         }
         self.current_dir = path;
         self.selected_path = None;
@@ -1548,6 +1656,9 @@ impl Sidebar {
     fn request_navigation(&mut self, target: PathBuf, cause: NavigationCause) -> Option<String> {
         if self.current_dir == target {
             return None;
+        }
+        if cause != NavigationCause::Follow {
+            self.pause_local_cwd_follow();
         }
         if self
             .pending_navigation
@@ -1584,25 +1695,29 @@ impl Sidebar {
     }
 
     pub fn can_navigate_back(&self) -> bool {
-        self.location.is_remote()
-            && self.pending_navigation.is_none()
-            && !self.navigation_back.is_empty()
+        self.pending_navigation.is_none() && !self.navigation_back.is_empty()
     }
 
     pub fn can_navigate_forward(&self) -> bool {
-        self.location.is_remote()
-            && self.pending_navigation.is_none()
-            && !self.navigation_forward.is_empty()
+        self.pending_navigation.is_none() && !self.navigation_forward.is_empty()
     }
 
     pub fn navigate_back(&mut self) -> Option<String> {
         let target = self.navigation_back.back().cloned()?;
-        self.request_navigation(target, NavigationCause::Back)
+        if self.location.is_remote() {
+            self.request_navigation(target, NavigationCause::Back)
+        } else {
+            self.set_current_dir_with_cause(target, NavigationCause::Back)
+        }
     }
 
     pub fn navigate_forward(&mut self) -> Option<String> {
         let target = self.navigation_forward.back().cloned()?;
-        self.request_navigation(target, NavigationCause::Forward)
+        if self.location.is_remote() {
+            self.request_navigation(target, NavigationCause::Forward)
+        } else {
+            self.set_current_dir_with_cause(target, NavigationCause::Forward)
+        }
     }
 
     pub fn open_path_entry(&mut self) {
@@ -1616,13 +1731,20 @@ impl Sidebar {
     }
 
     pub fn submit_path_entry(&mut self) -> Option<String> {
-        let target = match validate_remote_navigation_text(&self.path_entry) {
-            Ok(target) => target,
-            Err(error) => return Some(error),
+        let target = if self.location.is_remote() {
+            match validate_remote_navigation_text(&self.path_entry) {
+                Ok(target) => target,
+                Err(error) => return Some(error),
+            }
+        } else {
+            match validate_local_navigation_text(&self.path_entry) {
+                Ok(target) => target,
+                Err(error) => return Some(error),
+            }
         };
         self.path_entry_open = false;
         self.path_entry.clear();
-        self.request_navigation(target, NavigationCause::Ordinary)
+        self.set_current_dir(target)
     }
 
     pub fn breadcrumbs(&self) -> Vec<(String, PathBuf)> {
@@ -1715,6 +1837,7 @@ impl Sidebar {
                         Self::push_history(&mut self.navigation_back, pending.origin);
                     }
                 }
+                NavigationCause::Follow => {}
             }
         }
 
@@ -1894,7 +2017,7 @@ impl Sidebar {
             Some(None) => {
                 self.clear_clipboard();
                 Some(
-                    "远端文件剪贴板来源 profile 已被删除、更改或不再唯一；已清除剪贴板".to_string(),
+                    "The remote Files clipboard source profile was deleted, changed, or is no longer unique; clipboard cleared".to_string(),
                 )
             }
             None => None,
@@ -1904,13 +2027,13 @@ impl Sidebar {
             None => {
                 let local_refresh_error = self.set_location(FsLocation::Local);
                 let mut message =
-                    "所选远端 Files profile 已被删除、更改或不再唯一；正在验证并切换 Local"
+                    "The selected remote Files profile was deleted, changed, or is no longer unique; verifying and switching to Local"
                         .to_string();
                 if let Some(clipboard_notice) = clipboard_notice {
-                    message.push_str(&format!("；{clipboard_notice}"));
+                    message.push_str(&format!("; {clipboard_notice}"));
                 }
                 if let Some(error) = local_refresh_error {
-                    message.push_str(&format!("（本地文件树刷新失败：{error}）"));
+                    message.push_str(&format!(" (local Files refresh failed: {error})"));
                 }
                 return Some(message);
             }
@@ -2103,7 +2226,7 @@ impl Sidebar {
             self.start_dir_pending = false;
             self.failure_states.remove(&target);
             self.set_location_error(format!(
-                "无法进入 {endpoint_label}：{error}；原文件树保持不变"
+                "Could not open {endpoint_label}: {error}; keeping the previous file tree"
             ));
             return Some(error);
         }
@@ -2412,9 +2535,9 @@ impl Sidebar {
                     if result.cancelled {
                         let direction = match &result.kind {
                             OpRequestKind::Transfer(transfer) => transfer.direction(),
-                            _ => "操作",
+                            _ => "operation",
                         };
-                        messages.push(format!("已取消{direction}"));
+                        messages.push(format!("Cancelled {direction}"));
                         continue;
                     }
                     match result.kind {
@@ -2432,7 +2555,7 @@ impl Sidebar {
                                         let Some(path_text) = dir.to_str() else {
                                             self.start_dir_pending = false;
                                             messages.push(
-                                                "远端 home 不是有效 UTF-8；原文件树保持不变"
+                                                "Remote home is not valid UTF-8; keeping the previous file tree"
                                                     .to_string(),
                                             );
                                             continue;
@@ -2442,7 +2565,7 @@ impl Sidebar {
                                             Err(error) => {
                                                 self.start_dir_pending = false;
                                                 messages.push(format!(
-                                                    "远端 home 无效：{error}；原文件树保持不变"
+                                                    "Remote home is invalid: {error}; keeping the previous file tree"
                                                 ));
                                                 continue;
                                             }
@@ -2456,7 +2579,7 @@ impl Sidebar {
                                         home: dir,
                                     }) {
                                         self.start_dir_pending = false;
-                                        messages.push(format!("文件树读取失败：{error}"));
+                                        messages.push(format!("Files listing failed: {error}"));
                                     }
                                 }
                                 Ok(None) => {
@@ -2466,7 +2589,7 @@ impl Sidebar {
                                     self.start_dir_pending = false;
                                     let label = pending.location.label(&self.remote_hosts);
                                     self.set_location_error(format!(
-                                        "无法进入 {label}：{error}；原文件树保持不变"
+                                        "Could not open {label}: {error}; keeping the previous file tree"
                                     ));
                                     messages.push(
                                         self.location_error
@@ -2485,7 +2608,7 @@ impl Sidebar {
                                 for dir in kind.affected_dirs() {
                                     self.invalidate_navigation_cache(&dir);
                                     if let Some(error) = self.refresh_loaded_node(&dir) {
-                                        messages.push(format!("文件树刷新失败：{error}"));
+                                        messages.push(format!("Files refresh failed: {error}"));
                                     }
                                 }
                                 messages.push(kind.success_message());
@@ -2501,12 +2624,13 @@ impl Sidebar {
                                         self.invalidate_navigation_cache(&dir);
                                         if let Some(refresh_error) = self.refresh_loaded_node(&dir)
                                         {
-                                            messages
-                                                .push(format!("文件树重验失败：{refresh_error}"));
+                                            messages.push(format!(
+                                                "Files revalidation failed: {refresh_error}"
+                                            ));
                                         }
                                     }
                                 }
-                                messages.push(format!("{}：{error}", kind.verb()));
+                                messages.push(format!("{}: {error}", kind.verb()));
                             }
                         },
                         OpRequestKind::Transfer(transfer) => match result.outcome {
@@ -2521,16 +2645,20 @@ impl Sidebar {
                                 // 落位目录可能正是当前显示的目录，重新扫描它。
                                 self.invalidate_navigation_cache(&transfer.dst_dir);
                                 if let Some(error) = self.refresh_loaded_node(&transfer.dst_dir) {
-                                    messages.push(format!("文件树刷新失败：{error}"));
+                                    messages.push(format!("Files refresh failed: {error}"));
                                 }
                                 let mut message = match dst {
                                     Some(dst) => {
-                                        format!("已{}到 {}", transfer.direction(), dst.display())
+                                        format!(
+                                            "Finished {} to {}",
+                                            transfer.direction(),
+                                            dst.display()
+                                        )
                                     }
-                                    None => format!("已{}", transfer.direction()),
+                                    None => format!("Finished {}", transfer.direction()),
                                 };
                                 if let Some(warning) = result.warning {
-                                    message.push_str(&format!("；{warning}"));
+                                    message.push_str(&format!("; {warning}"));
                                 }
                                 messages.push(message);
                             }
@@ -2539,9 +2667,11 @@ impl Sidebar {
                                 if let Some(refresh_error) =
                                     self.refresh_loaded_node(&transfer.dst_dir)
                                 {
-                                    messages.push(format!("文件树重验失败：{refresh_error}"));
+                                    messages.push(format!(
+                                        "Files revalidation failed: {refresh_error}"
+                                    ));
                                 }
-                                messages.push(format!("{}失败：{error}", transfer.direction()));
+                                messages.push(format!("{} failed: {error}", transfer.direction()));
                             }
                         },
                         OpRequestKind::Batch(batch) => {
@@ -2549,8 +2679,8 @@ impl Sidebar {
                                 continue;
                             };
                             let (verb, total) = match &batch {
-                                BatchIntent::Paste { items, .. } => ("粘贴", items.len()),
-                                BatchIntent::Delete { items, .. } => ("删除", items.len()),
+                                BatchIntent::Paste { items, .. } => ("paste", items.len()),
+                                BatchIntent::Delete { items, .. } => ("delete", items.len()),
                             };
                             // 批量粘贴刷新落点目录；批量删除刷新每个条目的父目录。
                             let mut dirs: Vec<PathBuf> = Vec::new();
@@ -2570,7 +2700,7 @@ impl Sidebar {
                             for dir in dirs {
                                 self.invalidate_navigation_cache(&dir);
                                 if let Some(error) = self.refresh_loaded_node(&dir) {
-                                    messages.push(format!("文件树刷新失败:{error}"));
+                                    messages.push(format!("Files refresh failed: {error}"));
                                 }
                             }
                             // cut 粘贴：全成功清剪贴板；部分失败收缩为失败项（便于重试）。
@@ -3114,7 +3244,7 @@ impl Sidebar {
                                     self.pending_location_probe = None;
                                     self.failure_states.remove(&completed_path);
                                     self.set_location_error(format!(
-                                        "无法进入 {}：{}（仍显示 {}）",
+                                        "Could not open {}: {} (still showing {})",
                                         endpoint.location.label(&self.remote_hosts),
                                         message,
                                         pending.origin.display()
@@ -3122,13 +3252,13 @@ impl Sidebar {
                                 } else {
                                     self.record_scan_failure(&completed_path, &error);
                                     self.set_location_error(format!(
-                                        "{}（仍显示 {}）",
+                                        "{} (still showing {})",
                                         message,
                                         pending.origin.display()
                                     ));
                                 }
                                 errors.push(format!(
-                                    "{}: {message}；已保留原文件树",
+                                    "{}: {message}; keeping the previous file tree",
                                     completed_path.display()
                                 ));
                             }
@@ -3440,11 +3570,11 @@ fn plan_drop_with_limits(
         .filter(|path| path.is_absolute() && path.file_name().is_some())
         .collect();
     if candidates.is_empty() {
-        return Err("拖放内容里没有可导入的本地路径".to_string());
+        return Err("Drop contained no importable local paths".to_string());
     }
     if candidates.len() > max_items {
         return Err(format!(
-            "拖放条目过多（{} > {max_items}），已整批拒绝",
+            "Too many dropped items ({} > {max_items}); the whole drop was refused",
             candidates.len()
         ));
     }
@@ -3456,7 +3586,7 @@ fn plan_drop_with_limits(
         plan.total_bytes += measure_dropped_path(src, 0, &mut budget);
         if plan.total_bytes > max_bytes {
             return Err(format!(
-                "拖放内容总计超过 {}，已整批拒绝",
+                "Dropped content exceeds {}; the whole drop was refused",
                 remote_fs::format_bytes(max_bytes)
             ));
         }
@@ -3987,13 +4117,13 @@ mod tests {
         let messages = sidebar.poll_scan_results();
         assert!(messages
             .iter()
-            .any(|message| message.contains("已保留原文件树")));
+            .any(|message| message.contains("keeping the previous file tree")));
         assert_eq!(sidebar.current_dir, PathBuf::from("/remote/current"));
         assert_eq!(sidebar.selected_path.as_ref(), Some(&kept));
         assert_eq!(sidebar.root.as_ref().unwrap().children[0].name, "kept.txt");
         assert!(!sidebar.can_navigate_back());
         assert!(sidebar.navigation_pending_target().is_none());
-        assert!(sidebar.location_error().unwrap().contains("仍显示"));
+        assert!(sidebar.location_error().unwrap().contains("still showing"));
         assert!(sidebar
             .retry_cooldown(Path::new("/remote/missing"))
             .is_some());
@@ -4205,7 +4335,7 @@ mod tests {
         let token = Arc::new(AtomicBool::new(false));
         sidebar.transfer_tracks.push(TransferTrack {
             token: Arc::clone(&token),
-            direction: "下载",
+            direction: "download",
             name: "stale.txt".to_string(),
             total: None,
             bytes: 0,
@@ -4218,7 +4348,7 @@ mod tests {
         let notice = sidebar
             .set_remote_hosts(&changed)
             .expect("unsafe index reuse must be visible");
-        assert!(notice.contains("正在验证并切换 Local"));
+        assert!(notice.contains("verifying and switching to Local"));
         poll_until_loaded(&mut sidebar);
         assert_eq!(sidebar.location(), &FsLocation::Local);
         assert!(sidebar.selection.is_empty());
@@ -4259,7 +4389,7 @@ mod tests {
             .set_remote_hosts(&[profiles[1].clone()])
             .expect("removed active tree authority must be visible");
 
-        assert!(notice.contains("正在验证并切换 Local"));
+        assert!(notice.contains("verifying and switching to Local"));
         poll_until_loaded(&mut sidebar);
         assert_eq!(sidebar.location(), &FsLocation::Local);
         assert_eq!(sidebar.clipboard_intent, clipboard_intent);
@@ -4831,7 +4961,7 @@ mod tests {
     #[test]
     fn fs_op_queue_is_nonblocking_and_hard_bounded() {
         // 不启动真 worker，队列只进不出：前 64 项入队，第 65 项立即
-        // 返回可重试错误，不阻塞 UI 也不丢弃旧操作。
+        // 返回可重试错误，不阻塞 UI 也不丢弃旧operation。
         let (request_tx, request_rx) = crossbeam_channel::bounded(OP_QUEUE_CAPACITY);
         let (_result_tx, result_rx) = crossbeam_channel::bounded(OP_RESULT_CAPACITY);
         let service = FsOpService {
@@ -5025,9 +5155,10 @@ mod tests {
 
         let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
         assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("原文件树保持不变")),
+            messages.iter().any(
+                |message| message.contains("previous file tree is unchanged")
+                    || message.contains("keeping the previous file tree")
+            ),
             "messages so far: {messages:?}"
         );
         assert_eq!(sidebar.location(), &FsLocation::Local);
@@ -5096,7 +5227,9 @@ mod tests {
             ))
             .unwrap();
         let errors = sidebar.poll_scan_results();
-        assert!(errors.iter().any(|error| error.contains("已保留原文件树")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("keeping the previous file tree")));
         assert_eq!(sidebar.location(), &FsLocation::Local);
         assert_eq!(sidebar.current_dir, PathBuf::from("/local/kept"));
         assert_eq!(sidebar.selected_path.as_ref(), Some(&kept));
@@ -5165,7 +5298,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("已创建文件夹")),
+                .any(|message| message.contains("Created folder")),
             "messages: {messages:?}"
         );
         poll_until_loaded(&mut sidebar);
@@ -5188,7 +5321,8 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("新建文件夹失败") && message.contains("exists")),
+                .any(|message| message.contains("Failed to create folder")
+                    && message.contains("exists")),
             "messages: {messages:?}"
         );
 
@@ -5271,7 +5405,7 @@ mod tests {
         let messages = sidebar.poll_op_results();
 
         assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
-        assert!(messages.iter().any(|message| message.contains("已粘贴")));
+        assert!(messages.iter().any(|message| message.contains("Pasted")));
     }
 
     #[test]
@@ -5304,7 +5438,7 @@ mod tests {
 
         assert!(messages
             .iter()
-            .any(|message| message.contains("新建文件失败")));
+            .any(|message| message.contains("Failed to create file")));
         assert_eq!(
             sidebar.root.as_ref().unwrap().load_state,
             DirectoryLoadState::Refreshing
@@ -5495,7 +5629,9 @@ mod tests {
         assert!(!sidebar.has_pending_op());
         assert!(sidebar.transfer_status().is_none());
         assert!(sidebar.clipboard.is_none());
-        assert!(messages.iter().any(|message| message.contains("已上传")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("Finished upload")));
     }
 
     #[test]
@@ -5536,7 +5672,9 @@ mod tests {
         assert!(sidebar.has_pending_op());
         let messages = poll_ops_until(&mut sidebar, |sidebar| !sidebar.has_pending_op());
         assert!(
-            messages.iter().any(|message| message.contains("上传失败")),
+            messages
+                .iter()
+                .any(|message| message.contains("upload failed")),
             "messages: {messages:?}"
         );
         assert!(
@@ -5573,7 +5711,8 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("传输失败") && message.contains("copy/rename")),
+                .any(|message| message.contains("transfer failed")
+                    && message.contains("copy/rename")),
             "messages: {messages:?}"
         );
         assert!(src.exists());
@@ -5756,11 +5895,11 @@ mod tests {
         // 字节帽：150 字节的帽容不下 200 字节 → 整批拒绝。
         let error =
             plan_drop_with_limits(&dropped, &target, &FsLocation::Local, 256, 150).unwrap_err();
-        assert!(error.contains("整批拒绝"), "{error}");
+        assert!(error.contains("the whole drop was refused"), "{error}");
         // 条目帽：1 条容不下 2 条。
         let error =
             plan_drop_with_limits(&dropped, &target, &FsLocation::Local, 1, u64::MAX).unwrap_err();
-        assert!(error.contains("拖放条目过多"), "{error}");
+        assert!(error.contains("Too many dropped items"), "{error}");
         // 正好贴帽可以通过。
         let plan = plan_drop_with_limits(&dropped, &target, &FsLocation::Local, 2, 200).unwrap();
         assert_eq!(plan.total_bytes, 200);
@@ -5980,7 +6119,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("3 项中 1 项失败")
+                .any(|message| message.contains("1 of 3 items failed")
                     && message.contains("missing.txt")),
             "messages: {messages:?}"
         );
@@ -6049,7 +6188,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("2 项中 1 项失败") && message.contains("b.txt")),
+                .any(|message| message.contains("1 of 2 items failed") && message.contains("b.txt")),
             "messages: {messages:?}"
         );
         // cut = rename：a 移过去了；b 因目标已存在留在原地、目标内容未被覆盖。
@@ -6075,5 +6214,43 @@ mod tests {
         assert_eq!(bound_sidebar_notice(""), "Files panel notice");
         let overflow = format!("{}z", "x".repeat(MAX_SIDEBAR_NOTICE_BYTES));
         assert!(bound_sidebar_notice(overflow).len() <= MAX_SIDEBAR_NOTICE_BYTES);
+    }
+
+    #[test]
+    fn local_user_navigation_pauses_cwd_follow_and_records_history() {
+        let mut sidebar = Sidebar::with_scanner(
+            PathBuf::from("/virtual/home"),
+            Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>,
+        );
+        assert!(sidebar.follow_local_cwd());
+        assert!(sidebar
+            .set_current_dir(PathBuf::from("/virtual/projects"))
+            .is_none());
+        assert!(!sidebar.follow_local_cwd());
+        assert!(sidebar.can_navigate_back());
+        assert!(!sidebar.can_navigate_forward());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/virtual/projects"));
+        assert!(sidebar.navigate_back().is_none());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/virtual/home"));
+        assert!(sidebar.can_navigate_forward());
+        assert!(sidebar.navigate_forward().is_none());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/virtual/projects"));
+    }
+
+    #[test]
+    fn follow_to_dir_does_not_record_history_and_can_be_reenabled() {
+        let mut sidebar = Sidebar::with_scanner(
+            PathBuf::from("/virtual/home"),
+            Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>,
+        );
+        assert!(sidebar
+            .follow_to_dir(PathBuf::from("/virtual/shell-cwd"))
+            .is_none());
+        assert!(!sidebar.can_navigate_back());
+        assert_eq!(sidebar.current_dir, PathBuf::from("/virtual/shell-cwd"));
+        sidebar.pause_local_cwd_follow();
+        assert!(!sidebar.follow_local_cwd());
+        sidebar.set_follow_local_cwd(true);
+        assert!(sidebar.follow_local_cwd());
     }
 }

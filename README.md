@@ -1056,11 +1056,11 @@ streamed in 64 KiB chunks with a 512 MiB cap (directories travel as tar
 streams, regular files land via a write-then-rename partial file, never
 overwriting an existing target, including a dangling symbolic link), with cut
 becoming copy-then-delete and any partial success reported as such. While a
-transfer runs, the sidebar shows a live busy row (正在下载/上传 … with
-transferred bytes, and the total for
+transfer runs, the sidebar shows a live busy row (Downloading/Uploading …
+with transferred bytes, and the total for
 uploads) with a ✕ button that cancels it — the in-flight child is killed,
 local partial files are cleaned up, and the outcome is reported as a neutral
-已取消 rather than an error. The context menu also offers 复制路径, copying
+Cancelled rather than an error. The context menu also offers **Copy Path**, copying
 the row's full path (plain, unprefixed for remote rows) to the system
 clipboard. Root-level directories use `/` as their tar parent rather than an
 empty `-C` operand. The v7 probe receives directory archives in private staging,
@@ -1077,9 +1077,9 @@ remote trees. Each change starts a fresh generation-stamped root scan, clears
 row selection that may no longer be visible, and rejects results issued under
 the previous visibility policy.
 Rows support multi-select (ctrl+click toggles, shift+click extends a range in
-visible order): Delete/Copy/Cut/复制路径 act on the whole selection (delete
+visible order): Delete/Copy/Cut/Copy Path act on the whole selection (delete
 asks once with a count and up to five names), batch paste iterates items with
-per-item AlreadyExists refusal and a summary status (5 项中 2 项失败：…), and
+per-item AlreadyExists refusal and a summary status (2 of 5 items failed: …), and
 batch cut deletes only successfully-copied sources. A 🔍 toggle in the Files
 header opens a type-to-filter row that prunes the loaded tree client-side
 (case-insensitive name substring, matches plus auto-expanded ancestors,
@@ -1169,18 +1169,24 @@ do not loop in the background. The sidebar separates queue and execution
 latency for the last authoritative scan, and cache entries affected by
 filesystem operations are invalidated at their exact materialized directory.
 
-Remote browsing is now independent of terminal input: double-click enters the
-directory in the Remote tree, while **↑**/**Home** (or **Alt+Up**/**Alt+Home**
-with a focused tree row and the Files panel hovered) navigate the
-authority-bound remote root. These
-actions never inject `cd` into an unrelated PTY. Remote home output is strict
+Remote browsing is independent of terminal input: double-click enters the
+directory in Files without injecting `cd` into a PTY. Local Files can follow
+the focused shell's working directory (the pin/follow toggle); explicit
+navigation, breadcrumbs, Back/Forward, Up, Home, and the path editor pause
+follow. Double-click or Enter on a local file opens it with the trusted
+system opener (`xdg-open`). Remote files cannot be opened that way. **↑** /
+**Home** (or **Alt+Up** / **Alt+Home** with a focused tree row and the Files
+panel hovered) navigate the Files root. These actions never inject `cd` into
+an unrelated PTY. Remote home output is strict
 UTF-8, single-line and absolute. Probe/OS failures shown in the tree are mapped
 to stable retry-oriented classes; untrusted diagnostics are single-line,
 credential-redacted, control/bidi-cleaned, and truncated on Unicode character
 boundaries. With Files hovered, a tree row actually focused, and no
-filter/path editor/menu owning focus, Arrow Up/Down move row focus, Left/Right
-collapse/expand or enter a child, Enter navigates the focused directory, and
-Ctrl+L opens the path editor; terminal/text/popup input is never captured.
+filter/path editor/menu owning focus, Arrow Up/Down move row focus, Shift+Up/Down
+extend a range, Left/Right collapse/expand or enter a child, Enter opens a local
+file or enters a directory, F2 renames, Delete confirms deletion, and Ctrl+L
+opens the path editor; terminal/text/popup input is never captured. Clicking a
+split pane header reveals that session's directory in Files (drag still rearranges).
 
 The v4 remote list protocol applies the requested hidden-file policy and
 `MAX_DIRECTORY_ENTRIES + 1` row ceiling on the far side, preserving an explicit

@@ -137,7 +137,7 @@ impl TerminalApp {
                 // 只写 stderr 的话,拒写保护生效时用户会以为字号等改动已经落盘,
                 // 直到下次启动才发现全都没了。
                 self.set_status_for(
-                    format!("配置未保存：{e}"),
+                    format!("Config was not saved: {e}"),
                     std::time::Duration::from_secs(6),
                 );
             } else {
@@ -202,7 +202,7 @@ impl TerminalApp {
             Err(error) => {
                 eprintln!("[Config] Hot-reload read error: {error}");
                 self.set_status_for(
-                    format!("配置暂时无法读取，已保留当前值：{error}"),
+                    format!("Config is temporarily unreadable; keeping current values: {error}"),
                     std::time::Duration::from_secs(6),
                 );
                 return;
@@ -227,7 +227,7 @@ impl TerminalApp {
                     .to_string(),
             );
             self.set_status_for(
-                "配置在本地修改待保存时被外部更改；已停止自动写入",
+                "Config changed on disk while local edits were pending; automatic writes stopped",
                 std::time::Duration::from_secs(8),
             );
             return;
@@ -237,7 +237,7 @@ impl TerminalApp {
             Ok(path) => path,
             Err(error) => {
                 self.set_status_for(
-                    format!("无法定位配置文件：{error}"),
+                    format!("Could not locate the config file: {error}"),
                     std::time::Duration::from_secs(6),
                 );
                 return;
@@ -248,20 +248,20 @@ impl TerminalApp {
                 let notes = self.apply_hot_reload(new_config, ctx);
                 eprintln!("[Config] Hot-reloaded from {}", config_path.display());
                 if notes.is_empty() {
-                    self.set_status("配置已热重载");
+                    self.set_status("Config hot-reloaded");
                 } else {
                     for note in &notes {
                         eprintln!("[Config] WARNING: {note}");
                     }
                     self.set_status_for(
-                        format!("配置已重载（{} 项已调整）", notes.len()),
+                        format!("Config reloaded ({} settings adjusted)", notes.len()),
                         std::time::Duration::from_secs(5),
                     );
                 }
             }
             Err(error) => {
                 eprintln!("[Config] Hot-reload parse error: {error}");
-                self.status_message = format!("配置解析失败,已沿用旧配置: {error}");
+                self.status_message = format!("Config parse failed; keeping previous config: {error}");
                 self.status_expires_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
                 self.config.revision = Some(disk_revision);

@@ -373,7 +373,7 @@ pub fn open_link(link: &Link) -> Result<(), Box<dyn std::error::Error>> {
             open_url(&link.text)?;
         }
         LinkType::FilePath => {
-            open_file_path(&link.text)?;
+            open_local_path(std::path::Path::new(&link.text))?;
         }
         LinkType::IpAddress => {
             // IP 地址可以用浏览器打开或显示 whois 信息
@@ -450,6 +450,18 @@ fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Open a local filesystem path with the trusted system opener.
+pub(crate) fn open_local_path(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Open requires an absolute local path",
+        )
+        .into());
+    }
+    open_file_path(&path.to_string_lossy())
 }
 
 /// 打开文件路径（使用系统默认应用）

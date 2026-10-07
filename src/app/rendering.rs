@@ -392,7 +392,14 @@ impl TerminalApp {
     }
 
     fn reveal_files_at_active_cwd(&mut self) {
-        let session = self.session_manager.get_active_session_mut();
+        let session_idx = self.session_manager.active_index();
+        self.reveal_files_at_session_cwd(session_idx);
+    }
+
+    fn reveal_files_at_session_cwd(&mut self, session_idx: usize) {
+        let Some(session) = self.session_manager.sessions().get(session_idx) else {
+            return;
+        };
         let reported = session
             .terminal
             .lock()
@@ -406,19 +413,20 @@ impl TerminalApp {
         self.sidebar.note_files_user_intent();
         self.sidebar.visible = true;
         self.sidebar.view = crate::sidebar::SidebarView::Files;
+        self.sidebar.set_follow_local_cwd(true);
         if let Some(error) = self
             .sidebar
             .set_location(crate::remote_fs::FsLocation::Local)
         {
             self.set_status_for(
-                format!("文件树切换失败：{error}"),
+                format!("Files location switch failed: {error}"),
                 std::time::Duration::from_secs(5),
             );
             return;
         }
-        if let Some(error) = self.sidebar.set_current_dir(path) {
+        if let Some(error) = self.sidebar.follow_to_dir(path) {
             self.set_status_for(
-                format!("文件树目录切换失败：{error}"),
+                format!("Files directory switch failed: {error}"),
                 std::time::Duration::from_secs(5),
             );
         }
@@ -475,9 +483,7 @@ impl TerminalApp {
                         ui.id().with(("pane-header", pane.session_idx)),
                         egui::Sense::click_and_drag(),
                     )
-                    .on_hover_text(
-                        "Drag onto another pane to swap · drag to the tab bar to make a tab",
-                    );
+                    .on_hover_text("Click to show this directory in Files · drag to rearrange");
                 Some((pane.session_idx, response))
             })
             .collect();
@@ -582,6 +588,11 @@ impl TerminalApp {
         // Resolve the gesture only after painting, so the swap's new geometry
         // is drawn by the next frame rather than half-applied to this one.
         if self.pane_drag.is_some() && ctx.input(|input| input.pointer.any_released()) {
+            let click_reveal = self
+                .pane_drag
+                .as_ref()
+                .filter(|drag| !drag.active)
+                .and_then(|drag| self.session_manager.index_of(&drag.session_id));
             if let Some(source) = tab_bar_drop_target {
                 if self.tabs.promote_split_pane_to_tab(source) {
                     self.renaming_tab = None;
@@ -598,6 +609,8 @@ impl TerminalApp {
                     self.set_status("Swapped panes");
                     ctx.request_repaint();
                 }
+            } else if let Some(session_idx) = click_reveal {
+                self.reveal_files_at_session_cwd(session_idx);
             }
             self.pane_drag = None;
         }
@@ -1249,10 +1262,10 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         // 搜索输入框
-                        ui.label("Search:");
-                        let query = std::mem::take(&mut self.search_state.query);
-                        self.search_state.set_query(query);
-                        let search_response = ui.text_edit_singleline(&mut self.search_state.query);
+                        let search_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_state.query)
+                                .hint_text("Find in terminal"),
+                        );
 
                         // 自动 focus 搜索框
                         if self.search_state.search_focused {
@@ -1264,13 +1277,13 @@ impl TerminalApp {
                         // 切换后需要立刻按新选项重新搜索,否则用户看不到效果。
                         let case_btn = ui
                             .selectable_label(self.search_state.case_sensitive, "Aa")
-                            .on_hover_text("区分大小写 (Match Case)");
+                            .on_hover_text("Match case");
                         if case_btn.clicked() {
                             self.search_state.case_sensitive = !self.search_state.case_sensitive;
                         }
                         let regex_btn = ui
                             .selectable_label(self.search_state.use_regex, ".*")
-                            .on_hover_text("正则表达式 (Regex)");
+                            .on_hover_text("Regular expression");
                         if regex_btn.clicked() {
                             self.search_state.use_regex = !self.search_state.use_regex;
                         }
@@ -1385,10 +1398,10 @@ impl TerminalApp {
                     // 搜索输入框
                     ui.horizontal(|ui| {
                         ui.label(if ask_ai_mode { "✨" } else { "🔍" });
-                        let query = std::mem::take(&mut self.command_palette.search_query);
-                        self.command_palette.set_query(query);
-                        let search_response =
-                            ui.text_edit_singleline(&mut self.command_palette.search_query);
+                        let search_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_palette.search_query)
+                                .hint_text("Search commands... (? asks AI)"),
+                        );
                         if search_response.changed() {
                             let query = std::mem::take(&mut self.command_palette.search_query);
                             self.command_palette.set_query(query);
@@ -1396,11 +1409,6 @@ impl TerminalApp {
                         if self.command_palette.needs_focus {
                             search_response.request_focus();
                             self.command_palette.needs_focus = false;
-                        }
-                        if search_response.has_focus()
-                            && self.command_palette.search_query.is_empty()
-                        {
-                            ui.label("Search commands... (? asks AI)");
                         }
                     });
 
@@ -1576,8 +1584,6 @@ impl TerminalApp {
                                 if click_response.clicked() {
                                     clicked_palette_command = Some(cmd_info.command.clone());
                                 }
-
-                                ui.separator();
                             }
 
                             // 如果没有结果
@@ -3294,7 +3300,7 @@ impl TerminalApp {
         let ssh_retry = self
             .ssh_files_follow
             .retry_available_for_observation(&self.active_ssh_files_observation())
-            && message.contains("远程 Files");
+            && (message.contains("Click Retry") || message.contains("configure one and retry"));
         let mut retry_clicked = false;
 
         egui::Area::new(egui::Id::new("status_toast"))
@@ -3328,7 +3334,7 @@ impl TerminalApp {
 
         if retry_clicked {
             self.ssh_files_follow.request_retry();
-            self.status_message = "正在重试远程 Files…".to_string();
+            self.status_message = "Retrying remote Files…".to_string();
             self.status_expires_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
         }
@@ -3397,19 +3403,17 @@ impl TerminalApp {
             })
             .show(ctx, |ui| {
                 ui.set_max_width(640.0);
-                ui.heading("⚠ 确认粘贴");
+                ui.heading("⚠ Confirm paste");
                 ui.label(
                     egui::RichText::new(format!(
-                        "粘贴包含 {} 行 / {} 字节,执行前请确认内容:",
-                        line_count, byte_len
+                        "Paste contains {line_count} lines / {byte_len} bytes. Review it before sending:"
                     ))
                     .color(text_color),
                 );
                 if had_embedded_marker {
                     ui.label(
                         egui::RichText::new(
-                            "⚠ 剪贴板内嵌括号粘贴结束序列(ESC[201~),已剔除;\
-                             这通常意味着有人想让剩余内容被 shell 直接执行。",
+                            "⚠ The clipboard contained an embedded bracketed-paste terminator (ESC[201~); it was removed. That usually means someone wanted the remaining text executed by the shell.",
                         )
                         .color(text_color),
                     );
@@ -3417,8 +3421,7 @@ impl TerminalApp {
                 if had_visual_spoofing {
                     ui.label(
                         egui::RichText::new(
-                            "⚠ 剪贴板包含不可见、双向或非标准空白字符；预览已将其转义。\
-                             此类粘贴始终需要逐次确认。",
+                            "⚠ The clipboard contains invisible, bidirectional, or nonstandard whitespace; the preview shows it escaped. This kind of paste always requires confirmation.",
                         )
                         .color(text_color),
                     );
@@ -3439,7 +3442,7 @@ impl TerminalApp {
                                 );
                                 if truncated_preview {
                                     ui.label(
-                                        egui::RichText::new("…(预览已截断)").color(text_color),
+                                        egui::RichText::new("… (preview truncated)").color(text_color),
                                     );
                                 }
                             });
@@ -3448,19 +3451,19 @@ impl TerminalApp {
                 if !had_visual_spoofing {
                     ui.add_enabled(
                         decision_armed,
-                        egui::Checkbox::new(&mut dont_ask_again, "不再询问(可在配置里重新开启)"),
+                        egui::Checkbox::new(&mut dont_ask_again, "Don't ask again (re-enable in Settings)"),
                     );
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(decision_armed, egui::Button::new("取消"))
+                        .add_enabled(decision_armed, egui::Button::new("Cancel"))
                         .clicked()
                     {
                         decision = Some(false);
                     }
                     if ui
-                        .add_enabled(decision_armed, egui::Button::new("粘贴"))
+                        .add_enabled(decision_armed, egui::Button::new("Paste"))
                         .clicked()
                     {
                         decision = Some(true);

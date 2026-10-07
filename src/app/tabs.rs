@@ -545,7 +545,7 @@ impl TerminalApp {
                                 if row_hovered {
                                     let close_resp = ui
                                         .add_sized([row_h, row_h], egui::Button::new("✕").small())
-                                        .on_hover_text("关闭标签页(含其所有分屏)");
+                                        .on_hover_text("Close tab (including its splits)");
                                     if close_resp.clicked() {
                                         close_idx = Some(*i);
                                     }
@@ -563,7 +563,7 @@ impl TerminalApp {
                                 );
                                 let edit = egui::TextEdit::singleline(&mut buf)
                                     .desired_width(ui.available_width())
-                                    .hint_text("(空=清除自定义名)");
+                                    .hint_text("(empty = clear custom name)");
                                 let r = ui.add_sized([ui.available_width(), row_h], edit);
                                 r.request_focus();
                                 buf = crate::session_persistence::bound_tab_title_draft(buf);
@@ -797,15 +797,15 @@ impl TerminalApp {
 
     /// 侧边栏标签行的悬停提示。固定/标记状态在这里说明,列表里的符号才有解释。
     fn sidebar_tab_tooltip(flags: crate::tab_manager::TabFlags) -> String {
-        let mut lines = vec!["双击重命名 · 右键打开标签页菜单".to_string()];
+        let mut lines = vec!["Double-click to rename · right-click for the tab menu".to_string()];
         if flags.pinned {
-            lines.push("◆ 已固定(始终排在最前)".to_string());
+            lines.push("◆ Pinned (always first)".to_string());
         }
         if flags.marked {
-            lines.push("★ 已标记为重要".to_string());
+            lines.push("★ Marked important".to_string());
         }
         if flags.private_title {
-            lines.push("标题详情已隐藏".to_string());
+            lines.push("Title details hidden".to_string());
         }
         lines.join("\n")
     }
@@ -918,15 +918,15 @@ impl TerminalApp {
             }
             SidebarTabAction::CloseOthers(keep) => {
                 let targets = (0..self.tabs.len()).filter(|i| *i != keep).collect();
-                self.close_tabs(targets, "其他标签页");
+                self.close_tabs(targets, "other tabs");
             }
             SidebarTabAction::CloseToRight(anchor) => {
                 let targets = ((anchor + 1)..self.tabs.len()).collect();
-                self.close_tabs(targets, "右侧标签页");
+                self.close_tabs(targets, "tabs to the right");
             }
             SidebarTabAction::CloseMarked => {
                 let targets = self.tabs.marked_tabs();
-                self.close_tabs(targets, "已标记标签页");
+                self.close_tabs(targets, "marked tabs");
             }
             SidebarTabAction::ConnectRemote(index) => {
                 if self.config.remote_hosts.get(index).is_none() {
@@ -974,9 +974,9 @@ impl TerminalApp {
         let marked = self.tabs.toggle_marked(tab_idx);
         self.schedule_session_save();
         self.set_status(if marked {
-            "标签页已标记为重要"
+            "Tab marked important"
         } else {
-            "已取消标签页标记"
+            "Tab unmarked"
         });
     }
 
@@ -990,11 +990,7 @@ impl TerminalApp {
         self.renaming_tab = None;
         self.clear_tab_drag(TabDragOrigin::Sidebar);
         self.schedule_session_save();
-        self.set_status(if pinned {
-            "标签页已固定"
-        } else {
-            "已取消固定标签页"
-        });
+        self.set_status(if pinned { "Tab pinned" } else { "Tab unpinned" });
     }
 
     pub fn toggle_tab_private_title(&mut self, tab_idx: usize) {
@@ -1023,9 +1019,9 @@ impl TerminalApp {
         }
         if closed > 0 {
             self.schedule_session_save();
-            self.set_status(format!("已关闭 {closed} 个{what}"));
+            self.set_status(format!("Closed {closed} {what}"));
         } else {
-            self.set_status(format!("没有可关闭的{what}"));
+            self.set_status(format!("No {what} to close"));
         }
     }
 
@@ -1071,7 +1067,8 @@ impl TerminalApp {
         let tb_bg = crate::theme::Theme::rgb_to_color32(tb.bg);
         let tb_inactive_text = crate::theme::Theme::rgb_to_color32(tb.inactive_text);
         let tb_active_text = crate::theme::Theme::rgb_to_color32(tb.active_text);
-        let tab_hover_fill = egui::Color32::from_white_alpha(18);
+        let tb_accent = crate::theme::Theme::rgb_to_color32(tb.active_border);
+        let tab_hover_fill = tb_accent.gamma_multiply(0.18);
 
         let painter = ui.painter();
         let tab_alpha = (self.renderer.opacity * 255.0) as u8;
@@ -1119,11 +1116,17 @@ impl TerminalApp {
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {
                     if let Some(error) = self.sidebar.refresh() {
-                        self.set_status(format!("文件树刷新失败：{error}"));
+                        self.set_status(format!("Files refresh failed: {error}"));
                     }
                 }
             }
         }
+        ui.interact(
+            toggle_btn_rect,
+            egui::Id::new("sidebar_mode_toggle_btn"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Toggle sidebar");
 
         // ⬒ 标签栏位置切换（当前为侧边栏模式 → 点击移回顶部）
         let pos_btn_rect = egui::Rect::from_min_size(
@@ -1154,6 +1157,12 @@ impl TerminalApp {
                 self.toggle_tab_bar_position();
             }
         }
+        ui.interact(
+            pos_btn_rect,
+            egui::Id::new("sidebar_mode_tabpos_btn"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Move tab bar to the top");
 
         // 关闭窗口按钮（最右侧，与顶部 tab 模式保持一致）
         let close_win_size = 25.0;
@@ -1201,6 +1210,12 @@ impl TerminalApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+        ui.interact(
+            close_win_rect,
+            egui::Id::new("sidebar_mode_close_window"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Close window");
 
         ui.allocate_exact_size(
             egui::vec2(ui.available_width(), tab_height),
@@ -1228,7 +1243,7 @@ impl TerminalApp {
         let tb_close_bg = crate::theme::Theme::rgb_to_color32(tb.close_btn_bg);
         let tb_close_hover = crate::theme::Theme::rgb_to_color32(tb.close_btn_hover);
         // 在栏背景上叠加的「悬停/活跃」填充：以中性白做低透明 tint，跨深浅主题都协调
-        let tab_hover_fill = egui::Color32::from_white_alpha(18);
+        let tab_hover_fill = tb_accent.gamma_multiply(0.18);
         let tab_active_fill = tb_bg.lerp_to_gamma(tb_accent, 0.16);
 
         // 背景
@@ -1523,7 +1538,7 @@ impl TerminalApp {
                         && self.sidebar.view == crate::sidebar::SidebarView::Files
                     {
                         if let Some(error) = self.sidebar.refresh() {
-                            self.set_status(format!("文件树刷新失败：{error}"));
+                            self.set_status(format!("Files refresh failed: {error}"));
                         }
                     }
                 }
@@ -1534,6 +1549,18 @@ impl TerminalApp {
                     self.toggle_tab_bar_position();
                 }
             }
+            ui.interact(
+                sb_btn_rect,
+                egui::Id::new("top_sidebar_toggle_btn"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text("Toggle sidebar");
+            ui.interact(
+                pos_btn_rect,
+                egui::Id::new("top_tabpos_toggle_btn"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text("Move tab bar into the sidebar");
         }
 
         // === 交互辅助：用 tab_widths 计算 tab 位置的宏 ===
@@ -2116,6 +2143,19 @@ impl TerminalApp {
             }
         }
 
+        ui.interact(
+            plus_btn_rect,
+            egui::Id::new("top_new_tab_btn"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("New tab");
+        ui.interact(
+            close_win_rect,
+            egui::Id::new("top_close_window_btn"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Close window");
+
         // 向下移动光标
         ui.allocate_exact_size(
             egui::vec2(ui.available_width(), tab_height),
@@ -2161,7 +2201,7 @@ impl TerminalApp {
                                 egui::TextEdit::singleline(&mut buf)
                                     .desired_width(rect.width() - 8.0)
                                     .font(egui::FontId::monospace(12.0))
-                                    .hint_text("空=清除自定义名"),
+                                    .hint_text("empty = clear custom name"),
                             );
                             r.request_focus();
                             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));

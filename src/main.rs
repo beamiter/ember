@@ -649,14 +649,24 @@ fn apply_theme_visuals(ctx: &egui::Context, theme: &theme::Theme) {
         egui::Visuals::dark()
     };
 
+    let panel = theme::Theme::rgb_to_color32(ui.panel_bg);
+    let text = theme::Theme::rgb_to_color32(ui.text);
+    let border = theme::Theme::rgb_to_color32(ui.border);
     visuals.window_fill = theme::Theme::rgb_to_color32(ui.window_bg);
-    visuals.panel_fill = theme::Theme::rgb_to_color32(ui.panel_bg);
-    visuals.extreme_bg_color = theme::Theme::rgb_to_color32(ui.panel_bg);
-    visuals.override_text_color = Some(theme::Theme::rgb_to_color32(ui.text));
-    visuals.widgets.noninteractive.bg_stroke.color = theme::Theme::rgb_to_color32(ui.border);
-    visuals.widgets.inactive.bg_stroke.color = theme::Theme::rgb_to_color32(ui.border);
-    visuals.widgets.active.bg_stroke.color = theme::Theme::rgb_to_color32(ui.border);
-    visuals.widgets.hovered.bg_stroke.color = theme::Theme::rgb_to_color32(ui.border);
+    visuals.panel_fill = panel;
+    visuals.extreme_bg_color = panel;
+    visuals.override_text_color = Some(text);
+    visuals.widgets.noninteractive.bg_stroke.color = border;
+    visuals.widgets.inactive.bg_stroke.color = border;
+    visuals.widgets.active.bg_stroke.color = border;
+    visuals.widgets.hovered.bg_stroke.color = border;
+    let hover_fill = panel.lerp_to_gamma(text, 0.12);
+    let active_fill = panel.lerp_to_gamma(text, 0.20);
+    visuals.widgets.hovered.weak_bg_fill = hover_fill;
+    visuals.widgets.hovered.bg_fill = hover_fill;
+    visuals.widgets.active.weak_bg_fill = active_fill;
+    visuals.widgets.active.bg_fill = active_fill;
+    visuals.selection.bg_fill = panel.lerp_to_gamma(text, 0.28);
 
     ctx.set_visuals(visuals);
 }
@@ -2092,6 +2102,8 @@ enum FsMenuAction {
     Paste(std::path::PathBuf),
     /// 把条目完整路径复制到系统剪贴板（多选时换行连接；远程行是纯路径）。
     CopyPath(Vec<std::path::PathBuf>),
+    /// Open a local file with the trusted system opener.
+    Open(std::path::PathBuf),
     /// 重新扫描该目录（若已加载）。
     Refresh(std::path::PathBuf),
 }
@@ -2125,12 +2137,22 @@ enum FsPasteState {
 fn snapshot_age_label(age: std::time::Duration) -> String {
     let seconds = age.as_secs();
     match seconds {
-        0..=1 => "刚刚".to_string(),
-        2..=59 => format!("{seconds} 秒前"),
-        60..=3_599 => format!("{} 分钟前", seconds / 60),
-        3_600..=86_399 => format!("{} 小时前", seconds / 3_600),
-        _ => format!("{} 天前", seconds / 86_400),
+        0..=1 => "just now".to_string(),
+        2..=59 => format!("{seconds}s ago"),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
     }
+}
+
+fn files_icon_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: &str,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(enabled, egui::Button::new(icon))
+        .on_hover_text(tooltip)
 }
 
 /// 文件树名称输入对话框（New File / New Folder / Rename 共用）。
@@ -2433,7 +2455,9 @@ impl TerminalApp {
         // 配置读不出来时优先报告它:此后所有保存都被拒绝(见 Config::load_error),
         // 不说的话用户只会看到"设置改了但重启就没了"。
         let startup_notice = match &cfg.load_error {
-            Some(error) => Some(format!("配置未生效,也不会被覆盖：{error}")),
+            Some(error) => Some(format!(
+                "Configuration was not applied and will not be overwritten: {error}"
+            )),
             None => session_restore_notice,
         };
         let initial_status_expires_at = startup_notice
@@ -2703,7 +2727,7 @@ impl TerminalApp {
             Ok(created) => created,
             Err(error) => {
                 self.set_status_for(
-                    format!("无法从文件树目录新建终端：{error}"),
+                    format!("Could not open a terminal from the Files directory: {error}"),
                     Duration::from_secs(5),
                 );
                 return;
@@ -2716,7 +2740,7 @@ impl TerminalApp {
         self.schedule_session_save();
         let display = jterm_core::review_input::safe_inline_display(&cwd.to_string_lossy(), 256);
         self.set_status_for(
-            format!("已在 {display} 新建本地终端"),
+            format!("Opened a local terminal in {display}"),
             Duration::from_secs(5),
         );
     }
@@ -2819,7 +2843,7 @@ impl TerminalApp {
                         Ok(()) => {
                             self.ssh_files_follow.clear_failure();
                             self.set_status_for(
-                                format!("Files 已验证并切换 SSH 连接：{label}"),
+                                format!("Files verified and switched the SSH connection: {label}"),
                                 Duration::from_secs(5),
                             );
                         }
@@ -2828,7 +2852,7 @@ impl TerminalApp {
                             let error = jterm_core::review_input::safe_inline_display(&error, 320);
                             self.set_status_for(
                                 format!(
-                                    "无法更新远程 Files 连接：{error}。旧文件树和旧连接保持不变。非交互 BatchMode 连接需要可用的 SSH key、agent，或可复用的 ControlMaster/ControlPath socket；配置后可点击重试。"
+                                    "Could not update the remote Files connection: {error}. The previous tree and connection are unchanged. Non-interactive BatchMode needs a usable SSH key, agent, or reusable ControlMaster/ControlPath socket; configure one and retry."
                                 ),
                                 Duration::from_secs(15),
                             );
@@ -2843,7 +2867,7 @@ impl TerminalApp {
                         else {
                             self.ssh_files_follow.record_failure(pending.key);
                             self.set_status_for(
-                                "无法自动打开远程 Files：匹配的 saved profile 在连接期间被修改、删除或变得不唯一。可点击重试。",
+                                "Could not open remote Files automatically: the matching saved profile was modified, deleted, or became non-unique during the connection. Click Retry.",
                                 Duration::from_secs(12),
                             );
                             continue;
@@ -2856,12 +2880,12 @@ impl TerminalApp {
                                 self.ssh_files_follow.clear_failure();
                                 if let Some(error) = scan_error {
                                     self.set_status_for(
-                                        format!("已连接 {label}，但文件树读取失败：{error}"),
+                                        format!("Connected to {label}, but Files listing failed: {error}"),
                                         Duration::from_secs(7),
                                     );
                                 } else {
                                     self.set_status_for(
-                                        format!("Files 已跟随 SSH：{label}"),
+                                        format!("Files followed SSH: {label}"),
                                         Duration::from_secs(5),
                                     );
                                 }
@@ -2869,7 +2893,7 @@ impl TerminalApp {
                             Err(error) => {
                                 self.ssh_files_follow.record_failure(pending.key);
                                 self.set_status_for(
-                                    format!("无法自动打开远程 Files：{error}。可点击重试。"),
+                                    format!("Could not open remote Files automatically: {error}. Click Retry."),
                                     Duration::from_secs(12),
                                 );
                             }
@@ -2880,7 +2904,7 @@ impl TerminalApp {
                         let error = jterm_core::review_input::safe_inline_display(&error, 320);
                         self.set_status_for(
                             format!(
-                                "无法自动打开远程 Files：{error}。非交互 BatchMode 连接需要可用的 SSH key、agent，或可复用的 ControlMaster/ControlPath socket；配置后可点击重试。"
+                                "Could not open remote Files automatically: {error}. Non-interactive BatchMode needs a usable SSH key, agent, or reusable ControlMaster/ControlPath socket; configure one and retry."
                             ),
                             Duration::from_secs(15),
                         );
@@ -2908,7 +2932,7 @@ impl TerminalApp {
                 {
                     self.ssh_files_follow.mark_handled(key);
                     self.set_status_for(
-                        format!("无法自动打开远程 Files：{reason}"),
+                        format!("Could not open remote Files automatically: {reason}"),
                         Duration::from_secs(7),
                     );
                 }
@@ -2975,7 +2999,7 @@ impl TerminalApp {
                     self.ssh_files_follow.mark_handled(key.clone());
                     self.ssh_files_follow.record_failure(key);
                     self.set_status_for(
-                        format!("无法自动打开远程 Files：临时 SSH profile 不安全：{problem}"),
+                        format!("Could not open remote Files automatically: temporary SSH profile is unsafe: {problem}"),
                         Duration::from_secs(7),
                     );
                     return;
@@ -2991,7 +3015,7 @@ impl TerminalApp {
                     self.ssh_files_follow.mark_handled(key.clone());
                     self.ssh_files_follow.record_failure(key);
                     self.set_status_for(
-                        format!("无法自动打开远程 Files：SSH execution overlay 不安全：{error}"),
+                        format!("Could not open remote Files automatically: SSH execution overlay is unsafe: {error}"),
                         Duration::from_secs(12),
                     );
                     return;
@@ -3021,7 +3045,7 @@ impl TerminalApp {
                 if let Err(error) = self.ssh_files_follow.begin_probe(pending, ctx.clone()) {
                     self.ssh_files_follow.record_failure(key);
                     self.set_status_for(
-                        format!("无法自动打开远程 Files：{error}。可点击重试。"),
+                        format!("Could not open remote Files automatically: {error}. Click Retry."),
                         Duration::from_secs(12),
                     );
                 }
@@ -3052,7 +3076,10 @@ impl TerminalApp {
             self.sidebar.visible = true;
             if self.sidebar.view == sidebar::SidebarView::Files {
                 if let Some(error) = self.sidebar.refresh() {
-                    self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                    self.set_status_for(
+                        format!("Files refresh failed: {error}"),
+                        Duration::from_secs(5),
+                    );
                 }
             }
         }
@@ -3071,7 +3098,10 @@ impl TerminalApp {
             self.set_status_for(message, Duration::from_secs(6));
         }
         if let Some(error) = self.sidebar.poll_scan_results().into_iter().last() {
-            self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
+            self.set_status_for(
+                format!("Files listing failed: {error}"),
+                Duration::from_secs(5),
+            );
         }
         // 文件操作 worker 的结果（新建/重命名/删除/粘贴、远程起始目录解析）。
         for message in self.sidebar.poll_op_results() {
@@ -3080,7 +3110,7 @@ impl TerminalApp {
         if self.sidebar.visible && self.sidebar.view == sidebar::SidebarView::Files {
             for error in self.sidebar.auto_revalidate_visible() {
                 self.set_status_for(
-                    format!("Remote Files 后台重验失败：{error}"),
+                    format!("Remote Files background revalidation failed: {error}"),
                     Duration::from_secs(5),
                 );
             }
@@ -3124,6 +3154,7 @@ impl TerminalApp {
         // 仅在浏览本机时跟随：本地 shell 的 cwd 对远程文件系统没有意义。
         if self.sidebar.view == sidebar::SidebarView::Files
             && matches!(self.sidebar.location(), remote_fs::FsLocation::Local)
+            && self.sidebar.follow_local_cwd()
             && self.ssh_files_follow.pending.is_none()
             && self.ssh_files_follow.handled_observation.is_none()
             && self.active_session_allows_local_files_cwd_follow()
@@ -3137,9 +3168,9 @@ impl TerminalApp {
                 .map(std::path::PathBuf::from)
                 .filter(|path| self.sidebar.current_dir != *path);
             if let Some(path) = changed_directory {
-                if let Some(error) = self.sidebar.set_current_dir(path) {
+                if let Some(error) = self.sidebar.follow_to_dir(path) {
                     self.set_status_for(
-                        format!("文件树目录切换失败：{error}"),
+                        format!("Files directory switch failed: {error}"),
                         Duration::from_secs(5),
                     );
                 }
@@ -3150,6 +3181,7 @@ impl TerminalApp {
         let mut toggle_path: Option<std::path::PathBuf> = None;
         let mut select_action: Option<(std::path::PathBuf, bool, FsSelectMode)> = None;
         let mut cd_path: Option<std::path::PathBuf> = None;
+        let mut open_file_path: Option<std::path::PathBuf> = None;
         let mut show_more_path: Option<std::path::PathBuf> = None;
         let mut retry_path: Option<std::path::PathBuf> = None;
         let mut navigate_back = false;
@@ -3184,6 +3216,7 @@ impl TerminalApp {
         let mut path_entry_has_focus = false;
         let mut tree_has_focus = false;
         let mut show_hidden_changed: Option<bool> = None;
+        let mut follow_toggled = false;
         let mut files_popup_open = false;
         // 本帧渲染出的文件树行矩形（拖放落点命中测试用，帧级、不持久）。
         let mut tree_row_rects: Vec<(egui::Rect, std::path::PathBuf, bool)> = Vec::new();
@@ -3216,7 +3249,8 @@ impl TerminalApp {
             .default_size(self.sidebar.width)
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(root_ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.horizontal(|ui| {
                     // Sessions 在两种 tab 栏布局下都可选：Top 模式下它是顶部
                     // tab 栏之外的一份纵向标签列表，而非替代品。
                     if ui
@@ -3267,61 +3301,118 @@ impl TerminalApp {
                             view_changed = true;
                         }
                     }
-                    if self.sidebar.view == sidebar::SidebarView::Files
-                        && ui.button("⟳").on_hover_text("Refresh").clicked()
-                    {
-                        do_refresh = true;
-                    }
-                    if self.sidebar.view == sidebar::SidebarView::Files {
-                        if self.sidebar.location().is_remote() {
-                            if ui
-                                .add_enabled(
-                                    self.sidebar.can_navigate_back(),
-                                    egui::Button::new("←"),
-                                )
-                                .on_hover_text("Remote Files 后退（Alt+Left）")
-                                .clicked()
-                            {
-                                navigate_back = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    self.sidebar.can_navigate_forward(),
-                                    egui::Button::new("→"),
-                                )
-                                .on_hover_text("Remote Files 前进（Alt+Right）")
-                                .clicked()
-                            {
-                                navigate_forward = true;
-                            }
-                            let parent = self.sidebar.parent_dir();
-                            let up = ui
-                                .add_enabled(parent.is_some(), egui::Button::new("↑"))
-                                .on_hover_text("Remote Files 上级目录（Alt+Up）");
-                            if up.clicked() {
-                                cd_path = parent;
-                            }
-                            let home = self.sidebar.home_dir().map(std::path::Path::to_path_buf);
-                            let at_home = home
-                                .as_ref()
-                                .is_none_or(|home| *home == self.sidebar.current_dir);
-                            let home_button = ui
-                                .add_enabled(!at_home, egui::Button::new("⌂"))
-                                .on_hover_text("Remote Files Home（Alt+Home）");
-                            if home_button.clicked() {
-                                cd_path = home;
-                            }
-                            if ui
-                                .button("路径")
-                                .on_hover_text("输入绝对路径（Ctrl+L）")
-                                .clicked()
-                            {
-                                open_path_entry = true;
+                });
+                if self.sidebar.view == sidebar::SidebarView::Files {
+                    ui.horizontal(|ui| {
+                        let (pending, queued) = self.sidebar.scan_activity();
+                        let refresh_tip = match self.sidebar.last_scan_timing() {
+                            Some(timing) => format!(
+                                "Refresh (F5)\nLast read: {} ms (queued {} ms)\nPending {} · queued {}\n{}",
+                                timing.run_time.as_millis(),
+                                timing.queue_delay.as_millis(),
+                                pending,
+                                queued,
+                                timing.path.display()
+                            ),
+                            None if pending > 0 => format!(
+                                "Refresh (F5)\nPending {pending} · queued {queued}"
+                            ),
+                            None => "Refresh (F5)".to_string(),
+                        };
+                        if files_icon_button(ui, true, "⟳", &refresh_tip).clicked() {
+                            do_refresh = true;
+                        }
+                        if files_icon_button(
+                            ui,
+                            self.sidebar.can_navigate_back(),
+                            "←",
+                            "Back (Alt+Left)",
+                        )
+                        .clicked()
+                        {
+                            navigate_back = true;
+                        }
+                        if files_icon_button(
+                            ui,
+                            self.sidebar.can_navigate_forward(),
+                            "→",
+                            "Forward (Alt+Right)",
+                        )
+                        .clicked()
+                        {
+                            navigate_forward = true;
+                        }
+                        let parent = self.sidebar.parent_dir();
+                        if files_icon_button(ui, parent.is_some(), "↑", "Up (Alt+Up)").clicked() {
+                            cd_path = parent;
+                        }
+                        let home = if self.sidebar.location().is_remote() {
+                            self.sidebar.home_dir().map(std::path::Path::to_path_buf)
+                        } else {
+                            std::env::var_os("HOME")
+                                .map(std::path::PathBuf::from)
+                                .filter(|path| path.is_absolute())
+                                .or_else(|| {
+                                    self.sidebar.home_dir().map(std::path::Path::to_path_buf)
+                                })
+                        };
+                        let at_home = home
+                            .as_ref()
+                            .is_none_or(|home| *home == self.sidebar.current_dir);
+                        if files_icon_button(ui, !at_home, "⌂", "Home (Alt+Home)").clicked() {
+                            cd_path = home;
+                        }
+                        if files_icon_button(ui, true, "⌘", "Go to path (Ctrl+L)").clicked() {
+                            open_path_entry = true;
+                        }
+                        let follow_icon = if self.sidebar.follow_local_cwd()
+                            && !self.sidebar.location().is_remote()
+                        {
+                            "◉"
+                        } else {
+                            "○"
+                        };
+                        if files_icon_button(
+                            ui,
+                            !self.sidebar.location().is_remote(),
+                            follow_icon,
+                            "Follow terminal working directory",
+                        )
+                        .clicked()
+                        {
+                            follow_toggled = true;
+                        }
+                        let filter_icon =
+                            if self.sidebar.filter_open && !self.sidebar.filter.is_empty() {
+                                egui::RichText::new("🔍").strong()
+                            } else {
+                                egui::RichText::new("🔍")
+                            };
+                        if ui
+                            .button(filter_icon)
+                            .on_hover_text("Filter by name substring (Esc closes)")
+                            .clicked()
+                        {
+                            filter_interacted = true;
+                            self.sidebar.filter_open = !self.sidebar.filter_open;
+                            if !self.sidebar.filter_open {
+                                self.sidebar.filter.clear();
+                            } else {
+                                filter_request_focus = true;
                             }
                         }
+                        if ui
+                            .selectable_label(self.sidebar.show_hidden(), "·")
+                            .on_hover_text("Show hidden files")
+                            .clicked()
+                        {
+                            show_hidden_changed = Some(!self.sidebar.show_hidden());
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         if ssh_retry_available
                             && ui
-                                .button("Retry SSH Files")
+                                .button("Retry SSH")
                                 .on_hover_text(
                                     "Retry the failed Files probe for the still-active SSH process",
                                 )
@@ -3329,13 +3420,9 @@ impl TerminalApp {
                         {
                             retry_ssh_files = true;
                         }
-                        // 浏览位置选择器：本机 + config.remote_hosts 里的
-                        // SSH 主机 / Docker 容器。每帧从配置重建，设置面板
-                        // 的增删改立即生效。
                         let hosts = &self.config.remote_hosts;
                         let current = self.sidebar.location().clone();
-                        let location_picker =
-                            egui::ComboBox::from_id_salt("sidebar-fs-location")
+                        let location_picker = egui::ComboBox::from_id_salt("sidebar-fs-location")
                             .selected_text(current.label(hosts))
                             .show_ui(ui, |ui| {
                                 if ui
@@ -3363,11 +3450,6 @@ impl TerminalApp {
                                     }
                                 }
                                 if matches!(current, remote_fs::FsLocation::Transient(_)) {
-                                    // A transient process-observed profile is a
-                                    // real current choice, but never becomes a
-                                    // config row implicitly. Keep it visible in
-                                    // the open dropdown so selection state does
-                                    // not appear to point at no item.
                                     ui.selectable_label(true, current.label(hosts)).on_hover_text(
                                         format!(
                                             "{}\nTemporary profile observed from the active SSH process",
@@ -3386,11 +3468,8 @@ impl TerminalApp {
                         let (terminal_label, terminal_hint, terminal_enabled) =
                             match &terminal_target {
                                 Some(sidebar::FilesTerminalTarget::Local(path)) => (
-                                    "Open terminal here",
-                                    format!(
-                                        "Open a new local terminal tab in {}",
-                                        path.display()
-                                    ),
+                                    "Terminal here",
+                                    format!("Open a new local terminal tab in {}", path.display()),
                                     true,
                                 ),
                                 Some(sidebar::FilesTerminalTarget::Remote {
@@ -3410,21 +3489,21 @@ impl TerminalApp {
                                         *index,
                                     ) {
                                         Ok(_) if !overlay.is_empty() => (
-                                            "Connect terminal (SSH login)",
+                                            "SSH login",
                                             format!(
                                                 "Open {display} as a plain interactive SSH login using the live Files connection, not the current Files path"
                                             ),
                                             true,
                                         ),
                                         Ok(_) => (
-                                            "Connect terminal (profile default)",
+                                            "Connect",
                                             format!(
                                                 "Open {display} in a new terminal tab using the profile default directory, not the current Files path"
                                             ),
                                             true,
                                         ),
                                         Err(problem) => (
-                                            "Connect terminal (profile default)",
+                                            "Connect",
                                             format!("{display} is unavailable: {problem}"),
                                             false,
                                         ),
@@ -3434,33 +3513,30 @@ impl TerminalApp {
                                     host,
                                     overlay: _,
                                 }) => {
-                                    let display =
-                                        crate::config::remote_host_runtime_label(host);
+                                    let display = crate::config::remote_host_runtime_label(host);
                                     match crate::config::validate_remote_host(host) {
                                         Ok(()) => (
-                                            "Connect terminal (SSH login)",
+                                            "SSH login",
                                             format!(
                                                 "Open {display} in a new terminal tab using the observed SSH connection options and its default login directory, not the current Files path"
                                             ),
                                             true,
                                         ),
                                         Err(problem) => (
-                                            "Connect terminal (SSH login)",
+                                            "SSH login",
                                             format!("{display} is unavailable: {problem}"),
                                             false,
                                         ),
                                     }
                                 }
                                 None => (
-                                    "Open terminal here",
+                                    "Terminal here",
                                     "Wait for the local Files root to become available".to_string(),
                                     false,
                                 ),
                             };
-                        let terminal_response = ui.add_enabled(
-                            terminal_enabled,
-                            egui::Button::new(terminal_label),
-                        );
+                        let terminal_response =
+                            ui.add_enabled(terminal_enabled, egui::Button::new(terminal_label));
                         let terminal_clicked = terminal_response.clicked();
                         if terminal_enabled {
                             terminal_response.on_hover_text(terminal_hint);
@@ -3470,35 +3546,8 @@ impl TerminalApp {
                         if terminal_clicked {
                             files_terminal_target = terminal_target;
                         }
-                        // 树内过滤开关（客户端过滤已加载的树，不触发新扫描）。
-                        let filter_icon =
-                            if self.sidebar.filter_open && !self.sidebar.filter.is_empty() {
-                                egui::RichText::new("🔍").strong()
-                            } else {
-                                egui::RichText::new("🔍")
-                            };
-                        if ui
-                            .button(filter_icon)
-                            .on_hover_text("树内过滤（名称子串；Esc 或再次点击关闭）")
-                            .clicked()
-                        {
-                            filter_interacted = true;
-                            self.sidebar.filter_open = !self.sidebar.filter_open;
-                            if !self.sidebar.filter_open {
-                                self.sidebar.filter.clear();
-                            } else {
-                                filter_request_focus = true;
-                            }
-                        }
-                        if ui
-                            .selectable_label(self.sidebar.show_hidden(), "Hidden")
-                            .on_hover_text("显示/隐藏以点开头的文件；切换会安全刷新当前树")
-                            .clicked()
-                        {
-                            show_hidden_changed = Some(!self.sidebar.show_hidden());
-                        }
-                    }
-                });
+                    });
+                }
                 ui.separator();
 
                 match self.sidebar.view {
@@ -3506,106 +3555,74 @@ impl TerminalApp {
                     sidebar::SidebarView::Commands => self.render_sidebar_commands(ui),
                     sidebar::SidebarView::Tasks => self.render_sidebar_tasks(ui),
                     sidebar::SidebarView::Files => {
-                        if self.sidebar.location().is_remote() {
-                            if self.sidebar.path_entry_open {
-                                ui.horizontal(|ui| {
-                                    ui.label("路径:");
-                                    let response = ui.add(
-                                        egui::TextEdit::singleline(
-                                            &mut self.sidebar.path_entry,
-                                        )
-                                        .id_salt("remote-files-path-entry")
+                        if self.sidebar.path_entry_open {
+                            ui.horizontal(|ui| {
+                                ui.label("Path:");
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut self.sidebar.path_entry)
+                                        .id_salt("files-path-entry")
                                         .hint_text("/absolute/path")
                                         .desired_width(f32::INFINITY),
-                                    );
-                                    path_entry_has_focus = response.has_focus();
-                                    if response.has_focus()
-                                        && ui.input(|input| {
-                                            input.key_pressed(egui::Key::Enter)
-                                        })
-                                    {
-                                        submit_path_entry = true;
+                                );
+                                path_entry_has_focus = response.has_focus();
+                                if response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                {
+                                    submit_path_entry = true;
+                                }
+                                if response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Escape))
+                                {
+                                    cancel_path_entry = true;
+                                }
+                            });
+                        } else {
+                            let breadcrumbs = self.sidebar.breadcrumbs();
+                            ui.horizontal_wrapped(|ui| {
+                                for (index, (label, path)) in
+                                    breadcrumbs.into_iter().enumerate()
+                                {
+                                    if index > 0 {
+                                        ui.label(egui::RichText::new("›").weak());
                                     }
-                                    if response.has_focus()
-                                        && ui.input(|input| {
-                                            input.key_pressed(egui::Key::Escape)
-                                        })
+                                    let at_current = path == self.sidebar.current_dir;
+                                    if ui
+                                        .add_enabled(
+                                            !at_current,
+                                            egui::Button::new(label).frame(false),
+                                        )
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
                                     {
-                                        cancel_path_entry = true;
+                                        cd_path = Some(path);
                                     }
-                                });
-                            } else {
-                                let breadcrumbs = self.sidebar.breadcrumbs();
-                                ui.horizontal_wrapped(|ui| {
-                                    for (index, (label, path)) in
-                                        breadcrumbs.into_iter().enumerate()
-                                    {
-                                        if index > 0 {
-                                            ui.label(egui::RichText::new("›").weak());
-                                        }
-                                        let at_current = path == self.sidebar.current_dir;
-                                        if ui
-                                            .add_enabled(
-                                                !at_current,
-                                                egui::Button::new(label).frame(false),
-                                            )
-                                            .on_hover_text(path.display().to_string())
-                                            .clicked()
-                                        {
-                                            cd_path = Some(path);
-                                        }
-                                    }
-                                });
-                            }
-                            if let Some(target) = self.sidebar.navigation_pending_target() {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "正在验证 {}（当前树保持可用）",
-                                            target.display()
-                                        ))
-                                        .weak()
-                                        .small(),
-                                    );
-                                });
-                            }
+                                }
+                            });
                         }
-                        // 远程位置的起始目录解析/失败提示。
+                        if let Some(target) = self.sidebar.navigation_pending_target() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Verifying {} (current tree stays usable)",
+                                        target.display()
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            });
+                        }
                         if self.sidebar.is_starting() {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("正在验证新位置…（当前文件树保持可用）");
+                                ui.label("Verifying new location… (current tree stays usable)");
                             });
                         } else if let Some(error) = self.sidebar.location_error() {
                             ui.colored_label(
                                 ui.visuals().error_fg_color,
-                                format!("无法进入该位置：{error}"),
+                                format!("Could not open this location: {error}"),
                             );
                         }
-                        let (pending_scans, queued_scans) = self.sidebar.scan_activity();
-                        if pending_scans > 1 || queued_scans > 0 {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "目录请求：{pending_scans} 个（排队 {queued_scans} 个）"
-                                ))
-                                .weak()
-                                .small(),
-                            );
-                        }
-                        if let Some(timing) = self.sidebar.last_scan_timing() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "最近读取：{} ms（排队 {} ms）",
-                                    timing.run_time.as_millis(),
-                                    timing.queue_delay.as_millis()
-                                ))
-                                .weak()
-                                .small(),
-                            )
-                            .on_hover_text(timing.path.display().to_string());
-                        }
-                        // 传输忙碌行：进度原地更新，✕ 取消（仅传输可取消）。
                         if let Some(status) = self.sidebar.transfer_status() {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -3617,22 +3634,23 @@ impl TerminalApp {
                                     ),
                                     None => remote_fs::format_bytes(status.bytes),
                                 };
-                                ui.label(format!(
-                                    "正在{} {}… {}",
-                                    status.direction, status.name, amount
-                                ));
-                                if ui.small_button("✕").on_hover_text("取消传输").clicked() {
+                                let verb = match status.direction {
+                                    "download" => "Downloading",
+                                    "upload" => "Uploading",
+                                    _ => "Transferring",
+                                };
+                                ui.label(format!("{verb} {}… {amount}", status.name));
+                                if ui.small_button("✕").on_hover_text("Cancel transfer").clicked()
+                                {
                                     cancel_transfer = true;
                                 }
                             });
                         }
-                        // 树内过滤输入行：客户端过滤已加载的树，不触发新扫描。
                         if self.sidebar.filter_open {
                             ui.horizontal(|ui| {
-                                ui.label("过滤:");
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.sidebar.filter)
-                                        .hint_text("名称子串，Esc 关闭")
+                                        .hint_text("Filter names, Esc closes")
                                         .desired_width(f32::INFINITY),
                                 );
                                 if resp.changed() {
@@ -3656,48 +3674,10 @@ impl TerminalApp {
                         } else {
                             String::new()
                         };
-                        if !self.sidebar.current_dir.as_os_str().is_empty() {
-                            if let Some(dir) = self
-                                .sidebar
-                                .current_dir
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                            {
-                                // 根目录行也挂上下文菜单：在根里新建/粘贴/刷新。
-                                // 行矩形计入拖放命中表（落点 = 当前根目录）。
-                                let root_dir = self.sidebar.current_dir.clone();
-                                let snapshot_hint = self
-                                    .sidebar
-                                    .root
-                                    .as_ref()
-                                    .and_then(sidebar::FileTreeNode::snapshot_age)
-                                    .map(snapshot_age_label)
-                                    .map(|age| format!("\n上次成功快照：{age}"))
-                                    .unwrap_or_default();
-                                let label_resp = ui
-                                    .label(egui::RichText::new(dir).weak().small())
-                                    .on_hover_text(format!(
-                                        "{} {snapshot_hint}",
-                                        root_dir.display()
-                                    ));
-                                tree_has_focus |= label_resp.has_focus();
-                                tree_row_rects.push((label_resp.rect, root_dir.clone(), true));
-                                label_resp.context_menu(|ui| {
-                                    Self::fs_context_menu(
-                                        ui,
-                                        None,
-                                        &[],
-                                        &root_dir,
-                                        &mut fs_menu_action,
-                                        paste_state,
-                                    );
-                                });
-                                files_popup_open |= label_resp.context_menu_opened();
-                            }
-                        }
+                        let files_are_local = !self.sidebar.location().is_remote();
+                        let indent_guide = theme::Theme::rgb_to_color32(self.current_theme.ui.border);
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if let Some(root) = &self.sidebar.root {
-                                // 过滤视图：命中项 + 祖先（强制展开），纯客户端、不动原树。
                                 let filtered_root;
                                 let root = if filter_query.is_empty() {
                                     Some(root)
@@ -3706,24 +3686,57 @@ impl TerminalApp {
                                     filtered_root.as_ref()
                                 };
                                 let Some(root) = root else {
-                                    ui.label("无匹配项");
+                                    ui.label("No matches");
                                     return;
                                 };
                                 let snapshot_age = root.snapshot_age().map(snapshot_age_label);
+                                let root_dir = root.path.clone();
+                                let snapshot_hint = snapshot_age
+                                    .as_ref()
+                                    .map(|age| format!("\nLast good snapshot: {age}"))
+                                    .unwrap_or_default();
+                                let root_selected = self.sidebar.selection.contains_key(&root_dir);
+                                let root_resp = ui
+                                    .selectable_label(
+                                        root_selected,
+                                        format!("📁 {}", root.name),
+                                    )
+                                    .on_hover_text(format!("{}{snapshot_hint}", root_dir.display()));
+                                tree_has_focus |= root_resp.has_focus();
+                                tree_row_rects.push((root_resp.rect, root_dir.clone(), true));
+                                if root_resp.clicked() {
+                                    select_action = Some((
+                                        root_dir.clone(),
+                                        true,
+                                        FsSelectMode::Single,
+                                    ));
+                                }
+                                root_resp.context_menu(|ui| {
+                                    Self::fs_context_menu(
+                                        ui,
+                                        None,
+                                        &[],
+                                        &root_dir,
+                                        &mut fs_menu_action,
+                                        paste_state,
+                                        files_are_local,
+                                    );
+                                });
+                                files_popup_open |= root_resp.context_menu_opened();
                                 if root.is_refreshing() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
                                         ui.label(match &snapshot_age {
                                             Some(age) => {
-                                                format!("正在刷新…（显示 {age} 快照）")
+                                                format!("Refreshing… showing {age} snapshot")
                                             }
-                                            None => "正在刷新…（显示上次结果）".to_string(),
+                                            None => "Refreshing… showing last results".to_string(),
                                         });
                                     });
                                 } else if root.is_loading() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
-                                        ui.label("正在读取目录…");
+                                        ui.label("Reading directory…");
                                     });
                                 } else if let Some(error) = root.load_error() {
                                     let retry_cooldown = self.sidebar.retry_cooldown(&root.path);
@@ -3733,28 +3746,28 @@ impl TerminalApp {
                                             if root.has_stale_error() {
                                                 match &snapshot_age {
                                                     Some(age) => format!(
-                                                        "刷新失败，显示 {age} 快照：{error}"
+                                                        "Refresh failed, showing {age} snapshot: {error}"
                                                     ),
                                                     None => format!(
-                                                        "刷新失败，显示上次结果：{error}"
+                                                        "Refresh failed, showing last results: {error}"
                                                     ),
                                                 }
                                             } else {
-                                                format!("无法读取目录：{error}")
+                                                format!("Could not read directory: {error}")
                                             },
                                         );
                                         let retryable = root.load_error_retryable();
                                         let retry_label = retry_cooldown.map_or_else(
                                             || {
                                                 if retryable {
-                                                    "重试".to_string()
+                                                    "Retry".to_string()
                                                 } else {
-                                                    "重新验证".to_string()
+                                                    "Revalidate".to_string()
                                                 }
                                             },
                                             |remaining| {
                                                 format!(
-                                                    "重试（后台冷却 {}s）",
+                                                    "Retry (cooldown {}s)",
                                                     remaining.as_secs().max(1)
                                                 )
                                             },
@@ -3762,15 +3775,24 @@ impl TerminalApp {
                                         if ui
                                             .small_button(retry_label)
                                             .on_hover_text(if retryable {
-                                                "显式重试可旁路一次后台冷却；已有内容会保留"
+                                                "Explicit retry bypasses one cooldown; existing rows stay visible"
                                             } else {
-                                                "路径、权限或协议故障：修复后重新验证"
+                                                "Path, permission, or protocol error: revalidate after fixing it"
                                             })
                                             .clicked()
                                         {
                                             retry_path = Some(root.path.clone());
                                         }
                                     });
+                                } else if root.visible_children().is_empty()
+                                    && root.remaining_children() == 0
+                                    && !root.entries_truncated()
+                                {
+                                    ui.label(
+                                        egui::RichText::new("This folder is empty")
+                                            .weak()
+                                            .italics(),
+                                    );
                                 }
                                 for child in root.visible_children() {
                                     Self::draw_tree_node(
@@ -3780,10 +3802,14 @@ impl TerminalApp {
                                         &mut toggle_path,
                                         &mut select_action,
                                         &mut cd_path,
+                                        &mut open_file_path,
                                         &mut retry_path,
                                         &mut show_more_path,
                                         &mut fs_menu_action,
                                         paste_state,
+                                        files_are_local,
+                                        indent_guide,
+                                        1,
                                         &mut tree_row_rects,
                                         &mut selection_apply,
                                         &mut files_popup_open,
@@ -3793,7 +3819,7 @@ impl TerminalApp {
                                 let remaining = root.remaining_children();
                                 if remaining > 0
                                     && ui
-                                        .button(format!("显示更多（剩余 {remaining} 项）"))
+                                        .button(format!("Show more ({remaining} remaining)"))
                                         .clicked()
                                 {
                                     show_more_path = Some(root.path.clone());
@@ -3802,7 +3828,7 @@ impl TerminalApp {
                                     ui.colored_label(
                                         ui.visuals().warn_fg_color,
                                         format!(
-                                            "目录过大：仅显示前 {} 项",
+                                            "Directory is too large: showing the first {} entries",
                                             sidebar::MAX_DIRECTORY_ENTRIES
                                         ),
                                     );
@@ -3844,10 +3870,7 @@ impl TerminalApp {
         ) {
             do_refresh = true;
         }
-        if self.sidebar.view == sidebar::SidebarView::Files
-            && files_keyboard_enabled
-            && self.sidebar.location().is_remote()
-        {
+        if self.sidebar.view == sidebar::SidebarView::Files && files_keyboard_enabled {
             let (alt_up, alt_home, alt_left, alt_right, ctrl_l) =
                 root_ui.ctx().input_mut(|input| {
                     (
@@ -3862,7 +3885,14 @@ impl TerminalApp {
                 cd_path = self.sidebar.parent_dir();
             }
             if alt_home && cd_path.is_none() {
-                cd_path = self.sidebar.home_dir().map(std::path::Path::to_path_buf);
+                cd_path = if self.sidebar.location().is_remote() {
+                    self.sidebar.home_dir().map(std::path::Path::to_path_buf)
+                } else {
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .filter(|path| path.is_absolute())
+                        .or_else(|| self.sidebar.home_dir().map(std::path::Path::to_path_buf))
+                };
             }
             if alt_left {
                 navigate_back = true;
@@ -3875,22 +3905,28 @@ impl TerminalApp {
             }
         }
         if files_keyboard_enabled {
-            let (up, down, left, right, enter) = root_ui.ctx().input_mut(|input| {
-                (
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-                )
-            });
+            let (up, down, shift_up, shift_down, left, right, enter, delete, f2) =
+                root_ui.ctx().input_mut(|input| {
+                    (
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                        input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
+                        input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::F2),
+                    )
+                });
             let selected_index = self.sidebar.selected_path.as_ref().and_then(|selected| {
                 tree_row_rects
                     .iter()
                     .position(|(_, path, _)| path == selected)
             });
-            if up || down {
-                let next = match (up, selected_index) {
+            if up || down || shift_up || shift_down {
+                let going_up = up || shift_up;
+                let next = match (going_up, selected_index) {
                     (true, Some(index)) => index.saturating_sub(1),
                     (true, None) => tree_row_rects.len().saturating_sub(1),
                     (false, Some(index)) => index
@@ -3899,7 +3935,12 @@ impl TerminalApp {
                     (false, None) => 0,
                 };
                 if let Some((_, path, is_dir)) = tree_row_rects.get(next) {
-                    select_action = Some((path.clone(), *is_dir, FsSelectMode::Single));
+                    let mode = if shift_up || shift_down {
+                        FsSelectMode::Range
+                    } else {
+                        FsSelectMode::Single
+                    };
+                    select_action = Some((path.clone(), *is_dir, mode));
                 }
             } else if left {
                 if let Some(selected) = self.sidebar.selected_path.as_ref() {
@@ -3935,7 +3976,28 @@ impl TerminalApp {
                 if let Some(selected) = self.sidebar.selected_path.as_ref() {
                     if self.sidebar.directory_expanded(selected).is_some() {
                         cd_path = Some(selected.clone());
+                    } else if !self.sidebar.location().is_remote() {
+                        open_file_path = Some(selected.clone());
                     }
+                }
+            } else if f2 {
+                if self.sidebar.selection.len() == 1 {
+                    if let Some(path) = self.sidebar.selected_path.clone() {
+                        if path != self.sidebar.current_dir {
+                            fs_menu_action = Some(FsMenuAction::Rename(path));
+                        }
+                    }
+                }
+            } else if delete && !self.sidebar.selection.is_empty() {
+                let paths: Vec<_> = self
+                    .sidebar
+                    .selection
+                    .iter()
+                    .filter(|(path, _)| **path != self.sidebar.current_dir)
+                    .map(|(path, is_dir)| (path.clone(), *is_dir))
+                    .collect();
+                if !paths.is_empty() {
+                    fs_menu_action = Some(FsMenuAction::Delete { paths });
                 }
             }
         }
@@ -3952,6 +4014,8 @@ impl TerminalApp {
             || selection_apply.is_some()
             || select_action.is_some()
             || cd_path.is_some()
+            || open_file_path.is_some()
+            || follow_toggled
             || do_refresh
             || view_changed
             || location_changed.is_some()
@@ -3969,32 +4033,35 @@ impl TerminalApp {
         }
         if open_path_entry {
             self.sidebar.open_path_entry();
-            root_ui.ctx().memory_mut(|memory| {
-                memory.request_focus(egui::Id::new("remote-files-path-entry"))
-            });
+            root_ui
+                .ctx()
+                .memory_mut(|memory| memory.request_focus(egui::Id::new("files-path-entry")));
         }
         if cancel_path_entry {
             self.sidebar.cancel_path_entry();
         }
         if submit_path_entry {
+            self.sidebar.pause_local_cwd_follow();
             if let Some(error) = self.sidebar.submit_path_entry() {
                 self.set_status_for(
-                    format!("Remote Files 路径无效：{error}"),
+                    format!("Files path is invalid: {error}"),
                     Duration::from_secs(6),
                 );
             }
         }
         if navigate_back {
+            self.sidebar.pause_local_cwd_follow();
             if let Some(error) = self.sidebar.navigate_back() {
                 self.set_status_for(
-                    format!("Remote Files 后退失败：{error}"),
+                    format!("Files back failed: {error}"),
                     Duration::from_secs(5),
                 );
             }
         } else if navigate_forward {
+            self.sidebar.pause_local_cwd_follow();
             if let Some(error) = self.sidebar.navigate_forward() {
                 self.set_status_for(
-                    format!("Remote Files 前进失败：{error}"),
+                    format!("Files forward failed: {error}"),
                     Duration::from_secs(5),
                 );
             }
@@ -4003,12 +4070,18 @@ impl TerminalApp {
         self.execute_pending_task_sidebar_action();
         if let Some(p) = toggle_path {
             if let Some(error) = self.sidebar.toggle_node(&p) {
-                self.set_status_for(format!("文件树读取失败：{error}"), Duration::from_secs(5));
+                self.set_status_for(
+                    format!("Files listing failed: {error}"),
+                    Duration::from_secs(5),
+                );
             }
         }
         if let Some(p) = retry_path {
             if let Some(error) = self.sidebar.retry_node(&p) {
-                self.set_status_for(format!("文件树重试失败：{error}"), Duration::from_secs(5));
+                self.set_status_for(
+                    format!("Files retry failed: {error}"),
+                    Duration::from_secs(5),
+                );
             }
         }
         if let Some(p) = show_more_path {
@@ -4034,84 +4107,57 @@ impl TerminalApp {
             }
         }
         if let Some(p) = cd_path.take() {
-            if self.sidebar.location().is_remote() {
-                if let Some(error) = self.sidebar.set_current_dir(p.clone()) {
-                    self.set_status_for(
-                        format!("Remote Files 导航失败：{error}"),
-                        Duration::from_secs(5),
-                    );
-                } else {
-                    self.set_status_for(
-                        format!("Remote Files 正在验证：{}", p.display()),
-                        Duration::from_secs(3),
-                    );
-                }
-                // Remote Files is an independent execution endpoint. Never
-                // inject its path into an unrelated local/SSH terminal PTY.
-            } else {
-                cd_path = Some(p);
+            self.sidebar.pause_local_cwd_follow();
+            if let Some(error) = self.sidebar.set_current_dir(p.clone()) {
+                self.set_status_for(
+                    format!("Files navigation failed: {error}"),
+                    Duration::from_secs(5),
+                );
+            } else if self.sidebar.location().is_remote() {
+                self.set_status_for(format!("Verifying {}", p.display()), Duration::from_secs(3));
             }
         }
-        if let Some(p) = cd_path {
-            let quoted = jterm_core::process::shell_quote_path(&p.to_string_lossy());
-            let cmd = format!("cd {}\n", quoted);
-            let active_session_id = self
-                .session_manager
-                .sessions()
-                .get(self.session_manager.active_index())
-                .map(|session| session.metadata.session_id.clone());
-            let direct_input_blocked = active_session_id
-                .as_deref()
-                .is_none_or(|session_id| self.direct_input_is_blocked_for_session(session_id));
-            let paste_result = {
-                let session = self.session_manager.get_active_session_mut();
-                paste_text_into_session(
-                    session,
-                    cmd,
-                    self.config.paste_confirm,
-                    PasteOrigin::PromptInsert,
-                    true,
-                    direct_input_blocked,
-                    &mut self.pending_paste_confirm,
-                )
-            };
-            match paste_result {
-                Ok(true) if self.pending_paste_confirm.is_some() => {
-                    self.status_message =
-                        "请确认目录切换命令；文件树将在 shell 切换后同步".to_string();
-                    self.status_expires_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(4));
-                }
-                Ok(true) => {
-                    if let Some(session_id) = active_session_id {
-                        self.clear_block_selection_for_session(&session_id);
+        if let Some(path) = open_file_path.take() {
+            match crate::link::open_local_path(&path) {
+                Ok(()) => self
+                    .set_status_for(format!("Opened {}", path.display()), Duration::from_secs(3)),
+                Err(error) => self.set_status_for(
+                    format!("Could not open {}: {error}", path.display()),
+                    Duration::from_secs(5),
+                ),
+            }
+        }
+        if follow_toggled {
+            let next = !self.sidebar.follow_local_cwd();
+            self.sidebar.set_follow_local_cwd(next);
+            if next {
+                let reported_cwd = {
+                    let session = self.session_manager.get_active_session_mut();
+                    let osc7 = session.terminal.lock().current_working_dir.clone();
+                    osc7.or_else(|| jterm_core::process::process_cwd(session.get_shell_pid()))
+                };
+                if let Some(path) = reported_cwd.map(std::path::PathBuf::from) {
+                    if let Some(error) = self.sidebar.follow_to_dir(path) {
+                        self.set_status_for(
+                            format!("Files directory switch failed: {error}"),
+                            Duration::from_secs(5),
+                        );
                     }
-                    self.status_message =
-                        "目录切换命令已发送；文件树将跟随 shell 工作目录".to_string();
-                    self.status_expires_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(4));
-                }
-                Ok(false) => {
-                    self.status_message = "目录切换命令为空，未发送".to_string();
-                    self.status_expires_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(4));
-                }
-                Err(error) => {
-                    self.status_message = format!("目录切换命令发送失败：{error}");
-                    self.status_expires_at =
-                        Some(std::time::Instant::now() + Duration::from_secs(4));
                 }
             }
         }
         if do_refresh {
             if let Some(error) = self.sidebar.refresh() {
-                self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                self.set_status_for(
+                    format!("Files refresh failed: {error}"),
+                    Duration::from_secs(5),
+                );
             }
         }
         if let Some(show_hidden) = show_hidden_changed {
             if let Some(error) = self.sidebar.set_show_hidden(show_hidden) {
                 self.set_status_for(
-                    format!("隐藏文件策略切换失败：{error}"),
+                    format!("Could not change hidden-file policy: {error}"),
                     Duration::from_secs(5),
                 );
             }
@@ -4120,8 +4166,12 @@ impl TerminalApp {
             self.ssh_files_follow.request_retry();
         }
         if let Some(location) = location_changed {
+            self.sidebar.pause_local_cwd_follow();
             if let Some(error) = self.sidebar.set_location(location) {
-                self.set_status_for(format!("切换浏览位置失败:{error}"), Duration::from_secs(5));
+                self.set_status_for(
+                    format!("Could not switch Files location: {error}"),
+                    Duration::from_secs(5),
+                );
             }
         }
         if let Some(target) = files_terminal_target {
@@ -4141,7 +4191,7 @@ impl TerminalApp {
             self.apply_fs_menu_action(action, fs_intent_context);
         }
         if cancel_transfer && self.sidebar.cancel_transfers() > 0 {
-            self.set_status("正在取消传输…");
+            self.set_status("Cancelling transfer…");
         }
         if view_changed {
             // 记住用户选择的视图，下次默认沿用。
@@ -4149,13 +4199,17 @@ impl TerminalApp {
             self.schedule_config_save();
             if self.sidebar.view == sidebar::SidebarView::Files {
                 if let Some(error) = self.sidebar.refresh() {
-                    self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                    self.set_status_for(
+                        format!("Files refresh failed: {error}"),
+                        Duration::from_secs(5),
+                    );
                 }
             }
         }
 
         // 拖拽导入：面板矩形 + 行命中测试 + 悬停提示 + 落下分派。
         let panel_rect = panel_response.response.rect;
+        self.sidebar.width = panel_rect.width().clamp(160.0, 640.0);
         self.sidebar_drop_rect = (self.sidebar.view == sidebar::SidebarView::Files
             && !self.sidebar.current_dir.as_os_str().is_empty())
         .then_some(panel_rect);
@@ -4180,10 +4234,10 @@ impl TerminalApp {
                     }
                     let hint = match self.sidebar.location() {
                         remote_fs::FsLocation::Local => {
-                            format!("松开以导入到 {}", target.display())
+                            format!("Release to import into {}", target.display())
                         }
                         location => format!(
-                            "松开以上传到 {} 的 {}",
+                            "Release to upload into {} at {}",
                             location.label(&self.config.remote_hosts),
                             target.display()
                         ),
@@ -4314,19 +4368,19 @@ impl TerminalApp {
             }
         }
         let mut parts = vec![format!(
-            "开始导入 {item_count} 项（{}）",
+            "Starting import of {item_count} items ({})",
             remote_fs::format_bytes(plan.total_bytes)
         )];
         if !plan.refused_existing.is_empty() {
             parts.push(format!(
-                "{} 项因目标已存在被跳过",
+                "{} items skipped because the destination already exists",
                 plan.refused_existing.len()
             ));
         }
         if dispatch_errors > 0 {
-            parts.push(format!("{dispatch_errors} 项分派失败"));
+            parts.push(format!("{dispatch_errors} items failed to dispatch"));
         }
-        self.set_status_for(parts.join("；"), Duration::from_secs(5));
+        self.set_status_for(parts.join("; "), Duration::from_secs(5));
     }
 
     /// 递归绘制文件树节点（关联函数，不持 &self 以避免借用冲突）。
@@ -4340,10 +4394,14 @@ impl TerminalApp {
         toggle: &mut Option<std::path::PathBuf>,
         select: &mut Option<(std::path::PathBuf, bool, FsSelectMode)>,
         cd: &mut Option<std::path::PathBuf>,
+        open_file: &mut Option<std::path::PathBuf>,
         retry: &mut Option<std::path::PathBuf>,
         show_more: &mut Option<std::path::PathBuf>,
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
+        files_are_local: bool,
+        indent_guide: egui::Color32,
+        depth: usize,
         rows: &mut Vec<(egui::Rect, std::path::PathBuf, bool)>,
         selection_apply: &mut Option<std::collections::BTreeMap<std::path::PathBuf, bool>>,
         files_popup_open: &mut bool,
@@ -4359,131 +4417,45 @@ impl TerminalApp {
         } else {
             FsSelectMode::Single
         };
-        if node.is_dir {
-            let arrow = if node.expanded { "▼" } else { "▶" };
-            let label = format!("{} {}/", arrow, node.name);
-            let resp = ui.selectable_label(is_selected, label);
-            *tree_has_focus |= resp.has_focus();
-            rows.push((resp.rect, node.path.clone(), true));
-            if resp.clicked() {
-                if selection_only {
-                    *select = Some((node.path.clone(), true, select_mode));
-                } else {
+        let hover = if node.is_dir {
+            format!(
+                "{}\nClick to select · chevron expands · double-click enters · Ctrl/Shift multi-select",
+                node.path.display()
+            )
+        } else if files_are_local {
+            format!(
+                "{}\nClick to select · double-click opens · Ctrl/Shift multi-select",
+                node.path.display()
+            )
+        } else {
+            format!(
+                "{}\nClick to select · Ctrl/Shift multi-select",
+                node.path.display()
+            )
+        };
+        let row = ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            if node.is_dir {
+                let chevron = if node.expanded { "▾" } else { "▸" };
+                if ui.add(egui::Button::new(chevron).frame(false)).clicked() && !selection_only {
                     *toggle = Some(node.path.clone());
-                    *select = Some((node.path.clone(), true, FsSelectMode::Single));
                 }
+            } else {
+                ui.add_space(14.0);
+            }
+            let icon = if node.is_dir { "📁" } else { "📄" };
+            let resp = ui.selectable_label(is_selected, format!("{icon} {}", node.name));
+            *tree_has_focus |= resp.has_focus();
+            rows.push((resp.rect, node.path.clone(), node.is_dir));
+            if resp.clicked() {
+                *select = Some((node.path.clone(), node.is_dir, select_mode));
             }
             if resp.double_clicked() && !selection_only {
-                *cd = Some(node.path.clone());
-            }
-            // 右键点在选中集之外：选中集先收缩为该行（菜单目标随之只有它）。
-            if resp.secondary_clicked() && !selection.contains_key(&node.path) {
-                *selection_apply = Some(std::collections::BTreeMap::from([(
-                    node.path.clone(),
-                    node.is_dir,
-                )]));
-            }
-            resp.context_menu(|ui| {
-                let (_, targets) =
-                    sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
-                Self::fs_context_menu(
-                    ui,
-                    Some((&node.path, node.is_dir)),
-                    &targets,
-                    &node.path,
-                    menu,
-                    paste,
-                );
-            });
-            *files_popup_open |= resp.context_menu_opened();
-            resp.on_hover_text("单击展开/折叠，双击进入目录；ctrl/shift 点击多选");
-            if node.expanded {
-                ui.indent(node.path.to_string_lossy(), |ui| {
-                    let snapshot_age = node.snapshot_age().map(snapshot_age_label);
-                    if node.is_refreshing() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(match &snapshot_age {
-                                Some(age) => format!("正在刷新…（显示 {age} 快照）"),
-                                None => "正在刷新…（显示上次结果）".to_string(),
-                            });
-                        });
-                    } else if node.is_loading() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在读取…");
-                        });
-                    } else if let Some(error) = node.load_error() {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                if node.has_stale_error() {
-                                    match &snapshot_age {
-                                        Some(age) => {
-                                            format!("刷新失败，显示 {age} 快照：{error}")
-                                        }
-                                        None => {
-                                            format!("刷新失败，显示上次结果：{error}")
-                                        }
-                                    }
-                                } else {
-                                    format!("无法读取：{error}")
-                                },
-                            );
-                            let retryable = node.load_error_retryable();
-                            if ui
-                                .small_button(if retryable { "重试" } else { "重新验证" })
-                                .on_hover_text(if retryable {
-                                    "可重试故障：重新读取此目录，已有内容会保留"
-                                } else {
-                                    "路径、权限或协议故障：修复后重新验证"
-                                })
-                                .clicked()
-                            {
-                                *retry = Some(node.path.clone());
-                            }
-                        });
-                    }
-                    for child in node.visible_children() {
-                        Self::draw_tree_node(
-                            ui,
-                            child,
-                            selection,
-                            toggle,
-                            select,
-                            cd,
-                            retry,
-                            show_more,
-                            menu,
-                            paste,
-                            rows,
-                            selection_apply,
-                            files_popup_open,
-                            tree_has_focus,
-                        );
-                    }
-                    let remaining = node.remaining_children();
-                    if remaining > 0
-                        && ui
-                            .button(format!("显示更多（剩余 {remaining} 项）"))
-                            .clicked()
-                    {
-                        *show_more = Some(node.path.clone());
-                    }
-                    if node.entries_truncated() {
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            format!("目录过大：仅显示前 {} 项", sidebar::MAX_DIRECTORY_ENTRIES),
-                        );
-                    }
-                });
-            }
-        } else {
-            let resp = ui.selectable_label(is_selected, format!("  {}", node.name));
-            *tree_has_focus |= resp.has_focus();
-            rows.push((resp.rect, node.path.clone(), false));
-            if resp.clicked() {
-                *select = Some((node.path.clone(), false, select_mode));
+                if node.is_dir {
+                    *cd = Some(node.path.clone());
+                } else if files_are_local {
+                    *open_file = Some(node.path.clone());
+                }
             }
             if resp.secondary_clicked() && !selection.contains_key(&node.path) {
                 *selection_apply = Some(std::collections::BTreeMap::from([(
@@ -4491,13 +4463,15 @@ impl TerminalApp {
                     node.is_dir,
                 )]));
             }
-            // 文件行的"新建/粘贴/刷新"作用于它所在的目录。
-            let target_dir = node
-                .path
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| node.path.clone());
-            resp.context_menu(|ui| {
+            let target_dir = if node.is_dir {
+                node.path.clone()
+            } else {
+                node.path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| node.path.clone())
+            };
+            resp.clone().context_menu(|ui| {
                 let (_, targets) =
                     sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
                 Self::fs_context_menu(
@@ -4507,17 +4481,117 @@ impl TerminalApp {
                     &target_dir,
                     menu,
                     paste,
+                    files_are_local,
                 );
             });
             *files_popup_open |= resp.context_menu_opened();
+            resp.on_hover_text(hover)
+        });
+        if depth > 0 {
+            let rect = row.response.rect;
+            let x = rect.left() + (depth as f32 * 12.0) - 6.0;
+            ui.painter().line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, indent_guide.gamma_multiply(0.45)),
+            );
+        }
+        if node.is_dir && node.expanded {
+            let snapshot_age = node.snapshot_age().map(snapshot_age_label);
+            if node.is_refreshing() {
+                ui.horizontal(|ui| {
+                    ui.add_space((depth as f32 + 1.0) * 12.0);
+                    ui.spinner();
+                    ui.label(match &snapshot_age {
+                        Some(age) => format!("Refreshing… showing {age} snapshot"),
+                        None => "Refreshing… showing last results".to_string(),
+                    });
+                });
+            } else if node.is_loading() {
+                ui.horizontal(|ui| {
+                    ui.add_space((depth as f32 + 1.0) * 12.0);
+                    ui.spinner();
+                    ui.label("Reading…");
+                });
+            } else if let Some(error) = node.load_error() {
+                ui.horizontal(|ui| {
+                    ui.add_space((depth as f32 + 1.0) * 12.0);
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        if node.has_stale_error() {
+                            match &snapshot_age {
+                                Some(age) => {
+                                    format!("Refresh failed, showing {age} snapshot: {error}")
+                                }
+                                None => format!("Refresh failed, showing last results: {error}"),
+                            }
+                        } else {
+                            format!("Could not read: {error}")
+                        },
+                    );
+                    let retryable = node.load_error_retryable();
+                    if ui
+                        .small_button(if retryable { "Retry" } else { "Revalidate" })
+                        .on_hover_text(if retryable {
+                            "Retryable failure: reread this directory, keep existing rows"
+                        } else {
+                            "Path, permission, or protocol error: revalidate after fixing it"
+                        })
+                        .clicked()
+                    {
+                        *retry = Some(node.path.clone());
+                    }
+                });
+            } else if node.visible_children().is_empty()
+                && node.remaining_children() == 0
+                && !node.entries_truncated()
+            {
+                ui.horizontal(|ui| {
+                    ui.add_space((depth as f32 + 1.0) * 12.0);
+                    ui.label(egui::RichText::new("This folder is empty").weak().italics());
+                });
+            }
+            for child in node.visible_children() {
+                Self::draw_tree_node(
+                    ui,
+                    child,
+                    selection,
+                    toggle,
+                    select,
+                    cd,
+                    open_file,
+                    retry,
+                    show_more,
+                    menu,
+                    paste,
+                    files_are_local,
+                    indent_guide,
+                    depth + 1,
+                    rows,
+                    selection_apply,
+                    files_popup_open,
+                    tree_has_focus,
+                );
+            }
+            let remaining = node.remaining_children();
+            if remaining > 0
+                && ui
+                    .button(format!("Show more ({remaining} remaining)"))
+                    .clicked()
+            {
+                *show_more = Some(node.path.clone());
+            }
+            if node.entries_truncated() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "Directory is too large: showing the first {} entries",
+                        sidebar::MAX_DIRECTORY_ENTRIES
+                    ),
+                );
+            }
         }
     }
 
-    /// 文件树右键菜单（目录行/文件行/根目录行共用）。只收集动作、不做任何
-    /// mutate：实际执行在树遍历闭包结束后由 apply_fs_menu_action 完成。
-    /// `entry` 是被右键的条目自身（Rename 的目标），根目录行传 None ——
-    /// 不允许对浏览根做删除/重命名这类动作。`targets` 是批量动作
-    /// （Delete/Copy/Cut/复制路径）的目标集：点在选中集内时为整个选中集。
     fn fs_context_menu(
         ui: &mut egui::Ui,
         entry: Option<(&std::path::Path, bool)>,
@@ -4525,9 +4599,20 @@ impl TerminalApp {
         target_dir: &std::path::Path,
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
+        files_are_local: bool,
     ) {
         let multi = targets.len() > 1;
-        // 多选下新建/重命名没有意义（都是单目标操作）。
+        if let Some((path, false)) = entry {
+            let open = ui.add_enabled(files_are_local && !multi, egui::Button::new("Open  Enter"));
+            if files_are_local {
+                if open.clicked() {
+                    *menu = Some(FsMenuAction::Open(path.to_path_buf()));
+                    ui.close();
+                }
+            } else {
+                open.on_disabled_hover_text("Open is only available for local files");
+            }
+        }
         if ui
             .add_enabled(!multi, egui::Button::new("New File"))
             .clicked()
@@ -4544,16 +4629,16 @@ impl TerminalApp {
         }
         if let Some((path, _)) = entry {
             if ui
-                .add_enabled(targets.len() == 1, egui::Button::new("Rename"))
+                .add_enabled(targets.len() == 1, egui::Button::new("Rename  F2"))
                 .clicked()
             {
                 *menu = Some(FsMenuAction::Rename(path.to_path_buf()));
                 ui.close();
             }
             let delete_label = if multi {
-                format!("删除 {} 项", targets.len())
+                format!("Delete {} items  Del", targets.len())
             } else {
-                "Delete".to_string()
+                "Delete  Del".to_string()
             };
             if ui.button(delete_label).clicked() {
                 *menu = Some(FsMenuAction::Delete {
@@ -4562,13 +4647,13 @@ impl TerminalApp {
                 ui.close();
             }
             ui.separator();
-            if ui.button("Copy").clicked() {
+            if ui.button("Copy  Ctrl+C").clicked() {
                 *menu = Some(FsMenuAction::Copy {
                     paths: targets.to_vec(),
                 });
                 ui.close();
             }
-            if ui.button("Cut").clicked() {
+            if ui.button("Cut  Ctrl+X").clicked() {
                 *menu = Some(FsMenuAction::Cut {
                     paths: targets.to_vec(),
                 });
@@ -4576,16 +4661,16 @@ impl TerminalApp {
             }
         }
         let paste_label = match paste {
-            FsPasteState::Download => "Paste（下载）",
-            FsPasteState::Upload => "Paste（上传）",
-            FsPasteState::Relay => "Paste（中转）",
+            FsPasteState::Download => "Paste (download)",
+            FsPasteState::Upload => "Paste (upload)",
+            FsPasteState::Relay => "Paste (relay)",
             FsPasteState::Ready | FsPasteState::Empty => "Paste",
         };
         let paste_button =
             ui.add_enabled(paste != FsPasteState::Empty, egui::Button::new(paste_label));
         match paste {
             FsPasteState::Empty => {
-                paste_button.on_disabled_hover_text("剪贴板为空：先 Copy 或 Cut");
+                paste_button.on_disabled_hover_text("Clipboard is empty: Copy or Cut first");
             }
             _ => {
                 if paste_button.clicked() {
@@ -4595,14 +4680,12 @@ impl TerminalApp {
             }
         }
         ui.separator();
-        // 复制路径：多选时换行连接；本地与远程行都是完整路径文本（不带前缀）。
-        // 复制动作是纯 UI 行为，当场完成；菜单动作只负责状态栏提示。
         let copy_paths: Vec<std::path::PathBuf> = if entry.is_some() {
             targets.iter().map(|(path, _)| path.clone()).collect()
         } else {
             vec![target_dir.to_path_buf()]
         };
-        if ui.button("复制路径").clicked() {
+        if ui.button("Copy Path").clicked() {
             let payload = copy_paths
                 .iter()
                 .map(|path| Self::fs_copy_path_payload(path))
@@ -4613,7 +4696,7 @@ impl TerminalApp {
             ui.close();
         }
         ui.separator();
-        if ui.button("Refresh").clicked() {
+        if ui.button("Refresh  F5").clicked() {
             *menu = Some(FsMenuAction::Refresh(target_dir.to_path_buf()));
             ui.close();
         }
@@ -4628,7 +4711,7 @@ impl TerminalApp {
     fn apply_fs_menu_action(&mut self, action: FsMenuAction, context: sidebar::FilesIntentContext) {
         if !self.sidebar.files_intent_is_current(&context) {
             self.set_status_for(
-                "文件树位置已变化；已取消旧位置的操作",
+                "Files location changed; cancelled the previous location's action",
                 Duration::from_secs(5),
             );
             return;
@@ -4645,11 +4728,11 @@ impl TerminalApp {
                 .any(|(path, _)| self.sidebar.path_uses_stale_snapshot(path)),
             // Retry/Refresh must remain available, and copying already-visible
             // text cannot mutate or later dereference the remote pathname.
-            FsMenuAction::CopyPath(_) | FsMenuAction::Refresh(_) => false,
+            FsMenuAction::CopyPath(_) | FsMenuAction::Refresh(_) | FsMenuAction::Open(_) => false,
         };
         if uses_stale_snapshot {
             self.set_status_for(
-                "该目录显示的是上次结果；请先重试刷新，再执行文件操作",
+                "This directory is showing last-good results; retry refresh before file operations",
                 Duration::from_secs(5),
             );
             return;
@@ -4700,14 +4783,25 @@ impl TerminalApp {
             FsMenuAction::Paste(target_dir) => self.paste_fs_clipboard(&target_dir),
             FsMenuAction::CopyPath(paths) => {
                 if paths.len() == 1 {
-                    self.set_status(format!("已复制路径：{}", paths[0].display()));
+                    self.set_status(format!("Copied path: {}", paths[0].display()));
                 } else {
-                    self.set_status(format!("已复制 {} 个路径", paths.len()));
+                    self.set_status(format!("Copied {} paths", paths.len()));
                 }
             }
+            FsMenuAction::Open(path) => match crate::link::open_local_path(&path) {
+                Ok(()) => self
+                    .set_status_for(format!("Opened {}", path.display()), Duration::from_secs(3)),
+                Err(error) => self.set_status_for(
+                    format!("Could not open {}: {error}", path.display()),
+                    Duration::from_secs(5),
+                ),
+            },
             FsMenuAction::Refresh(dir) => {
                 if let Some(error) = self.sidebar.refresh_loaded_node(&dir) {
-                    self.set_status_for(format!("文件树刷新失败：{error}"), Duration::from_secs(5));
+                    self.set_status_for(
+                        format!("Files refresh failed: {error}"),
+                        Duration::from_secs(5),
+                    );
                 }
             }
         }
@@ -4726,10 +4820,10 @@ impl TerminalApp {
             cut,
         });
         self.set_status(match (count, cut) {
-            (1, false) => "已复制到文件剪贴板".to_string(),
-            (1, true) => "已剪切到文件剪贴板".to_string(),
-            (_, false) => format!("已复制 {count} 项到文件剪贴板"),
-            (_, true) => format!("已剪切 {count} 项到文件剪贴板"),
+            (1, false) => "Copied to the Files clipboard".to_string(),
+            (1, true) => "Cut to the Files clipboard".to_string(),
+            (_, false) => format!("Copied {count} items to the Files clipboard"),
+            (_, true) => format!("Cut {count} items to the Files clipboard"),
         });
     }
 
@@ -4767,7 +4861,7 @@ impl TerminalApp {
                 cut: clipboard.cut,
             };
             if let Some(error) = self.sidebar.request_batch(batch, clipboard.cut) {
-                self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
+                self.set_status_for(format!("Paste failed: {error}"), Duration::from_secs(5));
             }
             return;
         }
@@ -4775,11 +4869,11 @@ impl TerminalApp {
         if same_namespace {
             // 同位置：cut → rename，copy → copy（探针的 17/AlreadyExists 兜底）。
             let Some(dst) = item.paste_destination(target_dir) else {
-                self.set_status("无法粘贴：源路径没有文件名");
+                self.set_status("Cannot paste: source path has no file name");
                 return;
             };
             if clipboard.cut && item.path == dst {
-                self.set_status("源与目标相同，未移动");
+                self.set_status("Source and destination are the same; nothing moved");
                 return;
             }
             let (kind, clear_clipboard_on_success) = if clipboard.cut {
@@ -4808,19 +4902,19 @@ impl TerminalApp {
                 self.sidebar
                     .request_fs_op_with_overlay(kind, clear_clipboard_on_success, overlay)
             {
-                self.set_status_for(format!("粘贴失败:{error}"), Duration::from_secs(5));
+                self.set_status_for(format!("Paste failed: {error}"), Duration::from_secs(5));
             }
             return;
         }
         // 跨位置：FsOpService 上的流式传输（字节帽见 remote_fs::MAX_TRANSFER_BYTES）。
         if item.paste_destination(target_dir).is_none() {
-            self.set_status("无法粘贴：源路径没有文件名");
+            self.set_status("Cannot paste: source path has no file name");
             return;
         }
         let direction = match (clipboard.loc.is_remote(), current.is_remote()) {
-            (true, false) => "下载",
-            (false, true) => "上传",
-            _ => "中转",
+            (true, false) => "download",
+            (false, true) => "upload",
+            _ => "relay",
         };
         let cut = clipboard.cut;
         let transfer = sidebar::FsTransfer {
@@ -4838,10 +4932,13 @@ impl TerminalApp {
             cut,
         };
         if let Some(error) = self.sidebar.request_transfer(transfer, cut) {
-            self.set_status_for(format!("{direction}失败:{error}"), Duration::from_secs(5));
+            self.set_status_for(
+                format!("{direction} failed: {error}"),
+                Duration::from_secs(5),
+            );
         } else {
             self.set_status(format!(
-                "已开始{direction}（后台进行，大文件可能需要几分钟）"
+                "Started {direction} (running in the background; large files may take a few minutes)"
             ));
         }
     }
@@ -4850,7 +4947,7 @@ impl TerminalApp {
     fn submit_fs_name_dialog(&mut self, dialog: FsNameDialog) {
         if !self.sidebar.files_intent_is_current(&dialog.context) {
             self.set_status_for(
-                "文件树位置已变化；未执行旧位置的文件操作",
+                "Files location changed; the previous location's file action was not run",
                 Duration::from_secs(5),
             );
             return;
@@ -4859,11 +4956,11 @@ impl TerminalApp {
         let (kind, verb) = match dialog.kind {
             FsNameDialogKind::NewFile => (
                 sidebar::FsOpKind::CreateFile(dialog.base.join(&name)),
-                "新建文件",
+                "Create file",
             ),
             FsNameDialogKind::NewFolder => (
                 sidebar::FsOpKind::CreateDir(dialog.base.join(&name)),
-                "新建文件夹",
+                "Create folder",
             ),
             FsNameDialogKind::Rename => {
                 let dst = dialog.base.with_file_name(&name);
@@ -4876,12 +4973,12 @@ impl TerminalApp {
                         src: dialog.base.clone(),
                         dst,
                     },
-                    "重命名",
+                    "Rename",
                 )
             }
         };
         if let Some(error) = self.sidebar.request_fs_op(kind, false) {
-            self.set_status_for(format!("{verb}失败:{error}"), Duration::from_secs(5));
+            self.set_status_for(format!("{verb} failed: {error}"), Duration::from_secs(5));
         }
     }
 
@@ -4905,7 +5002,7 @@ impl TerminalApp {
         }
         if stale_name || stale_delete {
             self.set_status_for(
-                "文件树位置已变化；已关闭旧位置的文件操作",
+                "Files location changed; closed the previous location's file action",
                 Duration::from_secs(5),
             );
         }
@@ -4927,13 +5024,13 @@ impl TerminalApp {
                     match dialog.kind {
                         FsNameDialogKind::NewFile | FsNameDialogKind::NewFolder => {
                             ui.label(format!(
-                                "在 {} 中创建：",
+                                "Create in {}:",
                                 crate::sidebar::bound_sidebar_path_label(&dialog.base)
                             ));
                         }
                         FsNameDialogKind::Rename => {
                             ui.label(format!(
-                                "重命名 {}：",
+                                "Rename {}:",
                                 crate::sidebar::bound_sidebar_path_label(&dialog.base)
                             ));
                         }
@@ -4987,9 +5084,9 @@ impl TerminalApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     if dialog.paths.len() == 1 {
-                        ui.label("确定删除以下路径吗？");
+                        ui.label("Delete this path?");
                     } else {
-                        ui.label(format!("确定删除以下 {} 项吗？", dialog.paths.len()));
+                        ui.label(format!("Delete these {} items?", dialog.paths.len()));
                     }
                     for path in dialog.paths.iter().take(5) {
                         ui.label(
@@ -4998,16 +5095,16 @@ impl TerminalApp {
                         );
                     }
                     if dialog.paths.len() > 5 {
-                        ui.label(format!("… 等 {} 项", dialog.paths.len()));
+                        ui.label(format!("… and {} more", dialog.paths.len()));
                     }
                     if dialog.dir_count > 0 {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
                             if dialog.paths.len() == 1 {
-                                "这是一个目录，其中的全部内容都会被递归删除。".to_string()
+                                "This is a directory; all of its contents will be deleted recursively.".to_string()
                             } else {
                                 format!(
-                                    "其中包含 {} 个目录，它们的全部内容都会被递归删除。",
+                                    "Contains {} directories; all of their contents will be deleted recursively.",
                                     dialog.dir_count
                                 )
                             },
@@ -5035,7 +5132,7 @@ impl TerminalApp {
             if !self.sidebar.files_intent_is_current(&dialog.context) {
                 self.sidebar.note_files_user_intent();
                 self.set_status_for(
-                    "文件树位置已变化；未执行旧位置的删除操作",
+                    "Files location changed; the previous location's delete was not run",
                     Duration::from_secs(5),
                 );
                 return;
@@ -5047,7 +5144,7 @@ impl TerminalApp {
                     .sidebar
                     .request_fs_op(sidebar::FsOpKind::Delete(path), false)
                 {
-                    self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
+                    self.set_status_for(format!("Delete failed: {error}"), Duration::from_secs(5));
                 }
             } else {
                 // 多选删除：一个批量任务逐项删除、跳过失败、汇总上报。
@@ -5059,7 +5156,7 @@ impl TerminalApp {
                     items: paths,
                 };
                 if let Some(error) = self.sidebar.request_batch(batch, false) {
-                    self.set_status_for(format!("删除失败:{error}"), Duration::from_secs(5));
+                    self.set_status_for(format!("Delete failed: {error}"), Duration::from_secs(5));
                 }
             }
         }
@@ -5188,7 +5285,7 @@ impl eframe::App for TerminalApp {
         };
         if !dropped_paths.is_empty() {
             if ui_owns_clipboard {
-                self.set_status("图片拖放已忽略：当前面板正在接收输入");
+                self.set_status("Image drop ignored: another panel is receiving input");
             } else {
                 match image_drop::prompt_payload(&dropped_paths) {
                     Ok(payload) => {
@@ -5202,10 +5299,10 @@ impl eframe::App for TerminalApp {
                             &mut self.pending_paste_confirm,
                         );
                         if let Err(error) = accepted {
-                            self.set_status(format!("图片拖放失败：{error}"));
+                            self.set_status(format!("Image drop failed: {error}"));
                         }
                     }
-                    Err(error) => self.set_status(format!("图片拖放已拒绝：{error}")),
+                    Err(error) => self.set_status(format!("Image drop rejected: {error}")),
                 }
             }
         }
@@ -5314,7 +5411,10 @@ impl eframe::App for TerminalApp {
             .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
             .map(|capture| capture.session_id.clone());
         if let Some(error) = prior_mouse_write_error {
-            self.set_status_for(format!("鼠标报告发送失败：{error}"), Duration::from_secs(3));
+            self.set_status_for(
+                format!("Mouse report failed: {error}"),
+                Duration::from_secs(3),
+            );
             if error.is_backpressure() {
                 ctx.request_repaint_after(Duration::from_millis(10));
             }
@@ -5718,7 +5818,8 @@ impl eframe::App for TerminalApp {
                 // cannot accidentally duplicate or submit them.
                 semantic_paste_claims_rest = true;
                 rejected_mouse_prefix_allows_pointer = true;
-                self.status_message = "本帧已有更早的鼠标输入；请重试粘贴".to_string();
+                self.status_message =
+                    "Earlier mouse input is still in this frame; retry paste".to_string();
                 self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(3));
                 consumed_keys.insert("PasteEvent".to_string());
             } else {
@@ -5756,7 +5857,7 @@ impl eframe::App for TerminalApp {
                     // create an unbounded helper/thread population.
                     if !clean_route {
                         self.status_message =
-                            "终端仍有更早的输入；请在输入送达后重试粘贴".to_string();
+                            "The terminal still has earlier input; retry paste after it is delivered".to_string();
                         self.status_expires_at =
                             Some(std::time::Instant::now() + Duration::from_secs(3));
                     } else if self
@@ -5804,13 +5905,13 @@ impl eframe::App for TerminalApp {
                                 self.clipboard_request_in_flight
                                     .store(false, Ordering::Release);
                                 log::warn!("failed to spawn OSC 5522 paste event worker: {error}");
-                                self.status_message = "剪贴板正忙，请重试粘贴".to_string();
+                                self.status_message = "Clipboard is busy; retry paste".to_string();
                                 self.status_expires_at =
                                     Some(std::time::Instant::now() + Duration::from_secs(3));
                             }
                         }
                     } else {
-                        self.status_message = "剪贴板正忙，请稍后重试粘贴".to_string();
+                        self.status_message = "Clipboard is busy; retry paste shortly".to_string();
                         self.status_expires_at =
                             Some(std::time::Instant::now() + Duration::from_secs(3));
                     }
@@ -5860,7 +5961,7 @@ impl eframe::App for TerminalApp {
                                             crate::debug_log!("[PASTE] fallback: text is empty");
                                         }
                                         Err(error) => {
-                                            self.status_message = format!("粘贴失败：{error}");
+                                            self.status_message = format!("Paste failed: {error}");
                                             self.status_expires_at = Some(
                                                 std::time::Instant::now() + Duration::from_secs(4),
                                             );
@@ -5877,7 +5978,8 @@ impl eframe::App for TerminalApp {
                                         _bytes.len()
                                     );
                                     self.status_message =
-                                        "图像粘贴需要应用支持 OSC 5522".to_string();
+                                        "Image paste requires the application to support OSC 5522"
+                                            .to_string();
                                     self.status_expires_at =
                                         Some(std::time::Instant::now() + Duration::from_secs(4));
                                     consumed_keys.insert("PasteEvent".to_string());
@@ -6108,15 +6210,16 @@ impl eframe::App for TerminalApp {
         }
         if let Some(error) = terminal_write_error {
             if error.is_backpressure() {
-                self.status_message = "终端输入繁忙，正在重试…".to_string();
+                self.status_message = "Terminal input is busy; retrying…".to_string();
                 ctx.request_repaint_after(Duration::from_millis(10));
             } else {
-                self.status_message = format!("终端输入失败：{error}");
+                self.status_message = format!("Terminal input failed: {error}");
             }
             self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(3));
         }
         if input_retry_overflow {
-            self.status_message = "终端输入重试缓冲区已满，新输入未发送".to_string();
+            self.status_message =
+                "Terminal input retry buffer is full; new input was not sent".to_string();
             self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(4));
         }
         if !session.pending_input.is_empty() {
@@ -7146,7 +7249,7 @@ impl eframe::App for TerminalApp {
         if let Some(error) = mouse_write_error {
             // Motion/wheel are deliberately lossy. Press/release remain queued
             // on the capture and are retried in order on the next frame.
-            self.status_message = format!("鼠标报告发送失败：{error}");
+            self.status_message = format!("Mouse report failed: {error}");
             self.status_expires_at = Some(std::time::Instant::now() + Duration::from_secs(3));
             if error.is_backpressure() && self.terminal_mouse_capture.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(10));
@@ -7258,7 +7361,7 @@ impl eframe::App for TerminalApp {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_max_width(520.0);
                                 ui.label(egui::RichText::new(&link.text).monospace());
-                                ui.label(egui::RichText::new("Ctrl+Click 打开").small().weak());
+                                ui.label(egui::RichText::new("Ctrl+Click to open").small().weak());
                             });
                         });
                 }
@@ -7395,7 +7498,7 @@ impl eframe::App for TerminalApp {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        self.status_message = format!("粘贴失败：{error}");
+                        self.status_message = format!("Paste failed: {error}");
                         self.status_expires_at =
                             Some(std::time::Instant::now() + Duration::from_secs(4));
                     }
@@ -7681,6 +7784,8 @@ mod tests {
 
     #[test]
     fn files_tree_shortcuts_never_capture_terminal_text_or_popup_input() {
+        // Del/F2/Enter-open share this same gate so they stay inert when the
+        // PTY, a Files text field, or a popup owns focus.
         assert!(crate::TerminalApp::files_tree_keyboard_enabled(
             crate::sidebar::SidebarView::Files,
             true,
@@ -7725,11 +7830,11 @@ mod tests {
 
     #[test]
     fn directory_snapshot_age_uses_stable_human_scale_buckets() {
-        assert_eq!(snapshot_age_label(Duration::ZERO), "刚刚");
-        assert_eq!(snapshot_age_label(Duration::from_secs(59)), "59 秒前");
-        assert_eq!(snapshot_age_label(Duration::from_secs(60)), "1 分钟前");
-        assert_eq!(snapshot_age_label(Duration::from_secs(3_600)), "1 小时前");
-        assert_eq!(snapshot_age_label(Duration::from_secs(86_400)), "1 天前");
+        assert_eq!(snapshot_age_label(Duration::ZERO), "just now");
+        assert_eq!(snapshot_age_label(Duration::from_secs(59)), "59s ago");
+        assert_eq!(snapshot_age_label(Duration::from_secs(60)), "1m ago");
+        assert_eq!(snapshot_age_label(Duration::from_secs(3_600)), "1h ago");
+        assert_eq!(snapshot_age_label(Duration::from_secs(86_400)), "1d ago");
     }
 
     #[test]

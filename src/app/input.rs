@@ -1089,18 +1089,18 @@ impl TerminalApp {
             keybindings::Command::CommandPaletteToggle => {
                 if self.command_palette.is_open {
                     self.command_palette.close();
-                    self.set_status("命令面板已关闭");
+                    self.set_status("Command palette closed");
                 } else {
                     self.command_palette.open();
-                    self.set_status("命令面板已打开，直接输入即可搜索命令");
+                    self.set_status("Command palette open — type to search commands");
                 }
             }
             keybindings::Command::HelpToggle => {
                 self.help_panel.toggle();
                 self.set_status(if self.help_panel.is_open {
-                    "快捷键帮助已打开，按 Ctrl+Shift+/ 可关闭"
+                    "Shortcut help is open; press Ctrl+Shift+/ to close"
                 } else {
-                    "快捷键帮助已关闭"
+                    "Shortcut help closed"
                 });
             }
             keybindings::Command::ConfigOpen => {
@@ -1118,7 +1118,7 @@ impl TerminalApp {
                 self.sidebar.visible = !self.sidebar.visible;
                 if self.sidebar.visible && self.sidebar.view == crate::sidebar::SidebarView::Files {
                     if let Some(error) = self.sidebar.refresh() {
-                        self.set_status(format!("文件树刷新失败：{error}"));
+                        self.set_status(format!("Files refresh failed: {error}"));
                     }
                 }
             }
@@ -1128,7 +1128,9 @@ impl TerminalApp {
             keybindings::Command::RemotePicker => {
                 self.remote_picker.toggle();
                 if self.remote_picker.is_open && self.config.remote_hosts.is_empty() {
-                    self.set_status("配置里还没有 [[remote_hosts]]；面板里有可以照抄的示例");
+                    self.set_status(
+                        "No [[remote_hosts]] in config; the panel includes copyable examples",
+                    );
                 }
             }
             keybindings::Command::AgentToggle => {
@@ -1140,17 +1142,17 @@ impl TerminalApp {
                     .clone();
                 self.agent_panel.toggle(&self.config, session_id);
                 self.set_status(if self.agent_panel.is_open {
-                    "AI agent 已打开：每条命令都需要你批准后才会执行"
+                    "AI agent is open: every command waits for your approval before it runs"
                 } else {
-                    "AI agent 已关闭"
+                    "AI agent closed"
                 });
             }
             keybindings::Command::AiChatToggle => match self.ai_chat_panel.toggle(&self.config) {
                 Ok(()) => {
                     self.set_status(if self.ai_chat_panel.is_open {
-                        "AI chats 已打开：对话只读展示，不会执行任何命令"
+                        "AI chats are open: the conversation is read-only and does not run commands"
                     } else {
-                        "AI chats 已关闭"
+                        "AI chats closed"
                     });
                 }
                 Err(message) => {
@@ -2087,7 +2089,8 @@ impl TerminalApp {
             log::warn!(
                 "terminal input retry buffer full; IME commit retained by neither PTY nor UI"
             );
-            self.status_message = "终端输入重试缓冲区已满，IME 文本未发送".to_string();
+            self.status_message =
+                "Terminal input retry buffer is full; IME text was not sent".to_string();
             self.status_expires_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
         }

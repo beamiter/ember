@@ -228,14 +228,23 @@ pub fn badge_text_with_lifecycle(
 /// `keybindings.toml`, because these are hard-coded in the input router
 /// rather than bound commands. The help panel renders this list verbatim.
 pub const BLOCK_MODE_KEY_HINTS: &[(&str, &str)] = &[
-    ("Ctrl+↑", "从最新的已完成块开始选块"),
-    ("↑ / ↓", "移动活动边(收起当前范围)"),
-    ("Shift+↑ / Shift+↓", "以锚点为基准扩展/收缩范围"),
-    ("Enter", "把选中的命令回填到提示符(不执行)"),
-    ("Esc", "清除块选择"),
     (
-        "单击卡片头 / Shift+单击 / Ctrl+Shift+单击",
-        "选中 / 扩展 / 切换单块",
+        "Ctrl+↑",
+        "Start block selection at the newest completed block",
+    ),
+    ("↑ / ↓", "Move the active edge (collapse the current range)"),
+    (
+        "Shift+↑ / Shift+↓",
+        "Grow or shrink the range from the anchor",
+    ),
+    (
+        "Enter",
+        "Reinput selected commands at the prompt (do not run)",
+    ),
+    ("Esc", "Clear block selection"),
+    (
+        "Click card header / Shift+click / Ctrl+Shift+click",
+        "Select / extend / toggle one block",
     ),
 ];
 

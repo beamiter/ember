@@ -437,7 +437,7 @@ impl ConfigPanel {
                 ui.horizontal(|ui| {
                     ui.heading(RichText::new("Settings").size(18.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("x").clicked() {
+                        if ui.button("✕").clicked() {
                             self.is_open = false;
                             self.editing_theme = None;
                         }

@@ -68,9 +68,9 @@ impl HelpPanel {
                 ..Default::default()
             })
             .show(ctx, |ui| {
-                ui.heading(RichText::new("Ember 快捷键").size(18.0).color(text_color));
+                ui.heading(RichText::new("Ember keyboard shortcuts").size(18.0).color(text_color));
                 ui.label(
-                    RichText::new("从这里开始：用命令面板发现功能，用本页查找快捷键。")
+                    RichText::new("Start here: discover commands in the palette, then look up shortcuts on this page.")
                         .size(12.0)
                         .color(dim_color),
                 );
@@ -85,7 +85,7 @@ impl HelpPanel {
                                 .color(text_color),
                         ),
                     );
-                    ui.label(RichText::new("打开命令面板，搜索全部功能").color(text_color));
+                    ui.label(RichText::new("Open the command palette and search every command").color(text_color));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized(
@@ -94,7 +94,7 @@ impl HelpPanel {
                             RichText::new(&help_binding).monospace().color(text_color),
                         ),
                     );
-                    ui.label(RichText::new("打开或关闭本快捷键帮助").color(text_color));
+                    ui.label(RichText::new("Open or close this shortcut help").color(text_color));
                 });
                 ui.separator();
 
@@ -162,7 +162,7 @@ impl HelpPanel {
                 let block_color = Self::category_color(CommandCategory::Terminal, theme);
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("命令块选择（上下文键）")
+                    RichText::new("Command block selection (context keys)")
                         .size(13.0)
                         .strong()
                         .color(block_color),
@@ -180,7 +180,7 @@ impl HelpPanel {
 
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new(format!("💡 更多命令见命令调色板 ({palette_binding})"))
+                    RichText::new(format!("More commands are in the command palette ({palette_binding})"))
                         .size(11.0)
                         .color(dim_color),
                 );
