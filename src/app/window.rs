@@ -261,7 +261,8 @@ impl TerminalApp {
             }
             Err(error) => {
                 eprintln!("[Config] Hot-reload parse error: {error}");
-                self.status_message = format!("Config parse failed; keeping previous config: {error}");
+                self.status_message =
+                    format!("Config parse failed; keeping previous config: {error}");
                 self.status_expires_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
                 self.config.revision = Some(disk_revision);

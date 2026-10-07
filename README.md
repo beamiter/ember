@@ -310,20 +310,48 @@ click_moves_cursor = true
 # compact live elapsed-time badge when it fits without covering terminal text.
 # A badge that does not fit steps down through shorter spellings (dropping the
 # finish clock, then the lifecycle qualifier, then the duration, finally to the
-# bare outcome glyph) and then through smaller font sizes, so a small font or
+# short outcome label) and then through smaller font sizes, so a small font or
 # tight line_spacing no longer drops the outcome — and the exit code — whole.
 # When a long block's own prompt row scrolls above the viewport the badge
 # retries on that block's first visible row. Hovering a failed or
 # unknown-status card keeps its outcome color and only brightens it; hover
 # never repaints a failure in the neutral wash.
-# Block Mode reserves an 8px card gutter before column zero (which can reduce
-# a pane by one column). Compact only tightens visual chrome and never changes
+# Block Mode reserves a 34px action lane before column zero. Card menus live
+# outside terminal cells, so they never cover commands or output. Compact only
+# tightens visual chrome and never changes
 # the PTY/cell geometry relative to non-compact Block Mode.
 # Turning block mode off also clears/disables whole-block selection, so arrows
 # and Enter retain their ordinary terminal meaning.
 block_mode = true
 block_compact = false
 ```
+
+### Block workspace
+
+Block Mode adds a stable workspace strip for browsing command history. Search,
+previous/next block navigation and **Go live** are discoverable above the terminal;
+selecting a block reveals its status, selected count and copy/reuse actions without
+changing the terminal viewport height. Narrow panes move secondary actions into menus.
+
+- Click a command header or press **Ctrl+↑** to select a completed block
+- Use **↑ / ↓** to navigate and **Shift+↑ / Shift+↓** to extend a range
+- **Enter** or **Fill prompt** inserts selected commands without executing them
+- **Escape** clears selection, or returns keyboard focus from a block control to the terminal
+- Each completed card has a **⋯** action menu in the left lane; right-click remains available
+- Card menus group **Copy & share**, **Reuse**, and **Organize & navigate** actions, with command,
+  working directory and completion status shown together
+- **Go live** returns to the editable prompt, including when output is collapsed
+
+Terminal text remains selectable independently of whole-block selection. The action lane
+never covers terminal cells; very short clipped rows may omit their menu button, while
+right-click, workspace actions and keyboard navigation remain available. Run-again actions
+continue to use Ember's existing exact-command and safe-replay checks.
+
+For headless layout review, set `EMBER_UI_SNAPSHOT_DIR=/tmp/ember-ui` and run
+`cargo test --bin ember block_workspace_offscreen_visual_smoke`. The fixture checks
+wide/narrow hit targets and exports the real egui/CPU-terminal meshes for idle,
+empty, failed, collapsed, multiple-selection and running states. These CPU captures complement
+native window/GPU testing; they do not replace it.
 
 Completed records use `jterm_core::block_contract` only after Ember has merged
 OSC 133 metadata with its bounded screen reconstruction. Card badges,

@@ -8,3 +8,6 @@ pub mod state;
 pub mod tabs;
 pub mod tasks;
 pub mod window;
+
+#[cfg(test)]
+mod visual_test_support;

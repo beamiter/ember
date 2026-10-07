@@ -5267,7 +5267,8 @@ impl eframe::App for TerminalApp {
         }
         // Modal/search/settings text fields need egui's semantic clipboard
         // events. They must bypass the terminal-specific Ctrl+C/X/V rewrite.
-        let ui_owns_clipboard = self.terminal_input_blocked(ctx);
+        let ui_owns_clipboard =
+            self.terminal_input_blocked(ctx) || self.block_chrome_owns_keyboard(ctx);
         // 落在文件树面板上的拖放留给侧边栏（raw.dropped_files 原样保留给
         // egui 与本帧的 render_sidebar）；其余维持今天的行为：图片按 payload
         // 粘进终端。
@@ -6493,7 +6494,7 @@ impl eframe::App for TerminalApp {
         // OSC 9/777 desktop notifications
         {
             let mut terminal = session.terminal.lock();
-            let notifications: Vec<_> = terminal.pending_notifications.drain(..).collect();
+            let notifications = std::mem::take(&mut terminal.pending_notifications);
             let rang_bell = terminal.take_pending_bell();
             drop(terminal);
             for (title, body) in notifications {

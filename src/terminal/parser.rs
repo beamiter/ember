@@ -2287,9 +2287,7 @@ impl super::TerminalState {
 
         // 交换缓冲后强制整屏重绘(+rows+1 触发 ui.rs 的 grid_version_jumped)
         self.grid_version += self.grid.rows() as u64 + 1;
-        for row_ver in &mut self.row_versions {
-            *row_ver = self.grid_version;
-        }
+        self.row_versions.fill(self.grid_version);
         self.dirty_region.mark_all(self.grid.rows());
     }
 
