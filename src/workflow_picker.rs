@@ -49,6 +49,7 @@ pub struct WorkflowPickerState {
     pub needs_focus: bool,
     confirm_requested: bool,
     picker: WorkflowPicker,
+    scroll_to_selected: bool,
     /// egui 的 `TextEdit` 所需可变缓冲。核心仍是查询的唯一真相；
     /// [`Self::sync_query`] 在编辑后立即规范化并写回。
     query_buffer: String,
@@ -63,6 +64,7 @@ impl WorkflowPickerState {
             needs_focus: true,
             confirm_requested: false,
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
+            scroll_to_selected: true,
             query_buffer: String::new(),
         }
     }
@@ -91,6 +93,7 @@ impl WorkflowPickerState {
         }
         let query = std::mem::take(&mut self.query_buffer);
         self.picker.set_query(query);
+        self.scroll_to_selected = true;
         self.query_buffer.push_str(self.picker.query());
     }
 
@@ -109,12 +112,21 @@ impl WorkflowPickerState {
 
     /// 高亮项下移（在过滤结果中循环）。
     pub fn select_next(&mut self) {
+        self.needs_focus = true;
+        self.scroll_to_selected = true;
         self.picker.select_next();
     }
 
     /// 高亮项上移（在过滤结果中循环）。
     pub fn select_prev(&mut self) {
+        self.needs_focus = true;
+        self.scroll_to_selected = true;
         self.picker.select_prev();
+    }
+
+    /// Reveal only after query or keyboard navigation, not on idle repaint.
+    pub fn take_scroll_to_selected(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_selected)
     }
 
     /// 当前高亮的工作流（按过滤结果中的位置）。

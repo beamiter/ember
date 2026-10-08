@@ -220,6 +220,412 @@ fn draw_history_picker(
     }
 }
 
+fn workflow_frame(current_theme: &theme::Theme) -> egui::Frame {
+    egui::Frame {
+        fill: theme::Theme::rgb_to_color32(current_theme.ui.panel_bg),
+        stroke: egui::Stroke::new(1.0, theme::Theme::rgb_to_color32(current_theme.ui.border)),
+        corner_radius: egui::CornerRadius::same(10),
+        inner_margin: egui::Margin::same(8),
+        ..Default::default()
+    }
+}
+
+#[derive(Debug)]
+enum WorkflowPickerAction {
+    Close,
+    Accept(crate::workflows::Workflow),
+}
+
+fn draw_workflow_picker(
+    ctx: &egui::Context,
+    state: &mut crate::workflow_picker::WorkflowPickerState,
+    current_theme: &theme::Theme,
+) -> Option<WorkflowPickerAction> {
+    let mut accepted = None;
+    let mut selected = None;
+    let pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
+    let rect = history_picker_rect(ctx.content_rect());
+    let window_id = egui::Id::new("Workflows");
+    ctx.memory_mut(|memory| {
+        memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, window_id))
+    });
+    egui::Window::new("Workflows")
+        .id(window_id)
+        .order(egui::Order::Foreground)
+        .title_bar(false)
+        .resizable(false)
+        .movable(false)
+        .fixed_rect(rect)
+        .frame(workflow_frame(current_theme))
+        .show(ctx, |ui| {
+            let response = ui.add_sized(
+                [ui.available_width(), ui.spacing().interact_size.y],
+                egui::TextEdit::singleline(state.query_buffer_mut()).hint_text("Search workflows…"),
+            );
+            if response.changed() {
+                state.sync_query();
+            }
+            if state.needs_focus {
+                response.request_focus();
+                state.needs_focus = false;
+            }
+            ui.separator();
+            let reveal = state.take_scroll_to_selected();
+            egui::ScrollArea::vertical()
+                .id_salt("workflow-results")
+                .max_height((rect.height() - 96.0).max(1.0))
+                .show(ui, |ui| {
+                    let results = state.filtered();
+                    for (index, workflow) in results.iter().enumerate() {
+                        let selected_row = state.selected() == index;
+                        let response = workflow_picker_row(
+                            ui,
+                            ui.make_persistent_id(("workflow-row", state.query(), index)),
+                            workflow,
+                            selected_row,
+                            current_theme,
+                        );
+                        if (selected_row && reveal) || response.gained_focus() {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                        }
+                        if response.gained_focus() || (response.hovered() && pointer_moved) {
+                            selected = Some(index);
+                        }
+                        if block_search_result_render_activation(&response) {
+                            accepted = Some((*workflow).clone());
+                        }
+                        ui.separator();
+                    }
+                    if results.is_empty() {
+                        let hint = if state.query().is_empty() {
+                            let directory = crate::workflows::user_workflow_dir()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "~/.config/ember/workflows/".into());
+                            format!("No workflows yet. Add templates in {directory}")
+                        } else {
+                            "No workflows match".into()
+                        };
+                        ui.add(egui::Label::new(hint).wrap());
+                    }
+                });
+            ui.separator();
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("↑↓ Navigate · Enter Select · Esc Cancel")
+                        .size(10.0)
+                        .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+            );
+        });
+    if let Some(index) = selected {
+        state.select(index);
+    }
+    if state.take_confirm_request() {
+        Some(
+            state
+                .selected_workflow()
+                .cloned()
+                .map_or(WorkflowPickerAction::Close, WorkflowPickerAction::Accept),
+        )
+    } else {
+        accepted.map(WorkflowPickerAction::Accept)
+    }
+}
+
+fn workflow_row_label(ui: &mut egui::Ui, rect: egui::Rect, label: egui::Label, align: egui::Align) {
+    let mut lane = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(align)),
+    );
+    lane.set_clip_rect(ui.clip_rect().intersect(rect));
+    lane.add(label);
+}
+
+fn workflow_picker_row(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    workflow: &crate::workflows::Workflow,
+    selected: bool,
+    current_theme: &theme::Theme,
+) -> egui::Response {
+    let line_height = ui.text_style_height(&egui::TextStyle::Body);
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), line_height * 2.0 + 10.0));
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            theme::Theme::rgb_to_color32(current_theme.tabbar.active_border)
+                .gamma_multiply(if selected { 0.18 } else { 0.08 }),
+        );
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let name = crate::workflow_picker::display_label(&workflow.name);
+    let detail = if workflow.description.is_empty() {
+        crate::workflow_picker::display_command_preview(&workflow.command)
+    } else {
+        crate::workflow_picker::display_label(&workflow.description)
+    };
+    let tags = crate::workflow_picker::display_label(&workflow.tags.join(", "));
+    let inner = rect.shrink2(egui::vec2(6.0, 4.0));
+    let tag_width = if tags.is_empty() {
+        0.0
+    } else {
+        (inner.width() * 0.3).min(150.0)
+    };
+    workflow_row_label(
+        ui,
+        egui::Rect::from_min_size(
+            inner.min,
+            egui::vec2((inner.width() - tag_width).max(1.0), line_height),
+        ),
+        egui::Label::new(egui::RichText::new(&name).strong())
+            .selectable(false)
+            .truncate()
+            .halign(egui::Align::Min),
+        egui::Align::Min,
+    );
+    if tag_width > 0.0 {
+        workflow_row_label(
+            ui,
+            egui::Rect::from_min_size(
+                egui::pos2(inner.right() - tag_width, inner.top()),
+                egui::vec2(tag_width, line_height),
+            ),
+            egui::Label::new(
+                egui::RichText::new(&tags)
+                    .size(10.0)
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .selectable(false)
+            .truncate()
+            .halign(egui::Align::Max),
+            egui::Align::Max,
+        );
+    }
+    workflow_row_label(
+        ui,
+        egui::Rect::from_min_size(
+            inner.min + egui::vec2(0.0, line_height + 2.0),
+            egui::vec2(inner.width(), line_height),
+        ),
+        egui::Label::new(
+            egui::RichText::new(&detail)
+                .size(10.0)
+                .color(ui.visuals().weak_text_color()),
+        )
+        .selectable(false)
+        .truncate()
+        .halign(egui::Align::Min),
+        egui::Align::Min,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            format!("Workflow {name}; {detail}; {tags}; opens parameters or fills prompt only"),
+        )
+    });
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkflowArgsAction {
+    Cancel,
+    Submit,
+}
+
+fn draw_workflow_args(
+    ctx: &egui::Context,
+    state: &mut crate::workflow_picker::WorkflowArgsState,
+    current_theme: &theme::Theme,
+) -> Option<WorkflowArgsAction> {
+    let confirm = state.take_confirm_request();
+    // egui schedules backward Tab focus for its next pass. Keep the request
+    // until that focus is visible, so Shift+Tab+Enter cannot submit a form
+    // while the user's destination is Cancel.
+    let defer_focus = confirm
+        && ctx.input(|input| {
+            input.events.iter().any(|event|
+        matches!(event, egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. }
+            if modifiers.shift_only()))
+        });
+    let confirm = confirm && !defer_focus;
+    let mut action = None;
+    let available = history_picker_rect(ctx.content_rect());
+    let rect = egui::Rect::from_center_size(
+        available.center(),
+        egui::vec2(available.width().min(560.0), available.height()),
+    );
+    // Actions stay outside the scrolling reading area, even for all 64 legal arguments.
+    let window_id = egui::Id::new("Workflow Parameters");
+    ctx.memory_mut(|memory| {
+        memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, window_id))
+    });
+    egui::Window::new("Workflow Parameters")
+        .id(window_id)
+        .order(egui::Order::Foreground)
+        .title_bar(false)
+        .resizable(false)
+        .movable(false)
+        .fixed_rect(rect)
+        .frame(workflow_frame(current_theme))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("workflow-arguments")
+                .max_height((rect.height() - 88.0).max(1.0))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "Workflow: {}",
+                                crate::workflow_picker::display_label(&state.workflow().name)
+                            ))
+                            .strong(),
+                        )
+                        .wrap(),
+                    );
+                    if !state.workflow().description.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(crate::workflow_picker::display_label(
+                                    &state.workflow().description,
+                                ))
+                                .size(10.0),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(crate::workflow_picker::display_command_preview(
+                                &state.workflow().command,
+                            ))
+                            .monospace()
+                            .size(10.0),
+                        )
+                        .wrap(),
+                    );
+                    ui.separator();
+                    let mut focus_first = std::mem::take(&mut state.needs_focus);
+                    for index in 0..state.arg_count() {
+                        let required = state.is_missing(index);
+                        let narrow = ui.available_width() < 380.0;
+                        let row = |ui: &mut egui::Ui| {
+                            let Some((arg, value)) = state.row_mut(index) else {
+                                return;
+                            };
+                            let labels = |ui: &mut egui::Ui| {
+                                let name = crate::workflow_picker::display_label(&arg.name);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(if required {
+                                            format!("{name} *")
+                                        } else {
+                                            name
+                                        })
+                                        .size(11.0),
+                                    )
+                                    .wrap(),
+                                );
+                                if !arg.description.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(
+                                                crate::workflow_picker::display_label(
+                                                    &arg.description,
+                                                ),
+                                            )
+                                            .size(9.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            };
+                            if narrow {
+                                labels(ui);
+                            } else {
+                                ui.vertical(|ui| {
+                                    ui.set_width(140.0);
+                                    labels(ui);
+                                });
+                            }
+                            let response = ui.add_sized(
+                                [ui.available_width(), ui.spacing().interact_size.y],
+                                egui::TextEdit::singleline(value)
+                                    .id_salt(("workflow-argument", index)),
+                            );
+                            if focus_first {
+                                response.request_focus();
+                                focus_first = false;
+                            }
+                            if response.gained_focus() {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                            }
+                        };
+                        if narrow {
+                            ui.vertical(row);
+                        } else {
+                            ui.horizontal(row);
+                        }
+                        ui.add_space(2.0);
+                    }
+                    state.sync();
+                    if let Some(error) = state.error.as_deref() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(crate::workflow_picker::display_label(error))
+                                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                let insert = ui.button("Insert command");
+                if block_search_result_render_activation(&insert) {
+                    action = Some(WorkflowArgsAction::Submit);
+                }
+                let cancel = ui.button("Cancel");
+                // Enter belongs to the focused action after this frame's focus navigation.
+                // A picker-opening Enter has no argument-stage request and cannot activate it.
+                if block_search_result_render_activation(&cancel) || (confirm && cancel.has_focus())
+                {
+                    action = Some(WorkflowArgsAction::Cancel);
+                }
+            });
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Enter Insert at Prompt · Esc Cancel · * needs a value")
+                        .size(10.0)
+                        .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+            );
+        });
+    if defer_focus && action.is_none() {
+        state.request_confirm();
+        ctx.request_repaint();
+    }
+    action.or(if confirm {
+        Some(WorkflowArgsAction::Submit)
+    } else {
+        None
+    })
+}
+
 const MIN_FRAME_BUDGET: usize = 16 * 1024;
 const MAX_FRAME_BUDGET: usize = 256 * 1024;
 const TARGET_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
@@ -2669,373 +3075,20 @@ impl TerminalApp {
             }
         }
 
-        // 工作流选择器（workflow:picker，anvil/forge 的 workflows）：与历史
-        // 选择器同款的中央浮层。Enter/点击对无参数工作流直接回填提示符（绝不
-        // 执行），有参数的打开填写对话框。
-        let confirm_workflow = self
-            .workflow_picker
-            .as_mut()
-            .is_some_and(|state| state.take_confirm_request());
-        let mut accepted_workflow = None;
-        let mut hovered_workflow_index = None;
-        // A stationary pointer can remain over a row while ArrowUp/Down moves
-        // the keyboard highlight. Treating mere continued hover as fresh
-        // input would immediately undo that move on every frame (the block
-        // search picker below uses the same movement gate).
-        let workflow_pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
-        if self.workflow_picker.is_some() {
-            let screen_rect = ctx.viewport_rect();
-            let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
-            let picker_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
-            let picker_pos = egui::pos2(
-                screen_rect.center().x - picker_width / 2.0,
-                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
-            );
-
-            egui::Window::new("Workflows")
-                .title_bar(false)
-                .resizable(false)
-                .movable(false)
-                .default_pos(picker_pos)
-                .default_size([picker_width, picker_height])
-                .fixed_size([picker_width, picker_height])
-                .frame(egui::Frame {
-                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
-                    stroke: egui::Stroke::new(
-                        1.0,
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
-                    ),
-                    corner_radius: egui::CornerRadius::same(10),
-                    inner_margin: egui::Margin::same(8),
-                    ..Default::default()
-                })
-                .show(ctx, |ui| {
-                    let Some(state) = self.workflow_picker.as_mut() else {
-                        return;
-                    };
-                    // 搜索输入框：编辑即重置高亮（与历史选择器一致）。
-                    ui.horizontal(|ui| {
-                        ui.label("⚙");
-                        let search_response = ui.text_edit_singleline(state.query_buffer_mut());
-                        if search_response.changed() {
-                            state.sync_query();
-                        }
-                        if state.needs_focus {
-                            search_response.request_focus();
-                            state.needs_focus = false;
-                        }
-                        if search_response.has_focus() && state.query().is_empty() {
-                            ui.label("Search workflows…");
-                        }
-                    });
-
-                    ui.separator();
-
-                    // 这一帧只借用可见行。Workflow 的命令/标签总计可接近文件
-                    // 预算，逐帧深拷贝 15 条会把一次普通重绘放大到数 MiB。只有
-                    // 真正点击的那一条需要在闭包外继续存活，届时再克隆。
-                    let results = state.filtered();
-                    let selected_index = state.selected();
-                    let entries_empty = results.is_empty() && state.query().is_empty();
-
-                    egui::ScrollArea::vertical()
-                        .max_height(picker_height - 100.0)
-                        .show(ui, |ui| {
-                            for (idx, workflow) in results.iter().enumerate() {
-                                let is_selected = idx == selected_index;
-
-                                let bg_color = if is_selected {
-                                    crate::theme::Theme::rgb_to_color32(
-                                        self.current_theme.tabbar.active_border,
-                                    )
-                                    .gamma_multiply(0.18)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-
-                                let item_response = ui.horizontal(|ui| {
-                                    let item_rect = ui.available_rect_before_wrap();
-                                    ui.painter().rect_filled(item_rect, 2.0, bg_color);
-
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "⚙ {}",
-                                                crate::workflow_picker::display_label(
-                                                    &workflow.name
-                                                )
-                                            ))
-                                            .strong(),
-                                        );
-                                        // anvil 的 sublabel 语义：有描述用描述，
-                                        // 否则回退到命令模板本身。
-                                        let sublabel = if workflow.description.is_empty() {
-                                            crate::workflow_picker::display_command_preview(
-                                                &workflow.command,
-                                            )
-                                        } else {
-                                            crate::workflow_picker::display_label(
-                                                &workflow.description,
-                                            )
-                                        };
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(sublabel)
-                                                    .size(10.0)
-                                                    .color(ui.visuals().weak_text_color()),
-                                            )
-                                            .truncate(),
-                                        );
-                                    });
-
-                                    // anvil 的 right-hint 语义：标签以 `:` 前缀
-                                    // 列出（`:` 是源实现里工作流的 palette 前缀）。
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let right = if workflow.tags.is_empty() {
-                                                ":".to_string()
-                                            } else {
-                                                format!(
-                                                    ":{}",
-                                                    workflow
-                                                        .tags
-                                                        .iter()
-                                                        .map(|tag| {
-                                                            crate::workflow_picker::display_label(
-                                                                tag,
-                                                            )
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                        .join(",")
-                                                )
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(right)
-                                                    .size(10.0)
-                                                    .monospace()
-                                                    .color(ui.visuals().weak_text_color()),
-                                            );
-                                        },
-                                    );
-                                });
-
-                                // 高亮项保持可见
-                                if is_selected {
-                                    item_response
-                                        .response
-                                        .scroll_to_me(Some(egui::Align::Center));
-                                }
-
-                                let click_response = ui
-                                    .interact(
-                                        item_response.response.rect,
-                                        item_response.response.id.with("workflow_click"),
-                                        egui::Sense::click(),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if click_response.hovered() && workflow_pointer_moved {
-                                    hovered_workflow_index = Some(idx);
-                                }
-                                if block_search_result_render_activation(&click_response) {
-                                    accepted_workflow = Some((*workflow).clone());
-                                }
-
-                                ui.separator();
-                            }
-
-                            if results.is_empty() {
-                                let hint = if entries_empty {
-                                    let dir = crate::workflows::user_workflow_dir()
-                                        .map(|dir| dir.display().to_string())
-                                        .unwrap_or_else(|| "~/.config/ember/workflows/".into());
-                                    format!(
-                                        "No workflows yet — add TOML/YAML templates under {dir}"
-                                    )
-                                } else {
-                                    "No workflows match".to_string()
-                                };
-                                ui.label(
-                                    egui::RichText::new(hint).color(ui.visuals().weak_text_color()),
-                                );
-                            }
-                        });
-
-                    // 底部提示：Enter 只回填或打开参数对话框，绝不执行
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("↑↓ Navigate  Enter Select  Esc Cancel")
-                                .size(10.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    });
-                });
-        }
-
-        if confirm_workflow {
-            accepted_workflow = self
-                .workflow_picker
-                .as_ref()
-                .and_then(|state| state.selected_workflow().cloned());
-            self.workflow_picker = None;
-        }
-        if let Some(index) = hovered_workflow_index {
-            if let Some(state) = self.workflow_picker.as_mut() {
-                state.select(index);
+        if let Some(state) = self.workflow_picker.as_mut() {
+            if let Some(action) = draw_workflow_picker(ctx, state, &self.current_theme) {
+                match action {
+                    WorkflowPickerAction::Close => self.workflow_picker = None,
+                    WorkflowPickerAction::Accept(workflow) => self.workflow_picker_accept(workflow),
+                }
             }
         }
-        if let Some(workflow) = accepted_workflow {
-            self.workflow_picker_accept(workflow);
-        }
-
-        // 工作流参数填写对话框（anvil 的 dialogs/workflow.rs 对应物）：逐参数
-        // 一行文本框，预填声明的默认值；Insert command 只回填提示符。渲染失败
-        // 时对话框保持打开并显示错误（与 anvil 一致）。
-        let mut submit_args_clicked = self
-            .workflow_args
-            .as_mut()
-            .is_some_and(|state| state.take_confirm_request());
-        let mut cancel_args_clicked = false;
-        if self.workflow_args.is_some() {
-            let screen_rect = ctx.viewport_rect();
-            let dialog_width = (screen_rect.width() - 64.0).clamp(360.0, 560.0);
-            let dialog_pos = egui::pos2(
-                screen_rect.center().x - dialog_width / 2.0,
-                screen_rect.top() + (screen_rect.height() * 0.18).max(24.0),
-            );
-
-            egui::Window::new("Workflow Parameters")
-                .title_bar(false)
-                .resizable(false)
-                .movable(false)
-                .default_pos(dialog_pos)
-                .default_width(dialog_width)
-                .frame(egui::Frame {
-                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
-                    stroke: egui::Stroke::new(
-                        1.0,
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
-                    ),
-                    corner_radius: egui::CornerRadius::same(10),
-                    inner_margin: egui::Margin::same(8),
-                    ..Default::default()
-                })
-                .show(ctx, |ui| {
-                    let Some(state) = self.workflow_args.as_mut() else {
-                        return;
-                    };
-
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Workflow: {}",
-                            crate::workflow_picker::display_label(&state.workflow().name)
-                        ))
-                        .strong(),
-                    );
-                    if !state.workflow().description.is_empty() {
-                        ui.label(
-                            egui::RichText::new(crate::workflow_picker::display_label(
-                                &state.workflow().description,
-                            ))
-                            .size(10.0)
-                            .color(ui.visuals().weak_text_color()),
-                        );
-                    }
-                    // 命令模板预览（anvil 的 <tt> 对应物）：等宽、可只读查看。
-                    ui.label(
-                        egui::RichText::new(crate::workflow_picker::display_command_preview(
-                            &state.workflow().command,
-                        ))
-                        .monospace()
-                        .size(10.0),
-                    );
-                    ui.separator();
-
-                    let mut focus_first = state.needs_focus;
-                    state.needs_focus = false;
-                    let mut any_required = false;
-                    for index in 0..state.arg_count() {
-                        // 缺值行（文件没声明默认值、当前还是空）标星：提交时
-                        // 核心会报 `missing values: …`，但用户不该按下 Enter
-                        // 才发现少了什么。
-                        let required = state.is_missing(index);
-                        any_required |= required;
-                        // 编辑发生在缓冲上，整轮画完再一次性写回模型——
-                        // `ArgsForm` 用“没填”与“填了空串”两种状态托住缺值
-                        // 守卫，直接把内部值借给 `TextEdit` 会把两者抹平。
-                        ui.horizontal(|ui| {
-                            let Some((arg, value)) = state.row_mut(index) else {
-                                return;
-                            };
-                            ui.vertical(|ui| {
-                                ui.set_width(140.0);
-                                let name = crate::workflow_picker::display_label(&arg.name);
-                                ui.label(
-                                    egui::RichText::new(if required {
-                                        format!("{name} *")
-                                    } else {
-                                        name
-                                    })
-                                    .size(11.0),
-                                );
-                                if !arg.description.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(crate::workflow_picker::display_label(
-                                            &arg.description,
-                                        ))
-                                        .size(9.0)
-                                        .color(ui.visuals().weak_text_color()),
-                                    );
-                                }
-                            });
-                            let edit =
-                                egui::TextEdit::singleline(value).desired_width(f32::INFINITY);
-                            let response = ui.add(edit);
-                            if focus_first {
-                                response.request_focus();
-                                focus_first = false;
-                            }
-                        });
-                        ui.add_space(2.0);
-                    }
-                    state.sync();
-
-                    if let Some(error) = state.error.as_deref() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
-                            crate::workflow_picker::display_label(error),
-                        );
-                    }
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(if any_required {
-                                "Enter Insert at Prompt  Esc Cancel   * needs a value"
-                            } else {
-                                "Enter Insert at Prompt  Esc Cancel"
-                            })
-                            .size(10.0)
-                            .color(ui.visuals().weak_text_color()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if block_search_result_render_activation(&ui.button("Insert command")) {
-                                submit_args_clicked = true;
-                            }
-                            if block_search_result_render_activation(&ui.button("Cancel")) {
-                                cancel_args_clicked = true;
-                            }
-                        });
-                    });
-                });
-        }
-
-        if cancel_args_clicked {
-            self.workflow_args = None;
-        }
-        if submit_args_clicked {
-            self.submit_workflow_args();
+        if let Some(state) = self.workflow_args.as_mut() {
+            match draw_workflow_args(ctx, state, &self.current_theme) {
+                Some(WorkflowArgsAction::Cancel) => self.workflow_args = None,
+                Some(WorkflowArgsAction::Submit) => self.submit_workflow_args(),
+                None => {}
+            }
         }
 
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
@@ -4471,6 +4524,400 @@ mod tests {
     }
 
     #[test]
+    fn workflow_picker_same_frame_query_edit_selects_latest_match() {
+        let ctx = egui::Context::default();
+        let mut first = workflow_ui_fixture(0);
+        first.name = "choice A".into();
+        let mut second = first.clone();
+        second.name = "choice B".into();
+        second.command = "printf B".into();
+        let mut state = crate::workflow_picker::WorkflowPickerState::new(vec![first, second]);
+        *state.query_buffer_mut() = "choice ".into();
+        state.sync_query();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(280.0, 200.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            run_frame(&ctx, input(vec![]), |_ui| {
+                assert!(draw_workflow_picker(&ctx, &mut state, &theme::Theme::default()).is_none());
+            });
+        }
+        state.request_confirm();
+        let mut action = None;
+        run_frame(&ctx, input(vec![egui::Event::Text("B".into())]), |_ui| {
+            action = draw_workflow_picker(&ctx, &mut state, &theme::Theme::default());
+        });
+        match action {
+            Some(WorkflowPickerAction::Accept(workflow)) => {
+                assert_eq!(workflow.command, "printf B")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_picker_manual_scroll_survives_idle_repaint() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut state = crate::workflow_picker::WorkflowPickerState::new(
+            (0..15)
+                .map(|index| {
+                    let mut workflow = workflow_ui_fixture(0);
+                    workflow.name = format!("Choice {index:02}");
+                    workflow
+                })
+                .collect(),
+        );
+        let mut frame = |events| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    assert!(
+                        draw_workflow_picker(&ctx, &mut state, &theme::Theme::default()).is_none()
+                    );
+                },
+            )
+        };
+        for _ in 0..3 {
+            frame(vec![]);
+        }
+        let position = egui::pos2(350.0, 120.0);
+        frame(vec![egui::Event::PointerMoved(position)]);
+        frame(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            phase: egui::TouchPhase::Move,
+            delta: egui::vec2(0.0, -500.0),
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let mut output = frame(vec![]);
+        for _ in 0..30 {
+            output = frame(vec![]);
+        }
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        let first = nodes
+            .iter()
+            .find(|(_, n)| {
+                n.label()
+                    .is_some_and(|l| l.starts_with("Workflow Choice 00;"))
+            })
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        assert!(
+            first.y1 < 60.0,
+            "idle repaint must not drag the reading position back to selected first row: {first:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_arguments_same_frame_tab_then_confirm_honors_cancel() {
+        for reverse in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut state = crate::workflow_picker::WorkflowArgsState::new(workflow_ui_fixture(1));
+            let mut frame = |events, confirm| {
+                if confirm {
+                    state.request_confirm();
+                }
+                let mut action = None;
+                let output = run_frame(
+                    &ctx,
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 640.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = ui.button("Background action");
+                        action = draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+                    },
+                );
+                (output, action)
+            };
+            frame(vec![], false);
+            frame(vec![], false);
+            let output = frame(vec![], false).0;
+            if !reverse {
+                let insert = output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Insert command")
+                    })
+                    .unwrap()
+                    .0;
+                frame(
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Focus,
+                            target_tree: egui::accesskit::TreeId::ROOT,
+                            target_node: insert,
+                            data: None,
+                        },
+                    )],
+                    false,
+                );
+            }
+            let modifiers = egui::Modifiers {
+                shift: reverse,
+                ..egui::Modifiers::NONE
+            };
+            let (_, action) = frame(
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                true,
+            );
+            if reverse {
+                assert_eq!(action, None);
+                assert_eq!(frame(vec![], false).1, Some(WorkflowArgsAction::Cancel));
+            } else {
+                assert_eq!(action, Some(WorkflowArgsAction::Cancel));
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_picker_assistive_click_preserves_full_command_and_query_identity() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut workflow = workflow_ui_fixture(0);
+        workflow.name = "First workflow".into();
+        workflow.command = format!("printf {}", "参数🙂".repeat(4000));
+        let expected = workflow.command.clone();
+        let mut other = workflow_ui_fixture(0);
+        other.name = "Second workflow".into();
+        let mut state = crate::workflow_picker::WorkflowPickerState::new(vec![workflow, other]);
+        let frame = |state: &mut crate::workflow_picker::WorkflowPickerState, events| {
+            let mut action = None;
+            let output = run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(280.0, 200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    action = draw_workflow_picker(&ctx, state, &theme::Theme::default());
+                },
+            );
+            (output, action)
+        };
+        frame(&mut state, vec![]);
+        frame(&mut state, vec![]);
+        let output = frame(&mut state, vec![]).0;
+        let node = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node
+                        .label()
+                        .is_some_and(|label| label.starts_with("Workflow First workflow;"))
+            })
+            .unwrap()
+            .0;
+        let click = || {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: node,
+                data: None,
+            })
+        };
+        match frame(&mut state, vec![click()]).1 {
+            Some(WorkflowPickerAction::Accept(workflow)) => assert_eq!(workflow.command, expected),
+            action => panic!("unexpected {action:?}"),
+        }
+        *state.query_buffer_mut() = "Second".into();
+        state.sync_query();
+        frame(&mut state, vec![]);
+        assert!(
+            frame(&mut state, vec![click()]).1.is_none(),
+            "stale assistive click must not retarget a different workflow"
+        );
+    }
+
+    fn workflow_ui_fixture(count: usize) -> crate::workflows::Workflow {
+        crate::workflows::Workflow {
+            name: "Review workflow".into(),
+            description: "A bounded parameter form".into(),
+            command: "printf {arg0}".into(),
+            tags: vec!["qa".into()],
+            shell: None,
+            source_path: None,
+            args: (0..count)
+                .map(|index| crate::workflows::WorkflowArg {
+                    name: format!("arg{index}"),
+                    description: format!("Argument {index}"),
+                    default: Some("A".into()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn workflow_arguments_keep_actions_inside_small_and_large_windows() {
+        for size in [egui::vec2(280.0, 200.0), egui::vec2(1000.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut state = crate::workflow_picker::WorkflowArgsState::new(workflow_ui_fixture(64));
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(run_frame(
+                    &ctx,
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |_ui| {
+                        assert_eq!(
+                            draw_workflow_args(&ctx, &mut state, &theme::Theme::default()),
+                            None
+                        );
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes;
+            for label in ["Insert command", "Cancel"] {
+                let node = nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button && node.label() == Some(label)
+                    })
+                    .unwrap();
+                let bounds = node.1.bounds().unwrap();
+                assert!(
+                    bounds.x0 >= 0.0
+                        && bounds.y0 >= 0.0
+                        && bounds.x1 <= size.x as f64
+                        && bounds.y1 <= size.y as f64,
+                    "{label} outside {size:?}: {bounds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_arguments_focused_cancel_enter_returns_cancel() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut state = crate::workflow_picker::WorkflowArgsState::new(workflow_ui_fixture(1));
+        let mut frame = |events, confirm| {
+            if confirm {
+                state.request_confirm();
+            }
+            let mut action = None;
+            let output = run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 640.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    action = draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+                },
+            );
+            (output, action)
+        };
+        frame(vec![], false);
+        frame(vec![], false);
+        let output = frame(vec![], false).0;
+        let cancel = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.label() == Some("Cancel")
+            })
+            .unwrap()
+            .0;
+        let focus = egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Focus,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node: cancel,
+            data: None,
+        });
+        assert_eq!(frame(vec![focus], false).1, None);
+        assert_eq!(frame(vec![], true).1, Some(WorkflowArgsAction::Cancel));
+    }
+
+    #[test]
+    fn workflow_arguments_confirmation_observes_actual_text_edit() {
+        let ctx = egui::Context::default();
+        let mut state = crate::workflow_picker::WorkflowArgsState::new(workflow_ui_fixture(1));
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 640.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            run_frame(&ctx, input(vec![]), |_ui| {
+                draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+            });
+        }
+        state.request_confirm();
+        let mut action = None;
+        run_frame(&ctx, input(vec![egui::Event::Text("B".into())]), |_ui| {
+            action = draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+        });
+        assert_eq!(action, Some(WorkflowArgsAction::Submit));
+        assert_eq!(state.render().unwrap(), "printf AB");
+    }
+
+    #[test]
     fn history_picker_bounds_follow_narrow_and_short_viewports() {
         for (width, height) in [
             (1000.0, 680.0),
@@ -4484,6 +4931,63 @@ mod tests {
             assert!(panel.width() <= width - 32.0);
             assert!(panel.height() <= height - 32.0);
         }
+    }
+
+    #[test]
+    fn workflow_picker_row_text_does_not_steal_pointer_activation() {
+        let ctx = egui::Context::default();
+        let record = workflow_ui_fixture(0);
+        let theme = theme::Theme::default();
+        let mut rect = egui::Rect::NOTHING;
+        let mut clicked = false;
+        let mut frame = |events| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, 200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_width(240.0);
+                    let response = workflow_picker_row(
+                        ui,
+                        egui::Id::new("pointer-workflow-row"),
+                        &record,
+                        false,
+                        &theme,
+                    );
+                    rect = response.rect;
+                    clicked = response.clicked_by(egui::PointerButton::Primary);
+                },
+            );
+            (rect, clicked)
+        };
+        let (row, _) = frame(vec![]);
+        frame(vec![]);
+        let pos = row.min + egui::vec2(8.0, 8.0);
+        frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let (_, clicked) = frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            clicked,
+            "row labels are display-only; their hit boxes must not intercept the button"
+        );
     }
 
     #[test]

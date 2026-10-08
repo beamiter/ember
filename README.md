@@ -763,6 +763,11 @@ refuse it. Escape closes either surface. The library is re-read each time the
 picker opens, so a file added on disk appears the next time you press
 `Ctrl+Shift+M`.
 
+The picker fits narrow windows and preserves your reading position when you
+scroll. Parameter forms keep their actions visible while long templates and
+up to 64 fields scroll. Tab and Shift+Tab stay within the workflow dialog;
+Enter on the focused Cancel action closes it without filling the prompt.
+
 Workflow files are TOML or YAML (`.toml`, `.yaml`, `.yml`) and are read, in
 precedence order, from:
 
