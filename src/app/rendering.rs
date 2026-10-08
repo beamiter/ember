@@ -541,8 +541,8 @@ fn draw_block_workspace(
             )
             .on_hover_text("Actions apply to the selected completed blocks in this pane");
             let valid = snapshot.active_record_id.is_some();
-            if inner.width() >= 480.0 {
-                if block_workspace_control(
+            if inner.width() >= 300.0
+                && block_workspace_control(
                     ui,
                     focus,
                     "Review",
@@ -550,10 +550,11 @@ fn draw_block_workspace(
                     "Inspect selected command blocks without running anything",
                 )
                 .clicked()
-                {
-                    action = Some(BlockWorkspaceAction::Review);
-                }
-                if block_workspace_control(
+            {
+                action = Some(BlockWorkspaceAction::Review);
+            }
+            if inner.width() >= 480.0
+                && block_workspace_control(
                     ui,
                     focus,
                     "Copy",
@@ -561,9 +562,8 @@ fn draw_block_workspace(
                     "Copy selected commands and output as plain text",
                 )
                 .clicked()
-                {
-                    action = Some(BlockWorkspaceAction::Target(Target::CopyBlocks));
-                }
+            {
+                action = Some(BlockWorkspaceAction::Target(Target::CopyBlocks));
             }
             let response = block_workspace_control(
                 ui,
@@ -1562,6 +1562,8 @@ impl TerminalApp {
         ctx: &egui::Context,
         frame_pointer_input_blocked: bool,
     ) {
+        // Capture keyboard invocation before the modal disables its workspace.
+        self.remember_block_review_invoker(ctx);
         let interaction_enabled = terminal_frame_interaction_enabled(
             self.terminal_input_blocked(ctx),
             frame_pointer_input_blocked,
@@ -5147,6 +5149,19 @@ mod tests {
                     assert!(renderer.last_content_rect.unwrap().top() >= rect.bottom(), "{name}: chrome must never overlap terminal rows");
                 });
                 assert!(!output.shapes.is_empty());
+                if selected > 0 && pass == 1 {
+                    let review = output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .find_map(|(_, node)| (node.label() == Some("Review")).then_some(node))
+                        .expect("primary Review remains visible at narrow widths");
+                    let bounds = review.bounds().expect("Review has visible bounds");
+                    assert!(bounds.x0 >= 0.0 && bounds.x1 <= width as f64 && bounds.y1 <= 80.0);
+                }
                 if pass == 0 {
                     action_node =
                         output

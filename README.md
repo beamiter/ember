@@ -336,9 +336,17 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
 - Click a command header or press **Ctrl+↑** to select a completed block
 - Use **↑ / ↓** to navigate and **Shift+↑ / Shift+↓** to extend a range
 - **Review** opens selected blocks in terminal order, with full retained command text, cwd,
-  outcome, duration, lifecycle evidence and bounded captured output
+  outcome, duration, lifecycle evidence and bounded captured output. It stays directly
+  available at 360px pane width; smaller panes retain it in **Actions**
+- **Copy commands** copies exact original commands in terminal order, independently of
+  prompt readiness. It validates all captured identities, text and order again before
+  one clipboard write; incomplete, truncated, inexact, unsafe or evicted commands reject
+  the whole batch. Copy and review insertion are bounded to 64 blocks / 256 KiB including
+  command separators. Larger selections remain inspectable; select a smaller range to copy
 - **Fill prompt** and card-menu insertion open this review before **Insert at prompt**;
-  **Enter** keeps the existing direct, guarded selection-insertion shortcut
+  **Enter** keeps the existing direct, guarded selection-insertion shortcut outside review.
+  Inside review Enter never inserts; use the explicit button. Insertion uses the current
+  shell folder and never changes directory or submits the command
 - **Escape** clears selection, or returns keyboard focus from a block control to the terminal
 - Each completed card has a **⋯** action menu in the left lane; right-click remains available
 - Card menus group **Copy & share**, **Reuse**, and **Organize & navigate** actions, with command,
@@ -346,7 +354,8 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
 - While reading history, new retained completions are counted without moving your view;
   **Go live** returns to the editable prompt, including when output is collapsed
 - Review follows terminal-owned block identities. Evicted blocks cannot silently retarget
-  a reused shell id; closing review preserves your position and returns terminal focus
+  a reused shell id; closing review preserves your position and restores its invoking
+  block control when still present, falling back to terminal focus when unavailable
 - Commands and output show escaped control/bidi characters, explicit missing/truncated
   snapshot notices, and a 256 KiB display cap per text pane. Output is a retained snapshot,
   not a claim that every original byte is available
@@ -360,7 +369,9 @@ For headless layout review, set `EMBER_UI_SNAPSHOT_DIR=/tmp/ember-ui` and run
 `cargo test --bin ember block_workspace_offscreen_visual_smoke` and
 `cargo test --bin ember block_review_offscreen_visual_and_escape_reopen`. The fixture checks
 wide/narrow hit targets and exports the real egui/CPU-terminal meshes for idle,
-empty, failed, collapsed, multiple-selection and running states. These CPU captures complement
+empty, failed, collapsed, multiple-selection and running states, plus dirty-prompt,
+unsafe, Unicode and copied-feedback reviews. Real egui action tests check clipboard output,
+focused Enter rejection and footer bounds. These CPU captures complement
 native window/GPU testing; they do not replace it.
 
 Completed records use `jterm_core::block_contract` only after Ember has merged

@@ -361,6 +361,7 @@ pub(crate) fn verified_local_command_cwd(
 pub(crate) enum SelectedReplayError {
     NoSelection,
     MissingRecord,
+    ChangedReview,
     ExactCommandUnavailable,
     NoCommands,
     NotPromptReady,
@@ -378,6 +379,9 @@ pub(super) fn selected_replay_error_message(error: &SelectedReplayError) -> Stri
         SelectedReplayError::NoSelection => "No command blocks are selected".to_string(),
         SelectedReplayError::MissingRecord => {
             "A selected command block is no longer available".to_string()
+        }
+        SelectedReplayError::ChangedReview => {
+            "Reviewed commands changed or became unavailable. Nothing was inserted".to_string()
         }
         SelectedReplayError::ExactCommandUnavailable => {
             "Exact command text is unavailable for part of the selection".to_string()
@@ -3333,6 +3337,20 @@ impl TerminalApp {
     }
 
     pub(crate) fn try_reinput_selected_commands(&mut self) -> Result<usize, SelectedReplayError> {
+        self.try_reinput_commands(None)
+    }
+
+    pub(super) fn try_reinput_reviewed_commands(
+        &mut self,
+        review: &super::block_review::BlockReview,
+    ) -> Result<usize, SelectedReplayError> {
+        self.try_reinput_commands(Some(review))
+    }
+
+    fn try_reinput_commands(
+        &mut self,
+        review: Option<&super::block_review::BlockReview>,
+    ) -> Result<usize, SelectedReplayError> {
         if !self.config.block_mode {
             self.clear_block_selection();
             return Err(SelectedReplayError::NoSelection);
@@ -3366,6 +3384,17 @@ impl TerminalApp {
                     prompt_empty: terminal.prompt_input_is_empty(),
                 };
                 prepare_selected_replay(guard, || {
+                    if let Some(review) = review {
+                        // The snapshot and shell ids must still identify the same
+                        // bytes under the payload-building lock, not an earlier
+                        // UI lookup that a later parser update could invalidate.
+                        if review.session_id != active_session_id
+                            || !review
+                                .matches_insertion_selection(&terminal, &selection.selected_ids)
+                        {
+                            return Err(SelectedReplayError::ChangedReview);
+                        }
+                    }
                     selected_commands_in_terminal_order(
                         terminal
                             .command_records()
