@@ -47,6 +47,7 @@ pub fn display_command_preview(command: &str) -> String {
 pub struct WorkflowPickerState {
     /// 是否需要聚焦搜索框（egui 文本框在浮层打开后的第一帧取焦）。
     pub needs_focus: bool,
+    confirm_requested: bool,
     picker: WorkflowPicker,
     /// egui 的 `TextEdit` 所需可变缓冲。核心仍是查询的唯一真相；
     /// [`Self::sync_query`] 在编辑后立即规范化并写回。
@@ -60,9 +61,18 @@ impl WorkflowPickerState {
     pub fn new(entries: Vec<Workflow>) -> Self {
         Self {
             needs_focus: true,
+            confirm_requested: false,
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             query_buffer: String::new(),
         }
+    }
+
+    pub fn request_confirm(&mut self) {
+        self.confirm_requested = true;
+    }
+
+    pub fn take_confirm_request(&mut self) -> bool {
+        std::mem::take(&mut self.confirm_requested)
     }
 
     pub fn query(&self) -> &str {
@@ -125,6 +135,7 @@ pub struct WorkflowArgsState {
     pub error: Option<String>,
     /// 是否需要聚焦第一个参数输入框。
     pub needs_focus: bool,
+    confirm_requested: bool,
 }
 
 impl WorkflowArgsState {
@@ -140,7 +151,16 @@ impl WorkflowArgsState {
             buffers,
             error: None,
             needs_focus: true,
+            confirm_requested: false,
         }
+    }
+
+    pub fn request_confirm(&mut self) {
+        self.confirm_requested = true;
+    }
+
+    pub fn take_confirm_request(&mut self) -> bool {
+        std::mem::take(&mut self.confirm_requested)
     }
 
     pub fn workflow(&self) -> &Workflow {

@@ -198,6 +198,56 @@ pub(super) fn route_history_picker_events(
     owned_frame
 }
 
+/// Queue workflow confirmation until egui has applied this frame's edits.
+/// The opening Enter remains owned if acceptance creates an argument dialog.
+pub(super) fn route_workflow_events(
+    picker: &mut Option<crate::workflow_picker::WorkflowPickerState>,
+    args: &mut Option<crate::workflow_picker::WorkflowArgsState>,
+    enter_held: &mut PromptFillEnterLatch,
+    events: &mut Vec<egui::Event>,
+) -> bool {
+    let owned_frame = picker.is_some() || args.is_some();
+    if !owned_frame {
+        return false;
+    }
+    let loses_focus = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::WindowFocused(false)));
+    events.retain(|event| {
+        match route_prompt_fill_enter_event(enter_held, event, owned_frame, loses_focus) {
+            PromptFillEnterKeyRoute::Confirm => {
+                if let Some(state) = args.as_mut() {
+                    state.request_confirm();
+                } else if let Some(state) = picker.as_mut() {
+                    state.request_confirm();
+                }
+                return false;
+            }
+            PromptFillEnterKeyRoute::Suppress => return false,
+            PromptFillEnterKeyRoute::Pass => {}
+        }
+        if let egui::Event::Key {
+            key, pressed: true, ..
+        } = event
+        {
+            if *key == egui::Key::Escape {
+                *args = None;
+                *picker = None;
+            } else if args.is_none() {
+                if let Some(state) = picker.as_mut() {
+                    match key {
+                        egui::Key::ArrowUp => state.select_prev(),
+                        egui::Key::ArrowDown => state.select_next(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        true
+    });
+    owned_frame
+}
+
 fn transformed_next_command_returns_to_bottom(
     next: bool,
     target_found: bool,
@@ -913,6 +963,7 @@ fn block_selection_context_available(
 
 impl TerminalApp {
     pub(super) fn claim_enter_for_prompt_recall(&mut self) {
+        self.native_enter_ownership.claim_pressed();
         claim_prompt_fill_enter(
             self.prompt_fill_enter_down,
             &mut self.prompt_fill_enter_latch,
@@ -2028,11 +2079,17 @@ impl TerminalApp {
     /// Returns whether the picker owned this frame's input; it never requests
     /// a viewport close.
     pub fn handle_history_picker_input(&mut self) -> bool {
-        route_history_picker_events(
+        let owned = route_history_picker_events(
             &mut self.history_picker,
             &mut self.prompt_fill_enter_latch,
             &mut self.frame_events,
-        )
+        );
+        if owned {
+            // Native identities may still be held even if an aliased logical
+            // release ended this frame with an idle egui latch.
+            self.native_enter_ownership.claim_pressed();
+        }
+        owned
     }
 
     /// Handle keys the workflow picker and its parameter dialog own (same
@@ -2043,69 +2100,18 @@ impl TerminalApp {
     /// whether either surface owned this frame's input; it never requests a
     /// viewport close.
     pub fn handle_workflow_picker_input(&mut self) -> bool {
-        if self.workflow_picker.is_none() && self.workflow_args.is_none() {
-            return false;
+        let owned = route_workflow_events(
+            &mut self.workflow_picker,
+            &mut self.workflow_args,
+            &mut self.prompt_fill_enter_latch,
+            &mut self.frame_events,
+        );
+        if owned {
+            // Native identities may still be held even if an aliased logical
+            // release ended this frame with an idle egui latch.
+            self.native_enter_ownership.claim_pressed();
         }
-
-        let events_copy = self.frame_events.clone();
-        let mut accepted: Option<Option<crate::workflows::Workflow>> = None;
-        let mut submit_args = false;
-        let mut close_args = false;
-        for evt in &events_copy {
-            let egui::Event::Key {
-                key, pressed: true, ..
-            } = evt
-            else {
-                continue;
-            };
-            if self.workflow_args.is_some() {
-                // 参数对话框打开时，方向键/字符键归 egui 文本框（光标移动与
-                // 编辑）；浮层只额外认领 Enter 提交与 Escape 取消。
-                match key {
-                    egui::Key::Escape => close_args = true,
-                    egui::Key::Enter => submit_args = true,
-                    _ => {}
-                }
-                continue;
-            }
-            match key {
-                egui::Key::Escape => self.workflow_picker = None,
-                egui::Key::ArrowUp => {
-                    if let Some(state) = self.workflow_picker.as_mut() {
-                        state.select_prev();
-                    }
-                }
-                egui::Key::ArrowDown => {
-                    if let Some(state) = self.workflow_picker.as_mut() {
-                        state.select_next();
-                    }
-                }
-                egui::Key::Enter => {
-                    // 与历史选择器一致：即使过滤结果为空，Enter 也关闭浮层。
-                    accepted = Some(
-                        self.workflow_picker
-                            .as_ref()
-                            .and_then(|state| state.selected_workflow().cloned()),
-                    );
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if close_args {
-            self.workflow_args = None;
-        }
-        if submit_args {
-            self.submit_workflow_args();
-        }
-        if let Some(workflow) = accepted {
-            self.workflow_picker = None;
-            if let Some(workflow) = workflow {
-                self.workflow_picker_accept(workflow);
-            }
-        }
-        true
+        owned
     }
 
     /// Handle keys the block-search picker owns (same routing pattern as the
@@ -2639,6 +2645,136 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn confirm_test_workflow() -> crate::workflows::Workflow {
+        crate::workflows::Workflow {
+            name: "confirmation".into(),
+            description: String::new(),
+            command: "printf {{value}}".into(),
+            tags: Vec::new(),
+            shell: None,
+            args: vec![crate::workflows::WorkflowArg {
+                name: "value".into(),
+                description: String::new(),
+                default: Some("A".into()),
+            }],
+            source_path: None,
+        }
+    }
+
+    fn workflow_enter(pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn workflow_confirmation_is_deferred_and_preserves_edit_events() {
+        for edit in [
+            egui::Event::Text("B".into()),
+            egui::Event::Paste("B".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("B".into())),
+        ] {
+            for arguments in [false, true] {
+                let mut picker = (!arguments).then(|| {
+                    crate::workflow_picker::WorkflowPickerState::new(vec![confirm_test_workflow()])
+                });
+                let mut args = arguments.then(|| {
+                    crate::workflow_picker::WorkflowArgsState::new(confirm_test_workflow())
+                });
+                let mut latch = PromptFillEnterLatch::Idle;
+                let mut events = vec![edit.clone(), workflow_enter(true, false)];
+                assert!(route_workflow_events(
+                    &mut picker,
+                    &mut args,
+                    &mut latch,
+                    &mut events
+                ));
+                assert_eq!(events, vec![edit.clone()]);
+                assert_eq!(latch, PromptFillEnterLatch::Held);
+                if let Some(state) = picker.as_mut() {
+                    assert!(state.take_confirm_request());
+                    assert!(!state.take_confirm_request());
+                }
+                if let Some(state) = args.as_mut() {
+                    assert!(state.take_confirm_request());
+                    assert_eq!(
+                        state.render().unwrap(),
+                        "printf A",
+                        "routing must not render or edit values"
+                    );
+                    *state.row_mut(0).unwrap().1 = "B".into();
+                    state.sync();
+                    assert_eq!(state.render().unwrap(), "printf B");
+                    assert!(!state.take_confirm_request());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_opener_repeat_cannot_submit_new_argument_dialog() {
+        let mut picker = Some(crate::workflow_picker::WorkflowPickerState::new(vec![
+            confirm_test_workflow(),
+        ]));
+        let mut args = None;
+        let mut latch = PromptFillEnterLatch::Idle;
+        route_workflow_events(
+            &mut picker,
+            &mut args,
+            &mut latch,
+            &mut vec![workflow_enter(true, false)],
+        );
+        assert!(picker.as_mut().unwrap().take_confirm_request());
+        picker = None;
+        args = Some(crate::workflow_picker::WorkflowArgsState::new(
+            confirm_test_workflow(),
+        ));
+        for repeat in [true, false] {
+            let mut events = vec![workflow_enter(true, repeat)];
+            route_workflow_events(&mut picker, &mut args, &mut latch, &mut events);
+            assert!(events.is_empty());
+            assert!(!args.as_mut().unwrap().take_confirm_request());
+        }
+        route_workflow_events(
+            &mut picker,
+            &mut args,
+            &mut latch,
+            &mut vec![workflow_enter(false, false), workflow_enter(true, false)],
+        );
+        assert!(
+            args.as_mut().unwrap().take_confirm_request(),
+            "fresh intentional Enter still submits"
+        );
+    }
+
+    #[test]
+    fn workflow_escape_cancels_queued_confirmation_without_releasing_held_enter() {
+        let mut picker = None;
+        let mut args = Some(crate::workflow_picker::WorkflowArgsState::new(
+            confirm_test_workflow(),
+        ));
+        let mut latch = PromptFillEnterLatch::Idle;
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        route_workflow_events(
+            &mut picker,
+            &mut args,
+            &mut latch,
+            &mut vec![workflow_enter(true, false), escape],
+        );
+        assert!(args.is_none());
+        assert_eq!(latch, PromptFillEnterLatch::Held);
+    }
 
     #[test]
     fn claimed_enter_repeat_cannot_click_a_newly_focused_egui_button() {

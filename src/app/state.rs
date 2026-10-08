@@ -289,6 +289,7 @@ pub struct TerminalApp {
     pub prompt_fill_enter_latch: super::input::PromptFillEnterLatch,
     /// Passive state survives modal dispatch so pointer fills can claim Enter.
     pub prompt_fill_enter_down: bool,
+    pub native_enter_ownership: crate::native_enter::NativeEnterOwnership,
 
     /// 工作流选择器（Ctrl+Shift+M，anvil/forge 的 workflows）。打开时同步加载
     /// 有界目录扫描；Enter 对无参数工作流直接回填提示符，有参数则打开填写

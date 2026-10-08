@@ -28,6 +28,7 @@ mod keybindings;
 mod kitty_graphics;
 mod layout;
 mod link;
+mod native_enter;
 mod pane_header;
 mod persistence_file;
 mod pty;
@@ -2532,6 +2533,7 @@ impl TerminalApp {
             history_picker: None,
             prompt_fill_enter_latch: Default::default(),
             prompt_fill_enter_down: false,
+            native_enter_ownership: Default::default(),
             workflow_picker: None,
             workflow_args: None,
             workflow_refusals: Vec::new(),
@@ -5255,6 +5257,16 @@ impl TerminalApp {
 }
 
 impl eframe::App for TerminalApp {
+    fn on_native_key_event(
+        &mut self,
+        viewport_id: egui::ViewportId,
+        event: &winit::event::KeyEvent,
+        is_synthetic: bool,
+    ) -> bool {
+        viewport_id == egui::ViewportId::ROOT
+            && self.native_enter_ownership.observe(event, is_synthetic)
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Fully transparent clear color to support window-level opacity
         [0.0, 0.0, 0.0, 0.0]

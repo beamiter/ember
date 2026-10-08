@@ -2672,6 +2672,10 @@ impl TerminalApp {
         // 工作流选择器（workflow:picker，anvil/forge 的 workflows）：与历史
         // 选择器同款的中央浮层。Enter/点击对无参数工作流直接回填提示符（绝不
         // 执行），有参数的打开填写对话框。
+        let confirm_workflow = self
+            .workflow_picker
+            .as_mut()
+            .is_some_and(|state| state.take_confirm_request());
         let mut accepted_workflow = None;
         let mut hovered_workflow_index = None;
         // A stationary pointer can remain over a row while ArrowUp/Down moves
@@ -2833,7 +2837,7 @@ impl TerminalApp {
                                 if click_response.hovered() && workflow_pointer_moved {
                                     hovered_workflow_index = Some(idx);
                                 }
-                                if click_response.clicked() {
+                                if block_search_result_render_activation(&click_response) {
                                     accepted_workflow = Some((*workflow).clone());
                                 }
 
@@ -2869,6 +2873,13 @@ impl TerminalApp {
                 });
         }
 
+        if confirm_workflow {
+            accepted_workflow = self
+                .workflow_picker
+                .as_ref()
+                .and_then(|state| state.selected_workflow().cloned());
+            self.workflow_picker = None;
+        }
         if let Some(index) = hovered_workflow_index {
             if let Some(state) = self.workflow_picker.as_mut() {
                 state.select(index);
@@ -2881,7 +2892,10 @@ impl TerminalApp {
         // 工作流参数填写对话框（anvil 的 dialogs/workflow.rs 对应物）：逐参数
         // 一行文本框，预填声明的默认值；Insert command 只回填提示符。渲染失败
         // 时对话框保持打开并显示错误（与 anvil 一致）。
-        let mut submit_args_clicked = false;
+        let mut submit_args_clicked = self
+            .workflow_args
+            .as_mut()
+            .is_some_and(|state| state.take_confirm_request());
         let mut cancel_args_clicked = false;
         if self.workflow_args.is_some() {
             let screen_rect = ctx.viewport_rect();
@@ -3006,10 +3020,10 @@ impl TerminalApp {
                             .color(ui.visuals().weak_text_color()),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Insert command").clicked() {
+                            if block_search_result_render_activation(&ui.button("Insert command")) {
                                 submit_args_clicked = true;
                             }
-                            if ui.button("Cancel").clicked() {
+                            if block_search_result_render_activation(&ui.button("Cancel")) {
                                 cancel_args_clicked = true;
                             }
                         });
