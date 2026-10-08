@@ -424,6 +424,10 @@ behind.
 query. `All / Cmd / Out` restricts matching to all text, commands, or output;
 `Ctrl+O` cycles the scope, which is applied before the 500-hit cap. Invalid
 expressions stay visible as query errors and cannot activate an older result.
+Short windows use compact controls and reserve space for the keyboard help;
+the result list stays scrollable and virtualized. Compact icons retain their
+full tooltips and accessible names. Hover the help line for all shortcuts or a
+truncated expression error for its full explanation.
 `All / Failed / Slow / Bookmarked / Background` chips also browse their
 category with an empty query. Results report the current position and support
 wrapping `↑/↓`, `Home/End`, and ten-row `PageUp/PageDown` navigation while

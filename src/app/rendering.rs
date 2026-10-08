@@ -17,6 +17,29 @@ fn history_picker_rect(screen: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(screen.center().x - size.x / 2.0, top), size)
 }
 
+// egui defaults to a 64px minimum scroll viewport even when max_height is
+// smaller. Search reserves its measured footer first, so honor that remainder.
+fn block_search_result_scroll_area(max_height: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .min_scrolled_height(1.0)
+        .max_height(max_height)
+}
+
+// Compact labels and wrapped rows must not change keyboard control identity.
+fn block_search_control(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    selected: Option<bool>,
+) -> egui::Response {
+    let id = ui.make_persistent_id(("block-search-control", id));
+    ui.scope_builder(egui::UiBuilder::new().id(id), |ui| match selected {
+        Some(selected) => ui.selectable_label(selected, label),
+        None => ui.button(label),
+    })
+    .inner
+}
+
 /// Fixed-height, clipped rows keep long commands and cwd text in separate
 /// lanes. The semantic button owns pointer, keyboard and AccessKit actions.
 fn history_picker_row(
@@ -3149,22 +3172,15 @@ impl TerminalApp {
                 .record_version
                 .is_some_and(|version| version.len > 0);
 
-            let screen_rect = ctx.viewport_rect();
-            let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
-            let picker_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
-            let picker_pos = egui::pos2(
-                screen_rect.center().x - picker_width / 2.0,
-                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
-            );
+            let picker_rect = history_picker_rect(ctx.content_rect());
+            let compact_controls = picker_rect.height() < 340.0;
             let mut intent_control_focused = false;
 
             egui::Window::new("Block Search")
                 .title_bar(false)
                 .resizable(false)
                 .movable(false)
-                .default_pos(picker_pos)
-                .default_size([picker_width, picker_height])
-                .fixed_size([picker_width, picker_height])
+                .fixed_rect(picker_rect)
                 .frame(egui::Frame {
                     fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
                     stroke: egui::Stroke::new(
@@ -3178,7 +3194,11 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("🔍");
-                        let search_response = ui.text_edit_singleline(&mut self.block_search.query);
+                        let search_response = ui.add_sized(
+                            [ui.available_width(), ui.spacing().interact_size.y],
+                            egui::TextEdit::singleline(&mut self.block_search.query)
+                                .hint_text("Search block commands and output…"),
+                        );
                         if search_response.changed() {
                             self.block_search.query =
                                 crate::block_mode::bounded_block_search_query(std::mem::take(
@@ -3191,24 +3211,23 @@ impl TerminalApp {
                             self.block_search.needs_focus = false;
                             self.block_search.needs_bookmark_focus = false;
                         }
-                        if search_response.has_focus() && self.block_search.query.is_empty() {
-                            ui.label("Search block commands and output...");
-                        }
                     });
 
-                    // Keep the query usable at the picker's 360 px minimum.
-                    // The compact matching/actions row fits below it instead
-                    // of squeezing the text editor after Refresh was added.
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Match").small());
-                        let case_button = ui
-                            .selectable_label(self.block_search.case_sensitive, "Aa")
+                    // Short windows retain every control and the virtualized
+                    // result list. Compact labels keep two control rows usable.
+                    ui.horizontal_wrapped(|ui| {
+                        if compact_controls {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            ui.spacing_mut().button_padding.x = 3.0;
+                        }
+                        if !compact_controls {
+                            ui.label(egui::RichText::new("Match").small());
+                        }
+                        let case_button = block_search_control(ui, "match-case", "Aa", Some(self.block_search.case_sensitive))
                             .on_hover_text("Match case");
-                        let regex_button = ui
-                            .selectable_label(self.block_search.regex, ".*")
+                        let regex_button = block_search_control(ui, "match-regex", ".*", Some(self.block_search.regex))
                             .on_hover_text("Regular expression");
-                        let whole_word_button = ui
-                            .selectable_label(self.block_search.whole_word, "W")
+                        let whole_word_button = block_search_control(ui, "match-word", "W", Some(self.block_search.whole_word))
                             .on_hover_text("Match whole words");
                         case_button.widget_info(|| {
                             egui::WidgetInfo::selected(
@@ -3255,8 +3274,7 @@ impl TerminalApp {
                             self.block_search.needs_focus = true;
                             self.refresh_block_search_hits();
                         }
-                        let refresh_button = ui
-                            .button("Refresh")
+                        let refresh_button = block_search_control(ui, "refresh", if compact_controls { "↻" } else { "Refresh" }, None)
                             .on_hover_text("Refresh block search results (F5)");
                         refresh_button.widget_info(|| {
                             egui::WidgetInfo::labeled(
@@ -3269,8 +3287,7 @@ impl TerminalApp {
                         if refresh_button.clicked() {
                             self.block_search_manual_refresh();
                         }
-                        let reset_button = ui
-                            .button("Reset")
+                        let reset_button = block_search_control(ui, "reset", if compact_controls { "↺" } else { "Reset" }, None)
                             .on_hover_text("Reset query, matching options, scope, and filters");
                         reset_button.widget_info(|| {
                             egui::WidgetInfo::labeled(
@@ -3284,17 +3301,19 @@ impl TerminalApp {
                             self.block_search.reset_intent();
                             self.refresh_block_search_hits();
                         }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Scope").small());
+                        if compact_controls {
+                            ui.separator();
+                        } else {
+                            ui.end_row();
+                            ui.label(egui::RichText::new("Scope").small());
+                        }
                         for (label, scope) in [
                             ("All", crate::block_mode::BlockSearchScope::All),
                             ("Cmd", crate::block_mode::BlockSearchScope::Command),
                             ("Out", crate::block_mode::BlockSearchScope::Output),
                         ] {
-                            let scope_button =
-                                ui.selectable_label(self.block_search.scope == scope, label);
+                            let scope_button = block_search_control(ui, ("scope", label), label,
+                                Some(self.block_search.scope == scope));
                             scope_button.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::Button,
@@ -3327,8 +3346,14 @@ impl TerminalApp {
                                 crate::block_search::BlockSearchFilter::Background,
                             ),
                         ] {
-                            let filter_button =
-                                ui.selectable_label(self.block_search.filter == filter, label);
+                            let display_label = if compact_controls {
+                                match filter {
+                                    crate::block_search::BlockSearchFilter::Bookmarked => "★",
+                                    _ => label,
+                                }
+                            } else { label };
+                            let filter_button = block_search_control(ui, ("filter", label), display_label,
+                                Some(self.block_search.filter == filter)).on_hover_text(format!("Block filter: {label}"));
                             filter_button.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::Button,
@@ -3350,7 +3375,11 @@ impl TerminalApp {
                     ui.separator();
                     let query_error = self.block_search.query_error.clone();
                     if let Some(error) = &query_error {
-                        ui.label(egui::RichText::new(error).small().color(egui::Color32::RED));
+                        let label = egui::Label::new(
+                            egui::RichText::new(error).small().color(egui::Color32::RED),
+                        );
+                        ui.add(if compact_controls { label.truncate() } else { label.wrap() })
+                            .on_hover_text(error);
                     } else {
                         ui.label(
                             egui::RichText::new(self.block_search.count_label())
@@ -3372,12 +3401,21 @@ impl TerminalApp {
                     };
                     let selected_index = self.block_search.selected_index;
                     let query_is_empty = self.block_search.query.trim().is_empty();
-                    let list_height = picker_height - 148.0;
+                    const FULL_HELP: &str = "F5 Refresh  ↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+Shift+B Bookmark  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close";
+                    let help = if compact_controls {
+                        "↑↓ Navigate · Enter Jump · Esc Close"
+                    } else { FULL_HELP };
+                    let help_height = ui.painter().layout(
+                        help.to_owned(), egui::FontId::proportional(10.0),
+                        ui.visuals().weak_text_color(), ui.available_width(),
+                    ).size().y;
+                    let list_height = (ui.available_height() - help_height
+                        - ui.spacing().item_spacing.y * 2.0 - 8.0).max(1.0);
                     let scroll_to_selected =
                         std::mem::take(&mut self.block_search.scroll_to_selected);
 
                     if hit_count > 0 {
-                        let mut scroll = egui::ScrollArea::vertical().max_height(list_height);
+                        let mut scroll = block_search_result_scroll_area(list_height);
                         // Pointer movement wins if both devices act in one
                         // frame. A stationary cursor cannot cancel keyboard
                         // traversal simply because recentering moved a row
@@ -3612,8 +3650,7 @@ impl TerminalApp {
                             },
                         );
                     } else if query_error.is_none() {
-                        egui::ScrollArea::vertical()
-                            .max_height(list_height)
+                        block_search_result_scroll_area(list_height)
                             .show(ui, |ui| {
                                 let mut empty_message = if !pane_has_prompt_marks {
                                     "This pane has no command blocks: the shell is not reporting commands (OSC 133). Run “Install or update jsh” from the command palette.".to_string()
@@ -3650,15 +3687,13 @@ impl TerminalApp {
                     }
 
                     ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "F5 Refresh  ↑↓ Navigate  Enter Jump  Shift+Enter Jump & Next  Ctrl+Shift+B Bookmark  Ctrl+U Clear  Ctrl+Shift+U Reset  Esc Close",
-                            )
-                                .size(10.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    });
+                    let help_response = ui.add(egui::Label::new(
+                        egui::RichText::new(help).size(10.0)
+                            .color(ui.visuals().weak_text_color()),
+                    ).wrap()).on_hover_text(FULL_HELP);
+                    help_response.widget_info(|| egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label, true, FULL_HELP,
+                    ));
                 });
             if restored_bookmark_focus {
                 self.block_search.needs_bookmark_focus = false;
@@ -4915,6 +4950,106 @@ mod tests {
         });
         assert_eq!(action, Some(WorkflowArgsAction::Submit));
         assert_eq!(state.render().unwrap(), "printf AB");
+    }
+
+    #[test]
+    fn compact_block_search_controls_preserve_focus_across_resize() {
+        let ctx = egui::Context::default();
+        let frame = |compact: bool, events, focus: bool| {
+            let mut result = None;
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(280.0, 240.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if !compact {
+                            ui.label("Match");
+                        }
+                        let _ = block_search_control(ui, "match-case", "Aa", Some(false));
+                        let response = block_search_control(
+                            ui,
+                            "reset",
+                            if compact { "↺" } else { "Reset" },
+                            None,
+                        );
+                        if focus {
+                            response.request_focus();
+                        }
+                        result = Some((response.id, response.has_focus(), response.clicked()));
+                    });
+                },
+            );
+            result.unwrap()
+        };
+        let original = frame(false, vec![], true).0;
+        assert!(frame(false, vec![], false).1);
+        let resized = frame(true, vec![], false);
+        assert_eq!(resized.0, original);
+        assert!(
+            resized.1,
+            "compact labels must not transfer focus to another action"
+        );
+        let pressed = frame(
+            true,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            false,
+        );
+        assert!(pressed.2, "Enter still activates the same Reset button");
+    }
+
+    #[test]
+    fn compact_block_search_viewport_stays_bounded_and_virtualized() {
+        for height in [1.0, 24.0, 40.0, 120.0] {
+            let ctx = egui::Context::default();
+            let mut drawn = 0;
+            let mut last_visible = false;
+            for _ in 0..3 {
+                run_frame(
+                    &ctx,
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(280.0, 240.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let output = block_search_result_scroll_area(height)
+                            .vertical_scroll_offset(9_999.0 * 44.0)
+                            .show_rows(ui, 40.0, 10_000, |ui, range| {
+                                drawn = range.len();
+                                last_visible = range.contains(&9_999);
+                                for _ in range {
+                                    ui.allocate_exact_size(
+                                        egui::vec2(240.0, 40.0),
+                                        egui::Sense::hover(),
+                                    );
+                                }
+                            });
+                        assert!(output.inner_rect.height() <= height + 0.1);
+                        assert!(ui.label("Search keyboard help").rect.bottom() <= 240.0);
+                    },
+                );
+            }
+            assert!(drawn <= 5, "only visible rows may be built: {drawn}");
+            assert!(
+                last_visible,
+                "navigation can still reveal the final indexed result"
+            );
+        }
     }
 
     #[test]
