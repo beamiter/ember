@@ -71,6 +71,7 @@ struct BlockWorkspaceSnapshot {
     collapsed: bool,
     collapse_available: bool,
     in_history: bool,
+    unseen_completed: usize,
     prompt_ready: bool,
     has_prompt_marks: bool,
     read_only: bool,
@@ -84,6 +85,7 @@ enum BlockWorkspaceAction {
     Target(crate::block_mode::BlockMenuAction),
     Deselect,
     Live,
+    Review,
 }
 
 /// Scope selection to the focused session; a selection left in another pane
@@ -95,7 +97,10 @@ fn block_workspace_selection<'a>(
     selection.filter(|selection| selection.session_id == session_id)
 }
 
-fn block_workspace_status(record: &crate::terminal::CommandRecord, newest: bool) -> (String, bool) {
+pub(crate) fn block_workspace_status(
+    record: &crate::terminal::CommandRecord,
+    newest: bool,
+) -> (String, bool) {
     use crate::block_mode::BlockOutcome;
     let outcome = crate::block_mode::classify_outcome(
         record.command.as_deref(),
@@ -179,8 +184,23 @@ fn block_workspace_selection_menu(
 ) {
     use crate::block_mode::BlockMenuAction as Target;
     let valid = snapshot.active_record_id.is_some();
+    block_workspace_menu_item(
+        ui,
+        focus,
+        action,
+        "Review selected blocks",
+        valid,
+        "Inspect full commands, captured output and provenance in terminal order",
+        BlockWorkspaceAction::Review,
+    );
     ui.set_min_width(220.0);
     ui.label(egui::RichText::new(format!("{} selected", snapshot.selected_count)).strong());
+    if snapshot.unseen_completed > 0 {
+        ui.strong(format!(
+            "{} new completions while reading",
+            snapshot.unseen_completed
+        ));
+    }
     if !snapshot.command_preview.is_empty() {
         ui.add(egui::Label::new(&snapshot.command_preview).wrap());
     }
@@ -223,7 +243,7 @@ fn block_workspace_selection_menu(
     ui.separator();
     block_workspace_menu_item(ui, focus, action, "Fill prompt", valid && !snapshot.read_only,
         "Insert selected commands at an empty prompt for review. Nothing is executed. Safe replay checks still apply.",
-        BlockWorkspaceAction::Target(Target::Reinput));
+        BlockWorkspaceAction::Review);
     block_workspace_menu_item(
         ui,
         focus,
@@ -286,6 +306,12 @@ fn block_workspace_overflow(
     use crate::keybindings::Command;
     ui.set_min_width(220.0);
     ui.weak("Focused pane");
+    if snapshot.unseen_completed > 0 {
+        ui.strong(format!(
+            "{} new completions while reading",
+            snapshot.unseen_completed
+        ));
+    }
     for (label, command, needs_blocks, tooltip) in [
         (
             "Search blocks",
@@ -497,6 +523,11 @@ fn draw_block_workspace(
                 } else {
                     "Live terminal"
                 };
+                let status = if snapshot.unseen_completed > 0 {
+                    format!("{status} · {} new completions", snapshot.unseen_completed)
+                } else {
+                    status.to_owned()
+                };
                 ui.add(egui::Label::new(egui::RichText::new(status).weak()).truncate());
             }
         } else if snapshot.alternate_screen {
@@ -514,6 +545,17 @@ fn draw_block_workspace(
                 if block_workspace_control(
                     ui,
                     focus,
+                    "Review",
+                    valid,
+                    "Inspect selected command blocks without running anything",
+                )
+                .clicked()
+                {
+                    action = Some(BlockWorkspaceAction::Review);
+                }
+                if block_workspace_control(
+                    ui,
+                    focus,
                     "Copy",
                     valid,
                     "Copy selected commands and output as plain text",
@@ -521,17 +563,6 @@ fn draw_block_workspace(
                 .clicked()
                 {
                     action = Some(BlockWorkspaceAction::Target(Target::CopyBlocks));
-                }
-                if block_workspace_control(
-                    ui,
-                    focus,
-                    "Fill prompt",
-                    valid && !snapshot.read_only,
-                    "Insert selected commands at an empty prompt for review. Nothing is executed.",
-                )
-                .clicked()
-                {
-                    action = Some(BlockWorkspaceAction::Target(Target::Reinput));
                 }
             }
             let response = block_workspace_control(
@@ -604,6 +635,14 @@ fn draw_block_workspace(
                 ui.label(egui::RichText::new(&snapshot.status).color(color));
                 ui.separator();
             }
+            let hint = if snapshot.unseen_completed > 0 {
+                format!(
+                    "{} new completions · Go live when ready",
+                    snapshot.unseen_completed
+                )
+            } else {
+                hint.to_owned()
+            };
             ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate())
                 .on_hover_text("Click a command header to select it; use the left ⋯ button for actions. Shift-click extends a range; Ctrl+Shift-click toggles a block. Block cards require OSC 133 shell integration.");
         }
@@ -1349,6 +1388,12 @@ impl TerminalApp {
     }
 
     fn render_block_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, enabled: bool) {
+        self.reading_history.retain_sessions(
+            self.session_manager
+                .sessions()
+                .iter()
+                .map(|s| s.metadata.session_id.as_str()),
+        );
         let active_index = self.session_manager.active_index();
         let Some(session) = self.session_manager.sessions().get(active_index) else {
             return;
@@ -1395,7 +1440,18 @@ impl TerminalApp {
         if running.is_some() && active.is_none() && !terminal.is_alt_buffer_active() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        let in_history = if session.projection_policy.is_identity() {
+            terminal.scroll_offset > 0
+        } else {
+            session.projection_view_state.offset_from_bottom() > 0
+        };
+        let unseen_completed = self.reading_history.update(
+            session_id,
+            records,
+            in_history || selected_count > 0 || self.block_review.is_some(),
+        );
         let snapshot = BlockWorkspaceSnapshot {
+            unseen_completed,
             session_id: session_id.clone(),
             completed_count: retained_ids.len(),
             selected_count,
@@ -1464,6 +1520,7 @@ impl TerminalApp {
             return;
         };
         match action {
+            BlockWorkspaceAction::Review => self.open_block_review(),
             BlockWorkspaceAction::Command(command) => {
                 self.dispatch_command(ctx, command);
             }
@@ -1938,6 +1995,7 @@ impl TerminalApp {
 
     #[allow(deprecated)]
     pub fn render_floating_panels(&mut self, ctx: &egui::Context) {
+        self.render_block_review(ctx);
         const LIVE_SEARCH_REFRESH_INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(300);
         if self.search_state.is_open && self.search_state.projection_message.is_some() {

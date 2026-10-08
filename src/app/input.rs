@@ -737,17 +737,18 @@ impl TerminalApp {
     }
 
     pub(crate) fn terminal_input_blocked(&self, ctx: &egui::Context) -> bool {
-        should_block_terminal_input(
-            self.search_state.is_open,
-            self.config_panel.is_open,
-            self.search_replace_panel.is_open,
-            self.pending_paste_confirm.is_some(),
-            self.command_palette.is_open,
-            self.block_search.is_open,
-            self.history_picker.is_some(),
-            self.workflow_picker.is_some() || self.workflow_args.is_some(),
-            ctx.text_edit_focused(),
-        )
+        self.block_review.is_some()
+            || should_block_terminal_input(
+                self.search_state.is_open,
+                self.config_panel.is_open,
+                self.search_replace_panel.is_open,
+                self.pending_paste_confirm.is_some(),
+                self.command_palette.is_open,
+                self.block_search.is_open,
+                self.history_picker.is_some(),
+                self.workflow_picker.is_some() || self.workflow_args.is_some(),
+                ctx.text_edit_focused(),
+            )
     }
 
     pub(crate) fn active_terminal_is_read_only(&self) -> bool {

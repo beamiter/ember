@@ -654,6 +654,7 @@ pub enum BlockSelectionGesture {
 /// Action selected from a finished card's context menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockMenuAction {
+    Review,
     CopyCommands,
     AskAgent,
     /// frost 的 `BlockMenuAction::AskAi`：把块作为不可信证据附加到 Agent

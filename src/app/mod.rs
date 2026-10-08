@@ -1,5 +1,6 @@
 // Application core module - main app state and coordination
 
+pub(crate) mod block_review;
 pub mod commands;
 pub mod events;
 pub mod input;

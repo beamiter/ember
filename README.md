@@ -335,12 +335,21 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
 
 - Click a command header or press **Ctrl+↑** to select a completed block
 - Use **↑ / ↓** to navigate and **Shift+↑ / Shift+↓** to extend a range
-- **Enter** or **Fill prompt** inserts selected commands without executing them
+- **Review** opens selected blocks in terminal order, with full retained command text, cwd,
+  outcome, duration, lifecycle evidence and bounded captured output
+- **Fill prompt** and card-menu insertion open this review before **Insert at prompt**;
+  **Enter** keeps the existing direct, guarded selection-insertion shortcut
 - **Escape** clears selection, or returns keyboard focus from a block control to the terminal
 - Each completed card has a **⋯** action menu in the left lane; right-click remains available
 - Card menus group **Copy & share**, **Reuse**, and **Organize & navigate** actions, with command,
   working directory and completion status shown together
-- **Go live** returns to the editable prompt, including when output is collapsed
+- While reading history, new retained completions are counted without moving your view;
+  **Go live** returns to the editable prompt, including when output is collapsed
+- Review follows terminal-owned block identities. Evicted blocks cannot silently retarget
+  a reused shell id; closing review preserves your position and returns terminal focus
+- Commands and output show escaped control/bidi characters, explicit missing/truncated
+  snapshot notices, and a 256 KiB display cap per text pane. Output is a retained snapshot,
+  not a claim that every original byte is available
 
 Terminal text remains selectable independently of whole-block selection. The action lane
 never covers terminal cells; very short clipped rows may omit their menu button, while
@@ -348,7 +357,8 @@ right-click, workspace actions and keyboard navigation remain available. Run-aga
 continue to use Ember's existing exact-command and safe-replay checks.
 
 For headless layout review, set `EMBER_UI_SNAPSHOT_DIR=/tmp/ember-ui` and run
-`cargo test --bin ember block_workspace_offscreen_visual_smoke`. The fixture checks
+`cargo test --bin ember block_workspace_offscreen_visual_smoke` and
+`cargo test --bin ember block_review_offscreen_visual_and_escape_reopen`. The fixture checks
 wide/narrow hit targets and exports the real egui/CPU-terminal meshes for idle,
 empty, failed, collapsed, multiple-selection and running states. These CPU captures complement
 native window/GPU testing; they do not replace it.

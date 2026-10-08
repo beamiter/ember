@@ -2977,6 +2977,16 @@ impl TerminalRenderer {
                         ui.label(egui::RichText::new(cwd).small().weak());
                     }
                     ui.separator();
+                    if block_menu_button(
+                        ui,
+                        "Review selected blocks",
+                        true,
+                        "Inspect commands, output and provenance",
+                    ) {
+                        chosen = Some(crate::block_mode::BlockMenuAction::Review);
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.label(egui::RichText::new("COPY & SHARE").small().weak());
                     if let Some(detail) = lifecycle_warning {
                         ui.colored_label(

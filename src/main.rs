@@ -2514,6 +2514,8 @@ impl TerminalApp {
             active_session_epoch: 1,
             command_sidebar: Default::default(),
             task_sidebar: Default::default(),
+            block_review: None,
+            reading_history: Default::default(),
             block_selection: None,
             block_search: Default::default(),
             block_bookmarks: Default::default(),

@@ -243,6 +243,8 @@ pub struct TerminalApp {
     /// Block mode 当前选中的命令块范围。范围持有 session、固定 anchor、
     /// active edge 与 terminal-order ids；record 被淘汰或 session 关闭时一律
     /// 按“无选中”处理（绝不 panic）。真实键盘输入送往 PTY 时清空。
+    pub(crate) block_review: Option<super::block_review::BlockReview>,
+    pub(crate) reading_history: super::block_review::ReadingHistory,
     pub block_selection: Option<crate::block_mode::BlockSelection>,
 
     /// `block:search` 跨块搜索选择器（palette 式浮层）。打开期间拥有键盘

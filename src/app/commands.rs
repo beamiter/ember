@@ -358,7 +358,7 @@ pub(crate) fn verified_local_command_cwd(
 }
 
 #[derive(Debug)]
-enum SelectedReplayError {
+pub(crate) enum SelectedReplayError {
     NoSelection,
     MissingRecord,
     ExactCommandUnavailable,
@@ -371,6 +371,62 @@ enum SelectedReplayError {
     UnsafeCommand(crate::review_text::ReviewTextError),
     TooLarge { limit: usize },
     WriteFailed(crate::shell::ShellWriteError),
+}
+
+pub(super) fn selected_replay_error_message(error: &SelectedReplayError) -> String {
+    match error {
+        SelectedReplayError::NoSelection => "No command blocks are selected".to_string(),
+        SelectedReplayError::MissingRecord => {
+            "A selected command block is no longer available".to_string()
+        }
+        SelectedReplayError::ExactCommandUnavailable => {
+            "Exact command text is unavailable for part of the selection".to_string()
+        }
+        SelectedReplayError::NoCommands => {
+            "The selected blocks contain no commands to reinput".to_string()
+        }
+        SelectedReplayError::NotPromptReady => {
+            "Wait for the shell prompt before reinputting commands".to_string()
+        }
+        SelectedReplayError::AlternateScreen => {
+            "Cannot reinput commands while an alternate-screen app is open".to_string()
+        }
+        SelectedReplayError::BracketedPasteDisabled => {
+            "Safe multi-command replay requires bracketed-paste mode".to_string()
+        }
+        SelectedReplayError::PendingInput => {
+            "Wait for pending terminal input to be delivered".to_string()
+        }
+        SelectedReplayError::PromptNotEmpty => {
+            "Clear the current prompt before inserting selected commands".to_string()
+        }
+        SelectedReplayError::UnsafeCommand(error) => {
+            format!("Command replay rejected: {error}")
+        }
+        SelectedReplayError::TooLarge { limit } => {
+            format!("Selected commands exceed the {limit}-byte replay limit")
+        }
+        SelectedReplayError::WriteFailed(error) => {
+            format!("Command replay failed: {error}")
+        }
+    }
+}
+
+pub(super) fn review_replay_error(records: &[&crate::terminal::CommandRecord]) -> Option<String> {
+    let ids = records.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    selected_commands_in_terminal_order(
+        records.iter().map(|r| SelectedReplayRecord {
+            id: &r.id,
+            command: r.command.as_deref(),
+            exact: r.command_exact,
+            truncated: r.command_truncated,
+            complete: r.complete,
+        }),
+        &ids,
+        crate::review_text::MAX_PROMPT_INSERT_BYTES,
+    )
+    .err()
+    .map(|error| selected_replay_error_message(&error))
 }
 
 #[derive(Clone, Copy)]
@@ -1717,6 +1773,18 @@ impl TerminalApp {
             execution_id: request.record_id,
         };
         match request.action {
+            crate::block_mode::BlockMenuAction::Review
+            | crate::block_mode::BlockMenuAction::Reinput => {
+                if !self.block_selection.as_ref().is_some_and(|s| {
+                    s.session_id == session_id && s.selected_ids.contains(&target.execution_id)
+                }) {
+                    self.block_selection = Some(crate::block_mode::BlockSelection::single(
+                        session_id.to_owned(),
+                        target.execution_id.clone(),
+                    ));
+                }
+                self.open_block_review();
+            }
             crate::block_mode::BlockMenuAction::CopyCommands => {
                 self.copy_block_context(&target, CopyKind::Command)
             }
@@ -1733,7 +1801,6 @@ impl TerminalApp {
             crate::block_mode::BlockMenuAction::CopyMarkdown => {
                 self.copy_block_context_markdown(&target)
             }
-            crate::block_mode::BlockMenuAction::Reinput => self.block_reinput_selected_commands(),
             // 与 Commands 侧边栏的 "Run again" 共用同一条重放路径:命令
             // 权威性、只读任务终端、提示符/括号粘贴守卫和状态反馈都已经在
             // 那里实现,这里不重复判断。
@@ -3265,7 +3332,7 @@ impl TerminalApp {
         }
     }
 
-    fn try_reinput_selected_commands(&mut self) -> Result<usize, SelectedReplayError> {
+    pub(crate) fn try_reinput_selected_commands(&mut self) -> Result<usize, SelectedReplayError> {
         if !self.config.block_mode {
             self.clear_block_selection();
             return Err(SelectedReplayError::NoSelection);
@@ -3338,42 +3405,7 @@ impl TerminalApp {
     }
 
     fn report_selected_replay_error(&mut self, error: SelectedReplayError) {
-        let message = match error {
-            SelectedReplayError::NoSelection => "No command blocks are selected".to_string(),
-            SelectedReplayError::MissingRecord => {
-                "A selected command block is no longer available".to_string()
-            }
-            SelectedReplayError::ExactCommandUnavailable => {
-                "Exact command text is unavailable for part of the selection".to_string()
-            }
-            SelectedReplayError::NoCommands => {
-                "The selected blocks contain no commands to reinput".to_string()
-            }
-            SelectedReplayError::NotPromptReady => {
-                "Wait for the shell prompt before reinputting commands".to_string()
-            }
-            SelectedReplayError::AlternateScreen => {
-                "Cannot reinput commands while an alternate-screen app is open".to_string()
-            }
-            SelectedReplayError::BracketedPasteDisabled => {
-                "Safe multi-command replay requires bracketed-paste mode".to_string()
-            }
-            SelectedReplayError::PendingInput => {
-                "Wait for pending terminal input to be delivered".to_string()
-            }
-            SelectedReplayError::PromptNotEmpty => {
-                "Clear the current prompt before inserting selected commands".to_string()
-            }
-            SelectedReplayError::UnsafeCommand(error) => {
-                format!("Command replay rejected: {error}")
-            }
-            SelectedReplayError::TooLarge { limit } => {
-                format!("Selected commands exceed the {limit}-byte replay limit")
-            }
-            SelectedReplayError::WriteFailed(error) => {
-                format!("Command replay failed: {error}")
-            }
-        };
+        let message = selected_replay_error_message(&error);
         self.set_status_for(message, Duration::from_secs(5));
     }
 
