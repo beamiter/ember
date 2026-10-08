@@ -5,6 +5,221 @@ use crate::theme::ThemeExt as _;
 use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
 
+fn history_picker_rect(screen: egui::Rect) -> egui::Rect {
+    let available = screen.shrink(16.0);
+    let size = egui::vec2(
+        available.width().clamp(1.0, 720.0),
+        available.height().clamp(1.0, 520.0),
+    );
+    let top = (screen.top() + (screen.height() * 0.12).max(16.0))
+        .min(available.bottom() - size.y)
+        .max(available.top());
+    egui::Rect::from_min_size(egui::pos2(screen.center().x - size.x / 2.0, top), size)
+}
+
+/// Fixed-height, clipped rows keep long commands and cwd text in separate
+/// lanes. The semantic button owns pointer, keyboard and AccessKit actions.
+fn history_picker_row(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    record: &jterm_core::command_history::CommandHistoryRecord,
+    selected: bool,
+    current_theme: &theme::Theme,
+) -> egui::Response {
+    let line_height = ui.text_style_height(&egui::TextStyle::Body);
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), line_height * 2.0 + 10.0));
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if selected || response.hovered() {
+        let accent = crate::theme::Theme::rgb_to_color32(current_theme.tabbar.active_border);
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            accent.gamma_multiply(if selected { 0.18 } else { 0.08 }),
+        );
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let command = crate::history_picker::display_command(&record.command);
+    let cwd = record
+        .cwd
+        .as_deref()
+        .map(|cwd| {
+            crate::review_text::visible_bounded(&crate::pane_header::abbreviate_home(cwd), 512)
+        })
+        .unwrap_or_else(|| "Directory not recorded".into());
+    let status = if record.exit_code == 0 {
+        "Succeeded".to_owned()
+    } else {
+        format!("Exit {}", record.exit_code)
+    };
+    let inner = rect.shrink2(egui::vec2(6.0, 4.0));
+    let command_rect = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), line_height));
+    let detail_rect = egui::Rect::from_min_size(
+        inner.min + egui::vec2(0.0, line_height + 2.0),
+        egui::vec2(inner.width(), line_height),
+    );
+    ui.place(
+        command_rect,
+        egui::Label::new(&command)
+            .selectable(false)
+            .truncate()
+            .halign(egui::Align::Min),
+    );
+    ui.place(
+        detail_rect,
+        egui::Label::new(
+            egui::RichText::new(format!("{status} · {cwd}"))
+                .size(10.0)
+                .color(ui.visuals().weak_text_color()),
+        )
+        .selectable(false)
+        .truncate()
+        .halign(egui::Align::Min),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            format!("Recall {command}; {status}; {cwd}; fills prompt only"),
+        )
+    });
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HistoryPickerAction {
+    Close,
+    Fill(String),
+}
+
+fn draw_history_picker(
+    ctx: &egui::Context,
+    state: &mut crate::history_picker::HistoryPickerState,
+    current_theme: &theme::Theme,
+) -> Option<HistoryPickerAction> {
+    let mut accepted_history_command = None;
+    let mut hovered_history_index = None;
+    let pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
+    {
+        let picker_rect = history_picker_rect(ctx.content_rect());
+        let picker_height = picker_rect.height();
+
+        egui::Window::new("Command History")
+            .title_bar(false)
+            .resizable(false)
+            .movable(false)
+            .fixed_rect(picker_rect)
+            .frame(egui::Frame {
+                fill: crate::theme::Theme::rgb_to_color32(current_theme.ui.panel_bg),
+                stroke: egui::Stroke::new(
+                    1.0,
+                    crate::theme::Theme::rgb_to_color32(current_theme.ui.border),
+                ),
+                corner_radius: egui::CornerRadius::same(10),
+                inner_margin: egui::Margin::same(8),
+                ..Default::default()
+            })
+            .show(ctx, |ui| {
+                // 搜索输入框：编辑即重置高亮（与 frost 的 on_input 一致）。
+                ui.horizontal(|ui| {
+                    ui.label("↺");
+                    let search_response = ui.add_sized(
+                        [ui.available_width(), ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(state.query_buffer_mut())
+                            .hint_text("Recall a command…"),
+                    );
+                    if search_response.changed() {
+                        state.sync_query();
+                    }
+                    if state.needs_focus {
+                        search_response.request_focus();
+                        state.needs_focus = false;
+                    }
+                });
+
+                ui.separator();
+
+                // Borrow cached visible rows. Only an accepted command needs a
+                // copy; repainting long history must not clone every payload.
+                let scroll_to_selected = state.take_scroll_to_selected();
+                let results = state.filtered();
+                let selected_index = state.selected;
+
+                egui::ScrollArea::vertical()
+                    .max_height((picker_height - 96.0).max(24.0))
+                    .show(ui, |ui| {
+                        for (idx, record) in results.iter().enumerate() {
+                            let is_selected = idx == selected_index;
+
+                            let click_response = history_picker_row(
+                                ui,
+                                ui.make_persistent_id(("history-row", state.query(), idx)),
+                                record,
+                                is_selected,
+                                current_theme,
+                            );
+                            if (is_selected && scroll_to_selected) || click_response.gained_focus()
+                            {
+                                click_response.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if (click_response.hovered() && pointer_moved)
+                                || click_response.gained_focus()
+                            {
+                                hovered_history_index = Some(idx);
+                            }
+                            if block_search_result_render_activation(&click_response) {
+                                accepted_history_command = Some(record.command.clone());
+                            }
+
+                            ui.separator();
+                        }
+
+                        if results.is_empty() {
+                            let hint = if state.query().is_empty() {
+                                "No persisted commands yet (recorded via OSC 133 shell integration)"
+                            } else {
+                                "No commands match"
+                            };
+                            ui.label(
+                                egui::RichText::new(hint).color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
+
+                // 底部提示：Enter 只回填，不执行
+                ui.separator();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("↑↓ Navigate · Enter Fill at Prompt · Esc Cancel")
+                            .size(10.0)
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .wrap(),
+                );
+            });
+    }
+
+    if let Some(index) = hovered_history_index {
+        state.select_hovered(index);
+    }
+    if state.take_confirm_request() {
+        Some(
+            state
+                .selected_command()
+                .map_or(HistoryPickerAction::Close, HistoryPickerAction::Fill),
+        )
+    } else {
+        accepted_history_command.map(HistoryPickerAction::Fill)
+    }
+}
+
 const MIN_FRAME_BUDGET: usize = 16 * 1024;
 const MAX_FRAME_BUDGET: usize = 256 * 1024;
 const TARGET_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
@@ -2445,166 +2660,13 @@ impl TerminalApp {
 
         // 历史命令选择器（history:picker）：与命令面板同款的中央浮层。
         // Enter/点击只回填提示符，绝不执行。
-        let mut accepted_history_command = None;
-        let mut hovered_history_index = None;
-        if self.history_picker.is_some() {
-            let screen_rect = ctx.viewport_rect();
-            let picker_width = (screen_rect.width() - 32.0).clamp(360.0, 720.0);
-            let picker_height = (screen_rect.height() - 96.0).clamp(300.0, 520.0);
-            let picker_pos = egui::pos2(
-                screen_rect.center().x - picker_width / 2.0,
-                screen_rect.top() + (screen_rect.height() * 0.12).max(24.0),
-            );
-
-            egui::Window::new("Command History")
-                .title_bar(false)
-                .resizable(false)
-                .movable(false)
-                .default_pos(picker_pos)
-                .default_size([picker_width, picker_height])
-                .fixed_size([picker_width, picker_height])
-                .frame(egui::Frame {
-                    fill: crate::theme::Theme::rgb_to_color32(self.current_theme.ui.panel_bg),
-                    stroke: egui::Stroke::new(
-                        1.0,
-                        crate::theme::Theme::rgb_to_color32(self.current_theme.ui.border),
-                    ),
-                    corner_radius: egui::CornerRadius::same(10),
-                    inner_margin: egui::Margin::same(8),
-                    ..Default::default()
-                })
-                .show(ctx, |ui| {
-                    let Some(state) = self.history_picker.as_mut() else {
-                        return;
-                    };
-                    // 搜索输入框：编辑即重置高亮（与 frost 的 on_input 一致）。
-                    ui.horizontal(|ui| {
-                        ui.label("↺");
-                        let query = std::mem::take(&mut state.query);
-                        state.set_query(query);
-                        let search_response = ui.text_edit_singleline(&mut state.query);
-                        if search_response.changed() {
-                            let query = std::mem::take(&mut state.query);
-                            state.set_query(query);
-                        }
-                        if state.needs_focus {
-                            search_response.request_focus();
-                            state.needs_focus = false;
-                        }
-                        if search_response.has_focus() && state.query.is_empty() {
-                            ui.label("Recall a command…");
-                        }
-                    });
-
-                    ui.separator();
-
-                    // 快照一份结果，指针动作在窗口闭包外统一应用（与命令面板
-                    // 相同，避免对 history_picker 的双重借用）。
-                    let results: Vec<_> = state.filtered().into_iter().cloned().collect();
-                    let selected_index = state.selected;
-
-                    egui::ScrollArea::vertical()
-                        .max_height(picker_height - 100.0)
-                        .show(ui, |ui| {
-                            for (idx, record) in results.iter().enumerate() {
-                                let is_selected = idx == selected_index;
-
-                                let bg_color = if is_selected {
-                                    crate::theme::Theme::rgb_to_color32(
-                                        self.current_theme.tabbar.active_border,
-                                    )
-                                    .gamma_multiply(0.18)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-
-                                let item_response = ui.horizontal(|ui| {
-                                    let item_rect = ui.available_rect_before_wrap();
-                                    ui.painter().rect_filled(item_rect, 2.0, bg_color);
-
-                                    ui.label(crate::history_picker::display_command(
-                                        &record.command,
-                                    ));
-
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if let Some(cwd) = record.cwd.as_deref() {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        crate::pane_header::abbreviate_home(cwd),
-                                                    )
-                                                    .size(10.0)
-                                                    .color(ui.visuals().weak_text_color()),
-                                                );
-                                            }
-                                            if record.exit_code != 0 {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(255, 100, 100),
-                                                    format!("✗ {}", record.exit_code),
-                                                );
-                                            }
-                                        },
-                                    );
-                                });
-
-                                // 高亮项保持可见
-                                if is_selected {
-                                    item_response
-                                        .response
-                                        .scroll_to_me(Some(egui::Align::Center));
-                                }
-
-                                let click_response = ui
-                                    .interact(
-                                        item_response.response.rect,
-                                        item_response.response.id.with("history_click"),
-                                        egui::Sense::click(),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if click_response.hovered() {
-                                    hovered_history_index = Some(idx);
-                                }
-                                if click_response.clicked() {
-                                    accepted_history_command = Some(record.command.clone());
-                                }
-
-                                ui.separator();
-                            }
-
-                            if results.is_empty() {
-                                let hint = if state.query.is_empty() {
-                                    "No persisted commands yet (recorded via OSC 133 shell integration)"
-                                } else {
-                                    "No commands match"
-                                };
-                                ui.label(
-                                    egui::RichText::new(hint)
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            }
-                        });
-
-                    // 底部提示：Enter 只回填，不执行
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("↑↓ Navigate  Enter Fill at Prompt  Esc Cancel")
-                                .size(10.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    });
-                });
-        }
-
-        if let Some(index) = hovered_history_index {
-            if let Some(state) = self.history_picker.as_mut() {
-                state.selected = index;
+        if let Some(state) = self.history_picker.as_mut() {
+            if let Some(action) = draw_history_picker(ctx, state, &self.current_theme) {
+                self.history_picker = None;
+                if let HistoryPickerAction::Fill(command) = action {
+                    self.fill_prompt_with_history_command(&command);
+                }
             }
-        }
-        if let Some(command) = accepted_history_command {
-            self.history_picker = None;
-            self.fill_prompt_with_history_command(&command);
         }
 
         // 工作流选择器（workflow:picker，anvil/forge 的 workflows）：与历史
@@ -4392,6 +4454,586 @@ mod tests {
         let mut output = ctx.run_ui(input, f);
         output.textures_delta.clear();
         output
+    }
+
+    #[test]
+    fn history_picker_bounds_follow_narrow_and_short_viewports() {
+        for (width, height) in [
+            (1000.0, 680.0),
+            (360.0, 640.0),
+            (360.0, 300.0),
+            (280.0, 200.0),
+        ] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+            let panel = history_picker_rect(screen);
+            assert!(screen.contains_rect(panel));
+            assert!(panel.width() <= width - 32.0);
+            assert!(panel.height() <= height - 32.0);
+        }
+    }
+
+    #[test]
+    fn history_picker_row_text_does_not_steal_pointer_activation() {
+        let ctx = egui::Context::default();
+        let record = jterm_core::command_history::CommandHistoryRecord {
+            command: "printf row-click".into(),
+            cwd: Some("/work/ember".into()),
+            exit_code: 0,
+            end_time_ms: None,
+        };
+        let theme = theme::Theme::default();
+        let mut rect = egui::Rect::NOTHING;
+        let mut clicked = false;
+        let mut frame = |events| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, 200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_width(240.0);
+                    let response = history_picker_row(
+                        ui,
+                        egui::Id::new("pointer-history-row"),
+                        &record,
+                        false,
+                        &theme,
+                    );
+                    rect = response.rect;
+                    clicked = response.clicked_by(egui::PointerButton::Primary);
+                },
+            );
+            (rect, clicked)
+        };
+        let (row, _) = frame(vec![]);
+        frame(vec![]);
+        let pos = row.min + egui::vec2(8.0, 8.0);
+        frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let (_, clicked) = frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            clicked,
+            "row labels are display-only; their hit boxes must not intercept the button"
+        );
+    }
+
+    #[test]
+    fn history_picker_row_is_bounded_accessible_and_activates_exact_payload() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let record = jterm_core::command_history::CommandHistoryRecord {
+            command: format!("printf {}", "编译🙂".repeat(200)),
+            cwd: Some(format!("/{}", "very-long-directory/".repeat(200))),
+            exit_code: 101,
+            end_time_ms: None,
+        };
+        let theme = theme::Theme::default();
+        let row_id = egui::Id::new("history-test-row");
+        let mut clicked = false;
+        let render = |ui: &mut egui::Ui| {
+            ui.set_width(240.0);
+            let response = history_picker_row(ui, row_id, &record, true, &theme);
+            assert!(response.rect.width() <= 240.0);
+            response.clicked()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(280.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let output = run_frame(&ctx, input.clone(), |ui| {
+            clicked = render(ui);
+        });
+        assert!(!clicked);
+        let node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node
+                        .label()
+                        .is_some_and(|label| label.starts_with("Recall printf")))
+                .then_some((*id, node))
+            })
+            .expect("row exposes a semantic recall button");
+        let bounds = node.1.bounds().unwrap();
+        assert!(bounds.x0 >= 0.0 && bounds.x1 <= 280.0);
+        assert!(node.1.label().unwrap().contains("fills prompt only"));
+        let mut click = input;
+        click.events.push(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: node.0,
+                data: None,
+            },
+        ));
+        run_frame(&ctx, click, |ui| {
+            clicked = render(ui);
+        });
+        assert!(clicked, "direct assistive activation reaches the real row");
+        assert_eq!(
+            record.command.len(),
+            "printf ".len() + "编译🙂".len() * 200,
+            "display never rewrites the accepted payload"
+        );
+    }
+
+    #[test]
+    fn history_picker_assistive_activation_returns_full_review_only_command() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let command = format!("printf {}", "long-argument-".repeat(200));
+        let mut state = crate::history_picker::HistoryPickerState::new(vec![
+            jterm_core::command_history::CommandHistoryRecord {
+                command: command.clone(),
+                cwd: Some("/work/ember".into()),
+                exit_code: 0,
+                end_time_ms: None,
+            },
+        ]);
+        let theme = theme::Theme::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let mut accepted = None;
+        let mut output = run_frame(&ctx, input.clone(), |_ui| {
+            accepted = draw_history_picker(&ctx, &mut state, &theme);
+        });
+        for _ in 0..2 {
+            output = run_frame(&ctx, input.clone(), |_ui| {
+                accepted = draw_history_picker(&ctx, &mut state, &theme);
+            });
+        }
+        assert!(accepted.is_none());
+        let node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node
+                        .label()
+                        .is_some_and(|label| label.starts_with("Recall printf")))
+                .then_some(*id)
+            })
+            .expect("history result is an accessible button");
+        let mut click = input;
+        click.events.push(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: node,
+                data: None,
+            },
+        ));
+        let output = run_frame(&ctx, click, |_ui| {
+            accepted = draw_history_picker(&ctx, &mut state, &theme);
+        });
+        assert_eq!(
+            accepted,
+            Some(HistoryPickerAction::Fill(command.clone())),
+            "the display ellipsis never enters the returned payload"
+        );
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "the picker returns intent only; it cannot execute or copy"
+        );
+    }
+
+    #[test]
+    fn history_picker_row_focus_and_stale_actions_respect_current_query() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut state = crate::history_picker::HistoryPickerState::new(
+            ["cargo test", "git status", "pwd"]
+                .into_iter()
+                .map(
+                    |command| jterm_core::command_history::CommandHistoryRecord {
+                        command: command.into(),
+                        cwd: None,
+                        exit_code: 0,
+                        end_time_ms: None,
+                    },
+                )
+                .collect(),
+        );
+        let theme = theme::Theme::default();
+        let frame = |state: &mut crate::history_picker::HistoryPickerState, events| {
+            let mut accepted = None;
+            let output = run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, 640.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    accepted = draw_history_picker(&ctx, state, &theme);
+                },
+            );
+            (output, accepted)
+        };
+        let mut output = frame(&mut state, vec![]).0;
+        for _ in 0..2 {
+            output = frame(&mut state, vec![]).0;
+        }
+        let old_node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node
+                        .label()
+                        .is_some_and(|label| label.starts_with("Recall cargo test")))
+                .then_some(*id)
+            })
+            .unwrap();
+        let action = |kind| {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: kind,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: old_node,
+                data: None,
+            })
+        };
+        assert!(
+            frame(&mut state, vec![action(egui::accesskit::Action::Focus)])
+                .1
+                .is_none()
+        );
+        state.select_next();
+        frame(&mut state, vec![]);
+        assert_eq!(
+            state.selected_command().as_deref(),
+            Some("git status"),
+            "old row focus cannot undo keyboard navigation"
+        );
+        state.set_query("git");
+        assert!(
+            frame(&mut state, vec![action(egui::accesskit::Action::Click)])
+                .1
+                .is_none(),
+            "a stale click cannot retarget the replacement result at the same row index"
+        );
+        assert_eq!(state.selected_command().as_deref(), Some("git status"));
+    }
+
+    #[test]
+    fn history_confirmation_uses_same_frame_text_paste_and_ime_commit() {
+        for kind in ["text", "paste", "ime", "no-match", "unsafe"] {
+            let ctx = egui::Context::default();
+            let mut picker = Some(crate::history_picker::HistoryPickerState::new(
+                ["printf EMBER_RACE_A", "printf EMBER_RACE_B"]
+                    .into_iter()
+                    .map(
+                        |command| jterm_core::command_history::CommandHistoryRecord {
+                            command: command.into(),
+                            cwd: None,
+                            exit_code: 0,
+                            end_time_ms: None,
+                        },
+                    )
+                    .collect(),
+            ));
+            picker.as_mut().unwrap().set_query("EMBER_RACE_");
+            let theme = theme::Theme::default();
+            let input = |events| egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 640.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            for _ in 0..3 {
+                run_frame(&ctx, input(vec![]), |_ui| {
+                    assert!(draw_history_picker(&ctx, picker.as_mut().unwrap(), &theme).is_none());
+                });
+            }
+            if kind == "ime" {
+                run_frame(
+                    &ctx,
+                    input(vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "B".into(),
+                        active_range_chars: Some(0..1),
+                    })]),
+                    |_ui| {
+                        assert!(
+                            draw_history_picker(&ctx, picker.as_mut().unwrap(), &theme).is_none()
+                        );
+                    },
+                );
+            }
+            let edit = match kind {
+                "paste" => egui::Event::Paste("B".into()),
+                "ime" => egui::Event::Ime(egui::ImeEvent::Commit("B".into())),
+                "no-match" => egui::Event::Text("MISSING".into()),
+                "unsafe" => egui::Event::Text("\u{202e}".into()),
+                _ => egui::Event::Text("B".into()),
+            };
+            let events = vec![
+                edit,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let mut routed = events.clone();
+            let mut held = super::super::input::PromptFillEnterLatch::default();
+            assert!(super::super::input::route_history_picker_events(
+                &mut picker,
+                &mut held,
+                &mut routed
+            ));
+            let mut action = None;
+            let output = run_frame(&ctx, input(events), |_ui| {
+                action = draw_history_picker(&ctx, picker.as_mut().unwrap(), &theme);
+            });
+            let expected = if matches!(kind, "no-match" | "unsafe") {
+                HistoryPickerAction::Close
+            } else {
+                HistoryPickerAction::Fill("printf EMBER_RACE_B".into())
+            };
+            assert_eq!(
+                action,
+                Some(expected),
+                "{kind} must be applied before confirming"
+            );
+            assert!(output.platform_output.commands.is_empty());
+            assert_eq!(held, super::super::input::PromptFillEnterLatch::Held);
+            assert!(!picker.as_mut().unwrap().take_confirm_request());
+        }
+    }
+
+    #[test]
+    fn history_picker_offscreen_layout_snapshots() {
+        let destination = std::env::var_os("EMBER_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
+        if let Some(path) = &destination {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for (name, width, height) in [
+            ("history-wide", 1000, 680),
+            ("history-narrow", 360, 640),
+            ("history-short", 280, 200),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let theme = theme::Theme::default();
+            crate::apply_theme_visuals(&ctx, &theme);
+            let mut state = crate::history_picker::HistoryPickerState::new(
+                (0..15)
+                    .map(|index| jterm_core::command_history::CommandHistoryRecord {
+                        command: format!(
+                            "cargo test {} {index}",
+                            "long-command-argument-".repeat(40)
+                        ),
+                        cwd: Some(format!("/work/{}", "deep-directory/".repeat(40))),
+                        exit_code: if index == 0 { 101 } else { 0 },
+                        end_time_ms: None,
+                    })
+                    .collect(),
+            );
+            let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+            for pass in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(pass as f64 * 0.25),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width as f32, height as f32),
+                        )),
+                        ..Default::default()
+                    },
+                    |_ui| {
+                        assert!(draw_history_picker(&ctx, &mut state, &theme).is_none());
+                    },
+                );
+                if let Some(path) = &destination {
+                    capture.save(
+                        &ctx,
+                        &mut output,
+                        [width, height],
+                        &path.join(format!("{name}.png")),
+                    );
+                } else {
+                    output.textures_delta.clear();
+                }
+                if pass == 2 {
+                    for (_, node) in &output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                    {
+                        if node.role() == egui::accesskit::Role::Button
+                            && node
+                                .label()
+                                .is_some_and(|label| label.starts_with("Recall "))
+                        {
+                            let bounds = node.bounds().unwrap();
+                            assert!(
+                                bounds.x0 >= 0.0 && bounds.x1 <= width as f64,
+                                "{name}: row exceeds viewport {bounds:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_picker_keyboard_selection_survives_repaint() {
+        let ctx = egui::Context::default();
+        let mut state = crate::history_picker::HistoryPickerState::new(
+            ["first", "second", "third"]
+                .into_iter()
+                .map(
+                    |command| jterm_core::command_history::CommandHistoryRecord {
+                        command: command.into(),
+                        cwd: None,
+                        exit_code: 0,
+                        end_time_ms: None,
+                    },
+                )
+                .collect(),
+        );
+        let theme = theme::Theme::default();
+        let frame = |state: &mut crate::history_picker::HistoryPickerState| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |_ui| {
+                    assert!(draw_history_picker(&ctx, state, &theme).is_none());
+                },
+            );
+        };
+        frame(&mut state);
+        state.select_next();
+        assert_eq!(state.selected, 1);
+        frame(&mut state);
+        assert_eq!(
+            state.selected, 1,
+            "render must not undo ArrowDown navigation"
+        );
+        assert_eq!(state.selected_command().as_deref(), Some("second"));
+        frame(&mut state);
+        assert_eq!(state.selected, 1, "idle frames preserve keyboard selection");
+    }
+
+    #[test]
+    fn history_picker_stationary_pointer_does_not_undo_keyboard_selection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut state = crate::history_picker::HistoryPickerState::new(
+            ["first", "second", "third"]
+                .into_iter()
+                .map(
+                    |command| jterm_core::command_history::CommandHistoryRecord {
+                        command: command.into(),
+                        cwd: None,
+                        exit_code: 0,
+                        end_time_ms: None,
+                    },
+                )
+                .collect(),
+        );
+        let theme = theme::Theme::default();
+        let frame = |state: &mut crate::history_picker::HistoryPickerState, events| {
+            run_frame(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 640.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {
+                    assert!(draw_history_picker(&ctx, state, &theme).is_none());
+                },
+            )
+        };
+        let mut output = frame(&mut state, vec![]);
+        for _ in 0..2 {
+            output = frame(&mut state, vec![]);
+        }
+        let bounds = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.value() == Some("first") || node.label() == Some("first"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("first history row has accessible text bounds");
+        let pointer = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        frame(&mut state, vec![egui::Event::PointerMoved(pointer)]);
+        assert_eq!(state.selected, 0);
+        state.select_next();
+        frame(&mut state, vec![]);
+        assert_eq!(
+            state.selected, 1,
+            "continued hover is not new pointer input"
+        );
+        frame(&mut state, vec![]);
+        assert_eq!(state.selected, 1);
     }
 
     #[test]

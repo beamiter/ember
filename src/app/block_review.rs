@@ -154,17 +154,22 @@ fn display_text(text: &str) -> String {
 }
 
 fn display_text_bounded(text: &str, limit: usize) -> String {
-    let mut shown = String::new();
+    use std::fmt::Write as _;
+
+    // This runs on every review frame while the terminal is locked. Write
+    // scalars directly instead of allocating a temporary String per character.
+    let mut shown = String::with_capacity(text.len().min(limit));
     for character in text.chars() {
-        let part = if character != '\n'
+        let escape = character != '\n'
             && (character.is_control()
-                || jterm_core::review_input::is_terminal_visual_spoofing_character(character))
-        {
-            format!("\\u{{{:X}}}", character as u32)
+                || jterm_core::review_input::is_terminal_visual_spoofing_character(character));
+        let part_len = if escape {
+            // `\\u{HEX}` has four punctuation bytes plus at least one digit.
+            4 + (character as u32).checked_ilog(16).unwrap_or(0) as usize + 1
         } else {
-            character.to_string()
+            character.len_utf8()
         };
-        if part.len() > limit.saturating_sub(shown.len()) {
+        if part_len > limit.saturating_sub(shown.len()) {
             while "…".len() > limit.saturating_sub(shown.len()) && !shown.is_empty() {
                 shown.pop();
             }
@@ -173,7 +178,11 @@ fn display_text_bounded(text: &str, limit: usize) -> String {
             }
             break;
         }
-        shown.push_str(&part);
+        if escape {
+            write!(shown, "\\u{{{:X}}}", character as u32).expect("writing to String cannot fail");
+        } else {
+            shown.push(character);
+        }
     }
     shown
 }
@@ -472,6 +481,11 @@ impl TerminalApp {
             &selection.selected_ids,
             &session.terminal.lock(),
         );
+        if self.block_review.is_some() {
+            // A keyboard-opened review owns its opening Enter through release;
+            // repeats must not click a newly focused modal control.
+            self.claim_enter_for_prompt_recall();
+        }
     }
 
     pub(crate) fn render_block_review(&mut self, ctx: &egui::Context) {
@@ -626,6 +640,54 @@ mod tests {
             "line\n\\n literal\\u{202E}"
         );
         assert!(display_text(&"界".repeat(100_000)).len() <= 256 * 1024);
+    }
+
+    #[test]
+    fn bounded_review_display_preserves_every_scalar_and_budget_boundary() {
+        fn original(text: &str, limit: usize) -> String {
+            let mut shown = String::new();
+            for character in text.chars() {
+                let part = if character != '\n'
+                    && (character.is_control()
+                        || jterm_core::review_input::is_terminal_visual_spoofing_character(
+                            character,
+                        )) {
+                    format!("\\u{{{:X}}}", character as u32)
+                } else {
+                    character.to_string()
+                };
+                if part.len() > limit.saturating_sub(shown.len()) {
+                    while "…".len() > limit.saturating_sub(shown.len()) && !shown.is_empty() {
+                        shown.pop();
+                    }
+                    if "…".len() <= limit.saturating_sub(shown.len()) {
+                        shown.push('…');
+                    }
+                    break;
+                }
+                shown.push_str(&part);
+            }
+            shown
+        }
+        // Exhaust the scalar space, including every escaping-width transition.
+        for character in (0..=0x10ffff).filter_map(char::from_u32) {
+            let text = character.to_string();
+            assert_eq!(display_text_bounded(&text, 12), original(&text, 12));
+        }
+        for text in [
+            "",
+            "ascii newline\n",
+            "编译🙂",
+            "\0\u{f}\u{10}\u{7f}\u{80}\u{9f}",
+            "\u{202e}bidi\u{fff9}\u{e0001}",
+            "prefix\t尾\n\u{1b}suffix",
+        ] {
+            for limit in 0..=64 {
+                let actual = display_text_bounded(text, limit);
+                assert!(actual.len() <= limit);
+                assert_eq!(actual, original(text, limit), "{text:?}, budget {limit}");
+            }
+        }
     }
 
     #[test]

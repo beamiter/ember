@@ -2530,6 +2530,8 @@ impl TerminalApp {
             keybindings,
             command_palette,
             history_picker: None,
+            prompt_fill_enter_latch: Default::default(),
+            prompt_fill_enter_down: false,
             workflow_picker: None,
             workflow_args: None,
             workflow_refusals: Vec::new(),
@@ -5623,6 +5625,12 @@ impl eframe::App for TerminalApp {
         // Collect events once per frame to avoid multiple clones
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
+        app::input::guard_prompt_fill_enter(
+            ctx,
+            &mut self.prompt_fill_enter_down,
+            &mut self.prompt_fill_enter_latch,
+            &mut self.frame_events,
+        );
 
         let mut ui_input_blocked = self.terminal_input_blocked(ctx);
         let terminal_input_blocked_at_frame_start =
@@ -5656,11 +5664,15 @@ impl eframe::App for TerminalApp {
 
         // Block-search picker keys (Enter/Escape/arrows), routed like the
         // palette's so the overlay owns the whole frame's keyboard input.
-        let block_search_owned_input = self.handle_block_search_input();
+        let block_search_owned_input = !palette_owned_input && self.handle_block_search_input();
         // 历史命令选择器同理：浮层打开期间拥有整帧键盘输入。
-        let history_picker_owned_input = self.handle_history_picker_input();
+        let history_picker_owned_input =
+            !palette_owned_input && !block_search_owned_input && self.handle_history_picker_input();
         // 工作流选择器与参数对话框同理。
-        let workflow_picker_owned_input = self.handle_workflow_picker_input();
+        let workflow_picker_owned_input = !palette_owned_input
+            && !block_search_owned_input
+            && !history_picker_owned_input
+            && self.handle_workflow_picker_input();
         let overlay_owned_input = palette_owned_input
             || block_search_owned_input
             || history_picker_owned_input

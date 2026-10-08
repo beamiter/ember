@@ -285,6 +285,10 @@ pub struct TerminalApp {
     /// 历史命令选择器（Ctrl+Shift+H）。打开时从家族共享 JSONL 索引加载有界
     /// 尾部；Enter 只回填提示符，绝不执行。`None` 表示浮层未打开。
     pub history_picker: Option<crate::history_picker::HistoryPickerState>,
+    /// Own a confirming physical Enter until release, even after recall closes.
+    pub prompt_fill_enter_latch: super::input::PromptFillEnterLatch,
+    /// Passive state survives modal dispatch so pointer fills can claim Enter.
+    pub prompt_fill_enter_down: bool,
 
     /// 工作流选择器（Ctrl+Shift+M，anvil/forge 的 workflows）。打开时同步加载
     /// 有界目录扫描；Enter 对无参数工作流直接回填提示符，有参数则打开填写

@@ -2722,6 +2722,9 @@ impl TerminalApp {
     /// [`PROMPT_FILL_MAX_COMMAND_BYTES`] 而不是 64 KiB 的日志预算——否则
     /// 选择器刚开始展示的 64 KiB–256 KiB 记录会条条可选、条条被拒。
     pub(crate) fn fill_prompt_with_history_command(&mut self, command: &str) {
+        // Even a refused mouse recall must not let an already-held Enter
+        // submit the pre-existing draft after its overlay closes.
+        self.claim_enter_for_prompt_recall();
         let index = self.session_manager.active_index();
         let Some(session_id) = self
             .session_manager
@@ -2787,7 +2790,10 @@ impl TerminalApp {
         // 状态文案与 replay_sidebar_command 逐字一致：同一个动作在两个
         // 入口（块召回 / 历史召回）不给用户两套说法。
         match outcome {
-            ReplayOutcome::Filled => self.set_status("Command filled at prompt"),
+            ReplayOutcome::Filled => {
+                self.claim_enter_for_prompt_recall();
+                self.set_status("Command filled at prompt");
+            }
             ReplayOutcome::NotPromptReady => {
                 self.set_status("Wait for the shell prompt before replaying a command")
             }
@@ -3310,7 +3316,7 @@ impl TerminalApp {
     /// written at an idle prompt. A running program (including `read`) and a
     /// selection containing only background output must receive Enter normally.
     pub(crate) fn block_reinput_selected_commands_from_enter(&mut self) -> bool {
-        match self.try_reinput_selected_commands() {
+        match self.try_reinput_commands(None) {
             Ok(count) => {
                 self.set_status(format!(
                     "Filled {count} selected command{} at prompt",
@@ -3330,6 +3336,7 @@ impl TerminalApp {
                 | SelectedReplayError::AlternateScreen,
             ) => false,
             Err(error) => {
+                self.claim_enter_for_prompt_recall();
                 self.report_selected_replay_error(error);
                 true
             }
@@ -3337,6 +3344,7 @@ impl TerminalApp {
     }
 
     pub(crate) fn try_reinput_selected_commands(&mut self) -> Result<usize, SelectedReplayError> {
+        self.claim_enter_for_prompt_recall();
         self.try_reinput_commands(None)
     }
 
@@ -3344,6 +3352,7 @@ impl TerminalApp {
         &mut self,
         review: &super::block_review::BlockReview,
     ) -> Result<usize, SelectedReplayError> {
+        self.claim_enter_for_prompt_recall();
         self.try_reinput_commands(Some(review))
     }
 
@@ -3428,6 +3437,7 @@ impl TerminalApp {
         };
 
         if result.is_ok() {
+            self.claim_enter_for_prompt_recall();
             self.clear_block_selection();
         }
         result
@@ -4199,6 +4209,9 @@ impl TerminalApp {
     }
 
     fn replay_sidebar_command(&mut self, target: &CommandTarget, run: bool, require_empty: bool) {
+        if !run {
+            self.claim_enter_for_prompt_recall();
+        }
         let Some(index) = self.target_session_index(target) else {
             self.set_status("Command session is no longer available");
             return;
@@ -4316,7 +4329,10 @@ impl TerminalApp {
 
         let replay_accepted = replay_outcome_accepted(&outcome);
         match outcome {
-            ReplayOutcome::Filled => self.set_status("Command filled at prompt"),
+            ReplayOutcome::Filled => {
+                self.claim_enter_for_prompt_recall();
+                self.set_status("Command filled at prompt");
+            }
             ReplayOutcome::Ran => self.set_status("Command queued to run"),
             ReplayOutcome::NotPromptReady => {
                 self.set_status("Wait for the shell prompt before replaying a command")

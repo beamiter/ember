@@ -7,10 +7,20 @@
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use jterm_core::command_history::{self, CommandHistoryRecord};
+use std::borrow::Cow;
 
 /// 打开选择器时加载的最大条数。与 forge/frost 的历史面板一致：交互检索只
 /// 需要一个近期工作集，`read_recent` 本身也把读取限制在有界的文件尾部。
 pub const PICKER_MAX_ENTRIES: usize = 2_000;
+
+// Bound dynamic-programming work rather than only the source byte count.
+// Skim's linear fallback preserves full-input membership and smart case; only
+// expensive long-input ranking changes. Bytes conservatively bound scalars.
+const MAX_HISTORY_FUZZY_WORK: usize = 64 * 1024;
+
+fn use_linear_history_match(haystack: &str, query: &str) -> bool {
+    haystack.len().saturating_mul(query.len()) > MAX_HISTORY_FUZZY_WORK
+}
 
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更早的命令通过输入查询来召回。
@@ -105,13 +115,20 @@ pub fn display_command(command: &str) -> String {
 /// 历史选择器状态。`entries` 最新在前（`read_recent` 的顺序），在打开浮层
 /// 时加载一次；期间新完成的命令会在下一次打开时出现。
 pub struct HistoryPickerState {
-    pub query: String,
+    query: String,
+    query_buffer: String,
     /// 当前过滤结果中的高亮位置。
     pub selected: usize,
     /// 是否需要聚焦搜索框（egui 文本框在浮层打开后的第一帧取焦）。
     pub needs_focus: bool,
     entries: Vec<CommandHistoryRecord>,
     matcher: SkimMatcherV2,
+    linear_matcher: SkimMatcherV2,
+    results: Vec<usize>,
+    scroll_to_selected: bool,
+    confirm_requested: bool,
+    #[cfg(test)]
+    rebuild_count: usize,
 }
 
 impl HistoryPickerState {
@@ -132,13 +149,22 @@ impl HistoryPickerState {
             }
             true
         });
-        Self {
+        let mut state = Self {
             query: String::new(),
+            query_buffer: String::new(),
             selected: 0,
             needs_focus: true,
             entries,
             matcher: SkimMatcherV2::default(),
-        }
+            linear_matcher: SkimMatcherV2::default().element_limit(1),
+            results: Vec::new(),
+            scroll_to_selected: true,
+            confirm_requested: false,
+            #[cfg(test)]
+            rebuild_count: 0,
+        };
+        state.rebuild_results();
+        state
     }
 
     /// 从持久化索引加载最近的一段。读取是有界的（文件尾部窗口 + 条数上限），
@@ -154,68 +180,129 @@ impl HistoryPickerState {
     /// 模糊匹配分数降序，同分保持新旧顺序（稳定排序），命令与 cwd 一起参与
     /// 匹配，便于按项目目录召回。
     pub fn filtered(&self) -> Vec<&CommandHistoryRecord> {
-        if self.query.is_empty() {
-            return self.entries.iter().take(MAX_RESULTS).collect();
-        }
-        if history_query_is_unsafe(&self.query) {
-            return Vec::new();
-        }
-        let mut scored: Vec<(i64, &CommandHistoryRecord)> = self
-            .entries
+        self.results
             .iter()
-            .filter_map(|record| {
-                let haystack = match record.cwd.as_deref() {
-                    Some(cwd) => format!("{} {cwd}", record.command),
-                    None => record.command.clone(),
-                };
-                self.matcher
-                    .fuzzy_match(&haystack, &self.query)
-                    .map(|score| (score, record))
-            })
-            .collect();
-        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        scored
-            .into_iter()
-            .take(MAX_RESULTS)
-            .map(|(_, record)| record)
+            .map(|index| &self.entries[*index])
             .collect()
     }
 
-    /// Replace the query; the highlight returns to the first row.
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// egui edits a draft; sync it once after a real edit, never on idle frames.
+    pub fn query_buffer_mut(&mut self) -> &mut String {
+        &mut self.query_buffer
+    }
+
+    pub fn sync_query(&mut self) {
+        let query = std::mem::take(&mut self.query_buffer);
+        self.set_query(query);
+    }
+
+    /// Only a changed normalized query invalidates matching and navigation.
     pub fn set_query(&mut self, query: impl Into<String>) {
-        self.query = bound_history_query(query);
+        let query = bound_history_query(query);
+        self.query_buffer.clone_from(&query);
+        if self.query == query {
+            return;
+        }
+        self.query = query;
         self.selected = 0;
+        self.scroll_to_selected = true;
+        self.rebuild_results();
     }
 
-    /// 高亮项下移（在过滤结果中循环）。
+    fn rebuild_results(&mut self) {
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
+        if self.query.is_empty() {
+            self.results = (0..self.entries.len().min(MAX_RESULTS)).collect();
+            return;
+        }
+        if history_query_is_unsafe(&self.query) {
+            self.results.clear();
+            return;
+        }
+        let mut scored: Vec<(i64, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let haystack = match record.cwd.as_deref() {
+                    Some(cwd) => Cow::Owned(format!("{} {cwd}", record.command)),
+                    None => Cow::Borrowed(record.command.as_str()),
+                };
+                let matcher = if use_linear_history_match(&haystack, &self.query) {
+                    &self.linear_matcher
+                } else {
+                    &self.matcher
+                };
+                matcher
+                    .fuzzy_match(&haystack, &self.query)
+                    .map(|score| (score, index))
+            })
+            .collect();
+        // Stable sort retains newest-first order for equal scores.
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        self.results = scored
+            .into_iter()
+            .take(MAX_RESULTS)
+            .map(|(_, index)| index)
+            .collect();
+    }
+
+    /// The input prepass records intent; the renderer confirms only after
+    /// TextEdit applies this frame's text, paste and IME events.
+    pub fn request_confirm(&mut self) {
+        self.confirm_requested = true;
+    }
+
+    pub fn take_confirm_request(&mut self) -> bool {
+        std::mem::take(&mut self.confirm_requested)
+    }
+
+    /// One-shot keyboard/query scroll intent; pointer and wheel retain control.
+    pub fn take_scroll_to_selected(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_selected)
+    }
+
+    pub fn select_hovered(&mut self, index: usize) {
+        if index < self.results.len() {
+            self.selected = index;
+        }
+    }
+
     pub fn select_next(&mut self) {
-        let len = self.filtered().len();
-        if len == 0 {
-            self.selected = 0;
+        let len = self.results.len();
+        self.selected = if len == 0 {
+            0
         } else {
-            self.selected = (self.selected + 1) % len;
-        }
+            (self.selected + 1) % len
+        };
+        self.scroll_to_selected = len > 0;
+        self.needs_focus = true;
     }
 
-    /// 高亮项上移（在过滤结果中循环）。
     pub fn select_prev(&mut self) {
-        let len = self.filtered().len();
-        if len == 0 {
-            self.selected = 0;
+        let len = self.results.len();
+        self.selected = if len == 0 {
+            0
+        } else if self.selected == 0 {
+            len - 1
         } else {
-            self.selected = if self.selected == 0 {
-                len - 1
-            } else {
-                self.selected - 1
-            };
-        }
+            self.selected - 1
+        };
+        self.scroll_to_selected = len > 0;
+        self.needs_focus = true;
     }
 
-    /// 当前高亮的命令文本（按过滤结果中的位置）。
     pub fn selected_command(&self) -> Option<String> {
-        self.filtered()
+        self.results
             .get(self.selected)
-            .and_then(|record| sanitized_command(&record.command))
+            .and_then(|index| sanitized_command(&self.entries[*index].command))
             .map(str::to_string)
     }
 }
@@ -375,14 +462,12 @@ mod tests {
 
     #[test]
     fn fuzzy_query_drops_non_matches_and_ranks_ties_by_recency() {
-        let state = HistoryPickerState {
-            query: "cargo".to_string(),
-            ..HistoryPickerState::new(vec![
-                record("cargo test", None, 0),
-                record("git status", None, 0),
-                record("cargo test", None, 1),
-            ])
-        };
+        let mut state = HistoryPickerState::new(vec![
+            record("cargo test", None, 0),
+            record("git status", None, 0),
+            record("cargo test", None, 1),
+        ]);
+        state.set_query("cargo");
         let filtered = state.filtered();
         assert_eq!(filtered.len(), 2);
         // 相同 haystack 得分相同；稳定排序保持较新的记录在前。
@@ -391,14 +476,162 @@ mod tests {
     }
 
     #[test]
+    fn cached_history_preserves_selection_and_only_rescores_changed_queries() {
+        let mut state = HistoryPickerState::new(vec![
+            record("cargo test", None, 0),
+            record("cargo build", Some("/work/ember"), 1),
+            record("git status", None, 0),
+        ]);
+        assert_eq!(state.rebuild_count, 1);
+        state.set_query("cargo");
+        assert_eq!(state.rebuild_count, 2);
+        state.select_next();
+        assert_eq!(state.selected, 1);
+        for _ in 0..20 {
+            assert_eq!(state.filtered().len(), 2);
+        }
+        assert!(state.selected_command().is_some());
+        state.set_query("cargo\n");
+        assert_eq!(
+            state.selected, 1,
+            "same normalized query preserves navigation"
+        );
+        *state.query_buffer_mut() = "cargo".into();
+        state.sync_query();
+        assert_eq!(state.selected, 1);
+        assert_eq!(
+            state.rebuild_count, 2,
+            "idle reads, navigation and sync do not rescore"
+        );
+        state.set_query("git");
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.selected_command().as_deref(), Some("git status"));
+        assert_eq!(state.rebuild_count, 3);
+        state.set_query("git\u{202e}");
+        assert!(state.filtered().is_empty());
+        assert_eq!(state.selected_command(), None);
+    }
+
+    #[test]
+    fn history_scroll_intent_is_one_shot_and_pointer_does_not_recenter() {
+        let mut state =
+            HistoryPickerState::new(vec![record("one", None, 0), record("two", None, 0)]);
+        assert!(state.take_scroll_to_selected());
+        assert!(!state.take_scroll_to_selected());
+        state.select_next();
+        assert!(state.take_scroll_to_selected());
+        assert!(!state.take_scroll_to_selected());
+        state.select_hovered(0);
+        assert!(!state.take_scroll_to_selected());
+        state.select_hovered(100);
+        assert_eq!(state.selected, 0);
+        state.set_query("two");
+        assert!(state.take_scroll_to_selected());
+        state.set_query("two");
+        assert!(!state.take_scroll_to_selected());
+    }
+
+    #[test]
+    fn history_fuzzy_work_budget_keeps_full_text_and_normal_ranking() {
+        assert!(!use_linear_history_match(
+            &"x".repeat(256),
+            &"x".repeat(256)
+        ));
+        assert!(use_linear_history_match(&"x".repeat(257), &"x".repeat(256)));
+        let command = format!(
+            "{} target",
+            "a".repeat(MAX_SHARED_HISTORY_COMMAND_BYTES - 7)
+        );
+        let cwd = format!("/{}目录", "d".repeat(MAX_HISTORY_CWD_BYTES - 7));
+        let mut state = HistoryPickerState::new(vec![
+            record(&command, Some(&cwd), 0),
+            record(&command, Some(&cwd), 1),
+        ]);
+        state.set_query(format!("{} target", "a".repeat(512)));
+        assert_eq!(state.filtered().len(), 2);
+        assert_eq!(state.filtered()[0].exit_code, 0, "ties retain recency");
+        assert_eq!(state.selected_command().as_deref(), Some(command.as_str()));
+        state.set_query("target 目录");
+        assert_eq!(state.filtered().len(), 2, "matching spans command and cwd");
+        state.set_query("TARGET");
+        assert!(state.filtered().is_empty(), "smart case is unchanged");
+        let mut state = HistoryPickerState::new(vec![
+            record("cargo test", None, 0),
+            record("cat config", None, 0),
+            record("git status", None, 0),
+        ]);
+        state.set_query("ct");
+        let matcher = SkimMatcherV2::default();
+        let mut expected: Vec<_> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                matcher
+                    .fuzzy_match(&row.command, "ct")
+                    .map(|score| (score, i))
+            })
+            .collect();
+        expected.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        assert_eq!(
+            state.results,
+            expected.into_iter().map(|(_, i)| i).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linear_fallback_changes_ranking_not_match_membership() {
+        let exact = SkimMatcherV2::default();
+        let linear = SkimMatcherV2::default().element_limit(1);
+        let choices = [
+            "",
+            "cargo test",
+            "CARGO test",
+            "a___b__c",
+            "aaabaaaab",
+            "目录/项目",
+            "İstanbul Straße",
+            "编译🙂终端",
+            "foo/bar.rs",
+            "foo BAR baz",
+            " /é/É/ ",
+        ];
+        let patterns = [
+            "",
+            "ct",
+            "CT",
+            "ab",
+            "aaaa",
+            "目录",
+            "目项",
+            "🙂端",
+            "İS",
+            "st",
+            "ß",
+            "fb",
+            "fB",
+            " ",
+            "éÉ",
+            "unmatched",
+        ];
+        for choice in choices {
+            for pattern in patterns {
+                assert_eq!(
+                    exact.fuzzy_match(choice, pattern).is_some(),
+                    linear.fuzzy_match(choice, pattern).is_some(),
+                    "choice {choice:?}, pattern {pattern:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cwd_participates_in_matching() {
-        let state = HistoryPickerState {
-            query: "myproj".to_string(),
-            ..HistoryPickerState::new(vec![
-                record("make -j8", Some("/home/u/myproj"), 0),
-                record("make -j8", Some("/home/u/other"), 0),
-            ])
-        };
+        let mut state = HistoryPickerState::new(vec![
+            record("make -j8", Some("/home/u/myproj"), 0),
+            record("make -j8", Some("/home/u/other"), 0),
+        ]);
+        state.set_query("myproj");
         let filtered = state.filtered();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].cwd.as_deref(), Some("/home/u/myproj"));

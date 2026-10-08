@@ -5,6 +5,199 @@ use super::state::TerminalApp;
 use crate::{config, keybindings, layout, search};
 use eframe::egui;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptFillEnterKeyRoute {
+    Pass,
+    Confirm,
+    Suppress,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PromptFillEnterLatch {
+    #[default]
+    Idle,
+    Held,
+    // Backends can synthesize key-up on blur and mislabel a held repeat as a
+    // fresh press on refocus. Require an observed focused release. If key-up
+    // was lost, one press/release cycle may be swallowed to recover.
+    AwaitingRelease,
+}
+
+/// Keep the physical confirming key owned until release. Repeat must not
+/// become a shell Enter merely because the picker disappeared after filling.
+fn route_prompt_fill_enter_key(
+    latch: &mut PromptFillEnterLatch,
+    event: &egui::Event,
+    owned_frame: bool,
+) -> PromptFillEnterKeyRoute {
+    match event {
+        egui::Event::WindowFocused(false) => {
+            if *latch == PromptFillEnterLatch::Held {
+                *latch = PromptFillEnterLatch::AwaitingRelease;
+            }
+            PromptFillEnterKeyRoute::Pass
+        }
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            pressed: false,
+            ..
+        } if *latch != PromptFillEnterLatch::Idle => {
+            *latch = PromptFillEnterLatch::Idle;
+            PromptFillEnterKeyRoute::Suppress
+        }
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            pressed: true,
+            repeat,
+            ..
+        } => {
+            match *latch {
+                PromptFillEnterLatch::Held => return PromptFillEnterKeyRoute::Suppress,
+                PromptFillEnterLatch::AwaitingRelease => return PromptFillEnterKeyRoute::Suppress,
+                PromptFillEnterLatch::Idle => {}
+            }
+            if owned_frame {
+                *latch = PromptFillEnterLatch::Held;
+                if *repeat {
+                    PromptFillEnterKeyRoute::Suppress
+                } else {
+                    PromptFillEnterKeyRoute::Confirm
+                }
+            } else {
+                PromptFillEnterKeyRoute::Pass
+            }
+        }
+        _ => PromptFillEnterKeyRoute::Pass,
+    }
+}
+
+fn route_prompt_fill_enter_event(
+    latch: &mut PromptFillEnterLatch,
+    event: &egui::Event,
+    owned_frame: bool,
+    loses_focus: bool,
+) -> PromptFillEnterKeyRoute {
+    if loses_focus
+        && *latch != PromptFillEnterLatch::Idle
+        && matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: false,
+                ..
+            }
+        )
+    {
+        *latch = PromptFillEnterLatch::AwaitingRelease;
+        PromptFillEnterKeyRoute::Suppress
+    } else {
+        route_prompt_fill_enter_key(latch, event, owned_frame)
+    }
+}
+
+/// Observe Enter before any modal consumes its opener. A later mouse-driven
+/// prompt fill must still be able to claim a key held in the previous modal.
+pub(crate) fn track_prompt_fill_enter(
+    down: &mut bool,
+    latch: &mut PromptFillEnterLatch,
+    events: &mut Vec<egui::Event>,
+) {
+    let loses_focus = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::WindowFocused(false)));
+    events.retain_mut(|event| {
+        match event {
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                repeat,
+                ..
+            } => {
+                // Repeat metadata may reset on blur; the passive held state
+                // must outlive both the old modal and the focus transition.
+                *repeat |= *down;
+                *down = true;
+            }
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: false,
+                ..
+            } if !loses_focus => *down = false,
+            _ => {}
+        }
+        route_prompt_fill_enter_event(latch, event, false, loses_focus)
+            == PromptFillEnterKeyRoute::Pass
+    });
+}
+
+/// Claimed repeats belong to neither the PTY nor an egui button that happens
+/// to gain focus after a recall. Preserve every unrelated event unchanged.
+pub(crate) fn guard_prompt_fill_enter(
+    ctx: &egui::Context,
+    down: &mut bool,
+    latch: &mut PromptFillEnterLatch,
+    events: &mut Vec<egui::Event>,
+) {
+    let before = events.len();
+    track_prompt_fill_enter(down, latch, events);
+    if events.len() != before {
+        ctx.input_mut(|input| input.events.clone_from(events));
+    }
+}
+
+fn claim_prompt_fill_enter(down: bool, latch: &mut PromptFillEnterLatch) {
+    if down && *latch == PromptFillEnterLatch::Idle {
+        *latch = PromptFillEnterLatch::Held;
+    }
+}
+
+pub(super) fn route_history_picker_events(
+    picker: &mut Option<crate::history_picker::HistoryPickerState>,
+    enter_held: &mut PromptFillEnterLatch,
+    events: &mut Vec<egui::Event>,
+) -> bool {
+    let owned_frame = picker.is_some();
+    // winit X11 emits synthetic releases before Focused(false), and egui
+    // drops their synthetic flag. That whole frame is ambiguous: do not
+    // release the confirming key into the PTY when the window regains focus.
+    let loses_focus = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::WindowFocused(false)));
+    events.retain(|event| {
+        match route_prompt_fill_enter_event(enter_held, event, owned_frame, loses_focus) {
+            PromptFillEnterKeyRoute::Confirm => {
+                if let Some(state) = picker.as_mut() {
+                    state.request_confirm();
+                }
+                return false;
+            }
+            PromptFillEnterKeyRoute::Suppress => return false,
+            PromptFillEnterKeyRoute::Pass => {}
+        }
+        if let egui::Event::Key {
+            key, pressed: true, ..
+        } = event
+        {
+            match key {
+                egui::Key::Escape => *picker = None,
+                egui::Key::ArrowUp => {
+                    if let Some(state) = picker.as_mut() {
+                        state.select_prev();
+                    }
+                }
+                egui::Key::ArrowDown => {
+                    if let Some(state) = picker.as_mut() {
+                        state.select_next();
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    });
+    owned_frame
+}
+
 fn transformed_next_command_returns_to_bottom(
     next: bool,
     target_found: bool,
@@ -719,6 +912,13 @@ fn block_selection_context_available(
 }
 
 impl TerminalApp {
+    pub(super) fn claim_enter_for_prompt_recall(&mut self) {
+        claim_prompt_fill_enter(
+            self.prompt_fill_enter_down,
+            &mut self.prompt_fill_enter_latch,
+        );
+    }
+
     pub(crate) fn block_chrome_owns_keyboard(&self, ctx: &egui::Context) -> bool {
         self.config.block_mode
             && (super::rendering::block_workspace_has_focus(ctx)
@@ -1781,7 +1981,10 @@ impl TerminalApp {
         let mut ask_ai_request = None;
         for evt in &events_copy {
             let egui::Event::Key {
-                key, pressed: true, ..
+                key,
+                pressed: true,
+                repeat,
+                ..
             } = evt
             else {
                 continue;
@@ -1790,6 +1993,7 @@ impl TerminalApp {
                 egui::Key::Escape => self.command_palette.close(),
                 egui::Key::ArrowUp => self.command_palette.select_prev(),
                 egui::Key::ArrowDown => self.command_palette.select_next(),
+                egui::Key::Enter if *repeat => {}
                 egui::Key::Enter => {
                     // `?` mode (anvil's palette Ask-AI flow): the request goes
                     // to the review-only command suggestion, never to a PTY.
@@ -1824,51 +2028,11 @@ impl TerminalApp {
     /// Returns whether the picker owned this frame's input; it never requests
     /// a viewport close.
     pub fn handle_history_picker_input(&mut self) -> bool {
-        if self.history_picker.is_none() {
-            return false;
-        }
-
-        let events_copy = self.frame_events.clone();
-        let mut accepted: Option<Option<String>> = None;
-        for evt in &events_copy {
-            let egui::Event::Key {
-                key, pressed: true, ..
-            } = evt
-            else {
-                continue;
-            };
-            match key {
-                egui::Key::Escape => self.history_picker = None,
-                egui::Key::ArrowUp => {
-                    if let Some(state) = self.history_picker.as_mut() {
-                        state.select_prev();
-                    }
-                }
-                egui::Key::ArrowDown => {
-                    if let Some(state) = self.history_picker.as_mut() {
-                        state.select_next();
-                    }
-                }
-                egui::Key::Enter => {
-                    // 与 frost 一致：即使过滤结果为空，Enter 也关闭浮层。
-                    accepted = Some(
-                        self.history_picker
-                            .as_ref()
-                            .and_then(|state| state.selected_command()),
-                    );
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(command) = accepted {
-            self.history_picker = None;
-            if let Some(command) = command {
-                self.fill_prompt_with_history_command(&command);
-            }
-        }
-        true
+        route_history_picker_events(
+            &mut self.history_picker,
+            &mut self.prompt_fill_enter_latch,
+            &mut self.frame_events,
+        )
     }
 
     /// Handle keys the workflow picker and its parameter dialog own (same
@@ -2475,6 +2639,290 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claimed_enter_repeat_cannot_click_a_newly_focused_egui_button() {
+        let ctx = egui::Context::default();
+        let raw = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(300.0, 200.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw(vec![]), |ui| {
+            ui.button("Unrelated action").request_focus();
+        });
+        output.textures_delta.clear();
+        let mut down = true;
+        let mut latch = PromptFillEnterLatch::Held;
+        let event = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut clicked = false;
+        let mut output = ctx.run_ui(raw(vec![event]), |ui| {
+            let mut events = ctx.input(|input| input.events.clone());
+            guard_prompt_fill_enter(&ctx, &mut down, &mut latch, &mut events);
+            assert!(events.is_empty());
+            clicked = ui.button("Unrelated action").clicked();
+        });
+        output.textures_delta.clear();
+        assert!(
+            !clicked,
+            "an owned repeat must not become a synthetic button click"
+        );
+    }
+
+    #[test]
+    fn preheld_enter_transfers_from_consumed_opener_to_mouse_recall() {
+        let key = |pressed, repeat| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut down = false;
+        let mut latch = PromptFillEnterLatch::Idle;
+        let mut events = vec![key(true, false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert!(down);
+        assert_eq!(
+            events.len(),
+            1,
+            "ordinary Enter is not claimed before recall"
+        );
+        events.clear(); // The palette consumes its opener before history renders.
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert!(
+            down,
+            "the opening surface cannot hide a physically held Enter"
+        );
+        claim_prompt_fill_enter(down, &mut latch); // Mouse/assistive recall intent.
+        assert_eq!(latch, PromptFillEnterLatch::Held);
+        for repeat in [false, true] {
+            let mut events = vec![key(true, repeat)];
+            track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+            assert!(
+                events.is_empty(),
+                "pre-held Enter cannot submit a filled or refused draft"
+            );
+        }
+        let mut events = vec![key(false, false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert!(!down);
+        assert_eq!(latch, PromptFillEnterLatch::Idle);
+        assert!(events.is_empty());
+        let mut events = vec![key(true, false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert_eq!(
+            events.len(),
+            1,
+            "new intentional Enter still reaches the prompt"
+        );
+    }
+
+    #[test]
+    fn passive_enter_state_survives_synthetic_blur_release_before_recall() {
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut down = true;
+        let mut latch = PromptFillEnterLatch::Idle;
+        let mut events = vec![key(false), egui::Event::WindowFocused(false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert!(down);
+        claim_prompt_fill_enter(down, &mut latch);
+        let mut events = vec![egui::Event::WindowFocused(true), key(true)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                ..
+            }
+        )));
+        let mut events = vec![key(false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut events);
+        assert!(!down);
+        assert_eq!(latch, PromptFillEnterLatch::Idle);
+        claim_prompt_fill_enter(down, &mut latch);
+        assert_eq!(
+            latch,
+            PromptFillEnterLatch::Idle,
+            "a mouse recall with no held key adds no keyboard barrier"
+        );
+    }
+
+    #[test]
+    fn history_confirmation_owns_repeats_until_release_after_modal_closes() {
+        let key = |pressed, repeat| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut held = PromptFillEnterLatch::default();
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, false), false),
+            PromptFillEnterKeyRoute::Pass
+        );
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, false), true),
+            PromptFillEnterKeyRoute::Confirm
+        );
+        assert_eq!(held, PromptFillEnterLatch::Held);
+        for owner in [true, false] {
+            assert_eq!(
+                route_prompt_fill_enter_key(&mut held, &key(true, true), owner),
+                PromptFillEnterKeyRoute::Suppress
+            );
+        }
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(false, false), false),
+            PromptFillEnterKeyRoute::Suppress
+        );
+        assert_eq!(held, PromptFillEnterLatch::Idle);
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, false), false),
+            PromptFillEnterKeyRoute::Pass,
+            "a new intentional prompt Enter remains available"
+        );
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, true), true),
+            PromptFillEnterKeyRoute::Suppress,
+            "an already-held key cannot newly confirm a picker"
+        );
+        route_prompt_fill_enter_key(&mut held, &egui::Event::WindowFocused(false), true);
+        assert_eq!(held, PromptFillEnterLatch::AwaitingRelease);
+        route_prompt_fill_enter_key(&mut held, &egui::Event::WindowFocused(true), false);
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, true), false),
+            PromptFillEnterKeyRoute::Suppress,
+            "refocus must not leak a held confirming key"
+        );
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, false), false),
+            PromptFillEnterKeyRoute::Suppress,
+            "a backend can mislabel a held refocus repeat as a fresh edge"
+        );
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(false, false), false),
+            PromptFillEnterKeyRoute::Suppress
+        );
+        assert_eq!(held, PromptFillEnterLatch::Idle);
+        assert_eq!(
+            route_prompt_fill_enter_key(&mut held, &key(true, false), false),
+            PromptFillEnterKeyRoute::Pass,
+            "an observed release permits the next intentional Enter"
+        );
+    }
+
+    #[test]
+    fn history_confirm_ignores_synthetic_release_in_blur_frame() {
+        let key = |pressed, repeat| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut picker = None;
+        let mut held = PromptFillEnterLatch::Held;
+        let mut events = vec![key(false, false), egui::Event::WindowFocused(false)];
+        assert!(!route_history_picker_events(
+            &mut picker,
+            &mut held,
+            &mut events
+        ));
+        assert_eq!(held, PromptFillEnterLatch::AwaitingRelease);
+        let mut events = vec![
+            egui::Event::WindowFocused(true),
+            key(true, false),
+            key(true, true),
+        ];
+        assert!(!route_history_picker_events(
+            &mut picker,
+            &mut held,
+            &mut events
+        ));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                ..
+            }
+        )));
+        let mut events = vec![key(false, false), key(true, false)];
+        route_history_picker_events(&mut picker, &mut held, &mut events);
+        assert_eq!(held, PromptFillEnterLatch::Idle);
+        assert!(matches!(
+            events.as_slice(),
+            [egui::Event::Key {
+                pressed: true,
+                repeat: false,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn history_confirm_and_release_in_one_batch_do_not_leave_a_stuck_latch() {
+        let mut picker = Some(crate::history_picker::HistoryPickerState::new(Vec::new()));
+        let mut held = PromptFillEnterLatch::default();
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut events = vec![
+            egui::Event::Text("query".into()),
+            key(egui::Key::Enter, true),
+            key(egui::Key::Enter, false),
+        ];
+        assert!(route_history_picker_events(
+            &mut picker,
+            &mut held,
+            &mut events
+        ));
+        assert_eq!(held, PromptFillEnterLatch::Idle);
+        assert!(picker.as_mut().unwrap().take_confirm_request());
+        assert!(matches!(events.as_slice(), [egui::Event::Text(_)]));
+        let mut events = vec![
+            key(egui::Key::Enter, true),
+            key(egui::Key::Escape, true),
+            key(egui::Key::Enter, false),
+        ];
+        assert!(route_history_picker_events(
+            &mut picker,
+            &mut held,
+            &mut events
+        ));
+        assert!(
+            picker.is_none(),
+            "Escape cancels queued confirmation in the same batch"
+        );
+        assert_eq!(held, PromptFillEnterLatch::Idle);
+        let mut events = vec![key(egui::Key::Enter, true)];
+        assert!(!route_history_picker_events(
+            &mut picker,
+            &mut held,
+            &mut events
+        ));
+        assert_eq!(events.len(), 1);
+    }
 
     #[test]
     fn block_chrome_claims_terminal_keys_clipboard_and_ime_but_leaves_pointer_input() {
