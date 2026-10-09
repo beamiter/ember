@@ -506,6 +506,7 @@ fn draw_workflow_args(
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("workflow-arguments")
+                .min_scrolled_height(1.0)
                 .max_height((rect.height() - 88.0).max(1.0))
                 .show(ui, |ui| {
                     ui.add(
@@ -587,6 +588,9 @@ fn draw_workflow_args(
                             let response = ui.add_sized(
                                 [ui.available_width(), ui.spacing().interact_size.y],
                                 egui::TextEdit::singleline(value)
+                                    // The app owns confirmation; a refused Enter must
+                                    // leave this field ready for keyboard correction.
+                                    .return_key(None)
                                     .id_salt(("workflow-argument", index)),
                             );
                             if focus_first {
@@ -595,6 +599,8 @@ fn draw_workflow_args(
                             }
                             if response.gained_focus() {
                                 response.scroll_to_me(Some(egui::Align::Center));
+                            } else if response.changed() {
+                                response.scroll_to_me(None);
                             }
                         };
                         if narrow {
@@ -605,15 +611,6 @@ fn draw_workflow_args(
                         ui.add_space(2.0);
                     }
                     state.sync();
-                    if let Some(error) = state.error.as_deref() {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(crate::workflow_picker::display_label(error))
-                                    .color(egui::Color32::from_rgb(255, 100, 100)),
-                            )
-                            .wrap(),
-                        );
-                    }
                 });
             ui.separator();
             ui.horizontal(|ui| {
@@ -629,14 +626,27 @@ fn draw_workflow_args(
                     action = Some(WorkflowArgsAction::Cancel);
                 }
             });
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("Enter Insert at Prompt · Esc Cancel · * needs a value")
+            if let Some(error) = state.error.as_deref() {
+                let error = crate::workflow_picker::display_label(error);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&error).color(egui::Color32::from_rgb(255, 100, 100)),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(error);
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Enter Insert at Prompt · Esc Cancel · * needs a value",
+                        )
                         .size(10.0)
                         .color(ui.visuals().weak_text_color()),
-                )
-                .wrap(),
-            );
+                    )
+                    .wrap(),
+                );
+            }
         });
     if defer_focus && action.is_none() {
         state.request_confirm();
@@ -4807,6 +4817,129 @@ mod tests {
             frame(&mut state, vec![click()]).1.is_none(),
             "stale assistive click must not retarget a different workflow"
         );
+    }
+
+    #[test]
+    fn workflow_refused_enter_keeps_the_field_ready_for_correction() {
+        let ctx = egui::Context::default();
+        let mut workflow = workflow_ui_fixture(1);
+        workflow.args[0].default = None;
+        let mut state = crate::workflow_picker::WorkflowArgsState::new(workflow);
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 640.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            run_frame(&ctx, input(vec![]), |_ui| {
+                draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+            });
+        }
+        let field = ctx
+            .memory(|memory| memory.focused())
+            .expect("argument input focused");
+        state.request_confirm();
+        let mut action = None;
+        run_frame(
+            &ctx,
+            input(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |_ui| {
+                action = draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+            },
+        );
+        assert_eq!(action, Some(WorkflowArgsAction::Submit));
+        state.error = Some(state.render().unwrap_err());
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field));
+        run_frame(
+            &ctx,
+            input(vec![egui::Event::Text("RECOVERED".into())]),
+            |_ui| {
+                assert_eq!(
+                    draw_workflow_args(&ctx, &mut state, &theme::Theme::default()),
+                    None
+                );
+            },
+        );
+        assert_eq!(state.render().unwrap(), "printf RECOVERED");
+        assert!(
+            state.error.is_none(),
+            "a real edit clears the obsolete refusal"
+        );
+    }
+
+    #[test]
+    fn workflow_refusal_stays_visible_outside_a_long_form() {
+        for size in [egui::vec2(280.0, 200.0), egui::vec2(1000.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut workflow = workflow_ui_fixture(64);
+            for arg in &mut workflow.args {
+                arg.default = None;
+            }
+            workflow.command = format!(
+                "printf {}",
+                workflow
+                    .args
+                    .iter()
+                    .map(|arg| format!("{{{}}}", arg.name))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let mut state = crate::workflow_picker::WorkflowArgsState::new(workflow);
+            state.error = Some(state.render().unwrap_err());
+            let accessible_error =
+                crate::workflow_picker::display_label(state.error.as_deref().unwrap());
+            assert!(accessible_error.len() > 200, "exercise visual truncation");
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(run_frame(
+                    &ctx,
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |_ui| {
+                        draw_workflow_args(&ctx, &mut state, &theme::Theme::default());
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let error = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, node)| {
+                    node.value()
+                        .is_some_and(|value| value.contains("missing values: arg0"))
+                })
+                .expect("the refusal remains accessible")
+                .1;
+            assert_eq!(
+                error.value(),
+                Some(accessible_error.as_str()),
+                "visual ellipsis must preserve the full bounded accessible error"
+            );
+            let bounds = error.bounds().unwrap();
+            assert!(
+                bounds.y0 >= 0.0 && bounds.y1 <= size.y as f64,
+                "error is outside the viewport: {bounds:?}"
+            );
+            assert!(
+                state.error.is_some(),
+                "idle repaint does not erase feedback"
+            );
+        }
     }
 
     fn workflow_ui_fixture(count: usize) -> crate::workflows::Workflow {

@@ -203,6 +203,7 @@ impl WorkflowArgsState {
         for index in 0..self.buffers.len() {
             if self.form.value(index) != self.buffers[index] {
                 self.form.set(index, self.buffers[index].clone());
+                self.error = None;
             }
         }
     }

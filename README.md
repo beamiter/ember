@@ -771,6 +771,8 @@ The picker fits narrow windows and preserves your reading position when you
 scroll. Parameter forms keep their actions visible while long templates and
 up to 64 fields scroll. Tab and Shift+Tab stay within the workflow dialog;
 Enter on the focused Cancel action closes it without filling the prompt.
+Validation feedback stays beside the actions, and a refused Enter keeps the
+current field ready for correction. Typing reveals an offscreen focused field.
 
 Workflow files are TOML or YAML (`.toml`, `.yaml`, `.yml`) and are read, in
 precedence order, from:
