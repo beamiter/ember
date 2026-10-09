@@ -156,18 +156,24 @@ impl TerminalApp {
         sessions_snapshot_for_persistence(&self.session_manager, &self.tabs)
     }
 
-    /// 即时持久化命令面板最近命令 + 搜索历史。两者都很小,无需 debounce。
-    /// 写盘失败只记日志,不影响交互(下次启动顶多丢一次新增项)。
-    pub fn save_ui_history(&self) {
-        if let Ok(path) = config::Config::ui_history_path() {
-            let snapshot = history_persistence::HistorySnapshot {
-                version: 1,
-                recent_commands: self.command_palette.recent_commands_snapshot(),
-                search_history: self.search_state.history.iter().cloned().collect(),
-            };
-            if let Err(e) = snapshot.save(&path) {
-                eprintln!("[HistoryPersistence] Failed to save: {}", e);
-            }
+    /// Save palette/search history until the first I/O or recovery failure.
+    /// Paused windows keep the original file and a visible recovery notice.
+    pub fn save_ui_history(&mut self) {
+        if self.ui_history_persistence.is_paused() {
+            return;
+        }
+        let snapshot = history_persistence::HistorySnapshot {
+            version: 1,
+            recent_commands: self.command_palette.recent_commands_snapshot(),
+            search_history: self.search_state.history.iter().cloned().collect(),
+        };
+        if let Some(notice) = self
+            .ui_history_persistence
+            .save(&snapshot)
+            .map(str::to_owned)
+        {
+            eprintln!("[HistoryPersistence] {notice}");
+            self.set_status_for(notice, std::time::Duration::from_secs(12));
         }
     }
 

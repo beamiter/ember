@@ -1009,6 +1009,10 @@ mod unix_pty {
             if self.exit_code_cached.is_some() {
                 return Ok(true);
             }
+            Self::observe_child_exit(self.child_pid, nonblocking)
+        }
+
+        fn observe_child_exit(child_pid: i32, nonblocking: bool) -> std::io::Result<bool> {
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let options =
                 libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
@@ -1020,12 +1024,7 @@ mod unix_pty {
                 // our forked child, and WNOWAIT explicitly preserves its wait
                 // status for the cleanup/reap step below.
                 let result = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        self.child_pid as libc::id_t,
-                        &mut info,
-                        options,
-                    )
+                    libc::waitid(libc::P_PID, child_pid as libc::id_t, &mut info, options)
                 };
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
@@ -1035,7 +1034,7 @@ mod unix_pty {
             })?;
             // SAFETY: a successful waitid initializes siginfo. With WNOHANG,
             // si_pid == 0 means the selected child has not changed state.
-            Ok(unsafe { info.si_pid() } == self.child_pid)
+            Ok(unsafe { info.si_pid() } == child_pid)
         }
 
         /// The direct child is known to be exited but deliberately unreaped.
@@ -1247,25 +1246,26 @@ mod unix_pty {
             let child_pid = self.child_pid;
             std::thread::spawn(move || unsafe {
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                // Observe without reaping. Even if TERM already ended the
+                // leader, its zombie must pin the PID/PGID until we have killed
+                // same-group descendants that ignored HUP/TERM. Reaping first
+                // would both leak those jobs and permit numeric PID reuse.
+                if let Err(error) = Self::observe_child_exit(child_pid, true) {
+                    // ECHILD means ownership has already been lost; never send
+                    // a signal to a potentially recycled PID or process group.
+                    if error.raw_os_error() != Some(libc::ECHILD) {
+                        log::warn!("could not observe terminating PTY child: {error}");
+                    }
+                    return;
+                }
+                let _ = libc::kill(-child_pid, libc::SIGKILL);
+                let _ = libc::kill(child_pid, libc::SIGKILL);
                 let mut status = 0;
-                let observed = loop {
-                    let result = libc::waitpid(child_pid, &mut status, libc::WNOHANG);
-                    if result >= 0
+                loop {
+                    if libc::waitpid(child_pid, &mut status, 0) >= 0
                         || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
                     {
-                        break result;
-                    }
-                };
-                if observed == 0 {
-                    // 宽限期后仍存活:强杀进程组与进程本身,然后回收。
-                    let _ = libc::kill(-child_pid, libc::SIGKILL);
-                    let _ = libc::kill(child_pid, libc::SIGKILL);
-                    loop {
-                        if libc::waitpid(child_pid, &mut status, 0) >= 0
-                            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                        {
-                            break;
-                        }
+                        break;
                     }
                 }
             });
@@ -1395,6 +1395,81 @@ mod unix_pty {
                     .to_string()
                     .contains("Incomplete shell startup status"),
                 "unexpected error: {error:#}"
+            );
+        }
+
+        #[test]
+        fn terminate_cleans_descendants_after_leader_exits_during_grace_period() {
+            let root = std::env::temp_dir().join(format!(
+                "ember-pty-terminate-descendants-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let ready = root.join("ready");
+            let leader_exited = root.join("leader-exited");
+            let escaped = root.join("descendant-escaped");
+            let argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                // Non-interactive sh leaves the background job in the leader's
+                // group. Synchronize after its traps are installed, then make
+                // the leader exit immediately on TERM while its child ignores
+                // both graceful signals. The child is deliberately bounded so
+                // a failing regression cannot leave a long-running orphan.
+                concat!(
+                    "trap '' HUP; trap 'printf exited > \"$2\"; exit 0' TERM; ",
+                    "(trap '' HUP TERM; printf ready > \"$1\"; ",
+                    "sleep 0.6; printf escaped > \"$3\") & ",
+                    "while :; do :; done"
+                )
+                .to_string(),
+                "ember-terminate-descendant-test".to_string(),
+                ready.to_string_lossy().into_owned(),
+                leader_exited.to_string_lossy().into_owned(),
+                escaped.to_string_lossy().into_owned(),
+            ];
+            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+                .expect("spawn termination test shell");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant did not install its traps"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            pty.terminate().expect("terminate the leader");
+            pty.terminate().expect("repeated terminate is harmless");
+            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            // Do not reap here: the detached thread is the sole wait owner.
+            std::thread::sleep(Duration::from_millis(850));
+            let leader_handled_term = leader_exited.exists();
+            let descendant_survived = escaped.exists();
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pty.child_pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            let wait_error = std::io::Error::last_os_error();
+            let _ = std::fs::remove_dir_all(root);
+            assert_eq!(observed, -1, "detached reaper did not reap the leader");
+            assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+            assert!(
+                leader_handled_term,
+                "leader did not handle TERM before SIGKILL"
+            );
+            assert!(
+                !descendant_survived,
+                "same-group descendant survived after the leader exited during termination"
             );
         }
 

@@ -2025,7 +2025,25 @@ impl Sidebar {
         match remapped_location {
             Some(location) => self.location = location,
             None => {
-                let local_refresh_error = self.set_location(FsLocation::Local);
+                // The old index no longer denotes the displayed authority.
+                // Unlike an ordinary transactional location switch, retaining
+                // its tree while Local is probed would make a failed/cancelled
+                // fallback expose those paths under the replacement profile.
+                self.prepare_endpoint_switch();
+                self.location = FsLocation::Local;
+                self.execution_overlay = remote_fs::SshExecutionOverlay::default();
+                self.current_dir = remote_fs::start_dir(&self.location, &self.remote_hosts)
+                    .unwrap_or_else(|_| PathBuf::from("/"));
+                self.location_home = Some(self.current_dir.clone());
+                self.root = None;
+                self.selected_path = None;
+                self.selection.clear();
+                self.navigation_back.clear();
+                self.navigation_forward.clear();
+                self.navigation_cache.clear();
+                self.failure_states.clear();
+                self.start_dir_pending = false;
+                let local_refresh_error = self.start_root_scan();
                 let mut message =
                     "The selected remote Files profile was deleted, changed, or is no longer unique; verifying and switching to Local"
                         .to_string();
@@ -4362,6 +4380,56 @@ mod tests {
             !sidebar.files_intent_is_current(&delayed_intent),
             "a dialog from the replaced remote must not dispatch against Local"
         );
+    }
+
+    #[test]
+    fn replaced_remote_cannot_survive_a_failed_local_fallback() {
+        let scanner = Arc::new(|_: &Path| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local scan denied",
+            ))
+        }) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        sidebar.set_remote_hosts(&profiles);
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.current_dir = PathBuf::from("/remote/old-authority");
+        sidebar.root = Some(Sidebar::root_node(&sidebar.current_dir));
+        sidebar.select_single(Path::new("/remote/old-authority/delete-me"), false);
+        let old_intent = sidebar.files_intent_context();
+        let mut replacement = profiles;
+        replacement[0].host = "different-authority.invalid".into();
+
+        assert!(sidebar.set_remote_hosts(&replacement).is_some());
+        poll_until_loaded(&mut sidebar);
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert_ne!(sidebar.current_dir, Path::new("/remote/old-authority"));
+        assert!(sidebar.selection.is_empty());
+        assert!(sidebar.selected_path.is_none());
+        assert!(!sidebar.files_intent_is_current(&old_intent));
+        assert!(sidebar
+            .root
+            .as_ref()
+            .is_none_or(|root| root.path != Path::new("/remote/old-authority")));
+    }
+
+    #[test]
+    fn cancelling_fallback_cannot_reenable_a_replaced_remote_tree() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        let profiles = crate::config::default_remote_hosts();
+        sidebar.set_remote_hosts(&profiles);
+        sidebar.location = FsLocation::Remote(0);
+        sidebar.current_dir = PathBuf::from("/remote/old-authority");
+        sidebar.root = Some(Sidebar::root_node(&sidebar.current_dir));
+        let mut replacement = profiles;
+        replacement[0].host = "different-authority.invalid".into();
+        sidebar.set_remote_hosts(&replacement);
+        sidebar.note_files_user_intent();
+        assert_eq!(sidebar.location(), &FsLocation::Local);
+        assert_ne!(sidebar.current_dir, Path::new("/remote/old-authority"));
+        assert!(sidebar.selection.is_empty());
     }
 
     #[test]

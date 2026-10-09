@@ -1170,17 +1170,17 @@ cancel/timeout cleanup enumerates only that upload's 32 candidates, refuses
 symbolic links, and cannot remove the final target or another concurrent upload.
 Remote directory uploads and relays follow the same token-scoped pattern: tar
 extracts only inside a private 0700 same-parent directory, one matching
-non-symlink root is required, and GNU `mv --no-copy -nT` performs the final
-no-replace rename (plain `mv -nT` on coreutils 8.30–9.0, which predate
-`--no-copy` but already rename with `RENAME_NOREPLACE` inside the same
-directory). Any other `mv` fails closed; a collision,
-invalid archive, cancellation, or extraction error leaves no partial final tree.
-Downloaded directories are extracted into a private 0700 same-parent directory,
-validated for one matching directory root, and only then published with the
-same no-replace rename. A concurrently-created destination is never merged
-with tar output or removed during cleanup. The staging directory keeps a
-no-follow descriptor open, and recursive cleanup runs only while its path still
-resolves to that held inode.
+non-symlink root is required. Remote rename and copy (files and directories),
+and directory upload publication, require Linux, Python 3, libc `renameat2`,
+and target-filesystem support for `RENAME_NOREPLACE`. A small private directory
+checks the actual destination filesystem before transferring/extracting data.
+Missing capability, unsupported filesystems, and cross-device renames fail
+explicitly; there is no check-then-rename fallback and no automatic software
+installation. Browsing, new-file creation and single-file upload do not require
+Python; single-file upload publishes with an atomic no-replace hard link.
+Process-group cleanup covers members of the owned group. Nonblocking pipe
+I/O has separate deadline/cancellation bounds even if a descendant escapes
+with `setsid`; this does not promise to terminate that escaped session.
 
 Directory refresh is stale-while-revalidate: the last-good rows, expanded
 subtrees and pagination remain usable while a new local or remote listing is

@@ -258,45 +258,19 @@ struct PendingAgentExecution {
 }
 
 pub(crate) fn client_from_config(config: &Config) -> Result<AiClient, String> {
-    if !config.ai_enabled {
-        return Err("AI features are disabled by configuration".to_string());
-    }
-    let provider = config
-        .ai_provider
-        .parse::<Provider>()
-        .map_err(|error| error.to_string())?;
-    let app_key_name = format!(
-        "{}_AI_API_KEY",
-        jterm_core::identity::get().app_name.to_ascii_uppercase()
-    );
-    let provider_key_name = match provider {
-        Provider::Anthropic => "ANTHROPIC_API_KEY",
-        Provider::OpenAiCompatible => "OPENAI_API_KEY",
-        Provider::Ollama => "OLLAMA_API_KEY",
-    };
-    let nonempty_env = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    let api_key = match nonempty_env(&app_key_name).or_else(|| nonempty_env(provider_key_name)) {
-        Some(key) => Some(key),
-        None => jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref())
-            .as_deref()
-            .map(crate::persistence_file::read_api_key_file)
-            .transpose()
-            .map_err(|error| format!("AI API key file: {error}"))?,
-    };
-    AiClient::new(
-        provider,
-        api_key,
-        config.ai_model.clone(),
-        config.ai_base_url.clone(),
-        config.ai_max_tokens,
-        config.ai_temperature,
-        config.ai_redact_secrets,
-    )
+    // Keep endpoint-aware key selection and credential-file safety identical
+    // to the shared transport. A local resolver must not send an OpenAI key
+    // to a Moonshot/Kimi endpoint or normalize malformed credential bytes.
+    AiClient::from_settings(&jterm_core::ai::AiSettings {
+        enabled: config.ai_enabled,
+        provider: config.ai_provider.clone(),
+        api_key_file: jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref()),
+        model: config.ai_model.clone(),
+        base_url: config.ai_base_url.clone(),
+        max_tokens: config.ai_max_tokens,
+        temperature: config.ai_temperature,
+        redact_secrets: config.ai_redact_secrets,
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -1671,6 +1645,164 @@ impl AgentPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_configuration_keeps_provider_credentials_bound() {
+        // Run each credential scenario in a separate process. Mutating the
+        // main test process's provider environment would race unrelated tests.
+        const PROBE: &str = "JTERM_HOST_AI_CREDENTIAL_PROBE";
+        if let Ok(case) = std::env::var(PROBE) {
+            let mut config = Config {
+                ai_enabled: true,
+                ai_provider: "openai-compatible".into(),
+                ai_model: "fixture-model".into(),
+                ai_base_url: match case.as_str() {
+                    "moonshot-cn" => "https://api.moonshot.cn/v1",
+                    "kimi" | "kimi-fallback" => "https://api.kimi.com/coding/v1",
+                    "moonshot-ai" | "app-override" => "https://api.moonshot.ai/v1",
+                    _ => "https://api.openai.com/v1",
+                }
+                .into(),
+                ai_max_tokens: 512,
+                ai_api_key_file: None,
+                ..Config::default()
+            };
+            if case.starts_with("file-") {
+                let directory = std::env::temp_dir().join(format!(
+                    "host-ai-credential-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir(&directory).unwrap();
+                let path = directory.join("provider.key");
+                std::fs::write(
+                    &path,
+                    if case == "file-malformed" {
+                        "file-fixture-key\n\n"
+                    } else {
+                        "file-fixture-key\n"
+                    },
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    if case == "file-symlink" {
+                        let link = directory.join("link.key");
+                        std::os::unix::fs::symlink(&path, &link).unwrap();
+                        config.ai_api_key_file = Some(link.to_str().unwrap().into());
+                    }
+                    if case == "file-public" {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                    }
+                }
+                config
+                    .ai_api_key_file
+                    .get_or_insert_with(|| path.to_str().unwrap().into());
+                let result = client_from_config(&config);
+                std::fs::remove_dir_all(directory).unwrap();
+                if case == "file-private" {
+                    assert_eq!(result.unwrap().api_key.as_deref(), Some("file-fixture-key"));
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "unsafe file credential was accepted: {case}"
+                    );
+                }
+                return;
+            }
+            let result = client_from_config(&config);
+            if case == "padded-env" {
+                assert!(
+                    result.is_err(),
+                    "credential whitespace must not be silently trimmed"
+                );
+            } else {
+                let expected = match case.as_str() {
+                    "openai" => "openai-fixture-key",
+                    "app-override" => "app-fixture-key",
+                    "kimi-fallback" => "kimi-fixture-key",
+                    _ => "moonshot-fixture-key",
+                };
+                assert_eq!(result.unwrap().api_key.as_deref(), Some(expected), "{case}");
+            }
+            return;
+        }
+        let test_name = format!(
+            "{}::client_configuration_keeps_provider_credentials_bound",
+            module_path!().split_once("::").unwrap().1
+        );
+        let app_key = format!(
+            "{}_AI_API_KEY",
+            jterm_core::identity::get().app_name.to_ascii_uppercase()
+        );
+        let app_file = format!(
+            "{}_AI_API_KEY_FILE",
+            jterm_core::identity::get().app_name.to_ascii_uppercase()
+        );
+        for case in [
+            "moonshot-ai",
+            "moonshot-cn",
+            "kimi",
+            "kimi-fallback",
+            "openai",
+            "app-override",
+            "padded-env",
+            "file-private",
+            "file-malformed",
+            "file-symlink",
+            "file-public",
+        ] {
+            if !cfg!(unix) && matches!(case, "file-symlink" | "file-public") {
+                continue;
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(PROBE, case)
+                .env_remove(&app_key)
+                .env_remove(&app_file);
+            for name in [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "MOONSHOT_API_KEY",
+                "KIMI_API_KEY",
+                "OLLAMA_API_KEY",
+            ] {
+                command.env_remove(name);
+            }
+            if !case.starts_with("file-") {
+                command
+                    .env(
+                        "OPENAI_API_KEY",
+                        if case == "padded-env" {
+                            " padded-key "
+                        } else {
+                            "openai-fixture-key"
+                        },
+                    )
+                    .env("KIMI_API_KEY", "kimi-fixture-key");
+                if case != "kimi-fallback" {
+                    command.env("MOONSHOT_API_KEY", "moonshot-fixture-key");
+                }
+            }
+            if case == "app-override" {
+                command.env(&app_key, "app-fixture-key");
+            }
+            let output = command.output().expect("run isolated credential probe");
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
         std::fs::write(path, contents).unwrap();

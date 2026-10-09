@@ -461,19 +461,13 @@ pub(crate) fn open_local_path(path: &std::path::Path) -> Result<(), Box<dyn std:
         )
         .into());
     }
-    open_file_path(&path.to_string_lossy())
+    open_file_path(path)
 }
 
 /// 打开文件路径（使用系统默认应用）
-fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = expand_path(path);
-    let mut command = std::process::Command::new(trusted_opener()?);
-    // `--` first: a detected path beginning with `-` is a file operand, never
-    // an option for the opener.
-    #[cfg(not(target_os = "windows"))]
-    command.arg("--");
-    let mut child = command
-        .arg(&expanded_path)
+fn open_file_path(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut child = std::process::Command::new(trusted_opener()?)
+        .args(file_opener_args(path)?)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -484,14 +478,20 @@ fn open_file_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 扩展路径（~/ 变量替换等）
-fn expand_path(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}{}", home.display(), &path[1..]);
-        }
-    }
-    path.to_string()
+/// xdg-open has no `--` operand separator. An absolute path is already
+/// option-safe and keeps relative names such as `-notes.txt` out of its option
+/// parser. macOS `open` does accept `--`; preserve that platform's convention.
+fn file_opener_args(path: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    #[cfg(target_os = "macos")]
+    let args = vec![std::ffi::OsString::from("--"), absolute.into_os_string()];
+    #[cfg(not(target_os = "macos"))]
+    let args = vec![absolute.into_os_string()];
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -560,6 +560,40 @@ mod tests {
             };
             assert!(open_link(&link).is_err(), "accepted unsafe target {target}");
         }
+    }
+
+    #[test]
+    fn file_opener_uses_an_absolute_option_safe_operand() {
+        let args = file_opener_args(std::path::Path::new("-notes.txt")).unwrap();
+        let expected = std::env::current_dir().unwrap().join("-notes.txt");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            args,
+            [std::ffi::OsString::from("--"), expected.into_os_string()]
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(args, [expected.into_os_string()]);
+    }
+
+    #[test]
+    fn file_opener_keeps_absolute_paths_as_one_exact_operand() {
+        let path = std::env::temp_dir().join("file with spaces;$(not-a-command).txt");
+        let args = file_opener_args(&path).unwrap();
+        assert_eq!(args.last().unwrap(), path.as_os_str());
+        #[cfg(target_os = "linux")]
+        assert_eq!(args.len(), 1, "xdg-open rejects a separate -- operand");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_opener_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path =
+            std::env::temp_dir().join(std::ffi::OsString::from_vec(b"notes-\xff.txt".to_vec()));
+        assert_eq!(
+            file_opener_args(&path).unwrap().last().unwrap(),
+            path.as_os_str()
+        );
     }
 
     #[test]

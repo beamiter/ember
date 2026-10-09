@@ -2444,10 +2444,10 @@ impl TerminalApp {
         // close, avoiding four full GPU/text caches in the common one-pane case.
         let pane_renderers = Vec::new();
 
-        // 命令面板/搜索历史:启动时一次性读盘,失败回 Default(load 已吞日志)。
-        let history = config::Config::ui_history_path()
-            .map(|p| history_persistence::HistorySnapshot::load(&p))
-            .unwrap_or_default();
+        // Retain a failed history load as paused state with a recovery notice,
+        // so later palette/search events neither overwrite nor retry it.
+        let (history, ui_history_persistence) =
+            history_persistence::UiHistoryPersistence::restore(config::Config::ui_history_path());
 
         let mut command_palette = command_palette::CommandPalette::new();
         command_palette.restore_recent_commands(history.recent_commands);
@@ -2460,7 +2460,8 @@ impl TerminalApp {
                 "Configuration was not applied and will not be overwritten: {error}"
             )),
             None => session_restore_notice,
-        };
+        }
+        .or_else(|| ui_history_persistence.notice().map(str::to_owned));
         let initial_status_expires_at = startup_notice
             .as_ref()
             .map(|_| std::time::Instant::now() + Duration::from_secs(10));
@@ -2566,6 +2567,7 @@ impl TerminalApp {
             session_save_pending: !session_persistence_blocked,
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             session_persistence_blocked,
+            ui_history_persistence,
             _lock_file: lock_file,
             mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
             mouse_point_wheel: jterm_core::wheel::WheelAccumulator::default(),

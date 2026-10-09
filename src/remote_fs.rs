@@ -14,12 +14,13 @@
 //! - put/untar 的 stdin 要整个留给上传载荷，脚本本体改走 `sh -c` 内联
 //!   （`sh -s` 的预读缓冲会和探针里的 `cat`/`tar x` 抢 stdin 字节）。
 
+use jterm_core::supervised::SupervisedChild;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -226,9 +227,9 @@ pub struct Capture {
 /// - v6：`put <path> <transfer-id>` 由客户端唯一令牌命名有界的候选目录，
 ///   取消/超时后只清理本次上传的 32 个可能候选。
 /// - v7：`untar <dir> <name> <transfer-id>` 只向同父级私有目录解包，
-///   校验唯一同名非链接根后用 GNU `mv --no-copy -nT` 原子发布；coreutils
-///   8.30–9.0 没有 `--no-copy`，改用同样走 `renameat2(RENAME_NOREPLACE)` 的
-///   `mv -nT`（同目录内 rename，非特权进程无法让它跨设备），其他 `mv` 返回 4。
+///   校验唯一同名非链接根后用 Python 3/ctypes 直接调用 Linux
+///   `renameat2(RENAME_NOREPLACE)` 原子发布。远端 mv/cp/untar 先验证 libc
+///   和目标文件系统能力；缺失、不支持或跨设备都返回 4，不降级为 racy mv。
 /// - 退出码：0 正常，2 用法/路径非法，3 缺失，4 操作失败，13 权限，
 ///   17 目标已存在，20 非目录。
 pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v7 — runs under `sh -s -- <op> [args...]`.
@@ -246,9 +247,86 @@ pub const PROBE_SCRIPT: &str = r#"# remote-fs probe v7 — runs under `sh -s -- 
 # v6: put takes a client transfer id so cancel cleanup can enumerate only that
 # upload's bounded collision candidates.
 # v7: untar extracts into private same-parent staging, validates one matching
-# directory root, then publishes it with GNU mv's atomic no-replace rename
-# (--no-copy where coreutils >= 9.1 has it; plain -nT on 8.30+).
+# directory root, then publishes with Linux renameat2(RENAME_NOREPLACE).
+# Remote mv/cp/untar require Python 3, libc renameat2 and a supporting filesystem.
 set -u
+# GNU mv may emulate no-clobber on filesystems without renameat2 support.
+# Use the Linux syscall directly and probe the actual destination filesystem.
+rename_program='import ctypes
+import errno
+import os
+import sys
+import tempfile
+
+
+def fail(message, code=4):
+    print("remote-fs probe: " + message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+if sys.platform != "linux":
+    fail("atomic no-replace rename requires Linux")
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+except (AttributeError, OSError):
+    fail("atomic no-replace rename is unavailable in libc")
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+
+
+def rename(source, destination):
+    if renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+try:
+    if sys.argv[1] == "check":
+        # Probe the actual destination filesystem before moving user data.
+        # No installation or persistent configuration changes are needed.
+        with tempfile.TemporaryDirectory(prefix=".jterm-rename-check-", dir=sys.argv[2]) as stage:
+            source = os.path.join(stage, "source")
+            destination = os.path.join(stage, "destination")
+            os.mkdir(source)
+            rename(source, destination)
+            os.mkdir(source)
+            try:
+                rename(source, destination)
+            except OSError as error:
+                if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise
+            else:
+                fail("filesystem did not enforce atomic no-replace rename")
+    else:
+        rename(sys.argv[2], sys.argv[3])
+except OSError as error:
+    if sys.argv[1] != "check" and error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+        raise SystemExit(17)
+    fail("atomic no-replace rename unavailable or failed (errno %s: %s)" % (error.errno, error.strerror))
+'
+require_noreplace_rename() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "remote-fs probe: atomic no-replace rename requires Python 3" >&2
+    return 1
+  }
+  python3 -I -c "$rename_program" check "$1"
+}
+publish_noreplace() {
+  python3 -I -c "$rename_program" publish "$1" "$2"
+}
+make_stage() {
+  stage=
+  i=0
+  umask 077
+  while [ "$i" -lt 32 ]; do
+    candidate="$1/.ember-fs-copy-$$-$i"
+    i=$((i + 1))
+    if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+  done
+  [ -n "$stage" ] || return 1
+  trap 'rm -rf -- "$stage" 2>/dev/null' EXIT
+}
 op=${1:-}
 case "$op" in
   home)
@@ -290,7 +368,10 @@ case "$op" in
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
     if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
-    : > "$p" || exit 4
+    (set -C; : > "$p") 2>/dev/null || {
+      if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
+      exit 4
+    }
     ;;
   rm)
     p=${2:-}
@@ -302,14 +383,20 @@ case "$op" in
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
-    mv "$s" "$n" || exit 4
+    d=${n%/*}; d=${d:-/}
+    require_noreplace_rename "$d" || exit 4
+    publish_noreplace "$s" "$n" || exit $?
     ;;
   cp)
     s=${2:-}; n=${3:-}
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
-    cp -a "$s" "$n" || exit 4
+    d=${n%/*}; d=${d:-/}
+    require_noreplace_rename "$d" || exit 4
+    make_stage "$d" || exit 4
+    cp -a -- "$s" "$stage/payload" || exit 4
+    publish_noreplace "$stage/payload" "$n" || exit $?
     ;;
   cat)
     p=${2:-}
@@ -359,7 +446,7 @@ case "$op" in
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
     d=${p%/*}
     d=${d:-/}
-    tar cf - -C "$d" "${p##*/}" || exit 4
+    tar cf - -C "$d" -- "${p##*/}" || exit 4
     ;;
   untar)
     d=${2:-}; n=${3:-}; id=${4:-}
@@ -369,21 +456,7 @@ case "$op" in
     [ "${#id}" -le 96 ] || exit 2
     [ -d "$d" ] || exit 3
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
-    command -v mv >/dev/null 2>&1 || { echo "remote-fs probe: mv is not available" >&2; exit 4; }
-    # GNU mv -n is renameat2(RENAME_NOREPLACE) since coreutils 8.30; 9.1 added
-    # --no-copy to also refuse a cross-device copy. This rename stays inside
-    # one directory, out of a stage created just below, so only a privileged
-    # mount could make it cross devices. Other mv may emulate -n racily.
-    if mv --no-copy --version >/dev/null 2>&1; then
-      no_copy=--no-copy
-    else
-      no_copy=
-      case $(mv --version 2>/dev/null) in
-        "mv (GNU coreutils) "8.3[0-9]*|"mv (GNU coreutils) "8.[4-9][0-9]*) ;;
-        "mv (GNU coreutils) "9.*|"mv (GNU coreutils) "[1-9][0-9]*) ;;
-        *) echo "remote-fs probe: mv has no atomic no-replace rename" >&2; exit 4 ;;
-      esac
-    fi
+    require_noreplace_rename "$d" || exit 4
     cd "$d" 2>/dev/null || exit 3
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     stage=
@@ -408,14 +481,10 @@ case "$op" in
         fi
       done
       if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
-        if mv ${no_copy:+"$no_copy"} -nT -- "$source" "$n" 2>/dev/null; then
-          if [ -e "$source" ] || [ -L "$source" ]; then
-            if [ -e "$n" ] || [ -L "$n" ]; then code=17; fi
-          else
-            code=0
-          fi
-        elif [ -e "$n" ] || [ -L "$n" ]; then
-          code=17
+        if publish_noreplace "$source" "$n"; then
+          code=0
+        else
+          code=$?
         fi
       fi
     fi
@@ -764,11 +833,11 @@ fn checked_sh_c_probe_argv(
     Ok(sh_c_probe_argv(host, op, args))
 }
 
-fn spawn_piped(argv: &[String]) -> io::Result<Child> {
+fn spawn_piped(argv: &[String]) -> io::Result<SupervisedChild> {
     spawn_piped_inheriting(argv, &[])
 }
 
-fn spawn_piped_inheriting(argv: &[String], inherited_fds: &[i32]) -> io::Result<Child> {
+fn spawn_piped_inheriting(argv: &[String], inherited_fds: &[i32]) -> io::Result<SupervisedChild> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
@@ -801,139 +870,271 @@ fn spawn_piped_inheriting(argv: &[String], inherited_fds: &[i32]) -> io::Result<
     }
     #[cfg(not(unix))]
     let _ = inherited_fds;
-    command.spawn()
+    SupervisedChild::spawn(&mut command)
 }
 
-/// 杀掉整个进程组（子进程在 spawn 时被设为组长）；非 Unix 退化为只杀
-/// 直接子进程。只发信号、返回是否发出成功：直接子进程的回收由调用方的
-/// try_wait/wait 路径完成。
-fn kill_tree(child: &mut Child) -> bool {
-    #[cfg(unix)]
-    unsafe {
-        // SAFETY: 对 spawn 时建立的进程组发一次 kill；pid 来自存活的
-        // Child 句柄。
-        libc::kill(-(child.id() as i32), libc::SIGKILL) == 0
-    }
-    #[cfg(not(unix))]
-    child.kill().is_ok()
+/// Only this state may reap the child. SupervisedChild pins the Unix group
+/// leader with WNOWAIT until the whole group is killed, even if the leader
+/// already exited while descendants still hold an inherited pipe open.
+struct ChildState {
+    child: Option<SupervisedChild>,
+    result: Option<io::Result<ExitStatus>>,
 }
 
-/// Kill only a child that has not already exited. Checking and signalling
-/// under the same lock prevents the watchdog from targeting a recycled
-/// process-group id after the main waiter has reaped the child.
-fn kill_running_child(child: &Arc<Mutex<Child>>) -> bool {
-    let mut child = child.lock();
-    match child.try_wait() {
-        Ok(Some(_)) | Err(_) => false,
-        Ok(None) => kill_tree(&mut child),
-    }
-}
-
-/// Best-effort setup-error cleanup. `try_wait` itself reaps an exited child;
-/// a still-running child takes the mutually exclusive kill-then-wait branch.
-fn kill_and_reap_child(child: &Arc<Mutex<Child>>) {
-    let mut child = child.lock();
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            let _ = kill_tree(&mut child);
-            let _ = child.wait();
+impl ChildState {
+    fn finish(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            self.result = Some(child.reap_after_group_kill());
         }
-        Err(_) => {}
     }
 }
 
-/// 子进程 + watchdog 的组合：超时或取消令牌触发时强制 kill（同一条 kill
-/// 路径），try_wait 轮询而不是 wait() 长持锁（watchdog 需要同一把锁来 kill）。
-struct MonitoredChild {
-    child: Arc<Mutex<Child>>,
-    timed_out: Arc<AtomicBool>,
-    cancelled: Arc<AtomicBool>,
-    done_tx: mpsc::Sender<()>,
-    watchdog: Option<std::thread::JoinHandle<()>>,
-    reaped: bool,
+/// I/O owns a separate stopping condition: an escaped session can retain a
+/// pipe after the helper's original process group has been safely retired.
+struct PipeControl {
+    deadline: std::time::Instant,
+    cancel: Option<Arc<AtomicBool>>,
+    stopped: AtomicBool,
+    timed_out: AtomicBool,
+    cancelled: AtomicBool,
 }
 
-/// watchdog 的醒转间隔：有取消令牌时按它轮询令牌。
-const WATCHDOG_POLL: Duration = Duration::from_millis(100);
+impl PipeControl {
+    fn running(&self) -> bool {
+        if self.stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            self.cancelled.store(true, Ordering::SeqCst);
+            self.stopped.store(true, Ordering::SeqCst);
+            return false;
+        }
+        if std::time::Instant::now() >= self.deadline {
+            self.timed_out.store(true, Ordering::SeqCst);
+            self.stopped.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
 
-impl MonitoredChild {
-    fn new(child: Child, timeout: Duration, cancel: Option<Arc<AtomicBool>>) -> io::Result<Self> {
-        let child = Arc::new(Mutex::new(child));
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let watchdog = {
-            let child = child.clone();
-            let timed_out = timed_out.clone();
-            let cancelled = cancelled.clone();
-            std::thread::Builder::new()
-                .name("ember-fs-probe-watchdog".to_string())
-                .spawn(move || {
-                    let deadline = std::time::Instant::now() + timeout;
-                    loop {
-                        match done_rx.recv_timeout(WATCHDOG_POLL) {
-                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                // kill 成功才标记，避免与已自然退出的子进程竞争时误报。
-                                if cancel
-                                    .as_ref()
-                                    .is_some_and(|token| token.load(Ordering::SeqCst))
-                                {
-                                    if kill_running_child(&child) {
-                                        cancelled.store(true, Ordering::SeqCst);
-                                    }
-                                    break;
-                                }
-                                if std::time::Instant::now() >= deadline {
-                                    if kill_running_child(&child) {
-                                        timed_out.store(true, Ordering::SeqCst);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                })
-        };
-        let watchdog = match watchdog {
-            Ok(watchdog) => watchdog,
-            Err(error) => {
-                kill_and_reap_child(&child);
-                return Err(error);
-            }
-        };
+    fn pause(&self) {
+        std::thread::sleep(
+            self.deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+    }
+}
+
+struct DeadlinePipe<T> {
+    pipe: T,
+    control: Arc<PipeControl>,
+    #[cfg(unix)]
+    fd: i32,
+    remaining_after_stop: Option<usize>,
+}
+
+impl<T> DeadlinePipe<T> {
+    #[cfg(unix)]
+    fn new(pipe: T, control: Arc<PipeControl>) -> io::Result<Self>
+    where
+        T: std::os::fd::AsRawFd,
+    {
+        let fd = pipe.as_raw_fd();
+        // SAFETY: the owned pipe keeps fd live; preserve its other status
+        // flags and only make this parent's end nonblocking.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(Self {
-            child,
-            timed_out,
-            cancelled,
-            done_tx,
-            watchdog: Some(watchdog),
-            reaped: false,
+            pipe,
+            control,
+            fd,
+            remaining_after_stop: None,
         })
     }
 
-    /// 传输超限/流错误时立即中止子进程（整组 kill，子孙一并回收）。
-    fn kill(&self) {
-        let _ = kill_running_child(&self.child);
+    #[cfg(not(unix))]
+    fn new(_pipe: T, _control: Arc<PipeControl>) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded helper pipes require Unix nonblocking I/O",
+        ))
+    }
+}
+
+impl<T: Read> Read for DeadlinePipe<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let running = self.control.running();
+            let mut limit = bytes.len();
+            if !running {
+                if self.control.timed_out.load(Ordering::SeqCst)
+                    || self.control.cancelled.load(Ordering::SeqCst)
+                {
+                    return Ok(0);
+                }
+                // Preserve already-buffered diagnostics after a normal root
+                // exit, but do not keep draining a live escaped descendant.
+                // Snapshot the finite queued bytes once, then stop at zero.
+                if self.remaining_after_stop.is_none() {
+                    #[cfg(unix)]
+                    {
+                        let mut available: libc::c_int = 0;
+                        // SAFETY: self.pipe owns fd and available is writable.
+                        if unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut available) } < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        self.remaining_after_stop = Some(available.max(0) as usize);
+                    }
+                    #[cfg(not(unix))]
+                    return Ok(0);
+                }
+                limit = limit.min(self.remaining_after_stop.unwrap_or(0));
+                if limit == 0 {
+                    return Ok(0);
+                }
+            }
+            match self.pipe.read(&mut bytes[..limit]) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if !running {
+                        return Ok(0);
+                    }
+                    self.control.pause();
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(n) => {
+                    if let Some(remaining) = self.remaining_after_stop.as_mut() {
+                        *remaining = remaining.saturating_sub(n);
+                    }
+                    return Ok(n);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl<T: Write> Write for DeadlinePipe<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            if !self.control.running() {
+                // write_all retries Interrupted, so use a terminal pipe
+                // error here; the shared outcome retains cancel/timeout.
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "helper input stopped",
+                ));
+            }
+            match self.pipe.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => self.control.pause(),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
     }
 
-    /// 等子进程退出并停掉 watchdog，返回（退出码，是否超时，是否取消）。
-    fn wait(mut self) -> io::Result<(Option<i32>, bool, bool)> {
-        let status = loop {
-            if let Some(status) = self.child.lock().try_wait()? {
-                break status;
+    fn flush(&mut self) -> io::Result<()> {
+        self.pipe.flush()
+    }
+}
+
+struct MonitoredChild {
+    child: Arc<Mutex<ChildState>>,
+    control: Arc<PipeControl>,
+    done_tx: mpsc::Sender<()>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+const WATCHDOG_POLL: Duration = Duration::from_millis(100);
+
+impl MonitoredChild {
+    fn new(
+        child: SupervisedChild,
+        timeout: Duration,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Self> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))?;
+        let child = Arc::new(Mutex::new(ChildState {
+            child: Some(child),
+            result: None,
+        }));
+        let control = Arc::new(PipeControl {
+            deadline,
+            cancel,
+            stopped: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let watchdog = {
+            let child = child.clone();
+            let control = control.clone();
+            std::thread::Builder::new()
+                .name("ember-fs-probe-watchdog".to_string())
+                .spawn(move || loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match done_rx.recv_timeout(remaining.min(WATCHDOG_POLL)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let mut state = child.lock();
+                            if state.child.is_none() {
+                                break;
+                            }
+                            if !control.running() {
+                                state.finish();
+                                break;
+                            }
+                        }
+                    }
+                })?
+        };
+        Ok(Self {
+            child,
+            control,
+            done_tx,
+            watchdog: Some(watchdog),
+        })
+    }
+
+    fn kill(&self) {
+        self.control.stopped.store(true, Ordering::SeqCst);
+        self.child.lock().finish();
+    }
+
+    fn wait(&mut self) -> io::Result<Option<i32>> {
+        let result = loop {
+            {
+                let mut state = self.child.lock();
+                if let Some(child) = state.child.as_mut() {
+                    if child.root_has_exited()? {
+                        state.finish();
+                    }
+                }
+                if let Some(result) = state.result.take() {
+                    break result;
+                }
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        self.reaped = true;
-        // 通知 watchdog 停止并等它退出，避免残留线程挂着子进程的锁。
+        // Stop our pipe I/O before joining; escaped sessions themselves are not killed.
+        self.control.stopped.store(true, Ordering::SeqCst);
         self.stop_watchdog();
-        Ok((
-            status.code(),
-            self.timed_out.load(Ordering::SeqCst),
-            self.cancelled.load(Ordering::SeqCst),
-        ))
+        result.map(|status| status.code())
+    }
+
+    fn outcome(&self) -> (bool, bool) {
+        (
+            self.control.timed_out.load(Ordering::SeqCst),
+            self.control.cancelled.load(Ordering::SeqCst),
+        )
     }
 
     fn stop_watchdog(&mut self) {
@@ -946,18 +1147,16 @@ impl MonitoredChild {
 
 impl Drop for MonitoredChild {
     fn drop(&mut self) {
+        self.control.stopped.store(true, Ordering::SeqCst);
         self.stop_watchdog();
-        if !self.reaped {
-            kill_and_reap_child(&self.child);
-            self.reaped = true;
-        }
+        self.child.lock().finish();
     }
 }
 
 /// 把子进程输出流读到 EOF，硬上限 max 字节：超出部分继续排空（子进程
 /// 不会堵在满管道上），调用方把 truncated 视为错误。
 fn read_bounded<R: Read>(reader: R, max: u64) -> io::Result<(Vec<u8>, bool)> {
-    let mut limited = reader.take(max + 1);
+    let mut limited = reader.take(max.saturating_add(1));
     let mut bytes = Vec::new();
     limited.read_to_end(&mut bytes)?;
     if bytes.len() <= max as usize {
@@ -971,28 +1170,61 @@ fn read_bounded<R: Read>(reader: R, max: u64) -> io::Result<(Vec<u8>, bool)> {
 
 /// stderr 另开读者线程：子进程写满 stderr 管道而主线程在读 stdout 时，
 /// 单线程顺序读会互相等待形成死锁。
-type StderrReader = std::thread::JoinHandle<(Vec<u8>, bool)>;
+type StderrReader = std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>;
 
 fn spawn_stderr_reader(
-    stderr: std::process::ChildStderr,
+    stderr: DeadlinePipe<std::process::ChildStderr>,
     max_out: u64,
 ) -> io::Result<StderrReader> {
     std::thread::Builder::new()
         .name("ember-fs-probe-stderr".to_string())
-        .spawn(move || read_bounded(stderr, max_out).unwrap_or_default())
+        .spawn(move || read_bounded(stderr, max_out))
 }
 
 fn monitor_with_stderr_reader(
-    child: Child,
+    child: SupervisedChild,
     stderr: std::process::ChildStderr,
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
     max_out: u64,
-    spawn_reader: impl FnOnce(std::process::ChildStderr, u64) -> io::Result<StderrReader>,
+    spawn_reader: impl FnOnce(DeadlinePipe<std::process::ChildStderr>, u64) -> io::Result<StderrReader>,
 ) -> io::Result<(MonitoredChild, StderrReader)> {
     let monitored = MonitoredChild::new(child, timeout, cancel)?;
-    let stderr_reader = spawn_reader(stderr, max_out)?;
+    let stderr_reader = spawn_reader(
+        DeadlinePipe::new(stderr, monitored.control.clone())?,
+        max_out,
+    )?;
     Ok((monitored, stderr_reader))
+}
+
+fn join_stderr_reader(reader: StderrReader) -> io::Result<(Vec<u8>, bool)> {
+    reader
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("stderr reader panicked")))
+}
+
+/// Start after the watchdog and stderr reader, then read stdout concurrently.
+/// Even the probe script can exceed a platform's pipe capacity; no input size
+/// can justify an unsupervised write before draining the output pipes.
+fn spawn_stdin_writer(
+    mut stdin: DeadlinePipe<std::process::ChildStdin>,
+    bytes: &[u8],
+) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
+    let bytes = bytes.to_vec();
+    std::thread::Builder::new()
+        .name("ember-fs-probe-stdin".to_string())
+        .spawn(move || stdin.write_all(&bytes))
+}
+
+fn command_deadline(
+    timeout: Duration,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> io::Result<std::time::Instant> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))?;
+    check_local_transfer(cancel, deadline)?;
+    Ok(deadline)
 }
 
 /// 有界地运行一个子进程：pipe stdio，写入并关闭 stdin，stdout/stderr 各按
@@ -1025,31 +1257,41 @@ fn run_capture_with_cancel_inheriting(
     cancel: Option<Arc<AtomicBool>>,
     inherited_fds: &[i32],
 ) -> io::Result<Capture> {
+    let deadline = command_deadline(timeout, cancel.as_ref())?;
     let mut child = spawn_piped_inheriting(argv, inherited_fds)?;
-
-    // 探针脚本约 2KB，远小于 64KB 管道缓冲，同步写不会阻塞；子进程若立即
-    // 退出，BrokenPipe 按无害处理（结果由退出码说话）。
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_bytes);
-    }
-
+    let stdin_pipe = child
+        .take_stdin()
+        .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
     let stdout_pipe = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| io::Error::other("child stdout pipe missing"))?;
     let stderr_pipe = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
+    let mut monitored = MonitoredChild::new(child, remaining_transfer_timeout(deadline)?, cancel)?;
+    let stdout_pipe = DeadlinePipe::new(stdout_pipe, monitored.control.clone())?;
+    let stderr_reader = spawn_stderr_reader(
+        DeadlinePipe::new(stderr_pipe, monitored.control.clone())?,
+        max_out,
+    )?;
+    let stdin_writer = spawn_stdin_writer(
+        DeadlinePipe::new(stdin_pipe, monitored.control.clone())?,
+        stdin_bytes,
+    )?;
 
-    let monitored = MonitoredChild::new(child, timeout, cancel)?;
-    let stderr_reader = spawn_stderr_reader(stderr_pipe, max_out)?;
-
-    // 超限字节继续排空（子进程不会堵在满管道上），截断在下方统一报错。
     let stdout_read = read_bounded(stdout_pipe, max_out);
-
-    let (code, timed_out, cancelled) = monitored.wait()?;
-    let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
+    if stdout_read.is_err() {
+        monitored.kill();
+    }
+    let code = monitored.wait()?;
+    let stdin_result = stdin_writer
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("stdin writer panicked")));
+    let (stderr, stderr_truncated) = join_stderr_reader(stderr_reader)?;
+    let (timed_out, cancelled) = monitored.outcome();
+    if code == Some(0) && !timed_out && !cancelled {
+        stdin_result?;
+    }
 
     let (stdout, stdout_truncated) = stdout_read?;
     // 被 kill（超时/取消）的进程输出本就不完整，截断错误只报给正常跑完
@@ -1743,26 +1985,29 @@ fn run_stream_to_open_file_inheriting(
     mut control: TransferControl,
     inherited_fds: &[i32],
 ) -> io::Result<Capture> {
+    let deadline = command_deadline(timeout, control.cancel.as_ref())?;
     let mut child = spawn_piped_inheriting(argv, inherited_fds)?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_bytes);
-    }
-    let mut stdout_pipe = child
-        .stdout
-        .take()
+    let stdin_pipe = child
+        .take_stdin()
+        .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
+    let stdout_pipe = child
+        .take_stdout()
         .ok_or_else(|| io::Error::other("child stdout pipe missing"))?;
     let stderr_pipe = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
-
-    let (monitored, stderr_reader) = monitor_with_stderr_reader(
+    let (mut monitored, stderr_reader) = monitor_with_stderr_reader(
         child,
         stderr_pipe,
-        timeout,
+        remaining_transfer_timeout(deadline)?,
         control.cancel.clone(),
         MAX_SMALL_OUTPUT,
         spawn_stderr_reader,
+    )?;
+    let mut stdout_pipe = DeadlinePipe::new(stdout_pipe, monitored.control.clone())?;
+    let stdin_writer = spawn_stdin_writer(
+        DeadlinePipe::new(stdin_pipe, monitored.control.clone())?,
+        stdin_bytes,
     )?;
 
     let mut buffer = [0u8; STREAM_BUF_SIZE];
@@ -1796,13 +2041,18 @@ fn run_stream_to_open_file_inheriting(
     }
     drop(file);
 
-    let (code, timed_out, cancelled) = monitored.wait()?;
-    // 传输路径的 stderr 仅作诊断：截断标志在这里无关紧要，保留封顶字节即可。
-    let (stderr, _) = stderr_reader.join().unwrap_or_default();
+    let code = monitored.wait()?;
+    let stdin_result = stdin_writer
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("stdin writer panicked")));
+    // Transfer stderr is diagnostic; retain its bounded prefix but propagate I/O errors.
+    let (stderr, _) = join_stderr_reader(stderr_reader)?;
+    let (timed_out, cancelled) = monitored.outcome();
     if let Some(error) = stream_error {
         return Err(error);
     }
     if code == Some(0) && !timed_out && !cancelled {
+        stdin_result?;
         if let Some(sink) = control.progress.as_mut() {
             sink.report_final(total);
         }
@@ -1837,7 +2087,7 @@ fn run_stream_from_file_with_spawn(
     timeout: Duration,
     max_bytes: u64,
     control: TransferControl,
-    spawn: impl FnOnce(&[String]) -> io::Result<Child>,
+    spawn: impl FnOnce(&[String]) -> io::Result<SupervisedChild>,
 ) -> io::Result<Capture> {
     let mut file = open_source_file(src)?;
     let metadata = file.metadata()?;
@@ -1886,7 +2136,7 @@ fn run_stream_from_open_file_with_spawn(
     timeout: Duration,
     max_bytes: u64,
     control: TransferControl,
-    spawn: impl FnOnce(&[String]) -> io::Result<Child>,
+    spawn: impl FnOnce(&[String]) -> io::Result<SupervisedChild>,
 ) -> io::Result<Capture> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1903,74 +2153,105 @@ fn run_stream_from_open_file_with_spawn(
         .checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local command timed out"))?;
     check_local_transfer(control.cancel.as_ref(), deadline)?;
-    let remaining = remaining_transfer_timeout(deadline)?;
     let mut child = spawn(argv)?;
     let stdin_pipe = child
-        .stdin
-        .take()
+        .take_stdin()
         .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
     let stdout_pipe = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| io::Error::other("child stdout pipe missing"))?;
     let stderr_pipe = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
 
-    let monitored = MonitoredChild::new(child, remaining, control.cancel.clone())?;
-    let stderr_reader = spawn_stderr_reader(stderr_pipe, MAX_SMALL_OUTPUT)?;
+    let mut monitored = MonitoredChild::new(
+        child,
+        remaining_transfer_timeout(deadline)?,
+        control.cancel.clone(),
+    )?;
+    let stdin_pipe = DeadlinePipe::new(stdin_pipe, monitored.control.clone())?;
+    let stdout_pipe = DeadlinePipe::new(stdout_pipe, monitored.control.clone())?;
+    let stderr_reader = spawn_stderr_reader(
+        DeadlinePipe::new(stderr_pipe, monitored.control.clone())?,
+        MAX_SMALL_OUTPUT,
+    )?;
 
-    let mut progress = control.progress;
+    let writer_child = monitored.child.clone();
+    let writer_control = monitored.control.clone();
     let writer = std::thread::Builder::new()
         .name("ember-fs-upload-writer".to_string())
-        .spawn(move || -> io::Result<u64> {
-            let mut file = file;
-            let mut stdin = stdin_pipe;
-            let mut buffer = [0u8; STREAM_BUF_SIZE];
-            let mut total = 0u64;
-            let mut clean_eof = false;
-            loop {
-                let n = file.read(&mut buffer)?;
-                if n == 0 {
-                    clean_eof = true;
-                    break;
+        .spawn(move || {
+            let result = (|| -> io::Result<(u64, bool, Option<ProgressSink>)> {
+                let mut file = file;
+                let mut stdin = stdin_pipe;
+                let mut progress = control.progress;
+                let mut buffer = [0u8; STREAM_BUF_SIZE];
+                let mut total = 0u64;
+                loop {
+                    let n = file.read(&mut buffer)?;
+                    if n == 0 {
+                        return Ok((total, true, progress));
+                    }
+                    if total.saturating_add(n as u64) > max_bytes {
+                        return Err(too_large_error(max_bytes));
+                    }
+                    let mut pending = &buffer[..n];
+                    while !pending.is_empty() {
+                        match stdin.write(pending) {
+                            Ok(0) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "upload stdin closed",
+                                ))
+                            }
+                            Ok(written) => {
+                                total += written as u64;
+                                pending = &pending[written..];
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                                return Ok((total, false, progress))
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if let Some(sink) = progress.as_mut() {
+                        sink.report(total);
+                    }
                 }
-                total += n as u64;
-                if total > max_bytes {
-                    return Err(too_large_error(max_bytes));
-                }
-                match stdin.write_all(&buffer[..n]) {
-                    Ok(()) => {}
-                    // 子进程提前退出（比如 put 发现目标已存在直接 17）。
-                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
-                    Err(error) => return Err(error),
-                }
-                if let Some(sink) = progress.as_mut() {
-                    sink.report(total);
-                }
+            })();
+            if result.is_err() {
+                // A source/read/cap failure must wake the stdout reader now,
+                // rather than leave it waiting for the full transfer timeout.
+                writer_control.stopped.store(true, Ordering::SeqCst);
+                writer_child.lock().finish();
             }
-            if clean_eof {
-                if let Some(sink) = progress.as_mut() {
-                    sink.report_final(total);
-                }
-            }
-            Ok(total)
+            result
         })?;
 
-    let mut stdout = Vec::new();
-    let read_result = stdout_pipe.take(MAX_SMALL_OUTPUT).read_to_end(&mut stdout);
-    let (code, timed_out, cancelled) = monitored.wait()?;
-    // 传输路径的 stderr 仅作诊断：截断标志在这里无关紧要，保留封顶字节即可。
-    let (stderr, _) = stderr_reader.join().unwrap_or_default();
-    let written = writer
+    // Keep draining after the diagnostic cap so a verbose successful helper
+    // cannot deadlock or receive SIGPIPE before it consumes the upload.
+    let read_result = read_bounded(stdout_pipe, MAX_SMALL_OUTPUT);
+    if read_result.is_err() {
+        monitored.kill();
+    }
+    let code = monitored.wait()?;
+    let writer_result = writer
         .join()
-        .unwrap_or_else(|_| Err(io::Error::other("upload writer panicked")))?;
-    read_result?;
-    if code == Some(0) && !timed_out && written != expected {
-        return Err(io::Error::other(format!(
-            "local file changed during upload ({written} of {expected} bytes sent)"
-        )));
+        .unwrap_or_else(|_| Err(io::Error::other("upload writer panicked")));
+    let (stderr, _) = join_stderr_reader(stderr_reader)?;
+    let (timed_out, cancelled) = monitored.outcome();
+    let (stdout, _) = read_result?;
+    let (written, clean_eof, mut progress) = writer_result?;
+    if code == Some(0) && !timed_out && !cancelled {
+        if written != expected || !clean_eof {
+            return Err(io::Error::other(format!(
+                "local file changed during upload ({written} of {expected} bytes sent)"
+            )));
+        }
+        if let Some(sink) = progress.as_mut() {
+            sink.report_final(written);
+        }
     }
     Ok(Capture {
         status: code,
@@ -3663,6 +3944,7 @@ fn pack_upload_directory_with(
         tar_prefix_transform(name),
         "-C".to_string(),
         path_str(&anchored_descriptor_path(&source))?.to_string(),
+        "--".to_string(),
         ".".to_string(),
     ];
     use std::os::fd::AsRawFd;
@@ -4588,6 +4870,538 @@ docker = true
         }
     }
 
+    // ---- lifecycle regressions ----
+
+    #[test]
+    fn lifecycle_capture_deadline_retires_an_exited_leaders_descendant() {
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2 & exit 23".into()];
+        let started = std::time::Instant::now();
+        let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "descendant outlived deadline"
+        );
+        assert!(capture.timed_out);
+        assert_eq!(
+            capture.status,
+            Some(23),
+            "retain the leader's real exit status"
+        );
+    }
+
+    #[test]
+    fn lifecycle_capture_retires_stderr_only_descendants_before_join() {
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 2 >&2 & exec 1>&-; exit 23".into(),
+        ];
+        let started = std::time::Instant::now();
+        let capture = run_capture(&argv, &[], Duration::from_secs(5), 1024).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stderr join outlived root"
+        );
+        assert_eq!(capture.status, Some(23));
+        assert!(!capture.timed_out);
+    }
+
+    #[test]
+    fn lifecycle_capture_monitors_blocked_stdin() {
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        let started = std::time::Instant::now();
+        let capture = run_capture(
+            &argv,
+            &vec![0; 1024 * 1024],
+            Duration::from_millis(100),
+            1024,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stdin write outlived deadline"
+        );
+        assert!(capture.timed_out);
+    }
+
+    #[test]
+    fn lifecycle_capture_checks_precancellation_before_spawn() {
+        let dir = TestDir::new();
+        let marker = dir.join("spawned");
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch {}", sq(marker.to_str().unwrap())),
+        ];
+        let error = run_capture_with_cancel(
+            &argv,
+            &[],
+            Duration::from_secs(1),
+            1024,
+            Some(Arc::new(AtomicBool::new(true))),
+        )
+        .expect_err("cancel before spawn");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn lifecycle_download_monitors_blocked_stdin() {
+        let dir = TestDir::new();
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        let started = std::time::Instant::now();
+        let capture = run_stream_to_file(
+            &argv,
+            &vec![0; 1024 * 1024],
+            &dir.join("output"),
+            Duration::from_millis(100),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "download stdin outlived deadline"
+        );
+        assert!(capture.timed_out);
+    }
+
+    #[test]
+    fn lifecycle_upload_rejects_short_writes_even_with_success_exit() {
+        let dir = TestDir::new();
+        let src = dir.join("source");
+        std::fs::write(&src, vec![b'x'; STREAM_BUF_SIZE]).unwrap();
+        let argv = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let error = run_stream_from_file_with_spawn(
+            &argv,
+            &src,
+            Duration::from_secs(2),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |argv| {
+                let child = spawn_piped(argv)?;
+                // Let the no-input consumer close its read end before the
+                // writer starts, independently of this machine's pipe size.
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(child)
+            },
+        )
+        .expect_err("successful exit must not mask a short stdin write");
+        assert!(error.to_string().contains("bytes sent"), "{error}");
+    }
+
+    #[test]
+    fn lifecycle_capture_drains_output_while_writing_input() {
+        let input = vec![b'x'; 128 * 1024];
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "head -c 131072 /dev/zero; cat".into(),
+        ];
+        let capture = run_capture(&argv, &input, Duration::from_secs(2), 512 * 1024).unwrap();
+        assert_eq!(capture.status, Some(0));
+        assert!(!capture.timed_out);
+        assert_eq!(&capture.stdout[128 * 1024..], input.as_slice());
+        assert_eq!(capture.stdout.len(), 256 * 1024);
+    }
+
+    #[test]
+    fn lifecycle_capture_deadline_bounds_both_output_floods() {
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "while :; do printf abcdef; printf ghijkl >&2; done".into(),
+        ];
+        let started = std::time::Instant::now();
+        let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
+        assert!(capture.timed_out);
+        assert_eq!(capture.stdout.len(), 1024);
+        assert_eq!(capture.stderr.len(), 1024);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lifecycle_capture_cancels_an_exited_leaders_descendant() {
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2 & exit 23".into()];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let capture =
+            run_capture_with_cancel(&argv, &[], Duration::from_secs(5), 1024, Some(cancel))
+                .unwrap();
+        setter.join().unwrap();
+        assert!(capture.cancelled);
+        assert!(!capture.timed_out);
+        assert_eq!(capture.status, Some(23));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lifecycle_capture_checks_zero_timeout_before_spawn() {
+        let dir = TestDir::new();
+        let marker = dir.join("spawned");
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch {}", sq(marker.to_str().unwrap())),
+        ];
+        let error =
+            run_capture(&argv, &[], Duration::ZERO, 1024).expect_err("expired before spawn");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn lifecycle_download_checks_stop_conditions_before_spawn() {
+        let dir = TestDir::new();
+        for cancelled in [true, false] {
+            let marker = dir.join("spawned");
+            let argv = vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch {}", sq(marker.to_str().unwrap())),
+            ];
+            let file = std::fs::File::create(dir.join("output")).unwrap();
+            let error = run_stream_to_open_file(
+                &argv,
+                &[],
+                file,
+                if cancelled {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::ZERO
+                },
+                1024,
+                TransferControl {
+                    progress: None,
+                    cancel: Some(Arc::new(AtomicBool::new(cancelled))),
+                },
+            )
+            .expect_err("stopped before spawn");
+            assert_eq!(
+                error.kind(),
+                if cancelled {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::TimedOut
+                }
+            );
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn lifecycle_download_deadline_retires_an_exited_leaders_descendant() {
+        let dir = TestDir::new();
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf data; sleep 2 & exit 23".into(),
+        ];
+        let started = std::time::Instant::now();
+        let output = dir.join("output");
+        let capture = run_stream_to_file(
+            &argv,
+            &[],
+            &output,
+            Duration::from_millis(100),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert!(capture.timed_out);
+        assert_eq!(capture.status, Some(23));
+        assert_eq!(std::fs::read(output).unwrap(), b"data");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lifecycle_upload_drains_verbose_output_before_receiving_input() {
+        let dir = TestDir::new();
+        let src = dir.join("source");
+        let dst = dir.join("uploaded");
+        let data = vec![b'x'; 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "head -c 131072 /dev/zero && cat > {}",
+                sq(dst.to_str().unwrap())
+            ),
+        ];
+        let capture = run_stream_from_file(
+            &argv,
+            &src,
+            Duration::from_secs(2),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert_eq!(capture.status, Some(0));
+        assert!(!capture.timed_out);
+        assert_eq!(capture.stdout.len(), MAX_SMALL_OUTPUT as usize);
+        assert_eq!(std::fs::read(dst).unwrap(), data);
+    }
+
+    #[test]
+    fn lifecycle_upload_cancels_a_blocked_writer() {
+        let dir = TestDir::new();
+        let src = dir.join("source");
+        std::fs::write(&src, vec![b'x'; 1024 * 1024]).unwrap();
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let capture = run_stream_from_file(
+            &argv,
+            &src,
+            Duration::from_secs(5),
+            MAX_TRANSFER_BYTES,
+            TransferControl {
+                progress: None,
+                cancel: Some(cancel),
+            },
+        )
+        .unwrap();
+        setter.join().unwrap();
+        assert!(capture.cancelled);
+        assert!(!capture.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lifecycle_setup_failure_retires_an_exited_leaders_descendant() {
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2 & exit 0".into()];
+        let mut child = spawn_piped(&argv).unwrap();
+        let pid = child.process_group_id() as u32;
+        let mut stdout = child.take_stdout().unwrap();
+        let stderr = child.take_stderr().unwrap();
+        let started = std::time::Instant::now();
+        let error = monitor_with_stderr_reader(
+            child,
+            stderr,
+            Duration::from_secs(5),
+            None,
+            1024,
+            |_, _| -> io::Result<StderrReader> {
+                std::thread::sleep(Duration::from_millis(100));
+                Err(io::Error::other("injected setup error"))
+            },
+        )
+        .err()
+        .expect("injected setup error");
+        assert_eq!(error.to_string(), "injected setup error");
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).unwrap();
+        assert!(process_was_reaped(pid));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "setup cleanup left a pipe holder"
+        );
+    }
+
+    #[test]
+    fn lifecycle_upload_missing_pipe_reaps_before_returning_error() {
+        let dir = TestDir::new();
+        let src = dir.join("source");
+        std::fs::write(&src, b"data").unwrap();
+        let mut pid = None;
+        let error = run_stream_from_file_with_spawn(
+            &[],
+            &src,
+            Duration::from_secs(5),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            |_| {
+                let child = SupervisedChild::spawn(
+                    Command::new("sleep")
+                        .arg("2")
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped()),
+                )?;
+                pid = Some(child.process_group_id() as u32);
+                Ok(child)
+            },
+        )
+        .expect_err("missing stdout must fail safely");
+        assert_eq!(error.to_string(), "child stdout pipe missing");
+        assert!(process_was_reaped(pid.unwrap()));
+    }
+
+    #[test]
+    fn lifecycle_upload_read_failure_stops_producer_immediately() {
+        let dir = TestDir::new();
+        let src = dir.join("write-only-source");
+        let file = std::fs::File::create(src).unwrap();
+        let argv = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        let started = std::time::Instant::now();
+        let error = run_stream_from_open_file_with_spawn(
+            &argv,
+            file,
+            Duration::from_secs(5),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+            spawn_piped,
+        )
+        .expect_err("write-only source cannot be uploaded");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "writer failure waited for producer"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lifecycle_capture_bounds_an_escaped_stdout_holder() {
+        let dir = TestDir::new();
+        let ready_path = dir.join("ready");
+        let ready = sq(ready_path.to_str().unwrap());
+        let argv = vec!["sh".into(), "-c".into(), format!(
+            "setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} & while [ ! -f {ready} ]; do sleep 0.01; done; exit 23"
+        )];
+        let started = std::time::Instant::now();
+        let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
+        assert!(dir.join("ready").exists(), "escaped holder did not start");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "escaped stdout holder defeated the deadline"
+        );
+        assert!(capture.timed_out);
+        assert_eq!(capture.status, Some(23));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lifecycle_capture_bounds_an_escaped_stderr_holder() {
+        let dir = TestDir::new();
+        let ready = sq(dir.join("ready").to_str().unwrap());
+        let argv = vec!["sh".into(), "-c".into(), format!(
+            "setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} >&2 & while [ ! -f {ready} ]; do sleep 0.01; done; exit 23"
+        )];
+        let started = std::time::Instant::now();
+        let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
+        assert!(dir.join("ready").exists(), "escaped holder did not start");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "escaped stderr holder blocked join"
+        );
+        assert_eq!(capture.status, Some(23));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lifecycle_capture_bounds_an_escaped_stdin_holder() {
+        let dir = TestDir::new();
+        let ready = sq(dir.join("ready").to_str().unwrap());
+        let argv = vec!["sh".into(), "-c".into(), format!(
+            "exec 3<&0; setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} <&3 >/dev/null 2>&1 & while [ ! -f {ready} ]; do sleep 0.01; done; exec 3<&-; sleep 2"
+        )];
+        let started = std::time::Instant::now();
+        let capture = run_capture(
+            &argv,
+            &vec![0; 1024 * 1024],
+            Duration::from_millis(100),
+            1024,
+        )
+        .unwrap();
+        assert!(dir.join("ready").exists(), "escaped holder did not start");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "escaped stdin holder blocked join"
+        );
+        assert!(capture.timed_out);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lifecycle_capture_cancels_an_escaped_stdout_holder() {
+        let dir = TestDir::new();
+        let ready_path = dir.join("ready");
+        let ready = sq(ready_path.to_str().unwrap());
+        let argv = vec!["sh".into(), "-c".into(), format!(
+            "setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} & while [ ! -f {ready} ]; do sleep 0.01; done; exit 23"
+        )];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !ready_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let capture =
+            run_capture_with_cancel(&argv, &[], Duration::from_secs(5), 1024, Some(cancel))
+                .unwrap();
+        setter.join().unwrap();
+        assert!(dir.join("ready").exists());
+        assert!(capture.cancelled);
+        assert!(!capture.timed_out);
+        assert_eq!(capture.status, Some(23));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lifecycle_download_bounds_an_escaped_stdout_holder() {
+        let dir = TestDir::new();
+        let ready = sq(dir.join("ready").to_str().unwrap());
+        let argv = vec!["sh".into(), "-c".into(), format!(
+            "setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} & while [ ! -f {ready} ]; do sleep 0.01; done; exit 23"
+        )];
+        let started = std::time::Instant::now();
+        let capture = run_stream_to_file(
+            &argv,
+            &[],
+            &dir.join("output"),
+            Duration::from_millis(100),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert!(dir.join("ready").exists());
+        assert!(capture.timed_out);
+        assert_eq!(capture.status, Some(23));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lifecycle_upload_bounds_an_escaped_stdin_holder() {
+        let dir = TestDir::new();
+        let source = dir.join("source");
+        std::fs::write(&source, vec![0; 1024 * 1024]).unwrap();
+        let ready = sq(dir.join("ready").to_str().unwrap());
+        let argv = vec!["sh".into(), "-c".into(), format!(
+            "exec 3<&0; setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} <&3 >/dev/null 2>&1 & while [ ! -f {ready} ]; do sleep 0.01; done; exec 3<&-; sleep 2"
+        )];
+        let started = std::time::Instant::now();
+        let capture = run_stream_from_file(
+            &argv,
+            &source,
+            Duration::from_millis(100),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        assert!(dir.join("ready").exists());
+        assert!(capture.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     // ---- run_capture ----
 
     #[test]
@@ -4684,16 +5498,17 @@ docker = true
     fn stderr_reader_setup_failure_reaps_a_running_download_child() {
         use std::os::unix::process::CommandExt;
 
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let stderr = child.stderr.take().unwrap();
+        let mut child = SupervisedChild::spawn(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0),
+        )
+        .unwrap();
+        let pid = child.process_group_id() as u32;
+        let stderr = child.take_stderr().unwrap();
         let error = monitor_with_stderr_reader(
             child,
             stderr,
@@ -4718,17 +5533,18 @@ docker = true
     fn stderr_reader_setup_failure_reaps_an_exited_download_child() {
         use std::os::unix::process::CommandExt;
 
-        let mut child = Command::new("sh")
-            .args(["-c", "printf finished"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let mut stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let mut child = SupervisedChild::spawn(
+            Command::new("sh")
+                .args(["-c", "printf finished"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0),
+        )
+        .unwrap();
+        let pid = child.process_group_id() as u32;
+        let mut stdout = child.take_stdout().unwrap();
+        let stderr = child.take_stderr().unwrap();
         let error = monitor_with_stderr_reader(
             child,
             stderr,
@@ -5686,9 +6502,13 @@ docker = true
         );
     }
 
-    /// Run `untar` with `mv` resolved to `mv_shim` first on PATH. The shim can
-    /// reach the real mv through `$ORIGINAL_PATH` and log to `$MV_LOG`.
-    fn untar_with_mv_shim(dir: &TestDir, mv_shim: &str, id: &str) -> (Capture, PathBuf, PathBuf) {
+    /// Run `untar` with one controlled helper resolved first on PATH.
+    fn untar_with_tool_shim(
+        dir: &TestDir,
+        tool: &str,
+        mv_shim: &str,
+        id: &str,
+    ) -> (Capture, PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let source = dir.join("tree");
@@ -5699,7 +6519,7 @@ docker = true
 
         let shim_dir = dir.join("bin");
         std::fs::create_dir(&shim_dir).unwrap();
-        let shim = shim_dir.join("mv");
+        let shim = shim_dir.join(tool);
         std::fs::write(&shim, mv_shim).unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let destination = dir.join("destination");
@@ -5739,13 +6559,177 @@ docker = true
             })
     }
 
+    fn atomic_rename_program() -> &'static str {
+        PROBE_SCRIPT
+            .split_once("rename_program='")
+            .unwrap()
+            .1
+            .split_once("'\nrequire_noreplace_rename")
+            .unwrap()
+            .0
+    }
+
     #[test]
-    fn probe_untar_publishes_with_gnu_mv_that_predates_no_copy() {
-        // coreutils 8.30-9.0 (e.g. Ubuntu 22.04's 8.32) reject --no-copy but
-        // already rename with RENAME_NOREPLACE under -n.
+    fn remote_atomic_rename_fails_closed_without_python() {
+        let fixture = TestDir::new();
+        let root = fixture.path();
+        std::fs::write(root.join("file.txt"), b"x").unwrap();
+        let source = root.join("file.txt");
+        let destination = root.join("new");
+        let argv = vec![
+            "/usr/bin/env".to_string(),
+            format!("PATH={}", root.display()),
+            "/bin/sh".to_string(),
+            "-s".to_string(),
+            "--".to_string(),
+            "mv".to_string(),
+            source.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
+        let capture =
+            run_capture(&argv, PROBE_SCRIPT.as_bytes(), Duration::from_secs(5), 1024).unwrap();
+        assert_eq!(capture.status, Some(4));
+        assert!(String::from_utf8_lossy(&capture.stderr).contains("requires Python 3"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"x");
+        assert!(!destination.exists());
+    }
+
+    fn atomic_rename_with_mock(mock: &str) -> String {
+        format!(
+            "import sys, types\nmock = types.ModuleType('ctypes')\nexec({mock:?}, mock.__dict__)\nsys.modules['ctypes'] = mock\n{}",
+            atomic_rename_program(),
+        )
+    }
+
+    #[test]
+    fn remote_atomic_rename_preserves_entries_on_unsupported_or_cross_device_errors() {
+        let fixture = TestDir::new();
+        let root = fixture.path();
+        std::fs::write(root.join("file.txt"), b"x").unwrap();
+        let source = root.join("file.txt");
+        let destination = root.join("occupied");
+        std::fs::write(&destination, b"keep").unwrap();
+        for code in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP, libc::EXDEV] {
+            let mock = format!(
+                "c_int = c_char_p = c_uint = int\nclass Function:\n def __call__(self, *args): return -1\nclass CDLL:\n renameat2 = Function()\n def __init__(self, *args, **kwargs): assert kwargs.get('use_errno') is True\ndef get_errno(): return {code}\n"
+            );
+            let argv = vec![
+                "python3".to_string(),
+                "-I".to_string(),
+                "-c".to_string(),
+                atomic_rename_with_mock(&mock),
+                "publish".to_string(),
+                source.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+            ];
+            let capture = run_capture(&argv, b"", Duration::from_secs(5), 2048).unwrap();
+            assert_eq!(capture.status, Some(4), "errno {code}");
+            assert!(String::from_utf8_lossy(&capture.stderr).contains(&format!("errno {code}:")));
+            assert_eq!(std::fs::read(&source).unwrap(), b"x");
+            assert_eq!(std::fs::read(&destination).unwrap(), b"keep");
+        }
+        let argv = vec![
+            "python3".to_string(),
+            "-I".to_string(),
+            "-c".to_string(),
+            atomic_rename_with_mock("class CDLL:\n def __init__(self, *args, **kwargs): pass\n"),
+            "check".to_string(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let capture = run_capture(&argv, b"", Duration::from_secs(5), 2048).unwrap();
+        assert_eq!(capture.status, Some(4));
+        assert!(String::from_utf8_lossy(&capture.stderr).contains("unavailable in libc"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"x");
+    }
+
+    #[test]
+    fn remote_atomic_rename_ignores_untrusted_python_import_paths() {
+        let fixture = TestDir::new();
+        let root = fixture.path();
+        std::fs::write(root.join("file.txt"), b"x").unwrap();
+        let marker = root.join("imported");
+        let source = root.join("file.txt");
+        let destination = root.join("moved");
+        std::fs::write(
+            root.join("ctypes.py"),
+            format!(
+                "open({:?}, 'w').write('bad')\nraise RuntimeError('untrusted module')\n",
+                marker.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let script = format!("cd {}\n{}", sq(root.to_str().unwrap()), PROBE_SCRIPT);
+        let argv = vec![
+            "/usr/bin/env".to_string(),
+            format!("PYTHONPATH={}", root.display()),
+            "/bin/sh".to_string(),
+            "-s".to_string(),
+            "--".to_string(),
+            "mv".to_string(),
+            source.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
+        let capture = run_capture(&argv, script.as_bytes(), Duration::from_secs(5), 2048).unwrap();
+        assert_eq!(capture.status, Some(0), "{:?}", capture.stderr);
+        assert!(
+            !marker.exists(),
+            "remote working directory/PYTHONPATH cannot supply helper imports"
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), b"x");
+    }
+
+    #[test]
+    fn remote_atomic_publish_has_one_winner_and_retains_all_losers() {
+        let fixture = TestDir::new();
+        let root = fixture.path();
+        std::fs::write(root.join("file.txt"), b"x").unwrap();
+        let destination = root.join("winner");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut workers = Vec::new();
+        for index in 0..4 {
+            let source = root.join(format!("candidate-{index}"));
+            std::fs::write(&source, index.to_string()).unwrap();
+            let destination = destination.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let argv = vec![
+                    "python3".to_string(),
+                    "-c".to_string(),
+                    atomic_rename_program().to_string(),
+                    "publish".to_string(),
+                    source.to_string_lossy().into_owned(),
+                    destination.to_string_lossy().into_owned(),
+                ];
+                barrier.wait();
+                let result = run_capture(&argv, b"", Duration::from_secs(5), 1024).unwrap();
+                (index, source, result.status)
+            }));
+        }
+        let mut winners = 0;
+        for worker in workers {
+            let (index, source, code) = worker.join().unwrap();
+            if code == Some(0) {
+                winners += 1;
+                assert!(!source.exists());
+                assert_eq!(
+                    std::fs::read_to_string(&destination).unwrap(),
+                    index.to_string()
+                );
+            } else {
+                assert_eq!(code, Some(17));
+                assert_eq!(std::fs::read_to_string(source).unwrap(), index.to_string());
+            }
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn probe_untar_never_falls_back_to_a_racy_mv() {
+        // Even a version-claiming mv must not stand in for an atomic syscall.
         let dir = TestDir::new();
-        let (capture, destination, mv_log) = untar_with_mv_shim(
+        let (capture, destination, mv_log) = untar_with_tool_shim(
             &dir,
+            "mv",
             "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --no-copy) echo \"mv: unrecognized option '--no-copy'\" >&2; exit 1 ;;\n    --version) echo 'mv (GNU coreutils) 8.32'; exit 0 ;;\n  esac\ndone\nprintf '%s\\n' \"$@\" >> \"$MV_LOG\"\nPATH=$ORIGINAL_PATH\nexport PATH\nexec mv \"$@\"\n",
             "feed-e",
         );
@@ -5755,19 +6739,18 @@ docker = true
             std::fs::read(destination.join("tree/sub/blob.bin")).unwrap(),
             binary_sample()
         );
-        let invocation = std::fs::read_to_string(&mv_log).unwrap();
-        let args: Vec<&str> = invocation.lines().collect();
-        assert_eq!(args[..2], ["-nT", "--"], "publication args: {args:?}");
+        assert!(!mv_log.exists(), "atomic publication must not invoke mv");
         assert!(!untar_staging_left_in(&destination));
     }
 
     #[test]
-    fn probe_untar_fails_closed_without_an_atomic_gnu_mv() {
-        // BusyBox-style mv: no --version, and -n is a check-then-rename.
+    fn probe_untar_fails_closed_without_atomic_rename_capability() {
+        // A failed capability check must happen before extraction/staging.
         let dir = TestDir::new();
-        let (capture, destination, mv_log) = untar_with_mv_shim(
+        let (capture, destination, mv_log) = untar_with_tool_shim(
             &dir,
-            "#!/bin/sh\ncase \"$1\" in --*) echo \"mv: unrecognized option\" >&2; exit 1 ;; esac\n: > \"$MV_LOG\"\n",
+            "python3",
+            "#!/bin/sh\necho 'remote-fs probe: no atomic no-replace rename' >&2\nexit 4\n",
             "feed-f",
         );
 
@@ -5780,6 +6763,74 @@ docker = true
         assert!(!mv_log.exists(), "a racy mv must never publish");
         assert!(!destination.join("tree").exists());
         assert!(!untar_staging_left_in(&destination));
+    }
+
+    #[test]
+    fn probe_tar_treats_option_like_directory_names_as_operands() {
+        let dir = TestDir::new();
+        for (index, name) in ["--help", "-C"].iter().enumerate() {
+            let source = dir.join(name);
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("marker"), b"literal directory data").unwrap();
+            let archive = run_probe_locally(&["tar", source.to_str().unwrap()]);
+            assert_eq!(
+                archive.status,
+                Some(0),
+                "archive {name}: {:?}",
+                archive.stderr
+            );
+            let destination = dir.join(&format!("extracted-{index}"));
+            std::fs::create_dir(&destination).unwrap();
+            let unpacked = run_capture(
+                &sh_c_argv_locally("untar", &[destination.to_str().unwrap(), name, "feed-0"]),
+                &archive.stdout,
+                Duration::from_secs(5),
+                MAX_SMALL_OUTPUT,
+            )
+            .unwrap();
+            assert_eq!(
+                unpacked.status,
+                Some(0),
+                "extract {name}: {:?}",
+                unpacked.stderr
+            );
+            assert_eq!(
+                std::fs::read(destination.join(name).join("marker")).unwrap(),
+                b"literal directory data"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_pack_treats_option_like_names_literally() {
+        let dir = TestDir::new();
+        let src = dir.join("--help");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("marker"), b"literal local directory").unwrap();
+        let archive = dir.join("archive.tar");
+        pack_upload_directory_with(
+            &src,
+            Path::new("tar"),
+            std::fs::File::create(&archive).unwrap(),
+            MAX_TRANSFER_BYTES,
+            TransferControl::default(),
+        )
+        .unwrap();
+        let destination = dir.join("extracted");
+        std::fs::create_dir(&destination).unwrap();
+        let argv = vec![
+            "tar".into(),
+            "xf".into(),
+            archive.to_str().unwrap().into(),
+            "-C".into(),
+            destination.to_str().unwrap().into(),
+        ];
+        let capture = run_capture(&argv, &[], Duration::from_secs(5), MAX_SMALL_OUTPUT).unwrap();
+        assert_eq!(capture.status, Some(0));
+        assert_eq!(
+            std::fs::read(destination.join("--help/marker")).unwrap(),
+            b"literal local directory"
+        );
     }
 
     #[test]
@@ -5811,7 +6862,7 @@ docker = true
         .unwrap();
         assert_eq!(capture.status, Some(0), "stderr: {:?}", capture.stderr);
         assert_eq!(
-            capture.stdout, b"cf\n-\n-C\n/\ntmp\n",
+            capture.stdout, b"cf\n-\n-C\n/\n--\ntmp\n",
             "the tar probe must never pass an empty root-level parent"
         );
     }

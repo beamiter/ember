@@ -1674,18 +1674,19 @@ fn osc_terminators_straddling_chunks_complete_the_sequence() {
     assert_eq!(terminal.window_title, "straddle");
     assert_eq!(terminal.grid[0][0].character, 'Y');
 
-    // An ESC at a chunk end that is not followed by `\` is payload content,
-    // and a BEL in the next chunk still terminates the OSC.
+    // A non-ST ESC abandons OSC and starts the next escape. Here ESC c
+    // resets the terminal, then the ordinary suffix is displayed.
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"cd\x07");
-    assert_eq!(terminal.window_title, "abcd");
+    assert!(terminal.window_title.is_empty());
+    assert_eq!(terminal.grid[0][0].character, 'd');
 
-    // ESC ESC \: the first ESC is content (dropped as a control), the second pair terminates.
+    // ESC ESC \: the first non-ST escape abandons OSC; ST cannot revive it.
     let mut terminal = TerminalState::new(8, 2);
     terminal.process_input(b"\x1b]0;ab\x1b");
     terminal.process_input(b"\x1b\\");
-    assert_eq!(terminal.window_title, "ab");
+    assert!(terminal.window_title.is_empty());
 }
 
 #[test]
@@ -6945,7 +6946,7 @@ fn the_window_title_is_bounded_where_it_enters_terminal_state() {
 #[test]
 fn osc_titles_drop_controls_and_replace_visual_spoofing() {
     let mut terminal = TerminalState::new(24, 4);
-    terminal.process_input("\x1b]2;ok\u{1b}\u{202e}done\x07".as_bytes());
+    terminal.process_input("\x1b]2;ok\u{0}\u{202e}done\x07".as_bytes());
     assert_eq!(terminal.window_title, "ok\u{fffd}done");
     assert!(terminal.icon_title.is_empty());
 }
@@ -7352,4 +7353,118 @@ fn mode_2031_is_a_theme_notification_not_a_keyboard_mode() {
     terminal.process_batch(b"\x1b[?2031l");
     terminal.set_default_colors(dark);
     assert!(terminal.get_output().is_empty());
+}
+
+#[test]
+fn raw_block_copy_matches_the_highlight_in_both_drag_directions() {
+    for (anchor, active) in [((0, 1), (2, 3)), ((2, 3), (0, 1)), ((0, 3), (2, 1))] {
+        let mut terminal = TerminalState::new(6, 4);
+        terminal.process_input(b"abcdef\r\nghijkl\r\nmnopqr");
+        let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+        assert!(!viewport.is_transformed());
+        terminal.start_block_selection_projected(&viewport, anchor);
+        terminal.update_selection_projected(&viewport, active);
+        for row in 0..=2 {
+            assert_eq!(
+                terminal.row_selection_cols_projected(&viewport, row),
+                Some((1, 3))
+            );
+        }
+        assert_eq!(terminal.copy_selection().as_deref(), Some("bcd\nhij\nnop"));
+    }
+}
+
+#[test]
+fn raw_block_copy_keeps_soft_wrapped_rows_separate_and_retains_spaces() {
+    let mut terminal = TerminalState::new(4, 3);
+    terminal.process_input(b"ab  EF  ij  ");
+    terminal.start_block_selection((0, 1));
+    terminal.update_selection((2, 3));
+    assert_eq!(terminal.copy_selection().as_deref(), Some("b  \nF  \nj  "));
+}
+
+#[test]
+fn raw_block_copy_uses_the_same_rectangle_across_scrollback_and_grid() {
+    let mut terminal = TerminalState::new(4, 2);
+    terminal.process_input(b"abcd\r\nEFGH\r\nijkl");
+    terminal.scroll(1);
+    terminal.start_block_selection((0, 1));
+    terminal.update_selection((1, 2));
+    assert_eq!(terminal.copy_selection().as_deref(), Some("bc\nFG"));
+}
+
+#[test]
+fn cancelled_control_strings_resume_visible_text_at_every_split() {
+    for prefix in [
+        b"\x1b]0;unfinished".as_slice(),
+        b"\x1b_Gi=1",
+        b"\x1bP$qm",
+        b"\x1b^ignored",
+        b"\x1bXignored",
+    ] {
+        for cancel in [0x18, 0x1a] {
+            let mut bytes = prefix.to_vec();
+            bytes.push(cancel);
+            bytes.extend_from_slice(b"ok");
+            for split in 0..=bytes.len() {
+                let mut terminal = TerminalState::new(16, 2);
+                terminal.process_input(&bytes[..split]);
+                terminal.process_input(&bytes[split..]);
+                assert_eq!(
+                    terminal.grid[0][0].character, 'o',
+                    "prefix={prefix:?}, cancel={cancel}, split={split}"
+                );
+                assert_eq!(terminal.grid[0][1].character, 'k');
+                assert!(terminal.window_title.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_real_reset_interrupts_control_strings_at_every_split() {
+    for prefix in [
+        b"\x1b]0;unfinished".as_slice(),
+        b"\x1b_Gi=1",
+        b"\x1bP$qm",
+        b"\x1b^ignored",
+        b"\x1bXignored",
+        b"\x1b",
+    ] {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(b"\x1bcok");
+        for split in 0..=bytes.len() {
+            let mut terminal = TerminalState::new(16, 2);
+            terminal.process_input(b"old\x1b[?2004h");
+            terminal.process_input(&bytes[..split]);
+            terminal.process_input(&bytes[split..]);
+            assert_eq!(
+                terminal.grid[0][0].character, 'o',
+                "prefix={prefix:?}, split={split}"
+            );
+            assert_eq!(
+                terminal.grid[0][1].character, 'k',
+                "prefix={prefix:?}, split={split}"
+            );
+            assert!(!terminal.modes.contains(&2004));
+            assert!(terminal.window_title.is_empty());
+        }
+    }
+}
+
+#[test]
+fn discarded_oversized_apc_still_obeys_cancellation_and_reset() {
+    for suffix in [b"\x18ok".as_slice(), b"\x1aok", b"\x1bcok"] {
+        let mut terminal = TerminalState::new(16, 2);
+        let mut oversized = b"\x1b_Gi=1;".to_vec();
+        oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+        terminal.process_input(&oversized);
+        assert!(terminal.discarding_oversized_apc);
+        for byte in suffix {
+            terminal.process_input(&[*byte]);
+        }
+        assert!(!terminal.discarding_oversized_apc);
+        assert_eq!(terminal.grid[0][0].character, 'o');
+        assert_eq!(terminal.grid[0][1].character, 'k');
+    }
 }

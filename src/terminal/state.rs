@@ -6957,12 +6957,25 @@ impl super::TerminalState {
             let cols = self.grid.row_len();
             let total_rows = scrollback_len + grid_rows;
 
-            for abs_row in start.0..=end.0.min(total_rows.saturating_sub(1)) {
-                let start_col = if abs_row == start.0 { start.1 } else { 0 };
-                let end_col = if abs_row == end.0 {
-                    end.1.min(cols.saturating_sub(1))
+            let block = sel.mode == SelectionMode::Block;
+            let last_row = end.0.min(total_rows.saturating_sub(1));
+            for abs_row in start.0..=last_row {
+                let (start_col, end_col) = if block {
+                    // Copy exactly the rectangle painted by the selection
+                    // overlay, including reverse and upward drags.
+                    (
+                        sel.anchor.1.min(sel.active.1),
+                        sel.anchor.1.max(sel.active.1).min(cols.saturating_sub(1)),
+                    )
                 } else {
-                    cols.saturating_sub(1)
+                    (
+                        if abs_row == start.0 { start.1 } else { 0 },
+                        if abs_row == end.0 {
+                            end.1.min(cols.saturating_sub(1))
+                        } else {
+                            cols.saturating_sub(1)
+                        },
+                    )
                 };
 
                 // 行是否因到达行末被自动换行(软换行)。复制时软换行不应插入 \n,
@@ -7002,14 +7015,14 @@ impl super::TerminalState {
 
                 // 软换行(URL 等被终端宽度截断)拼接时去掉尾部填充空白,
                 // 避免还原后的字符串里夹杂大段空格。
-                if row_wrapped && abs_row < end.0 {
+                if !block && row_wrapped && abs_row < last_row {
                     let trimmed_len = line_buf.trim_end_matches(' ').len();
                     line_buf.truncate(trimmed_len);
                 }
 
                 result.push_str(&line_buf);
 
-                if abs_row < end.0 && !row_wrapped {
+                if abs_row < last_row && (block || !row_wrapped) {
                     result.push('\n');
                 }
             }

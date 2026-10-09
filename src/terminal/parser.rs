@@ -1,5 +1,30 @@
 use super::*;
 
+/// Locate cancellation before the first real string terminator. A fresh ESC
+/// abandons the string and is parsed again; CAN/SUB are consumed. The bool says
+/// that ESC was the final byte of the previous read and must be restored.
+fn control_string_abort(input: &[u8], previous_escape: bool, osc: bool) -> Option<(usize, bool)> {
+    if previous_escape {
+        match input.first().copied()? {
+            b'\\' => return None,
+            0x18 | 0x1a => return Some((1, false)),
+            _ => return Some((0, true)),
+        }
+    }
+    for (index, byte) in input.iter().copied().enumerate() {
+        match byte {
+            0x18 | 0x1a => return Some((index + 1, false)),
+            0x07 if osc => return None,
+            0x1b => match input.get(index + 1) {
+                Some(b'\\') | None => return None,
+                Some(_) => return Some((index, false)),
+            },
+            _ => {}
+        }
+    }
+    None
+}
+
 impl super::TerminalState {
     /// Sanitise one OSC 9 / OSC 777 notification field.
     ///
@@ -122,6 +147,45 @@ impl super::TerminalState {
         self.kitty_graphics
             .reject_graphics_payload(&recovery, error);
         self.drain_kitty_graphics_responses();
+    }
+
+    /// Abort a fragmented control string before its ordinary resume scanner
+    /// can consume a replacement escape or the visible text after CAN/SUB.
+    fn abort_pending_control_string(&mut self, input: &[u8]) -> bool {
+        let (previous_escape, osc) = if self.discarding_oversized_apc {
+            (self.discarding_apc_prev_escape, false)
+        } else if !self.pending_apc.is_empty() {
+            (self.pending_apc.last() == Some(&0x1b), false)
+        } else if !self.pending_osc.is_empty() {
+            (self.pending_osc.last() == Some(&0x1b), true)
+        } else if !self.pending_string.is_empty() {
+            (self.pending_string.last() == Some(&0x1b), false)
+        } else {
+            return false;
+        };
+        let Some((resume, restore_escape)) = control_string_abort(input, previous_escape, osc)
+        else {
+            return false;
+        };
+        if !self.pending_apc.is_empty() {
+            self.reject_buffered_kitty_apc_with_suffix(
+                &input[..resume],
+                "Kitty graphics APC was cancelled",
+            );
+        }
+        self.pending_apc.clear();
+        self.pending_apc_scan_from = 0;
+        self.pending_osc.clear();
+        self.pending_osc_scan_from = 0;
+        self.pending_string.clear();
+        self.pending_string_scan_from = 0;
+        self.discarding_oversized_apc = false;
+        self.discarding_apc_prev_escape = false;
+        if restore_escape {
+            self.pending_escape.push(0x1b);
+        }
+        self.process_input(&input[resume..]);
+        true
     }
 
     fn begin_pending_apc(&mut self, tail: &[u8]) {
@@ -779,6 +843,9 @@ impl super::TerminalState {
     }
 
     pub fn process_input(&mut self, input: &[u8]) {
+        if self.abort_pending_control_string(input) {
+            return;
+        }
         if self.resume_pending_apc(input) {
             return;
         }
@@ -873,6 +940,10 @@ impl super::TerminalState {
                     }
 
                     match data_slice[i + 1] {
+                        // A repeated ESC abandons the unfinished prefix.
+                        0x1b => {
+                            i += 1;
+                        }
                         b'c' => {
                             // RIS — full terminal reset. Reinitialize graphics
                             // state as well; the final byte is control syntax,
@@ -901,6 +972,12 @@ impl super::TerminalState {
                             i += 2;
 
                             let payload_start = i;
+                            if let Some((resume, _)) =
+                                control_string_abort(&data_slice[i..], false, true)
+                            {
+                                i += resume;
+                                continue;
+                            }
 
                             let mut terminated = false;
                             while i < data_slice.len() {
@@ -945,6 +1022,20 @@ impl super::TerminalState {
                             let is_dcs = introducer == b'P';
                             i += 2;
 
+                            if let Some((resume, _)) =
+                                control_string_abort(&data_slice[i..], false, false)
+                            {
+                                if is_apc {
+                                    self.kitty_graphics.reject_graphics_payload(
+                                        &data_slice[i..i + resume],
+                                        "Kitty graphics APC was cancelled",
+                                    );
+                                    let responses = self.kitty_graphics.take_responses();
+                                    self.output_buffer.extend_from_slice(&responses);
+                                }
+                                i += resume;
+                                continue;
+                            }
                             let mut terminated = false;
                             let string_start = i;
                             while i < data_slice.len() {

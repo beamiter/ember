@@ -381,6 +381,10 @@ pub struct TerminalApp {
     /// overwritten by the fresh fallback session on debounce or Drop.
     pub session_persistence_blocked: bool,
 
+    /// A failed UI-history load/save pauses retries and keeps its recovery
+    /// notice visible after ordinary transient status messages expire.
+    pub ui_history_persistence: crate::history_persistence::UiHistoryPersistence,
+
     // Lock file to detect running instances
     pub _lock_file: Option<crate::session_persistence::InstanceLock>,
 
@@ -473,7 +477,7 @@ impl TerminalApp {
             }
         }
         if self.status_message.is_empty() {
-            None
+            self.ui_history_persistence.notice()
         } else {
             Some(self.status_message.as_str())
         }

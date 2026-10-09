@@ -17,6 +17,13 @@ const COMMAND_DETAIL_OUTPUT_BYTES: usize = 16 * 1024;
 const DETAIL_TRUNCATION_MARKER: &str = "\n… preview truncated …\n";
 const MAX_BLOCK_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 
+/// OSC prompt metadata can also be emitted by a foreground editor or test.
+/// Review-only insertions and explicitly approved replays need both proofs at
+/// the final PTY write boundary, including a fail-closed process-group probe.
+fn review_prompt_is_ready(reported_ready: bool, shell_is_foreground: bool) -> bool {
+    reported_ready && shell_is_foreground
+}
+
 fn block_absence_message(has_prompt_marks: bool, ordinary: &str) -> String {
     if has_prompt_marks {
         ordinary.to_string()
@@ -2773,6 +2780,14 @@ impl TerminalApp {
             } else {
                 match prompt_fill_payload(command) {
                     Err(error) => ReplayOutcome::UnsafeCommand(error.to_string()),
+                    Ok(_)
+                        if !review_prompt_is_ready(
+                            session.terminal.lock().shell_is_prompt_ready(),
+                            session.shell_owns_foreground_pty(),
+                        ) =>
+                    {
+                        ReplayOutcome::NotPromptReady
+                    }
                     Ok(payload) => match session.shell.write(&payload) {
                         Ok(()) => {
                             let mut terminal = session.terminal.lock();
@@ -2955,6 +2970,14 @@ impl TerminalApp {
         }
         let payload = correction_replay_payload(&effect.command, effect.run)
             .map_err(|error| format!("Correction rejected: {error}"))?;
+        if !review_prompt_is_ready(
+            session.terminal.lock().shell_is_prompt_ready(),
+            session.shell_owns_foreground_pty(),
+        ) {
+            return Err(
+                "Wait for the interactive shell to own the foreground terminal".to_string(),
+            );
+        }
         session
             .shell
             .write(&payload)
@@ -3081,6 +3104,14 @@ impl TerminalApp {
         }
         let payload = correction_replay_payload(&effect.command, false)
             .map_err(|error| format!("Suggestion rejected: {error}"))?;
+        if !review_prompt_is_ready(
+            session.terminal.lock().shell_is_prompt_ready(),
+            session.shell_owns_foreground_pty(),
+        ) {
+            return Err(
+                "Wait for the interactive shell to own the foreground terminal".to_string(),
+            );
+        }
         session
             .shell
             .write(&payload)
@@ -3424,6 +3455,12 @@ impl TerminalApp {
             // run the single-record 64-KiB validator over the combined buffer
             // and accidentally undercut MAX_PROMPT_INSERT_BYTES.
             let payload = replay_prepared_payload(&command, false);
+            if !review_prompt_is_ready(
+                session.terminal.lock().shell_is_prompt_ready(),
+                session.shell_owns_foreground_pty(),
+            ) {
+                return Err(SelectedReplayError::NotPromptReady);
+            }
             session
                 .shell
                 .write(&payload)
@@ -4308,6 +4345,14 @@ impl TerminalApp {
             } else {
                 match replay_payload(&command, run) {
                     Err(error) => ReplayOutcome::UnsafeCommand(error.to_string()),
+                    Ok(_)
+                        if !review_prompt_is_ready(
+                            session.terminal.lock().shell_is_prompt_ready(),
+                            session.shell_owns_foreground_pty(),
+                        ) =>
+                    {
+                        ReplayOutcome::NotPromptReady
+                    }
                     Ok(payload) => match session.shell.write(&payload) {
                         Ok(()) => {
                             let mut terminal = session.terminal.lock();
@@ -5377,6 +5422,15 @@ fn workflow_refusal_toast(refused: &[(std::path::PathBuf, String)]) -> Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_write_requires_both_prompt_metadata_and_foreground_ownership() {
+        assert!(super::review_prompt_is_ready(true, true));
+        // A foreground app can spoof OSC 133 A/B and bracketed-paste mode.
+        assert!(!super::review_prompt_is_ready(true, false));
+        // A shell owning the PTY is insufficient before it reports a prompt.
+        assert!(!super::review_prompt_is_ready(false, true));
+        assert!(!super::review_prompt_is_ready(false, false));
+    }
     use super::*;
 
     fn workflow_refusal(path: &str, reason: &str) -> (std::path::PathBuf, String) {
