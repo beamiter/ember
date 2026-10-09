@@ -201,9 +201,9 @@ fn validate_private_key_metadata(path: &Path, metadata: &fs::Metadata) -> io::Re
     Ok(())
 }
 
-/// Read an API key through the same descriptor-level no-follow, owner and
-/// hard-link checks as snapshots. This local boundary avoids the pinned
-/// core's blocking `File::open` when a FIFO is planted at a configured path.
+/// Legacy local reader retained for private-file regression fixtures.
+/// Production credential loading now uses the shared AiClient settings path.
+#[cfg(test)]
 pub fn read_api_key_file(raw_path: &str) -> io::Result<String> {
     let path = expand_private_path(raw_path)?;
     let file = open_owned_regular(&path)?;

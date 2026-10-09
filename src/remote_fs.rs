@@ -5152,16 +5152,34 @@ docker = true
     fn lifecycle_upload_cancels_a_blocked_writer() {
         let dir = TestDir::new();
         let src = dir.join("source");
-        std::fs::write(&src, vec![b'x'; 1024 * 1024]).unwrap();
-        let argv = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        let data = vec![b'x'; 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let ready_path = dir.join("ready");
+        let published = dir.join("published");
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "head -c {STREAM_BUF_SIZE} >/dev/null && printf ready > {}; sleep 2; cat > {}",
+                sq(ready_path.to_str().unwrap()),
+                sq(published.to_str().unwrap()),
+            ),
+        ];
         let cancel = Arc::new(AtomicBool::new(false));
         let trigger = cancel.clone();
         let setter = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+            // Acknowledging actual input avoids cancelling during snapshot/fsync
+            // or before the upload writer has started on a busy CI machine.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !ready_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready_path.exists(), "upload consumer did not receive input");
+            let started = std::time::Instant::now();
             trigger.store(true, Ordering::SeqCst);
+            started
         });
-        let started = std::time::Instant::now();
-        let capture = run_stream_from_file(
+        let result = run_stream_from_file(
             &argv,
             &src,
             Duration::from_secs(5),
@@ -5170,12 +5188,58 @@ docker = true
                 progress: None,
                 cancel: Some(cancel),
             },
-        )
-        .unwrap();
-        setter.join().unwrap();
+        );
+        let cancelled_at = setter.join().unwrap();
+        let capture = result.expect("a started upload reports cancellation in Capture");
         assert!(capture.cancelled);
         assert!(!capture.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert!(!published.exists(), "cancelled upload must not publish");
+        assert_eq!(std::fs::read(&src).unwrap(), data);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "only the unchanged source and ready marker remain"
+        );
+    }
+
+    #[test]
+    fn lifecycle_upload_checks_stop_conditions_before_spawn() {
+        for cancelled in [true, false] {
+            let dir = TestDir::new();
+            let src = dir.join("source");
+            std::fs::write(&src, b"unchanged").unwrap();
+            let error = run_stream_from_file_with_spawn(
+                &[],
+                &src,
+                if cancelled {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::ZERO
+                },
+                MAX_TRANSFER_BYTES,
+                TransferControl {
+                    progress: None,
+                    cancel: Some(Arc::new(AtomicBool::new(cancelled))),
+                },
+                |_| panic!("a stopped upload must not spawn a child"),
+            )
+            .expect_err("pre-start stop is an error, not a Capture");
+            assert_eq!(
+                error.kind(),
+                if cancelled {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::TimedOut
+                }
+            );
+            assert_eq!(std::fs::read(&src).unwrap(), b"unchanged");
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "no snapshot or published output remains"
+            );
+        }
     }
 
     #[test]
@@ -5383,23 +5447,44 @@ docker = true
     fn lifecycle_upload_bounds_an_escaped_stdin_holder() {
         let dir = TestDir::new();
         let source = dir.join("source");
-        std::fs::write(&source, vec![0; 1024 * 1024]).unwrap();
-        let ready = sq(dir.join("ready").to_str().unwrap());
+        let data = vec![0; 1024 * 1024];
+        std::fs::write(&source, &data).unwrap();
+        let file = open_source_file(&source).unwrap();
+        let ready_path = dir.join("ready");
+        let ready = sq(ready_path.to_str().unwrap());
+        let published = dir.join("published");
         let argv = vec!["sh".into(), "-c".into(), format!(
-            "exec 3<&0; setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} <&3 >/dev/null 2>&1 & while [ ! -f {ready} ]; do sleep 0.01; done; exec 3<&-; sleep 2"
+            "exec 3<&0; setsid sh -c 'printf ready > \"$1\"; sleep 2' sh {ready} <&3 >/dev/null 2>&1 & while [ ! -f {ready} ]; do sleep 0.01; done; exec 3<&-; sleep 2; cat > {}",
+            sq(published.to_str().unwrap()),
         )];
+        // Isolate the pipe deadline from snapshot/fsync and process startup.
+        // The escaped session must already hold stdin when the clock starts.
+        let child = spawn_piped(&argv).unwrap();
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready_path.exists(), "escaped stdin holder did not start");
         let started = std::time::Instant::now();
-        let capture = run_stream_from_file(
+        let capture = run_stream_from_open_file_with_spawn(
             &argv,
-            &source,
+            file,
             Duration::from_millis(100),
             MAX_TRANSFER_BYTES,
             TransferControl::default(),
+            |_| Ok(child),
         )
-        .unwrap();
-        assert!(dir.join("ready").exists());
+        .expect("a started upload reports its pipe timeout in Capture");
         assert!(capture.timed_out);
+        assert!(!capture.cancelled);
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!published.exists(), "timed-out upload must not publish");
+        assert_eq!(std::fs::read(&source).unwrap(), data);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "only the unchanged source and ready marker remain"
+        );
     }
 
     // ---- run_capture ----
