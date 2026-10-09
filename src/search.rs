@@ -41,6 +41,11 @@ fn find_query_is_unsafe(query: &str) -> bool {
     query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
 }
 
+/// Regex diagnostics quote the draft. Keep them inside one bounded UI line.
+pub(crate) fn safe_regex_error(error: impl std::fmt::Display) -> String {
+    jterm_core::review_input::safe_inline_display(&format!("Invalid regex: {error}"), 160)
+}
+
 /// 编译后的正则缓存槽。由 `SearchState` 持有,这样搜索面板打开期间
 /// 每次刷新(PTY 输出、按键)只要 pattern 与大小写标志未变,就复用同一个
 /// `Regex`,而不是每次都付出一次完整的 `RegexBuilder::build()`。
@@ -49,7 +54,7 @@ fn find_query_is_unsafe(query: &str) -> bool {
 pub struct RegexCache {
     pattern: String,
     case_sensitive: bool,
-    regex: regex::Regex,
+    compiled: Result<regex::Regex, String>,
 }
 
 /// 单个搜索匹配项
@@ -112,8 +117,8 @@ pub struct SearchState {
     /// 历史导航位置（None 表示在输入框，Some(i) 表示在历史第 i 项）
     pub history_nav_index: Option<usize>,
 
-    /// 上次搜索词（用于检测搜索词变化）
-    last_query: String,
+    /// Draft and mode flags to restore after navigating back out of history.
+    history_draft: Option<(String, bool, bool)>,
 
     /// 搜索错误消息（正则表达式编译错误等）
     pub error_message: Option<String>,
@@ -171,7 +176,7 @@ impl SearchState {
             search_focused: false,
             history: VecDeque::new(),
             history_nav_index: None,
-            last_query: String::new(),
+            history_draft: None,
             error_message: None,
             projection_message: None,
             hidden_projection_zone: None,
@@ -219,10 +224,9 @@ impl SearchState {
     pub fn close(&mut self) {
         self.is_open = false;
         self.search_focused = false;
-        if !self.query.is_empty() && self.last_query != self.query {
-            self.save_to_history();
-            self.last_query = self.query.clone();
-        }
+        self.save_to_history();
+        self.history_nav_index = None;
+        self.history_draft = None;
     }
 
     /// Replace the find query. Control characters are dropped and the byte
@@ -233,6 +237,7 @@ impl SearchState {
         if bounded != self.query {
             self.query = bounded;
             self.history_nav_index = None;
+            self.history_draft = None;
             self.current_match_index = 0;
         }
     }
@@ -262,7 +267,11 @@ impl SearchState {
         }
 
         // 检查重复
-        if !self.history.is_empty() && self.history[0].query == self.query {
+        if self.history.front().is_some_and(|entry| {
+            entry.query == self.query
+                && entry.is_regex == self.use_regex
+                && entry.case_sensitive == self.case_sensitive
+        }) {
             return;
         }
 
@@ -284,41 +293,65 @@ impl SearchState {
 
     /// 从历史中加载前一条
     pub fn history_prev(&mut self) {
+        self.detach_edited_history();
         if self.history.is_empty() {
             return;
         }
 
-        if let Some(idx) = self.history_nav_index {
-            if idx + 1 < self.history.len() {
-                self.history_nav_index = Some(idx + 1);
-                let entry = &self.history[idx + 1];
-                self.query = bound_query_text(entry.query.clone());
-                self.use_regex = entry.is_regex;
-                self.case_sensitive = entry.case_sensitive;
-            }
-        } else {
-            self.history_nav_index = Some(0);
-            let entry = &self.history[0];
-            self.query = bound_query_text(entry.query.clone());
-            self.use_regex = entry.is_regex;
-            self.case_sensitive = entry.case_sensitive;
-        }
+        let next = match self.history_nav_index {
+            Some(idx) if idx + 1 < self.history.len() => idx + 1,
+            None => 0,
+            _ => return,
+        };
+        self.restore_history_entry(next);
     }
 
     /// 从历史中加载后一条
     pub fn history_next(&mut self) {
+        self.detach_edited_history();
         if let Some(idx) = self.history_nav_index {
             if idx > 0 {
-                self.history_nav_index = Some(idx - 1);
-                let entry = &self.history[idx - 1];
-                self.query = bound_query_text(entry.query.clone());
-                self.use_regex = entry.is_regex;
-                self.case_sensitive = entry.case_sensitive;
+                self.restore_history_entry(idx - 1);
             } else {
-                // 返回输入框
                 self.history_nav_index = None;
-                self.query.clear();
+                if let Some((query, use_regex, case_sensitive)) = self.history_draft.take() {
+                    self.query = query;
+                    self.use_regex = use_regex;
+                    self.case_sensitive = case_sensitive;
+                } else {
+                    self.query.clear();
+                }
+                self.current_match_index = 0;
             }
+        }
+    }
+
+    fn restore_history_entry(&mut self, idx: usize) {
+        let Some(entry) = self.history.get(idx) else {
+            return;
+        };
+        if self.history_nav_index.is_none() {
+            self.history_draft = Some((self.query.clone(), self.use_regex, self.case_sensitive));
+        }
+        self.query = bound_query_text(entry.query.clone());
+        self.use_regex = entry.is_regex;
+        self.case_sensitive = entry.case_sensitive;
+        self.history_nav_index = Some(idx);
+        self.current_match_index = 0;
+    }
+
+    /// The mode buttons edit public flags directly. Treat those edits like
+    /// typed text, rather than silently discarding them on the next arrow.
+    fn detach_edited_history(&mut self) {
+        if self.history_nav_index.is_some_and(|idx| {
+            self.history.get(idx).is_none_or(|entry| {
+                self.query != bound_query_text(entry.query.clone())
+                    || self.use_regex != entry.is_regex
+                    || self.case_sensitive != entry.case_sensitive
+            })
+        }) {
+            self.history_nav_index = None;
+            self.history_draft = None;
         }
     }
 }
@@ -376,7 +409,7 @@ impl SearchEngine {
     }
 
     /// 取得缓存的编译正则;pattern(实际参与编译的字符串)或大小写标志
-    /// 变化时才重新编译并写回缓存,编译失败会清空缓存并返回错误。
+    /// 变化时才重新编译并写回缓存。失败也缓存，避免每次 PTY 刷新重复编译。
     fn cached_regex<'a>(
         cache: &'a mut Option<RegexCache>,
         pattern: &str,
@@ -391,21 +424,18 @@ impl SearchEngine {
             if !case_sensitive {
                 builder.case_insensitive(true);
             }
-            match builder.build() {
-                Ok(regex) => {
-                    *cache = Some(RegexCache {
-                        pattern: pattern.to_string(),
-                        case_sensitive,
-                        regex,
-                    });
-                }
-                Err(e) => {
-                    *cache = None;
-                    return Err(format!("Invalid regex: {}", e));
-                }
-            }
+            *cache = Some(RegexCache {
+                pattern: pattern.to_string(),
+                case_sensitive,
+                compiled: builder.build().map_err(safe_regex_error),
+            });
         }
-        Ok(&cache.as_ref().expect("cache was just rebuilt").regex)
+        cache
+            .as_ref()
+            .expect("cache was just rebuilt")
+            .compiled
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     /// 逐行遍历 scrollback(主缓冲时)与活动网格;回调返回 true 表示达到
@@ -642,6 +672,96 @@ impl SearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_navigation_restores_draft_and_modes() {
+        let mut state = SearchState::new();
+        state.set_query("older");
+        state.close();
+        state.set_query("newer");
+        state.use_regex = true;
+        state.close();
+        state.set_query("unfinished");
+        state.use_regex = false;
+        state.case_sensitive = true;
+
+        state.history_prev();
+        assert_eq!(state.query, "newer");
+        assert!(state.use_regex);
+        assert!(!state.case_sensitive);
+        state.history_prev();
+        assert_eq!(state.query, "older");
+        state.history_next();
+        assert_eq!(state.query, "newer");
+        state.history_next();
+        assert_eq!(state.query, "unfinished");
+        assert!(!state.use_regex);
+        assert!(state.case_sensitive);
+        assert!(state.history_nav_index.is_none());
+        assert!(state.history_draft.is_none());
+    }
+
+    #[test]
+    fn edited_history_becomes_the_new_draft() {
+        let mut state = SearchState::new();
+        state.set_query("saved");
+        state.close();
+        state.set_query("original draft");
+        state.history_prev();
+        state.set_query("edited history");
+        state.history_prev();
+        state.history_next();
+        assert_eq!(state.query, "edited history");
+
+        // The actual mode buttons change the public flags directly.
+        state.history_prev();
+        state.use_regex = true;
+        state.case_sensitive = true;
+        state.history_prev();
+        assert!(!state.use_regex);
+        assert!(!state.case_sensitive);
+        state.history_next();
+        assert_eq!(state.query, "saved");
+        assert!(state.use_regex);
+        assert!(state.case_sensitive);
+    }
+
+    #[test]
+    fn noop_input_preserves_history_navigation() {
+        let mut state = SearchState::new();
+        state.set_query("saved");
+        state.close();
+        state.set_query("draft");
+        state.history_prev();
+        state.set_query("saved\n");
+        assert_eq!(state.history_nav_index, Some(0));
+        state.history_next();
+        assert_eq!(state.query, "draft");
+    }
+
+    #[test]
+    fn history_remembers_mode_changes_and_resets_navigation_on_close() {
+        let mut state = SearchState::new();
+        state.set_query("same query");
+        state.close();
+        state.close();
+        assert_eq!(state.history.len(), 1);
+        state.use_regex = true;
+        state.close();
+        state.case_sensitive = true;
+        state.close();
+        assert_eq!(state.history.len(), 3);
+        state.history_prev();
+        state.history_prev();
+        assert!(!state.case_sensitive);
+        state.close();
+        assert!(state.history_nav_index.is_none());
+        state.open();
+        state.history_prev();
+        assert_eq!(state.history_nav_index, Some(0));
+        assert!(state.use_regex);
+        assert!(!state.case_sensitive);
+    }
 
     #[test]
     fn test_search_state_open_and_close() {
@@ -887,8 +1007,8 @@ mod tests {
             Some(("a", true))
         );
 
-        // A case-flag flip rebuilds; an invalid pattern reports the error and
-        // clears the slot so the next valid pattern compiles fresh.
+        // A case-flag flip rebuilds; an invalid pattern caches its error so
+        // live output does not repeatedly compile the same invalid draft.
         let (_, error, _) = SearchEngine::search(&terminal, "a", true, false, &mut cache);
         assert!(error.is_none());
         assert_eq!(
@@ -900,7 +1020,40 @@ mod tests {
         let (matches, error, _) = SearchEngine::search(&terminal, "a(", true, true, &mut cache);
         assert!(matches.is_empty());
         assert!(error.is_some());
-        assert!(cache.is_none());
+        assert!(cache.as_ref().unwrap().compiled.is_err());
+        let (_, repeated_error, _) = SearchEngine::search(&terminal, "a(", true, true, &mut cache);
+        assert_eq!(error, repeated_error);
+        let (matches, error, _) = SearchEngine::search(&terminal, "a", true, true, &mut cache);
+        assert!(error.is_none());
+        assert_eq!(matches.len(), 1);
+        assert!(cache.as_ref().unwrap().compiled.is_ok());
+    }
+
+    #[test]
+    fn regex_errors_are_bounded_single_line_diagnostics() {
+        let terminal = crate::terminal::TerminalState::new(8, 1);
+        let query = format!("{}(", "a".repeat(MAX_SEARCH_QUERY_BYTES - 1));
+        let (_, error, _) = SearchEngine::search(&terminal, &query, true, true, &mut None);
+        let error = error.unwrap();
+        assert!(error.starts_with("Invalid regex:"));
+        assert!(error.len() <= 160);
+        assert!(!error.chars().any(char::is_control));
+        let diagnostic = safe_regex_error("bad\n\u{1b}[31m\u{202e}pattern");
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(!jterm_core::review_input::contains_visual_spoofing(
+            &diagnostic
+        ));
+    }
+
+    #[test]
+    fn zero_width_regex_matches_keep_existing_navigation_semantics() {
+        let terminal = crate::terminal::TerminalState::new(8, 2);
+        let (matches, error, truncated) =
+            SearchEngine::search(&terminal, "^", true, true, &mut None);
+        assert!(error.is_none());
+        assert!(!truncated);
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|found| found.col_start == found.col_end));
     }
 
     #[test]

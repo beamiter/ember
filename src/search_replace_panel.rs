@@ -168,14 +168,20 @@ impl SearchReplacePanel {
 
                 ui.horizontal(|ui| {
                     if ui
-                        .button("Replace → Clipboard")
+                        .add_enabled(
+                            !self.search_input.is_empty(),
+                            egui::Button::new("Replace → Clipboard"),
+                        )
                         .on_hover_text("对选中文本替换后复制到剪贴板")
                         .clicked()
                     {
                         action = Some(SearchReplaceAction::ReplaceToClipboard);
                     }
                     if ui
-                        .button("Type into terminal")
+                        .add_enabled(
+                            !self.search_input.is_empty(),
+                            egui::Button::new("Type into terminal"),
+                        )
                         .on_hover_text("替换后发送到终端（不带回车）")
                         .clicked()
                     {
@@ -233,6 +239,31 @@ impl SearchReplacePanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_regex_find_does_not_insert_at_every_boundary() {
+        let mut panel = SearchReplacePanel::new();
+        panel.config.use_regex = true;
+        panel.options.replace_all = true;
+        panel.replace_input = "x".to_string();
+        assert_eq!(panel.apply("abc").as_deref(), Some("abc"));
+        assert_eq!(panel.status, "0 replacement(s)");
+    }
+
+    #[test]
+    fn invalid_regex_status_is_bounded_and_recovers_after_edit() {
+        let mut panel = SearchReplacePanel::new();
+        panel.config.use_regex = true;
+        panel.search_input = format!("{}(", "a".repeat(MAX_SEARCH_QUERY_BYTES - 1));
+        assert!(panel.apply("abc").is_none());
+        assert!(panel.status.starts_with("Invalid regex:"));
+        assert!(panel.status.len() <= 160);
+        assert!(!panel.status.chars().any(char::is_control));
+        panel.search_input = "a".to_string();
+        panel.replace_input = "x".to_string();
+        assert_eq!(panel.apply("abc").as_deref(), Some("xbc"));
+        assert_eq!(panel.status, "1 replacement(s)");
+    }
 
     #[test]
     fn find_replace_fields_bound_and_apply_refuses_spoofing() {

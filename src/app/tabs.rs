@@ -357,6 +357,10 @@ impl TerminalApp {
         if !self.session_manager.close_session(index) {
             return false;
         }
+        // A split's focused session may disappear while its tab survives.
+        // The draft names a tab index, so never commit it onto the replacement
+        // focused pane. Refused closes above leave the editor untouched.
+        self.renaming_tab = None;
         let active_session_after = self
             .session_manager
             .sessions()
@@ -2232,6 +2236,26 @@ mod tests {
     use super::{block_or_sidebar_selection_targets_session, workspace_drag_pointer_pos};
     use crate::app::commands::CommandTarget;
     use eframe::egui;
+
+    /// Auxiliary controller wiring guard; the headless close fixture also
+    /// exercises successful/refused closes with the actual method body.
+    #[test]
+    fn session_close_invalidates_index_bound_rename_only_after_success() {
+        let source = include_str!("tabs.rs");
+        let close = source
+            .split("    pub fn close_session_synced(")
+            .nth(1)
+            .unwrap()
+            .split("    pub fn reorder_tabs(")
+            .next()
+            .unwrap();
+        let mutation = close
+            .find("if !self.session_manager.close_session(index)")
+            .unwrap();
+        let clear = close.find("self.renaming_tab = None;").unwrap();
+        assert!(mutation < clear);
+        assert!(close[..clear].contains("return false;"));
+    }
 
     #[test]
     fn workspace_drag_keeps_the_touch_end_position_after_pointer_gone() {

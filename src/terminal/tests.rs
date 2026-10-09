@@ -5692,6 +5692,80 @@ fn undo_clear_blocks_enforces_the_record_cap_oldest_first() {
 }
 
 #[test]
+fn undo_clear_blocks_reapplies_the_captured_output_budget_oldest_first() {
+    let mut terminal = TerminalState::new(8, 2);
+    let per_record = MAX_COMPLETED_COMMAND_OUTPUT_BYTES;
+    let records_per_budget = MAX_CAPTURED_COMMAND_OUTPUT_BYTES / per_record;
+    for index in 0..records_per_budget * 2 {
+        if index == records_per_budget {
+            assert_eq!(terminal.clear_completed_blocks(), records_per_budget);
+            assert_eq!(terminal.captured_command_output_bytes, 0);
+        }
+        emit_completed_block(&mut terminal, index);
+        let record_index = terminal.command_records().len() - 1;
+        terminal.store_captured_command_output(
+            record_index,
+            ExtractedText {
+                text: "x".repeat(per_record),
+                truncated: false,
+                total_bytes: per_record,
+            },
+        );
+        // Completion delivery is a separate bounded application queue.
+        terminal.take_completed_command_events();
+    }
+    let live_sequence = terminal.command_records().back().unwrap().sequence;
+    assert_eq!(terminal.undo_clear_blocks(), records_per_budget);
+    let retained_bytes: usize = terminal
+        .command_records()
+        .iter()
+        .filter_map(|record| record.captured_output.as_ref())
+        .map(|output| output.text.len())
+        .sum();
+    assert_eq!(terminal.captured_command_output_bytes, retained_bytes);
+    assert_eq!(retained_bytes, MAX_CAPTURED_COMMAND_OUTPUT_BYTES);
+    assert_eq!(terminal.command_records().len(), records_per_budget * 2);
+    assert!(terminal
+        .command_records()
+        .iter()
+        .take(records_per_budget)
+        .all(|record| record.captured_output.is_none()));
+    assert!(terminal
+        .command_records()
+        .iter()
+        .skip(records_per_budget)
+        .all(|record| record.captured_output.is_some()));
+    assert_eq!(
+        terminal.command_records().back().unwrap().sequence,
+        live_sequence
+    );
+    assert_eq!(terminal.undo_clear_blocks(), 0);
+}
+
+#[test]
+fn local_command_identity_does_not_retarget_a_shell_named_record() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07\x1b]133;C;id=local:2;cmdline_url=first\x07one\x1b]133;D;0;id=local:2\x07",
+    );
+    let original_sequence = terminal.command_record("local:2").unwrap().sequence;
+    terminal.take_completed_command_events();
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;cmdline_url=second\x07two");
+    let active_id = terminal.command_records().back().unwrap().id.clone();
+    assert_ne!(active_id, "local:2");
+    assert_eq!(
+        terminal.command_record("local:2").unwrap().sequence,
+        original_sequence
+    );
+    terminal.process_input(format!("\x1b]133;D;7;id={active_id}\x07").as_bytes());
+    assert!(terminal.command_records().back().unwrap().complete);
+    let completed = terminal.take_completed_command_events();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, active_id);
+    assert_eq!(completed[0].exit_code, Some(7));
+}
+
+#[test]
 fn hard_reset_drops_the_undo_stash_with_the_rest_of_block_history() {
     let mut terminal = TerminalState::new(40, 8);
     emit_completed_block(&mut terminal, 0);
@@ -7467,4 +7541,231 @@ fn discarded_oversized_apc_still_obeys_cancellation_and_reset() {
         assert_eq!(terminal.grid[0][0].character, 'o');
         assert_eq!(terminal.grid[0][1].character, 'k');
     }
+}
+
+#[test]
+fn raw_selection_tracks_prefix_eviction_and_limit_shrink() {
+    for shrink in [false, true] {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_max_scrollback(2);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.select_word_at(0, 1);
+        assert_eq!(terminal.copy_selection().as_deref(), Some("three"));
+        if shrink {
+            terminal.set_max_scrollback(1);
+        } else {
+            terminal.process_input(b"\r\nfive");
+        }
+        assert_eq!(terminal.copy_selection().as_deref(), Some("three"));
+    }
+}
+
+#[test]
+fn raw_history_selection_is_rebased_or_cleared_when_its_endpoint_is_evicted() {
+    for (viewport_row, expected) in [(0, None), (1, Some("two"))] {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_max_scrollback(2);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.scroll(2);
+        terminal.select_word_at(viewport_row, 1);
+        terminal.process_input(b"\r\nfive");
+        assert_eq!(terminal.copy_selection().as_deref(), expected);
+    }
+}
+
+#[test]
+fn raw_selection_keeps_reverse_rectangle_coordinates_during_prefix_trim() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.set_max_scrollback(2);
+    terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+    terminal.start_block_selection((1, 2));
+    terminal.update_selection((0, 0));
+    let before = terminal.copy_selection();
+    assert_eq!(before.as_deref(), Some("thr\nfou"));
+    terminal.process_input(b"\r\nfive");
+    assert_eq!(terminal.copy_selection(), before);
+}
+
+#[test]
+fn raw_snapshot_copy_rebases_history_and_keeps_the_live_grid_selected() {
+    for history in [false, true] {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_max_scrollback(3);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        if history {
+            terminal.scroll(2);
+            terminal.select_word_at(1, 1);
+            assert_eq!(terminal.copy_selection().as_deref(), Some("two"));
+        } else {
+            terminal.select_word_at(0, 1);
+            assert_eq!(terminal.copy_selection().as_deref(), Some("three"));
+        }
+        let before = terminal.copy_selection();
+        terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+        assert_eq!(terminal.copy_selection(), before);
+    }
+}
+
+#[test]
+fn raw_snapshot_copy_clears_an_evicted_history_endpoint() {
+    let mut terminal = TerminalState::new(8, 2);
+    terminal.set_max_scrollback(2);
+    terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+    terminal.scroll(2);
+    terminal.select_word_at(1, 1);
+    assert_eq!(terminal.copy_selection().as_deref(), Some("two"));
+    terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+    assert_eq!(terminal.copy_selection(), None);
+}
+
+#[test]
+fn local_command_identity_skips_consumed_spellings_after_clear_or_reset() {
+    for reset in [false, true] {
+        let mut terminal = TerminalState::new(24, 4);
+        terminal
+            .process_input(b"\x1b]133;A\x07\x1b]133;C;id=local:2\x07\x1b]133;D;0;id=local:2\x07");
+        if reset {
+            terminal.process_input(b"\x1bc");
+        } else {
+            assert_eq!(terminal.clear_completed_blocks(), 1);
+        }
+        terminal.process_input(b"\x1b]133;A\x07");
+        assert_eq!(terminal.command_records().back().unwrap().id, "local:3");
+        if !reset {
+            assert_eq!(terminal.undo_clear_blocks(), 1);
+            let ids: std::collections::HashSet<_> = terminal
+                .command_records()
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect();
+            assert_eq!(ids.len(), terminal.command_records().len());
+        }
+    }
+}
+
+#[test]
+fn local_command_identity_exhaustion_never_wraps_or_reuses_a_shell_id() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(
+        format!(
+            "\x1b]133;A\x07\x1b]133;C;id=local:{}\x07\x1b]133;D;0\x07",
+            u64::MAX
+        )
+        .as_bytes(),
+    );
+    terminal.next_command_sequence = u64::MAX;
+    terminal.process_input(b"\x1b]133;A\x07");
+    assert_eq!(terminal.command_records().len(), 1);
+    assert_eq!(terminal.next_command_sequence, 0);
+    terminal.process_input(b"\x1b]133;A\x07");
+    assert_eq!(terminal.command_records().len(), 1);
+}
+
+#[test]
+fn local_command_identity_skips_stashed_ids_after_the_consumed_window_expires() {
+    let mut terminal = TerminalState::new(24, 4);
+    let reserved_id = format!("local:{}", super::MAX_CONSUMED_COMMAND_IDS + 2);
+    terminal.process_input(
+        format!("\x1b]133;A\x07\x1b]133;C;id={reserved_id}\x07\x1b]133;D;0;id={reserved_id}\x07")
+            .as_bytes(),
+    );
+    assert_eq!(terminal.clear_completed_blocks(), 1);
+    for index in 0..super::MAX_CONSUMED_COMMAND_IDS {
+        emit_completed_block(&mut terminal, index);
+        terminal.take_completed_command_events();
+    }
+    assert!(!terminal.command_id_was_consumed(&reserved_id));
+    assert_eq!(
+        terminal.next_command_sequence,
+        (super::MAX_CONSUMED_COMMAND_IDS + 2) as u64
+    );
+    terminal.process_input(b"\x1b]133;A\x07");
+    assert_ne!(terminal.command_records().back().unwrap().id, reserved_id);
+    // The ordinary record cap now drops the stashed oldest record entirely.
+    // It still must not lend its name to the fallback allocator before undo.
+    assert_eq!(terminal.undo_clear_blocks(), 0);
+    let ids: std::collections::HashSet<_> = terminal
+        .command_records()
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect();
+    assert_eq!(ids.len(), terminal.command_records().len());
+}
+
+#[test]
+fn erase_saved_lines_rebases_live_raw_selection_and_clears_lost_history() {
+    for history in [false, true] {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        if history {
+            terminal.scroll(2);
+        }
+        terminal.select_word_at(0, 1);
+        terminal.process_input(b"\x1b[3J");
+        assert_eq!(
+            terminal.copy_selection().as_deref(),
+            if history { None } else { Some("three") }
+        );
+    }
+}
+
+#[test]
+fn raw_selection_retention_matrix_covers_small_caps_and_both_directions() {
+    for cap in [0, 1, 2] {
+        for reverse in [false, true] {
+            for rectangular in [false, true] {
+                for change in ["scroll", "copy", "shrink"] {
+                    let mut terminal = TerminalState::new(8, 3);
+                    terminal.set_max_scrollback(cap);
+                    terminal.process_input(b"aaa\r\nbbb\r\nccc\r\nddd\r\neee\r\nfff");
+                    let (anchor, active) = if reverse {
+                        ((1, 2), (0, 0))
+                    } else {
+                        ((0, 0), (1, 2))
+                    };
+                    let mode = if rectangular {
+                        super::SelectionMode::Block
+                    } else {
+                        super::SelectionMode::Normal
+                    };
+                    terminal.start_selection_with_mode(anchor, mode);
+                    terminal.update_selection(active);
+                    let before = terminal.copy_selection();
+                    assert!(before
+                        .as_ref()
+                        .is_some_and(|text| text.contains("ddd") && text.contains("eee")));
+                    match change {
+                        "scroll" => terminal.process_input(b"\r\nggg"),
+                        "copy" => {
+                            terminal
+                                .archive_visible_screen_to_scrollback_with_options(false, false);
+                        }
+                        "shrink" => terminal.set_max_scrollback(0),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(
+                        terminal.copy_selection(),
+                        before,
+                        "cap={cap} reverse={reverse} rectangular={rectangular} change={change}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_snapshot_copy_refuses_alt_buffer_without_rebasing_selection() {
+    let mut terminal = TerminalState::new(8, 3);
+    terminal.set_max_scrollback(0);
+    terminal.process_input(b"\x1b[?1049haaa\r\nbbb");
+    terminal.start_selection_with_mode((0, 0), super::SelectionMode::Normal);
+    terminal.update_selection((1, 2));
+    let before = terminal.copy_selection();
+    let selection = terminal.selection;
+    let history = terminal.scrollback_len();
+    terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+    assert_eq!(terminal.scrollback_len(), history);
+    assert_eq!(terminal.selection, selection);
+    assert_eq!(terminal.copy_selection(), before);
 }

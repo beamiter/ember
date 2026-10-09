@@ -1623,7 +1623,10 @@ impl SessionsSnapshot {
             raw_tabs
         };
 
-        for tab in raw_tabs {
+        let raw_tab_count = raw_tabs.len();
+        let original_active_tab = self.active_tab;
+        let mut retained_active_tab = None;
+        for (original_index, tab) in raw_tabs.into_iter().enumerate() {
             let root = sanitize_layout_node(
                 tab.root,
                 &allowed_session_ids,
@@ -1634,6 +1637,9 @@ impl SessionsSnapshot {
             );
             match root {
                 Some(root) => {
+                    if original_active_tab == Some(original_index) {
+                        retained_active_tab = Some(self.tabs.len());
+                    }
                     let focused_session_id = tab.focused_session_id.filter(|session_id| {
                         let keep = used_session_ids.contains(session_id);
                         layout_repaired |= !keep;
@@ -1653,13 +1659,16 @@ impl SessionsSnapshot {
             }
         }
 
-        if self
-            .active_tab
-            .is_some_and(|index| index >= self.tabs.len())
-        {
-            self.active_tab = self.tabs.len().checked_sub(1);
-            layout_repaired = true;
-        }
+        // An index names the input tab, not whichever tab shifted into its
+        // slot after missing/duplicate-session leaves were removed. A removed
+        // selected tab uses the active-session fallback in TabManager::restore;
+        // do not let a subsequently adopted orphan inherit its old index.
+        self.active_tab = if original_active_tab.is_some_and(|index| index >= raw_tab_count) {
+            self.tabs.len().checked_sub(1)
+        } else {
+            retained_active_tab
+        };
+        layout_repaired |= self.active_tab != original_active_tab;
         self.layout = self
             .active_tab
             .and_then(|idx| self.tabs.get(idx))
@@ -1722,8 +1731,10 @@ fn sanitize_layout_node(
             );
             match (first, second) {
                 (Some(first), Some(second)) => {
-                    let normalized_ratio = if ratio.is_finite() {
-                        ratio.clamp(0.1, 0.9)
+                    // Binary snapshots fold n-ary splits: a valid first
+                    // child can occupy less than the UI's 10% divider limit.
+                    let normalized_ratio = if ratio.is_finite() && ratio > 0.0 && ratio < 1.0 {
+                        ratio
                     } else {
                         0.5
                     };
@@ -2093,6 +2104,51 @@ mod tests {
     }
 
     #[test]
+    fn layout_ratio_sanitizing_preserves_all_valid_shares_and_rejects_invalid_ones() {
+        for ratio in [
+            1.0 / 12.0,
+            0.01,
+            0.5,
+            0.99,
+            0.0,
+            1.0,
+            -1.0,
+            2.0,
+            f32::NAN,
+            f32::INFINITY,
+        ] {
+            let mut repaired = false;
+            let root = sanitize_layout_node(
+                LayoutNodeSnapshot::Split {
+                    horizontal: false,
+                    ratio,
+                    first: Box::new(LayoutNodeSnapshot::Pane {
+                        session_id: "a".into(),
+                    }),
+                    second: Box::new(LayoutNodeSnapshot::Pane {
+                        session_id: "b".into(),
+                    }),
+                },
+                &HashSet::from(["a".into(), "b".into()]),
+                &mut HashSet::new(),
+                &mut 0,
+                0,
+                &mut repaired,
+            )
+            .unwrap();
+            let valid = ratio.is_finite() && ratio > 0.0 && ratio < 1.0;
+            let LayoutNodeSnapshot::Split {
+                ratio: restored, ..
+            } = root
+            else {
+                panic!("split survives")
+            };
+            assert_eq!(restored, if valid { ratio } else { 0.5 });
+            assert_eq!(repaired, !valid);
+        }
+    }
+
+    #[test]
     fn malformed_layout_does_not_prevent_session_restore() {
         let json = r#"{
             "version": 3,
@@ -2175,6 +2231,43 @@ mod tests {
 
         assert_eq!(snapshot.tabs.len(), 1);
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn reference_pruning_preserves_active_tab_identity_or_uses_session_fallback() {
+        for (references, active, expected) in [
+            (vec!["missing", "a", "b"], Some(1), Some(0)),
+            (vec!["a", "a", "b"], Some(1), None),
+            (vec!["a", "missing"], Some(1), None),
+            (vec!["a", "b"], Some(1), Some(1)),
+            (vec!["a", "b"], None, None),
+        ] {
+            let sessions = ["a", "b"]
+                .into_iter()
+                .map(|id| SessionSnapshot {
+                    name: id.into(),
+                    tags: vec![],
+                    cwd: None,
+                    session_id: Some(id.into()),
+                    custom_name: None,
+                })
+                .collect();
+            let tabs = references
+                .into_iter()
+                .map(|id| LayoutSnapshot {
+                    root: LayoutNodeSnapshot::Pane {
+                        session_id: id.into(),
+                    },
+                    focused_session_id: None,
+                    pinned: false,
+                    marked: false,
+                    private_title: false,
+                })
+                .collect();
+            let mut snapshot = SessionsSnapshot::from_snapshots(sessions, Some(0), tabs, active);
+            snapshot.sanitize();
+            assert_eq!(snapshot.active_tab, expected);
+        }
     }
 
     #[test]

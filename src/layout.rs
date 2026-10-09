@@ -321,8 +321,10 @@ impl LayoutManager {
                         } else {
                             SplitAxis::Vertical
                         };
-                        let ratio = if ratio.is_finite() {
-                            ratio.clamp(Self::MIN_SPLIT_RATIO, Self::MAX_SPLIT_RATIO)
+                        // This may be one child of a folded n-ary split,
+                        // not a two-pane UI divider. Preserve every valid share.
+                        let ratio = if ratio.is_finite() && *ratio > 0.0 && *ratio < 1.0 {
+                            *ratio
                         } else {
                             0.5
                         };
@@ -1283,6 +1285,70 @@ mod tests {
         assert_eq!(restored.panes().len(), 1);
         assert_eq!(restored.focused_session_idx(), Some(0));
         assert!(restored.get_divider_rects().is_empty());
+    }
+
+    #[test]
+    fn wide_and_nested_layouts_preserve_geometry_across_snapshot_restore() {
+        for nested in [false, true] {
+            let mut layout = LayoutManager::new(0);
+            for session in 1..12 {
+                layout.split(session, false).unwrap();
+            }
+            if nested {
+                layout.split(12, true).unwrap();
+            }
+            layout.equalize_splits();
+            let ids: Vec<_> = (0..13).map(|index| format!("session-{index}")).collect();
+            let snapshot = layout.to_snapshot(&ids).unwrap();
+            let mut restored = LayoutManager::try_from_snapshot(&snapshot, &ids, None).unwrap();
+            layout.compute_pane_rects(test_rect());
+            restored.compute_pane_rects(test_rect());
+            assert_eq!(layout.focused_session_idx(), restored.focused_session_idx());
+            assert_eq!(layout.session_indices(), restored.session_indices());
+            for (before, after) in layout.panes().iter().zip(restored.panes()) {
+                assert!((before.rect.left() - after.rect.left()).abs() < 0.01);
+                assert!((before.rect.top() - after.rect.top()).abs() < 0.01);
+                assert!((before.rect.width() - after.rect.width()).abs() < 0.01);
+                assert!((before.rect.height() - after.rect.height()).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn restored_invalid_split_shares_fall_back_to_even() {
+        use crate::session_persistence::{LayoutNodeSnapshot, LayoutSnapshot};
+        for ratio in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1.0,
+            0.0,
+            1.0,
+            2.0,
+        ] {
+            let snapshot = LayoutSnapshot {
+                root: LayoutNodeSnapshot::Split {
+                    horizontal: false,
+                    ratio,
+                    first: Box::new(LayoutNodeSnapshot::Pane {
+                        session_id: "a".into(),
+                    }),
+                    second: Box::new(LayoutNodeSnapshot::Pane {
+                        session_id: "b".into(),
+                    }),
+                },
+                focused_session_id: None,
+                pinned: false,
+                marked: false,
+                private_title: false,
+            };
+            let mut restored =
+                LayoutManager::try_from_snapshot(&snapshot, &["a".into(), "b".into()], None)
+                    .unwrap();
+            restored.compute_pane_rects(test_rect());
+            assert_eq!(restored.panes()[0].rect.width(), test_rect().width() / 2.0);
+            assert_eq!(restored.panes()[1].rect.width(), test_rect().width() / 2.0);
+        }
     }
 
     #[test]

@@ -91,21 +91,27 @@ impl TabManager {
         active_session_idx: usize,
         saved_active_tab: Option<usize>,
     ) -> Self {
-        let mut layouts: Vec<(LayoutManager, TabFlags)> = saved_tabs
-            .iter()
-            .filter_map(|snapshot| {
-                LayoutManager::try_from_snapshot(snapshot, session_ids, None).map(|layout| {
-                    (
-                        layout,
-                        TabFlags {
-                            pinned: snapshot.pinned,
-                            marked: snapshot.marked,
-                            private_title: snapshot.private_title,
-                        },
-                    )
-                })
-            })
-            .collect();
+        let mut layouts = Vec::new();
+        let mut restored_active_tab = None;
+        for (saved_index, snapshot) in saved_tabs.iter().enumerate() {
+            let Some(layout) = LayoutManager::try_from_snapshot(snapshot, session_ids, None) else {
+                continue;
+            };
+            // A failed shell can remove an entire saved tab. Preserve the
+            // selected tab's identity before compacting the list or adopting
+            // orphans; its old index must never select a different live PTY.
+            if saved_active_tab == Some(saved_index) {
+                restored_active_tab = Some(layouts.len());
+            }
+            layouts.push((
+                layout,
+                TabFlags {
+                    pinned: snapshot.pinned,
+                    marked: snapshot.marked,
+                    private_title: snapshot.private_title,
+                },
+            ));
+        }
 
         let mut adopted: std::collections::HashSet<usize> = layouts
             .iter()
@@ -117,8 +123,7 @@ impl TabManager {
             }
         }
 
-        let active = saved_active_tab
-            .filter(|idx| *idx < layouts.len())
+        let active = restored_active_tab
             // 没记录活跃 tab（或它已失效）时跟着活跃会话走。
             .or_else(|| {
                 layouts
@@ -268,7 +273,10 @@ impl TabManager {
     /// 在当前 tab 之后插入一个新 tab 并激活它。会话索引必须已经存在于
     /// SessionManager 中，并且调用方已经调用过 [`Self::on_session_inserted`]。
     pub fn insert_tab_after_active(&mut self, session_idx: usize) -> usize {
-        let at = (self.active + 1).min(self.tabs.len());
+        // New tabs are unpinned. When the active tab is pinned, insert after
+        // the whole pinned partition instead of splitting that partition.
+        let pinned_count = self.tabs.iter().take_while(|tab| tab.flags.pinned).count();
+        let at = (self.active + 1).max(pinned_count).min(self.tabs.len());
         self.tabs
             .insert(at, Tab::new(LayoutManager::new(session_idx)));
         self.active = at;
@@ -747,6 +755,27 @@ mod tests {
         }
 
         #[test]
+        fn active_tab_identity_survives_an_earlier_failed_shell() {
+            let saved = vec![
+                tab(pane("failed"), None),
+                tab(pane("session-0"), None),
+                tab(pane("session-1"), None),
+            ];
+            let tabs = TabManager::restore(&saved, &ids(2), 0, Some(1));
+            assert_eq!(tabs.active_index(), 0);
+            assert_eq!(tabs.active_focused_session(), Some(0));
+        }
+
+        #[test]
+        fn a_missing_active_tab_cannot_select_a_new_orphan_by_old_index() {
+            let saved = vec![tab(pane("session-0"), None), tab(pane("failed"), None)];
+            let tabs = TabManager::restore(&saved, &ids(2), 0, Some(1));
+            assert_eq!(tabs.len(), 2);
+            assert_eq!(tabs.sessions_in(1), vec![1]);
+            assert_eq!(tabs.active_focused_session(), Some(0));
+        }
+
+        #[test]
         fn no_saved_layout_gives_every_session_its_own_tab() {
             let tabs = TabManager::restore(&[], &ids(3), 2, None);
 
@@ -794,6 +823,27 @@ mod tests {
         // 取消固定把它放回未固定组的最前面，活跃标签页依旧不变。
         assert!(!tabs.toggle_pinned(0));
         assert_eq!(tabs.active_focused_session(), Some(1));
+    }
+
+    #[test]
+    fn new_tab_after_a_pinned_tab_preserves_the_pinned_partition() {
+        let mut tabs = TabManager::new(0);
+        tabs.insert_tab_after_active(1);
+        tabs.insert_tab_after_active(2);
+        tabs.toggle_pinned(0);
+        tabs.toggle_pinned(1);
+        tabs.set_active(0);
+
+        let inserted = tabs.insert_tab_after_active(3);
+
+        assert!(tabs.flags(0).pinned);
+        assert!(tabs.flags(1).pinned);
+        assert!(!tabs.flags(2).pinned);
+        assert!(!tabs.flags(3).pinned);
+        assert_eq!(inserted, 2);
+        assert_eq!(tabs.active_index(), inserted);
+        assert_eq!(tabs.active_focused_session(), Some(3));
+        assert_eq!(tabs.sessions_in(3), vec![2]);
     }
 
     #[test]

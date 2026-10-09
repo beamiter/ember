@@ -27,6 +27,10 @@ impl SearchAndReplaceEngine {
         config: &SearchConfig,
         options: &ReplaceOptions,
     ) -> Result<(String, usize), String> {
+        // An empty Find field is a no-op in both literal and regex modes.
+        if search_pattern.is_empty() {
+            return Ok((text.to_string(), 0));
+        }
         if config.use_regex {
             Self::regex_replace(text, search_pattern, replacement, config, options)
         } else {
@@ -96,7 +100,7 @@ impl SearchAndReplaceEngine {
             .case_insensitive(!config.case_sensitive)
             .multi_line(config.multi_line)
             .build()
-            .map_err(|e| format!("Invalid regex: {}", e))?;
+            .map_err(crate::search::safe_regex_error)?;
 
         let result = if options.replace_all {
             regex.replace_all(text, replacement).to_string()
@@ -117,7 +121,14 @@ impl SearchAndReplaceEngine {
 }
 
 fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    // Share the regex mode's Unicode word boundary: combining marks,
+    // connector punctuation and non-Latin letters all belong to words.
+    static WORD_CHAR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\A\w\z").expect("valid word class"));
+    WORD_CHAR.is_match(c.encode_utf8(&mut [0; 4]))
 }
 
 /// True when `text[start..end]` is bounded by non-word characters (or the ends
@@ -155,6 +166,94 @@ fn match_len_at(text: &str, idx: usize, pattern: &str, case_sensitive: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_word_literal_uses_unicode_regex_boundaries() {
+        for (text, pattern, expected, count) in [
+            ("cafe\u{301} cafe", "cafe", "cafe\u{301} X", 1),
+            ("a\u{301}\u{327} a", "a", "a\u{301}\u{327} X", 1),
+            (
+                "\u{301} \u{301}a a\u{301} \u{301}",
+                "\u{301}",
+                "X \u{301}a a\u{301} X",
+                2,
+            ),
+            ("界2 界٢ 界 界_ _界", "界", "界2 界٢ X 界_ _界", 1),
+            ("٣a ٣ ٣_ _٣", "٣", "٣a X ٣_ _٣", 1),
+            ("a_ _ _٣ _界", "_", "a_ X _٣ _界", 1),
+            ("a\u{203f} a \u{203f}a", "a", "a\u{203f} X \u{203f}a", 1),
+        ] {
+            for use_regex in [false, true] {
+                let config = SearchConfig {
+                    use_regex,
+                    whole_word: true,
+                    case_sensitive: true,
+                    ..Default::default()
+                };
+                let actual = SearchAndReplaceEngine::search_and_replace(
+                    text,
+                    pattern,
+                    "X",
+                    &config,
+                    &ReplaceOptions { replace_all: true },
+                )
+                .unwrap();
+                assert_eq!(
+                    actual,
+                    (expected.to_owned(), count),
+                    "text={text:?}, regex={use_regex}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_find_is_noop_in_every_mode() {
+        for use_regex in [false, true] {
+            for whole_word in [false, true] {
+                for replace_all in [false, true] {
+                    let config = SearchConfig {
+                        use_regex,
+                        whole_word,
+                        ..Default::default()
+                    };
+                    let actual = SearchAndReplaceEngine::search_and_replace(
+                        "abc",
+                        "",
+                        "x",
+                        &config,
+                        &ReplaceOptions { replace_all },
+                    )
+                    .unwrap();
+                    assert_eq!(actual, ("abc".to_owned(), 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_does_not_rescan_inserted_text_and_regex_expands_captures() {
+        let options = ReplaceOptions { replace_all: true };
+        let actual = SearchAndReplaceEngine::search_and_replace(
+            "aa",
+            "a",
+            "aa",
+            &SearchConfig::default(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(actual, ("aaaa".to_owned(), 2));
+        let config = SearchConfig {
+            use_regex: true,
+            multi_line: true,
+            ..Default::default()
+        };
+        let actual = SearchAndReplaceEngine::search_and_replace(
+            "one\ntwo", r"^(\w+)$", "$1!", &config, &options,
+        )
+        .unwrap();
+        assert_eq!(actual, ("one!\ntwo!".to_owned(), 2));
+    }
 
     #[test]
     fn test_literal_replace() {

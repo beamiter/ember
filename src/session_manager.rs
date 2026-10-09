@@ -568,6 +568,12 @@ fn restored_or_fresh_session_id(
     }
 }
 
+/// Local spawn/restore authority comes from the process, never from terminal
+/// output. Missing observations use the existing default-directory fallback.
+fn local_session_cwd(shell_pid: i32) -> Option<String> {
+    jterm_core::process::process_cwd(shell_pid)
+}
+
 impl SessionManager {
     /// 创建新的会话管理器，初始化一个默认会话
     pub fn new(
@@ -983,15 +989,14 @@ impl SessionManager {
         scrollback_lines: usize,
         command_argv: Option<Vec<String>>,
     ) -> usize {
-        // 优先使用 shell 通过 OSC 7 报告的 cwd(SSH/tmux 等场景下 /proc 不能反
-        // 映远端进程真实目录);否则退回 /proc/[pid]/cwd。
-        let cwd = if !self.sessions.is_empty() {
-            let active_session = &self.sessions[self.active_index];
-            let osc7 = active_session.terminal.lock().current_working_dir.clone();
-            osc7.or_else(|| jterm_core::process::process_cwd(active_session.get_shell_pid()))
-        } else {
-            None
-        };
+        // This launches a local shell (or local helper), even when the source
+        // pane is showing SSH/container output. OSC 133 and OSC 7 share the
+        // terminal's display cwd, so that field has no reliable local-host
+        // provenance. An unreadable/exited process keeps the default-cwd path.
+        let cwd = self
+            .sessions
+            .get(self.active_index)
+            .and_then(|session| local_session_cwd(session.get_shell_pid()));
 
         match self.try_insert_session(
             name,
@@ -1199,16 +1204,9 @@ impl SessionManager {
             .iter()
             .filter(|session| session.purpose == SessionPurpose::Interactive)
             .map(|s| {
-                // OSC 7 is authoritative for remote shells and multiplexers;
-                // /proc only describes the local wrapper process in those
-                // cases. Match new-tab inheritance so restore returns to the
-                // directory the user actually saw.
-                let cwd = s
-                    .terminal
-                    .lock()
-                    .current_working_dir
-                    .clone()
-                    .or_else(|| jterm_core::process::process_cwd(s.get_shell_pid()));
+                // Restore always starts a local shell. A displayed remote cwd
+                // must not become a same-spelled directory on this computer.
+                let cwd = local_session_cwd(s.get_shell_pid());
                 session_persistence::SessionSnapshot {
                     name: s.metadata.name.clone(),
                     tags: s.metadata.tags.clone(),
@@ -1761,6 +1759,46 @@ mod tests {
         .unwrap();
         assert_eq!(writes, b"paste-oklater-enter\r");
         assert!(pending.is_empty());
+    }
+
+    /// Auxiliary wiring guard: the actual /proc resolver is tested below;
+    /// neither consumer may reintroduce terminal-output cwd as authority.
+    #[test]
+    fn implicit_spawn_and_snapshot_cwd_use_only_the_local_resolver() {
+        let source = include_str!("session_manager.rs");
+        let insert = source
+            .split("    fn insert_session(")
+            .nth(1)
+            .unwrap()
+            .split("    fn try_insert_session(")
+            .next()
+            .unwrap();
+        let snapshot = source
+            .split("    pub fn get_session_snapshots(")
+            .nth(1)
+            .unwrap()
+            .split("    pub fn restorable_active_index(")
+            .next()
+            .unwrap();
+        for consumer in [insert, snapshot] {
+            assert!(consumer.contains("local_session_cwd("));
+            assert!(!consumer.contains("current_working_dir"));
+            assert!(!consumer.contains(".terminal"));
+        }
+    }
+
+    #[test]
+    fn local_cwd_observation_matches_the_process_or_is_absent() {
+        let expected = std::env::current_dir()
+            .unwrap()
+            .to_str()
+            .map(str::to_string);
+        assert_eq!(
+            super::local_session_cwd(std::process::id() as i32),
+            expected
+        );
+        assert_eq!(super::local_session_cwd(-1), None);
+        assert_eq!(super::local_session_cwd(0), None);
     }
 
     #[test]

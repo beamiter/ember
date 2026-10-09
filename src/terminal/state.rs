@@ -1345,26 +1345,72 @@ impl super::TerminalState {
         // coordinates, so history growth must move every live-grid anchor by
         // the same amount. Codex redraws this way on every frame.
         let old_grid_base = self.scrollback.len();
+        // These are copies: prefix eviction must move historical endpoints,
+        // while live-grid endpoints follow the final grid base only.
+        let selection = self.selection.take();
         for row in first..=last {
             let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
-        self.rebase_raw_selection_for_grid_base_change(old_grid_base, self.scrollback.len());
+        self.selection = selection;
+        let removed_prefix = old_grid_base
+            .saturating_add(last - first + 1)
+            .saturating_sub(self.scrollback.len());
+        self.rebase_raw_selection_for_grid_base_change(
+            old_grid_base,
+            self.scrollback.len(),
+            removed_prefix,
+        );
     }
 
-    fn rebase_raw_selection_for_grid_base_change(&mut self, old_base: usize, new_base: usize) {
-        let Some(selection) = self.selection.as_mut() else {
+    fn rebase_raw_selection_for_grid_base_change(
+        &mut self,
+        old_base: usize,
+        new_base: usize,
+        removed_prefix: usize,
+    ) {
+        let Some(mut selection) = self.selection else {
             return;
         };
         for point in [&mut selection.anchor, &mut selection.active] {
             if point.0 < old_base {
-                continue;
-            }
-            point.0 = if new_base >= old_base {
-                point.0.saturating_add(new_base - old_base)
+                // A copied screen can evict old history; a retired snapshot
+                // can remove its tail. Neither may retarget a lost endpoint.
+                let Some(row) = point
+                    .0
+                    .checked_sub(removed_prefix)
+                    .filter(|row| *row < new_base)
+                else {
+                    self.selection = None;
+                    self.bump_selection_revision();
+                    return;
+                };
+                point.0 = row;
             } else {
-                point.0.saturating_sub(old_base - new_base)
-            };
+                point.0 = new_base.saturating_add(point.0 - old_base);
+            }
+        }
+        self.selection = Some(selection);
+        self.bump_selection_revision();
+    }
+
+    fn rebase_raw_selection_after_prefix_trim(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some(mut selection) = self.selection else {
+            return;
+        };
+        match (
+            selection.anchor.0.checked_sub(count),
+            selection.active.0.checked_sub(count),
+        ) {
+            (Some(anchor), Some(active)) => {
+                selection.anchor.0 = anchor;
+                selection.active.0 = active;
+                self.selection = Some(selection);
+            }
+            _ => self.selection = None,
         }
         self.bump_selection_revision();
     }
@@ -1479,6 +1525,7 @@ impl super::TerminalState {
         if self.scrollback.len() >= self.max_scrollback {
             if let Some(evicted) = self.scrollback.pop_front() {
                 self.forget_output_provenance_for_raw_row(evicted.raw_row_id());
+                self.rebase_raw_selection_after_prefix_trim(1);
             }
         }
         self.scrollback.push_back(line);
@@ -1897,6 +1944,7 @@ impl super::TerminalState {
             }
         }
         if self.scrollback.len() != old_len {
+            self.rebase_raw_selection_after_prefix_trim(old_len - self.scrollback.len());
             self.invalidate_scrollback_view_cache();
         }
 
@@ -2054,6 +2102,7 @@ impl super::TerminalState {
         for zone_id in zones {
             self.unregister_finished_output_zone(zone_id);
         }
+        self.rebase_raw_selection_after_prefix_trim(self.scrollback.len());
         self.scrollback.clear();
         if self.active_output_provenance.is_some_and(|active| {
             evicted.contains(&active.start_row_id)
@@ -2580,12 +2629,27 @@ impl super::TerminalState {
     }
 
     fn next_command_identity(&mut self) -> Option<(u64, String)> {
-        let sequence = self.next_command_sequence;
-        if sequence == 0 {
-            return None;
+        loop {
+            let sequence = self.next_command_sequence;
+            if sequence == 0 {
+                return None;
+            }
+            self.next_command_sequence = sequence.checked_add(1).unwrap_or(0);
+            let id = Self::local_command_id(sequence);
+            // A shell may legitimately choose a future local:<n> spelling.
+            // Never let the fallback allocator reuse that routing key for a
+            // different record, including after clear or RIS hid the record.
+            let stashed = self
+                .cleared_blocks_stash
+                .as_ref()
+                .is_some_and(|stash| stash.records.iter().any(|record| record.id == id));
+            if self.record_index_for_id(&id).is_none()
+                && !self.command_id_was_consumed(&id)
+                && !stashed
+            {
+                return Some((sequence, id));
+            }
         }
-        self.next_command_sequence = sequence.checked_add(1).unwrap_or(0);
-        Some((sequence, Self::local_command_id(sequence)))
     }
 
     fn record_index_for_id(&self, id: &str) -> Option<usize> {
@@ -3615,6 +3679,20 @@ impl super::TerminalState {
                             .map(|output| output.text.len())
                             .unwrap_or(0),
                     );
+            }
+        }
+        // Clear moved the old payloads outside the live cache budget; new
+        // output could fill that budget again before undo. Restore metadata
+        // for every retained record, but shed the oldest snapshots just as
+        // normal capture does instead of accumulating another budget per undo.
+        for record in &mut self.command_records {
+            if self.captured_command_output_bytes <= MAX_CAPTURED_COMMAND_OUTPUT_BYTES {
+                break;
+            }
+            if let Some(output) = record.captured_output.take() {
+                self.captured_command_output_bytes = self
+                    .captured_command_output_bytes
+                    .saturating_sub(output.text.len());
             }
         }
         stashed.saturating_sub(evicted.min(stashed))
