@@ -208,7 +208,7 @@ impl SessionExportBlock {
         let finished = self
             .finished_at_ms
             .map(|ms| block_mode::format_local_datetime(ms / 1000, self.tz_offset_secs));
-        block_mode::block_markdown_with_lifecycle(
+        let mut markdown = block_mode::block_markdown_with_lifecycle(
             &block_mode::MarkdownBlock {
                 command,
                 command_exact: self.command_exact,
@@ -223,7 +223,13 @@ impl SessionExportBlock {
             },
             self.start_mark_seen,
             self.completion_provenance,
-        )
+        );
+        if self.output_unavailable {
+            // An evicted capture is not evidence that the command printed
+            // nothing. Keep that distinction in Markdown as well as JSON.
+            markdown.push_str("\n- Note: output unavailable (snapshot and buffer rows evicted)\n");
+        }
+        markdown
     }
 }
 
@@ -689,7 +695,7 @@ mod tests {
                 .unwrap();
         assert!(markdown.contains("- Note: command omitted because source text was truncated"));
         assert!(markdown.contains("- Completion: inferred at next shell boundary"));
-        // The unavailable marker lives in the JSON; Markdown shows empty output.
+        assert!(markdown.contains("- Note: output unavailable"));
         assert!(!markdown.contains("partial-command"));
 
         let json: serde_json::Value = serde_json::from_slice(
@@ -708,6 +714,33 @@ mod tests {
             json["blocks"][0]["completion_provenance"],
             "boundary_inferred"
         );
+    }
+
+    #[test]
+    fn markdown_discloses_unavailable_output_without_claiming_empty_success() {
+        for command in [Some("cargo test".to_string()), None] {
+            let mut unavailable = block(7, "cargo test", "");
+            unavailable.command = command;
+            unavailable.output_unavailable = true;
+            let markdown = String::from_utf8(
+                serialize_session(
+                    &snapshot(vec![unavailable.clone()]),
+                    SessionExportFormat::Markdown,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                markdown.contains("- Note: output unavailable (snapshot and buffer rows evicted)"),
+                "{markdown}"
+            );
+            let mut empty = unavailable.clone();
+            empty.output_unavailable = false;
+            assert!(!empty.markdown().contains("output unavailable"));
+            let json = serde_json::to_value(&unavailable).unwrap();
+            assert_eq!(json["output_unavailable"], true);
+            assert_eq!(json["output"], "");
+        }
     }
 
     #[test]
