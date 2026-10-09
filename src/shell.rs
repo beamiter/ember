@@ -19,6 +19,55 @@ pub enum ShellEvent {
     Error(String),
 }
 
+// An exited leader may leave bytes readable after the ordinary 128 KiB
+// batch cut-off. Bound the final drain by bytes and stop on EOF, WouldBlock
+// or Hangup. Existing blocking event sends and read EINTR retries mean this
+// is not a wall-clock bound on Exit delivery.
+const EXIT_DRAIN_BYTE_CAP: usize = 1024 * 1024;
+
+fn drain_exited_pty_output(
+    buffer: &mut [u8],
+    mut read: impl FnMut(&mut [u8]) -> Result<crate::pty::ReadOutcome, String>,
+    mut emit: impl FnMut(ShellEvent) -> bool,
+    mut cancelled: impl FnMut() -> bool,
+) -> bool {
+    let mut drained = 0usize;
+    loop {
+        if cancelled() {
+            return false;
+        }
+        if drained == EXIT_DRAIN_BYTE_CAP {
+            return emit(ShellEvent::Error(format!(
+                "PTY exit output drain reached the {EXIT_DRAIN_BYTE_CAP}-byte limit; remaining output may be omitted"
+            )));
+        }
+        let available = buffer.len().min(EXIT_DRAIN_BYTE_CAP - drained);
+        match read(&mut buffer[..available]) {
+            Ok(crate::pty::ReadOutcome::Data(0)) => {
+                return emit(ShellEvent::Error(
+                    "PTY exit output drain returned zero bytes without EOF".to_string(),
+                ));
+            }
+            Ok(crate::pty::ReadOutcome::Data(bytes)) => {
+                drained += bytes;
+                if !emit(ShellEvent::Output(buffer[..bytes].to_vec())) {
+                    return false;
+                }
+            }
+            Ok(
+                crate::pty::ReadOutcome::WouldBlock
+                | crate::pty::ReadOutcome::Eof
+                | crate::pty::ReadOutcome::Hangup,
+            ) => return true,
+            Err(error) => {
+                return emit(ShellEvent::Error(format!(
+                    "PTY exit output drain failed; remaining output may be omitted: {error}"
+                )));
+            }
+        }
+    }
+}
+
 /// 事件 channel 容量上限。每个事件最多 ~128KB(BATCH_SIZE_THRESHOLD),
 /// 256 * 128KB ≈ 32MB 为内存上界,既能吸收突发又能阻止无限堆积。
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -475,6 +524,32 @@ impl ShellSession {
         true
     }
 
+    /// Publish the final event only after any already-readable exit tail.
+    /// Ordinary read errors retain their existing behavior; only a confirmed
+    /// Exit enters this byte-bounded drain using the existing nonblocking read.
+    /// Sends remain outside locks and retain existing channel backpressure;
+    /// neither sends nor read EINTR retries have a new wall-clock deadline.
+    fn send_final_io_event(
+        pty: &Arc<Mutex<Pty>>,
+        event_tx: &crossbeam_channel::Sender<ShellEvent>,
+        repaint_ctx: &egui::Context,
+        shutdown: &AtomicBool,
+        buffer: &mut [u8],
+        event: ShellEvent,
+    ) {
+        if matches!(&event, ShellEvent::Exit(_))
+            && !drain_exited_pty_output(
+                buffer,
+                |buffer| pty.lock().read(buffer).map_err(|error| error.to_string()),
+                |output| Self::send_event(event_tx, repaint_ctx, output),
+                || shutdown.load(Ordering::Relaxed),
+            )
+        {
+            return;
+        }
+        let _ = Self::send_event(event_tx, repaint_ctx, event);
+    }
+
     /// 后台 I/O 循环 - 阻塞等待 PTY 可读，避免忙轮询
     /// P3 优化：批量读取 PTY 数据，累积后一次性发送事件
     fn io_loop(
@@ -554,8 +629,16 @@ impl ShellSession {
                     }
                     Err(_) => {}
                 }
-                if let Some(exit_code) = pty.lock().try_reap() {
-                    let _ = Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Exit(exit_code));
+                let exit_code = { pty.lock().try_reap() };
+                if let Some(exit_code) = exit_code {
+                    Self::send_final_io_event(
+                        &pty,
+                        &event_tx,
+                        &repaint_ctx,
+                        &shutdown,
+                        &mut buf,
+                        ShellEvent::Exit(exit_code),
+                    );
                     return;
                 }
                 // POLLHUP/EIO remains immediately ready forever. Back off to
@@ -660,7 +743,14 @@ impl ShellSession {
                             }
                         }
                         After::Stop(ev) => {
-                            let _ = Self::send_event(&event_tx, &repaint_ctx, ev);
+                            Self::send_final_io_event(
+                                &pty,
+                                &event_tx,
+                                &repaint_ctx,
+                                &shutdown,
+                                &mut buf,
+                                ev,
+                            );
                             return;
                         }
                         After::ReadClosed => {
@@ -715,7 +805,14 @@ impl ShellSession {
                         let data = std::mem::take(&mut accumulated);
                         let _ = Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
                     }
-                    let _ = Self::send_event(&event_tx, &repaint_ctx, exit_event);
+                    Self::send_final_io_event(
+                        &pty,
+                        &event_tx,
+                        &repaint_ctx,
+                        &shutdown,
+                        &mut buf,
+                        exit_event,
+                    );
                     return;
                 }
                 last_alive_check = std::time::Instant::now();
@@ -874,6 +971,144 @@ impl Drop for ShellSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    enum ExitDrainStep {
+        Bytes(Vec<u8>),
+        Stop(crate::pty::ReadOutcome),
+        Error(&'static str),
+    }
+
+    fn exercise_exit_drain(
+        steps: Vec<ExitDrainStep>,
+        buffer_size: usize,
+    ) -> (bool, Vec<ShellEvent>, usize) {
+        let mut steps: std::collections::VecDeque<_> = steps.into();
+        let mut events = Vec::new();
+        let mut read_calls = 0;
+        let result = drain_exited_pty_output(
+            &mut vec![0; buffer_size],
+            |buffer| {
+                read_calls += 1;
+                match steps.pop_front().expect("unexpected extra tail read") {
+                    ExitDrainStep::Bytes(mut bytes) => {
+                        let count = buffer.len().min(bytes.len());
+                        buffer[..count].copy_from_slice(&bytes[..count]);
+                        if count < bytes.len() {
+                            bytes.drain(..count);
+                            steps.push_front(ExitDrainStep::Bytes(bytes));
+                        }
+                        Ok(crate::pty::ReadOutcome::Data(count))
+                    }
+                    ExitDrainStep::Stop(outcome) => Ok(outcome),
+                    ExitDrainStep::Error(error) => Err(error.to_string()),
+                }
+            },
+            |event| {
+                events.push(event);
+                true
+            },
+            || false,
+        );
+        (result, events, read_calls)
+    }
+
+    #[test]
+    fn exited_tail_stops_immediately_at_would_block_eof_or_hangup() {
+        for stop in [
+            crate::pty::ReadOutcome::WouldBlock,
+            crate::pty::ReadOutcome::Eof,
+            crate::pty::ReadOutcome::Hangup,
+        ] {
+            let (finish, events, reads) = exercise_exit_drain(
+                vec![
+                    ExitDrainStep::Bytes(b"tail".to_vec()),
+                    ExitDrainStep::Stop(stop),
+                    ExitDrainStep::Error("must never poll or wait after this stop"),
+                ],
+                8,
+            );
+            assert!(finish);
+            assert_eq!(reads, 2);
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes == b"tail"));
+        }
+    }
+
+    #[test]
+    fn exited_tail_error_follows_retained_output_before_exit_permission() {
+        let (finish, events, reads) = exercise_exit_drain(
+            vec![
+                ExitDrainStep::Bytes(b"tail".to_vec()),
+                ExitDrainStep::Error("read fixture failure"),
+            ],
+            8,
+        );
+        assert!(finish);
+        assert_eq!(reads, 2);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes == b"tail"));
+        assert!(
+            matches!(&events[1], ShellEvent::Error(error) if error.contains("read fixture failure") && error.contains("may be omitted"))
+        );
+    }
+
+    #[test]
+    fn exited_tail_byte_cap_is_explicit_and_never_overread() {
+        let (finish, events, reads) = exercise_exit_drain(
+            vec![ExitDrainStep::Bytes(vec![b'x'; EXIT_DRAIN_BYTE_CAP + 1])],
+            65_536,
+        );
+        assert!(finish);
+        assert_eq!(reads, EXIT_DRAIN_BYTE_CAP / 65_536);
+        let bytes = events
+            .iter()
+            .map(|event| match event {
+                ShellEvent::Output(bytes) => bytes.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert_eq!(bytes, EXIT_DRAIN_BYTE_CAP);
+        assert!(
+            matches!(events.last(), Some(ShellEvent::Error(error)) if error.contains("limit") && error.contains("may be omitted"))
+        );
+    }
+
+    #[test]
+    fn exited_tail_cancellation_and_receiver_loss_stop_without_exit_permission() {
+        let finish = drain_exited_pty_output(
+            &mut [0; 8],
+            |_| panic!("cancelled tail must not read"),
+            |_| panic!("cancelled tail must not publish"),
+            || true,
+        );
+        assert!(!finish);
+
+        let mut reads = 0;
+        let finish = drain_exited_pty_output(
+            &mut [0; 8],
+            |buffer| {
+                reads += 1;
+                buffer[0] = b'x';
+                Ok(crate::pty::ReadOutcome::Data(1))
+            },
+            |_| false,
+            || false,
+        );
+        assert!(!finish);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn exited_tail_zero_data_reports_error_instead_of_spinning() {
+        let (finish, events, reads) = exercise_exit_drain(
+            vec![ExitDrainStep::Stop(crate::pty::ReadOutcome::Data(0))],
+            8,
+        );
+        assert!(finish);
+        assert_eq!(reads, 1);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ShellEvent::Error(error) if error.contains("zero bytes")));
+    }
 
     fn tiny_limits() -> WriteQueueLimits {
         WriteQueueLimits {

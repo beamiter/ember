@@ -2041,7 +2041,13 @@ impl TerminalApp {
                 continue;
             };
             match key {
-                egui::Key::Escape => self.command_palette.close(),
+                egui::Key::Escape => {
+                    self.command_palette.close();
+                    // Cancellation owns the rest of this OS batch too. A
+                    // later Enter must neither dispatch the old selection nor
+                    // start an Ask-AI request after the palette has closed.
+                    return (false, true);
+                }
                 egui::Key::ArrowUp => self.command_palette.select_prev(),
                 egui::Key::ArrowDown => self.command_palette.select_next(),
                 egui::Key::Enter if *repeat => {}
@@ -2645,6 +2651,31 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_escape_retires_the_batch_before_later_acceptance() {
+        // Behavioral coverage uses the exact handler with inert dispatch in
+        // the audit fixture. Keep the production cancellation wiring pinned
+        // here without constructing a native window or a PTY-backed app.
+        let source = include_str!("input.rs");
+        let handler = source
+            .split_once("    pub fn handle_command_palette_input(")
+            .expect("palette input handler")
+            .1
+            .split_once("    pub fn handle_history_picker_input(")
+            .expect("next input handler")
+            .0;
+        let escape = handler
+            .split_once("egui::Key::Escape => {")
+            .expect("Escape cancellation branch")
+            .1
+            .split_once("egui::Key::ArrowUp")
+            .expect("next palette key branch")
+            .0;
+        let close = escape.find("self.command_palette.close();").expect("close");
+        let claim = escape.find("return (false, true);").expect("claim batch");
+        assert!(close < claim, "cancel before returning palette-owned input");
+    }
 
     fn confirm_test_workflow() -> crate::workflows::Workflow {
         crate::workflows::Workflow {
