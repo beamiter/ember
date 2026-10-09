@@ -58,32 +58,51 @@ pub fn semantic_shortcut_modifiers(
 
 /// Recover the modifiers that accompanied a semantic paste shortcut.
 ///
-/// `egui::Event::Paste` carries only clipboard text. If V and the modifiers
-/// are released before eframe drains the window-event batch,
-/// the batch's trailing [`egui::Event::ModifiersChanged`] already contains the
-/// final (usually empty) state.
-/// Winit still emits V's release with its event-time modifiers, which lets us
-/// distinguish Ctrl+Shift+V from an application's ordinary Ctrl+V.
+/// A command-modified fallback already describes the first semantic event's
+/// press, as replayed by [`semantic_shortcut_modifiers`]. It must not inherit
+/// modifiers changed before V's release or from a later paste in the batch.
+/// When that press state is unavailable, use only the first paste's matching
+/// release, without crossing another V press, paste, or focus boundary.
 pub fn semantic_paste_modifiers(
     events: &[egui::Event],
     fallback: egui::Modifiers,
 ) -> egui::Modifiers {
-    if !events
-        .iter()
-        .any(|event| matches!(event, egui::Event::Paste(_)))
-    {
+    if fallback.command {
         return fallback;
     }
-
-    let release = events.iter().rev().find_map(|event| match event {
-        egui::Event::Key {
-            key: egui::Key::V,
-            pressed: false,
-            modifiers,
-            ..
-        } => Some(*modifiers),
-        _ => None,
-    });
+    let Some(first) = events.iter().position(|event| {
+        matches!(
+            event,
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+        )
+    }) else {
+        return fallback;
+    };
+    if !matches!(events[first], egui::Event::Paste(_)) {
+        return fallback;
+    }
+    let mut release = None;
+    for event in &events[first + 1..] {
+        match event {
+            egui::Event::Key {
+                key: egui::Key::V,
+                pressed: false,
+                modifiers,
+                ..
+            } => {
+                release = Some(*modifiers);
+                break;
+            }
+            egui::Event::Key {
+                key: egui::Key::V,
+                pressed: true,
+                ..
+            }
+            | egui::Event::Paste(_)
+            | egui::Event::WindowFocused(_) => break,
+            _ => {}
+        }
+    }
 
     let Some(release) = release else {
         return fallback;
@@ -160,8 +179,18 @@ pub fn normalize_terminal_shortcut_events(
     }
 
     let mut normalized_events = Vec::with_capacity(events.len());
+    let mut event_modifiers = modifiers;
 
     for event in events.drain(..) {
+        // One raw batch can contain several different clipboard chords. Keep
+        // their event-time states separate instead of applying the first (or
+        // last V release's) modifiers to every Copy/Cut/Paste in the batch.
+        match &event {
+            egui::Event::ModifiersChanged(changed) => event_modifiers = *changed,
+            egui::Event::WindowFocused(false) => event_modifiers = egui::Modifiers::NONE,
+            _ => {}
+        }
+        let restore_event = restore_shortcuts && event_modifiers.command && !event_modifiers.alt;
         match &event {
             egui::Event::Paste(_) => {
                 crate::debug_log!("[NORMALIZE] found Paste event");
@@ -194,9 +223,9 @@ pub fn normalize_terminal_shortcut_events(
         // represents both as Event::Paste, so keeping the shifted event here
         // would incorrectly send Codex an OSC 5522 MIME notification and make
         // it try an image paste instead of inserting the clipboard text.
-        let explicit_text_paste = restore_shortcuts
-            && modifiers.ctrl
-            && modifiers.shift
+        let explicit_text_paste = restore_event
+            && event_modifiers.ctrl
+            && event_modifiers.shift
             && matches!(event, egui::Event::Paste(_));
         if preserve_paste_event && matches!(event, egui::Event::Paste(_)) && !explicit_text_paste {
             crate::debug_log!("[NORMALIZE] preserving Paste (preserve_paste_event=true)");
@@ -204,13 +233,13 @@ pub fn normalize_terminal_shortcut_events(
             continue;
         }
 
-        if restore_shortcuts
+        if restore_event
             && matches!(
                 event,
                 egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
             )
         {
-            if let Some(key_event) = shortcut_event_to_key_event(event, modifiers) {
+            if let Some(key_event) = shortcut_event_to_key_event(event, event_modifiers) {
                 crate::debug_log!("[NORMALIZE] converted to Key event via restore_shortcuts");
                 normalized_events.push(key_event);
             }
@@ -591,6 +620,255 @@ mod tests {
         ] {
             let chord = build_keybinding_string(key, modifiers).unwrap();
             assert_eq!(bindings.get_command(&chord), Some(expected), "{chord}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod semantic_batch_tests {
+    use super::*;
+    fn ctrl(shift: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift,
+            ..Default::default()
+        }
+    }
+    fn key(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+    fn route(events: &mut Vec<egui::Event>, start: egui::Modifiers, preserve: bool) {
+        let at_first = semantic_shortcut_modifiers(events, start);
+        let recovered = semantic_paste_modifiers(events, at_first);
+        normalize_terminal_shortcut_events(
+            events,
+            recovered,
+            recovered.command && !recovered.alt,
+            preserve,
+            false,
+        );
+    }
+    fn presses(events: &[egui::Event]) -> Vec<(egui::Key, egui::Modifiers)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn paste_then_interrupt_uses_each_event_time_modifier() {
+        let mut events = vec![
+            egui::Event::Paste("first".into()),
+            egui::Event::ModifiersChanged(ctrl(false)),
+            egui::Event::Copy,
+        ];
+        route(&mut events, ctrl(true), false);
+        assert_eq!(
+            presses(&events),
+            vec![(egui::Key::V, ctrl(true)), (egui::Key::C, ctrl(false))]
+        );
+    }
+    #[test]
+    fn interrupt_before_shifted_paste_is_not_rewritten_by_later_v_release() {
+        let mut events = vec![
+            egui::Event::Copy,
+            egui::Event::ModifiersChanged(ctrl(true)),
+            egui::Event::Paste("later".into()),
+            key(egui::Key::V, false, ctrl(true)),
+        ];
+        route(&mut events, ctrl(false), true);
+        assert_eq!(
+            presses(&events),
+            vec![(egui::Key::C, ctrl(false)), (egui::Key::V, ctrl(true))]
+        );
+    }
+    #[test]
+    fn two_pastes_with_different_chords_keep_their_individual_paste_route() {
+        let mut events = vec![
+            egui::Event::Paste("plain".into()),
+            key(egui::Key::V, false, ctrl(false)),
+            egui::Event::ModifiersChanged(ctrl(true)),
+            egui::Event::Paste("text".into()),
+            key(egui::Key::V, false, ctrl(true)),
+        ];
+        route(&mut events, ctrl(false), true);
+        assert!(matches!(&events[0],egui::Event::Paste(s) if s=="plain"));
+        assert_eq!(presses(&events), vec![(egui::Key::V, ctrl(true))]);
+    }
+    #[test]
+    fn known_press_modifiers_win_over_shift_pressed_before_v_release() {
+        let events = vec![
+            egui::Event::Paste("plain".into()),
+            egui::Event::ModifiersChanged(ctrl(true)),
+            key(egui::Key::V, false, ctrl(true)),
+        ];
+        assert_eq!(semantic_paste_modifiers(&events, ctrl(false)), ctrl(false));
+    }
+    #[test]
+    fn recovery_does_not_cross_a_new_v_press_or_another_paste() {
+        for boundary in [
+            key(egui::Key::V, true, ctrl(true)),
+            egui::Event::Paste("later".into()),
+            egui::Event::WindowFocused(false),
+        ] {
+            let events = vec![
+                egui::Event::Paste("first".into()),
+                boundary,
+                key(egui::Key::V, false, ctrl(true)),
+            ];
+            assert_eq!(
+                semantic_paste_modifiers(&events, egui::Modifiers::NONE),
+                egui::Modifiers::NONE
+            );
+        }
+    }
+    #[test]
+    fn recovery_does_not_claim_a_copy_or_cut_before_paste() {
+        for first in [egui::Event::Copy, egui::Event::Cut] {
+            let events = vec![
+                first,
+                egui::Event::Paste("later".into()),
+                key(egui::Key::V, false, ctrl(true)),
+            ];
+            assert_eq!(
+                semantic_paste_modifiers(&events, egui::Modifiers::NONE),
+                egui::Modifiers::NONE
+            );
+        }
+    }
+    #[test]
+    fn missing_press_fallback_can_use_only_its_own_matching_release() {
+        let events = vec![
+            egui::Event::Paste("plain".into()),
+            key(egui::Key::V, false, ctrl(false)),
+            egui::Event::Paste("later".into()),
+            key(egui::Key::V, false, ctrl(true)),
+        ];
+        assert_eq!(
+            semantic_paste_modifiers(&events, egui::Modifiers::NONE),
+            ctrl(false)
+        );
+        let shifted = vec![
+            egui::Event::Paste("text".into()),
+            key(egui::Key::V, false, ctrl(true)),
+        ];
+        assert_eq!(
+            semantic_paste_modifiers(&shifted, egui::Modifiers::NONE),
+            ctrl(true)
+        );
+    }
+    #[test]
+    fn no_release_or_no_paste_preserves_the_supplied_fallback() {
+        for events in [
+            vec![],
+            vec![egui::Event::Copy],
+            vec![egui::Event::Paste("text".into())],
+            vec![key(egui::Key::V, false, ctrl(true))],
+        ] {
+            assert_eq!(semantic_paste_modifiers(&events, ctrl(false)), ctrl(false));
+            assert_eq!(
+                semantic_paste_modifiers(&events, egui::Modifiers::NONE),
+                egui::Modifiers::NONE
+            );
+        }
+    }
+    #[test]
+    fn ui_clipboard_owner_preserves_the_entire_batch() {
+        let original = vec![
+            egui::Event::Copy,
+            egui::Event::ModifiersChanged(ctrl(true)),
+            egui::Event::Paste("text".into()),
+            egui::Event::Cut,
+        ];
+        let mut events = original.clone();
+        normalize_terminal_shortcut_events(&mut events, ctrl(false), true, true, true);
+        assert_eq!(events, original);
+    }
+    #[test]
+    fn explicit_restore_gate_remains_authoritative() {
+        let mut events = vec![
+            egui::Event::Copy,
+            egui::Event::ModifiersChanged(ctrl(true)),
+            egui::Event::Paste("text".into()),
+            egui::Event::Cut,
+        ];
+        normalize_terminal_shortcut_events(&mut events, ctrl(false), false, false, false);
+        assert_eq!(events, vec![egui::Event::ModifiersChanged(ctrl(true))]);
+    }
+    #[test]
+    fn batch_replay_resets_modifiers_on_focus_loss() {
+        let mut events = vec![
+            egui::Event::Copy,
+            egui::Event::WindowFocused(false),
+            egui::Event::Cut,
+        ];
+        normalize_terminal_shortcut_events(&mut events, ctrl(false), true, false, false);
+        assert_eq!(presses(&events), vec![(egui::Key::C, ctrl(false))]);
+    }
+    #[test]
+    fn every_copy_cut_paste_pair_preserves_modifier_order_and_protocol_routing() {
+        fn semantic(n: usize) -> egui::Event {
+            match n {
+                0 => egui::Event::Copy,
+                1 => egui::Event::Cut,
+                _ => egui::Event::Paste("payload".into()),
+            }
+        }
+        fn k(n: usize) -> egui::Key {
+            [egui::Key::C, egui::Key::X, egui::Key::V][n]
+        }
+        for shift_a in [false, true] {
+            for shift_b in [false, true] {
+                for a in 0..3 {
+                    for b in 0..3 {
+                        for preserve in [false, true] {
+                            let ma = ctrl(shift_a);
+                            let mb = ctrl(shift_b);
+                            let mut events = vec![
+                                egui::Event::Text("sentinel".into()),
+                                semantic(a),
+                                key(k(a), false, ma),
+                                egui::Event::ModifiersChanged(mb),
+                                semantic(b),
+                                key(k(b), false, mb),
+                                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                            ];
+                            let expected_semantic = |n, mods: egui::Modifiers| {
+                                if n == 2 && preserve && !mods.shift {
+                                    semantic(n)
+                                } else {
+                                    key(k(n), true, mods)
+                                }
+                            };
+                            let expected = vec![
+                                egui::Event::Text("sentinel".into()),
+                                expected_semantic(a, ma),
+                                key(k(a), false, ma),
+                                egui::Event::ModifiersChanged(mb),
+                                expected_semantic(b, mb),
+                                key(k(b), false, mb),
+                                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                            ];
+                            route(&mut events, ma, preserve);
+                            assert_eq!(events,expected,"a={a}, b={b}, shift_a={shift_a}, shift_b={shift_b}, preserve={preserve}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

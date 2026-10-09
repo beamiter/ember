@@ -46,6 +46,22 @@ fn ssh_files_login_argv(
     Ok(argv)
 }
 
+/// Validate the legacy session helper's result before using it as a new tab.
+/// A successful synchronous spawn inserts exactly one session immediately
+/// after the previously active one; failure returns that old active index.
+fn new_command_session_index(
+    previous_len: usize,
+    previous_active_index: usize,
+    current_len: usize,
+    returned_index: usize,
+) -> Option<usize> {
+    (previous_active_index < previous_len
+        && previous_len.checked_add(1) == Some(current_len)
+        && previous_active_index.checked_add(1) == Some(returned_index)
+        && returned_index < current_len)
+        .then_some(returned_index)
+}
+
 /// Background update check plus whatever it decided to offer.
 #[derive(Default)]
 pub struct JshNotice {
@@ -134,10 +150,11 @@ impl TerminalApp {
                 return;
             }
         };
-        self.set_status(format!("Connecting to {display_name}"));
+        let status = format!("Connecting to {display_name}");
 
         let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
         let old_len = self.session_manager.len();
+        let old_active = self.session_manager.active_index();
         let index = self.session_manager.new_command_session(
             display_name,
             argv,
@@ -145,11 +162,18 @@ impl TerminalApp {
             rows,
             self.config.scrollback_lines,
         );
-        if self.session_manager.len() > old_len {
-            self.tabs.on_session_inserted(index);
-            self.tabs.insert_tab_after_active(index);
-        }
+        // The legacy helper returns the old active index on spawn failure.
+        // Only a newly inserted session may become the connection's tab.
+        let Some(index) =
+            new_command_session_index(old_len, old_active, self.session_manager.len(), index)
+        else {
+            self.set_status("Could not start the remote session; no new session was created");
+            return;
+        };
+        self.tabs.on_session_inserted(index);
+        self.tabs.insert_tab_after_active(index);
         self.activate_session(index);
+        self.set_status(status);
     }
 
     /// Draw the notice row, if there is anything to say. Returns true when the
@@ -208,6 +232,7 @@ impl TerminalApp {
 
         let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
         let old_len = self.session_manager.len();
+        let old_active = self.session_manager.active_index();
         let index = self.session_manager.new_command_session(
             "Install jsh".to_string(),
             argv,
@@ -215,12 +240,16 @@ impl TerminalApp {
             rows,
             self.config.scrollback_lines,
         );
-        if self.session_manager.len() > old_len {
-            self.tabs.on_session_inserted(index);
-            // 安装脚本自己就是进度界面，给它一个独立 tab，而不是塞进当前
-            // tab 的某个窗格里。
-            self.tabs.insert_tab_after_active(index);
-        }
+        let Some(index) =
+            new_command_session_index(old_len, old_active, self.session_manager.len(), index)
+        else {
+            self.set_status("Could not start the jsh installer; no new session was created");
+            return;
+        };
+        self.tabs.on_session_inserted(index);
+        // 安装脚本自己就是进度界面，给它一个独立 tab，而不是塞进当前
+        // tab 的某个窗格里。
+        self.tabs.insert_tab_after_active(index);
         self.activate_session(index);
         self.set_status("Installing jsh in a new session");
     }
@@ -245,21 +274,22 @@ impl TerminalApp {
         };
         let display_name = crate::config::remote_host_display_name(&host, index);
         let (argv, degraded) = host.tab_argv();
-        if let Some(error) = degraded {
+        let status = if let Some(error) = degraded {
             // The tab still opens — a plain connection beats no connection —
             // but quietly pretending jsh was deployed would be worse than
             // either.
             log::warn!("cannot publish jsh-remote.sh: {error}; connecting without deployment");
-            self.set_status(format!(
+            format!(
                 "Deploy unavailable ({error}); connecting to {} plainly",
                 display_name
-            ));
+            )
         } else {
-            self.set_status(format!("Connecting to {display_name}"));
-        }
+            format!("Connecting to {display_name}")
+        };
 
         let (cols, rows) = crate::terminal::clamp_terminal_dimensions(self.cols, self.rows);
         let old_len = self.session_manager.len();
+        let old_active = self.session_manager.active_index();
         let index = self.session_manager.new_command_session(
             display_name,
             argv,
@@ -267,12 +297,17 @@ impl TerminalApp {
             rows,
             self.config.scrollback_lines,
         );
-        if self.session_manager.len() > old_len {
-            self.tabs.on_session_inserted(index);
-            // 远程会话拿独立 tab，而不是塞进当前 tab 的分屏里。
-            self.tabs.insert_tab_after_active(index);
-        }
+        let Some(index) =
+            new_command_session_index(old_len, old_active, self.session_manager.len(), index)
+        else {
+            self.set_status("Could not start the remote session; no new session was created");
+            return;
+        };
+        self.tabs.on_session_inserted(index);
+        // 远程会话拿独立 tab，而不是塞进当前 tab 的分屏里。
+        self.tabs.insert_tab_after_active(index);
         self.activate_session(index);
+        self.set_status(status);
     }
 
     /// Open the terminal action for a saved Files profile. Ordinarily this
@@ -318,6 +353,45 @@ impl TerminalApp {
     ) {
         let display_name = crate::config::remote_host_runtime_label(&host);
         self.connect_plain_ssh_files_host(display_name, host, overlay);
+    }
+}
+
+#[cfg(test)]
+mod session_launch_tests {
+    use super::new_command_session_index;
+
+    #[test]
+    fn successful_spawn_is_the_new_middle_or_last_session() {
+        assert_eq!(new_command_session_index(3, 1, 4, 2), Some(2));
+        assert_eq!(new_command_session_index(3, 2, 4, 3), Some(3));
+        assert_eq!(new_command_session_index(1, 0, 2, 1), Some(1));
+    }
+
+    #[test]
+    fn failed_spawn_cannot_reactivate_an_existing_session() {
+        for returned in 0..4 {
+            assert_eq!(new_command_session_index(3, 1, 3, returned), None);
+        }
+        assert_eq!(new_command_session_index(3, 1, 2, 1), None);
+    }
+
+    #[test]
+    fn count_growth_alone_does_not_authorize_a_stale_index() {
+        for returned in [0, 1, 3, 4, usize::MAX] {
+            assert_eq!(new_command_session_index(3, 1, 4, returned), None);
+        }
+        assert_eq!(new_command_session_index(3, 1, 5, 2), None);
+    }
+
+    #[test]
+    fn invalid_or_overflowing_previous_state_fails_closed() {
+        assert_eq!(new_command_session_index(0, 0, 1, 0), None);
+        assert_eq!(new_command_session_index(3, 3, 4, 4), None);
+        assert_eq!(new_command_session_index(usize::MAX, 0, 0, 1), None);
+        assert_eq!(
+            new_command_session_index(usize::MAX, usize::MAX, 0, 0),
+            None
+        );
     }
 }
 

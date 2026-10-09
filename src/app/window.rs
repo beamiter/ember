@@ -8,6 +8,14 @@ use crate::session_persistence;
 // retain more title than this function is ever willing to display.
 use crate::terminal::MAX_WINDOW_TITLE_CHARS;
 
+/// Parser diagnostics include source lines and may be much larger than status
+/// chrome, or contain untrusted display controls from the config file.
+fn config_hot_reload_error_status(error: &str) -> String {
+    crate::review_text::bound_toast_text(format!(
+        "Config parse failed; keeping previous config: {error}"
+    ))
+}
+
 /// Window titles originate in untrusted OSC output. Keep them single-line,
 /// bounded, and free of bidi override/isolate controls that could make a
 /// desktop task switcher display a deceptive title. An empty OSC title must
@@ -267,10 +275,10 @@ impl TerminalApp {
             }
             Err(error) => {
                 eprintln!("[Config] Hot-reload parse error: {error}");
-                self.status_message =
-                    format!("Config parse failed; keeping previous config: {error}");
-                self.status_expires_at =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
+                self.set_status_for(
+                    config_hot_reload_error_status(&error),
+                    std::time::Duration::from_secs(6),
+                );
                 self.config.revision = Some(disk_revision);
                 self.config.load_error = Some(error);
             }
@@ -329,6 +337,50 @@ impl TerminalApp {
         self.config_panel.sync_from_config(&self.config);
         self.apply_runtime_config(ctx);
         notes
+    }
+}
+
+#[cfg(test)]
+mod config_hot_reload_status_tests {
+    use super::config_hot_reload_error_status;
+
+    #[test]
+    fn parse_error_toast_bounds_long_unicode_diagnostics() {
+        let shown = config_hot_reload_error_status(&"界".repeat(4096));
+        assert!(shown.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(shown.starts_with("Config parse failed; keeping previous config: "));
+    }
+
+    #[test]
+    fn parse_error_toast_exposes_display_controls_without_their_effect() {
+        let shown = config_hot_reload_error_status("line\n\u{202e}spoof\t\x1b");
+        assert!(!shown.chars().any(char::is_control));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains("line"));
+        assert!(shown.contains("spoof"));
+    }
+
+    #[test]
+    fn short_parse_error_keeps_its_explanation() {
+        assert_eq!(
+            config_hot_reload_error_status("expected string"),
+            "Config parse failed; keeping previous config: expected string"
+        );
+    }
+
+    #[test]
+    fn actual_hot_reload_parse_branch_uses_the_safe_status_path() {
+        let source = include_str!("window.rs");
+        let branch = source
+            .split_once(r#"eprintln!("[Config] Hot-reload parse error: {error}");"#)
+            .expect("actual parse-error branch")
+            .1
+            .split_once("self.config.revision")
+            .expect("parse-error revision adoption")
+            .0;
+        assert!(branch.contains("self.set_status_for("));
+        assert!(branch.contains("config_hot_reload_error_status(&error)"));
+        assert!(!branch.contains("self.status_message ="));
     }
 }
 
