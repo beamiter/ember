@@ -34,6 +34,15 @@ const MAX_NATIVE_ITEM_DISPLAY_BYTES: usize = 8 * 1024;
 // exceeds the provider limit.
 const MAX_NATIVE_FOLLOW_UP_CHARS: usize = NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
 
+/// Visible before starting a print-mode provider; a worktree is not containment.
+fn native_start_notice(provider: AgentProvider) -> Option<&'static str> {
+    match provider {
+        AgentProvider::Claude => Some("Claude skips its own permission prompts and can automatically run tools with your user account's file access. This worktree is not a sandbox."),
+        AgentProvider::Kimi => Some("Kimi uses automatic tool permission and can run tools with your user account's file access. This worktree is not a sandbox."),
+        AgentProvider::Codex | AgentProvider::OpenCode => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskSidebarAction {
     StartNative(TaskId),
@@ -862,6 +871,9 @@ impl TerminalApp {
                     });
 
                     if selected {
+                        if let Some(notice) = native_start_notice(row.provider) {
+                            ui.label(egui::RichText::new(notice).small().color(egui::Color32::YELLOW));
+                        }
                         let native_view = self.agent_runtime.snapshot(row.id);
                         let native_idle = row.status == TaskStatus::ReadyForReview
                             && row.has_active_agent_stream
@@ -880,10 +892,10 @@ impl TerminalApp {
                                             "Start a native Codex app-server session. Review points can continue on the same loaded thread; finish the session before validation. Agent tool writes are restricted to this worktree, while the current Codex sandbox may read other host files."
                                         }
                                         AgentProvider::Claude => {
-                                            "Start a native Claude Code print/stream-json session. This MVP does not use Codex-style private home or cgroup containment; prefer Terminal fallback when stronger isolation is required."
+                                            "Start a native Claude Code print/stream-json session with its permission prompts skipped. No private home or cgroup containment is provided; the worktree is not a sandbox."
                                         }
                                         AgentProvider::Kimi => {
-                                            "Start a native Kimi Code print/stream-json session. Print mode uses auto tool permission; this MVP does not use Codex-style private home or cgroup containment."
+                                            "Start a native Kimi Code print/stream-json session with automatic tool permission. No private home or cgroup containment is provided; the worktree is not a sandbox."
                                         }
                                         AgentProvider::OpenCode => {
                                             "Start the native provider session."
@@ -1801,6 +1813,20 @@ fn task_validation_color(ui: &egui::Ui, status: TaskValidationStatus) -> egui::C
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn print_provider_notice_discloses_permissions_without_promising_a_sandbox() {
+        use super::{native_start_notice, AgentProvider};
+        let claude = native_start_notice(AgentProvider::Claude).unwrap();
+        assert!(claude.contains("skips its own permission prompts"));
+        let kimi = native_start_notice(AgentProvider::Kimi).unwrap();
+        assert!(kimi.contains("automatic tool permission"));
+        for notice in [claude, kimi] {
+            assert!(notice.contains("user account's file access"));
+            assert!(notice.contains("not a sandbox"));
+        }
+        assert_eq!(native_start_notice(AgentProvider::Codex), None);
+        assert_eq!(native_start_notice(AgentProvider::OpenCode), None);
+    }
     use super::*;
 
     fn row(status: TaskStatus, updated_at_ms: u64, title: &str) -> TaskRowSnapshot {

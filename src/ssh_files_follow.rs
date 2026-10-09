@@ -6,6 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crossbeam_channel::{Receiver, Sender};
 use jterm_core::jsh_remote::{ObservedSshTarget, RemoteHostConfig};
@@ -269,6 +273,8 @@ pub(crate) fn poll_allowed_after_shell_exit(
 
 #[derive(Clone, Debug)]
 pub(crate) struct PendingProbe {
+    pub cancellation: Arc<AtomicBool>,
+    pub show_hidden: bool,
     pub token: u64,
     pub observation_epoch: u64,
     pub active_session_epoch: u64,
@@ -310,9 +316,15 @@ impl SidebarUiSnapshot {
 }
 
 #[derive(Debug)]
+pub(crate) struct ProbeSnapshot {
+    pub home: PathBuf,
+    pub listing: Option<Vec<remote_fs::Entry>>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ProbeResult {
     pub token: u64,
-    pub outcome: Result<PathBuf, String>,
+    pub outcome: Result<ProbeSnapshot, String>,
 }
 
 #[derive(Debug)]
@@ -332,7 +344,7 @@ pub(crate) struct State {
 
 impl Default for State {
     fn default() -> Self {
-        let (result_tx, result_rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
         Self {
             pending: None,
             handled_observation: None,
@@ -470,14 +482,44 @@ impl State {
         let authority = pending.authority.clone();
         let overlay = pending.overlay.clone();
         let results = self.result_tx.clone();
+        let cancellation = pending.cancellation.clone();
+        let list_root = pending.commit == FollowCommit::ReplaceLocation;
+        let show_hidden = pending.show_hidden;
         std::thread::Builder::new()
             .name("ember-ssh-files-probe".to_string())
             .spawn(move || {
-                let outcome = remote_fs::start_dir_with_overlay(
-                    &FsLocation::Transient(authority.profile().clone()),
-                    &[],
-                    &overlay,
-                )
+                let outcome = (|| -> std::io::Result<ProbeSnapshot> {
+                    let check_cancelled = || {
+                        if cancellation.load(Ordering::SeqCst) {
+                            Err(remote_fs::cancelled_error())
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    check_cancelled()?;
+                    let location = FsLocation::Transient(authority.profile().clone());
+                    let home = remote_fs::start_dir_with_overlay_cancellable(
+                        &location,
+                        &[],
+                        &overlay,
+                        cancellation.clone(),
+                    )?;
+                    check_cancelled()?;
+                    let listing = if list_root {
+                        Some(remote_fs::list_dir_with_overlay_and_hidden_control(
+                            &location,
+                            &[],
+                            &overlay,
+                            &home,
+                            show_hidden,
+                            cancellation.clone(),
+                        )?)
+                    } else {
+                        None
+                    };
+                    check_cancelled()?;
+                    Ok(ProbeSnapshot { home, listing })
+                })()
                 .map_err(|error| error.to_string());
                 let _ = results.send(ProbeResult { token, outcome });
                 repaint.request_repaint();
@@ -489,6 +531,14 @@ impl State {
 
     pub fn try_result(&self) -> Option<ProbeResult> {
         self.result_rx.try_recv().ok()
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(pending) = &self.pending {
+            pending.cancellation.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -516,7 +566,8 @@ pub(crate) fn result_is_current(
             && profile.as_ref() == &pending.profile
             && overlay == &pending.overlay
     );
-    same_observation
+    !pending.cancellation.load(Ordering::SeqCst)
+        && same_observation
         && observation_epoch == pending.observation_epoch
         && active_session_epoch == pending.active_session_epoch
         && files_authority_is_current(
@@ -670,6 +721,8 @@ mod tests {
 
     fn pending() -> PendingProbe {
         PendingProbe {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            show_hidden: false,
             token: 7,
             observation_epoch: 3,
             active_session_epoch: 11,
@@ -684,6 +737,55 @@ mod tests {
             root: PathBuf::from("/old/root"),
             sidebar_ui: sidebar_ui(),
         }
+    }
+
+    #[test]
+    fn completed_initial_listing_still_requires_uncancelled_source_context() {
+        let pending = pending();
+        let observation = Observation::Target {
+            key: pending.key.clone(),
+            profile: Box::new(pending.profile.clone()),
+            overlay: pending.overlay.clone(),
+        };
+        let ready = ProbeSnapshot {
+            home: "/remote/home".into(),
+            listing: Some(vec![]),
+        };
+        assert!(ready.listing.is_some());
+        let is_current = |active_epoch| {
+            result_is_current(
+                &pending,
+                &observation,
+                pending.observation_epoch,
+                active_epoch,
+                pending.files_user_intent_generation,
+                pending.sidebar_ui_epoch,
+                true,
+                &pending.root,
+                &pending.sidebar_ui,
+            )
+        };
+        assert!(is_current(pending.active_session_epoch));
+        assert!(
+            !is_current(pending.active_session_epoch + 1),
+            "a source change during initial listing revokes the whole combined result"
+        );
+        pending.cancellation.store(true, Ordering::SeqCst);
+        assert!(
+            !is_current(pending.active_session_epoch),
+            "returning to the same pane cannot revive a cancelled result"
+        );
+    }
+
+    #[test]
+    fn dropping_follow_state_cancels_pending_work_and_results_are_bounded() {
+        let mut state = State::default();
+        let pending = pending();
+        let cancellation = pending.cancellation.clone();
+        state.pending = Some(pending);
+        assert_eq!(state.result_tx.capacity(), Some(1));
+        drop(state);
+        assert!(cancellation.load(Ordering::SeqCst));
     }
 
     #[test]

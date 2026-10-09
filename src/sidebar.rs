@@ -1617,7 +1617,12 @@ impl Sidebar {
             };
             return self.request_navigation(path, cause);
         }
-        let path = match validate_local_navigation_text(&path.to_string_lossy()) {
+        let Some(path_text) = path.to_str() else {
+            return Some(
+                "This Files path is not valid UTF-8 and cannot be opened safely".to_string(),
+            );
+        };
+        let path = match validate_local_navigation_text(path_text) {
             Ok(path) => path,
             Err(error) => return Some(error),
         };
@@ -2302,6 +2307,7 @@ impl Sidebar {
     /// be a uniquely matched saved profile or a transient stable identity.
     /// Its first listing is still staged, so even a failure after the home
     /// probe leaves the old authority and tree untouched.
+    #[cfg(test)]
     pub fn commit_probed_location(
         &mut self,
         location: FsLocation,
@@ -2328,6 +2334,56 @@ impl Sidebar {
             overlay,
             home: current_dir,
         }))
+    }
+
+    /// Commit the bounded first listing returned by the same automatic SSH
+    /// probe whose source authority the caller has just revalidated.
+    pub fn commit_probed_location_listing(
+        &mut self,
+        location: FsLocation,
+        overlay: remote_fs::SshExecutionOverlay,
+        current_dir: PathBuf,
+        mut entries: Vec<remote_fs::Entry>,
+    ) -> Result<(), String> {
+        if matches!(location, FsLocation::Local) {
+            return Err("an observed SSH target cannot commit Local Files".to_string());
+        }
+        remote_fs::validate_execution_endpoint(&location, &self.remote_hosts, &overlay)
+            .map_err(|error| format!("observed SSH endpoint is invalid: {error}"))?;
+        let path_text = current_dir
+            .to_str()
+            .ok_or("observed SSH home is not valid UTF-8")?;
+        let current_dir = validate_remote_navigation_text(path_text)?;
+        if !self.show_hidden {
+            entries.retain(|entry| !entry.name.starts_with('.'));
+        }
+        let truncated = entries.len() > MAX_DIRECTORY_ENTRIES;
+        entries.truncate(MAX_DIRECTORY_ENTRIES);
+        let listing = DirectoryListing {
+            entries: entries
+                .into_iter()
+                .map(|entry| FileEntry {
+                    name: entry.name,
+                    path: entry.path,
+                    is_dir: entry.is_dir,
+                })
+                .collect(),
+            truncated,
+        };
+        self.prepare_endpoint_switch();
+        let pending = PendingNavigation {
+            generation: self.scan_generation,
+            origin: self.current_dir.clone(),
+            target: current_dir.clone(),
+            cause: NavigationCause::Ordinary,
+            endpoint_commit: Some(PendingEndpoint {
+                location,
+                overlay,
+                home: current_dir,
+            }),
+        };
+        self.commit_navigation(pending, listing);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -3644,6 +3700,50 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn local_navigation_never_retargets_invalid_utf8_to_another_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/virtual/local"), scanner);
+        sidebar.select_single(Path::new("/virtual/local/kept.txt"), false);
+        let generation = sidebar.scan_generation;
+        let requested = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/invalid-\xff".to_vec()));
+        let error = sidebar.set_current_dir(requested);
+        assert!(error.is_some_and(|error| error.contains("UTF-8")));
+        assert_eq!(sidebar.current_dir, Path::new("/virtual/local"));
+        assert_eq!(sidebar.scan_generation, generation);
+        assert_eq!(
+            sidebar.selected_path.as_deref(),
+            Some(Path::new("/virtual/local/kept.txt"))
+        );
+        assert!(!sidebar.has_pending_scan());
+    }
+
+    #[test]
+    fn combined_ssh_listing_commits_without_queueing_a_second_scan() {
+        let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+        let mut sidebar = Sidebar::with_scanner(PathBuf::from("/local/kept"), scanner);
+        let (requests, _results) = install_controlled_scan_service(&mut sidebar);
+        let profile = crate::config::default_remote_hosts()[0].clone();
+        let location = FsLocation::Transient(profile);
+        sidebar
+            .commit_probed_location_listing(
+                location.clone(),
+                remote_fs::SshExecutionOverlay::default(),
+                "/remote/home".into(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(sidebar.location(), &location);
+        assert_eq!(sidebar.current_dir, PathBuf::from("/remote/home"));
+        assert!(
+            requests.try_recv().is_err(),
+            "automatic completion must not leave an unguarded second scan"
+        );
+        assert!(sidebar.pending_navigation.is_none());
+    }
 
     #[test]
     fn tasks_view_round_trips_and_falls_back_when_feature_is_disabled() {

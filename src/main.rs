@@ -2844,10 +2844,10 @@ impl TerminalApp {
             let label = crate::config::remote_host_runtime_label(&pending.profile);
             match pending.commit {
                 ssh_files_follow::FollowCommit::RebindCurrentOverlay => {
-                    match self
-                        .sidebar
-                        .finish_probed_execution_overlay(pending.overlay, result.outcome)
-                    {
+                    match self.sidebar.finish_probed_execution_overlay(
+                        pending.overlay,
+                        result.outcome.map(|snapshot| snapshot.home),
+                    ) {
                         Ok(()) => {
                             self.ssh_files_follow.clear_failure();
                             self.set_status_for(
@@ -2868,7 +2868,7 @@ impl TerminalApp {
                     }
                 }
                 ssh_files_follow::FollowCommit::ReplaceLocation => match result.outcome {
-                    Ok(home) => {
+                    Ok(snapshot) => {
                         let Some(location) = pending
                             .authority
                             .current_location(&pending.profile, &self.config.remote_hosts)
@@ -2880,23 +2880,22 @@ impl TerminalApp {
                             );
                             continue;
                         };
-                        match self
-                            .sidebar
-                            .commit_probed_location(location, pending.overlay, home)
-                        {
-                            Ok(scan_error) => {
+                        let Some(listing) = snapshot.listing else {
+                            self.ssh_files_follow.record_failure(pending.key);
+                            continue;
+                        };
+                        match self.sidebar.commit_probed_location_listing(
+                            location,
+                            pending.overlay,
+                            snapshot.home,
+                            listing,
+                        ) {
+                            Ok(()) => {
                                 self.ssh_files_follow.clear_failure();
-                                if let Some(error) = scan_error {
-                                    self.set_status_for(
-                                        format!("Connected to {label}, but Files listing failed: {error}"),
-                                        Duration::from_secs(7),
-                                    );
-                                } else {
-                                    self.set_status_for(
-                                        format!("Files followed SSH: {label}"),
-                                        Duration::from_secs(5),
-                                    );
-                                }
+                                self.set_status_for(
+                                    format!("Files followed SSH: {label}"),
+                                    Duration::from_secs(5),
+                                );
                             }
                             Err(error) => {
                                 self.ssh_files_follow.record_failure(pending.key);
@@ -2928,6 +2927,24 @@ impl TerminalApp {
             self.sidebar_name_dialog.is_some() || self.sidebar_delete_dialog.is_some(),
         );
         let sidebar_ui_epoch = self.ssh_files_follow.sync_sidebar_ui(&sidebar_ui);
+        if let Some(pending) = &self.ssh_files_follow.pending {
+            if !ssh_files_follow::result_is_current(
+                pending,
+                &observation,
+                observation_epoch,
+                self.active_session_epoch,
+                self.sidebar.files_user_intent_generation(),
+                sidebar_ui_epoch,
+                self.sidebar.files_intent_is_current(&pending.files_context)
+                    && !self.sidebar.has_pending_op(),
+                &self.sidebar.current_dir,
+                &sidebar_ui,
+            ) {
+                pending
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         match observation {
             ssh_files_follow::Observation::None => {
                 // SSH exiting only re-arms future observations; the transient
@@ -3036,6 +3053,8 @@ impl TerminalApp {
                 }
                 self.ssh_files_follow.mark_handled(key.clone());
                 let pending = ssh_files_follow::PendingProbe {
+                    cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    show_hidden: self.sidebar.show_hidden(),
                     token: 0,
                     observation_epoch,
                     active_session_epoch: self.active_session_epoch,
@@ -7717,7 +7736,9 @@ impl Drop for TerminalApp {
         // Give already accepted snapshots a bounded chance to reach the shared
         // jsh journal before process teardown terminates that worker.
         if !execution_journal::flush(Duration::from_secs(2)) {
-            log::warn!("timed out flushing jsh execution output journal");
+            log::warn!(
+                "jsh execution output journal did not fully flush (write failure or timeout)"
+            );
         }
         // 命令历史同样由后台写入器落盘；退出前给已接受的记录一个有界冲刷
         // 窗口（与 frost 相同的 2 秒）。

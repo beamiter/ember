@@ -581,6 +581,14 @@ retain the reviewed feedback that caused them, while approval authority remains
 confined to the active turn. This is a bounded review aid rather than a durable
 transcript; the Git diff remains cumulative from the task's immutable base commit.
 
+**Start Claude skips Claude's own permission prompts; Start Kimi uses automatic
+tool permission.** Both print-mode providers can run tools automatically with
+your user account's file access. Their separate Git worktree is not a security
+sandbox and does not restrict file access to that directory. The task card
+shows this warning beside the start actions. Neither mode has Codex-style
+private-home or cgroup containment. **Terminal fallback** delegates interactive
+prompts to the provider CLI; it does not add filesystem isolation.
+
 Native Codex runs with approval policy `never`, hosted web search and tool
 network access disabled, and `/tmp` excluded from tool writable roots. Its
 tool-write capability is the descriptor-pinned worktree; the app-server keeps

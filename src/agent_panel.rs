@@ -365,6 +365,18 @@ fn ollama_base_url_is_loopback(base_url: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn restored_history_notice(session: &jterm_core::agent::AgentSession) -> Option<&'static str> {
+    session
+        .snapshot()
+        .is_some_and(|snapshot| snapshot.transcript_truncated())
+        .then_some("Earlier activity was omitted to keep the saved session within its size limit")
+}
+
+fn restored_review_session(session: AgentSession) -> (AgentSession, Option<&'static str>) {
+    let notice = restored_history_notice(&session);
+    (seal_unbound_restored_session(session), notice)
+}
+
 pub struct AgentPanel {
     pub is_open: bool,
     session: Option<AgentSession>,
@@ -384,6 +396,7 @@ pub struct AgentPanel {
     edit: Option<(ProposalId, String)>,
     loading: bool,
     status: String,
+    restored_history_notice: Option<&'static str>,
     provider_label: String,
     result_rx: Option<mpsc::Receiver<Result<String, String>>>,
     /// Task generation the in-flight request was started for. A reply that
@@ -407,6 +420,7 @@ impl AgentPanel {
             edit: None,
             loading: false,
             status: String::new(),
+            restored_history_notice: None,
             provider_label: String::new(),
             result_rx: None,
             request_epoch: None,
@@ -431,7 +445,9 @@ impl AgentPanel {
                 // structured source provenance. Preserve its transcript for
                 // review, but never let an old proposal execute in whichever
                 // tab happened to open the panel after restart.
-                self.session = Some(seal_unbound_restored_session(session));
+                let (session, notice) = restored_review_session(session);
+                self.restored_history_notice = notice;
+                self.session = Some(session);
                 self.status = "restored the previous Agent transcript for review only; start a new task to bind this terminal".to_string();
             }
             None => self.session = Some(AgentSession::new(config.agent_max_turns)),
@@ -682,6 +698,7 @@ impl AgentPanel {
             session.cancel();
         }
         self.session = None;
+        self.restored_history_notice = None;
         self.bound_session_id = None;
         self.awaiting = None;
         self.last_manual_completed = None;
@@ -1085,6 +1102,9 @@ impl AgentPanel {
                     .weak()
                     .small(),
                 );
+                if let Some(notice) = self.restored_history_notice {
+                    ui.label(egui::RichText::new(notice).weak().small());
+                }
                 ui.separator();
 
                 let row_count = session.transcript().len();
@@ -1443,6 +1463,7 @@ impl AgentPanel {
                 self.source_context = None;
                 if let Some(max_turns) = self.session.as_ref().map(AgentSession::max_turns) {
                     self.session = Some(AgentSession::new(max_turns));
+                    self.restored_history_notice = None;
                     self.status.clear();
                 }
             } else if let Some(session) = self.session.as_mut() {
@@ -1645,6 +1666,42 @@ impl AgentPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_omitted_history_session() -> jterm_core::agent::AgentSession {
+        use jterm_core::agent::{AgentSession, AgentSessionSnapshot};
+        let mut session = AgentSession::new(10);
+        session.submit_user("retained task").unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap();
+        snapshot["transcript_truncated"] = serde_json::json!(true);
+        AgentSession::restore(AgentSessionSnapshot::from_json(&snapshot.to_string()).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn restored_omission_notice_is_captured_before_review_only_sealing() {
+        let (session, notice) = restored_review_session(legacy_omitted_history_session());
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(session.snapshot().is_none());
+        assert!(notice.unwrap().contains("Earlier activity was omitted"));
+        let mut panel = AgentPanel::new();
+        panel.session = Some(session);
+        panel.restored_history_notice = notice;
+        panel.status = "a later provider error".to_string();
+        panel.status.clear();
+        assert_eq!(panel.restored_history_notice, notice);
+        panel.close_session();
+        assert!(panel.restored_history_notice.is_none());
+    }
+
+    #[test]
+    fn complete_restored_history_stays_read_only_without_omission_notice() {
+        let mut session = AgentSession::new(10);
+        session.submit_user("complete task").unwrap();
+        let (session, notice) = restored_review_session(session);
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(notice.is_none());
+    }
 
     #[test]
     fn client_configuration_keeps_provider_credentials_bound() {
