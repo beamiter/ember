@@ -391,6 +391,9 @@ pub struct AgentPanel {
     /// command block. The compatibility BlockContext above intentionally
     /// drops these stable ids, so retain the owned source snapshot here.
     source_context: Option<crate::agent::SemanticCommandContext>,
+    /// Background evidence has no compatibility BlockContext. Keep its
+    /// attachment independent from the source provenance retained for review.
+    background_context_attached: bool,
     input: String,
     /// Proposal currently being edited inline: (id, buffer).
     edit: Option<(ProposalId, String)>,
@@ -416,6 +419,7 @@ impl AgentPanel {
             awaiting: None,
             last_manual_completed: None,
             source_context: None,
+            background_context_attached: false,
             input: String::new(),
             edit: None,
             loading: false,
@@ -571,6 +575,7 @@ impl AgentPanel {
         self.session = Some(fresh_session);
         self.last_manual_completed = block_context;
         self.source_context = Some(context);
+        self.background_context_attached = background;
         self.input.clear();
         self.request_epoch = None;
         self.status.clear();
@@ -673,6 +678,20 @@ impl AgentPanel {
         // controls whether command/output evidence is attached to later model
         // requests, matching the UI label.
         self.last_manual_completed = None;
+        self.background_context_attached = false;
+    }
+
+    /// The payload and its attachment badge must agree after Detach, while
+    /// the immutable source still owns terminal/cwd and review authority.
+    fn attached_background_context(&self) -> Option<&crate::agent::SemanticCommandContext> {
+        self.source_context.as_ref().filter(|source| {
+            self.background_context_attached
+                && self.last_manual_completed.is_none()
+                && source
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| command.trim().is_empty())
+        })
     }
 
     /// Close the panel and cancel the whole session.
@@ -703,6 +722,7 @@ impl AgentPanel {
         self.awaiting = None;
         self.last_manual_completed = None;
         self.source_context = None;
+        self.background_context_attached = false;
         self.result_rx = None;
         self.loading = false;
         self.edit = None;
@@ -901,15 +921,7 @@ impl AgentPanel {
             .flatten();
         let session_prompt = session.build_user_prompt();
         let background_prompt = self
-            .source_context
-            .as_ref()
-            .filter(|source| {
-                self.last_manual_completed.is_none()
-                    && source
-                        .command
-                        .as_deref()
-                        .is_none_or(|command| command.trim().is_empty())
-            })
+            .attached_background_context()
             .map(|source| user_prompt_with_background_context(&session_prompt, source));
         let user = jterm_core::ai::agent_user_prompt(
             background_prompt.as_deref().unwrap_or(&session_prompt),
@@ -1390,12 +1402,7 @@ impl AgentPanel {
                             clear_context = true;
                         }
                     });
-                } else if self.source_context.as_ref().is_some_and(|source| {
-                    source
-                        .command
-                        .as_deref()
-                        .is_none_or(|command| command.trim().is_empty())
-                }) {
+                } else if self.attached_background_context().is_some() {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(
@@ -1461,6 +1468,7 @@ impl AgentPanel {
             if new_task {
                 self.last_manual_completed = None;
                 self.source_context = None;
+                self.background_context_attached = false;
                 if let Some(max_turns) = self.session.as_ref().map(AgentSession::max_turns) {
                     self.session = Some(AgentSession::new(max_turns));
                     self.restored_history_notice = None;
@@ -2647,6 +2655,66 @@ mod tests {
         assert_eq!(panel.source_context.as_ref(), Some(&source));
         let epoch = panel.session.as_ref().unwrap().epoch();
         assert!(panel.claim_context_effect("source-session", epoch));
+    }
+
+    #[test]
+    fn detaching_background_evidence_revokes_attachment_but_keeps_source_authority() {
+        let mut source = background_block_context();
+        source.cwd = Some("/workspace/ember".into());
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), source.clone(), None)
+            .unwrap();
+        assert_eq!(panel.attached_background_context(), Some(&source));
+        let epoch = panel.session.as_ref().unwrap().epoch();
+
+        // The shared selector feeds both the real payload and the UI badge.
+        // This exercise never drives the model, Git metadata, or a provider.
+        panel.detach_model_context();
+        panel.detach_model_context();
+        assert!(panel.attached_background_context().is_none());
+        assert!(!panel.background_context_attached);
+        assert_eq!(panel.source_context.as_ref(), Some(&source));
+        assert_eq!(panel.bound_session_id(), Some("source-session"));
+        assert!(panel.claim_context_effect("source-session", epoch));
+
+        panel.close_session();
+        assert!(!panel.background_context_attached);
+        assert!(panel.attached_background_context().is_none());
+    }
+
+    #[test]
+    fn background_attachment_is_conservative_on_fresh_and_command_tasks() {
+        let mut panel = AgentPanel::new();
+        assert!(!panel.background_context_attached);
+        // Merely restoring source provenance must not opt in its output.
+        panel.source_context = Some(background_block_context());
+        assert!(panel.attached_background_context().is_none());
+        panel.close_session();
+        panel
+            .start_for_block(&ai_config(), failed_block_context(), None)
+            .unwrap();
+        assert!(!panel.background_context_attached);
+        assert!(panel.attached_background_context().is_none());
+        assert!(panel.last_manual_completed.is_some());
+    }
+
+    #[test]
+    fn newer_manual_context_keeps_priority_over_background_evidence() {
+        let source = background_block_context();
+        let mut panel = AgentPanel::new();
+        panel
+            .start_for_block(&ai_config(), source.clone(), None)
+            .unwrap();
+        let manual = failed_block_context().to_block_context().unwrap();
+        panel.last_manual_completed = Some(manual.clone());
+        assert!(panel.attached_background_context().is_none());
+        assert_eq!(panel.last_manual_completed.as_ref(), Some(&manual));
+
+        panel.detach_model_context();
+        assert!(panel.last_manual_completed.is_none());
+        assert!(panel.attached_background_context().is_none());
+        assert_eq!(panel.source_context.as_ref(), Some(&source));
     }
 
     #[test]

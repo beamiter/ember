@@ -174,6 +174,15 @@ impl AiCommandSuggestion {
     /// (Re)issue the provider request. Config is re-read every time so a
     /// hot-reload (disabled AI, rotated key) applies to Regenerate too.
     fn begin_request(&mut self, config: &Config) {
+        // Regenerate is a new disclosure of the saved request/cwd. Recheck
+        // the current destination and consent before resolving credentials
+        // or replacing the user's existing review card.
+        if let Err(error) = crate::agent_panel::ensure_semantic_context_sharing_allowed(config) {
+            self.busy = false;
+            self.error = true;
+            self.status = error;
+            return;
+        }
         let client = match crate::agent_panel::client_from_config(config) {
             Ok(client) => client,
             Err(error) => {
@@ -183,6 +192,7 @@ impl AiCommandSuggestion {
                 return;
             }
         };
+        self.provider = client.display_name();
         self.card = None;
         self.busy = true;
         self.error = false;
@@ -655,6 +665,42 @@ mod tests {
             }),
             status: "Review the proposal below.".into(),
             error: false,
+        }
+    }
+
+    #[test]
+    fn regenerate_rechecks_current_consent_without_replacing_the_review_card() {
+        // Neither config is loopback-exempt. The gate must return before
+        // client construction, so no credential file or provider is touched.
+        for (provider, base_url) in [
+            ("anthropic", "https://provider-a.invalid"),
+            ("ollama", "https://provider-b.invalid"),
+        ] {
+            let config = Config {
+                ai_enabled: true,
+                ai_provider: provider.into(),
+                ai_base_url: base_url.into(),
+                ai_share_command_context: false,
+                ..Config::default()
+            };
+            let mut session = session_with_card("reviewed command");
+            let generation = session.generation;
+            let request_id = session.request_id;
+            session.begin_request(&config);
+            assert!(session.error);
+            assert!(session.status.contains("context sharing"));
+            assert!(!session.busy);
+            assert!(session.reply_rx.is_none());
+            assert!(session.cancel.is_none());
+            assert!(session.started.is_none());
+            assert_eq!(session.request_id, request_id);
+            assert_eq!(session.generation, generation);
+            assert_eq!(session.request, "delete every log file");
+            assert_eq!(session.cwd, "/tmp");
+            assert_eq!(
+                session.card.as_ref().map(|card| card.command.as_str()),
+                Some("reviewed command")
+            );
         }
     }
 
