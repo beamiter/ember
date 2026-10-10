@@ -603,7 +603,10 @@ mod tests {
             None
         );
         preview.sync_viewport(true, false);
-        assert_eq!(preview.model.context(now), Some(PreviewPose::Calm.context()));
+        assert_eq!(
+            preview.model.context(now),
+            Some(PreviewPose::Calm.context())
+        );
         assert_eq!(
             preview.model.greeting_availability(now),
             GreetingAvailability::CoolingDown
