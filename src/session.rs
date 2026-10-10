@@ -1,6 +1,7 @@
 use crate::shell::ShellSession;
 use crate::terminal::{ProjectionPolicy, ProjectionViewState, TerminalState};
 use parking_lot::Mutex as ParkingMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,13 +26,28 @@ fn shell_owns_foreground_group(shell_pid: i32, foreground_pgid: Option<i32>) -> 
     foreground_pgid == Some(shell_pid)
 }
 
-/// Generate a unique session ID for jsh session persistence.
+static NEXT_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn session_id_from_parts(pid: u32, timestamp: u128, sequence: u64) -> String {
+    format!("{pid}-{timestamp}-{sequence}")
+}
+
+fn session_id_at(pid: u32, timestamp: u128, counter: &AtomicU64) -> String {
+    // Relaxed ordering is sufficient: the counter allocates identities, not
+    // shared state. Fail rather than reuse a sequence after u64 exhaustion.
+    let sequence = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .expect("session ID sequence exhausted");
+    session_id_from_parts(pid, timestamp, sequence)
+}
+
+/// Generate a session ID without relying on wall-clock resolution/monotonicity.
 pub fn generate_session_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{}-{}", std::process::id(), ts)
+    session_id_at(std::process::id(), ts, &NEXT_SESSION_SEQUENCE)
 }
 
 /// Match jsh's `--session` and execution-journal grammar. Persisted metadata
@@ -229,6 +245,29 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_identity_does_not_alias_when_clock_repeats_or_moves_backwards() {
+        let counter = AtomicU64::new(0);
+        let first = session_id_at(123, 900, &counter);
+        let repeated_clock = session_id_at(123, 900, &counter);
+        let backwards_clock = session_id_at(123, 0, &counter);
+        assert_ne!(first, repeated_clock);
+        assert_ne!(first, backwards_clock);
+        assert_ne!(repeated_clock, backwards_clock);
+        for id in [first, repeated_clock, backwards_clock,
+            session_id_from_parts(u32::MAX, u128::MAX, u64::MAX)] {
+            assert!(is_valid_jsh_session_id(&id));
+            assert!(id.len() <= jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "session ID sequence exhausted")]
+    fn exhausted_sequence_does_not_wrap_to_an_existing_identity() {
+        let counter = AtomicU64::new(u64::MAX);
+        let _ = session_id_at(123, 900, &counter);
+    }
 
     #[test]
     fn test_session_metadata() {

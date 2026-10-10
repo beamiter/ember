@@ -934,19 +934,48 @@ impl AgentPanel {
         let token = AiCancellationToken::new();
         let worker_token = token.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = client
-                .send_turns_blocking_cancellable(
-                    Some(&system),
-                    &[jterm_core::ai::Turn {
-                        role: jterm_core::ai::Role::User,
-                        text: user,
-                    }],
-                    &worker_token,
-                )
-                .map_err(|error| error.to_string());
-            let _ = tx.send(result);
-        });
+        let spawned = std::thread::Builder::new()
+            .name("ember-agent-model".to_string())
+            .spawn(move || {
+                let result = client
+                    .send_turns_blocking_cancellable(
+                        Some(&system),
+                        &[jterm_core::ai::Turn {
+                            role: jterm_core::ai::Role::User,
+                            text: user,
+                        }],
+                        &worker_token,
+                    )
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(result);
+            })
+            .map(|_handle| ());
+        self.finish_model_worker_spawn(spawned, token, rx);
+    }
+
+    fn finish_model_worker_spawn(
+        &mut self,
+        spawned: std::io::Result<()>,
+        token: AiCancellationToken,
+        rx: mpsc::Receiver<Result<String, String>>,
+    ) {
+        if let Err(error) = spawned {
+            // No worker owns this already-started model turn. Close its
+            // receiver and fail the turn once, leaving the ordinary retry
+            // path available instead of panicking or waiting forever.
+            drop(rx);
+            token.cancel();
+            self.cancel = None;
+            self.result_rx = None;
+            self.request_epoch = None;
+            self.loading = false;
+            let message = format!("could not start AI worker: {error}");
+            if let Some(session) = self.session.as_mut() {
+                let _ = session.model_failed(message.clone());
+            }
+            self.status = message;
+            return;
+        }
         self.cancel = Some(token);
         self.result_rx = Some(rx);
         self.request_epoch = self.session.as_ref().map(|session| session.epoch());
@@ -1985,6 +2014,68 @@ mod tests {
             .contains("disabled"));
         remote_ollama.ai_share_command_context = true;
         assert!(ensure_semantic_context_sharing_allowed(&remote_ollama).is_ok());
+    }
+
+    #[test]
+    fn failed_model_worker_spawn_closes_request_and_preserves_retry() {
+        let mut panel = AgentPanel::new();
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect safely").unwrap();
+        panel.session = Some(session);
+        let token = AiCancellationToken::new();
+        let observer = token.clone();
+        let (tx, rx) = mpsc::channel();
+
+        panel.finish_model_worker_spawn(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "synthetic thread limit",
+            )),
+            token,
+            rx,
+        );
+
+        assert!(!panel.loading);
+        assert!(panel.result_rx.is_none());
+        assert!(panel.cancel.is_none());
+        assert!(panel.request_epoch.is_none());
+        assert!(observer.is_cancelled());
+        assert!(tx.send(Ok("late result".to_string())).is_err());
+        assert!(panel.status.contains("could not start AI worker"));
+        let session = panel.session.as_mut().unwrap();
+        assert_ne!(session.state(), AgentState::AwaitingModel);
+        assert_eq!(
+            session.transcript().iter().filter(|turn| matches!(
+                turn, Turn::ProtocolError(message) if message.contains("synthetic thread limit")
+            )).count(),
+            1
+        );
+        session.retry_model().unwrap();
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+    }
+
+    #[test]
+    fn successful_model_worker_spawn_keeps_request_ownership() {
+        let mut panel = AgentPanel::new();
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect safely").unwrap();
+        let epoch = session.epoch();
+        panel.session = Some(session);
+        panel.status = "old error".to_string();
+        let token = AiCancellationToken::new();
+        let observer = token.clone();
+        let (tx, rx) = mpsc::channel();
+        panel.finish_model_worker_spawn(Ok(()), token, rx);
+        assert!(panel.loading);
+        assert!(panel.cancel.is_some());
+        assert_eq!(panel.request_epoch, Some(epoch));
+        assert!(panel.status.is_empty());
+        assert!(!observer.is_cancelled());
+        tx.send(Ok("synthetic reply".to_string())).unwrap();
+        assert_eq!(
+            panel.result_rx.as_ref().unwrap().try_recv().unwrap(),
+            Ok("synthetic reply".to_string())
+        );
     }
 
     #[test]

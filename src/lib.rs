@@ -14,6 +14,7 @@ pub mod keybindings;
 pub mod kitty_graphics;
 pub mod layout;
 pub mod link;
+pub mod organism;
 pub mod pane_header;
 pub mod persistence_file;
 pub mod pty;

@@ -758,7 +758,7 @@ pub enum FsOpKind {
 }
 
 impl FsOpKind {
-    /// 操作成功后需要重新扫描的目录（去重、无父目录时为空）。
+    /// 操作完成后需要重新扫描的目录（包括可能部分变更的失败，去重）。
     fn affected_dirs(&self) -> Vec<PathBuf> {
         fn parent(path: &Path) -> Option<PathBuf> {
             path.parent().map(Path::to_path_buf)
@@ -2688,20 +2688,17 @@ impl Sidebar {
                                 messages.push(kind.success_message());
                             }
                             Err(error) => {
-                                if self.location.is_remote() {
-                                    // A remote command can commit and then lose
-                                    // its transport before the client observes
-                                    // success. Revalidate only the exact parent
-                                    // directories so the UI never treats an
-                                    // ambiguous failure as proof of no change.
-                                    for dir in kind.affected_dirs() {
-                                        self.invalidate_navigation_cache(&dir);
-                                        if let Some(refresh_error) = self.refresh_loaded_node(&dir)
-                                        {
-                                            messages.push(format!(
-                                                "Files revalidation failed: {refresh_error}"
-                                            ));
-                                        }
+                                // Local copy/delete may leave partial changes;
+                                // a remote command may commit before transport
+                                // failure. Neither error proves no change.
+                                // Keep clipboard/selection intent, but refresh
+                                // only the operation's exact parent directories.
+                                for dir in kind.affected_dirs() {
+                                    self.invalidate_navigation_cache(&dir);
+                                    if let Some(refresh_error) = self.refresh_loaded_node(&dir) {
+                                        messages.push(format!(
+                                            "Files revalidation failed: {refresh_error}"
+                                        ));
                                     }
                                 }
                                 messages.push(format!("{}: {error}", kind.verb()));
@@ -5574,6 +5571,60 @@ mod tests {
 
         assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
         assert!(messages.iter().any(|message| message.contains("Pasted")));
+    }
+
+    #[test]
+    fn partial_local_copy_failure_revalidates_destination_and_keeps_clipboard() {
+        for stale in [false, true] {
+            let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+            let parent = PathBuf::from("/synthetic/work");
+            let src = PathBuf::from("/synthetic/source.txt");
+            let mut sidebar = Sidebar::with_scanner(parent.clone(), scanner);
+            let mut root = Sidebar::root_node(&parent);
+            root.load_state = DirectoryLoadState::Loaded;
+            root.last_loaded_at = Some(Instant::now());
+            sidebar.root = Some(root);
+            sidebar.scan_service = Some(controlled_scan_service(SCAN_QUEUE_CAPACITY));
+            let (requests, results) = controlled_op_service(&mut sidebar);
+            let clipboard = remote_fs::FsClipboard {
+                loc: FsLocation::Local,
+                overlay: remote_fs::SshExecutionOverlay::default(),
+                items: vec![remote_fs::FsClipboardItem {
+                    path: src.clone(),
+                    is_dir: false,
+                }],
+                cut: false,
+            };
+            sidebar.set_clipboard(clipboard.clone());
+            assert!(sidebar.request_fs_op(
+                FsOpKind::Copy { src, dst: parent.join("partial.txt") }, true,
+            ).is_none());
+            let request = requests.recv().unwrap();
+            if stale {
+                sidebar.authority_generation += 1;
+            }
+            complete_request(
+                &results,
+                request,
+                Err("copy failed; a partial destination may remain".to_string()),
+                None,
+            );
+            let messages = sidebar.poll_op_results();
+            assert_eq!(
+                messages.iter().any(|message| message.contains("partial destination")),
+                !stale
+            );
+            assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
+            assert_eq!(
+                sidebar.root.as_ref().unwrap().load_state,
+                if stale { DirectoryLoadState::Loaded } else { DirectoryLoadState::Refreshing }
+            );
+            let scans = &sidebar.scan_service.as_ref().unwrap().request_rx;
+            if !stale {
+                assert_eq!(scans.try_recv().unwrap().path, parent);
+            }
+            assert!(scans.try_recv().is_err());
+        }
     }
 
     #[test]

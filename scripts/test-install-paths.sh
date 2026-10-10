@@ -346,6 +346,34 @@ assert_contains "staging ancestor diagnostic" "$(<"${TEST_ROOT}/ancestor.log")" 
 
 # Public resources use the same atomic replacement rule as the binary: replace
 # a hostile destination link itself and never touch its target.
+# All nested resource directories need the same preflight as the data root.
+# The applications case also pins the legacy-launcher deletion boundary.
+for resource_link in \
+    applications metainfo icons icons/hicolor icons/hicolor/scalable/apps \
+    icons/hicolor/128x128/apps icons/hicolor/256x256/apps; do
+    nested_root="$(mktemp -d "${TEST_ROOT}/nested-resource.XXXXXX")"
+    nested_stage="${nested_root}/stage"
+    nested_victim="${nested_root}/outside"
+    nested_link="${nested_stage}/opt/ember/share/${resource_link}"
+    mkdir -p "$(dirname -- "${nested_link}")" "${nested_victim}"
+    ln -s -- "${nested_victim}" "${nested_link}"
+    printf 'outside legacy launcher\n' \
+        >"${nested_victim}/io.github.beamiter.jterm2.desktop"
+    if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${nested_stage}" \
+        "${INSTALLER}" --binary "${prebuilt_binary}" --prefix /opt/ember \
+        >"${nested_root}/install.log" 2>&1; then
+        fail "installer accepted nested resource symlink: ${resource_link}"
+    fi
+    assert_contains "nested resource diagnostic" "$(<"${nested_root}/install.log")" \
+        "symbolic-link ancestor"
+    assert_absent "binary before failed resource preflight" \
+        "${nested_stage}/opt/ember/bin/ember"
+    [[ "$(<"${nested_victim}/io.github.beamiter.jterm2.desktop")" == \
+        'outside legacy launcher' ]] || fail "installer deleted an outside legacy launcher"
+    [[ "$(find "${nested_victim}" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ]] \
+        || fail "installer wrote resource files outside DESTDIR"
+done
+
 resource_stage="${TEST_ROOT}/resource-stage"
 resource_prefix="/opt/ember-resource"
 resource_victim="${TEST_ROOT}/resource-victim"

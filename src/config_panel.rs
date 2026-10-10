@@ -370,7 +370,7 @@ impl ConfigPanel {
         config.ai_share_command_context = self.edit_ai_share_command_context;
         config.command_correction_enabled = self.edit_command_correction_enabled;
         config.ai_api_key_file =
-            Some(self.edit_ai_api_key_file.trim().to_string()).filter(|path| !path.is_empty());
+            Some(self.edit_ai_api_key_file.clone()).filter(|path| !path.is_empty());
         config.agent_max_turns = self.edit_agent_max_turns.clamp(1, 100);
         config.experimental_task_sidebar = self.edit_experimental_task_sidebar;
         config.preferred_fix_provider = self.edit_preferred_fix_provider.clone();
@@ -2001,6 +2001,37 @@ mod tests {
         let serialized = toml::to_string_pretty(&applied).expect("serialize config");
         let reparsed: Config = toml::from_str(&serialized).expect("reparse config");
         assert!(reparsed.ai_share_command_context);
+    }
+
+    #[test]
+    fn settings_preserves_rejected_credential_paths_for_loader_validation() {
+        for path in ["   ", " /private/key ", "/private/key\n", "/private/key\u{200b}"] {
+            let source = Config {
+                ai_api_key_file: Some(path.to_string()),
+                ..Config::default()
+            };
+            let mut panel = ConfigPanel::new();
+            panel.sync_from_config(&source);
+            let mut applied = Config::default();
+            panel.apply_to_config(&mut applied);
+            applied.normalize();
+            assert_eq!(applied.ai_api_key_file.as_deref(), Some(path));
+        }
+        for (path, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("/private/key"), Some("/private/key")),
+        ] {
+            let source = Config {
+                ai_api_key_file: path.map(str::to_string),
+                ..Config::default()
+            };
+            let mut panel = ConfigPanel::new();
+            panel.sync_from_config(&source);
+            let mut applied = Config::default();
+            panel.apply_to_config(&mut applied);
+            assert_eq!(applied.ai_api_key_file.as_deref(), expected);
+        }
     }
 
     #[test]

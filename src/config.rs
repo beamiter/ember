@@ -92,8 +92,39 @@ pub enum TabBarPosition {
     Sidebar,
 }
 
+/// Persisted family-wide motion choices; `None` is the Automatic setting.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganismMotion {
+    Full,
+    Calm,
+    Static,
+}
+
+impl<'de> Deserialize<'de> for OrganismMotion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "calm" => Ok(Self::Calm),
+            "static" => Ok(Self::Static),
+            _ => Err(serde::de::Error::custom("expected full, calm, or static")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Reserved for the renderer-independent organism groundwork. The live
+    /// terminal adapter is not connected yet; loading this does not show a body.
+    #[serde(default)]
+    pub ascii_organism_enabled: bool,
+
+    /// Missing means Automatic. Until a platform animation-preference adapter
+    /// exists, Automatic resolves to Calm rather than claiming desktop parity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii_organism_motion: Option<OrganismMotion>,
+
     /// AI features master switch. Off by default: nothing leaves the machine
     /// unless the user opts in.
     #[serde(default)]
@@ -575,6 +606,8 @@ fn default_font_ligatures() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            ascii_organism_enabled: false,
+            ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
             ai_provider: default_ai_provider(),
@@ -1030,9 +1063,23 @@ impl Config {
                 warnings.push("preferred_fix_provider is unknown or invalid; using codex".into());
             }
         }
-        if normalize_optional_text(&mut self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES) {
+        // A credential path is an exact destination, not a display label.
+        // Preserve rejected values so, when this file source is selected,
+        // the shared loader rejects it instead of selecting a trimmed path
+        // or falling back. Explicit environment-source precedence is unchanged.
+        // Whole-config decoding/serialization remains bounded separately.
+        if self.ai_api_key_file.as_ref().is_some_and(String::is_empty) {
+            // Exact-empty is the existing explicit clearing operation. A
+            // whitespace-only nonempty path must instead remain rejected.
+            self.ai_api_key_file = None;
+        } else if self.ai_api_key_file.as_ref().is_some_and(|path| {
+            path.len() > 16 * 1024
+                || path.trim_matches(' ') != path
+                || path.chars().any(char::is_control)
+                || jterm_core::review_input::contains_visual_spoofing(path)
+        }) {
             warnings.push(
-                "ai_api_key_file is empty, oversized, or contains controls or invisible formatting; ignoring it"
+                "ai_api_key_file is invalid; retaining its exact value for credential-loader rejection"
                     .into(),
             );
         }
@@ -1362,6 +1409,39 @@ fn valid_config_path(path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn organism_preferences_default_off_and_round_trip_all_motion_modes() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(!default.ascii_organism_enabled);
+        assert_eq!(default.ascii_organism_motion, None);
+        for (text, mode) in [
+            ("full", OrganismMotion::Full),
+            ("calm", OrganismMotion::Calm),
+            ("static", OrganismMotion::Static),
+            ("FuLl", OrganismMotion::Full),
+            (" CALM ", OrganismMotion::Calm),
+            ("Static", OrganismMotion::Static),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "ascii_organism_enabled = true\nascii_organism_motion = '{text}'\n"
+            ))
+            .unwrap();
+            assert!(config.ascii_organism_enabled);
+            assert_eq!(config.ascii_organism_motion, Some(mode));
+            let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert!(restored.ascii_organism_enabled);
+            assert_eq!(restored.ascii_organism_motion, Some(mode));
+            let canonical = match mode {
+                OrganismMotion::Full => "full",
+                OrganismMotion::Calm => "calm",
+                OrganismMotion::Static => "static",
+            };
+            assert!(toml::to_string(&config)
+                .unwrap()
+                .contains(&format!("ascii_organism_motion = \"{canonical}\"")));
+        }
+    }
+
     fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
         std::fs::write(path, contents).unwrap();
         #[cfg(unix)]
@@ -1579,6 +1659,40 @@ mod tests {
     }
 
     #[test]
+    fn credential_path_normalization_never_retargets_or_enables_fallback() {
+        for path in [
+            "   ".to_string(),
+            " /private/key ".to_string(),
+            "/private/key\n".to_string(),
+            "/private/key\u{200b}".to_string(),
+            format!("/{}", "x".repeat(16 * 1024)),
+        ] {
+            let mut config = Config {
+                ai_api_key_file: Some(path.clone()),
+                ..Config::default()
+            };
+            let warnings = config.normalize();
+            assert_eq!(config.ai_api_key_file.as_deref(), Some(path.as_str()));
+            assert!(warnings.iter().any(|warning| warning.starts_with("ai_api_key_file")));
+            let encoded = toml::to_string(&config).unwrap();
+            let decoded: Config = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.ai_api_key_file, config.ai_api_key_file);
+        }
+        for (path, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("/private/key"), Some("/private/key")),
+        ] {
+            let mut config = Config {
+                ai_api_key_file: path.map(str::to_string),
+                ..Config::default()
+            };
+            config.normalize();
+            assert_eq!(config.ai_api_key_file.as_deref(), expected);
+        }
+    }
+
+    #[test]
     fn normalize_drops_oversized_or_control_bearing_config_strings() {
         let mut config = Config {
             ai_provider: "p".repeat(MAX_CONFIG_NAME_BYTES + 1),
@@ -1602,7 +1716,7 @@ mod tests {
         assert_eq!(config.ai_provider, default_ai_provider());
         assert_eq!(config.ai_base_url, default_ai_base_url());
         assert_eq!(config.ai_model, default_ai_model());
-        assert_eq!(config.ai_api_key_file, None);
+        assert_eq!(config.ai_api_key_file.as_deref(), Some("/tmp/key\0suffix"));
         assert_eq!(config.font_family, default_font_family());
         assert_eq!(config.theme, default_theme());
         assert_eq!(config.shell, None);

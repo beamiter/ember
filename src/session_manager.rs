@@ -555,13 +555,25 @@ fn restored_or_fresh_session_id(
     candidate: Option<String>,
     used_session_ids: &HashSet<String>,
 ) -> String {
+    restored_or_fresh_session_id_with(
+        candidate,
+        used_session_ids,
+        crate::session::generate_session_id,
+    )
+}
+
+fn restored_or_fresh_session_id_with(
+    candidate: Option<String>,
+    used_session_ids: &HashSet<String>,
+    mut generate: impl FnMut() -> String,
+) -> String {
     if let Some(id) = candidate
         .filter(|id| crate::session::is_valid_jsh_session_id(id) && !used_session_ids.contains(id))
     {
         return id;
     }
     loop {
-        let id = crate::session::generate_session_id();
+        let id = generate();
         if !used_session_ids.contains(&id) {
             return id;
         }
@@ -1035,7 +1047,10 @@ impl SessionManager {
 
         // 在启动 shell 前分配稳定 ID；jsh 的 --session、tab 路由和执行
         // journal 必须从第一条输出起使用同一个值。
-        let session_id = crate::session::generate_session_id();
+        let used_session_ids = self.sessions.iter()
+            .map(|session| session.metadata.session_id.clone())
+            .collect();
+        let session_id = restored_or_fresh_session_id(None, &used_session_ids);
         let shell = ShellSession::new_with_pinned_cwd(
             cols,
             rows,
@@ -1799,6 +1814,23 @@ mod tests {
         );
         assert_eq!(super::local_session_cwd(-1), None);
         assert_eq!(super::local_session_cwd(0), None);
+    }
+
+    #[test]
+    fn fresh_session_admission_skips_live_or_restored_identity_collisions() {
+        let used = HashSet::from(["123-900-0".to_string()]);
+        let mut candidates = ["123-900-0", "123-900-1"].into_iter();
+        let fresh = super::restored_or_fresh_session_id_with(None, &used, || {
+            candidates.next().unwrap().to_string()
+        });
+        assert_eq!(fresh, "123-900-1");
+        assert_eq!(
+            super::restored_or_fresh_session_id_with(
+                Some("legacy-session".to_string()), &used,
+                || panic!("valid existing IDs must not be regenerated"),
+            ),
+            "legacy-session"
+        );
     }
 
     #[test]

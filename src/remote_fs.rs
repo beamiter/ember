@@ -2471,13 +2471,51 @@ fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
     parse_list_with_hidden(bytes, dir, false)
 }
 
+/// The transport's successful exit cannot turn a partial record into an
+/// actionable filename or an apparently empty directory. Empty bytes are a
+/// valid empty listing; every nonempty listing must contain complete pairs
+/// with the exact one-byte type emitted by PROBE_SCRIPT.
+fn validate_list_records(bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if bytes.last() != Some(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote directory listing ends inside a record",
+        ));
+    }
+    let mut fields = bytes[..bytes.len() - 1].split(|byte| *byte == 0);
+    while let Some(kind) = fields.next() {
+        if !matches!(kind, b"d" | b"f" | b"l") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote directory listing contains an invalid entry type",
+            ));
+        }
+        if fields.next().is_none_or(|name| name.is_empty()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote directory listing has a missing or empty entry name",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_list_with_hidden(bytes: &[u8], dir: &Path, show_hidden: bool) -> Vec<Entry> {
     // A lossy-decoded remote name is not the same command operand. Invalid
     // UTF-8 is therefore skipped instead of displayed as U+FFFD and later sent
     // back to a potentially different path. Duplicate names are ambiguous
     // protocol output; drop every occurrence rather than choosing a type.
     let mut entries_by_name: BTreeMap<String, Option<Entry>> = BTreeMap::new();
-    let mut tokens = bytes.split(|byte| *byte == 0);
+    // Defensive parsing also discards an unterminated final field. Production
+    // first validates the complete envelope and returns an error instead.
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == 0)
+        .map_or(0, |index| index + 1);
+    let mut tokens = bytes[..complete_len].split(|byte| *byte == 0);
     let mut scanned = 0usize;
     while let (Some(kind), Some(name)) = (tokens.next(), tokens.next()) {
         scanned += 1;
@@ -2500,9 +2538,9 @@ fn parse_list_with_hidden(bytes: &[u8], dir: &Path, show_hidden: bool) -> Vec<En
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        let is_dir = match kind.first() {
-            Some(b'd') => true,
-            Some(b'f') | Some(b'l') => false,
+        let is_dir = match kind {
+            b"d" => true,
+            b"f" | b"l" => false,
             _ => continue,
         };
         use std::collections::btree_map::Entry as MapEntry;
@@ -2941,6 +2979,7 @@ fn list_dir_with_overlay_and_hidden_impl(
         cancel,
     )?;
     let output = probe_output(capture)?;
+    validate_list_records(&output)?;
     Ok(parse_list_with_hidden(&output, dir, show_hidden))
 }
 
@@ -3112,6 +3151,7 @@ pub fn delete_with_overlay(
             // 与探针一致：目录（非符号链接）递归删除，其余按文件删。
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.is_dir() {
+                reject_local_root_directory(path)?;
                 std::fs::remove_dir_all(path)
             } else {
                 std::fs::remove_file(path)
@@ -3119,6 +3159,21 @@ pub fn delete_with_overlay(
         }
         Some(host) => remote_delete(&host, path),
     }
+}
+
+/// Read-only preflight for directory targets, including aliases with `..` or
+/// symlink ancestors. Failure to resolve is an error, never permission to
+/// delete. The caller must classify the final entry first so a final symlink
+/// to a root can still be unlinked itself. This is not a TOCTOU/ancestor lock.
+fn reject_local_root_directory(path: &Path) -> io::Result<()> {
+    let resolved = path.canonicalize()?;
+    if resolved.parent().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to delete a filesystem root directory",
+        ));
+    }
+    Ok(())
 }
 
 /// 重命名/移动；目标已存在 → AlreadyExists。
@@ -3213,9 +3268,56 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
         // 复制链接本身，与 cp -a 对齐。
         let target = std::fs::read_link(src)?;
         std::os::unix::fs::symlink(target, dst)
+    } else if metadata.is_file() {
+        copy_regular_file_noreplace(src, dst, &metadata)
     } else {
-        std::fs::copy(src, dst).map(|_| ())
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy source is not a regular file, directory, or symbolic link",
+        ))
     }
+}
+
+/// Reserve the destination at the actual write boundary, not only in the
+/// caller's earlier preflight. All writes and permission changes use that
+/// owned descriptor; a late destination or symlink can never be truncated.
+/// This preserves ordinary recursive-copy partial-result semantics on I/O
+/// failure. Do not unlink by pathname: another process may have replaced it.
+fn copy_regular_file_noreplace(
+    src: &Path,
+    dst: &Path,
+    expected: &std::fs::Metadata,
+) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(src)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file()
+        || metadata.dev() != expected.dev()
+        || metadata.ino() != expected.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy source changed before it could be opened",
+        ));
+    }
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dst)?;
+    io::copy(&mut source, &mut destination)
+        .and_then(|_| destination.set_permissions(metadata.permissions()))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("copy failed; a partial destination may remain: {error}"),
+            )
+        })
 }
 
 // ---- 跨位置传输（上传 / 下载 / 本地中转） ----
@@ -3556,8 +3658,25 @@ fn probe_output_empty(capture: Capture) -> io::Result<()> {
 /// 目录传输前确认本地有 tar：目录流就是 tar 格式，缺了它什么都传不了。
 fn require_local_tar() -> io::Result<()> {
     let argv = vec!["tar".to_string(), "--version".to_string()];
-    match run_capture(&argv, &[], Duration::from_secs(5), MAX_SMALL_OUTPUT) {
-        Ok(capture) if capture.status == Some(0) => Ok(()),
+    local_tar_available(run_capture(
+        &argv,
+        &[],
+        Duration::from_secs(5),
+        MAX_SMALL_OUTPUT,
+    ))
+}
+
+fn local_tar_available(result: io::Result<Capture>) -> io::Result<()> {
+    match result.and_then(local_status) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Err(error)
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::NotFound,
             "transferring directories requires the system tar command",
@@ -3575,17 +3694,24 @@ pub struct RemoteStat {
 
 /// 解析 `stat` 的一行输出："<t> <size>\n"。
 fn parse_stat(bytes: &[u8]) -> Option<RemoteStat> {
-    let line = bytes.split(|byte| *byte == b'\n').next()?;
+    let line = bytes.strip_suffix(b"\n")?;
+    if line.contains(&b'\n') || line.contains(&b'\r') {
+        return None;
+    }
     let space = line.iter().position(|byte| *byte == b' ')?;
     let kind = match &line[..space] {
         [kind @ (b'd' | b'f' | b'l')] => *kind,
         _ => return None,
     };
-    let size = std::str::from_utf8(&line[space + 1..])
+    // POSIX wc may pad its count with ASCII spaces. Do not accept signs,
+    // Unicode whitespace or additional records as protocol numeric content.
+    let count = std::str::from_utf8(&line[space + 1..])
         .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+        .trim_matches([' ', '\t']);
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let size = count.parse().ok()?;
     Some(RemoteStat { kind, size })
 }
 
@@ -3599,15 +3725,18 @@ fn remote_stat(host: &RemoteHostConfig, path: &Path) -> io::Result<Option<Remote
         PROBE_LIST_TIMEOUT,
         MAX_SMALL_OUTPUT,
     )?;
-    match capture.status {
-        Some(0) => {
-            Ok(Some(parse_stat(&capture.stdout).ok_or_else(|| {
-                io::Error::other("unparsable stat probe output")
-            })?))
-        }
-        Some(3) => Ok(None),
-        // 其余退出码/超时/取消走统一的错误映射。
-        _ => probe_output(capture).map(|_| None),
+    stat_from_capture(capture)
+}
+
+fn stat_from_capture(capture: Capture) -> io::Result<Option<RemoteStat>> {
+    // Root exit status can be 0/3 even when an inherited pipe later times out.
+    // Apply cancellation and timeout precedence before trusting that status.
+    match probe_output(capture) {
+        Ok(stdout) => parse_stat(&stdout)
+            .map(Some)
+            .ok_or_else(|| io::Error::other("unparsable stat probe output")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -4518,6 +4647,128 @@ docker = true
     // ---- list 输出解析 ----
 
     #[test]
+    fn stat_parser_requires_one_complete_numeric_record() {
+        for output in [b"f 123\n".as_slice(), b"f    123 \n", b"f \t123\t\n"] {
+            assert_eq!(parse_stat(output), Some(RemoteStat { kind: b'f', size: 123 }));
+        }
+        for output in [
+            b"f 123".as_slice(),
+            b"f 123\nf 456\n",
+            b"f 123\ntrailing",
+            b"f 123\n\n",
+            b"f 123\r\n",
+            b"f +123\n",
+            b"f -1\n",
+            b"f \n",
+            b"f 18446744073709551616\n",
+            "f \u{a0}123\n".as_bytes(),
+        ] {
+            assert_eq!(parse_stat(output), None);
+        }
+        assert_eq!(parse_stat(b"d 0\n"), Some(RemoteStat { kind: b'd', size: 0 }));
+        assert_eq!(parse_stat(b"l 0\n"), Some(RemoteStat { kind: b'l', size: 0 }));
+        assert_eq!(parse_stat(b"f 18446744073709551615\n").unwrap().size, u64::MAX);
+    }
+
+    #[test]
+    fn stat_capture_honors_timeout_and_cancellation_before_exit_status() {
+        for status in [Some(0), Some(3)] {
+            for (timed_out, cancelled, expected) in [
+                (true, false, io::ErrorKind::TimedOut),
+                (false, true, io::ErrorKind::Interrupted),
+                (true, true, io::ErrorKind::Interrupted),
+            ] {
+                let mut result = capture(status, "");
+                result.stdout = b"f 9\n".to_vec();
+                result.timed_out = timed_out;
+                result.cancelled = cancelled;
+                assert_eq!(stat_from_capture(result).unwrap_err().kind(), expected);
+            }
+        }
+        let mut present = capture(Some(0), "");
+        present.stdout = b"f 9\n".to_vec();
+        assert_eq!(
+            stat_from_capture(present).unwrap(),
+            Some(RemoteStat {
+                kind: b'f',
+                size: 9,
+            })
+        );
+        assert_eq!(stat_from_capture(capture(Some(3), "")).unwrap(), None);
+        assert!(stat_from_capture(capture(Some(0), "")).is_err());
+        assert_eq!(
+            stat_from_capture(capture(Some(13), "")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn local_tar_preflight_preserves_transport_failures() {
+        for status in [Some(0), Some(1)] {
+            for (timed_out, cancelled, expected) in [
+                (true, false, io::ErrorKind::TimedOut),
+                (false, true, io::ErrorKind::Interrupted),
+                (true, true, io::ErrorKind::Interrupted),
+            ] {
+                let mut result = capture(status, "");
+                result.timed_out = timed_out;
+                result.cancelled = cancelled;
+                assert_eq!(local_tar_available(Ok(result)).unwrap_err().kind(), expected);
+            }
+        }
+        assert!(local_tar_available(Ok(capture(Some(0), ""))).is_ok());
+        for result in [
+            Ok(capture(Some(1), "private diagnostic")),
+            Err(io::Error::new(io::ErrorKind::NotFound, "missing executable")),
+        ] {
+            let error = local_tar_available(result).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert_eq!(
+                error.to_string(),
+                "transferring directories requires the system tar command"
+            );
+        }
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::Interrupted] {
+            let error = local_tar_available(Err(io::Error::new(kind, "capture interrupted")))
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "capture interrupted");
+        }
+    }
+
+    #[test]
+    fn list_record_validation_distinguishes_empty_complete_and_partial_output() {
+        assert!(validate_list_records(b"").is_ok());
+        for bytes in [
+            b"f\0ordinary name\0".as_slice(),
+            b"d\0subdir\0l\0link\0".as_slice(),
+            b"f\0line\nbreak\0f\0bad\xffname\0".as_slice(),
+        ] {
+            assert!(validate_list_records(bytes).is_ok());
+        }
+        for bytes in [
+            b"f\0partial-name".as_slice(),
+            b"f\0complete\0d\0".as_slice(),
+            b"f\0\0".as_slice(),
+            b"directory\0wrong-type\0".as_slice(),
+            b"file\0wrong-type\0".as_slice(),
+            b"l\xff\0wrong-type\0".as_slice(),
+            b"\0".as_slice(),
+        ] {
+            assert_eq!(
+                validate_list_records(bytes).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let entries = parse_list(b"directory\0wrong\0f\0valid\0", Path::new("/base"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "valid");
+        let entries = parse_list(b"f\0valid\0f\0partial-name", Path::new("/base"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "valid");
+    }
+
+    #[test]
     fn parse_list_reads_types_and_sorts_dirs_first() {
         let bytes = b"f\0zeta.txt\0d\0subdir\0l\0alink\0f\0Alpha.txt\0";
         let entries = parse_list(bytes, Path::new("/base"));
@@ -4730,6 +4981,107 @@ docker = true
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&src).unwrap(), b"source bytes");
         assert_eq!(std::fs::read(&dst).unwrap(), b"racing winner");
+    }
+
+    #[test]
+    fn local_root_guard_rejects_aliases_without_attempting_deletion() {
+        let dir = TestDir::new();
+        let absolute = dir.path().canonicalize().unwrap();
+        let mut alias = absolute.clone();
+        for component in absolute.components() {
+            if matches!(component, std::path::Component::Normal(_)) {
+                alias.push("..");
+            }
+        }
+        // Only the read-only guard sees root paths, never the delete API.
+        for root in [Path::new("/").to_path_buf(), alias] {
+            assert_eq!(
+                reject_local_root_directory(&root).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(reject_local_root_directory(&absolute).is_ok());
+        assert_eq!(
+            reject_local_root_directory(&dir.join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // A final symlink is a removable entry, not the directory it names.
+        let link = dir.join("root-link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        delete(&FsLocation::Local, &[], &link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn local_copy_preserves_a_destination_created_after_preflight() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let src = dir.join("source");
+        let dst = dir.join("destination");
+        std::fs::write(&src, b"source bytes").unwrap();
+        ensure_absent(&dst).unwrap();
+        std::fs::write(&dst, b"racing winner").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        assert_eq!(
+            copy_recursive(&src, &dst, 0).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"racing winner");
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        std::fs::remove_file(&dst).unwrap();
+
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep victim").unwrap();
+        std::os::unix::fs::symlink(&victim, &dst).unwrap();
+        assert_eq!(
+            copy_recursive(&src, &dst, 0).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep victim");
+        assert!(std::fs::symlink_metadata(&dst)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn local_copy_rejects_a_source_replaced_after_classification() {
+        let dir = TestDir::new();
+        let src = dir.join("source");
+        let dst = dir.join("destination");
+        let moved = dir.join("original");
+        std::fs::write(&src, b"original bytes").unwrap();
+        let expected = std::fs::symlink_metadata(&src).unwrap();
+        std::fs::rename(&src, &moved).unwrap();
+        std::fs::write(&src, b"replacement bytes").unwrap();
+        assert!(copy_regular_file_noreplace(&src, &dst, &expected).is_err());
+        assert!(!dst.exists());
+
+        std::fs::remove_file(&src).unwrap();
+        std::os::unix::fs::symlink(&moved, &src).unwrap();
+        assert!(copy_regular_file_noreplace(&src, &dst, &expected).is_err());
+        assert!(!dst.exists());
+
+        std::fs::remove_file(&src).unwrap();
+        let fifo = std::ffi::CString::new(src.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fifo is a live NUL-terminated temporary fixture path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            copy_regular_file_noreplace(&src, &dst, &expected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!dst.exists());
     }
 
     #[test]

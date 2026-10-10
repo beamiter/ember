@@ -15,6 +15,18 @@ const INSTANCE_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::f
 const NO_INSTANCE_LOCK_FD: i32 = -1;
 static INSTANCE_LOCK_FD: AtomicI32 = AtomicI32::new(NO_INSTANCE_LOCK_FD);
 
+/// Diagnostic I/O must not change a persistence result, including after an
+/// atomic save has already committed. Escape untrusted paths and warning text
+/// and keep the message body within the existing presentation budget.
+fn write_session_diagnostic(writer: &mut impl std::io::Write, message: &str) {
+    let bounded = crate::review_text::bound_toast_text(message);
+    let _ = writeln!(writer, "[SessionPersistence] {bounded}");
+}
+
+fn log_session_diagnostic(message: String) {
+    write_session_diagnostic(&mut std::io::stderr().lock(), &message);
+}
+
 fn default_split_ratio() -> f32 {
     0.5
 }
@@ -1475,7 +1487,7 @@ impl SessionsSnapshot {
         bounded.version = 4;
         let warnings = bounded.sanitize();
         for warning in warnings {
-            eprintln!("[SessionPersistence] WARNING while saving: {warning}");
+            log_session_diagnostic(format!("WARNING while saving: {warning}"));
         }
         let json = serde_json::to_vec_pretty(&bounded)?;
         if json.len() as u64 > MAX_SESSION_SNAPSHOT_BYTES {
@@ -1490,7 +1502,7 @@ impl SessionsSnapshot {
             .into());
         }
         crate::persistence_file::write_atomic(path, &json)?;
-        eprintln!("[SessionPersistence] Sessions saved to {}", path.display());
+        log_session_diagnostic(format!("Sessions saved to {}", path.display()));
         Ok(())
     }
 
@@ -1525,10 +1537,7 @@ impl SessionsSnapshot {
                 warnings.push(warning);
             }
         }
-        eprintln!(
-            "[SessionPersistence] Sessions loaded from {}",
-            path.display()
-        );
+        log_session_diagnostic(format!("Sessions loaded from {}", path.display()));
         Ok((snapshot, warnings))
     }
 
@@ -1953,21 +1962,21 @@ pub fn try_acquire_instance_lock() -> Option<InstanceLock> {
         Ok(Some(file)) => match InstanceLock::register(file) {
             Ok(lock) => Some(lock),
             Err(error) => {
-                eprintln!(
-                    "[SessionPersistence] Failed to register instance lock {}: {}",
+                log_session_diagnostic(format!(
+                    "Failed to register instance lock {}: {}",
                     lock_path.display(),
                     error
-                );
+                ));
                 None
             }
         },
         Ok(None) => None,
         Err(error) => {
-            eprintln!(
-                "[SessionPersistence] Failed to acquire instance lock {}: {}",
+            log_session_diagnostic(format!(
+                "Failed to acquire instance lock {}: {}",
                 lock_path.display(),
                 error
-            );
+            ));
             None
         }
     }
@@ -1982,6 +1991,38 @@ pub fn ensure_session_history_dir(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_write_failures_do_not_escape() {
+        struct FailingSink(std::io::ErrorKind);
+        impl std::io::Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for kind in [std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::PermissionDenied] {
+            super::write_session_diagnostic(&mut FailingSink(kind), "synthetic diagnostic");
+        }
+        // A sink that accepts zero bytes is also an ordinary WriteZero error.
+        let mut empty: &mut [u8] = &mut [];
+        super::write_session_diagnostic(&mut empty, "synthetic diagnostic");
+    }
+
+    #[test]
+    fn diagnostics_bound_and_escape_untrusted_path_text() {
+        let raw = format!("path\n\u{1b}\u{202e}{}", "界".repeat(10_000));
+        let mut output = Vec::new();
+        super::write_session_diagnostic(&mut output, &raw);
+        let shown = String::from_utf8(output).unwrap();
+        assert_eq!(shown, format!("[SessionPersistence] {}\n",
+            crate::review_text::bound_toast_text(raw)));
+        assert!(shown.len() <= "[SessionPersistence] ".len()
+            + crate::review_text::MAX_TOAST_BYTES + 1);
+        assert_eq!(shown.matches('\n').count(), 1);
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

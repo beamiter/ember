@@ -5,7 +5,6 @@
 //! required by ember's configurable snapshot paths. Keep those checks local
 //! until the hardened core implementation is part of the pinned contract.
 
-use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -15,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const DIRECTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_KEY_FILE_BYTES: u64 = 16 * 1024;
+const MAX_API_KEY_PATH_BYTES: usize = 16 * 1024;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Exact byte identity used by optimistic persistence transactions. Debug
@@ -156,20 +156,61 @@ pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     })
 }
 
+fn expand_private_home(home: &std::ffi::OsStr, suffix: &str) -> io::Result<PathBuf> {
+    let home = home
+        .to_str()
+        .filter(|value| {
+            !value.chars().any(char::is_control)
+                && !jterm_core::review_input::contains_visual_spoofing(value)
+        })
+        .ok_or_else(|| invalid_path("HOME must be visible UTF-8 for ~/ credential path"))?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(invalid_path("HOME must be absolute for ~/ credential path"));
+    }
+    let suffix = Path::new(suffix);
+    if suffix.has_root()
+        || matches!(
+            suffix.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
+    {
+        return Err(invalid_path(
+            "~/ credential suffix must not be rooted or prefixed",
+        ));
+    }
+    let path = home.join(suffix);
+    if path.as_os_str().as_encoded_bytes().len() > MAX_API_KEY_PATH_BYTES {
+        return Err(invalid_path("expanded credential path is too long"));
+    }
+    Ok(path)
+}
+
 fn expand_private_path(raw_path: &str) -> io::Result<PathBuf> {
-    let raw_path = raw_path.trim();
+    let home = std::env::var_os("HOME");
+    expand_private_path_with_home(raw_path, home.as_deref())
+}
+
+fn expand_private_path_with_home(
+    raw_path: &str,
+    home: Option<&std::ffi::OsStr>,
+) -> io::Result<PathBuf> {
+    // Match the pinned core's production reader without changing destinations.
+    if raw_path.len() > MAX_API_KEY_PATH_BYTES
+        || raw_path.trim_matches(' ') != raw_path
+        || raw_path.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(raw_path)
+    {
+        return Err(invalid_path("credential path must be bounded visible text"));
+    }
     if raw_path.is_empty() {
         return Err(invalid_path("credential path is empty"));
     }
     if raw_path == "~" || raw_path.starts_with("~/") {
-        let home = std::env::var_os("HOME")
+        let home = home
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invalid_path("HOME is unavailable for ~/ credential path"))?;
-        let mut path = PathBuf::from(home);
-        if let Some(rest) = raw_path.strip_prefix("~/") {
-            path.push(rest);
-        }
-        return Ok(path);
+        return expand_private_home(home, raw_path.strip_prefix("~/").unwrap_or(""));
     }
     let path = PathBuf::from(raw_path);
     if !path.is_absolute() {
@@ -250,22 +291,7 @@ pub fn read_api_key_file(raw_path: &str) -> io::Result<String> {
 /// permissions are rejected before replacement.
 pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
     let path = expand_private_path(raw_path)?;
-    let key = raw_key.trim();
-    if key.is_empty() {
-        return Err(invalid_path("API key must not be empty"));
-    }
-    if key.chars().any(char::is_control) {
-        return Err(invalid_path(
-            "API key must be one line without control characters",
-        ));
-    }
-    if key.len() as u64 + 1 > MAX_API_KEY_FILE_BYTES {
-        return Err(oversize_error(
-            &path,
-            key.len() as u64 + 1,
-            MAX_API_KEY_FILE_BYTES,
-        ));
-    }
+    let key = validate_api_key_for_storage(raw_key)?;
 
     match open_owned_regular(&path) {
         Ok(file) => validate_private_key_metadata(&path, &file.metadata()?)?,
@@ -276,6 +302,21 @@ pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
     encoded.extend_from_slice(key.as_bytes());
     encoded.push(b'\n');
     write_atomic(&path, &encoded)
+}
+
+fn validate_api_key_for_storage(key: &str) -> io::Result<&str> {
+    if key.is_empty() {
+        return Err(invalid_path("API key must not be empty"));
+    }
+    if key.len() > (MAX_API_KEY_FILE_BYTES - 1) as usize {
+        return Err(invalid_path("API key exceeds the credential file limit"));
+    }
+    if !key.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
+        return Err(invalid_path(
+            "API key must be visible ASCII without whitespace",
+        ));
+    }
+    Ok(key)
 }
 
 fn oversize_error(path: &Path, actual: u64, max_bytes: u64) -> io::Error {
@@ -566,15 +607,28 @@ impl Drop for TempFileGuard {
     }
 }
 
+fn staging_file_name(destination: &std::ffi::OsStr, pid: u32, id: u64) -> String {
+    let name = format!(".ember.tmp.{pid}.{id}");
+    if destination == std::ffi::OsStr::new(&name) {
+        // An absent destination must never be used as the staging entry:
+        // writes would become visible before publication (and no-replace
+        // publication would mistake our own temporary for an existing file).
+        format!(".ember-alt.tmp.{pid}.{id}")
+    } else {
+        name
+    }
+}
+
 fn create_unique_temp(path: &Path, parent: &Path) -> io::Result<(File, PathBuf)> {
     let destination = path
         .file_name()
         .ok_or_else(|| invalid_path("persistence path has no file name"))?;
     for _ in 0..128 {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let mut name = OsString::from(".");
-        name.push(destination);
-        name.push(format!(".tmp.{}.{id}", std::process::id()));
+        // A valid destination may already consume the filesystem's entire
+        // filename budget. Keep staging names independent of that basename;
+        // PID, the process-wide counter and create_new still prevent reuse.
+        let name = staging_file_name(destination, std::process::id(), id);
         let temp_path = parent.join(name);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -645,6 +699,92 @@ mod tests {
     }
 
     #[test]
+    fn credential_admission_preserves_exact_reader_compatible_bytes() {
+        let valid = "sk-visible_09-+/:=!?";
+        assert_eq!(validate_api_key_for_storage(valid).unwrap(), valid);
+        for key in [
+            "", " padded", "padded ", "two words", "tab\tkey", "line\nkey",
+            "秘密", "key\u{200b}",
+        ] {
+            assert!(validate_api_key_for_storage(key).is_err());
+        }
+        assert!(validate_api_key_for_storage(&"x".repeat(16_383)).is_ok());
+        assert!(validate_api_key_for_storage(&"x".repeat(16_384)).is_err());
+
+        let absolute = if cfg!(windows) {
+            r"C:\safe\key"
+        } else {
+            "/safe/key"
+        };
+        assert_eq!(
+            expand_private_path_with_home(absolute, None).unwrap(),
+            PathBuf::from(absolute)
+        );
+        for path in [
+            format!(" {absolute}"),
+            format!("{absolute} "),
+            format!("{absolute}\n"),
+            format!("{absolute}\u{200b}"),
+            format!("{absolute}{}", "x".repeat(16_384)),
+        ] {
+            assert!(expand_private_path_with_home(&path, None).is_err());
+        }
+        for home in ["/bad\n", "/bad\u{200b}"] {
+            assert!(expand_private_path_with_home(
+                "~/key", Some(std::ffi::OsStr::new(home))
+            ).is_err());
+        }
+        let oversized_home = format!("/{}", "x".repeat(16_383));
+        assert!(expand_private_path_with_home(
+            "~/key", Some(std::ffi::OsStr::new(&oversized_home))
+        ).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(expand_private_path_with_home(
+                "~/key", Some(std::ffi::OsStr::from_bytes(b"/bad\xff"))
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn private_home_expansion_never_resolves_against_the_working_directory() {
+        use std::ffi::OsStr;
+
+        for home in ["", ".", "relative", "../relative"] {
+            assert_eq!(
+                expand_private_home(OsStr::new(home), "key").unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\example"
+        } else {
+            "/home/example"
+        });
+        assert!(home.is_absolute());
+        assert_eq!(expand_private_home(home.as_os_str(), "").unwrap(), home);
+        assert_eq!(
+            expand_private_home(home.as_os_str(), "nested/key").unwrap(),
+            home.join("nested/key")
+        );
+        // These are the suffixes after removing the leading ~/ from ~//key
+        // and ~///key. PathBuf::push used to discard HOME for these inputs.
+        for suffix in ["/key", "//key", "/"] {
+            assert_eq!(
+                expand_private_home(home.as_os_str(), suffix)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        #[cfg(windows)]
+        for suffix in [r"\key", r"C:\key", r"C:key"] {
+            assert!(expand_private_home(home.as_os_str(), suffix).is_err());
+        }
+    }
+
+    #[test]
     fn bounded_read_is_inclusive_and_requires_utf8() {
         let root = TestDir::new("bounded");
         let path = root.join("state.json");
@@ -710,7 +850,10 @@ mod tests {
 
         let root = TestDir::new("api-key");
         let path = root.join("ai.key");
-        write_api_key_file(path.to_str().unwrap(), "  sk-secret  ").unwrap();
+        assert!(write_api_key_file(path.to_str().unwrap(), "  sk-secret  ").is_err());
+        assert!(!path.exists());
+        write_api_key_file(path.to_str().unwrap(), "sk-secret").unwrap();
+        assert!(write_api_key_file(path.to_str().unwrap(), "invalid key").is_err());
         assert_eq!(
             read_api_key_file(path.to_str().unwrap()).unwrap(),
             "sk-secret"
@@ -832,6 +975,54 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_name_never_equals_the_destination_or_grows_with_it() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStringExt;
+
+        for destination in [
+            OsString::from(".ember.tmp.42.7"),
+            OsString::from(".ember-alt.tmp.42.7"),
+            OsString::from("s".repeat(255)),
+            OsString::from_vec(vec![0xff; 255]),
+        ] {
+            let name = staging_file_name(&destination, 42, 7);
+            assert_ne!(OsStr::new(&name), destination.as_os_str());
+            assert!(name.len() < 64);
+        }
+        assert_eq!(
+            staging_file_name(OsStr::new(".ember.tmp.42.7"), 42, 7),
+            ".ember-alt.tmp.42.7"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistence_supports_full_length_destination_names() {
+        let root = TestDir::new("long-destination");
+        let path = root.join("s".repeat(255));
+        write_private(&path, b"before");
+
+        write_atomic(&path, b"after").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        let revision = FileRevision::from_bytes(b"after");
+        write_atomic_if_unchanged(&path, b"checked", &revision, 16).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"checked");
+
+        let export = root.join("e".repeat(255));
+        write_new_private_file(&export, b"export", 16).unwrap();
+        assert_eq!(fs::read(&export).unwrap(), b"export");
+        assert_eq!(
+            write_new_private_file(&export, b"replace", 16)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&export).unwrap(), b"export");
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 2);
     }
 
     #[cfg(unix)]

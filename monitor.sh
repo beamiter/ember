@@ -9,7 +9,15 @@ fi
 
 TARGET=$1
 INTERVAL=${2:-2} # 默认间隔2秒
-LOG_FILE=$3
+LOG_FILE=${3:-}
+
+# A bad or zero delay otherwise turns a failed sleep into a hot sampling loop.
+# Accept positive decimal seconds, including .5 and 1., before opening a log.
+if [[ ! "${INTERVAL}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+    || [[ -z "${INTERVAL//[0.]/}" ]]; then
+    printf '错误: 监控间隔必须是正数秒: %s\n' "${INTERVAL}" >&2
+    exit 1
+fi
 
 # 确定进程PID
 if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
@@ -17,7 +25,7 @@ if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
 else
     # 修复点：使用 pgrep -f 查找，但通过 grep -v 排除当前脚本自身的 PID ($$)
     # tail -n 1 取出匹配到的最后一个（通常是较新的）
-    PID=$(pgrep -f "$TARGET" | grep -x -v "$$" | head -n 1)
+    PID=$(pgrep -f -- "$TARGET" | grep -x -v "$$" | head -n 1)
 fi
 
 # 检查进程是否存在
@@ -41,7 +49,10 @@ echo "--------------------------------------------------------"
 HEADER=$(printf "%-20s | %-8s | %-8s | %-10s" "时间" "%CPU" "%MEM" "RSS(KB)")
 echo "$HEADER"
 if [ -n "$LOG_FILE" ]; then
-    echo "$HEADER" > "$LOG_FILE"
+    if ! printf '%s\n' "$HEADER" > "$LOG_FILE"; then
+        printf '错误: 无法写入日志: %s\n' "$LOG_FILE" >&2
+        exit 1
+    fi
 fi
 
 # 循环监控
@@ -66,8 +77,14 @@ while true; do
     echo "$OUTPUT"
 
     if [ -n "$LOG_FILE" ]; then
-        echo "$OUTPUT" >> "$LOG_FILE"
+        if ! printf '%s\n' "$OUTPUT" >> "$LOG_FILE"; then
+            printf '错误: 无法写入日志: %s\n' "$LOG_FILE" >&2
+            exit 1
+        fi
     fi
 
-    sleep "$INTERVAL"
+    if ! sleep "$INTERVAL"; then
+        printf '错误: 监控等待失败，已停止监控\n' >&2
+        exit 1
+    fi
 done

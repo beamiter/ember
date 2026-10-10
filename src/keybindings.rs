@@ -12,6 +12,13 @@ use std::path::{Path, PathBuf};
 /// bounds allocation and TOML parsing work for a planted configuration file.
 const MAX_KEYBINDINGS_BYTES: u64 = 256 * 1024;
 
+/// Invalid configuration text may itself contain display controls. Bound and
+/// sanitize only the emitted warning; keep merging and returned errors intact.
+fn write_binding_warning(writer: &mut impl std::io::Write, warning: &str) {
+    let bounded = crate::review_text::bound_toast_text(warning);
+    let _ = writeln!(writer, "[Keybindings] WARNING: {bounded}");
+}
+
 /// 所有可用的命令
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
@@ -667,7 +674,7 @@ impl KeyBindings {
             )
         })?;
         for warning in bindings.merge_user_bindings(user_bindings) {
-            eprintln!("[Keybindings] WARNING: {warning}");
+            write_binding_warning(&mut std::io::stderr().lock(), &warning);
         }
 
         Ok(bindings)
@@ -733,6 +740,47 @@ impl Default for KeyBindings {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn invalid_binding_warnings_are_safe_at_the_output_boundary() {
+        let mut bindings = KeyBindings::new();
+        let warnings = bindings.merge_user_bindings(KeyBindings {
+            bindings: HashMap::from([
+                ("ctrl+x".to_owned(), format!("bad\n\u{1b}[2J\u{202e}{}", "界".repeat(1000))),
+                ("ctrl+y".to_owned(), "session:new".to_owned()),
+                ("\u{1b}[2J\n\u{202e}".to_owned(), "session:new".to_owned()),
+            ]),
+        });
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().all(|warning| warning.contains('\u{1b}')),
+            "raw diagnostics stay intact");
+        assert_eq!(bindings.get_command("ctrl+x"), None);
+        assert_eq!(bindings.get_command("ctrl+y"), Some(Command::SessionNew));
+        for warning in &warnings {
+            let mut output = Vec::new();
+            write_binding_warning(&mut output, warning);
+            let shown = String::from_utf8(output).unwrap();
+            assert_eq!(shown.matches('\n').count(), 1);
+            assert!(!shown.contains('\u{1b}'));
+            assert!(!shown.contains('\u{202e}'));
+            assert!(shown.len() <= "[Keybindings] WARNING: ".len()
+                + crate::review_text::MAX_TOAST_BYTES + 1);
+        }
+    }
+
+    #[test]
+    fn binding_warning_io_failure_is_best_effort() {
+        struct FailingSink;
+        impl std::io::Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        write_binding_warning(&mut FailingSink, "synthetic warning");
+        let mut empty: &mut [u8] = &mut [];
+        write_binding_warning(&mut empty, "synthetic warning");
+    }
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 

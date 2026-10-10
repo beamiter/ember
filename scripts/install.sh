@@ -484,6 +484,18 @@ fi
 validate_staging_target "${DESTDIR}${BIN_DIR}"
 validate_staging_target "${DESTDIR}${DATA_HOME}"
 if ((INSTALL_DESKTOP == 1)); then
+    # Validate every resource directory before installing even the binary.
+    # Checking DATA_HOME alone misses nested links such as share/applications,
+    # which can redirect both atomic installs and legacy-launcher cleanup out
+    # of DESTDIR. Final file symlinks remain safe to replace with rename.
+    for resource_dir in \
+        applications \
+        metainfo \
+        icons/hicolor/scalable/apps \
+        icons/hicolor/128x128/apps \
+        icons/hicolor/256x256/apps; do
+        validate_staging_target "${DESTDIR}${DATA_HOME}/${resource_dir}"
+    done
     require_source_file "${REPO_ROOT}/data/${APP_ID}.desktop"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.metainfo.xml"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.svg"
