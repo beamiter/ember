@@ -459,8 +459,23 @@ impl PreviewUi {
         self.greeting_until = Duration::ZERO;
     }
 
+    fn sync_viewport(&mut self, focused: bool, occluded: bool) {
+        if focused && !occluded {
+            self.model.open();
+        } else {
+            self.close();
+        }
+    }
+
     pub fn show(&mut self, ui: &mut Ui, motion: Option<OrganismMotion>) {
-        self.model.open();
+        let (focused, occluded) = ui.ctx().input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.focused.unwrap_or(false),
+                viewport.occluded.unwrap_or(false),
+            )
+        });
+        self.sync_viewport(focused, occluded);
         ui.label("Organism Preview");
         ui.label("Pose");
         egui::ComboBox::from_id_salt("organism_preview_pose")
@@ -483,6 +498,9 @@ impl PreviewUi {
             egui::Button::new("Say hello"),
         );
         match availability {
+            GreetingAvailability::Closed => {
+                ui.small("Preview paused while window is inactive");
+            }
             GreetingAvailability::Busy => {
                 ui.small("Unavailable for this pose");
             }
@@ -495,8 +513,15 @@ impl PreviewUi {
             self.greeting_until = now.saturating_add(GentleInteraction::HOLD);
             self.hello_ready_at = now.saturating_add(GentleInteraction::COOLDOWN);
         }
-        if let Some(context) = self.model.context(now) {
-            let full = resolved_motion(motion) == OrganismMotion::Full;
+        {
+            // Keep the same settings layout while inactive, without replaying
+            // a canceled greeting or requesting background animation frames.
+            let context = self
+                .model
+                .context(now)
+                .unwrap_or_else(|| self.pose.context());
+            let full = availability != GreetingAvailability::Closed
+                && resolved_motion(motion) == OrganismMotion::Full;
             let frame = if full {
                 now.as_millis() as u64 / 100
             } else {
@@ -554,6 +579,73 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn preview_blur_preserves_cooldown_without_replaying_greeting() {
+        let mut preview = PreviewUi::default();
+        preview.sync_viewport(true, false);
+        assert!(preview.model.say_hello(Duration::ZERO));
+        preview.greeting_until = GentleInteraction::HOLD;
+        preview.hello_ready_at = GentleInteraction::COOLDOWN;
+        preview.sync_viewport(false, false);
+        assert_eq!(preview.greeting_until, Duration::ZERO);
+        assert_eq!(preview.hello_ready_at, GentleInteraction::COOLDOWN);
+        assert_eq!(preview.pose, PreviewPose::Calm);
+        let now = Duration::from_secs(1);
+        assert_eq!(
+            preview_next_wake(
+                now,
+                true,
+                preview.greeting_until,
+                preview.hello_ready_at,
+                preview.model.greeting_availability(now),
+            ),
+            None
+        );
+        preview.sync_viewport(true, false);
+        assert_eq!(preview.model.context(now), Some(PreviewPose::Calm.context()));
+        assert_eq!(
+            preview.model.greeting_availability(now),
+            GreetingAvailability::CoolingDown
+        );
+        assert_eq!(
+            preview_next_wake(
+                now,
+                false,
+                preview.greeting_until,
+                preview.hello_ready_at,
+                preview.model.greeting_availability(now),
+            ),
+            Some(Duration::from_secs(7))
+        );
+        let expired = Duration::from_secs(20);
+        assert_eq!(
+            preview_next_wake(
+                expired,
+                false,
+                preview.greeting_until,
+                preview.hello_ready_at,
+                preview.model.greeting_availability(expired),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_occlusion_suspends_even_with_retained_focus() {
+        let mut preview = PreviewUi::default();
+        preview.sync_viewport(true, false);
+        preview.sync_viewport(true, true);
+        assert_eq!(
+            preview.model.greeting_availability(Duration::ZERO),
+            GreetingAvailability::Closed
+        );
+        preview.sync_viewport(true, false);
+        assert_eq!(
+            preview.model.greeting_availability(Duration::ZERO),
+            GreetingAvailability::Available
+        );
+    }
 
     #[test]
     fn preview_query_never_spends_attention_and_explains_busy_or_cooldown() {
