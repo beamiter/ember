@@ -629,12 +629,7 @@ mod tests {
         policy.focused_owner = false;
         policy.motion = Some(OrganismMotion::Full);
         assert_eq!(
-            next_host_wake(
-                policy,
-                Duration::ZERO,
-                Duration::from_secs(5),
-                false
-            ),
+            next_host_wake(policy, Duration::ZERO, Duration::from_secs(5), false),
             None
         );
         host.set_available_width(120.0);
