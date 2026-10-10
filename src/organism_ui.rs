@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use jterm_core::organism::{AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone};
-use jterm_core::organism_daily::{GentleInteraction, behavior_explanation};
+use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 
 use crate::config::{Config, OrganismMotion};
 use crate::organism::{
@@ -841,7 +841,10 @@ mod tests {
         ] {
             let mut greeting = LiveGreeting::default();
             greeting.update(Duration::ZERO, true, true, base);
-            assert_eq!(greeting.update(LIVE_HOVER_DWELL, true, true, context), context);
+            assert_eq!(
+                greeting.update(LIVE_HOVER_DWELL, true, true, context),
+                context
+            );
             assert_eq!(greeting.next_wake(LIVE_HOVER_DWELL), None);
         }
         let mut greeting = LiveGreeting::default();
