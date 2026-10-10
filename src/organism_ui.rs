@@ -981,7 +981,11 @@ impl PreviewUi {
             egui::Button::new("Say hello"),
         );
         if let Some(step) = demo {
-            ui.small(format!("Demo {}/5: {} (example)", step.index + 1, step.pose.label()));
+            ui.small(format!(
+                "Demo {}/5: {} (example)",
+                step.index + 1,
+                step.pose.label()
+            ));
             ui.small(step.pose.explanation());
             ui.small("No command is run. Say hello is paused during the demo.");
         } else {
@@ -1006,7 +1010,11 @@ impl PreviewUi {
             // Keep the same settings layout while inactive, without replaying
             // a canceled greeting or requesting background animation frames.
             let context = demo.map_or_else(
-                || self.model.context(now).unwrap_or_else(|| self.pose.context()),
+                || {
+                    self.model
+                        .context(now)
+                        .unwrap_or_else(|| self.pose.context())
+                },
                 |step| step.pose.context(),
             );
             let full = availability != GreetingAvailability::Closed
@@ -1135,7 +1143,10 @@ mod tests {
             preview.model.greeting_availability(Duration::from_secs(2)),
             GreetingAvailability::CoolingDown
         );
-        assert_eq!(preview.model.context(Duration::from_secs(2)), Some(PreviewPose::Curious.context()));
+        assert_eq!(
+            preview.model.context(Duration::from_secs(2)),
+            Some(PreviewPose::Curious.context())
+        );
         assert!(preview.demo.sample(Duration::from_secs(11)).is_none());
         assert_eq!(preview.pose, PreviewPose::Curious);
         assert_eq!(
