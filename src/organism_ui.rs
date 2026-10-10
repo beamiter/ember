@@ -194,8 +194,8 @@ impl WatchObservation {
             return;
         }
         let quiet_since = self.outputs[2].or(self.activity_since);
-        let was_waiting = quiet_since
-            .is_some_and(|last| now.saturating_sub(last) >= Self::WAITING_AFTER);
+        let was_waiting =
+            quiet_since.is_some_and(|last| now.saturating_sub(last) >= Self::WAITING_AFTER);
         self.outputs = [self.outputs[1], self.outputs[2], Some(now)];
         if was_waiting {
             self.resumed_until = Some(now.saturating_add(Self::RESUMED_HOLD));
@@ -239,7 +239,12 @@ impl WatchObservation {
         }
     }
 
-    fn context(&self, now: Duration, language: BodyLanguage, rhythm_enabled: bool) -> RenderContext {
+    fn context(
+        &self,
+        now: Duration,
+        language: BodyLanguage,
+        rhythm_enabled: bool,
+    ) -> RenderContext {
         RenderContext::new(self.behavior(now), language, false).with_watch_rhythm(
             if rhythm_enabled {
                 self.rhythm(now)
@@ -250,7 +255,8 @@ impl WatchObservation {
     }
 
     fn behavior(&self, now: Duration) -> Behavior {
-        if self.observed_since
+        if self
+            .observed_since
             .is_some_and(|start| now.saturating_sub(start) >= Self::SETTLED_AFTER)
         {
             Behavior::WatchSettled
@@ -377,7 +383,9 @@ impl OrganismHost {
             record.state == crate::terminal::CommandState::Running && record.start_mark_seen
         });
         self.running = running;
-        let generation = running.then(|| records.back().map(|record| record.sequence)).flatten();
+        let generation = running
+            .then(|| records.back().map(|record| record.sequence))
+            .flatten();
         let discard_activity = self.quarantine_batch || backlogged || !completions.is_empty();
         self.observe_watch_activity(now, generation, discard_activity);
         if self.quarantine(
@@ -930,19 +938,31 @@ mod tests {
         let mut watch = WatchObservation::default();
         watch.observe_running(Duration::ZERO, Some(7));
         watch.observe_activity(Duration::ZERO, Some(7), false, true);
-        assert_eq!(watch.rhythm(Duration::from_millis(2999)), WatchRhythm::Steady);
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(2999)),
+            WatchRhythm::Steady
+        );
         assert_eq!(watch.rhythm(Duration::from_secs(3)), WatchRhythm::Waiting);
         watch.observe_activity(Duration::from_secs(3), Some(7), false, true);
         assert_eq!(watch.rhythm(Duration::from_secs(3)), WatchRhythm::Resumed);
-        assert_eq!(watch.rhythm(Duration::from_millis(3899)), WatchRhythm::Resumed);
-        assert_eq!(watch.rhythm(Duration::from_millis(3900)), WatchRhythm::Steady);
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(3899)),
+            WatchRhythm::Resumed
+        );
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(3900)),
+            WatchRhythm::Steady
+        );
     }
 
     #[test]
     fn silent_running_waits_before_any_output_and_first_activity_stays_neutral() {
         let mut watch = WatchObservation::default();
         watch.observe_running(Duration::ZERO, Some(7));
-        assert_eq!(watch.rhythm(Duration::from_millis(2999)), WatchRhythm::Steady);
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(2999)),
+            WatchRhythm::Steady
+        );
         assert_eq!(watch.rhythm(Duration::from_secs(3)), WatchRhythm::Waiting);
         watch.observe_activity(Duration::from_secs(5), Some(7), false, true);
         assert_eq!(watch.rhythm(Duration::from_secs(5)), WatchRhythm::Steady);
@@ -958,12 +978,21 @@ mod tests {
         for millis in [100, 200] {
             watch.observe_activity(Duration::from_millis(millis), Some(7), false, true);
         }
-        assert_eq!(watch.rhythm(Duration::from_millis(200)), WatchRhythm::Steady);
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(200)),
+            WatchRhythm::Steady
+        );
         watch.observe_activity(Duration::from_millis(300), Some(7), false, true);
         assert_eq!(watch.rhythm(Duration::from_millis(300)), WatchRhythm::Busy);
         assert_eq!(watch.rhythm(Duration::from_millis(1300)), WatchRhythm::Busy);
-        assert_eq!(watch.rhythm(Duration::from_millis(1301)), WatchRhythm::Steady);
-        assert_eq!(watch.rhythm(Duration::from_millis(3300)), WatchRhythm::Waiting);
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(1301)),
+            WatchRhythm::Steady
+        );
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(3300)),
+            WatchRhythm::Waiting
+        );
     }
 
     #[test]
@@ -981,7 +1010,10 @@ mod tests {
         for millis in [1100, 1200] {
             watch.observe_activity(Duration::from_millis(millis), Some(8), false, true);
         }
-        assert_eq!(watch.rhythm(Duration::from_millis(1200)), WatchRhythm::Steady);
+        assert_eq!(
+            watch.rhythm(Duration::from_millis(1200)),
+            WatchRhythm::Steady
+        );
         watch.observe_activity(Duration::from_secs(10), Some(8), true, true);
         assert_eq!(watch.rhythm(Duration::from_secs(10)), WatchRhythm::Steady);
         assert_eq!(watch.activity_since, Some(Duration::from_secs(10)));
@@ -992,11 +1024,20 @@ mod tests {
     fn watch_settling_measures_only_this_continuous_observation() {
         let mut watch = WatchObservation::default();
         watch.observe_running(Duration::ZERO, Some(7));
-        assert_eq!(watch.behavior(Duration::from_millis(59999)), Behavior::WatchCommand);
-        assert_eq!(watch.behavior(Duration::from_secs(60)), Behavior::WatchSettled);
+        assert_eq!(
+            watch.behavior(Duration::from_millis(59999)),
+            Behavior::WatchCommand
+        );
+        assert_eq!(
+            watch.behavior(Duration::from_secs(60)),
+            Behavior::WatchSettled
+        );
         watch.reset();
         watch.observe_running(Duration::from_secs(120), Some(7));
-        assert_eq!(watch.behavior(Duration::from_secs(120)), Behavior::WatchCommand);
+        assert_eq!(
+            watch.behavior(Duration::from_secs(120)),
+            Behavior::WatchCommand
+        );
         assert_eq!(watch.rhythm(Duration::from_secs(120)), WatchRhythm::Steady);
     }
 
@@ -1022,7 +1063,10 @@ mod tests {
         }
         assert_eq!(watch.outputs, [None; 3]);
         assert_eq!(watch.resumed_until, None);
-        assert_eq!(watch.behavior(Duration::from_secs(60)), Behavior::WatchSettled);
+        assert_eq!(
+            watch.behavior(Duration::from_secs(60)),
+            Behavior::WatchSettled
+        );
         // Exercise the same presentation gate used by the live host.
         let context = watch.context(Duration::from_secs(60), BodyLanguage::default(), false);
         assert_eq!(context.watch_rhythm, WatchRhythm::Steady);
