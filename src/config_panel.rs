@@ -5,6 +5,17 @@ use crate::theme::{
 use egui::{Color32, RichText};
 use jterm_core::jsh_remote::RemoteHostConfig;
 
+fn organism_motion_explanation(motion: Option<OrganismMotion>) -> &'static str {
+    match motion {
+        None => "Automatic currently uses Calm; system motion preferences are not detected.",
+        Some(OrganismMotion::Full) => "Animated poses, work rhythm and hover greetings.",
+        Some(OrganismMotion::Calm) => "Still poses respond to work, with hover greetings.",
+        Some(OrganismMotion::Static) => {
+            "Still status poses; hover greetings and output rhythm are off."
+        }
+    }
+}
+
 fn accent_color(theme: &Theme) -> Color32 {
     Theme::rgb_to_color32(theme.tabbar.active_border)
 }
@@ -726,8 +737,10 @@ impl ConfigPanel {
                     }
                 });
         });
+        ui.label("Local terminal chrome; command cards optional. Memory is volatile.");
+        ui.label(organism_motion_explanation(self.edit_organism_motion));
         ui.label(
-            "Local terminal chrome; command cards optional. Automatic uses Calm. Memory is volatile.",
+            "The live organism pauses while Settings or terminal-input overlays are open. Preview is independent.",
         );
         ui.label("In Full or Calm, hover over the live glyph briefly to say hello.");
         ui.label("Changes apply now; Save persists them.");
@@ -1955,6 +1968,16 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 mod tests {
     use super::{ConfigPanel, RemoteHostDraft};
     use crate::config::{Config, OrganismMotion};
+
+    #[test]
+    fn organism_motion_help_matches_resolved_capabilities() {
+        assert_eq!(crate::organism::resolved_motion(None), OrganismMotion::Calm);
+        assert!(organism_motion_explanation(None).contains("currently uses Calm"));
+        assert!(organism_motion_explanation(None).contains("not detected"));
+        assert!(organism_motion_explanation(Some(OrganismMotion::Full)).contains("Animated"));
+        assert!(organism_motion_explanation(Some(OrganismMotion::Calm)).contains("Still poses"));
+        assert!(organism_motion_explanation(Some(OrganismMotion::Static)).contains("are off"));
+    }
 
     /// A Fix-menu pick made while Settings is open must survive the panel's
     /// Save, but must not overwrite a different choice the user made there.
