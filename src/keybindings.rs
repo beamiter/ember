@@ -746,14 +746,19 @@ mod tests {
         let mut bindings = KeyBindings::new();
         let warnings = bindings.merge_user_bindings(KeyBindings {
             bindings: HashMap::from([
-                ("ctrl+x".to_owned(), format!("bad\n\u{1b}[2J\u{202e}{}", "界".repeat(1000))),
+                (
+                    "ctrl+x".to_owned(),
+                    format!("bad\n\u{1b}[2J\u{202e}{}", "界".repeat(1000)),
+                ),
                 ("ctrl+y".to_owned(), "session:new".to_owned()),
                 ("\u{1b}[2J\n\u{202e}".to_owned(), "session:new".to_owned()),
             ]),
         });
         assert_eq!(warnings.len(), 2);
-        assert!(warnings.iter().all(|warning| warning.contains('\u{1b}')),
-            "raw diagnostics stay intact");
+        assert!(
+            warnings.iter().all(|warning| warning.contains('\u{1b}')),
+            "raw diagnostics stay intact"
+        );
         assert_eq!(bindings.get_command("ctrl+x"), None);
         assert_eq!(bindings.get_command("ctrl+y"), Some(Command::SessionNew));
         for warning in &warnings {
@@ -763,8 +768,10 @@ mod tests {
             assert_eq!(shown.matches('\n').count(), 1);
             assert!(!shown.contains('\u{1b}'));
             assert!(!shown.contains('\u{202e}'));
-            assert!(shown.len() <= "[Keybindings] WARNING: ".len()
-                + crate::review_text::MAX_TOAST_BYTES + 1);
+            assert!(
+                shown.len()
+                    <= "[Keybindings] WARNING: ".len() + crate::review_text::MAX_TOAST_BYTES + 1
+            );
         }
     }
 
@@ -775,7 +782,9 @@ mod tests {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
                 Err(std::io::ErrorKind::BrokenPipe.into())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         write_binding_warning(&mut FailingSink, "synthetic warning");
         let mut empty: &mut [u8] = &mut [];

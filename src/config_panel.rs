@@ -2005,7 +2005,12 @@ mod tests {
 
     #[test]
     fn settings_preserves_rejected_credential_paths_for_loader_validation() {
-        for path in ["   ", " /private/key ", "/private/key\n", "/private/key\u{200b}"] {
+        for path in [
+            "   ",
+            " /private/key ",
+            "/private/key\n",
+            "/private/key\u{200b}",
+        ] {
             let source = Config {
                 ai_api_key_file: Some(path.to_string()),
                 ..Config::default()

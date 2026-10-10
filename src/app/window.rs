@@ -24,7 +24,8 @@ fn save_resolved_session_snapshot(
     save(&path)
 }
 
-const SESSION_SAVE_FAILURE_STATUS: &str = "Session layout was not saved; check the storage path and permissions.";
+const SESSION_SAVE_FAILURE_STATUS: &str =
+    "Session layout was not saved; check the storage path and permissions.";
 
 fn session_save_notice_slot_available(
     message: &str,
@@ -221,8 +222,10 @@ impl TerminalApp {
             if let Err(error) = result {
                 use std::io::Write;
                 let diagnostic = crate::review_text::bound_toast_text(error.to_string());
-                let _ = writeln!(std::io::stderr().lock(),
-                    "[SessionPersistence] Failed to save: {diagnostic}");
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[SessionPersistence] Failed to save: {diagnostic}"
+                );
                 if session_save_notice_slot_available(
                     &self.status_message,
                     self.status_expires_at,
@@ -382,28 +385,47 @@ mod config_hot_reload_status_tests {
         let now = std::time::Instant::now();
         let later = now + std::time::Duration::from_secs(12);
         assert!(super::session_save_notice_slot_available("", None, now));
-        assert!(super::session_save_notice_slot_available("expired", Some(now), now));
-        assert!(!super::session_save_notice_slot_available("newer unrelated error", Some(later), now));
-        assert!(!super::session_save_notice_slot_available("persistent unrelated error", None, now));
+        assert!(super::session_save_notice_slot_available(
+            "expired",
+            Some(now),
+            now
+        ));
         assert!(!super::session_save_notice_slot_available(
-            super::SESSION_SAVE_FAILURE_STATUS, Some(later), now));
+            "newer unrelated error",
+            Some(later),
+            now
+        ));
+        assert!(!super::session_save_notice_slot_available(
+            "persistent unrelated error",
+            None,
+            now
+        ));
+        assert!(!super::session_save_notice_slot_available(
+            super::SESSION_SAVE_FAILURE_STATUS,
+            Some(later),
+            now
+        ));
     }
 
     #[test]
     fn session_save_propagates_path_and_writer_failures_without_io() {
-        let missing = Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound, "synthetic path failure",
-        ).into());
+        let missing =
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic path failure").into());
         let error = super::save_resolved_session_snapshot(missing, |_| {
             panic!("path failure must not attempt a write")
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("synthetic path failure"));
         let path = std::path::PathBuf::from("/synthetic/session.json");
         let error = super::save_resolved_session_snapshot(Ok(path.clone()), |actual| {
             assert_eq!(actual, path.as_path());
-            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                "synthetic write failure").into())
-        }).unwrap_err();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic write failure",
+            )
+            .into())
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("synthetic write failure"));
         assert!(super::save_resolved_session_snapshot(Ok(path), |_| Ok(())).is_ok());
     }

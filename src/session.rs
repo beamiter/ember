@@ -35,9 +35,14 @@ fn session_id_from_parts(pid: u32, timestamp: u128, sequence: u64) -> String {
 fn session_id_at(pid: u32, timestamp: u128, counter: &AtomicU64) -> String {
     // Relaxed ordering is sufficient: the counter allocates identities, not
     // shared state. Fail rather than reuse a sequence after u64 exhaustion.
-    let sequence = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
-        .expect("session ID sequence exhausted");
+    let mut sequence = counter.load(Ordering::Relaxed);
+    loop {
+        let next = sequence.checked_add(1).expect("session ID sequence exhausted");
+        match counter.compare_exchange_weak(sequence, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(current) => sequence = current,
+        }
+    }
     session_id_from_parts(pid, timestamp, sequence)
 }
 
@@ -247,6 +252,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_session_sequences_are_unique() {
+        let counter = AtomicU64::new(0);
+        let ids = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let counter = &counter;
+                    scope.spawn(move || {
+                        (0..128)
+                            .map(|_| session_id_at(7, 42, counter))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("ID worker completed"))
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(ids.len(), 1024);
+        assert_eq!(counter.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
     fn generated_identity_does_not_alias_when_clock_repeats_or_moves_backwards() {
         let counter = AtomicU64::new(0);
         let first = session_id_at(123, 900, &counter);
@@ -255,11 +283,25 @@ mod tests {
         assert_ne!(first, repeated_clock);
         assert_ne!(first, backwards_clock);
         assert_ne!(repeated_clock, backwards_clock);
-        for id in [first, repeated_clock, backwards_clock,
-            session_id_from_parts(u32::MAX, u128::MAX, u64::MAX)] {
+        for id in [
+            first,
+            repeated_clock,
+            backwards_clock,
+            session_id_from_parts(u32::MAX, u128::MAX, u64::MAX),
+        ] {
             assert!(is_valid_jsh_session_id(&id));
             assert!(id.len() <= jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES);
         }
+    }
+
+    #[test]
+    fn final_available_sequence_advances_to_exhaustion_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            session_id_at(7, 42, &counter),
+            session_id_from_parts(7, 42, u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

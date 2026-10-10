@@ -1998,9 +1998,14 @@ mod tests {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
                 Err(std::io::Error::from(self.0))
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        for kind in [std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::PermissionDenied] {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
             super::write_session_diagnostic(&mut FailingSink(kind), "synthetic diagnostic");
         }
         // A sink that accepts zero bytes is also an ordinary WriteZero error.
@@ -2014,10 +2019,16 @@ mod tests {
         let mut output = Vec::new();
         super::write_session_diagnostic(&mut output, &raw);
         let shown = String::from_utf8(output).unwrap();
-        assert_eq!(shown, format!("[SessionPersistence] {}\n",
-            crate::review_text::bound_toast_text(raw)));
-        assert!(shown.len() <= "[SessionPersistence] ".len()
-            + crate::review_text::MAX_TOAST_BYTES + 1);
+        assert_eq!(
+            shown,
+            format!(
+                "[SessionPersistence] {}\n",
+                crate::review_text::bound_toast_text(raw)
+            )
+        );
+        assert!(
+            shown.len() <= "[SessionPersistence] ".len() + crate::review_text::MAX_TOAST_BYTES + 1
+        );
         assert_eq!(shown.matches('\n').count(), 1);
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));

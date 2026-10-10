@@ -703,8 +703,14 @@ mod tests {
         let valid = "sk-visible_09-+/:=!?";
         assert_eq!(validate_api_key_for_storage(valid).unwrap(), valid);
         for key in [
-            "", " padded", "padded ", "two words", "tab\tkey", "line\nkey",
-            "秘密", "key\u{200b}",
+            "",
+            " padded",
+            "padded ",
+            "two words",
+            "tab\tkey",
+            "line\nkey",
+            "秘密",
+            "key\u{200b}",
         ] {
             assert!(validate_api_key_for_storage(key).is_err());
         }
@@ -730,20 +736,24 @@ mod tests {
             assert!(expand_private_path_with_home(&path, None).is_err());
         }
         for home in ["/bad\n", "/bad\u{200b}"] {
-            assert!(expand_private_path_with_home(
-                "~/key", Some(std::ffi::OsStr::new(home))
-            ).is_err());
+            assert!(
+                expand_private_path_with_home("~/key", Some(std::ffi::OsStr::new(home))).is_err()
+            );
         }
         let oversized_home = format!("/{}", "x".repeat(16_383));
         assert!(expand_private_path_with_home(
-            "~/key", Some(std::ffi::OsStr::new(&oversized_home))
-        ).is_err());
+            "~/key",
+            Some(std::ffi::OsStr::new(&oversized_home))
+        )
+        .is_err());
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             assert!(expand_private_path_with_home(
-                "~/key", Some(std::ffi::OsStr::from_bytes(b"/bad\xff"))
-            ).is_err());
+                "~/key",
+                Some(std::ffi::OsStr::from_bytes(b"/bad\xff"))
+            )
+            .is_err());
         }
     }
 
@@ -753,7 +763,9 @@ mod tests {
 
         for home in ["", ".", "relative", "../relative"] {
             assert_eq!(
-                expand_private_home(OsStr::new(home), "key").unwrap_err().kind(),
+                expand_private_home(OsStr::new(home), "key")
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidInput
             );
         }
@@ -1003,7 +1015,7 @@ mod tests {
     #[test]
     fn persistence_supports_full_length_destination_names() {
         let root = TestDir::new("long-destination");
-        let path = root.join("s".repeat(255));
+        let path = root.join(&"s".repeat(255));
         write_private(&path, b"before");
 
         write_atomic(&path, b"after").unwrap();
@@ -1012,7 +1024,7 @@ mod tests {
         write_atomic_if_unchanged(&path, b"checked", &revision, 16).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"checked");
 
-        let export = root.join("e".repeat(255));
+        let export = root.join(&"e".repeat(255));
         write_new_private_file(&export, b"export", 16).unwrap();
         assert_eq!(fs::read(&export).unwrap(), b"export");
         assert_eq!(

@@ -1673,7 +1673,9 @@ mod tests {
             };
             let warnings = config.normalize();
             assert_eq!(config.ai_api_key_file.as_deref(), Some(path.as_str()));
-            assert!(warnings.iter().any(|warning| warning.starts_with("ai_api_key_file")));
+            assert!(warnings
+                .iter()
+                .any(|warning| warning.starts_with("ai_api_key_file")));
             let encoded = toml::to_string(&config).unwrap();
             let decoded: Config = toml::from_str(&encoded).unwrap();
             assert_eq!(decoded.ai_api_key_file, config.ai_api_key_file);

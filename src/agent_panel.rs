@@ -2045,9 +2045,13 @@ mod tests {
         let session = panel.session.as_mut().unwrap();
         assert_ne!(session.state(), AgentState::AwaitingModel);
         assert_eq!(
-            session.transcript().iter().filter(|turn| matches!(
-                turn, Turn::ProtocolError(message) if message.contains("synthetic thread limit")
-            )).count(),
+            session
+                .transcript()
+                .iter()
+                .filter(|turn| matches!(
+                    turn, Turn::ProtocolError(message) if message.contains("synthetic thread limit")
+                ))
+                .count(),
             1
         );
         session.retry_model().unwrap();

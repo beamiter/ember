@@ -5576,7 +5576,8 @@ mod tests {
     #[test]
     fn partial_local_copy_failure_revalidates_destination_and_keeps_clipboard() {
         for stale in [false, true] {
-            let scanner = Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
+            let scanner =
+                Arc::new(|_: &Path| Ok(DirectoryListing::complete(vec![]))) as Arc<ScanFn>;
             let parent = PathBuf::from("/synthetic/work");
             let src = PathBuf::from("/synthetic/source.txt");
             let mut sidebar = Sidebar::with_scanner(parent.clone(), scanner);
@@ -5596,9 +5597,15 @@ mod tests {
                 cut: false,
             };
             sidebar.set_clipboard(clipboard.clone());
-            assert!(sidebar.request_fs_op(
-                FsOpKind::Copy { src, dst: parent.join("partial.txt") }, true,
-            ).is_none());
+            assert!(sidebar
+                .request_fs_op(
+                    FsOpKind::Copy {
+                        src,
+                        dst: parent.join("partial.txt")
+                    },
+                    true,
+                )
+                .is_none());
             let request = requests.recv().unwrap();
             if stale {
                 sidebar.authority_generation += 1;
@@ -5611,13 +5618,19 @@ mod tests {
             );
             let messages = sidebar.poll_op_results();
             assert_eq!(
-                messages.iter().any(|message| message.contains("partial destination")),
+                messages
+                    .iter()
+                    .any(|message| message.contains("partial destination")),
                 !stale
             );
             assert_eq!(sidebar.clipboard.as_ref(), Some(&clipboard));
             assert_eq!(
                 sidebar.root.as_ref().unwrap().load_state,
-                if stale { DirectoryLoadState::Loaded } else { DirectoryLoadState::Refreshing }
+                if stale {
+                    DirectoryLoadState::Loaded
+                } else {
+                    DirectoryLoadState::Refreshing
+                }
             );
             let scans = &sidebar.scan_service.as_ref().unwrap().request_rx;
             if !stale {

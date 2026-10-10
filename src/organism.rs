@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use crate::config::OrganismMotion;
 pub use jterm_core::organism::{
-    classify_command, sprite_frame_with_context, sticky_glyph_with_context, CircadianPhase, CommandKind,
-    LifeState, NativeOrganism, Reaction, RenderContext,
+    classify_command, sprite_frame_with_context, sticky_glyph_with_context, CircadianPhase,
+    CommandKind, LifeState, NativeOrganism, Reaction, RenderContext,
 };
-pub use jterm_core::organism_daily::PreviewPose;
 use jterm_core::organism_daily::GentleInteraction;
+pub use jterm_core::organism_daily::PreviewPose;
 
 pub const INPUT_RETREAT: Duration = Duration::from_millis(900);
 pub const FULL_FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -39,10 +39,7 @@ pub struct PresentationPolicy {
 
 impl PresentationPolicy {
     fn eligible(self) -> bool {
-        self.enabled
-            && self.focused_owner
-            && self.local
-            && !self.alternate_screen
+        self.enabled && self.focused_owner && self.local && !self.alternate_screen
     }
 
     /// Static still permits a non-interactive inline/status representation.
@@ -222,7 +219,8 @@ impl WindowLife {
             self.state.tick(active.as_secs_f32(), true, resting, phase);
         }
         if !inactive.is_zero() {
-            self.state.tick(inactive.as_secs_f32(), false, resting, phase);
+            self.state
+                .tick(inactive.as_secs_f32(), false, resting, phase);
         }
         elapsed.as_secs_f32()
     }
@@ -250,12 +248,21 @@ mod tests {
         let mut life = WindowLife::new_at(Duration::ZERO);
         let phase = CircadianPhase::Unlearned;
         assert_eq!(life.advance(Duration::ZERO, true, false, phase), 0.0);
-        assert_eq!(life.advance(Duration::from_millis(100), true, false, phase), 0.1);
+        assert_eq!(
+            life.advance(Duration::from_millis(100), true, false, phase),
+            0.1
+        );
         let once = life_values(life.state());
-        assert_eq!(life.advance(Duration::from_millis(100), true, false, phase), 0.0);
+        assert_eq!(
+            life.advance(Duration::from_millis(100), true, false, phase),
+            0.0
+        );
         assert_eq!(life.advance(Duration::ZERO, true, false, phase), 0.0);
         assert_eq!(life_values(life.state()), once);
-        assert_eq!(life.advance(Duration::from_secs(3600), true, false, phase), 1.0);
+        assert_eq!(
+            life.advance(Duration::from_secs(3600), true, false, phase),
+            1.0
+        );
     }
 
     #[test]
@@ -267,9 +274,15 @@ mod tests {
         let before = life_values(life.state());
         assert_eq!(life.advance(Duration::ZERO, false, true, phase), 0.0);
         assert_eq!(life_values(life.state()), before);
-        assert_eq!(life.advance(Duration::from_secs(2), true, false, phase), 0.0);
+        assert_eq!(
+            life.advance(Duration::from_secs(2), true, false, phase),
+            0.0
+        );
         assert_eq!(life_values(life.state()), before);
-        assert_eq!(life.advance(Duration::from_secs(3), true, false, phase), 1.0);
+        assert_eq!(
+            life.advance(Duration::from_secs(3), true, false, phase),
+            1.0
+        );
     }
 
     #[test]

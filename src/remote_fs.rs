@@ -3295,10 +3295,7 @@ fn copy_regular_file_noreplace(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(src)?;
     let metadata = source.metadata()?;
-    if !metadata.is_file()
-        || metadata.dev() != expected.dev()
-        || metadata.ino() != expected.ino()
-    {
+    if !metadata.is_file() || metadata.dev() != expected.dev() || metadata.ino() != expected.ino() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "copy source changed before it could be opened",
@@ -4649,7 +4646,13 @@ docker = true
     #[test]
     fn stat_parser_requires_one_complete_numeric_record() {
         for output in [b"f 123\n".as_slice(), b"f    123 \n", b"f \t123\t\n"] {
-            assert_eq!(parse_stat(output), Some(RemoteStat { kind: b'f', size: 123 }));
+            assert_eq!(
+                parse_stat(output),
+                Some(RemoteStat {
+                    kind: b'f',
+                    size: 123
+                })
+            );
         }
         for output in [
             b"f 123".as_slice(),
@@ -4665,9 +4668,24 @@ docker = true
         ] {
             assert_eq!(parse_stat(output), None);
         }
-        assert_eq!(parse_stat(b"d 0\n"), Some(RemoteStat { kind: b'd', size: 0 }));
-        assert_eq!(parse_stat(b"l 0\n"), Some(RemoteStat { kind: b'l', size: 0 }));
-        assert_eq!(parse_stat(b"f 18446744073709551615\n").unwrap().size, u64::MAX);
+        assert_eq!(
+            parse_stat(b"d 0\n"),
+            Some(RemoteStat {
+                kind: b'd',
+                size: 0
+            })
+        );
+        assert_eq!(
+            parse_stat(b"l 0\n"),
+            Some(RemoteStat {
+                kind: b'l',
+                size: 0
+            })
+        );
+        assert_eq!(
+            parse_stat(b"f 18446744073709551615\n").unwrap().size,
+            u64::MAX
+        );
     }
 
     #[test]
@@ -4713,13 +4731,19 @@ docker = true
                 let mut result = capture(status, "");
                 result.timed_out = timed_out;
                 result.cancelled = cancelled;
-                assert_eq!(local_tar_available(Ok(result)).unwrap_err().kind(), expected);
+                assert_eq!(
+                    local_tar_available(Ok(result)).unwrap_err().kind(),
+                    expected
+                );
             }
         }
         assert!(local_tar_available(Ok(capture(Some(0), ""))).is_ok());
         for result in [
             Ok(capture(Some(1), "private diagnostic")),
-            Err(io::Error::new(io::ErrorKind::NotFound, "missing executable")),
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "missing executable",
+            )),
         ] {
             let error = local_tar_available(result).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -4729,8 +4753,8 @@ docker = true
             );
         }
         for kind in [io::ErrorKind::TimedOut, io::ErrorKind::Interrupted] {
-            let error = local_tar_available(Err(io::Error::new(kind, "capture interrupted")))
-                .unwrap_err();
+            let error =
+                local_tar_available(Err(io::Error::new(kind, "capture interrupted"))).unwrap_err();
             assert_eq!(error.kind(), kind);
             assert_eq!(error.to_string(), "capture interrupted");
         }
