@@ -57,7 +57,165 @@ enum SidebarTabAction {
     ConnectRemote(usize),
 }
 
+type TabMenuSnapshot = Vec<(Option<Vec<String>>, bool)>;
+
+#[derive(Clone)]
+pub(crate) struct TabRenameDraft {
+    opening: std::sync::Arc<()>,
+    members: Vec<String>,
+    text: String,
+}
+
+impl TabRenameDraft {
+    fn same_opening(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.opening, &other.opening)
+    }
+
+    fn resolve(&self, snapshot: &TabMenuSnapshot) -> Option<usize> {
+        let before = vec![(Some(self.members.clone()), false)];
+        match revalidate_tab_menu_action(SidebarTabAction::Rename(0), &before, snapshot)? {
+            SidebarTabAction::Rename(index) => Some(index),
+            _ => None,
+        }
+    }
+}
+
+fn tab_menu_popup_id(surface: &str, identity: &Option<Vec<String>>) -> Option<egui::Id> {
+    let members = identity.as_ref()?;
+    (!members.is_empty() && members.iter().all(|id| !id.is_empty()))
+        .then(|| egui::Id::new((surface, members)))
+}
+
+fn revalidate_tab_menu_action(
+    action: SidebarTabAction,
+    before: &TabMenuSnapshot,
+    after: &TabMenuSnapshot,
+) -> Option<SidebarTabAction> {
+    if let SidebarTabAction::CloseOthers(index) | SidebarTabAction::CloseToRight(index) = action {
+        before.get(index)?;
+    }
+    match action {
+        SidebarTabAction::Close(index)
+        | SidebarTabAction::Duplicate(index)
+        | SidebarTabAction::Rename(index)
+        | SidebarTabAction::ToggleMarked(index)
+        | SidebarTabAction::TogglePinned(index)
+        | SidebarTabAction::TogglePrivateTitle(index) => {
+            let identity = &before.get(index)?.0;
+            tab_menu_popup_id("validation", identity)?;
+            let mut matches = after
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| &item.0 == identity);
+            let current = matches.next()?.0;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(match action {
+                SidebarTabAction::Close(_) => SidebarTabAction::Close(current),
+                SidebarTabAction::Duplicate(_) => SidebarTabAction::Duplicate(current),
+                SidebarTabAction::Rename(_) => SidebarTabAction::Rename(current),
+                SidebarTabAction::ToggleMarked(_) => SidebarTabAction::ToggleMarked(current),
+                SidebarTabAction::TogglePinned(_) => SidebarTabAction::TogglePinned(current),
+                SidebarTabAction::TogglePrivateTitle(_) => {
+                    SidebarTabAction::TogglePrivateTitle(current)
+                }
+                _ => unreachable!(),
+            })
+        }
+        SidebarTabAction::CloseOthers(_)
+        | SidebarTabAction::CloseToRight(_)
+        | SidebarTabAction::CloseMarked => {
+            // Bulk actions must not acquire new victims after the click.
+            // Conservatively reject structural/order/marked-set changes.
+            (before == after
+                && before
+                    .iter()
+                    .all(|item| tab_menu_popup_id("validation", &item.0).is_some()))
+            .then_some(action)
+        }
+        _ => Some(action),
+    }
+}
+
 impl TerminalApp {
+    fn validate_tab_rename(&mut self) -> Option<usize> {
+        let index = self
+            .renaming_tab
+            .as_ref()
+            .and_then(|draft| draft.resolve(&self.tab_menu_snapshot()));
+        if index.is_none() {
+            self.renaming_tab = None;
+        }
+        index
+    }
+
+    fn start_tab_rename(&mut self, members: Vec<String>) {
+        let mut draft = TabRenameDraft {
+            opening: std::sync::Arc::new(()),
+            members,
+            text: String::new(),
+        };
+        let Some(index) = draft.resolve(&self.tab_menu_snapshot()) else {
+            return;
+        };
+        draft.text = self
+            .tab_display_session(index)
+            .and_then(|index| self.session_manager.sessions().get(index))
+            .map(|session| {
+                session
+                    .metadata
+                    .custom_name
+                    .clone()
+                    .unwrap_or_else(|| Self::session_cwd_title(session))
+            })
+            .unwrap_or_default();
+        self.renaming_tab = Some(draft);
+    }
+
+    fn commit_tab_rename(&mut self, draft: TabRenameDraft, text: String) {
+        if !self
+            .renaming_tab
+            .as_ref()
+            .is_some_and(|current| current.same_opening(&draft))
+        {
+            return;
+        }
+        self.renaming_tab = None;
+        if let Some(index) = draft.resolve(&self.tab_menu_snapshot()) {
+            self.apply_rename(index, text);
+        }
+    }
+
+    fn cancel_tab_rename(&mut self, draft: &TabRenameDraft) {
+        if self
+            .renaming_tab
+            .as_ref()
+            .is_some_and(|current| current.same_opening(draft))
+        {
+            self.renaming_tab = None;
+        }
+    }
+
+    fn tab_menu_snapshot(&self) -> TabMenuSnapshot {
+        (0..self.tabs.len())
+            .map(|index| {
+                let members = self
+                    .tabs
+                    .sessions_in(index)
+                    .into_iter()
+                    .map(|session| {
+                        self.session_manager
+                            .sessions()
+                            .get(session)
+                            .map(|session| session.metadata.session_id.clone())
+                    })
+                    .collect::<Option<Vec<_>>>();
+                (members, self.tabs.flags(index).marked)
+            })
+            .collect()
+    }
+
     /// Drop the in-flight tab drag, but only if `origin` started it. The
     /// horizontal top bar and the vertical sidebar list share the drag fields
     /// and both run every frame in Top mode; the top bar draws first, so an
@@ -288,7 +446,6 @@ impl TerminalApp {
         // Structural index changes invalidate every frame-local drag target.
         // Cancellation also restores any hover-previewed active tab first.
         self.clear_workspace_drag();
-        self.renaming_tab = None;
         let mut owned = self.tabs.sessions_in(tab_idx);
         // 先摘掉 tab,后续每次删除会话就只剩纯粹的索引平移;从大到小删除,
         // 保证还没处理的索引不会因为前面的删除而漂移。
@@ -357,10 +514,6 @@ impl TerminalApp {
         if !self.session_manager.close_session(index) {
             return false;
         }
-        // A split's focused session may disappear while its tab survives.
-        // The draft names a tab index, so never commit it onto the replacement
-        // focused pane. Refused closes above leave the editor untouched.
-        self.renaming_tab = None;
         let active_session_after = self
             .session_manager
             .sessions()
@@ -412,6 +565,7 @@ impl TerminalApp {
             self.clear_block_selection();
         }
         self.tabs.on_session_removed(index);
+        self.validate_tab_rename();
         self.force_resize_session = true;
         if self.search_state.is_open {
             self.refresh_search_matches();
@@ -425,8 +579,8 @@ impl TerminalApp {
         if from_idx == to_idx || from_idx >= self.tabs.len() || to_idx >= self.tabs.len() {
             return;
         }
-        self.renaming_tab = None;
         self.tabs.reorder(from_idx, to_idx);
+        self.validate_tab_rename();
     }
 
     /// 会话标题:用户双击重命名设置的 custom_name 优先;否则用 shell 当前工作
@@ -460,6 +614,8 @@ impl TerminalApp {
     /// 右键任意一行打开标签页操作菜单(与 anvil/forge 的侧边栏标签右键菜单同款)。
     pub fn render_sidebar_sessions(&mut self, ui: &mut egui::Ui) {
         self.refresh_unseen_flags_for_visible_panes();
+        let menu_snapshot = self.tab_menu_snapshot();
+        let renaming_index = self.validate_tab_rename();
         let active = self.tabs.active_index();
         let infos: Vec<SidebarTabInfo> = (0..self.tabs.len())
             .map(|i| SidebarTabInfo {
@@ -495,11 +651,11 @@ impl TerminalApp {
         let mut close_idx: Option<usize> = None;
         let mut new_session = false;
         let mut reorder: Option<(usize, usize)> = None;
-        let mut begin_rename: Option<usize> = None;
+        let mut begin_rename: Option<Vec<String>> = None;
         let mut menu_action: Option<SidebarTabAction> = None;
         // 提交/取消重命名需要在循环外处理,这里只收集事件,避免与 self 借用冲突。
-        let mut commit_rename: Option<(usize, String)> = None;
-        let mut cancel_rename = false;
+        let mut commit_rename: Option<(TabRenameDraft, String)> = None;
+        let mut cancel_rename: Option<TabRenameDraft> = None;
 
         // 拖拽阈值与顶部 tab bar 保持一致(5px),用 y 轴判断。Top 模式下顶部
         // tab 栏与本列表同帧存在且共享拖拽字段,所以只认本列表发起的拖拽。
@@ -535,8 +691,7 @@ impl TerminalApp {
                     } = info;
                     let is_active = *i == active;
                     let is_dragging_this = self.dragging_tab == Some(*i);
-                    let is_renaming_this =
-                        self.renaming_tab.as_ref().map(|(idx, _)| *idx) == Some(*i);
+                    let is_renaming_this = renaming_index == Some(*i);
                     let row_rect = egui::Rect::from_min_size(
                         ui.cursor().min,
                         egui::vec2(ui.available_width(), row_h),
@@ -562,26 +717,32 @@ impl TerminalApp {
                                 let mut buf = crate::session_persistence::bound_tab_title_draft(
                                     self.renaming_tab
                                         .as_ref()
-                                        .map(|(_, b)| b.clone())
+                                        .map(|draft| draft.text.clone())
                                         .unwrap_or_default(),
                                 );
+                                let rename_id = egui::Id::new((
+                                    "sidebar_tab_rename",
+                                    self.renaming_tab.as_ref().map(|draft| &draft.members),
+                                ));
                                 let edit = egui::TextEdit::singleline(&mut buf)
+                                    .id(rename_id)
                                     .desired_width(ui.available_width())
                                     .hint_text("(empty = clear custom name)");
                                 let r = ui.add_sized([ui.available_width(), row_h], edit);
                                 r.request_focus();
                                 buf = crate::session_persistence::bound_tab_title_draft(buf);
                                 // 同步回 self
-                                if let Some((_, ref mut existing)) = self.renaming_tab {
-                                    *existing = buf.clone();
+                                if let Some(draft) = &mut self.renaming_tab {
+                                    draft.text = buf.clone();
                                 }
                                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
                                 let lost_focus = r.lost_focus() && !enter && !esc;
                                 if enter {
-                                    commit_rename = Some((*i, buf));
+                                    commit_rename =
+                                        self.renaming_tab.clone().map(|draft| (draft, buf));
                                 } else if esc || lost_focus {
-                                    cancel_rename = true;
+                                    cancel_rename = self.renaming_tab.clone();
                                 }
                             } else {
                                 // 后台 tab 有未查看输出时用圆点提醒;固定/标记
@@ -628,22 +789,27 @@ impl TerminalApp {
                                     }
                                 }
                                 if resp.double_clicked() {
-                                    begin_rename = Some(*i);
+                                    begin_rename = menu_snapshot[*i].0.clone();
                                 } else if resp.clicked() && !is_actually_dragging {
                                     switch_to = Some(*i);
                                 }
                                 // 右键菜单挂在标签行上。菜单项只写 menu_action,
                                 // 真正的状态变更留到渲染闭包之外执行。
-                                resp.context_menu(|ui| {
-                                    Self::sidebar_tab_menu(
-                                        ui,
-                                        info,
-                                        infos.len(),
-                                        marked_count,
-                                        &remote_entries,
-                                        &mut menu_action,
-                                    );
-                                });
+                                if let Some(popup_id) = tab_menu_popup_id(
+                                    "sidebar_tab_context_menu",
+                                    &menu_snapshot[*i].0,
+                                ) {
+                                    egui::Popup::context_menu(&resp).id(popup_id).show(|ui| {
+                                        Self::sidebar_tab_menu(
+                                            ui,
+                                            info,
+                                            infos.len(),
+                                            marked_count,
+                                            &remote_entries,
+                                            &mut menu_action,
+                                        );
+                                    });
+                                }
                             }
                         });
                     });
@@ -756,7 +922,7 @@ impl TerminalApp {
         }
 
         if let Some((from_idx, to_idx)) = reorder {
-            // 重排后索引会漂移,正在编辑的重命名失效,避免提交到错的 tab
+            // Stable rename membership follows the reorder; queued menu actions revalidate below.
             self.reorder_tabs(from_idx, to_idx);
             self.schedule_session_save();
         }
@@ -773,29 +939,26 @@ impl TerminalApp {
         }
         // 右键菜单的操作在渲染闭包外统一执行。重命名走列表内的行内编辑器,
         // 因此只是把它转成本帧的 begin_rename。
-        if let Some(action) = menu_action {
+        if let Some(action) = menu_action.and_then(|action| {
+            revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot())
+        }) {
             match action {
-                SidebarTabAction::Rename(i) => begin_rename = Some(i),
+                SidebarTabAction::Rename(i) => {
+                    begin_rename = self
+                        .tab_menu_snapshot()
+                        .get(i)
+                        .and_then(|item| item.0.clone())
+                }
                 other => self.apply_sidebar_tab_action(other),
             }
         }
-        if let Some(i) = begin_rename {
-            let initial = self
-                .tab_display_session(i)
-                .and_then(|idx| self.session_manager.sessions().get(idx))
-                .map(|s| {
-                    s.metadata
-                        .custom_name
-                        .clone()
-                        .unwrap_or_else(|| Self::session_cwd_title(s))
-                })
-                .unwrap_or_default();
-            self.renaming_tab = Some((i, initial));
+        if let Some(members) = begin_rename {
+            self.start_tab_rename(members);
         }
-        if let Some((i, new_name)) = commit_rename {
-            self.apply_rename(i, new_name);
-        } else if cancel_rename {
-            self.renaming_tab = None;
+        if let Some((draft, new_name)) = commit_rename {
+            self.commit_tab_rename(draft, new_name);
+        } else if let Some(draft) = cancel_rename {
+            self.cancel_tab_rename(&draft);
         }
     }
 
@@ -984,14 +1147,13 @@ impl TerminalApp {
         });
     }
 
-    /// 翻转固定状态。固定会把标签页重排到最前,因此正在进行的行内重命名
-    /// (它按序号定位)必须作废。
+    /// Pinning reorders tabs; an unchanged rename target follows its membership.
     pub fn toggle_tab_pinned(&mut self, tab_idx: usize) {
         if tab_idx >= self.tabs.len() {
             return;
         }
         let pinned = self.tabs.toggle_pinned(tab_idx);
-        self.renaming_tab = None;
+        self.validate_tab_rename();
         self.clear_tab_drag(TabDragOrigin::Sidebar);
         self.schedule_session_save();
         self.set_status(if pinned { "Tab pinned" } else { "Tab unpinned" });
@@ -1229,6 +1391,7 @@ impl TerminalApp {
 
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
         self.refresh_unseen_flags_for_visible_panes();
+        let menu_snapshot = self.tab_menu_snapshot();
         let tab_height = 30.0;
         let close_btn_size = 14.0;
         let tab_rect = egui::Rect::from_min_size(
@@ -1477,8 +1640,8 @@ impl TerminalApp {
             i.pointer
                 .button_double_clicked(egui::PointerButton::Primary)
         });
-        let mut begin_rename_idx: Option<usize> = None;
-        let mut renaming_rect: Option<egui::Rect> = None;
+        let mut begin_rename_idx: Option<Vec<String>> = None;
+        let mut renaming_rect: Option<(std::sync::Arc<()>, egui::Rect)> = None;
 
         // === 顶栏左侧控件：☰ 侧边栏开关 + ⬓ 标签栏位置切换（始终显示）===
         {
@@ -1743,6 +1906,10 @@ impl TerminalApp {
             })
             .collect();
         let mut top_menu_action: Option<SidebarTabAction> = None;
+        // Direct close/reorder above may have invalidated the painted rows.
+        // Never combine an old row identity with a newly indexed menu target.
+        let menu_rows_current = menu_snapshot == self.tab_menu_snapshot();
+        let renaming_index = self.validate_tab_rename();
 
         // 绘制每个标签
         for (i, (_, display_text, _)) in tab_infos.iter().enumerate() {
@@ -1800,7 +1967,7 @@ impl TerminalApp {
             // response over each painted pill to provide the same right-click
             // menu as sidebar tabs.
             let hit_rect = tab_rect_item.intersect(tab_clip_rect);
-            if hit_rect.is_positive() {
+            if hit_rect.is_positive() && menu_rows_current {
                 let response = ui.interact(
                     hit_rect,
                     egui::Id::new(("top_tab_context_menu", i)),
@@ -1812,16 +1979,22 @@ impl TerminalApp {
                     unseen: tab_unseen.get(i).copied().unwrap_or(false),
                     flags: self.tabs.flags(i),
                 };
-                response.context_menu(|ui| {
-                    Self::sidebar_tab_menu(
-                        ui,
-                        &info,
-                        tab_count_for_menu,
-                        marked_count_for_menu,
-                        &remote_entries_for_menu,
-                        &mut top_menu_action,
-                    );
-                });
+                if let Some(popup_id) =
+                    tab_menu_popup_id("top_tab_context_menu", &menu_snapshot[i].0)
+                {
+                    egui::Popup::context_menu(&response)
+                        .id(popup_id)
+                        .show(|ui| {
+                            Self::sidebar_tab_menu(
+                                ui,
+                                &info,
+                                tab_count_for_menu,
+                                marked_count_for_menu,
+                                &remote_entries_for_menu,
+                                &mut top_menu_action,
+                            );
+                        });
+                }
             }
 
             // 背景色：圆角 pill 风格，hover 强度做淡入淡出
@@ -1887,14 +2060,17 @@ impl TerminalApp {
             }
 
             // 双击检测:落在本 tab 矩形且可见 -> 进入重命名
-            let is_renaming_this = self.renaming_tab.as_ref().map(|(idx, _)| *idx) == Some(i);
+            let is_renaming_this = menu_rows_current && renaming_index == Some(i);
             if is_renaming_this {
-                renaming_rect = Some(tab_rect_item);
+                renaming_rect = self
+                    .renaming_tab
+                    .as_ref()
+                    .map(|draft| (draft.opening.clone(), tab_rect_item));
             }
             if mouse_double_clicked && !is_actually_dragging {
                 if let Some(p) = hover_pos {
                     if tab_rect_item.contains(p) && tab_clip_rect.contains(p) {
-                        begin_rename_idx = Some(i);
+                        begin_rename_idx = menu_snapshot[i].0.clone();
                     }
                 }
             }
@@ -1996,9 +2172,16 @@ impl TerminalApp {
             x_offset += tab_width + tab_spacing;
         }
 
-        if let Some(action) = top_menu_action {
+        if let Some(action) = top_menu_action.and_then(|action| {
+            revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot())
+        }) {
             match action {
-                SidebarTabAction::Rename(index) => begin_rename_idx = Some(index),
+                SidebarTabAction::Rename(index) => {
+                    begin_rename_idx = self
+                        .tab_menu_snapshot()
+                        .get(index)
+                        .and_then(|item| item.0.clone())
+                }
                 action => self.apply_sidebar_tab_action(action),
             }
         }
@@ -2167,32 +2350,31 @@ impl TerminalApp {
         );
 
         // 进入重命名:用 begin_rename_idx 标记的 tab 当前标题做初值。
-        if let Some(i) = begin_rename_idx {
-            let initial = self
-                .tab_display_session(i)
-                .and_then(|idx| self.session_manager.sessions().get(idx))
-                .map(|s| {
-                    s.metadata
-                        .custom_name
-                        .clone()
-                        .unwrap_or_else(|| Self::session_cwd_title(s))
-                })
-                .unwrap_or_default();
-            self.renaming_tab = Some((i, initial));
+        if let Some(members) = begin_rename_idx {
+            self.start_tab_rename(members);
         }
+        self.validate_tab_rename();
 
         // 渲染重命名输入框:Area 覆盖在 tab 矩形上方,foreground 层级保证可见。
         // commit(Enter)写入 custom_name + 持久化;cancel(Esc/失焦)放弃。
-        if let (Some((idx, _)), Some(rect)) = (self.renaming_tab.clone(), renaming_rect) {
+        let rename_overlay =
+            self.renaming_tab
+                .clone()
+                .zip(renaming_rect)
+                .filter(|(draft, (opening, _))| {
+                    menu_snapshot == self.tab_menu_snapshot()
+                        && std::sync::Arc::ptr_eq(&draft.opening, opening)
+                });
+        if let Some((draft, (_, rect))) = rename_overlay {
             let mut buf = crate::session_persistence::bound_tab_title_draft(
                 self.renaming_tab
                     .as_ref()
-                    .map(|(_, b)| b.clone())
+                    .map(|draft| draft.text.clone())
                     .unwrap_or_default(),
             );
             let mut do_commit = false;
             let mut do_cancel = false;
-            egui::Area::new(egui::Id::new(("tab_rename_overlay", idx)))
+            egui::Area::new(egui::Id::new(("tab_rename_overlay", &draft.members)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(rect.left_top())
                 .show(ctx, |ui| {
@@ -2219,11 +2401,11 @@ impl TerminalApp {
                     );
                 });
             if do_commit {
-                self.apply_rename(idx, buf);
+                self.commit_tab_rename(draft, buf);
             } else if do_cancel {
-                self.renaming_tab = None;
-            } else if let Some((_, ref mut existing)) = self.renaming_tab {
-                *existing = crate::session_persistence::bound_tab_title_draft(buf);
+                self.cancel_tab_rename(&draft);
+            } else if let Some(draft) = &mut self.renaming_tab {
+                draft.text = crate::session_persistence::bound_tab_title_draft(buf);
             }
         }
 
@@ -2233,14 +2415,17 @@ impl TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_or_sidebar_selection_targets_session, workspace_drag_pointer_pos};
+    use super::{
+        block_or_sidebar_selection_targets_session, revalidate_tab_menu_action, tab_menu_popup_id,
+        workspace_drag_pointer_pos, SidebarTabAction, TabMenuSnapshot, TabRenameDraft,
+    };
     use crate::app::commands::CommandTarget;
     use eframe::egui;
 
     /// Auxiliary controller wiring guard; the headless close fixture also
     /// exercises successful/refused closes with the actual method body.
     #[test]
-    fn session_close_invalidates_index_bound_rename_only_after_success() {
+    fn session_close_revalidates_stable_rename_only_after_success() {
         let source = include_str!("tabs.rs");
         let close = source
             .split("    pub fn close_session_synced(")
@@ -2252,7 +2437,7 @@ mod tests {
         let mutation = close
             .find("if !self.session_manager.close_session(index)")
             .unwrap();
-        let clear = close.find("self.renaming_tab = None;").unwrap();
+        let clear = close.find("self.validate_tab_rename();").unwrap();
         assert!(mutation < clear);
         assert!(close[..clear].contains("return false;"));
     }
@@ -2302,5 +2487,262 @@ mod tests {
             None,
             "closed-session",
         ));
+    }
+    fn menu_snapshot(ids: &[&[&str]]) -> TabMenuSnapshot {
+        ids.iter()
+            .map(|members| {
+                (
+                    Some(members.iter().map(|id| (*id).to_owned()).collect()),
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_menu_popup_follows_membership_not_reused_index_or_title() {
+        let before = menu_snapshot(&[&["a"], &["b", "c"]]);
+        let after = menu_snapshot(&[&["b", "c"], &["new"]]);
+        for surface in ["top_tab_context_menu", "sidebar_tab_context_menu"] {
+            assert_eq!(
+                tab_menu_popup_id(surface, &before[1].0),
+                tab_menu_popup_id(surface, &after[0].0)
+            );
+            assert_ne!(
+                tab_menu_popup_id(surface, &before[0].0),
+                tab_menu_popup_id(surface, &after[0].0)
+            );
+            assert_ne!(
+                tab_menu_popup_id(surface, &before[1].0),
+                tab_menu_popup_id(surface, &Some(vec!["b".into()]))
+            );
+            assert!(tab_menu_popup_id(surface, &None).is_none());
+            assert!(tab_menu_popup_id(surface, &Some(vec![])).is_none());
+            assert!(tab_menu_popup_id(surface, &Some(vec![String::new()])).is_none());
+        }
+    }
+
+    #[test]
+    fn queued_close_resolves_surviving_identity_after_reorder() {
+        let before = menu_snapshot(&[&["a"], &["b"]]);
+        let after = menu_snapshot(&[&["b"], &["a"]]);
+        assert_eq!(
+            revalidate_tab_menu_action(SidebarTabAction::Close(0), &before, &after),
+            Some(SidebarTabAction::Close(1))
+        );
+        assert!(revalidate_tab_menu_action(
+            SidebarTabAction::Close(0),
+            &before,
+            &menu_snapshot(&[&["b"]])
+        )
+        .is_none());
+        assert!(revalidate_tab_menu_action(
+            SidebarTabAction::Close(0),
+            &before,
+            &menu_snapshot(&[&["a", "new"], &["b"]])
+        )
+        .is_none());
+        assert!(revalidate_tab_menu_action(
+            SidebarTabAction::Close(0),
+            &before,
+            &menu_snapshot(&[&["a"], &["a"]])
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn queued_bulk_close_rejects_changed_membership_order_or_marks() {
+        let before = menu_snapshot(&[&["a"], &["b"]]);
+        for action in [
+            SidebarTabAction::CloseOthers(0),
+            SidebarTabAction::CloseToRight(0),
+            SidebarTabAction::CloseMarked,
+        ] {
+            assert_eq!(
+                revalidate_tab_menu_action(action, &before, &before),
+                Some(action)
+            );
+            for after in [
+                menu_snapshot(&[&["b"], &["a"]]),
+                menu_snapshot(&[&["a"], &["b"], &["new"]]),
+                menu_snapshot(&[&["a"]]),
+            ] {
+                assert!(revalidate_tab_menu_action(action, &before, &after).is_none());
+            }
+            let mut marked = before.clone();
+            marked[1].1 = true;
+            assert!(revalidate_tab_menu_action(action, &before, &marked).is_none());
+        }
+        assert!(
+            revalidate_tab_menu_action(SidebarTabAction::CloseOthers(9), &before, &before)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn both_tab_menu_paths_bind_popup_identity_and_revalidate_close() {
+        let source = include_str!("tabs.rs");
+        for (start, end) in [
+            (
+                "    pub fn render_sidebar_sessions(",
+                "    fn sidebar_tab_menu(",
+            ),
+            ("    pub fn render_tab_bar(", "#[cfg(test)]"),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(body.contains(".id(popup_id)"));
+            assert!(body.contains("tab_menu_popup_id("));
+            assert!(body.contains(
+                "revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot())"
+            ));
+        }
+        let top = source.split_once("    pub fn render_tab_bar(").unwrap().1;
+        assert!(top.contains("let menu_rows_current = menu_snapshot == self.tab_menu_snapshot();"));
+        assert!(top.contains("if hit_rect.is_positive() && menu_rows_current"));
+        let capture = top
+            .find("let menu_snapshot = self.tab_menu_snapshot();")
+            .unwrap();
+        let gate = top
+            .find("let menu_rows_current = menu_snapshot == self.tab_menu_snapshot();")
+            .unwrap();
+        let build = top
+            .find("if hit_rect.is_positive() && menu_rows_current")
+            .unwrap();
+        for mutation in [
+            "self.reorder_tabs(from_idx, target_idx)",
+            "self.close_tab_synced(i)",
+        ] {
+            let mutation = top.find(mutation).unwrap();
+            assert!(capture < mutation && mutation < gate && gate < build);
+        }
+    }
+    #[test]
+    fn queued_non_close_tab_actions_remap_or_reject_the_same_identity() {
+        let before = menu_snapshot(&[&["a"], &["b"]]);
+        let after = menu_snapshot(&[&["b"], &["a"]]);
+        for (action, expected) in [
+            (
+                SidebarTabAction::Duplicate(0),
+                SidebarTabAction::Duplicate(1),
+            ),
+            (SidebarTabAction::Rename(0), SidebarTabAction::Rename(1)),
+            (
+                SidebarTabAction::ToggleMarked(0),
+                SidebarTabAction::ToggleMarked(1),
+            ),
+            (
+                SidebarTabAction::TogglePinned(0),
+                SidebarTabAction::TogglePinned(1),
+            ),
+            (
+                SidebarTabAction::TogglePrivateTitle(0),
+                SidebarTabAction::TogglePrivateTitle(1),
+            ),
+        ] {
+            assert_eq!(
+                revalidate_tab_menu_action(action, &before, &after),
+                Some(expected)
+            );
+            assert!(
+                revalidate_tab_menu_action(action, &before, &menu_snapshot(&[&["b"]])).is_none()
+            );
+            assert!(
+                revalidate_tab_menu_action(action, &before, &menu_snapshot(&[&["a"], &["a"]]))
+                    .is_none()
+            );
+        }
+        for action in [SidebarTabAction::NewTab, SidebarTabAction::ConnectRemote(9)] {
+            assert_eq!(
+                revalidate_tab_menu_action(action, &before, &after),
+                Some(action)
+            );
+        }
+    }
+    #[test]
+    fn rename_draft_follows_insertion_and_preserves_typed_text() {
+        let mut draft = TabRenameDraft {
+            opening: std::sync::Arc::new(()),
+            members: vec!["a".into()],
+            text: "original".into(),
+        };
+        let before = menu_snapshot(&[&["a"], &["b"]]);
+        assert_eq!(draft.resolve(&before), Some(0));
+        let after = menu_snapshot(&[&["new"], &["b"], &["a"]]);
+        draft.text = "edited title".into();
+        assert_eq!(draft.resolve(&after), Some(2));
+        assert_eq!(draft.text, "edited title");
+        assert_eq!(draft.resolve(&menu_snapshot(&[&["a"]])), Some(0));
+    }
+
+    #[test]
+    fn rename_draft_rejects_changed_missing_or_ambiguous_group() {
+        let draft = TabRenameDraft {
+            opening: std::sync::Arc::new(()),
+            members: vec!["a".into(), "b".into()],
+            text: "draft".into(),
+        };
+        for snapshot in [
+            menu_snapshot(&[&["a"]]),
+            menu_snapshot(&[&["a", "b", "new"]]),
+            menu_snapshot(&[&["a", "b"], &["a", "b"]]),
+            menu_snapshot(&[&["other"]]),
+        ] {
+            assert!(draft.resolve(&snapshot).is_none());
+        }
+        assert!(TabRenameDraft {
+            opening: std::sync::Arc::new(()),
+            members: vec![],
+            text: "draft".into()
+        }
+        .resolve(&menu_snapshot(&[&[]]))
+        .is_none());
+    }
+
+    #[test]
+    fn rename_editor_resolves_membership_again_at_commit() {
+        let source = include_str!("tabs.rs");
+        let commit = source
+            .split_once("    fn commit_tab_rename(")
+            .unwrap()
+            .1
+            .split_once("    fn tab_menu_snapshot(")
+            .unwrap()
+            .0;
+        assert!(
+            commit
+                .find("draft.resolve(&self.tab_menu_snapshot())")
+                .unwrap()
+                < commit.find("self.apply_rename(index, text)").unwrap()
+        );
+        assert!(source.contains("self.commit_tab_rename(draft, new_name)"));
+        assert!(source.contains("self.commit_tab_rename(draft, buf)"));
+        assert!(source.contains("(\"tab_rename_overlay\", &draft.members)"));
+        assert!(commit.contains("current.same_opening(&draft)"));
+        assert!(source.contains("self.cancel_tab_rename(&draft)"));
+        assert!(source.contains("std::sync::Arc::ptr_eq(&draft.opening, opening)"));
+    }
+
+    #[test]
+    fn rename_opening_token_rejects_stale_events_even_for_same_membership() {
+        let original = TabRenameDraft {
+            opening: std::sync::Arc::new(()),
+            members: vec!["a".into()],
+            text: "first".into(),
+        };
+        let mut captured = original.clone();
+        captured.text = "edited".into();
+        assert!(original.same_opening(&captured));
+        let reopened = TabRenameDraft {
+            opening: std::sync::Arc::new(()),
+            members: original.members.clone(),
+            text: "second".into(),
+        };
+        assert!(!reopened.same_opening(&captured));
     }
 }

@@ -205,10 +205,9 @@ pub struct TerminalApp {
     pub tab_drag_origin: Option<TabDragOrigin>,
     pub current_mouse_x: f32,
     pub tab_scroll_offset: f32,
-    /// 双击 tab 进入重命名:(会话索引, 编辑中的名称缓冲)。提交时写入
-    /// session.metadata.name 并触发持久化;Esc 放弃。重排/关闭等结构性
-    /// 操作会顺手清空,避免索引漂移后继续提交到错误的会话。
-    pub renaming_tab: Option<(usize, String)>,
+    /// Rename text is bound to stable tab membership, resolved again at commit.
+    /// Benign index shifts preserve it; changed or vanished groups cancel it.
+    pub renaming_tab: Option<super::tabs::TabRenameDraft>,
 
     // Search state
     pub search_state: search::SearchState,
