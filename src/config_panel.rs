@@ -37,6 +37,10 @@ pub enum ConfigTab {
     Remote,
 }
 
+fn remote_editor_row_id(epoch: u64, index: usize) -> egui::Id {
+    egui::Id::new(("remote_host_draft", epoch, index))
+}
+
 /// One `[[remote_hosts]]` entry under edit. Wraps the full family type so
 /// fields the tab does not surface (ssh_args, session, remote_shell,
 /// deploy_artifact) round-trip untouched; `user` gets its own buffer because
@@ -164,6 +168,9 @@ pub struct ConfigPanel {
     edit_experimental_task_sidebar: bool,
     edit_preferred_fix_provider: String,
     edit_remote_hosts: Vec<RemoteHostDraft>,
+    // Ephemeral widget namespace. Structural replacement must not inherit
+    // another row's cursor, undo history, pending click or dropdown state.
+    remote_editor_epoch: u64,
     // 系统字体缓存
     monospace_fonts: Vec<String>,
     all_fonts: Vec<String>,
@@ -232,6 +239,7 @@ impl ConfigPanel {
             edit_experimental_task_sidebar: false,
             edit_preferred_fix_provider: "codex".to_string(),
             edit_remote_hosts: Vec::new(),
+            remote_editor_epoch: 0,
             monospace_fonts: Vec::new(),
             all_fonts: Vec::new(),
             available_themes: Vec::new(),
@@ -294,6 +302,7 @@ impl ConfigPanel {
     }
 
     pub fn sync_from_config(&mut self, config: &Config) {
+        self.renew_remote_editor_epoch();
         self.has_changes = false;
         self.edit_font_size = config.font_size;
         self.edit_font_weight = config.font_weight;
@@ -1747,6 +1756,31 @@ impl ConfigPanel {
         }
     }
 
+    fn renew_remote_editor_epoch(&mut self) {
+        self.remote_editor_epoch = self
+            .remote_editor_epoch
+            .checked_add(1)
+            .expect("remote editor identity epoch exhausted");
+    }
+
+    fn remove_remote_host_draft(&mut self, index: usize) -> bool {
+        if index >= self.edit_remote_hosts.len() {
+            return false;
+        }
+        self.edit_remote_hosts.remove(index);
+        self.renew_remote_editor_epoch();
+        true
+    }
+
+    fn add_remote_host_draft(&mut self) -> bool {
+        if self.edit_remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS {
+            return false;
+        }
+        self.edit_remote_hosts.push(RemoteHostDraft::template());
+        self.renew_remote_editor_epoch();
+        true
+    }
+
     fn render_remote_tab(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.label(RichText::new("Remote Hosts").strong().size(14.0));
         ui.separator();
@@ -1764,12 +1798,14 @@ impl ConfigPanel {
 
         let mut changed = false;
         let mut delete_index = None;
+        let editor_epoch = self.remote_editor_epoch;
         for (index, draft) in self
             .edit_remote_hosts
             .iter_mut()
             .take(crate::config::MAX_REMOTE_HOST_UI_ROWS)
             .enumerate()
         {
+            ui.push_id(remote_editor_row_id(editor_epoch, index), |ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 // Preflight before deriving labels or constructing the
                 // bounded owning value used by shared semantic validation.
@@ -1843,7 +1879,7 @@ impl ConfigPanel {
                         },
                         64,
                     );
-                    egui::ComboBox::from_id_salt(("remote_host_deploy", index))
+                    egui::ComboBox::from_id_salt("remote_host_deploy")
                         .selected_text(current_label)
                         .width(110.0)
                         .show_ui(ui, |ui| {
@@ -1867,6 +1903,7 @@ impl ConfigPanel {
                     ui.colored_label(warning_color(theme), problem);
                 }
             });
+            });
             ui.add_space(4.0);
         }
         if self.edit_remote_hosts.len() > crate::config::MAX_REMOTE_HOST_UI_ROWS {
@@ -1880,8 +1917,7 @@ impl ConfigPanel {
             );
         }
         if let Some(index) = delete_index {
-            self.edit_remote_hosts.remove(index);
-            changed = true;
+            changed |= self.remove_remote_host_draft(index);
         }
 
         let at_capacity = self.edit_remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS;
@@ -1889,8 +1925,7 @@ impl ConfigPanel {
             .add_enabled(!at_capacity, egui::Button::new("+ Add host"))
             .clicked()
         {
-            self.edit_remote_hosts.push(RemoteHostDraft::template());
-            changed = true;
+            changed |= self.add_remote_host_draft();
         }
         if at_capacity {
             let message = if self.edit_remote_hosts.len() == crate::config::MAX_REMOTE_HOSTS {
@@ -2308,5 +2343,78 @@ deploy = "persist"
         draft.user = "repaired-user".to_string();
         assert!(draft.validate_for_apply().is_ok());
         assert_eq!(draft.applied().user.as_deref(), Some("repaired-user"));
+    }
+    #[test]
+    fn remote_editor_structural_changes_retire_row_widget_ids() {
+        let mut panel = ConfigPanel::new();
+        let config = Config::default();
+        panel.sync_from_config(&config);
+        assert!(!panel.edit_remote_hosts.is_empty());
+        let original = super::remote_editor_row_id(panel.remote_editor_epoch, 0);
+        panel.edit_remote_hosts[0].host.name.push_str(" edited");
+        panel.edit_remote_hosts[0].user.push_str(" user");
+        assert_eq!(
+            original,
+            super::remote_editor_row_id(panel.remote_editor_epoch, 0)
+        );
+        let epoch = panel.remote_editor_epoch;
+        assert!(!panel.remove_remote_host_draft(usize::MAX));
+        assert_eq!(epoch, panel.remote_editor_epoch);
+        assert!(panel.remove_remote_host_draft(0));
+        assert_ne!(
+            original,
+            super::remote_editor_row_id(panel.remote_editor_epoch, 0)
+        );
+        let after_delete = panel.remote_editor_epoch;
+        assert!(panel.add_remote_host_draft());
+        assert_ne!(after_delete, panel.remote_editor_epoch);
+        let after_add = panel.remote_editor_epoch;
+        panel.sync_from_config(&config);
+        assert_ne!(after_add, panel.remote_editor_epoch);
+    }
+
+    #[test]
+    fn remote_editor_namespaces_separate_rows_and_replacement_epochs() {
+        let old_a = super::remote_editor_row_id(1, 0);
+        let old_b = super::remote_editor_row_id(1, 1);
+        let shifted_b = super::remote_editor_row_id(2, 0);
+        assert_ne!(old_a, old_b);
+        assert_ne!(old_a, shifted_b);
+        assert_ne!(old_b, shifted_b);
+        // Pinned egui retains undo points when a positional widget receives
+        // different text; a fresh row namespace prevents that state lookup.
+        let mut undo = eframe::egui::util::undoer::Undoer::<String>::default();
+        undo.feed_state(0.0, &"old row".to_owned());
+        undo.feed_state(0.1, &"new row".to_owned());
+        assert_eq!(
+            undo.undo(&"new row".to_owned()).map(String::as_str),
+            Some("old row")
+        );
+    }
+
+    #[test]
+    fn remote_editor_row_scope_covers_fields_and_deploy_popup() {
+        let source = include_str!("config_panel.rs");
+        let body = source
+            .split_once("    fn render_remote_tab(")
+            .unwrap()
+            .1
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        let scope = body
+            .find("ui.push_id(remote_editor_row_id(editor_epoch, index)")
+            .unwrap();
+        for field in [
+            "&mut draft.host.name",
+            "&mut draft.host.host",
+            "&mut draft.user",
+            "&mut draft.host.docker",
+            "ComboBox::from_id_salt(\"remote_host_deploy\")",
+        ] {
+            assert!(scope < body.find(field).unwrap());
+        }
+        assert!(body.contains("self.remove_remote_host_draft(index)"));
+        assert!(body.contains("self.add_remote_host_draft()"));
     }
 }
