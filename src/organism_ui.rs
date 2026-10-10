@@ -831,8 +831,63 @@ fn reaction_duration(reaction: &Reaction) -> Duration {
     })
 }
 
+#[derive(Default)]
+struct PreviewSequence {
+    started: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DemoStep {
+    index: usize,
+    pose: PreviewPose,
+    next_in: Duration,
+}
+
+impl DemoStep {
+    fn next_wake(self, full: bool) -> Duration {
+        if full {
+            self.next_in.min(Duration::from_millis(100))
+        } else {
+            self.next_in
+        }
+    }
+}
+
+impl PreviewSequence {
+    const POSES: [PreviewPose; 5] = [
+        PreviewPose::Calm,
+        PreviewPose::Working,
+        PreviewPose::Concerned,
+        PreviewPose::Success,
+        PreviewPose::Sleeping,
+    ];
+
+    fn start(&mut self, now: Duration) {
+        self.started = Some(now);
+    }
+
+    fn stop(&mut self) {
+        self.started = None;
+    }
+
+    fn sample(&mut self, now: Duration) -> Option<DemoStep> {
+        let elapsed = now.saturating_sub(self.started?);
+        if elapsed >= Duration::from_secs(10) {
+            self.stop();
+            return None;
+        }
+        let index = elapsed.as_secs() as usize / 2;
+        Some(DemoStep {
+            index,
+            pose: Self::POSES[index],
+            next_in: Duration::from_secs((index as u64 + 1) * 2) - elapsed,
+        })
+    }
+}
+
 pub struct PreviewUi {
     model: OrganismPreview,
+    demo: PreviewSequence,
     pose: PreviewPose,
     born: Instant,
     greeting_until: Duration,
@@ -843,6 +898,7 @@ impl Default for PreviewUi {
     fn default() -> Self {
         Self {
             model: OrganismPreview::default(),
+            demo: PreviewSequence::default(),
             pose: PreviewPose::Calm,
             born: Instant::now(),
             greeting_until: Duration::ZERO,
@@ -853,7 +909,24 @@ impl Default for PreviewUi {
 
 impl PreviewUi {
     pub fn close(&mut self) {
+        self.demo.stop();
         self.model.close();
+        self.greeting_until = Duration::ZERO;
+    }
+
+    fn start_demo(&mut self, now: Duration) {
+        // Cancel only the isolated greeting, retaining its real cooldown and
+        // the manually selected pose. No live host/model is accessed.
+        self.model.close();
+        self.model.open();
+        self.greeting_until = Duration::ZERO;
+        self.demo.start(now);
+    }
+
+    fn select_pose(&mut self, pose: PreviewPose) {
+        self.demo.stop();
+        self.pose = pose;
+        self.model.select_pose(pose);
         self.greeting_until = Duration::ZERO;
     }
 
@@ -884,40 +957,58 @@ impl PreviewUi {
                         .selectable_value(&mut self.pose, pose, pose.label())
                         .changed()
                     {
-                        self.model.select_pose(pose);
-                        self.greeting_until = Duration::ZERO;
+                        self.select_pose(pose);
                     }
                 }
             });
         let now = self.born.elapsed();
         let availability = self.model.greeting_availability(now);
+        let playing = self.demo.sample(now).is_some();
+        let demo_button = ui.add_enabled(
+            availability != GreetingAvailability::Closed,
+            egui::Button::new(if playing { "Stop demo" } else { "Play demo" }),
+        );
+        if demo_button.clicked() {
+            if playing {
+                self.demo.stop();
+            } else {
+                self.start_demo(now);
+            }
+        }
+        let demo = self.demo.sample(now);
         let button = ui.add_enabled(
-            availability == GreetingAvailability::Available,
+            demo.is_none() && availability == GreetingAvailability::Available,
             egui::Button::new("Say hello"),
         );
-        match availability {
-            GreetingAvailability::Closed => {
-                ui.small("Preview paused while window is inactive");
+        if let Some(step) = demo {
+            ui.small(format!("Demo {}/5: {} (example)", step.index + 1, step.pose.label()));
+            ui.small(step.pose.explanation());
+            ui.small("No command is run. Say hello is paused during the demo.");
+        } else {
+            match availability {
+                GreetingAvailability::Closed => {
+                    ui.small("Preview paused while window is inactive");
+                }
+                GreetingAvailability::Busy => {
+                    ui.small("Unavailable for this pose");
+                }
+                GreetingAvailability::CoolingDown => {
+                    ui.small("Wait for the greeting cooldown");
+                }
+                _ => {}
             }
-            GreetingAvailability::Busy => {
-                ui.small("Unavailable for this pose");
-            }
-            GreetingAvailability::CoolingDown => {
-                ui.small("Wait for the greeting cooldown");
-            }
-            _ => {}
         }
-        if button.clicked() && self.model.say_hello(now) {
+        if demo.is_none() && button.clicked() && self.model.say_hello(now) {
             self.greeting_until = now.saturating_add(GentleInteraction::HOLD);
             self.hello_ready_at = now.saturating_add(GentleInteraction::COOLDOWN);
         }
         {
             // Keep the same settings layout while inactive, without replaying
             // a canceled greeting or requesting background animation frames.
-            let context = self
-                .model
-                .context(now)
-                .unwrap_or_else(|| self.pose.context());
+            let context = demo.map_or_else(
+                || self.model.context(now).unwrap_or_else(|| self.pose.context()),
+                |step| step.pose.context(),
+            );
             let full = availability != GreetingAvailability::Closed
                 && resolved_motion(motion) == OrganismMotion::Full;
             let frame = if full {
@@ -931,13 +1022,20 @@ impl PreviewUi {
                     RichText::new(sprite_frame_with_context(context, frame)).monospace(),
                 ),
             );
-            if let Some(delay) = preview_next_wake(
-                now,
-                full,
-                self.greeting_until,
-                self.hello_ready_at,
-                self.model.greeting_availability(now),
-            ) {
+            let next = if availability == GreetingAvailability::Closed {
+                None
+            } else if let Some(step) = demo {
+                Some(step.next_wake(full))
+            } else {
+                preview_next_wake(
+                    now,
+                    full,
+                    self.greeting_until,
+                    self.hello_ready_at,
+                    self.model.greeting_availability(now),
+                )
+            };
+            if let Some(delay) = next {
                 ui.ctx().request_repaint_after(delay);
             }
         }
@@ -977,6 +1075,102 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn preview_demo_runs_once_at_exact_phase_boundaries() {
+        let mut demo = PreviewSequence::default();
+        assert!(demo.sample(Duration::ZERO).is_none());
+        demo.start(Duration::ZERO);
+        for (millis, pose, remaining) in [
+            (0, PreviewPose::Calm, 2000),
+            (1999, PreviewPose::Calm, 1),
+            (2000, PreviewPose::Working, 2000),
+            (4000, PreviewPose::Concerned, 2000),
+            (6000, PreviewPose::Success, 2000),
+            (8000, PreviewPose::Sleeping, 2000),
+            (9999, PreviewPose::Sleeping, 1),
+        ] {
+            let step = demo.sample(Duration::from_millis(millis)).unwrap();
+            assert_eq!(step.pose, pose);
+            assert_eq!(step.next_in, Duration::from_millis(remaining));
+        }
+        assert!(demo.sample(Duration::from_secs(10)).is_none());
+        assert!(demo.sample(Duration::from_secs(11)).is_none());
+        demo.start(Duration::from_secs(20));
+        assert!(demo.sample(Duration::from_secs(80)).is_none());
+        assert!(demo.sample(Duration::from_secs(81)).is_none());
+    }
+
+    #[test]
+    fn preview_demo_static_has_only_finite_phase_and_end_wakes() {
+        let mut demo = PreviewSequence::default();
+        demo.start(Duration::ZERO);
+        let first = demo.sample(Duration::ZERO).unwrap();
+        assert_eq!(first.next_wake(false), Duration::from_secs(2));
+        assert_eq!(first.next_wake(true), Duration::from_millis(100));
+        let last = demo.sample(Duration::from_millis(9999)).unwrap();
+        assert_eq!(last.next_wake(false), Duration::from_millis(1));
+        assert!(demo.sample(Duration::from_secs(10)).is_none());
+        assert_eq!(
+            preview_next_wake(
+                Duration::from_secs(10),
+                false,
+                Duration::ZERO,
+                Duration::ZERO,
+                GreetingAvailability::Available,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_demo_preserves_manual_pose_and_real_greeting_cooldown() {
+        let mut preview = PreviewUi::default();
+        preview.sync_viewport(true, false);
+        preview.select_pose(PreviewPose::Curious);
+        assert!(preview.model.say_hello(Duration::ZERO));
+        preview.start_demo(Duration::from_secs(1));
+        assert_eq!(preview.pose, PreviewPose::Curious);
+        assert_eq!(
+            preview.model.greeting_availability(Duration::from_secs(2)),
+            GreetingAvailability::CoolingDown
+        );
+        assert_eq!(preview.model.context(Duration::from_secs(2)), Some(PreviewPose::Curious.context()));
+        assert!(preview.demo.sample(Duration::from_secs(11)).is_none());
+        assert_eq!(preview.pose, PreviewPose::Curious);
+        assert_eq!(
+            preview.model.greeting_availability(Duration::from_secs(11)),
+            GreetingAvailability::Available
+        );
+    }
+
+    #[test]
+    fn preview_demo_cancels_on_stop_pose_close_and_inactive_viewport() {
+        let mut preview = PreviewUi::default();
+        preview.sync_viewport(true, false);
+        preview.start_demo(Duration::ZERO);
+        preview.demo.stop();
+        assert!(preview.demo.sample(Duration::from_secs(1)).is_none());
+        preview.start_demo(Duration::ZERO);
+        preview.select_pose(PreviewPose::Sleeping);
+        assert!(preview.demo.sample(Duration::from_secs(1)).is_none());
+        assert_eq!(preview.pose, PreviewPose::Sleeping);
+        preview.start_demo(Duration::ZERO);
+        preview.close();
+        assert!(preview.demo.sample(Duration::from_secs(1)).is_none());
+        for (focused, occluded) in [(false, false), (true, true)] {
+            preview.sync_viewport(true, false);
+            preview.start_demo(Duration::ZERO);
+            preview.sync_viewport(focused, occluded);
+            assert!(preview.demo.sample(Duration::from_secs(1)).is_none());
+            assert_eq!(
+                preview.model.greeting_availability(Duration::from_secs(1)),
+                GreetingAvailability::Closed
+            );
+            preview.sync_viewport(true, false);
+            assert!(preview.demo.sample(Duration::from_secs(2)).is_none());
+        }
+    }
 
     #[test]
     fn companion_height_depends_only_on_explicit_preferences() {
