@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
-use jterm_core::organism::{AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone, WatchRhythm};
+use jterm_core::organism::{
+    AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone, VisualTransition, WatchRhythm,
+};
 use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 
 use crate::config::{Config, OrganismMotion};
@@ -110,6 +112,106 @@ fn live_greeting_allowed(
         && resolved_motion(policy.motion) != OrganismMotion::Static
         && !running
         && !buttons_down
+}
+
+/// Endpoints are committed only after a visible body paint command is submitted.
+/// This is not evidence that a GPU frame has reached the screen.
+#[derive(Clone, Copy, Default)]
+struct PaintedBridge {
+    last_settled: Option<Behavior>,
+    active: Option<PaintedArc>,
+}
+
+#[derive(Clone, Copy)]
+struct PaintedArc {
+    transition: VisualTransition,
+    started: Duration,
+}
+
+struct BodyPaintPlan {
+    context: RenderContext,
+    frame: u64,
+    after_submit: PaintedBridge,
+}
+
+impl PaintedBridge {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn direct(target: RenderContext, frame: u64) -> BodyPaintPlan {
+        BodyPaintPlan {
+            context: target,
+            frame,
+            after_submit: Self {
+                last_settled: Some(target.behavior),
+                active: None,
+            },
+        }
+    }
+
+    fn plan_at_cadence(
+        &self,
+        now: Duration,
+        target: RenderContext,
+        frame: u64,
+        cadence_active: bool,
+    ) -> BodyPaintPlan {
+        if cadence_active {
+            self.plan(now, target, frame)
+        } else {
+            Self::direct(target, frame)
+        }
+    }
+
+    fn plan(&self, now: Duration, target: RenderContext, frame: u64) -> BodyPaintPlan {
+        let direct = || Self::direct(target, frame);
+        if let Some(arc) = self.active {
+            // A newer authoritative target interrupts immediately. Never queue
+            // an arc or infer a settled source from an intermediate bridge pose.
+            if arc.transition.target() != target.behavior {
+                return direct();
+            }
+            let relative = now.saturating_sub(arc.started).as_millis() / 100;
+            if relative >= u128::from(arc.transition.frame_count()) {
+                return direct();
+            }
+            return BodyPaintPlan {
+                context: target.with_transition(Some(arc.transition)),
+                frame: relative as u64,
+                after_submit: *self,
+            };
+        }
+        let Some(transition) = self
+            .last_settled
+            .and_then(|source| VisualTransition::between(source, target.behavior))
+        else {
+            return direct();
+        };
+        BodyPaintPlan {
+            context: target.with_transition(Some(transition)),
+            frame: 0,
+            after_submit: Self {
+                last_settled: self.last_settled,
+                active: Some(PaintedArc {
+                    transition,
+                    started: now,
+                }),
+            },
+        }
+    }
+
+    fn submitted(&mut self, plan: BodyPaintPlan) {
+        *self = plan.after_submit;
+    }
+}
+
+fn submitted_text_visible(text_rect: egui::Rect, clip: egui::Rect) -> bool {
+    text_rect.intersect(clip).is_positive()
+}
+
+fn bridge_allowed(expanded: bool, full: bool, visible_clip: bool, greeting: bool) -> bool {
+    expanded && full && visible_clip && !greeting
 }
 
 fn host_height(enabled: bool, expanded: bool) -> f32 {
@@ -306,6 +408,8 @@ pub struct OrganismHost {
     reaction_until: Duration,
     greeting: LiveGreeting,
     watch: WatchObservation,
+    bridge: PaintedBridge,
+    bridge_mode: bool,
     rhythm_enabled: bool,
 }
 
@@ -329,12 +433,21 @@ impl Default for OrganismHost {
             reaction_until: Duration::ZERO,
             greeting: LiveGreeting::default(),
             watch: WatchObservation::default(),
+            bridge: PaintedBridge::default(),
+            bridge_mode: false,
             rhythm_enabled: false,
         }
     }
 }
 
 impl OrganismHost {
+    fn configure_bridge(&mut self, active: bool) {
+        if self.bridge_mode != active {
+            self.bridge.reset();
+        }
+        self.bridge_mode = active;
+    }
+
     fn set_available_width(&mut self, width: f32) {
         self.presentable = host_geometry_allows(width);
         if !self.presentable {
@@ -355,6 +468,7 @@ impl OrganismHost {
             return;
         }
         self.watch.reset();
+        self.bridge.reset();
         self.watch.observe_running(now, generation);
         self.life
             .advance(now, false, false, CircadianPhase::Unlearned);
@@ -376,6 +490,7 @@ impl OrganismHost {
             let now = self.born.elapsed();
             self.greeting.cancel();
             self.watch.reset();
+            self.bridge.reset();
             self.last_input = Some(now);
             self.life.note_input(now);
             self.ambient.interrupt();
@@ -551,6 +666,7 @@ impl OrganismHost {
         };
         if !policy.inline_visible(now) {
             self.watch.reset();
+            self.bridge.reset();
         }
         if eligible && now >= self.reaction_until && !self.running {
             let behavior = self.ambient.step(
@@ -566,6 +682,9 @@ impl OrganismHost {
             );
         }
         let full = resolved_motion(config.ascii_organism_motion) == OrganismMotion::Full;
+        if !config.ascii_organism_expanded || !full {
+            self.bridge.reset();
+        }
         let frame = if full {
             now.as_millis() as u64 / 100
         } else {
@@ -590,6 +709,7 @@ impl OrganismHost {
         if !greeting_allowed {
             self.greeting.cancel();
         }
+        let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
         // Allocate exactly the same strip while suppressed. Typing, switching
         // panes and alternate screen must not change the terminal's grid size.
         egui::Panel::bottom("ascii_organism_chrome")
@@ -624,13 +744,37 @@ impl OrganismHost {
                     let display = self.greeting.update(now, near, greeting_allowed, context);
                     let (sprite, status) = host_text(display, frame, rect.width(), expanded);
                     if let Some(sprite) = sprite {
-                        ui.painter().with_clip_rect(body_rect).text(
-                            body_rect.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            sprite,
-                            egui::FontId::monospace(14.0),
-                            ui.visuals().text_color(),
-                        );
+                        let clip = body_rect.intersect(ui.clip_rect());
+                        let visible = clip.is_positive();
+                        let greeting = self
+                            .greeting
+                            .greeting_until
+                            .is_some_and(|until| now < until);
+                        let plan = if bridge_allowed(expanded, full, visible, greeting) {
+                            Some(self.bridge.plan_at_cadence(now, display, frame, !dormant))
+                        } else {
+                            self.bridge.reset();
+                            None
+                        };
+                        if visible {
+                            let sprite = plan.as_ref().map_or(sprite, |plan| {
+                                sprite_frame_with_context(plan.context, plan.frame)
+                            });
+                            let text_rect = ui.painter().with_clip_rect(clip).text(
+                                body_rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                sprite,
+                                egui::FontId::monospace(14.0),
+                                ui.visuals().text_color(),
+                            );
+                            if submitted_text_visible(text_rect, clip) {
+                                if let Some(plan) = plan {
+                                    self.bridge.submitted(plan);
+                                }
+                            } else {
+                                self.bridge.reset();
+                            }
+                        }
                     }
                     ui.painter().with_clip_rect(status_rect).text(
                         status_rect.left_center(),
@@ -641,7 +785,6 @@ impl OrganismHost {
                     );
                 }
             });
-        let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
         let next = [
             next_host_wake(policy, now, self.reaction_until, dormant),
             self.greeting.next_wake(now),
@@ -704,6 +847,10 @@ impl crate::TerminalApp {
     }
 
     pub(crate) fn prepare_organism(&mut self, ctx: &egui::Context) {
+        self.organism.configure_bridge(
+            self.config.ascii_organism_expanded
+                && resolved_motion(self.config.ascii_organism_motion) == OrganismMotion::Full,
+        );
         let rhythm_enabled =
             resolved_motion(self.config.ascii_organism_motion) != OrganismMotion::Static;
         if self.organism.rhythm_enabled != rhythm_enabled {
@@ -1083,6 +1230,136 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn body_bridge_endpoint_requires_submitted_text_inside_the_clip() {
+        let text = egui::Rect::from_min_max(egui::pos2(8.0, 8.0), egui::pos2(80.0, 60.0));
+        let far_right = egui::Rect::from_min_max(egui::pos2(120.0, 0.0), egui::pos2(160.0, 72.0));
+        assert!(far_right.is_positive());
+        assert!(!submitted_text_visible(text, far_right));
+        let partial = egui::Rect::from_min_max(egui::pos2(50.0, 0.0), egui::pos2(160.0, 72.0));
+        assert!(submitted_text_visible(text, partial));
+        let edge = egui::Rect::from_min_max(egui::pos2(80.0, 0.0), egui::pos2(160.0, 72.0));
+        assert!(!submitted_text_visible(text, edge));
+    }
+
+    #[test]
+    fn body_bridge_requires_a_submitted_source_and_uses_relative_frames() {
+        let mut bridge = PaintedBridge::default();
+        let source = PreviewPose::Working.context();
+        let target = PreviewPose::Success.context();
+        let unsubmitted = bridge.plan(Duration::ZERO, source, 9000);
+        assert!(unsubmitted.context.transition.is_none());
+        assert!(bridge.last_settled.is_none());
+        assert!(bridge
+            .plan(Duration::ZERO, target, 9000)
+            .context
+            .transition
+            .is_none());
+        bridge.submitted(unsubmitted);
+        let start = Duration::from_secs(1);
+        let plan = bridge.plan(start, target, 9000);
+        assert_eq!(plan.context.behavior, target.behavior);
+        assert!(plan.context.transition.is_some());
+        assert_eq!(plan.frame, 0);
+        bridge.submitted(plan);
+        let almost = bridge.plan(Duration::from_millis(1399), target, 9004);
+        assert!(almost.context.transition.is_some());
+        assert_eq!(almost.frame, 3);
+        bridge.submitted(almost);
+        let done = bridge.plan(Duration::from_millis(1400), target, 9004);
+        assert!(done.context.transition.is_none());
+        assert_eq!(done.frame, 9004);
+        bridge.submitted(done);
+        assert_eq!(bridge.last_settled, Some(target.behavior));
+        assert!(bridge.active.is_none());
+    }
+
+    #[test]
+    fn body_bridge_new_target_interrupts_without_queuing_or_stale_semantics() {
+        let mut bridge = PaintedBridge::default();
+        let source = PreviewPose::Working.context();
+        let success = PreviewPose::Success.context();
+        let failure = PreviewPose::Concerned.context();
+        let first = bridge.plan(Duration::ZERO, source, 0);
+        bridge.submitted(first);
+        let arc = bridge.plan(Duration::from_millis(100), success, 1);
+        bridge.submitted(arc);
+        let interrupted = bridge.plan(Duration::from_millis(200), failure, 2);
+        assert_eq!(interrupted.context, failure);
+        assert_eq!(interrupted.frame, 2);
+        bridge.submitted(interrupted);
+        assert_eq!(bridge.last_settled, Some(failure.behavior));
+        assert!(bridge.active.is_none());
+        // Status is always rendered independently from the true target.
+        assert_eq!(
+            live_status_text(failure, 2, 640.0),
+            host_text(failure, 2, 640.0, true).1
+        );
+    }
+
+    #[test]
+    fn body_bridge_dormant_cadence_paints_target_without_a_new_wake() {
+        let mut bridge = PaintedBridge::default();
+        let source = PreviewPose::Working.context();
+        let target = PreviewPose::Success.context();
+        let seed = bridge.plan(Duration::ZERO, source, 0);
+        bridge.submitted(seed);
+        let dormant = bridge.plan_at_cadence(Duration::from_secs(1), target, 10, false);
+        assert_eq!(dormant.context, target);
+        assert!(dormant.after_submit.active.is_none());
+        assert_eq!(dormant.after_submit.last_settled, Some(target.behavior));
+        // Entering slow cadence also retires an in-flight bridge.
+        let arc = bridge.plan(Duration::from_secs(1), target, 10);
+        bridge.submitted(arc);
+        assert!(bridge.active.is_some());
+        let stopped = bridge.plan_at_cadence(Duration::from_millis(1100), target, 11, false);
+        assert_eq!(stopped.context, target);
+        bridge.submitted(stopped);
+        assert!(bridge.active.is_none());
+    }
+
+    #[test]
+    fn body_bridge_is_limited_to_full_expanded_visible_non_greeting_paints() {
+        assert!(bridge_allowed(true, true, true, false));
+        for (expanded, full, visible, greeting) in [
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert!(!bridge_allowed(expanded, full, visible, greeting));
+        }
+        let mut bridge = PaintedBridge::default();
+        let plan = bridge.plan(Duration::ZERO, PreviewPose::Working.context(), 0);
+        bridge.submitted(plan);
+        bridge.reset();
+        assert!(bridge
+            .plan(Duration::from_secs(1), PreviewPose::Success.context(), 10)
+            .context
+            .transition
+            .is_none());
+    }
+
+    #[test]
+    fn body_bridge_input_owner_and_mode_changes_retire_painted_endpoints() {
+        let mut host = OrganismHost::default();
+        host.acquire(Some("one"), None, false);
+        host.configure_bridge(true);
+        for event in 0..3 {
+            let plan = host
+                .bridge
+                .plan(Duration::ZERO, PreviewPose::Working.context(), 0);
+            host.bridge.submitted(plan);
+            match event {
+                0 => host.accepted_input("one"),
+                1 => host.acquire(None, None, false),
+                _ => host.configure_bridge(false),
+            }
+            assert!(host.bridge.last_settled.is_none());
+            assert!(host.bridge.active.is_none());
+        }
+    }
 
     #[test]
     fn preview_demo_runs_once_at_exact_phase_boundaries() {
