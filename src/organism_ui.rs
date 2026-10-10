@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use jterm_core::organism::{AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone};
+use jterm_core::organism_daily::GentleInteraction;
 
 use crate::config::{Config, OrganismMotion};
 use crate::organism::{
     classify_command, resolved_motion, sprite_frame_with_context, sticky_glyph_with_context,
-    CircadianPhase, CommandKind, NativeOrganism, OrganismPreview, PresentationPolicy, PreviewPose,
-    Reaction, RenderContext, WindowLife,
+    CircadianPhase, CommandKind, GreetingAvailability, NativeOrganism, OrganismPreview,
+    PresentationPolicy, PreviewPose, Reaction, RenderContext, WindowLife,
 };
 use crate::terminal::{CommandRecord, CompletedCommandEvent};
 
@@ -437,6 +438,7 @@ pub struct PreviewUi {
     pose: PreviewPose,
     born: Instant,
     greeting_until: Duration,
+    hello_ready_at: Duration,
 }
 
 impl Default for PreviewUi {
@@ -446,6 +448,7 @@ impl Default for PreviewUi {
             pose: PreviewPose::Calm,
             born: Instant::now(),
             greeting_until: Duration::ZERO,
+            hello_ready_at: Duration::ZERO,
         }
     }
 }
@@ -474,8 +477,23 @@ impl PreviewUi {
                 }
             });
         let now = self.born.elapsed();
-        if ui.button("Say hello").clicked() && self.model.say_hello(now) {
-            self.greeting_until = now + Duration::from_secs(2);
+        let availability = self.model.greeting_availability(now);
+        let button = ui.add_enabled(
+            availability == GreetingAvailability::Available,
+            egui::Button::new("Say hello"),
+        );
+        match availability {
+            GreetingAvailability::Busy => {
+                ui.small("Unavailable for this pose");
+            }
+            GreetingAvailability::CoolingDown => {
+                ui.small("Wait for the greeting cooldown");
+            }
+            _ => {}
+        }
+        if button.clicked() && self.model.say_hello(now) {
+            self.greeting_until = now.saturating_add(GentleInteraction::HOLD);
+            self.hello_ready_at = now.saturating_add(GentleInteraction::COOLDOWN);
         }
         if let Some(context) = self.model.context(now) {
             let full = resolved_motion(motion) == OrganismMotion::Full;
@@ -490,13 +508,45 @@ impl PreviewUi {
                     RichText::new(sprite_frame_with_context(context, frame)).monospace(),
                 ),
             );
-            if full {
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            } else if now < self.greeting_until {
-                ui.ctx().request_repaint_after(self.greeting_until - now);
+            if let Some(delay) = preview_next_wake(
+                now,
+                full,
+                self.greeting_until,
+                self.hello_ready_at,
+                self.model.greeting_availability(now),
+            ) {
+                ui.ctx().request_repaint_after(delay);
             }
         }
     }
+}
+
+// No repeating Static/Calm heartbeat. Closing the preview stops scheduling;
+// pose changes retain the cooldown but only eligible poses need its wake.
+fn preview_next_wake(
+    now: Duration,
+    full: bool,
+    greeting_until: Duration,
+    hello_ready_at: Duration,
+    availability: GreetingAvailability,
+) -> Option<Duration> {
+    if availability == GreetingAvailability::Closed {
+        return None;
+    }
+    let mut next = full.then_some(Duration::from_millis(100));
+    for deadline in [
+        Some(greeting_until),
+        (availability == GreetingAvailability::CoolingDown).then_some(hello_ready_at),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if deadline > now {
+            let delay = deadline - now;
+            next = Some(next.map_or(delay, |current| current.min(delay)));
+        }
+    }
+    next
 }
 
 #[cfg(test)]
@@ -504,6 +554,126 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn preview_query_never_spends_attention_and_explains_busy_or_cooldown() {
+        let mut preview = OrganismPreview::default();
+        assert_eq!(
+            preview.greeting_availability(Duration::ZERO),
+            GreetingAvailability::Closed
+        );
+        preview.open();
+        for _ in 0..3 {
+            assert_eq!(
+                preview.greeting_availability(Duration::ZERO),
+                GreetingAvailability::Available
+            );
+        }
+        assert!(preview.say_hello(Duration::ZERO));
+        assert_eq!(
+            preview.greeting_availability(Duration::from_secs(1)),
+            GreetingAvailability::CoolingDown
+        );
+        // Querying a future time must not move the real core clock.
+        assert_eq!(
+            preview.greeting_availability(Duration::from_secs(8)),
+            GreetingAvailability::Available
+        );
+        assert!(!preview.say_hello(Duration::from_secs(1)));
+        preview.select_pose(PreviewPose::Working);
+        assert_eq!(
+            preview.greeting_availability(Duration::from_secs(8)),
+            GreetingAvailability::Busy
+        );
+        preview.select_pose(PreviewPose::Calm);
+        preview.close();
+        preview.open();
+        assert_eq!(
+            preview.greeting_availability(Duration::from_secs(7)),
+            GreetingAvailability::CoolingDown
+        );
+        assert!(preview.say_hello(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn preview_static_wakes_at_greeting_then_cooldown_without_heartbeat() {
+        let greeting = Duration::from_secs(2);
+        let ready = Duration::from_secs(8);
+        assert_eq!(
+            preview_next_wake(
+                Duration::ZERO,
+                false,
+                greeting,
+                ready,
+                GreetingAvailability::CoolingDown,
+            ),
+            Some(greeting)
+        );
+        assert_eq!(
+            preview_next_wake(
+                greeting,
+                false,
+                greeting,
+                ready,
+                GreetingAvailability::CoolingDown,
+            ),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(
+            preview_next_wake(ready, false, greeting, ready, GreetingAvailability::Available),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_closed_or_busy_does_not_schedule_cooldown() {
+        for availability in [GreetingAvailability::Closed, GreetingAvailability::Busy] {
+            assert_eq!(
+                preview_next_wake(
+                    Duration::ZERO,
+                    false,
+                    Duration::ZERO,
+                    Duration::from_secs(8),
+                    availability,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            preview_next_wake(
+                Duration::ZERO,
+                true,
+                Duration::from_secs(2),
+                Duration::from_secs(8),
+                GreetingAvailability::Closed,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_full_motion_keeps_nearest_deadline() {
+        assert_eq!(
+            preview_next_wake(
+                Duration::ZERO,
+                true,
+                Duration::from_millis(50),
+                Duration::from_secs(8),
+                GreetingAvailability::CoolingDown,
+            ),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            preview_next_wake(
+                Duration::from_secs(2),
+                true,
+                Duration::ZERO,
+                Duration::from_secs(8),
+                GreetingAvailability::CoolingDown,
+            ),
+            Some(Duration::from_millis(100))
+        );
+    }
 
     // Synthetic data only: these tests never parse terminal text, construct a
     // renderer, open a file, or spawn a shell.

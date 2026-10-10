@@ -104,6 +104,14 @@ impl Default for OrganismPreview {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GreetingAvailability {
+    Closed,
+    Busy,
+    CoolingDown,
+    Available,
+}
+
 impl OrganismPreview {
     pub fn open(&mut self) {
         self.open = true;
@@ -118,6 +126,21 @@ impl OrganismPreview {
         if self.pose != pose {
             self.pose = pose;
             self.greeting.cancel();
+        }
+    }
+
+    /// Probe a clone: inspecting a button must never spend real attention.
+    pub fn greeting_availability(&self, now: Duration) -> GreetingAvailability {
+        if !self.open {
+            return GreetingAvailability::Closed;
+        }
+        if !GentleInteraction::default().request(now, self.pose.context()) {
+            return GreetingAvailability::Busy;
+        }
+        if self.greeting.clone().request(now, self.pose.context()) {
+            GreetingAvailability::Available
+        } else {
+            GreetingAvailability::CoolingDown
         }
     }
 
