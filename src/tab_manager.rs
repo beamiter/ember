@@ -530,6 +530,30 @@ mod tests {
     }
 
     #[test]
+    fn hidden_sibling_removal_preserves_zoomed_focus_after_index_shift() {
+        let mut tabs = TabManager::new(0);
+        split_active(&mut tabs, 1);
+        split_active(&mut tabs, 2);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        assert!(tabs.active_layout_mut().toggle_focused_pane_zoom());
+        tabs.active_layout_mut().compute_pane_rects(rect);
+        assert_eq!(tabs.active_layout().focused_session_idx(), Some(2));
+
+        // Session 0 exits in the hidden sibling. Original session 2 becomes
+        // index 1, but remains the same focused, full-container zoomed pane.
+        tabs.on_session_removed(0);
+        tabs.active_layout_mut().compute_pane_rects(rect);
+        let layout = tabs.active_layout();
+        assert!(layout.is_zoomed());
+        assert_eq!(layout.focused_session_idx(), Some(1));
+        assert_eq!(layout.session_indices(), vec![0, 1]);
+        assert_eq!(layout.panes().len(), 1);
+        assert_eq!(layout.panes()[0].session_idx, 1);
+        assert_eq!(layout.panes()[0].rect, rect);
+        assert!(layout.get_divider_rects().is_empty());
+    }
+
+    #[test]
     fn closing_a_tabs_last_pane_leaves_the_tab_removable() {
         let mut tabs = TabManager::new(0);
         tabs.insert_tab_after_active(1);

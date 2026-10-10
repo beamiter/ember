@@ -540,7 +540,12 @@ impl LayoutManager {
         if !self.tree.remove_leaf(session_idx) {
             return false;
         }
-        self.zoomed = false;
+        // A hidden sibling exiting must not cancel the surviving focused
+        // pane's zoom. A replaced focus or a single remaining leaf has no
+        // existing multi-pane zoom to preserve.
+        if self.focused_pane_id.0 == session_idx || self.tree.leaf_count() <= 1 {
+            self.zoomed = false;
+        }
         if self.focused_pane_id.0 == session_idx {
             if let Some(next) = next_focus.or_else(|| self.tree.leaves().first().copied()) {
                 self.focused_pane_id = PaneId(next);
@@ -1475,6 +1480,35 @@ mod tests {
 
         assert_eq!(layout.panes.len(), 1);
         assert_eq!(layout.focused_session_idx(), Some(0));
+    }
+
+    #[test]
+    fn removing_focused_or_last_sibling_clears_zoom() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        layout.split(2, true).unwrap();
+        assert!(layout.toggle_focused_pane_zoom());
+        assert!(layout.remove_session_leaf(2));
+        assert!(!layout.is_zoomed());
+        assert_eq!(layout.focused_session_idx(), Some(1));
+        assert_eq!(layout.pane_count(), 2);
+
+        assert!(layout.toggle_focused_pane_zoom());
+        assert!(layout.remove_session_leaf(0));
+        assert!(!layout.is_zoomed());
+        assert_eq!(layout.focused_session_idx(), Some(1));
+        assert_eq!(layout.pane_count(), 1);
+    }
+
+    #[test]
+    fn removing_absent_session_preserves_zoom_and_focus() {
+        let mut layout = LayoutManager::new(0);
+        layout.split(1, false).unwrap();
+        assert!(layout.toggle_focused_pane_zoom());
+        assert!(!layout.remove_session_leaf(99));
+        assert!(layout.is_zoomed());
+        assert_eq!(layout.focused_session_idx(), Some(1));
+        assert_eq!(layout.session_indices(), vec![0, 1]);
     }
 
     #[test]
