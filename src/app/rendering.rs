@@ -4934,8 +4934,12 @@ mod tests {
                 .nodes
                 .into_iter()
                 .find(|(_, node)| {
-                    node.value()
-                        .is_some_and(|value| value.contains("missing values: arg0"))
+                    // TextRun children carry visually elided glyphs; IdMap
+                    // iteration does not guarantee the full Label comes first.
+                    node.role() == egui::accesskit::Role::Label
+                        && node
+                            .value()
+                            .is_some_and(|value| value.contains("missing values: arg0"))
                 })
                 .expect("the refusal remains accessible")
                 .1;
