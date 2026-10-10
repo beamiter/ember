@@ -21,11 +21,18 @@ use crate::terminal::{CommandRecord, CompletedCommandEvent};
 
 const BATCH_RECORD_LIMIT: usize = 32;
 
+// The fixed strip is still allocated when hidden, so terminal grid size stays
+// stable. Geometry only controls ownership, physiology and repaint scheduling.
+fn host_geometry_allows(width: f32) -> bool {
+    width.is_finite() && width >= 120.0
+}
+
 pub struct OrganismHost {
     born: Instant,
     life: WindowLife,
     native: NativeOrganism,
     owner: Option<String>,
+    presentable: bool,
     cursor: Option<(u64, bool)>,
     quarantine_batch: bool,
     running: bool,
@@ -45,6 +52,7 @@ impl Default for OrganismHost {
             life: WindowLife::new_at(Duration::ZERO),
             native: NativeOrganism::from_persisted_state(crate::organism::LifeState::default()),
             owner: None,
+            presentable: false,
             cursor: None,
             quarantine_batch: false,
             running: false,
@@ -60,6 +68,13 @@ impl Default for OrganismHost {
 }
 
 impl OrganismHost {
+    fn set_available_width(&mut self, width: f32) {
+        self.presentable = host_geometry_allows(width);
+        if !self.presentable {
+            self.acquire(None, None, false);
+        }
+    }
+
     /// Revoke the old session before accepting a new one. Acquiring a running
     /// command quarantines it; it must not manufacture a Start or completion.
     pub fn acquire(&mut self, owner: Option<&str>, tail: Option<(u64, bool)>, running: bool) {
@@ -216,7 +231,12 @@ impl OrganismHost {
 
     pub fn draw(&mut self, ui: &mut Ui, config: &Config, focused: bool) {
         let now = self.born.elapsed();
-        let eligible = config.ascii_organism_enabled && focused && self.owner.is_some();
+        let presentable = self.presentable;
+        if !presentable {
+            self.acquire(None, None, false);
+        }
+        let eligible =
+            config.ascii_organism_enabled && focused && presentable && self.owner.is_some();
         let dt = self
             .life
             .advance(now, eligible, self.running, CircadianPhase::Unlearned);
@@ -267,7 +287,7 @@ impl OrganismHost {
             .frame(egui::Frame::NONE.inner_margin(0.0))
             .resizable(false)
             .show(ui, |ui| {
-                if policy.inline_visible(now) && ui.available_width() >= 120.0 {
+                if policy.inline_visible(now) {
                     let rect = ui
                         .available_rect_before_wrap()
                         .shrink2(egui::vec2(8.0, 0.0));
@@ -324,7 +344,10 @@ impl crate::TerminalApp {
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false))
             && !self.terminal_input_blocked(ctx)
             && !self.active_terminal_is_read_only();
-        if !self.config.ascii_organism_enabled || !focused {
+        // Admission uses the last actual root-UI geometry, not a potentially
+        // different viewport width. Rendering refreshes it on resize.
+        let presentable = self.organism.presentable;
+        if !self.config.ascii_organism_enabled || !focused || !presentable {
             self.organism.acquire(None, None, false);
             return;
         }
@@ -377,6 +400,9 @@ impl crate::TerminalApp {
     }
 
     pub(crate) fn render_organism(&mut self, ui: &mut Ui) {
+        // Resize events wake the host naturally. One root-UI width decision
+        // drives admission, painting and scheduling, avoiding threshold churn.
+        self.organism.set_available_width(ui.available_width());
         // Top-bar navigation may have changed the owner since event ingestion.
         self.prepare_organism(ui.ctx());
         let focused = ui
@@ -579,6 +605,73 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn host_geometry_is_fail_closed_at_the_paint_boundary() {
+        for width in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0, 119.9] {
+            assert!(!host_geometry_allows(width));
+        }
+        assert!(host_geometry_allows(120.0));
+        assert!(host_geometry_allows(800.0));
+    }
+
+    #[test]
+    fn hidden_geometry_revokes_owner_and_resize_reacquires_without_replay() {
+        let mut host = OrganismHost::default();
+        host.set_available_width(120.0);
+        host.acquire(Some("local"), Some((7, true)), true);
+        host.pending = Some(pending());
+        host.set_available_width(119.9);
+        assert!(host.owner.is_none());
+        assert!(host.pending.is_none());
+        assert!(!host.running);
+        let mut policy = static_policy();
+        policy.focused_owner = false;
+        policy.motion = Some(OrganismMotion::Full);
+        assert_eq!(
+            next_host_wake(
+                policy,
+                Duration::ZERO,
+                Duration::from_secs(5),
+                false
+            ),
+            None
+        );
+        host.set_available_width(120.0);
+        host.acquire(Some("local"), Some((9, true)), true);
+        assert!(host.quarantine_batch);
+        assert!(host.pending.is_none());
+        assert_eq!(host.cursor, Some((9, true)));
+        assert!(host.running);
+    }
+
+    #[test]
+    fn hidden_geometry_pauses_physiology_and_resume_has_no_catchup() {
+        let mut life = WindowLife::new_at(Duration::ZERO);
+        let phase = CircadianPhase::Unlearned;
+        life.advance(Duration::ZERO, true, false, phase);
+        let before = format!("{:?}", life.state());
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(60),
+                host_geometry_allows(119.0),
+                false,
+                phase,
+            ),
+            0.0
+        );
+        assert_eq!(format!("{:?}", life.state()), before);
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(120),
+                host_geometry_allows(120.0),
+                false,
+                phase,
+            ),
+            0.0
+        );
+        assert_eq!(format!("{:?}", life.state()), before);
+    }
 
     #[test]
     fn preview_blur_preserves_cooldown_without_replaying_greeting() {
