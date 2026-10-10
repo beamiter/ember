@@ -3791,7 +3791,9 @@ impl TerminalApp {
                     // Apply runtime changes (fonts, GPU, renderer)
                     self.apply_runtime_config(ctx);
                     // Save to file
-                    match self.config.save() {
+                    let save_result = self.config.save();
+                    let saved = save_result.is_ok();
+                    match save_result {
                         Ok(()) => {
                             let (invalid, inactive) = crate::config::remote_host_problem_counts(
                                 &self.config.remote_hosts,
@@ -3822,7 +3824,7 @@ impl TerminalApp {
                             );
                         }
                     }
-                    self.config_panel.sync_from_config(&self.config);
+                    self.config_panel.finish_save(&self.config, saved);
                 }
                 config_panel::ConfigAction::ResetToDefaults => {
                     let bottom_bar_was = self.config.bottom_bar;

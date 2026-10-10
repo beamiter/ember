@@ -357,6 +357,16 @@ impl ConfigPanel {
             .collect();
     }
 
+    /// Acknowledge the synchronous Save attempt. Failed persistence must retain
+    /// exact draft text and widget history, even when runtime values were applied.
+    pub fn finish_save(&mut self, config: &Config, saved: bool) {
+        if saved {
+            self.sync_from_config(config);
+        } else {
+            self.has_changes = true;
+        }
+    }
+
     /// Apply all buffered edit values to the given Config.
     pub fn apply_to_config(&self, config: &mut Config) {
         config.font_size = self.edit_font_size;
@@ -533,7 +543,6 @@ impl ConfigPanel {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Save").clicked() {
                             actions.push(ConfigAction::SaveRequested);
-                            self.has_changes = false;
                         }
                     });
                 });
@@ -2012,6 +2021,68 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 mod tests {
     use super::{organism_motion_explanation, ConfigPanel, RemoteHostDraft};
     use crate::config::{Config, OrganismMotion};
+
+    #[test]
+    fn failed_settings_save_preserves_raw_draft_and_widget_history() {
+        let mut config = Config::default();
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        panel.edit_ai_temperature = "1e-".to_owned();
+        panel.edit_ai_model = "  synthetic-model  ".to_owned();
+        panel.edit_ai_api_key_file = " ~/synthetic-key ".to_owned();
+        panel.edit_remote_hosts[0].user = "  synthetic-user  ".to_owned();
+        let epoch = panel.remote_editor_epoch;
+        panel.apply_to_config(&mut config);
+        assert_eq!(config.ai_temperature, None);
+        panel.finish_save(&config, false);
+        assert!(panel.has_changes);
+        assert_eq!(panel.edit_ai_temperature, "1e-");
+        assert_eq!(panel.edit_ai_model, "  synthetic-model  ");
+        assert_eq!(panel.edit_ai_api_key_file, " ~/synthetic-key ");
+        assert_eq!(panel.edit_remote_hosts[0].user, "  synthetic-user  ");
+        assert_eq!(panel.remote_editor_epoch, epoch);
+    }
+
+    #[test]
+    fn successful_settings_save_adopts_acknowledged_values_and_clears_dirty() {
+        let mut config = Config::default();
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&config);
+        panel.has_changes = true;
+        panel.edit_ai_temperature = "1e-".to_owned();
+        let epoch = panel.remote_editor_epoch;
+        config.ai_temperature = Some(0.5);
+        panel.finish_save(&config, true);
+        assert!(!panel.has_changes);
+        assert_eq!(panel.edit_ai_temperature, "0.5");
+        assert_ne!(panel.remote_editor_epoch, epoch);
+    }
+
+    #[test]
+    fn settings_save_acknowledges_only_the_synchronous_result() {
+        let panel = include_str!("config_panel.rs");
+        let button = panel
+            .split_once("if ui.button(\"Save\").clicked()")
+            .unwrap()
+            .1;
+        let button = button.split_once('}').unwrap().0;
+        assert!(button.contains("actions.push(ConfigAction::SaveRequested)"));
+        assert!(!button.contains("has_changes = false"));
+        let rendering = include_str!("app/rendering.rs");
+        let save = rendering
+            .split_once("config_panel::ConfigAction::SaveRequested => {")
+            .unwrap()
+            .1;
+        let save = save
+            .split_once("config_panel::ConfigAction::ResetToDefaults => {")
+            .unwrap()
+            .0;
+        assert!(save.contains("let save_result = self.config.save();"));
+        assert!(save.contains("let saved = save_result.is_ok();"));
+        assert!(save.contains("match save_result"));
+        assert!(save.contains("self.config_panel.finish_save(&self.config, saved)"));
+        assert!(!save.contains("sync_from_config"));
+    }
 
     #[test]
     fn organism_motion_help_matches_resolved_capabilities() {
