@@ -402,6 +402,10 @@ impl ConfigPanel {
             .collect();
     }
 
+    pub(crate) fn suspend_organism_preview(&mut self) {
+        self.organism_preview.close();
+    }
+
     pub fn close(&mut self) {
         self.is_open = false;
         self.editing_theme = None;

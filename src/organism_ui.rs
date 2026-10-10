@@ -339,7 +339,26 @@ impl PendingCommand {
     }
 }
 
+fn hidden_root_viewport(root: bool, focused: Option<bool>, visible: Option<bool>) -> bool {
+    root && (!focused.unwrap_or(false) || !visible.unwrap_or(true))
+}
+
 impl crate::TerminalApp {
+    /// eframe skips App::ui in an observed hidden root pass, but still calls
+    /// App::logic. Revoke only organism state here; never draw or request wakes.
+    /// Rapid hide/restore transitions without a hidden pass remain unobserved.
+    pub(crate) fn observe_organism_visibility(&mut self, ctx: &egui::Context) {
+        let root = ctx.viewport_id() == egui::ViewportId::ROOT;
+        let hidden = ctx.input(|input| {
+            let viewport = input.viewport();
+            hidden_root_viewport(root, viewport.focused, viewport.visible())
+        });
+        if hidden {
+            self.organism.acquire(None, None, false);
+            self.config_panel.suspend_organism_preview();
+        }
+    }
+
     pub(crate) fn prepare_organism(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false))
             && !self.terminal_input_blocked(ctx)
@@ -605,6 +624,63 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn hidden_logic_is_root_only_and_uses_current_visibility() {
+        assert!(hidden_root_viewport(true, Some(true), Some(false)));
+        assert!(hidden_root_viewport(true, Some(false), Some(true)));
+        assert!(hidden_root_viewport(true, None, Some(true)));
+        assert!(!hidden_root_viewport(true, Some(true), None));
+        assert!(!hidden_root_viewport(true, Some(true), Some(true)));
+        assert!(!hidden_root_viewport(false, Some(false), Some(false)));
+    }
+
+    #[test]
+    fn observed_hidden_pass_discards_completion_and_restore_quarantines() {
+        let mut host = OrganismHost::default();
+        host.acquire(Some("local"), Some((7, true)), true);
+        host.pending = Some(pending());
+        let before = format!("{:?}", host.life.state());
+        // This is the exact state-only operation performed by App::logic.
+        host.acquire(None, None, false);
+        host.batch(
+            "local",
+            &VecDeque::new(),
+            &[completion(Some(0))],
+            false,
+            false,
+        );
+        assert_eq!(format!("{:?}", host.life.state()), before);
+        assert!(host.pending.is_none());
+        host.acquire(Some("local"), Some((7, true)), false);
+        host.batch(
+            "local",
+            &VecDeque::new(),
+            &[completion(Some(0))],
+            false,
+            false,
+        );
+        assert_eq!(format!("{:?}", host.life.state()), before);
+        assert!(host.pending.is_none());
+        assert!(!host.quarantine_batch);
+    }
+
+    #[test]
+    fn hidden_logic_wiring_keeps_the_hook_state_only() {
+        let main = include_str!("main.rs");
+        let hook = main
+            .split("    fn logic(")
+            .nth(1)
+            .expect("root App logic hook")
+            .split("    fn ui(")
+            .next()
+            .expect("next UI method");
+        assert!(hook.contains("self.observe_organism_visibility(ctx);"));
+        assert!(!hook.contains("request_repaint"));
+        assert!(!hook.contains("render_"));
+        let panel = include_str!("config_panel.rs");
+        assert!(panel.contains("self.organism_preview.close();"));
+    }
 
     #[test]
     fn host_geometry_is_fail_closed_at_the_paint_boundary() {

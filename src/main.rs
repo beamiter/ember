@@ -5388,6 +5388,10 @@ impl eframe::App for TerminalApp {
         );
     }
 
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.observe_organism_visibility(ctx);
+    }
+
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // eframe 0.35 起将原来的 App::update 拆成了 `logic` 和 `ui` 两段:
         // 这里把整个 update 的逻辑迁到 ui 中。许多下游代码(viewport 命令、输入查询、重绘请求)
