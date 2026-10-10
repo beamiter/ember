@@ -37,7 +37,9 @@ fn session_id_at(pid: u32, timestamp: u128, counter: &AtomicU64) -> String {
     // shared state. Fail rather than reuse a sequence after u64 exhaustion.
     let mut sequence = counter.load(Ordering::Relaxed);
     loop {
-        let next = sequence.checked_add(1).expect("session ID sequence exhausted");
+        let next = sequence
+            .checked_add(1)
+            .expect("session ID sequence exhausted");
         match counter.compare_exchange_weak(sequence, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(current) => sequence = current,
