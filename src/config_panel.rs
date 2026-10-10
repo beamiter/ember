@@ -1,4 +1,4 @@
-use crate::config::{AppRendererType, Config, TabBarPosition};
+use crate::config::{AppRendererType, Config, OrganismMotion, TabBarPosition};
 use crate::theme::{
     bound_custom_theme_name, validate_saved_custom_theme_name, Theme, ThemeExt as _,
 };
@@ -92,6 +92,7 @@ impl RemoteHostDraft {
 pub enum ConfigAction {
     CustomThemeApplied(Box<Theme>),
     DebugPanelToggled(bool),
+    OrganismChanged(bool, Option<OrganismMotion>),
     SaveRequested,
     ResetToDefaults,
 }
@@ -122,6 +123,9 @@ pub struct ConfigPanel {
     edit_notify_long_block_threshold_ms: u64,
     edit_show_repo_strip: bool,
     edit_bottom_bar: bool,
+    edit_organism_enabled: bool,
+    edit_organism_motion: Option<OrganismMotion>,
+    organism_preview: crate::organism_ui::PreviewUi,
     edit_block_mode: bool,
     edit_block_compact: bool,
     edit_ai_enabled: bool,
@@ -193,6 +197,9 @@ impl ConfigPanel {
             edit_notify_long_block_threshold_ms: 10_000,
             edit_show_repo_strip: true,
             edit_bottom_bar: jterm_core::bottom_bar::ENABLED_BY_DEFAULT,
+            edit_organism_enabled: false,
+            edit_organism_motion: None,
+            organism_preview: crate::organism_ui::PreviewUi::default(),
             edit_block_mode: true,
             edit_block_compact: false,
             edit_ai_enabled: false,
@@ -296,6 +303,8 @@ impl ConfigPanel {
         self.edit_notify_long_block_threshold_ms = config.notify_long_block_threshold_ms;
         self.edit_show_repo_strip = config.show_repo_strip;
         self.edit_bottom_bar = config.bottom_bar;
+        self.edit_organism_enabled = config.ascii_organism_enabled;
+        self.edit_organism_motion = config.ascii_organism_motion;
         self.edit_block_mode = config.block_mode;
         self.edit_block_compact = config.block_compact;
         self.edit_ai_enabled = config.ai_enabled;
@@ -352,6 +361,8 @@ impl ConfigPanel {
         config.notify_long_block_threshold_ms = self.edit_notify_long_block_threshold_ms;
         config.show_repo_strip = self.edit_show_repo_strip;
         config.bottom_bar = self.edit_bottom_bar;
+        config.ascii_organism_enabled = self.edit_organism_enabled;
+        config.ascii_organism_motion = self.edit_organism_motion;
         config.block_mode = self.edit_block_mode;
         config.block_compact = self.edit_block_compact;
         config.ai_enabled = self.edit_ai_enabled;
@@ -408,9 +419,13 @@ impl ConfigPanel {
         let mut actions = Vec::new();
 
         if !self.is_open {
+            self.organism_preview.close();
             return actions;
         }
 
+        if self.active_tab != ConfigTab::Appearance {
+            self.organism_preview.close();
+        }
         let screen_rect = ctx.viewport_rect();
         let panel_width = 580.0;
         let panel_height = 560.0;
@@ -496,6 +511,9 @@ impl ConfigPanel {
                 });
             });
 
+        if !self.is_open || self.active_tab != ConfigTab::Appearance {
+            self.organism_preview.close();
+        }
         actions
     }
 
@@ -677,6 +695,45 @@ impl ConfigPanel {
         theme: &Theme,
     ) {
         ui.label(RichText::new("Appearance Settings").strong().size(14.0));
+        ui.separator();
+
+        let mut organism_changed = ui
+            .checkbox(&mut self.edit_organism_enabled, "ASCII Organism")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Organism Motion");
+            egui::ComboBox::from_id_salt("organism_motion")
+                .selected_text(match self.edit_organism_motion {
+                    None => "Automatic",
+                    Some(OrganismMotion::Full) => "Full",
+                    Some(OrganismMotion::Calm) => "Calm",
+                    Some(OrganismMotion::Static) => "Static",
+                })
+                .show_ui(ui, |ui| {
+                    for (value, label) in [
+                        (None, "Automatic"),
+                        (Some(OrganismMotion::Full), "Full"),
+                        (Some(OrganismMotion::Calm), "Calm"),
+                        (Some(OrganismMotion::Static), "Static"),
+                    ] {
+                        organism_changed |= ui
+                            .selectable_value(&mut self.edit_organism_motion, value, label)
+                            .changed();
+                    }
+                });
+        });
+        ui.label(
+            "Local terminal chrome; command cards optional. Automatic uses Calm. Memory is volatile.",
+        );
+        ui.label("Changes apply now; Save persists them.");
+        if organism_changed {
+            self.has_changes = true;
+            actions.push(ConfigAction::OrganismChanged(
+                self.edit_organism_enabled,
+                self.edit_organism_motion,
+            ));
+        }
+        self.organism_preview.show(ui, self.edit_organism_motion);
         ui.separator();
 
         // Theme selector
@@ -1966,6 +2023,27 @@ mod tests {
         assert!(applied.notify_long_blocks);
         assert_eq!(applied.notify_long_block_threshold_ms, 5_000);
         assert!(applied.show_repo_strip);
+    }
+
+    #[test]
+    fn organism_fields_round_trip_without_changing_other_settings() {
+        let source = Config {
+            ascii_organism_enabled: true,
+            ascii_organism_motion: Some(OrganismMotion::Static),
+            ..Config::default()
+        };
+        let mut panel = ConfigPanel::new();
+        panel.sync_from_config(&source);
+        assert!(panel.edit_organism_enabled);
+        assert_eq!(panel.edit_organism_motion, Some(OrganismMotion::Static));
+        panel.edit_organism_enabled = false;
+        panel.edit_organism_motion = None;
+        let mut applied = source.clone();
+        panel.apply_to_config(&mut applied);
+        assert!(!applied.ascii_organism_enabled);
+        assert_eq!(applied.ascii_organism_motion, None);
+        assert_eq!(applied.font_family, source.font_family);
+        assert_eq!(applied.block_mode, source.block_mode);
     }
 
     #[test]

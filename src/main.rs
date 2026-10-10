@@ -29,6 +29,8 @@ mod kitty_graphics;
 mod layout;
 mod link;
 mod native_enter;
+mod organism;
+mod organism_ui;
 mod pane_header;
 mod persistence_file;
 mod pty;
@@ -2550,6 +2552,7 @@ impl TerminalApp {
             help_panel: help::HelpPanel::new(),
             remote_picker: Default::default(),
             config_panel: config_panel::ConfigPanel::new(),
+            organism: organism_ui::OrganismHost::default(),
             debug_panel: debug_panel::DebugPanel::new(),
             agent_panel: agent_panel::AgentPanel::new(),
             command_correction: command_correction::CorrectionMonitor::default(),
@@ -5259,6 +5262,7 @@ impl TerminalApp {
         // 底部状态栏(全宽)：同顶栏一样在侧边栏之前声明，因此它横跨整个
         // 窗口底边，侧边栏落在顶栏与它之间。
         self.render_bottom_bar(root_ui);
+        self.render_organism(root_ui);
 
         // 侧边栏：在顶栏之后声明，占据顶栏下方区域的左侧。
         self.render_sidebar(root_ui);
@@ -5770,6 +5774,7 @@ impl eframe::App for TerminalApp {
             }
         }
 
+        self.prepare_organism(ctx);
         let active_session_idx = self.session_manager.active_index();
         let active_pane_renderer_idx = (self.layout().panes().len() > 1).then(|| {
             self.layout()
@@ -6238,6 +6243,9 @@ impl eframe::App for TerminalApp {
         }
         let accepted_terminal_input =
             keyboard_input_accepted || accepted_ime_input || accepted_paste_input;
+        if accepted_terminal_input || has_cursor_move_input {
+            self.organism.accepted_input(&active_session_id);
+        }
 
         // 本帧真正接受的终端输入（键盘、IME 或 paste）都遵循同一时序：
         // 只有输入之后又显式建立的新选区才能保留。Retry-buffer cap 拒绝
@@ -6395,6 +6403,13 @@ impl eframe::App for TerminalApp {
                 terminal_parse_time += active_parse_started.elapsed();
                 active_processed_bytes = accumulated_data.len();
                 let completed_outputs = terminal.take_completed_command_events();
+                self.organism.batch(
+                    &active_session_id,
+                    terminal.command_records(),
+                    &completed_outputs,
+                    terminal.is_alt_buffer_active(),
+                    has_more_data,
+                );
                 let rang_bell = terminal.take_pending_bell();
                 // 不再每帧清空 status_message:它由 set_status*/current_status_for_display
                 // 按时长自动过期,否则任何快速输出都会把瞬时反馈瞬间吞掉。
@@ -6871,6 +6886,17 @@ impl eframe::App for TerminalApp {
             && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
             && pointer_over_active_terminal
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+
+        if !terminal_pointer_input_blocked
+            && pointer_over_active_terminal
+            && ctx.input(|input| {
+                input.pointer.any_pressed()
+                    || input.pointer.any_down()
+                    || input.raw_scroll_delta != egui::Vec2::ZERO
+            })
+        {
+            self.organism.accepted_input(&active_session_id);
+        }
 
         // Step 11: 鼠标处理（包括滚轮）
         let terminal_button_pressed = ctx.input(|input| {

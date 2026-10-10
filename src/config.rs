@@ -115,8 +115,7 @@ impl<'de> Deserialize<'de> for OrganismMotion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Reserved for the renderer-independent organism groundwork. The live
-    /// terminal adapter is not connected yet; loading this does not show a body.
+    /// Opt-in ASCII organism in local terminal chrome, with or without command cards.
     #[serde(default)]
     pub ascii_organism_enabled: bool,
 

@@ -3845,6 +3845,15 @@ impl TerminalApp {
                     self.config_panel.edit_debug_overlay = self.debug_panel.is_open;
                     self.schedule_config_save();
                 }
+                config_panel::ConfigAction::OrganismChanged(enabled, motion) => {
+                    if self.config.ascii_organism_enabled != enabled {
+                        self.force_resize_session = true;
+                    }
+                    self.config.ascii_organism_enabled = enabled;
+                    self.config.ascii_organism_motion = motion;
+                    self.prepare_organism(ctx);
+                    ctx.request_repaint();
+                }
                 config_panel::ConfigAction::DebugPanelToggled(open) => {
                     self.debug_panel.is_open = open;
                 }

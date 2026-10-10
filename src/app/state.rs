@@ -340,6 +340,7 @@ pub struct TerminalApp {
 
     // Config panel
     pub config_panel: config_panel::ConfigPanel,
+    pub(crate) organism: crate::organism_ui::OrganismHost,
 
     // Debug overlay panel
     pub debug_panel: debug_panel::DebugPanel,

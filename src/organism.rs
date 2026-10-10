@@ -1,9 +1,8 @@
-//! Renderer-independent groundwork for the shared ASCII organism contract.
+//! Renderer-independent model for the shared ASCII organism contract.
 //!
-//! This library module is not wired into Ember's live application. It owns no
-//! timers, input handlers, PTY writers, renderer, wall-clock source, or persistence. Hosts
-//! must supply authoritative paired command events and implement the pending
-//! focused-session lifecycle adapter before this is a visible feature.
+//! This model owns no timers, input handlers, PTY writers, renderer, wall-clock
+//! source, or persistence. The binary's organism_ui adapter provides a focused
+//! local-session host in existing egui chrome.
 
 use std::time::Duration;
 
@@ -24,7 +23,7 @@ pub fn resolved_motion(value: Option<OrganismMotion>) -> OrganismMotion {
     value.unwrap_or(OrganismMotion::Calm)
 }
 
-/// Immutable input from the future owner adapter. Defaults fail closed.
+/// Immutable input from the owner adapter. Defaults fail closed.
 /// `focused_owner` must identify the single chosen local pane, not merely a
 /// visible background pane. Input observation never consumes the input event.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,7 +42,7 @@ impl PresentationPolicy {
     }
 
     /// Static still permits a non-interactive inline/status representation.
-    /// This is a host capability hint, not an implemented Ember status widget.
+    /// The egui host uses this for its non-interactive chrome representation.
     pub fn inline_visible(self, now: Duration) -> bool {
         self.eligible()
             && self

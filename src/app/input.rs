@@ -2551,6 +2551,7 @@ impl TerminalApp {
                             // 用 byte len 会让光标落到错误(过大)的位置。
                             let cursor = text.chars().count();
                             terminal.set_preedit(text.clone(), cursor);
+                            self.organism.accepted_input(&session.metadata.session_id);
                         }
                     }
                     egui::ImeEvent::Commit(_text) => {
