@@ -1966,7 +1966,7 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigPanel, RemoteHostDraft};
+    use super::{organism_motion_explanation, ConfigPanel, RemoteHostDraft};
     use crate::config::{Config, OrganismMotion};
 
     #[test]
