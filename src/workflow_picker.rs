@@ -46,6 +46,7 @@ pub fn display_command_preview(command: &str) -> String {
 /// 工作流选择器状态。`entries` 在打开浮层时加载一次；之后磁盘上的新文件在
 /// 下一次打开时出现（与历史选择器的加载语义一致）。
 pub struct WorkflowPickerState {
+    target_session_id: Option<String>,
     /// 是否需要聚焦搜索框（egui 文本框在浮层打开后的第一帧取焦）。
     pub needs_focus: bool,
     confirm_requested: bool,
@@ -62,12 +63,22 @@ impl WorkflowPickerState {
     /// 加载顺序悄悄覆盖掉——两处口径一旦不同，用户看到的是这一处。
     pub fn new(entries: Vec<Workflow>) -> Self {
         Self {
+            target_session_id: None,
             needs_focus: true,
             confirm_requested: false,
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             scroll_to_selected: true,
             query_buffer: String::new(),
         }
+    }
+
+    pub fn with_target(mut self, session_id: String) -> Self {
+        self.target_session_id = Some(session_id);
+        self
+    }
+
+    pub fn target_session_id(&self) -> Option<&str> {
+        self.target_session_id.as_deref()
     }
 
     pub fn request_confirm(&mut self) {
@@ -136,6 +147,11 @@ impl WorkflowPickerState {
     }
 }
 
+/// A workflow never follows a replacement foreground terminal.
+pub(crate) fn workflow_target_is_active(expected: &str, active: Option<&str>) -> bool {
+    !expected.is_empty() && active == Some(expected)
+}
+
 static NEXT_ARGS_OPENING: AtomicU64 = AtomicU64::new(0);
 
 fn allocate_args_opening(counter: &AtomicU64) -> u64 {
@@ -154,6 +170,7 @@ fn allocate_args_opening(counter: &AtomicU64) -> u64 {
 
 /// 参数填写对话框状态：核心 [`ArgsForm`] 的 egui 外壳。
 pub struct WorkflowArgsState {
+    target_session_id: Option<String>,
     opening_id: u64,
     form: ArgsForm,
     /// 每行的编辑缓冲。egui 的 `TextEdit` 要 `&mut String`，而 [`ArgsForm`]
@@ -177,12 +194,35 @@ impl WorkflowArgsState {
             .map(|index| form.value(index).to_string())
             .collect();
         Self {
+            target_session_id: None,
             opening_id: allocate_args_opening(&NEXT_ARGS_OPENING),
             form,
             buffers,
             error: None,
             needs_focus: true,
             confirm_requested: false,
+        }
+    }
+
+    pub fn with_target(mut self, session_id: String) -> Self {
+        self.target_session_id = Some(session_id);
+        self
+    }
+
+    /// Return true only after whole-message queue admission. A refusal keeps
+    /// this exact opening and its raw buffers available for explicit retry.
+    pub fn submit_with(&mut self, admit: impl FnOnce(&str, &str) -> Result<(), String>) -> bool {
+        let result = self
+            .target_session_id
+            .as_deref()
+            .ok_or_else(|| "The workflow's original terminal is unavailable".to_owned())
+            .and_then(|target| self.render().and_then(|command| admit(target, &command)));
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
         }
     }
 
@@ -335,6 +375,115 @@ mod tests {
         assert!(!state.query().contains('\n'));
         assert_eq!(state.query_buffer, state.query());
         assert_eq!(state.selected(), 0);
+    }
+
+    #[test]
+    fn workflow_admission_refusal_retains_exact_form_for_explicit_retry() {
+        let mut wf = workflow("review", "", &[]);
+        wf.command = "echo {{value}}".to_owned();
+        wf.args = vec![arg("value", None)];
+        let mut state = WorkflowArgsState::new(wf).with_target("original".to_owned());
+        let opening = state.opening_id();
+        *state.row_mut(0).unwrap().1 = "  synthetic  ".to_owned();
+        state.sync();
+        let mut attempts = 0;
+        assert!(!state.submit_with(|target, _command| {
+            attempts += 1;
+            assert_eq!(target, "original");
+            Err("queue full; zero bytes admitted".to_owned())
+        }));
+        assert_eq!(attempts, 1);
+        assert_eq!(state.opening_id(), opening);
+        assert_eq!(state.row_mut(0).unwrap().1.as_str(), "  synthetic  ");
+        assert_eq!(
+            state.error.as_deref(),
+            Some("queue full; zero bytes admitted")
+        );
+        state.sync();
+        assert_eq!(attempts, 1, "idle synchronization must not retry admission");
+        assert!(state.submit_with(|target, _command| {
+            attempts += 1;
+            assert_eq!(target, "original");
+            Ok(())
+        }));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn parameterless_workflow_refusal_keeps_snapshot_and_target() {
+        let mut wf = workflow("no-args", "", &[]);
+        wf.command = "echo synthetic".to_owned();
+        let mut state = WorkflowArgsState::new(wf).with_target("original".to_owned());
+        let opening = state.opening_id();
+        assert!(!state.submit_with(|target, command| {
+            assert_eq!(target, "original");
+            assert_eq!(command, "echo synthetic");
+            Err("original terminal is not active".to_owned())
+        }));
+        assert_eq!(state.arg_count(), 0);
+        assert_eq!(state.opening_id(), opening);
+        assert_eq!(state.workflow().name, "no-args");
+        assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn workflow_target_refuses_missing_or_replacement_foreground() {
+        assert!(super::workflow_target_is_active("A", Some("A")));
+        assert!(!super::workflow_target_is_active("A", Some("B")));
+        assert!(!super::workflow_target_is_active("A", None));
+        assert!(!super::workflow_target_is_active("", Some("")));
+        let mut unbound = WorkflowArgsState::new(workflow("unbound", "", &[]));
+        assert!(!unbound.submit_with(|_, _| panic!("unbound form must not admit input")));
+        assert!(unbound.error.is_some());
+    }
+
+    #[test]
+    fn workflow_production_carries_opening_target_and_restores_only_refused_form() {
+        let source = include_str!("app/commands.rs");
+        let opening = source
+            .split_once("pub(crate) fn workflow_picker_toggle")
+            .unwrap()
+            .1
+            .split_once("fn report_refused_workflows")
+            .unwrap()
+            .0;
+        assert!(opening.contains("session.metadata.session_id.clone()"));
+        assert!(opening.contains(".with_target(target)"));
+        let accept = source
+            .split_once("pub(crate) fn workflow_picker_accept")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn submit_workflow_args")
+            .unwrap()
+            .0;
+        assert!(
+            accept.find("picker.target_session_id()").unwrap()
+                < accept.find("self.workflow_picker = None").unwrap()
+        );
+        assert!(!accept.contains("active_index"));
+        assert!(accept.contains("if parameterless"));
+        let submit = source
+            .split_once("pub(crate) fn submit_workflow_args")
+            .unwrap()
+            .1
+            .split_once("/// Apply an accepted command-correction")
+            .unwrap()
+            .0;
+        assert!(submit.contains("if !state.submit_with"));
+        assert!(submit.contains("Some(target)"));
+        assert!(submit.contains("self.workflow_args = Some(state)"));
+        let fill = source
+            .split_once("fn try_fill_prompt_with_history_command")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn workflow_picker_toggle")
+            .unwrap()
+            .0;
+        assert!(
+            fill.find("workflow_target_is_active").unwrap()
+                < fill.find("session.shell.write(&payload)").unwrap()
+        );
+        assert!(fill.contains("ReplayOutcome::WriteFailed(error)"));
     }
 
     #[test]

@@ -2729,6 +2729,15 @@ impl TerminalApp {
     /// [`PROMPT_FILL_MAX_COMMAND_BYTES`] 而不是 64 KiB 的日志预算——否则
     /// 选择器刚开始展示的 64 KiB–256 KiB 记录会条条可选、条条被拒。
     pub(crate) fn fill_prompt_with_history_command(&mut self, command: &str) {
+        let _ = self.try_fill_prompt_with_history_command(command, None);
+    }
+
+    /// Success acknowledges FIFO admission, not delivery by the asynchronous writer.
+    fn try_fill_prompt_with_history_command(
+        &mut self,
+        command: &str,
+        expected_session: Option<&str>,
+    ) -> Result<(), String> {
         // Even a refused mouse recall must not let an already-held Enter
         // submit the pre-existing draft after its overlay closes.
         self.claim_enter_for_prompt_recall();
@@ -2739,8 +2748,15 @@ impl TerminalApp {
             .get(index)
             .map(|session| session.metadata.session_id.clone())
         else {
-            return;
+            return Err("The original terminal is no longer available".to_owned());
         };
+        if expected_session.is_some_and(|expected| {
+            !crate::workflow_picker::workflow_target_is_active(expected, Some(&session_id))
+        }) {
+            let message = "Return to the workflow's original terminal before inserting";
+            self.set_status(message);
+            return Err(message.to_owned());
+        }
         if self
             .session_manager
             .sessions()
@@ -2750,12 +2766,12 @@ impl TerminalApp {
             })
         {
             self.set_status("Exited task terminals are read-only");
-            return;
+            return Err("Exited task terminals are read-only".to_owned());
         }
         let direct_input_blocked = self.direct_input_is_blocked_for_session(&session_id);
         let outcome = {
             let Some(session) = self.session_manager.get_session_mut(index) else {
-                return;
+                return Err("The original terminal is no longer available".to_owned());
             };
             let pending_input = direct_input_blocked || !session.pending_input.is_empty();
             let (alt_screen, prompt_ready, bracketed_paste, prompt_empty) = {
@@ -2804,37 +2820,48 @@ impl TerminalApp {
         };
         // 状态文案与 replay_sidebar_command 逐字一致：同一个动作在两个
         // 入口（块召回 / 历史召回）不给用户两套说法。
-        match outcome {
+        let (message, duration) = match outcome {
             ReplayOutcome::Filled => {
                 self.claim_enter_for_prompt_recall();
                 self.set_status("Command filled at prompt");
+                return Ok(());
             }
-            ReplayOutcome::NotPromptReady => {
-                self.set_status("Wait for the shell prompt before replaying a command")
-            }
-            ReplayOutcome::AlternateScreen => {
-                self.set_status("Cannot replay a command while an alternate-screen app is open")
-            }
+            ReplayOutcome::NotPromptReady => (
+                "Wait for the shell prompt before replaying a command".to_owned(),
+                None,
+            ),
+            ReplayOutcome::AlternateScreen => (
+                "Cannot replay a command while an alternate-screen app is open".to_owned(),
+                None,
+            ),
             ReplayOutcome::BracketedPasteDisabled => {
-                self.set_status("Safe replay requires bracketed-paste mode")
+                ("Safe replay requires bracketed-paste mode".to_owned(), None)
             }
-            ReplayOutcome::PendingInput => {
-                self.set_status("Wait for pending terminal input to be delivered")
-            }
-            ReplayOutcome::PromptNotEmpty => {
-                self.set_status("Clear the current prompt before recalling a command")
-            }
-            ReplayOutcome::UnsafeCommand(error) => self.set_status_for(
+            ReplayOutcome::PendingInput => (
+                "Wait for pending terminal input to be delivered".to_owned(),
+                None,
+            ),
+            ReplayOutcome::PromptNotEmpty => (
+                "Clear the current prompt before recalling a command".to_owned(),
+                None,
+            ),
+            ReplayOutcome::UnsafeCommand(error) => (
                 format!("Command replay rejected: {error}"),
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             ),
-            ReplayOutcome::WriteFailed(error) => self.set_status_for(
+            ReplayOutcome::WriteFailed(error) => (
                 format!("Command replay failed: {error}"),
-                Duration::from_secs(4),
+                Some(Duration::from_secs(4)),
             ),
-            // 单行历史命令永远不会触发 run/多行/cwd 分支。
-            _ => {}
+            // This single-line path cannot produce run/multiline/cwd outcomes.
+            _ => return Err("Command could not be admitted to the original terminal".to_owned()),
+        };
+        if let Some(duration) = duration {
+            self.set_status_for(message.clone(), duration);
+        } else {
+            self.set_status(message.clone());
         }
+        Err(message)
     }
 
     /// 工作流选择器开关（Ctrl+Shift+M）。发现/解析/校验全部在打开时同步完成
@@ -2846,12 +2873,21 @@ impl TerminalApp {
             self.workflow_args = None;
             return;
         }
+        let Some(target) = self
+            .session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| session.metadata.session_id.clone())
+        else {
+            self.set_status("No terminal is available for workflow insertion");
+            return;
+        };
         let dirs = crate::workflows::workflow_dirs();
         let scan = crate::workflows::scan(&dirs);
         self.report_refused_workflows(&scan.refused);
-        self.workflow_picker = Some(crate::workflow_picker::WorkflowPickerState::new(
-            scan.workflows,
-        ));
+        self.workflow_picker = Some(
+            crate::workflow_picker::WorkflowPickerState::new(scan.workflows).with_target(target),
+        );
     }
 
     /// Surface loader refusals once per changed path set. `load_all` logs the
@@ -2872,38 +2908,36 @@ impl TerminalApp {
     /// （`fill_prompt_with_history_command`：只读任务终端、alt-screen、提示符
     /// 未就绪、括号粘贴关闭、待发送输入、非空提示符都拒绝）。
     pub(crate) fn workflow_picker_accept(&mut self, workflow: crate::workflows::Workflow) {
+        let target = self
+            .workflow_picker
+            .as_ref()
+            .and_then(|picker| picker.target_session_id())
+            .map(str::to_owned);
         self.workflow_picker = None;
-        if workflow.args.is_empty() {
-            match crate::workflows::render(&workflow, &std::collections::HashMap::new()) {
-                Ok(command) => self.fill_prompt_with_history_command(&command),
-                Err(error) => {
-                    log::warn!("workflow render failed: {error}");
-                    self.set_status_for(
-                        format!("Workflow could not be rendered: {error}"),
-                        Duration::from_secs(5),
-                    );
-                }
-            }
+        let Some(target) = target else {
+            self.set_status("The workflow's original terminal is unavailable");
             return;
+        };
+        let parameterless = workflow.args.is_empty();
+        self.workflow_args =
+            Some(crate::workflow_picker::WorkflowArgsState::new(workflow).with_target(target));
+        if parameterless {
+            self.submit_workflow_args();
         }
-        self.workflow_args = Some(crate::workflow_picker::WorkflowArgsState::new(workflow));
     }
 
-    /// 参数对话框提交：渲染成功则回填提示符并关闭；失败则与 anvil 一致——
-    /// 在同一对话框内显示错误并保持打开。文件没声明默认值、用户也没填的参数
-    /// 现在会走到这条失败路径（`missing values: …`），而不是像以前那样按空串
-    /// 渲染出半截命令再回填。
+    /// Keep the same form on rendering or zero-byte admission refusal. Once
+    /// queued, retire it; later asynchronous writer failures must not replay it.
     pub(crate) fn submit_workflow_args(&mut self) {
         let Some(mut state) = self.workflow_args.take() else {
             return;
         };
-        match state.render() {
-            Ok(command) => self.fill_prompt_with_history_command(&command),
-            Err(error) => {
-                log::warn!("workflow render failed: {error}");
-                state.error = Some(error);
-                self.workflow_args = Some(state);
-            }
+        if !state.submit_with(|target, command| {
+            self.try_fill_prompt_with_history_command(command, Some(target))
+        }) {
+            self.workflow_args = Some(state);
+        } else {
+            self.set_status("Workflow command queued for prompt insertion");
         }
     }
 
