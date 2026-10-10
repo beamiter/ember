@@ -103,7 +103,7 @@ impl RemoteHostDraft {
 pub enum ConfigAction {
     CustomThemeApplied(Box<Theme>),
     DebugPanelToggled(bool),
-    OrganismChanged(bool, Option<OrganismMotion>),
+    OrganismChanged(bool, Option<OrganismMotion>, bool),
     SaveRequested,
     ResetToDefaults,
 }
@@ -135,6 +135,7 @@ pub struct ConfigPanel {
     edit_show_repo_strip: bool,
     edit_bottom_bar: bool,
     edit_organism_enabled: bool,
+    edit_organism_expanded: bool,
     edit_organism_motion: Option<OrganismMotion>,
     organism_preview: crate::organism_ui::PreviewUi,
     edit_block_mode: bool,
@@ -209,6 +210,7 @@ impl ConfigPanel {
             edit_show_repo_strip: true,
             edit_bottom_bar: jterm_core::bottom_bar::ENABLED_BY_DEFAULT,
             edit_organism_enabled: false,
+            edit_organism_expanded: false,
             edit_organism_motion: None,
             organism_preview: crate::organism_ui::PreviewUi::default(),
             edit_block_mode: true,
@@ -315,6 +317,7 @@ impl ConfigPanel {
         self.edit_show_repo_strip = config.show_repo_strip;
         self.edit_bottom_bar = config.bottom_bar;
         self.edit_organism_enabled = config.ascii_organism_enabled;
+        self.edit_organism_expanded = config.ascii_organism_expanded;
         self.edit_organism_motion = config.ascii_organism_motion;
         self.edit_block_mode = config.block_mode;
         self.edit_block_compact = config.block_compact;
@@ -373,6 +376,7 @@ impl ConfigPanel {
         config.show_repo_strip = self.edit_show_repo_strip;
         config.bottom_bar = self.edit_bottom_bar;
         config.ascii_organism_enabled = self.edit_organism_enabled;
+        config.ascii_organism_expanded = self.edit_organism_expanded;
         config.ascii_organism_motion = self.edit_organism_motion;
         config.block_mode = self.edit_block_mode;
         config.block_compact = self.edit_block_compact;
@@ -737,6 +741,10 @@ impl ConfigPanel {
                     }
                 });
         });
+        organism_changed |= ui
+            .checkbox(&mut self.edit_organism_expanded, "Expanded companion")
+            .changed();
+        ui.small("Reserves a fixed companion area while enabled. Turning ASCII Organism off releases it.");
         ui.label("Local terminal chrome; command cards optional. Memory is volatile.");
         ui.label(organism_motion_explanation(self.edit_organism_motion));
         ui.label(
@@ -749,6 +757,7 @@ impl ConfigPanel {
             actions.push(ConfigAction::OrganismChanged(
                 self.edit_organism_enabled,
                 self.edit_organism_motion,
+                self.edit_organism_expanded,
             ));
         }
         self.organism_preview.show(ui, self.edit_organism_motion);
@@ -2057,18 +2066,22 @@ mod tests {
     fn organism_fields_round_trip_without_changing_other_settings() {
         let source = Config {
             ascii_organism_enabled: true,
+            ascii_organism_expanded: true,
             ascii_organism_motion: Some(OrganismMotion::Static),
             ..Config::default()
         };
         let mut panel = ConfigPanel::new();
         panel.sync_from_config(&source);
         assert!(panel.edit_organism_enabled);
+        assert!(panel.edit_organism_expanded);
         assert_eq!(panel.edit_organism_motion, Some(OrganismMotion::Static));
         panel.edit_organism_enabled = false;
+        panel.edit_organism_expanded = false;
         panel.edit_organism_motion = None;
         let mut applied = source.clone();
         panel.apply_to_config(&mut applied);
         assert!(!applied.ascii_organism_enabled);
+        assert!(!applied.ascii_organism_expanded);
         assert_eq!(applied.ascii_organism_motion, None);
         assert_eq!(applied.font_family, source.font_family);
         assert_eq!(applied.block_mode, source.block_mode);

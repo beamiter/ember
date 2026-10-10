@@ -119,6 +119,10 @@ pub struct Config {
     #[serde(default)]
     pub ascii_organism_enabled: bool,
 
+    /// Explicitly reserve a fixed expanded companion area instead of compact status.
+    #[serde(default)]
+    pub ascii_organism_expanded: bool,
+
     /// Missing means Automatic. Until a platform animation-preference adapter
     /// exists, Automatic resolves to Calm rather than claiming desktop parity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,6 +610,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             ascii_organism_enabled: false,
+            ascii_organism_expanded: false,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
@@ -1409,9 +1414,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expanded_organism_is_opt_in_and_round_trips() {
+        let old: Config = toml::from_str("ascii_organism_enabled = true").unwrap();
+        assert!(!old.ascii_organism_expanded);
+        let expanded: Config = toml::from_str("ascii_organism_expanded = true").unwrap();
+        assert!(expanded.ascii_organism_expanded);
+        let restored: Config = toml::from_str(&toml::to_string(&expanded).unwrap()).unwrap();
+        assert!(restored.ascii_organism_expanded);
+        assert!(!restored.ascii_organism_enabled);
+    }
+
+    #[test]
     fn organism_preferences_default_off_and_round_trip_all_motion_modes() {
         let default: Config = toml::from_str("").unwrap();
         assert!(!default.ascii_organism_enabled);
+        assert!(!default.ascii_organism_expanded);
         assert_eq!(default.ascii_organism_motion, None);
         for (text, mode) in [
             ("full", OrganismMotion::Full),

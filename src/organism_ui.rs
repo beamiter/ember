@@ -112,6 +112,28 @@ fn live_greeting_allowed(
         && !buttons_down
 }
 
+fn host_height(enabled: bool, expanded: bool) -> f32 {
+    if !enabled {
+        0.0
+    } else if expanded {
+        96.0
+    } else {
+        24.0
+    }
+}
+
+fn host_text(
+    context: RenderContext,
+    frame: u64,
+    width: f32,
+    expanded: bool,
+) -> (Option<std::borrow::Cow<'static, str>>, String) {
+    (
+        expanded.then(|| sprite_frame_with_context(context, frame)),
+        live_status_text(context, frame, width),
+    )
+}
+
 fn live_status_text(context: RenderContext, frame: u64, width: f32) -> String {
     let glyph = sticky_glyph_with_context(context, frame);
     if width.is_finite() && width >= 640.0 {
@@ -571,7 +593,10 @@ impl OrganismHost {
         // Allocate exactly the same strip while suppressed. Typing, switching
         // panes and alternate screen must not change the terminal's grid size.
         egui::Panel::bottom("ascii_organism_chrome")
-            .exact_size(24.0)
+            .exact_size(host_height(
+                config.ascii_organism_enabled,
+                config.ascii_organism_expanded,
+            ))
             .frame(egui::Frame::NONE.inner_margin(0.0))
             .resizable(false)
             .show(ui, |ui| {
@@ -581,16 +606,36 @@ impl OrganismHost {
                         .shrink2(egui::vec2(8.0, 0.0));
                     // Observe only the bounded glyph footprint. No widget,
                     // click handler, focus request or terminal input is created.
-                    let hover_rect = egui::Rect::from_min_size(
+                    let expanded = config.ascii_organism_expanded;
+                    let status_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x, (rect.max.y - 24.0).max(rect.min.y)),
+                        rect.max,
+                    );
+                    let body_rect = egui::Rect::from_min_max(
                         rect.min,
-                        egui::vec2(96.0_f32.min(rect.width()), rect.height()),
+                        egui::pos2(rect.max.x, status_rect.min.y),
+                    );
+                    let target = if expanded { body_rect } else { status_rect };
+                    let hover_rect = egui::Rect::from_min_size(
+                        target.min,
+                        egui::vec2(96.0_f32.min(target.width()), target.height()),
                     );
                     let near = pointer.is_some_and(|point| hover_rect.contains(point));
                     let display = self.greeting.update(now, near, greeting_allowed, context);
-                    ui.painter().with_clip_rect(rect).text(
-                        rect.left_center(),
+                    let (sprite, status) = host_text(display, frame, rect.width(), expanded);
+                    if let Some(sprite) = sprite {
+                        ui.painter().with_clip_rect(body_rect).text(
+                            body_rect.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            sprite,
+                            egui::FontId::monospace(14.0),
+                            ui.visuals().text_color(),
+                        );
+                    }
+                    ui.painter().with_clip_rect(status_rect).text(
+                        status_rect.left_center(),
                         egui::Align2::LEFT_CENTER,
-                        live_status_text(display, frame, rect.width()),
+                        status,
                         egui::TextStyle::Monospace.resolve(ui.style()),
                         ui.visuals().text_color(),
                     );
@@ -932,6 +977,41 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn companion_height_depends_only_on_explicit_preferences() {
+        assert_eq!(host_height(false, false), 0.0);
+        assert_eq!(host_height(false, true), 0.0);
+        assert_eq!(host_height(true, false), 24.0);
+        assert_eq!(host_height(true, true), 96.0);
+        for width in [0.0, 119.9, 120.0, 640.0] {
+            for focused in [false, true] {
+                let policy = PresentationPolicy {
+                    enabled: true,
+                    focused_owner: focused && host_geometry_allows(width),
+                    local: true,
+                    ..PresentationPolicy::default()
+                };
+                let _visible = policy.inline_visible(Duration::ZERO);
+                assert_eq!(host_height(policy.enabled, true), 96.0);
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_body_and_status_share_the_final_context_and_frame() {
+        for pose in PreviewPose::ALL {
+            for frame in [0, 1, 9] {
+                let context = pose.context();
+                let (sprite, status) = host_text(context, frame, 640.0, true);
+                assert_eq!(sprite.unwrap(), sprite_frame_with_context(context, frame));
+                assert_eq!(status, live_status_text(context, frame, 640.0));
+                let (compact, compact_status) = host_text(context, frame, 640.0, false);
+                assert!(compact.is_none());
+                assert_eq!(compact_status, status);
+            }
+        }
+    }
 
     #[test]
     fn watch_rhythm_waits_and_briefly_acknowledges_resumed_activity() {
