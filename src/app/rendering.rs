@@ -491,7 +491,7 @@ fn draw_workflow_args(
         egui::vec2(available.width().min(560.0), available.height()),
     );
     // Actions stay outside the scrolling reading area, even for all 64 legal arguments.
-    let window_id = egui::Id::new("Workflow Parameters");
+    let window_id = egui::Id::new(("Workflow Parameters", state.opening_id()));
     ctx.memory_mut(|memory| {
         memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, window_id))
     });

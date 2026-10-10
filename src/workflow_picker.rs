@@ -23,6 +23,7 @@
 
 use crate::workflows::{ArgsForm, Workflow, WorkflowArg};
 use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 一次渲染/导航的最大结果数。与历史选择器一致：键盘选择与绘制共用
 /// `filtered()`，上限同时约束两者。
@@ -135,8 +136,25 @@ impl WorkflowPickerState {
     }
 }
 
+static NEXT_ARGS_OPENING: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_args_opening(counter: &AtomicU64) -> u64 {
+    // Identity allocation only; no shared form state is published here.
+    let mut opening = counter.load(Ordering::Relaxed);
+    loop {
+        let next = opening
+            .checked_add(1)
+            .expect("workflow opening ID exhausted");
+        match counter.compare_exchange_weak(opening, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return opening,
+            Err(current) => opening = current,
+        }
+    }
+}
+
 /// 参数填写对话框状态：核心 [`ArgsForm`] 的 egui 外壳。
 pub struct WorkflowArgsState {
+    opening_id: u64,
     form: ArgsForm,
     /// 每行的编辑缓冲。egui 的 `TextEdit` 要 `&mut String`，而 [`ArgsForm`]
     /// 刻意不外借内部值——Unset 与 Supplied("") 一旦被同一个 `&mut String`
@@ -159,12 +177,19 @@ impl WorkflowArgsState {
             .map(|index| form.value(index).to_string())
             .collect();
         Self {
+            opening_id: allocate_args_opening(&NEXT_ARGS_OPENING),
             form,
             buffers,
             error: None,
             needs_focus: true,
             confirm_requested: false,
         }
+    }
+
+    /// Stable while editing/retrying this form, fresh even when the same
+    /// workflow is reopened. Retained egui memory must not cross openings.
+    pub fn opening_id(&self) -> u64 {
+        self.opening_id
     }
 
     pub fn request_confirm(&mut self) {
@@ -310,6 +335,59 @@ mod tests {
         assert!(!state.query().contains('\n'));
         assert_eq!(state.query_buffer, state.query());
         assert_eq!(state.selected(), 0);
+    }
+
+    #[test]
+    fn args_opening_is_fresh_but_survives_edits_and_validation_retry() {
+        let mut wf = workflow("opening", "", &[]);
+        wf.command = "echo {{value}}".to_owned();
+        wf.args = vec![arg("value", None)];
+        let mut state = WorkflowArgsState::new(wf.clone());
+        let first = state.opening_id();
+        state.error = Some(state.render().unwrap_err());
+        state.request_confirm();
+        assert!(state.take_confirm_request());
+        assert_eq!(state.opening_id(), first);
+        *state.row_mut(0).unwrap().1 = "synthetic".to_owned();
+        state.sync();
+        assert_eq!(state.opening_id(), first);
+        assert!(state.error.is_none());
+        drop(state);
+        assert_ne!(WorkflowArgsState::new(wf).opening_id(), first);
+    }
+
+    #[test]
+    fn args_opening_allocator_does_not_wrap() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        assert_eq!(super::allocate_args_opening(&counter), u64::MAX - 1);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
+        assert!(std::panic::catch_unwind(|| super::allocate_args_opening(&counter)).is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn args_window_namespace_owns_the_entire_form_subtree() {
+        let first = WorkflowArgsState::new(workflow("same", "", &[]));
+        let second = WorkflowArgsState::new(workflow("same", "", &[]));
+        let a = eframe::egui::Id::new(("Workflow Parameters", first.opening_id()));
+        let b = eframe::egui::Id::new(("Workflow Parameters", second.opening_id()));
+        assert_ne!(a, b);
+        assert_ne!(
+            a.with(("workflow-argument", 0)),
+            b.with(("workflow-argument", 0))
+        );
+        let source = include_str!("app/rendering.rs");
+        let body = source
+            .split_once("fn draw_workflow_args(")
+            .unwrap()
+            .1
+            .split_once("const MIN_FRAME_BUDGET")
+            .unwrap()
+            .0;
+        assert!(body.contains("egui::Id::new((\"Workflow Parameters\", state.opening_id()))"));
+        assert!(body.contains(".id(window_id)"));
+        assert!(body.contains("egui::Order::Foreground, window_id"));
+        assert!(!body.contains(".id(egui::Id::new("));
     }
 
     #[test]
