@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
-use jterm_core::organism::{AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone};
+use jterm_core::organism::{AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone, WatchRhythm};
 use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 
 use crate::config::{Config, OrganismMotion};
@@ -125,6 +125,141 @@ fn live_status_text(context: RenderContext, frame: u64, width: f32) -> String {
     }
 }
 
+/// Content-free presentation clock. Counts observed PTY activity batches, not
+/// throughput. Settling measures this eligible observation, not command age.
+#[derive(Default)]
+struct WatchObservation {
+    generation: Option<u64>,
+    observed_since: Option<Duration>,
+    activity_since: Option<Duration>,
+    outputs: [Option<Duration>; 3],
+    resumed_until: Option<Duration>,
+    clock: Duration,
+    first_activity_pending: bool,
+}
+
+impl WatchObservation {
+    const BUSY_WINDOW: Duration = Duration::from_millis(1200);
+    const WAITING_AFTER: Duration = Duration::from_secs(3);
+    const RESUMED_HOLD: Duration = Duration::from_millis(900);
+    const SETTLED_AFTER: Duration = Duration::from_secs(60);
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn clear_activity(&mut self) {
+        self.outputs = [None; 3];
+        self.resumed_until = None;
+    }
+
+    fn observe_running(&mut self, now: Duration, generation: Option<u64>) -> bool {
+        let now = now.max(self.clock);
+        self.clock = now;
+        if generation != self.generation {
+            self.generation = generation;
+            self.observed_since = generation.map(|_| now);
+            self.activity_since = self.observed_since;
+            self.first_activity_pending = generation.is_some();
+            self.clear_activity();
+            return true;
+        }
+        if generation.is_none() {
+            self.observed_since = None;
+            self.activity_since = None;
+            self.first_activity_pending = false;
+            self.clear_activity();
+        }
+        false
+    }
+
+    fn observe_batch(&mut self, now: Duration, generation: Option<u64>, discard: bool) {
+        let backwards = now < self.clock;
+        self.observe_running(now, generation);
+        if generation.is_none() || discard {
+            if discard {
+                self.activity_since = generation.map(|_| now.max(self.clock));
+                self.first_activity_pending = generation.is_some();
+            }
+            self.clear_activity();
+            return;
+        }
+        if backwards {
+            return;
+        }
+        if self.first_activity_pending {
+            self.first_activity_pending = false;
+            self.activity_since = Some(now);
+            self.clear_activity();
+            return;
+        }
+        let quiet_since = self.outputs[2].or(self.activity_since);
+        let was_waiting = quiet_since
+            .is_some_and(|last| now.saturating_sub(last) >= Self::WAITING_AFTER);
+        self.outputs = [self.outputs[1], self.outputs[2], Some(now)];
+        if was_waiting {
+            self.resumed_until = Some(now.saturating_add(Self::RESUMED_HOLD));
+        }
+    }
+
+    fn observe_activity(
+        &mut self,
+        now: Duration,
+        generation: Option<u64>,
+        discard: bool,
+        rhythm_enabled: bool,
+    ) {
+        if rhythm_enabled {
+            self.observe_batch(now, generation, discard);
+        } else {
+            self.observe_running(now, generation);
+            self.clear_activity();
+        }
+    }
+
+    fn rhythm(&self, now: Duration) -> WatchRhythm {
+        if self.generation.is_none() {
+            return WatchRhythm::Steady;
+        }
+        let now = now.max(self.clock);
+        if self.resumed_until.is_some_and(|until| now < until) {
+            return WatchRhythm::Resumed;
+        }
+        if self.outputs[2]
+            .or(self.activity_since)
+            .is_some_and(|last| now.saturating_sub(last) >= Self::WAITING_AFTER)
+        {
+            WatchRhythm::Waiting
+        } else if self.outputs[0]
+            .is_some_and(|oldest| now.saturating_sub(oldest) <= Self::BUSY_WINDOW)
+        {
+            WatchRhythm::Busy
+        } else {
+            WatchRhythm::Steady
+        }
+    }
+
+    fn context(&self, now: Duration, language: BodyLanguage, rhythm_enabled: bool) -> RenderContext {
+        RenderContext::new(self.behavior(now), language, false).with_watch_rhythm(
+            if rhythm_enabled {
+                self.rhythm(now)
+            } else {
+                WatchRhythm::Steady
+            },
+        )
+    }
+
+    fn behavior(&self, now: Duration) -> Behavior {
+        if self.observed_since
+            .is_some_and(|start| now.saturating_sub(start) >= Self::SETTLED_AFTER)
+        {
+            Behavior::WatchSettled
+        } else {
+            Behavior::WatchCommand
+        }
+    }
+}
+
 pub struct OrganismHost {
     born: Instant,
     life: WindowLife,
@@ -142,6 +277,8 @@ pub struct OrganismHost {
     context: RenderContext,
     reaction_until: Duration,
     greeting: LiveGreeting,
+    watch: WatchObservation,
+    rhythm_enabled: bool,
 }
 
 impl Default for OrganismHost {
@@ -163,6 +300,8 @@ impl Default for OrganismHost {
             context: PreviewPose::Calm.context(),
             reaction_until: Duration::ZERO,
             greeting: LiveGreeting::default(),
+            watch: WatchObservation::default(),
+            rhythm_enabled: false,
         }
     }
 }
@@ -178,11 +317,17 @@ impl OrganismHost {
     /// Revoke the old session before accepting a new one. Acquiring a running
     /// command quarantines it; it must not manufacture a Start or completion.
     pub fn acquire(&mut self, owner: Option<&str>, tail: Option<(u64, bool)>, running: bool) {
+        let now = self.born.elapsed();
+        let generation = (owner.is_some() && running)
+            .then(|| tail.map(|(sequence, _)| sequence))
+            .flatten();
         if self.owner.as_deref() == owner {
             self.running = owner.is_some() && running;
+            self.watch.observe_running(now, generation);
             return;
         }
-        let now = self.born.elapsed();
+        self.watch.reset();
+        self.watch.observe_running(now, generation);
         self.life
             .advance(now, false, false, CircadianPhase::Unlearned);
         self.greeting.cancel();
@@ -202,6 +347,7 @@ impl OrganismHost {
         if self.owner.as_deref() == Some(session) {
             let now = self.born.elapsed();
             self.greeting.cancel();
+            self.watch.reset();
             self.last_input = Some(now);
             self.life.note_input(now);
             self.ambient.interrupt();
@@ -231,6 +377,9 @@ impl OrganismHost {
             record.state == crate::terminal::CommandState::Running && record.start_mark_seen
         });
         self.running = running;
+        let generation = running.then(|| records.back().map(|record| record.sequence)).flatten();
+        let discard_activity = self.quarantine_batch || backlogged || !completions.is_empty();
+        self.observe_watch_activity(now, generation, discard_activity);
         if self.quarantine(
             records
                 .back()
@@ -283,6 +432,20 @@ impl OrganismHost {
                 self.pending = None;
             }
         }
+    }
+
+    fn observe_watch_activity(&mut self, now: Duration, generation: Option<u64>, discard: bool) {
+        // Typing retreat is a hidden presentation interval, not a reservoir
+        // of output activity to replay when the glyph returns.
+        if self
+            .last_input
+            .is_some_and(|last| now.saturating_sub(last) < crate::organism::INPUT_RETREAT)
+        {
+            self.watch.reset();
+            return;
+        }
+        self.watch
+            .observe_activity(now, generation, discard, self.rhythm_enabled);
     }
 
     fn quarantine(&mut self, tail: Option<(u64, bool)>, running: bool, backlogged: bool) -> bool {
@@ -356,6 +519,9 @@ impl OrganismHost {
             motion: config.ascii_organism_motion,
             last_input: self.last_input,
         };
+        if !policy.inline_visible(now) {
+            self.watch.reset();
+        }
         if eligible && now >= self.reaction_until && !self.running {
             let behavior = self.ambient.step(
                 self.life.state(),
@@ -376,10 +542,10 @@ impl OrganismHost {
             0
         };
         let context = if self.running {
-            RenderContext::new(
-                Behavior::WatchCommand,
+            self.watch.context(
+                now,
                 BodyLanguage::from_state(self.life.state()),
-                false,
+                self.rhythm_enabled,
             )
         } else {
             self.context
@@ -485,6 +651,15 @@ impl crate::TerminalApp {
     }
 
     pub(crate) fn prepare_organism(&mut self, ctx: &egui::Context) {
+        let rhythm_enabled =
+            resolved_motion(self.config.ascii_organism_motion) != OrganismMotion::Static;
+        if self.organism.rhythm_enabled != rhythm_enabled {
+            self.organism.watch.reset();
+        }
+        self.organism.rhythm_enabled = rhythm_enabled;
+        if !rhythm_enabled {
+            self.organism.watch.clear_activity();
+        }
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false))
             && !self.terminal_input_blocked(ctx)
             && !self.active_terminal_is_read_only();
@@ -749,6 +924,172 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn watch_rhythm_waits_and_briefly_acknowledges_resumed_activity() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        watch.observe_activity(Duration::ZERO, Some(7), false, true);
+        assert_eq!(watch.rhythm(Duration::from_millis(2999)), WatchRhythm::Steady);
+        assert_eq!(watch.rhythm(Duration::from_secs(3)), WatchRhythm::Waiting);
+        watch.observe_activity(Duration::from_secs(3), Some(7), false, true);
+        assert_eq!(watch.rhythm(Duration::from_secs(3)), WatchRhythm::Resumed);
+        assert_eq!(watch.rhythm(Duration::from_millis(3899)), WatchRhythm::Resumed);
+        assert_eq!(watch.rhythm(Duration::from_millis(3900)), WatchRhythm::Steady);
+    }
+
+    #[test]
+    fn silent_running_waits_before_any_output_and_first_activity_stays_neutral() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        assert_eq!(watch.rhythm(Duration::from_millis(2999)), WatchRhythm::Steady);
+        assert_eq!(watch.rhythm(Duration::from_secs(3)), WatchRhythm::Waiting);
+        watch.observe_activity(Duration::from_secs(5), Some(7), false, true);
+        assert_eq!(watch.rhythm(Duration::from_secs(5)), WatchRhythm::Steady);
+        assert_eq!(watch.rhythm(Duration::from_secs(8)), WatchRhythm::Waiting);
+        assert_eq!(watch.outputs, [None; 3]);
+    }
+
+    #[test]
+    fn watch_rhythm_busy_requires_three_observed_batches_in_the_window() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        watch.observe_activity(Duration::ZERO, Some(7), false, true);
+        for millis in [100, 200] {
+            watch.observe_activity(Duration::from_millis(millis), Some(7), false, true);
+        }
+        assert_eq!(watch.rhythm(Duration::from_millis(200)), WatchRhythm::Steady);
+        watch.observe_activity(Duration::from_millis(300), Some(7), false, true);
+        assert_eq!(watch.rhythm(Duration::from_millis(300)), WatchRhythm::Busy);
+        assert_eq!(watch.rhythm(Duration::from_millis(1300)), WatchRhythm::Busy);
+        assert_eq!(watch.rhythm(Duration::from_millis(1301)), WatchRhythm::Steady);
+        assert_eq!(watch.rhythm(Duration::from_millis(3300)), WatchRhythm::Waiting);
+    }
+
+    #[test]
+    fn watch_rhythm_command_boundary_and_quarantine_discard_old_activity() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        watch.observe_activity(Duration::ZERO, Some(7), false, true);
+        for millis in [100, 200, 300] {
+            watch.observe_activity(Duration::from_millis(millis), Some(7), false, true);
+        }
+        let boundary = Duration::from_secs(1);
+        watch.observe_activity(boundary, Some(8), true, true);
+        assert_eq!(watch.rhythm(boundary), WatchRhythm::Steady);
+        assert_eq!(watch.outputs, [None; 3]);
+        for millis in [1100, 1200] {
+            watch.observe_activity(Duration::from_millis(millis), Some(8), false, true);
+        }
+        assert_eq!(watch.rhythm(Duration::from_millis(1200)), WatchRhythm::Steady);
+        watch.observe_activity(Duration::from_secs(10), Some(8), true, true);
+        assert_eq!(watch.rhythm(Duration::from_secs(10)), WatchRhythm::Steady);
+        assert_eq!(watch.activity_since, Some(Duration::from_secs(10)));
+        assert_eq!(watch.observed_since, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn watch_settling_measures_only_this_continuous_observation() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        assert_eq!(watch.behavior(Duration::from_millis(59999)), Behavior::WatchCommand);
+        assert_eq!(watch.behavior(Duration::from_secs(60)), Behavior::WatchSettled);
+        watch.reset();
+        watch.observe_running(Duration::from_secs(120), Some(7));
+        assert_eq!(watch.behavior(Duration::from_secs(120)), Behavior::WatchCommand);
+        assert_eq!(watch.rhythm(Duration::from_secs(120)), WatchRhythm::Steady);
+    }
+
+    #[test]
+    fn first_late_activity_does_not_make_a_settled_watch_young_again() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        let now = Duration::from_secs(61);
+        assert_eq!(watch.rhythm(now), WatchRhythm::Waiting);
+        assert_eq!(watch.behavior(now), Behavior::WatchSettled);
+        watch.observe_activity(now, Some(7), false, true);
+        assert_eq!(watch.behavior(now), Behavior::WatchSettled);
+        assert_eq!(watch.rhythm(now), WatchRhythm::Steady);
+        assert_eq!(watch.activity_since, Some(now));
+    }
+
+    #[test]
+    fn watch_static_does_not_record_activity_or_reset_observation_age() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(7));
+        for millis in [100, 200, 300] {
+            watch.observe_activity(Duration::from_millis(millis), Some(7), false, false);
+        }
+        assert_eq!(watch.outputs, [None; 3]);
+        assert_eq!(watch.resumed_until, None);
+        assert_eq!(watch.behavior(Duration::from_secs(60)), Behavior::WatchSettled);
+        // Exercise the same presentation gate used by the live host.
+        let context = watch.context(Duration::from_secs(60), BodyLanguage::default(), false);
+        assert_eq!(context.watch_rhythm, WatchRhythm::Steady);
+    }
+
+    #[test]
+    fn watch_owner_loss_and_nonrunning_batch_clear_observation_without_life_change() {
+        let mut host = OrganismHost {
+            rhythm_enabled: true,
+            ..OrganismHost::default()
+        };
+        host.acquire(Some("one"), Some((7, true)), true);
+        let before = format!("{:?}", host.life.state());
+        host.acquire(None, None, false);
+        assert_eq!(host.watch.generation, None);
+        host.acquire(Some("two"), Some((8, true)), true);
+        assert_eq!(host.watch.generation, Some(8));
+        assert_eq!(host.watch.outputs, [None; 3]);
+        host.batch("two", &VecDeque::new(), &[], false, false);
+        assert_eq!(host.watch.generation, None);
+        assert_eq!(format!("{:?}", host.life.state()), before);
+    }
+
+    #[test]
+    fn watch_acquire_then_batch_keeps_first_activity_quarantined() {
+        let mut host = OrganismHost {
+            rhythm_enabled: true,
+            ..OrganismHost::default()
+        };
+        host.acquire(Some("one"), Some((7, true)), true);
+        host.acquire(Some("one"), Some((7, true)), true);
+        assert!(host.watch.first_activity_pending);
+        let now = host.born.elapsed();
+        host.observe_watch_activity(now, Some(7), false);
+        assert_eq!(host.watch.outputs, [None; 3]);
+        assert!(!host.watch.first_activity_pending);
+        host.acquire(Some("one"), Some((8, true)), true);
+        host.observe_watch_activity(host.born.elapsed(), Some(8), false);
+        assert_eq!(host.watch.outputs, [None; 3]);
+        assert!(!host.watch.first_activity_pending);
+    }
+
+    #[test]
+    fn watch_retreat_drops_activity_before_the_next_draw() {
+        let mut host = OrganismHost {
+            rhythm_enabled: true,
+            last_input: Some(Duration::ZERO),
+            ..OrganismHost::default()
+        };
+        host.observe_watch_activity(Duration::from_millis(100), Some(7), false);
+        assert_eq!(host.watch.generation, None);
+        host.observe_watch_activity(Duration::from_secs(1), Some(7), false);
+        assert_eq!(host.watch.generation, Some(7));
+        assert_eq!(host.watch.outputs, [None; 3]);
+        assert!(!host.watch.first_activity_pending);
+    }
+
+    #[test]
+    fn watch_backwards_activity_cannot_create_a_false_burst() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::from_secs(10), Some(7));
+        for millis in [100, 200, 300] {
+            watch.observe_activity(Duration::from_millis(millis), Some(7), false, true);
+        }
+        assert_eq!(watch.outputs, [None; 3]);
+        assert_eq!(watch.rhythm(Duration::from_secs(10)), WatchRhythm::Steady);
+    }
 
     #[test]
     fn live_hover_dwells_once_and_requires_a_new_entry() {
