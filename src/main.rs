@@ -6892,7 +6892,10 @@ impl eframe::App for TerminalApp {
             && ctx.input(|input| {
                 input.pointer.any_pressed()
                     || input.pointer.any_down()
-                    || input.raw_scroll_delta != egui::Vec2::ZERO
+                    || input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
             })
         {
             self.organism.accepted_input(&active_session_id);

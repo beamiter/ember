@@ -267,12 +267,17 @@ impl OrganismHost {
             .resizable(false)
             .show(ui, |ui| {
                 if policy.inline_visible(now) && ui.available_width() >= 120.0 {
-                    let rect = ui.available_rect_before_wrap().shrink2(egui::vec2(8.0, 0.0));
+                    let rect = ui
+                        .available_rect_before_wrap()
+                        .shrink2(egui::vec2(8.0, 0.0));
                     // Paint only: no widget ID, focus, click or hover target.
                     ui.painter().with_clip_rect(rect).text(
                         rect.left_center(),
                         egui::Align2::LEFT_CENTER,
-                        format!("{:<12}  Volatile", sticky_glyph_with_context(context, frame)),
+                        format!(
+                            "{:<12}  Volatile",
+                            sticky_glyph_with_context(context, frame)
+                        ),
                         egui::TextStyle::Monospace.resolve(ui.style()),
                         ui.visuals().text_color(),
                     );
@@ -408,9 +413,8 @@ fn next_host_wake(
 
 fn fresh_start(cursor: Option<(u64, bool)>, sequence: u64, started: bool) -> bool {
     started
-        && cursor.is_none_or(|(seen, was_started)| {
-            sequence > seen || (sequence == seen && !was_started)
-        })
+        && cursor
+            .is_none_or(|(seen, was_started)| sequence > seen || (sequence == seen && !was_started))
 }
 
 fn reaction_duration(reaction: &Reaction) -> Duration {
@@ -662,7 +666,6 @@ mod tests {
         assert!(!host.running);
     }
 
-
     fn static_policy() -> PresentationPolicy {
         PresentationPolicy {
             enabled: true,
@@ -682,7 +685,10 @@ mod tests {
             next_host_wake(static_policy(), now, deadline, true),
             Some(Duration::from_secs(2))
         );
-        assert_eq!(next_host_wake(static_policy(), deadline, deadline, true), None);
+        assert_eq!(
+            next_host_wake(static_policy(), deadline, deadline, true),
+            None
+        );
         assert_eq!(
             next_host_wake(
                 static_policy(),
@@ -759,5 +765,4 @@ mod tests {
             Some(Duration::from_millis(50))
         );
     }
-
 }

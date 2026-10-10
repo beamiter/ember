@@ -1949,7 +1949,7 @@ fn color_btn_rgb(ui: &mut egui::Ui, tooltip: &str, color: &mut [u8; 3]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{ConfigPanel, RemoteHostDraft};
-    use crate::config::Config;
+    use crate::config::{Config, OrganismMotion};
 
     /// A Fix-menu pick made while Settings is open must survive the panel's
     /// Save, but must not overwrite a different choice the user made there.
