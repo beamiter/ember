@@ -55,7 +55,11 @@ use jterm_core::workflows::{
     MAX_WORKFLOW_DIRECTORIES,
 };
 
-pub use jterm_core::workflows::{render, ArgsForm, LoadOrder, Workflow, WorkflowArg};
+// This module is also public in lib.rs. Preserve ember::workflows::render
+// for library consumers even though the binary now uses ArgsForm exclusively.
+#[allow(unused_imports)]
+pub use jterm_core::workflows::render;
+pub use jterm_core::workflows::{ArgsForm, LoadOrder, Workflow, WorkflowArg};
 
 /// The directory segment ember looks under, and — derived from it by
 /// [`SearchPathSpec::for_app`] — the `EMBER_WORKFLOW_DIR` override it honours.
