@@ -59,6 +59,67 @@ enum SidebarTabAction {
 
 type TabMenuSnapshot = Vec<(Option<Vec<String>>, bool)>;
 
+struct RemoteMenuEntry {
+    index: usize,
+    label: String,
+    widget_id: egui::Id,
+    profile: jterm_core::jsh_remote::RemoteHostConfig,
+}
+
+fn remote_menu_widget_id(
+    index: usize,
+    host: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> egui::Id {
+    // UI gesture identity only. Admission below compares the exact profile.
+    egui::Id::new((
+        "remote_profile_entry",
+        index,
+        &host.name,
+        &host.host,
+        &host.user,
+        host.docker,
+        &host.remote_shell,
+        &host.session,
+        &host.ssh_args,
+        &host.deploy,
+        &host.deploy_artifact,
+    ))
+}
+
+fn remote_menu_entries(hosts: &[jterm_core::jsh_remote::RemoteHostConfig]) -> Vec<RemoteMenuEntry> {
+    hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .map(|(index, host)| {
+            let mut label = crate::config::remote_host_display_name(host, index);
+            if crate::config::validate_remote_host_at(hosts, index).is_err() {
+                label.push_str(" (unavailable)");
+            }
+            RemoteMenuEntry {
+                index,
+                label,
+                widget_id: remote_menu_widget_id(index, host),
+                profile: host.clone(),
+            }
+        })
+        .collect()
+}
+
+fn revalidate_remote_menu_action(
+    action: SidebarTabAction,
+    entries: &[RemoteMenuEntry],
+    current: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> Option<SidebarTabAction> {
+    if let SidebarTabAction::ConnectRemote(index) = action {
+        let captured = entries.iter().find(|entry| entry.index == index)?;
+        if current.get(index) != Some(&captured.profile) {
+            return None;
+        }
+    }
+    Some(action)
+}
+
 #[derive(Clone)]
 pub(crate) struct TabRenameDraft {
     opening: std::sync::Arc<()>,
@@ -629,23 +690,7 @@ impl TerminalApp {
         // 右键菜单只读这些预先算好的值,菜单闭包内不再碰 self,避免与列表
         // 渲染闭包争借用。
         let marked_count = infos.iter().filter(|info| info.flags.marked).count();
-        let remote_entries: Vec<(usize, String)> = self
-            .config
-            .remote_hosts
-            .iter()
-            .take(crate::config::MAX_REMOTE_HOSTS)
-            .enumerate()
-            .map(|(index, host)| {
-                let unavailable =
-                    crate::config::validate_remote_host_at(&self.config.remote_hosts, index)
-                        .is_err();
-                let mut label = crate::config::remote_host_display_name(host, index);
-                if unavailable {
-                    label.push_str(" (unavailable)");
-                }
-                (index, label)
-            })
-            .collect();
+        let remote_entries = remote_menu_entries(&self.config.remote_hosts);
 
         let mut switch_to: Option<usize> = None;
         let mut close_idx: Option<usize> = None;
@@ -940,7 +985,15 @@ impl TerminalApp {
         // 右键菜单的操作在渲染闭包外统一执行。重命名走列表内的行内编辑器,
         // 因此只是把它转成本帧的 begin_rename。
         if let Some(action) = menu_action.and_then(|action| {
-            revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot())
+            revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot()).and_then(
+                |action| {
+                    revalidate_remote_menu_action(
+                        action,
+                        &remote_entries,
+                        &self.config.remote_hosts,
+                    )
+                },
+            )
         }) {
             match action {
                 SidebarTabAction::Rename(i) => {
@@ -987,7 +1040,7 @@ impl TerminalApp {
         info: &SidebarTabInfo,
         tab_count: usize,
         marked_count: usize,
-        remote_entries: &[(usize, String)],
+        remote_entries: &[RemoteMenuEntry],
         action: &mut Option<SidebarTabAction>,
     ) {
         let index = info.index;
@@ -1055,12 +1108,14 @@ impl TerminalApp {
 
         if !remote_entries.is_empty() {
             ui.separator();
-            for (host_index, name) in remote_entries {
-                item(
-                    ui,
-                    &format!("Remote: {name}"),
-                    SidebarTabAction::ConnectRemote(*host_index),
-                );
+            for entry in remote_entries {
+                ui.push_id(entry.widget_id, |ui| {
+                    item(
+                        ui,
+                        &format!("Remote: {}", entry.label),
+                        SidebarTabAction::ConnectRemote(entry.index),
+                    );
+                });
             }
         }
     }
@@ -1888,23 +1943,7 @@ impl TerminalApp {
         let mut active_indicator_target: Option<(f32, f32, f32)> = None;
         let tab_count_for_menu = self.tabs.len();
         let marked_count_for_menu = self.tabs.marked_tabs().len();
-        let remote_entries_for_menu: Vec<(usize, String)> = self
-            .config
-            .remote_hosts
-            .iter()
-            .take(crate::config::MAX_REMOTE_HOSTS)
-            .enumerate()
-            .map(|(index, host)| {
-                let unavailable =
-                    crate::config::validate_remote_host_at(&self.config.remote_hosts, index)
-                        .is_err();
-                let mut label = crate::config::remote_host_display_name(host, index);
-                if unavailable {
-                    label.push_str(" (unavailable)");
-                }
-                (index, label)
-            })
-            .collect();
+        let remote_entries_for_menu = remote_menu_entries(&self.config.remote_hosts);
         let mut top_menu_action: Option<SidebarTabAction> = None;
         // Direct close/reorder above may have invalidated the painted rows.
         // Never combine an old row identity with a newly indexed menu target.
@@ -2173,7 +2212,15 @@ impl TerminalApp {
         }
 
         if let Some(action) = top_menu_action.and_then(|action| {
-            revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot())
+            revalidate_tab_menu_action(action, &menu_snapshot, &self.tab_menu_snapshot()).and_then(
+                |action| {
+                    revalidate_remote_menu_action(
+                        action,
+                        &remote_entries_for_menu,
+                        &self.config.remote_hosts,
+                    )
+                },
+            )
         }) {
             match action {
                 SidebarTabAction::Rename(index) => {
@@ -2416,7 +2463,8 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_or_sidebar_selection_targets_session, revalidate_tab_menu_action, tab_menu_popup_id,
+        block_or_sidebar_selection_targets_session, remote_menu_entries, remote_menu_widget_id,
+        revalidate_remote_menu_action, revalidate_tab_menu_action, tab_menu_popup_id,
         workspace_drag_pointer_pos, SidebarTabAction, TabMenuSnapshot, TabRenameDraft,
     };
     use crate::app::commands::CommandTarget;
@@ -2744,5 +2792,117 @@ mod tests {
             text: "second".into(),
         };
         assert!(!reopened.same_opening(&captured));
+    }
+    fn synthetic_remote(host: &str) -> jterm_core::jsh_remote::RemoteHostConfig {
+        jterm_core::jsh_remote::RemoteHostConfig {
+            name: "test".into(),
+            host: host.into(),
+            user: None,
+            docker: false,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: vec![],
+            deploy: "off".into(),
+            deploy_artifact: None,
+        }
+    }
+
+    #[test]
+    fn remote_menu_gesture_identity_changes_with_every_profile_field() {
+        let original = synthetic_remote("first.example.invalid");
+        let id = remote_menu_widget_id(0, &original);
+        let mut variants = vec![];
+        let mut h = original.clone();
+        h.name = "renamed".into();
+        variants.push(h);
+        let mut h = original.clone();
+        h.host = "second.example.invalid".into();
+        variants.push(h);
+        let mut h = original.clone();
+        h.user = Some("user".into());
+        variants.push(h);
+        let mut h = original.clone();
+        h.docker = true;
+        variants.push(h);
+        let mut h = original.clone();
+        h.remote_shell = "sh".into();
+        variants.push(h);
+        let mut h = original.clone();
+        h.session = Some("session-1".into());
+        variants.push(h);
+        let mut h = original.clone();
+        h.ssh_args = vec!["-p".into(), "2222".into()];
+        variants.push(h);
+        let mut h = original.clone();
+        h.deploy = "incognito".into();
+        variants.push(h);
+        let mut h = original.clone();
+        h.deploy_artifact = Some("/synthetic/jsh".into());
+        variants.push(h);
+        for variant in variants {
+            assert_ne!(id, remote_menu_widget_id(0, &variant));
+        }
+        assert_ne!(id, remote_menu_widget_id(1, &original));
+        assert_eq!(id, remote_menu_widget_id(0, &original.clone()));
+    }
+
+    #[test]
+    fn remote_menu_dispatch_rejects_replacement_reorder_and_removal() {
+        let hosts = vec![
+            synthetic_remote("a.example.invalid"),
+            synthetic_remote("b.example.invalid"),
+        ];
+        let entries = remote_menu_entries(&hosts);
+        let action = SidebarTabAction::ConnectRemote(0);
+        assert_eq!(
+            revalidate_remote_menu_action(action, &entries, &hosts),
+            Some(action)
+        );
+        assert!(revalidate_remote_menu_action(
+            action,
+            &entries,
+            &[hosts[1].clone(), hosts[0].clone()]
+        )
+        .is_none());
+        assert!(revalidate_remote_menu_action(action, &entries, &[]).is_none());
+        let mut changed = hosts.clone();
+        changed[0].ssh_args.push("-4".into());
+        assert!(revalidate_remote_menu_action(action, &entries, &changed).is_none());
+        assert!(revalidate_remote_menu_action(
+            SidebarTabAction::ConnectRemote(9),
+            &entries,
+            &hosts
+        )
+        .is_none());
+        // Identical duplicates retain explicit indexed semantics, never a first-match relocation.
+        let duplicates = vec![hosts[0].clone(), hosts[0].clone()];
+        let entries = remote_menu_entries(&duplicates);
+        assert_ne!(entries[0].widget_id, entries[1].widget_id);
+        let second = SidebarTabAction::ConnectRemote(1);
+        assert_eq!(
+            revalidate_remote_menu_action(second, &entries, &duplicates),
+            Some(second)
+        );
+        assert!(revalidate_remote_menu_action(second, &entries, &duplicates[..1]).is_none());
+    }
+
+    #[test]
+    fn both_remote_menu_paths_use_snapshot_gesture_and_dispatch_guards() {
+        let source = include_str!("tabs.rs");
+        let implementation = source.split_once("#[cfg(test)]").unwrap().0;
+        assert_eq!(
+            implementation
+                .matches("= remote_menu_entries(&self.config.remote_hosts);")
+                .count(),
+            2
+        );
+        assert_eq!(
+            implementation
+                .matches("revalidate_remote_menu_action(")
+                .count(),
+            3
+        );
+        assert!(implementation.contains("ui.push_id(entry.widget_id"));
+        assert!(implementation.contains("current.get(index) != Some(&captured.profile)"));
     }
 }
