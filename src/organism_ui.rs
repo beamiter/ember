@@ -620,7 +620,13 @@ mod tests {
             Some(Duration::from_secs(6))
         );
         assert_eq!(
-            preview_next_wake(ready, false, greeting, ready, GreetingAvailability::Available),
+            preview_next_wake(
+                ready,
+                false,
+                greeting,
+                ready,
+                GreetingAvailability::Available
+            ),
             None
         );
     }
