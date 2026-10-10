@@ -729,6 +729,7 @@ impl ConfigPanel {
         ui.label(
             "Local terminal chrome; command cards optional. Automatic uses Calm. Memory is volatile.",
         );
+        ui.label("In Full or Calm, hover over the live glyph briefly to say hello.");
         ui.label("Changes apply now; Save persists them.");
         if organism_changed {
             self.has_changes = true;

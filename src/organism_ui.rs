@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use jterm_core::organism::{AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone};
-use jterm_core::organism_daily::GentleInteraction;
+use jterm_core::organism_daily::{GentleInteraction, behavior_explanation};
 
 use crate::config::{Config, OrganismMotion};
 use crate::organism::{
@@ -25,6 +25,104 @@ const BATCH_RECORD_LIMIT: usize = 32;
 // stable. Geometry only controls ownership, physiology and repaint scheduling.
 fn host_geometry_allows(width: f32) -> bool {
     width.is_finite() && width >= 120.0
+}
+
+const LIVE_HOVER_DWELL: Duration = Duration::from_millis(600);
+
+/// Presentation-only attention: no reducer or life-state access. Cooldown is
+/// window-local and survives owner changes; a stationary pointer never loops.
+#[derive(Default)]
+struct LiveGreeting {
+    interaction: GentleInteraction,
+    near: bool,
+    candidate_since: Option<Duration>,
+    greeting_until: Option<Duration>,
+}
+
+impl LiveGreeting {
+    fn cancel(&mut self) {
+        self.interaction.cancel();
+        // Consume the current entry until an outside sample is observed.
+        // Suppression or owner replacement must not manufacture a new entry.
+        self.near = true;
+        self.candidate_since = None;
+        self.greeting_until = None;
+    }
+
+    fn update(
+        &mut self,
+        now: Duration,
+        near: bool,
+        allowed: bool,
+        context: RenderContext,
+    ) -> RenderContext {
+        if !near {
+            self.cancel();
+            self.near = false;
+            return context;
+        }
+        if !allowed || !GentleInteraction::default().request(now, context) {
+            self.cancel();
+            return context;
+        }
+        if !self.near {
+            self.near = true;
+            if self.interaction.clone().request(now, context) {
+                self.candidate_since = Some(now);
+            }
+        }
+        if self
+            .candidate_since
+            .is_some_and(|start| now.saturating_sub(start) >= LIVE_HOVER_DWELL)
+        {
+            self.candidate_since = None;
+            if self.interaction.request(now, context) {
+                self.greeting_until = Some(now.saturating_add(GentleInteraction::HOLD));
+            }
+        }
+        if self.greeting_until.is_some_and(|until| now >= until) {
+            self.greeting_until = None;
+        }
+        self.interaction.apply(now, context)
+    }
+
+    fn next_wake(&self, now: Duration) -> Option<Duration> {
+        [
+            self.candidate_since
+                .map(|start| start.saturating_add(LIVE_HOVER_DWELL)),
+            self.greeting_until,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|deadline| *deadline > now)
+        .map(|deadline| deadline - now)
+        .min()
+    }
+}
+
+fn live_greeting_allowed(
+    policy: PresentationPolicy,
+    now: Duration,
+    running: bool,
+    buttons_down: bool,
+) -> bool {
+    policy.inline_visible(now)
+        && resolved_motion(policy.motion) != OrganismMotion::Static
+        && !running
+        && !buttons_down
+}
+
+fn live_status_text(context: RenderContext, frame: u64, width: f32) -> String {
+    let glyph = sticky_glyph_with_context(context, frame);
+    if width.is_finite() && width >= 640.0 {
+        format!(
+            "{:<12}  {}  | Volatile",
+            glyph,
+            behavior_explanation(context.behavior)
+        )
+    } else {
+        format!("{:<12}  Volatile", glyph)
+    }
 }
 
 pub struct OrganismHost {
@@ -43,6 +141,7 @@ pub struct OrganismHost {
     ambient: AmbientMind,
     context: RenderContext,
     reaction_until: Duration,
+    greeting: LiveGreeting,
 }
 
 impl Default for OrganismHost {
@@ -63,6 +162,7 @@ impl Default for OrganismHost {
             ambient: AmbientMind::seeded(0x656d626572),
             context: PreviewPose::Calm.context(),
             reaction_until: Duration::ZERO,
+            greeting: LiveGreeting::default(),
         }
     }
 }
@@ -85,6 +185,7 @@ impl OrganismHost {
         let now = self.born.elapsed();
         self.life
             .advance(now, false, false, CircadianPhase::Unlearned);
+        self.greeting.cancel();
         self.owner = owner.map(str::to_owned);
         self.cursor = tail;
         self.quarantine_batch = owner.is_some();
@@ -100,6 +201,7 @@ impl OrganismHost {
     pub fn accepted_input(&mut self, session: &str) {
         if self.owner.as_deref() == Some(session) {
             let now = self.born.elapsed();
+            self.greeting.cancel();
             self.last_input = Some(now);
             self.life.note_input(now);
             self.ambient.interrupt();
@@ -122,6 +224,7 @@ impl OrganismHost {
             return;
         }
         let now = self.born.elapsed();
+        self.greeting.cancel();
         self.life.note_output(now);
         self.ambient.interrupt();
         let running = records.back().is_some_and(|record| {
@@ -220,6 +323,7 @@ impl OrganismHost {
     }
 
     fn react(&mut self, reaction: Reaction, now: Duration) {
+        self.greeting.cancel();
         self.ambient.interrupt();
         self.context = RenderContext::new(
             reaction.behavior,
@@ -280,6 +384,16 @@ impl OrganismHost {
         } else {
             self.context
         };
+        let (pointer, buttons_down) = ui.ctx().input(|input| {
+            (
+                input.pointer.hover_pos(),
+                input.pointer.any_down() || input.pointer.any_pressed(),
+            )
+        });
+        let greeting_allowed = live_greeting_allowed(policy, now, self.running, buttons_down);
+        if !greeting_allowed {
+            self.greeting.cancel();
+        }
         // Allocate exactly the same strip while suppressed. Typing, switching
         // panes and alternate screen must not change the terminal's grid size.
         egui::Panel::bottom("ascii_organism_chrome")
@@ -291,21 +405,32 @@ impl OrganismHost {
                     let rect = ui
                         .available_rect_before_wrap()
                         .shrink2(egui::vec2(8.0, 0.0));
-                    // Paint only: no widget ID, focus, click or hover target.
+                    // Observe only the bounded glyph footprint. No widget,
+                    // click handler, focus request or terminal input is created.
+                    let hover_rect = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(96.0_f32.min(rect.width()), rect.height()),
+                    );
+                    let near = pointer.is_some_and(|point| hover_rect.contains(point));
+                    let display = self.greeting.update(now, near, greeting_allowed, context);
                     ui.painter().with_clip_rect(rect).text(
                         rect.left_center(),
                         egui::Align2::LEFT_CENTER,
-                        format!(
-                            "{:<12}  Volatile",
-                            sticky_glyph_with_context(context, frame)
-                        ),
+                        live_status_text(display, frame, rect.width()),
                         egui::TextStyle::Monospace.resolve(ui.style()),
                         ui.visuals().text_color(),
                     );
                 }
             });
         let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
-        if let Some(delay) = next_host_wake(policy, now, self.reaction_until, dormant) {
+        let next = [
+            next_host_wake(policy, now, self.reaction_until, dormant),
+            self.greeting.next_wake(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(delay) = next {
             ui.ctx().request_repaint_after(delay);
         }
     }
@@ -624,6 +749,143 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn live_hover_dwells_once_and_requires_a_new_entry() {
+        let mut greeting = LiveGreeting::default();
+        let base = PreviewPose::Calm.context();
+        assert_eq!(greeting.update(Duration::ZERO, true, true, base), base);
+        assert_eq!(greeting.next_wake(Duration::ZERO), Some(LIVE_HOVER_DWELL));
+        let almost = Duration::from_millis(599);
+        assert_eq!(greeting.update(almost, true, true, base), base);
+        let start = LIVE_HOVER_DWELL;
+        assert_eq!(
+            greeting.update(start, true, true, base).behavior,
+            Behavior::Approach
+        );
+        assert_eq!(greeting.next_wake(start), Some(GentleInteraction::HOLD));
+        let end = start + GentleInteraction::HOLD;
+        assert_eq!(greeting.update(end, true, true, base), base);
+        assert_eq!(greeting.next_wake(end), None);
+        let later = Duration::from_secs(10);
+        assert_eq!(greeting.update(later, true, true, base), base);
+        assert_eq!(greeting.next_wake(later), None);
+        greeting.update(later, false, true, base);
+        greeting.update(later, true, true, base);
+        assert_eq!(greeting.next_wake(later), Some(LIVE_HOVER_DWELL));
+    }
+
+    #[test]
+    fn stationary_hover_cannot_rearm_after_suppression_or_output() {
+        let base = PreviewPose::Calm.context();
+        let mut greeting = LiveGreeting::default();
+        greeting.update(Duration::ZERO, true, true, base);
+        greeting.update(Duration::from_millis(100), true, false, base);
+        let later = Duration::from_secs(2);
+        assert_eq!(greeting.update(later, true, true, base), base);
+        assert_eq!(greeting.next_wake(later), None);
+        greeting.update(later, false, true, base);
+        greeting.update(later, true, true, base);
+        assert_eq!(greeting.next_wake(later), Some(LIVE_HOVER_DWELL));
+        // Output and ownership hooks call this same cancellation operation.
+        greeting.cancel();
+        assert_eq!(greeting.update(later, true, true, base), base);
+        assert_eq!(greeting.next_wake(later), None);
+        greeting.update(later, false, true, base);
+        greeting.update(later, true, true, base);
+        assert_eq!(greeting.next_wake(later), Some(LIVE_HOVER_DWELL));
+    }
+
+    #[test]
+    fn live_hover_cooldown_entry_never_queues_a_later_greeting() {
+        let mut greeting = LiveGreeting::default();
+        let base = PreviewPose::Calm.context();
+        greeting.update(Duration::ZERO, true, true, base);
+        greeting.update(LIVE_HOVER_DWELL, true, true, base);
+        let early = Duration::from_secs(1);
+        greeting.update(early, false, true, base);
+        greeting.update(early, true, true, base);
+        assert_eq!(greeting.next_wake(early), None);
+        let later = Duration::from_secs(20);
+        assert_eq!(greeting.update(later, true, true, base), base);
+        assert_eq!(greeting.next_wake(later), None);
+    }
+
+    #[test]
+    fn live_hover_cancellation_preserves_window_cooldown_and_life() {
+        let mut host = OrganismHost::default();
+        host.acquire(Some("one"), None, false);
+        let base = PreviewPose::Calm.context();
+        let before = format!("{:?}", host.life.state());
+        host.greeting.update(Duration::ZERO, false, true, base);
+        host.greeting.update(Duration::ZERO, true, true, base);
+        host.greeting.update(LIVE_HOVER_DWELL, true, true, base);
+        host.acquire(Some("two"), None, false);
+        let now = Duration::from_secs(1);
+        assert_eq!(host.greeting.update(now, true, true, base), base);
+        assert_eq!(host.greeting.next_wake(now), None);
+        host.greeting.update(now, false, true, base);
+        assert_eq!(host.greeting.update(now, true, true, base), base);
+        assert_eq!(host.greeting.next_wake(now), None);
+        assert_eq!(format!("{:?}", host.life.state()), before);
+    }
+
+    #[test]
+    fn live_hover_busy_or_suppressed_context_cancels_without_wakes() {
+        let base = PreviewPose::Calm.context();
+        for context in [
+            PreviewPose::Working.context(),
+            PreviewPose::Concerned.context(),
+            PreviewPose::Success.context(),
+            RenderContext::new(Behavior::UnknownOutcome, BodyLanguage::default(), false),
+        ] {
+            let mut greeting = LiveGreeting::default();
+            greeting.update(Duration::ZERO, true, true, base);
+            assert_eq!(greeting.update(LIVE_HOVER_DWELL, true, true, context), context);
+            assert_eq!(greeting.next_wake(LIVE_HOVER_DWELL), None);
+        }
+        let mut greeting = LiveGreeting::default();
+        greeting.update(Duration::ZERO, true, true, base);
+        assert_eq!(greeting.update(LIVE_HOVER_DWELL, true, false, base), base);
+        assert_eq!(greeting.next_wake(LIVE_HOVER_DWELL), None);
+    }
+
+    #[test]
+    fn live_hover_admission_prioritizes_input_visibility_and_static() {
+        let mut policy = static_policy();
+        let now = Duration::from_secs(10);
+        assert!(!live_greeting_allowed(policy, now, false, false));
+        policy.motion = Some(OrganismMotion::Calm);
+        assert!(live_greeting_allowed(policy, now, false, false));
+        assert!(!live_greeting_allowed(policy, now, true, false));
+        assert!(!live_greeting_allowed(policy, now, false, true));
+        policy.last_input = Some(now);
+        assert!(!live_greeting_allowed(policy, now, false, false));
+        policy.last_input = None;
+        policy.local = false;
+        assert!(!live_greeting_allowed(policy, now, false, false));
+        policy.local = true;
+        policy.alternate_screen = true;
+        assert!(!live_greeting_allowed(policy, now, false, false));
+        policy.alternate_screen = false;
+        policy.focused_owner = false;
+        assert!(!live_greeting_allowed(policy, now, false, false));
+    }
+
+    #[test]
+    fn live_status_explains_final_behavior_without_expanding_narrow_layout() {
+        for behavior in [
+            Behavior::WatchCommand,
+            Behavior::UnknownOutcome,
+            Behavior::InspectError,
+            Behavior::CelebrateBig,
+            Behavior::Approach,
+        ] {
+            let context = RenderContext::new(behavior, BodyLanguage::default(), false);
+            assert!(live_status_text(context, 0, 640.0).contains(behavior_explanation(behavior)));
+            assert!(!live_status_text(context, 0, 120.0).contains(behavior_explanation(behavior)));
+        }
+    }
 
     #[test]
     fn hidden_logic_is_root_only_and_uses_current_visibility() {
