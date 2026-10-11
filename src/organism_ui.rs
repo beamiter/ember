@@ -2105,9 +2105,11 @@ mod tests {
         host.acquire(Some("original"), None, false);
         let before = host.life.state();
         let now = Duration::from_secs(10);
-        let mut config = Config::default();
-        config.ascii_organism_enabled = true;
-        config.ascii_organism_motion = Some(OrganismMotion::Calm);
+        let mut config = Config {
+            ascii_organism_enabled: true,
+            ascii_organism_motion: Some(OrganismMotion::Calm),
+            ..Default::default()
+        };
         assert!(host.request_hello_at(now, None, &config).is_err());
         assert!(host
             .request_hello_at(now, Some("replacement"), &config)
