@@ -5,6 +5,7 @@
 //! with the existing completion drain. This is not a parser-arrival epoch.
 //! The bounded record tail is read only after a parser batch, never per frame.
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
@@ -1169,9 +1170,56 @@ fn reaction_duration(reaction: &Reaction) -> Duration {
     })
 }
 
-#[derive(Default)]
+static NEXT_PREVIEW_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_preview_revision(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 struct PreviewSequence {
     started: Option<Duration>,
+    paused_at: Option<Duration>,
+    paused_total: Duration,
+    revision: Option<u64>,
+}
+
+impl Default for PreviewSequence {
+    fn default() -> Self {
+        Self {
+            started: None,
+            paused_at: None,
+            paused_total: Duration::ZERO,
+            revision: allocate_preview_revision(&NEXT_PREVIEW_REVISION),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PreviewAction {
+    Play,
+    Stop,
+    Pause,
+    Resume,
+    Hello,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PreviewTicket {
+    revision: Option<u64>,
+    action: PreviewAction,
+}
+
+impl PreviewTicket {
+    fn id(self) -> egui::Id {
+        egui::Id::new(("organism_preview_control", self))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1179,14 +1227,26 @@ struct DemoStep {
     index: usize,
     pose: PreviewPose,
     next_in: Duration,
+    animation_time: Duration,
+    paused: bool,
 }
 
 impl DemoStep {
-    fn next_wake(self, full: bool) -> Duration {
-        if full {
-            self.next_in.min(Duration::from_millis(100))
+    fn next_wake(self, full: bool) -> Option<Duration> {
+        if self.paused {
+            None
+        } else if full {
+            Some(self.next_in.min(Duration::from_millis(100)))
         } else {
-            self.next_in
+            Some(self.next_in)
+        }
+    }
+
+    fn frame(self, full: bool) -> u64 {
+        if full {
+            self.animation_time.as_millis() as u64 / 100
+        } else {
+            0
         }
     }
 }
@@ -1200,16 +1260,72 @@ impl PreviewSequence {
         PreviewPose::Sleeping,
     ];
 
+    fn ticket(&self, action: PreviewAction) -> PreviewTicket {
+        PreviewTicket {
+            revision: self.revision,
+            action,
+        }
+    }
+
+    fn retire(&mut self) {
+        self.started = None;
+        self.paused_at = None;
+        self.paused_total = Duration::ZERO;
+        self.revision = allocate_preview_revision(&NEXT_PREVIEW_REVISION);
+    }
+
     fn start(&mut self, now: Duration) {
-        self.started = Some(now);
+        self.retire();
+        if self.revision.is_some() {
+            self.started = Some(now);
+        }
     }
 
     fn stop(&mut self) {
-        self.started = None;
+        if self.started.is_some() {
+            self.retire();
+        }
+    }
+
+    fn pause(&mut self, now: Duration) -> bool {
+        if self.sample(now).is_none() || self.paused_at.is_some() {
+            return false;
+        }
+        self.paused_at = Some(now.max(self.started.unwrap()));
+        self.revision = allocate_preview_revision(&NEXT_PREVIEW_REVISION);
+        if self.revision.is_none() {
+            self.started = None;
+            self.paused_at = None;
+            return false;
+        }
+        true
+    }
+
+    fn resume(&mut self, now: Duration) -> bool {
+        if self.sample(now).is_none() {
+            return false;
+        }
+        let Some(paused_at) = self.paused_at.take() else {
+            return false;
+        };
+        self.paused_total = self
+            .paused_total
+            .saturating_add(now.saturating_sub(paused_at));
+        self.revision = allocate_preview_revision(&NEXT_PREVIEW_REVISION);
+        if self.revision.is_none() {
+            self.started = None;
+            self.paused_at = None;
+            return false;
+        }
+        true
     }
 
     fn sample(&mut self, now: Duration) -> Option<DemoStep> {
-        let elapsed = now.saturating_sub(self.started?);
+        let started = self.started?;
+        let clock = self.paused_at.unwrap_or(now).max(started);
+        let elapsed = clock
+            .saturating_sub(started)
+            .saturating_sub(self.paused_total);
         if elapsed >= Duration::from_secs(10) {
             self.stop();
             return None;
@@ -1219,6 +1335,8 @@ impl PreviewSequence {
             index,
             pose: Self::POSES[index],
             next_in: Duration::from_secs((index as u64 + 1) * 2) - elapsed,
+            animation_time: clock.saturating_sub(self.paused_total),
+            paused: self.paused_at.is_some(),
         })
     }
 }
@@ -1247,7 +1365,9 @@ impl Default for PreviewUi {
 
 impl PreviewUi {
     pub fn close(&mut self) {
-        self.demo.stop();
+        if self.model.greeting_availability(self.born.elapsed()) != GreetingAvailability::Closed {
+            self.demo.retire();
+        }
         self.model.close();
         self.greeting_until = Duration::ZERO;
     }
@@ -1262,10 +1382,50 @@ impl PreviewUi {
     }
 
     fn select_pose(&mut self, pose: PreviewPose) {
-        self.demo.stop();
+        self.demo.retire();
         self.pose = pose;
         self.model.select_pose(pose);
         self.greeting_until = Duration::ZERO;
+    }
+
+    fn apply_control(&mut self, ticket: PreviewTicket, now: Duration) -> bool {
+        let step = self.demo.sample(now);
+        if ticket.revision.is_none()
+            || ticket.revision != self.demo.revision
+            || self.model.greeting_availability(now) == GreetingAvailability::Closed
+        {
+            return false;
+        }
+        match ticket.action {
+            PreviewAction::Play if step.is_none() => {
+                self.start_demo(now);
+                self.demo.started.is_some()
+            }
+            PreviewAction::Stop if step.is_some() => {
+                self.demo.stop();
+                true
+            }
+            PreviewAction::Pause if step.is_some_and(|step| !step.paused) => self.demo.pause(now),
+            PreviewAction::Resume if step.is_some_and(|step| step.paused) => self.demo.resume(now),
+            PreviewAction::Hello if step.is_none() && self.model.say_hello(now) => {
+                self.greeting_until = now.saturating_add(GentleInteraction::HOLD);
+                self.hello_ready_at = now.saturating_add(GentleInteraction::COOLDOWN);
+                self.demo.retire();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn display_context(&mut self, now: Duration, demo: Option<DemoStep>) -> RenderContext {
+        demo.map_or_else(
+            || {
+                self.model
+                    .context(now)
+                    .unwrap_or_else(|| self.pose.context())
+            },
+            |step| step.pose.context(),
+        )
     }
 
     fn sync_viewport(&mut self, focused: bool, occluded: bool) {
@@ -1301,30 +1461,78 @@ impl PreviewUi {
             });
         let now = self.born.elapsed();
         let availability = self.model.greeting_availability(now);
-        let playing = self.demo.sample(now).is_some();
-        let demo_button = ui.add_enabled(
-            availability != GreetingAvailability::Closed,
-            egui::Button::new(if playing { "Stop demo" } else { "Play demo" }),
-        );
-        if demo_button.clicked() {
-            if playing {
-                self.demo.stop();
+        let initial_demo = self.demo.sample(now);
+        ui.horizontal_wrapped(|ui| {
+            let action = if initial_demo.is_some() {
+                PreviewAction::Stop
             } else {
-                self.start_demo(now);
+                PreviewAction::Play
+            };
+            let ticket = self.demo.ticket(action);
+            let label = if initial_demo.is_some() {
+                "Stop demo"
+            } else {
+                "Play demo"
+            };
+            let clicked = ui
+                .push_id(ticket.id(), |ui| {
+                    ui.add_enabled(
+                        ticket.revision.is_some() && availability != GreetingAvailability::Closed,
+                        egui::Button::new(label),
+                    )
+                    .clicked()
+                })
+                .inner;
+            if clicked {
+                self.apply_control(ticket, now);
             }
-        }
+            if let Some(step) = self.demo.sample(now) {
+                let action = if step.paused {
+                    PreviewAction::Resume
+                } else {
+                    PreviewAction::Pause
+                };
+                let ticket = self.demo.ticket(action);
+                let label = if step.paused {
+                    "Resume demo"
+                } else {
+                    "Pause demo"
+                };
+                let clicked = ui
+                    .push_id(ticket.id(), |ui| {
+                        ui.add_enabled(
+                            ticket.revision.is_some()
+                                && availability != GreetingAvailability::Closed,
+                            egui::Button::new(label),
+                        )
+                        .clicked()
+                    })
+                    .inner;
+                if clicked {
+                    self.apply_control(ticket, now);
+                }
+            }
+        });
         let demo = self.demo.sample(now);
-        let button = ui.add_enabled(
-            demo.is_none() && availability == GreetingAvailability::Available,
-            egui::Button::new("Say hello"),
-        );
+        let hello_ticket = self.demo.ticket(PreviewAction::Hello);
+        let hello_clicked = ui
+            .push_id(hello_ticket.id(), |ui| {
+                ui.add_enabled(
+                    hello_ticket.revision.is_some()
+                        && demo.is_none()
+                        && availability == GreetingAvailability::Available,
+                    egui::Button::new("Say hello"),
+                )
+                .clicked()
+            })
+            .inner;
         if let Some(step) = demo {
             ui.small(format!(
-                "Demo {}/5: {} (example)",
+                "Demo {}/5: {} (example{})",
                 step.index + 1,
-                step.pose.label()
+                step.pose.label(),
+                if step.paused { ", paused" } else { "" }
             ));
-            ui.small(step.pose.explanation());
             ui.small("No command is run. Say hello is paused during the demo.");
         } else {
             match availability {
@@ -1340,28 +1548,29 @@ impl PreviewUi {
                 _ => {}
             }
         }
-        if demo.is_none() && button.clicked() && self.model.say_hello(now) {
-            self.greeting_until = now.saturating_add(GentleInteraction::HOLD);
-            self.hello_ready_at = now.saturating_add(GentleInteraction::COOLDOWN);
+        if hello_clicked {
+            self.apply_control(hello_ticket, now);
         }
         {
             // Keep the same settings layout while inactive, without replaying
             // a canceled greeting or requesting background animation frames.
-            let context = demo.map_or_else(
-                || {
-                    self.model
-                        .context(now)
-                        .unwrap_or_else(|| self.pose.context())
-                },
-                |step| step.pose.context(),
-            );
+            let context = self.display_context(now, demo);
             let full = availability != GreetingAvailability::Closed
                 && resolved_motion(motion) == OrganismMotion::Full;
-            let frame = if full {
-                now.as_millis() as u64 / 100
-            } else {
-                0
-            };
+            let frame = demo.map_or_else(
+                || {
+                    if full {
+                        now.as_millis() as u64 / 100
+                    } else {
+                        0
+                    }
+                },
+                |step| step.frame(full),
+            );
+            ui.small(format!(
+                "Example: {}",
+                behavior_explanation(context.behavior)
+            ));
             ui.add_sized(
                 [ui.available_width(), 64.0],
                 egui::Label::new(
@@ -1371,7 +1580,7 @@ impl PreviewUi {
             let next = if availability == GreetingAvailability::Closed {
                 None
             } else if let Some(step) = demo {
-                Some(step.next_wake(full))
+                step.next_wake(full)
             } else {
                 preview_next_wake(
                     now,
@@ -1670,6 +1879,298 @@ mod tests {
     }
 
     #[test]
+    fn preview_pause_freezes_stage_frame_and_exact_remaining_time() {
+        let mut demo = PreviewSequence::default();
+        demo.start(Duration::from_secs(10));
+        let pause_at = Duration::from_millis(12345);
+        assert!(demo.pause(pause_at));
+        let frozen = demo.sample(pause_at).unwrap();
+        assert_eq!(frozen.pose, PreviewPose::Working);
+        assert_eq!(frozen.next_in, Duration::from_millis(1655));
+        assert_eq!(frozen.frame(true), 123);
+        let later = Duration::from_secs(3600);
+        assert_eq!(demo.sample(later), Some(frozen));
+        assert_eq!(frozen.next_wake(true), None);
+        assert_eq!(frozen.next_wake(false), None);
+        assert!(demo.resume(later));
+        let resumed = demo.sample(later).unwrap();
+        assert_eq!(resumed.frame(true), frozen.frame(true));
+        assert_eq!(resumed.next_in, frozen.next_in);
+        assert_eq!(
+            demo.sample(later + frozen.next_in).unwrap().pose,
+            PreviewPose::Concerned
+        );
+        assert!(demo.sample(later + Duration::from_millis(7655)).is_none());
+    }
+
+    #[test]
+    fn paused_preview_respects_motion_preferences_without_resuming() {
+        let mut demo = PreviewSequence::default();
+        demo.start(Duration::ZERO);
+        assert!(demo.pause(Duration::from_millis(1750)));
+        let step = demo.sample(Duration::from_secs(100)).unwrap();
+        assert_eq!(step.frame(true), 17);
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(step.frame(motion == OrganismMotion::Full), 0);
+            assert_eq!(step.next_wake(motion == OrganismMotion::Full), None);
+        }
+        assert_eq!(step.frame(true), 17);
+        assert!(demo.sample(Duration::from_secs(200)).unwrap().paused);
+    }
+
+    #[test]
+    fn preview_pause_cannot_revive_expiry_or_repeat_retirement() {
+        let mut demo = PreviewSequence::default();
+        demo.start(Duration::ZERO);
+        assert!(!demo.pause(Duration::from_secs(10)));
+        let retired = demo.revision;
+        assert!(!demo.resume(Duration::from_secs(11)));
+        assert!(demo.sample(Duration::from_secs(12)).is_none());
+        assert_eq!(demo.revision, retired);
+        demo.start(Duration::from_secs(20));
+        assert!(demo.pause(Duration::from_millis(29999)));
+        assert!(demo.resume(Duration::from_secs(100)));
+        assert_eq!(
+            demo.sample(Duration::from_secs(100)).unwrap().next_in,
+            Duration::from_millis(1)
+        );
+        assert!(demo.sample(Duration::from_millis(100001)).is_none());
+    }
+
+    #[test]
+    fn preview_control_tickets_reject_stale_repeated_and_cross_run_actions() {
+        let mut preview = PreviewUi::default();
+        preview.sync_viewport(true, false);
+        let old_hello = preview.demo.ticket(PreviewAction::Hello);
+        let play = preview.demo.ticket(PreviewAction::Play);
+        assert!(preview.apply_control(play, Duration::ZERO));
+        assert!(!preview.apply_control(play, Duration::ZERO));
+        assert!(!preview.apply_control(old_hello, Duration::from_secs(1)));
+        let pause = preview.demo.ticket(PreviewAction::Pause);
+        assert!(preview.apply_control(pause, Duration::from_secs(1)));
+        assert!(!preview.apply_control(pause, Duration::from_secs(2)));
+        let old_resume = preview.demo.ticket(PreviewAction::Resume);
+        assert!(preview.apply_control(old_resume, Duration::from_secs(3)));
+        let pause = preview.demo.ticket(PreviewAction::Pause);
+        assert!(preview.apply_control(pause, Duration::from_secs(4)));
+        assert!(!preview.apply_control(old_resume, Duration::from_secs(5)));
+        let old_stop = preview.demo.ticket(PreviewAction::Stop);
+        assert!(preview.apply_control(old_stop, Duration::from_secs(6)));
+        assert!(!preview.apply_control(old_hello, Duration::from_secs(6)));
+        let play = preview.demo.ticket(PreviewAction::Play);
+        assert!(preview.apply_control(play, Duration::from_secs(7)));
+        assert!(!preview.apply_control(old_stop, Duration::from_secs(8)));
+        assert!(preview.demo.sample(Duration::from_secs(8)).is_some());
+        let stop = preview.demo.ticket(PreviewAction::Stop);
+        assert!(!preview.apply_control(stop, Duration::from_secs(17)));
+        assert!(preview.demo.sample(Duration::from_secs(18)).is_none());
+        let hello = preview.demo.ticket(PreviewAction::Hello);
+        assert!(preview.apply_control(hello, Duration::from_secs(20)));
+        assert!(!preview.apply_control(hello, Duration::from_secs(29)));
+        let fresh_hello = preview.demo.ticket(PreviewAction::Hello);
+        assert!(preview.apply_control(fresh_hello, Duration::from_secs(29)));
+    }
+
+    #[test]
+    fn paused_preview_cancel_reopen_preserves_manual_pose_and_retires_hello() {
+        for cancel in 0..4 {
+            let mut preview = PreviewUi::default();
+            preview.sync_viewport(true, false);
+            preview.select_pose(PreviewPose::Curious);
+            let hello = preview.demo.ticket(PreviewAction::Hello);
+            preview.start_demo(Duration::ZERO);
+            assert!(preview.demo.pause(Duration::from_secs(1)));
+            match cancel {
+                0 => preview.close(),
+                1 => preview.sync_viewport(false, false),
+                2 => preview.sync_viewport(true, true),
+                _ => preview.select_pose(PreviewPose::Curious),
+            }
+            preview.sync_viewport(true, false);
+            assert!(preview.demo.sample(Duration::from_secs(100)).is_none());
+            assert_eq!(preview.pose, PreviewPose::Curious);
+            assert!(!preview.apply_control(hello, Duration::from_secs(100)));
+            assert_eq!(
+                preview.display_context(Duration::from_secs(100), None),
+                PreviewPose::Curious.context()
+            );
+        }
+    }
+
+    #[test]
+    fn preview_explanation_tracks_hello_and_demo_without_spending_cooldown() {
+        let mut preview = PreviewUi::default();
+        preview.sync_viewport(true, false);
+        preview.select_pose(PreviewPose::Curious);
+        let hello = preview.demo.ticket(PreviewAction::Hello);
+        assert!(preview.apply_control(hello, Duration::ZERO));
+        let greeting = preview.display_context(Duration::from_secs(1), None);
+        assert_eq!(greeting.behavior, Behavior::Approach);
+        preview.start_demo(Duration::from_secs(1));
+        assert!(preview.demo.pause(Duration::from_secs(4)));
+        let step = preview.demo.sample(Duration::from_secs(5));
+        assert_eq!(
+            preview.display_context(Duration::from_secs(5), step),
+            PreviewPose::Working.context()
+        );
+        let current_hello = preview.demo.ticket(PreviewAction::Hello);
+        assert!(!preview.apply_control(current_hello, Duration::from_secs(5)));
+        preview.demo.stop();
+        assert_eq!(
+            preview.model.greeting_availability(Duration::from_secs(6)),
+            GreetingAvailability::CoolingDown
+        );
+        assert_eq!(
+            preview.display_context(Duration::from_secs(6), None),
+            PreviewPose::Curious.context()
+        );
+        assert_eq!(
+            preview.model.greeting_availability(Duration::from_secs(8)),
+            GreetingAvailability::Available
+        );
+    }
+
+    fn preview_button_frame(
+        ctx: &egui::Context,
+        ticket: PreviewTicket,
+        label: &str,
+        events: Vec<egui::Event>,
+    ) -> (bool, egui::Rect) {
+        let mut clicked = false;
+        let mut rect = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                ui.push_id(ticket.id(), |ui| {
+                    let response = ui.add_sized([120.0, 24.0], egui::Button::new(label));
+                    clicked = response.clicked();
+                    rect = response.rect;
+                });
+            },
+        );
+        output.textures_delta.clear();
+        (clicked, rect)
+    }
+
+    fn preview_button_release(
+        old: PreviewTicket,
+        old_label: &str,
+        new: PreviewTicket,
+        new_label: &str,
+    ) -> bool {
+        let ctx = egui::Context::default();
+        let (_, rect) = preview_button_frame(&ctx, old, old_label, vec![]);
+        let pos = rect.center();
+        preview_button_frame(&ctx, old, old_label, vec![egui::Event::PointerMoved(pos)]);
+        preview_button_frame(
+            &ctx,
+            old,
+            old_label,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        preview_button_frame(&ctx, new, new_label, vec![]);
+        preview_button_frame(
+            &ctx,
+            new,
+            new_label,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+        .0
+    }
+
+    #[test]
+    fn preview_buttons_do_not_migrate_press_to_new_action_run_or_hello() {
+        let mut demo = PreviewSequence::default();
+        demo.start(Duration::ZERO);
+        let pause = demo.ticket(PreviewAction::Pause);
+        assert!(preview_button_release(
+            pause,
+            "Pause demo",
+            pause,
+            "Pause demo"
+        ));
+        assert!(demo.pause(Duration::from_secs(1)));
+        assert!(!preview_button_release(
+            pause,
+            "Pause demo",
+            demo.ticket(PreviewAction::Resume),
+            "Resume demo"
+        ));
+        let stop = demo.ticket(PreviewAction::Stop);
+        demo.stop();
+        assert!(!preview_button_release(
+            stop,
+            "Stop demo",
+            demo.ticket(PreviewAction::Play),
+            "Play demo"
+        ));
+        let hello = demo.ticket(PreviewAction::Hello);
+        demo.start(Duration::from_secs(2));
+        demo.stop();
+        assert!(!preview_button_release(
+            hello,
+            "Say hello",
+            demo.ticket(PreviewAction::Hello),
+            "Say hello"
+        ));
+    }
+
+    #[test]
+    fn preview_revision_is_checked_and_controls_share_snapshot_identity() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_preview_revision(&counter), Some(u64::MAX - 1));
+        assert_eq!(allocate_preview_revision(&counter), None);
+        let mut exhausted = PreviewUi {
+            demo: PreviewSequence {
+                revision: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        exhausted.sync_viewport(true, false);
+        for action in [
+            PreviewAction::Play,
+            PreviewAction::Pause,
+            PreviewAction::Resume,
+            PreviewAction::Stop,
+            PreviewAction::Hello,
+        ] {
+            assert!(!exhausted.apply_control(exhausted.demo.ticket(action), Duration::ZERO));
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        let source = include_str!("organism_ui.rs");
+        let show = source
+            .split("pub fn show(&mut self, ui: &mut Ui, motion:")
+            .nth(1)
+            .unwrap()
+            .split("fn preview_next_wake")
+            .next()
+            .unwrap();
+        assert!(show.contains(".push_id(hello_ticket.id()"));
+        assert_eq!(show.matches(".push_id(ticket.id()").count(), 2);
+        assert!(show.contains("self.display_context(now, demo)"));
+        assert!(show.contains("Example: {}"));
+        assert!(show.contains("step.next_wake(full)"));
+    }
+
+    #[test]
     fn preview_demo_runs_once_at_exact_phase_boundaries() {
         let mut demo = PreviewSequence::default();
         assert!(demo.sample(Duration::ZERO).is_none());
@@ -1699,10 +2200,10 @@ mod tests {
         let mut demo = PreviewSequence::default();
         demo.start(Duration::ZERO);
         let first = demo.sample(Duration::ZERO).unwrap();
-        assert_eq!(first.next_wake(false), Duration::from_secs(2));
-        assert_eq!(first.next_wake(true), Duration::from_millis(100));
+        assert_eq!(first.next_wake(false), Some(Duration::from_secs(2)));
+        assert_eq!(first.next_wake(true), Some(Duration::from_millis(100)));
         let last = demo.sample(Duration::from_millis(9999)).unwrap();
-        assert_eq!(last.next_wake(false), Duration::from_millis(1));
+        assert_eq!(last.next_wake(false), Some(Duration::from_millis(1)));
         assert!(demo.sample(Duration::from_secs(10)).is_none());
         assert_eq!(
             preview_next_wake(
