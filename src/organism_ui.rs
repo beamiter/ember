@@ -249,6 +249,48 @@ fn live_status_text(context: RenderContext, frame: u64, width: f32) -> String {
     }
 }
 
+fn live_semantic_text(context: RenderContext) -> String {
+    // No sprite/frame/transition text: accessibility describes the current
+    // authoritative behavior, without a live-region announcement every tick.
+    format!(
+        "ASCII Organism: {} Memory is volatile.",
+        behavior_explanation(context.behavior)
+    )
+}
+
+fn live_semantic_rect(rect: egui::Rect, clip: egui::Rect) -> Option<egui::Rect> {
+    if !rect.is_finite() || !clip.is_finite() {
+        return None;
+    }
+    let visible = rect.intersect(clip);
+    visible.is_positive().then_some(visible)
+}
+
+fn live_semantic_response(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    context: RenderContext,
+) -> Option<egui::Response> {
+    let rect = live_semantic_rect(rect, ui.clip_rect())?;
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id("ascii_organism_semantics"),
+        egui::Sense::hover(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            ui.is_enabled(),
+            live_semantic_text(context),
+        )
+    });
+    Some(response)
+}
+
+fn live_tooltip_allowed(running: bool, buttons_down: bool, keys_down: bool) -> bool {
+    !running && !buttons_down && !keys_down
+}
+
 /// Content-free presentation clock. Counts observed PTY activity batches, not
 /// throughput. Settling measures this eligible observation, not command age.
 #[derive(Default)]
@@ -743,6 +785,16 @@ impl OrganismHost {
                     let near = pointer.is_some_and(|point| hover_rect.contains(point));
                     let display = self.greeting.update(now, near, greeting_allowed, context);
                     let (sprite, status) = host_text(display, frame, rect.width(), expanded);
+                    if let Some(response) = live_semantic_response(ui, rect, display) {
+                        if live_tooltip_allowed(
+                            self.running,
+                            buttons_down,
+                            ui.ctx().input(|input| !input.keys_down.is_empty()),
+                        ) {
+                            // Native hover-delay redraw only; no organism timer.
+                            response.on_hover_text(live_semantic_text(display));
+                        }
+                    }
                     if let Some(sprite) = sprite {
                         let clip = body_rect.intersect(ui.clip_rect());
                         let visible = clip.is_positive();
@@ -1230,6 +1282,121 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn live_semantics_are_complete_and_independent_of_animation_or_width() {
+        for pose in PreviewPose::ALL {
+            let context = pose.context();
+            let text = live_semantic_text(context);
+            assert!(text.contains(behavior_explanation(context.behavior)));
+            assert!(text.starts_with("ASCII Organism: "));
+            assert!(text.ends_with("Memory is volatile."));
+            assert!(!text.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn live_semantics_require_finite_positive_clipped_chrome() {
+        let chrome = egui::Rect::from_min_size(egui::pos2(8.0, 200.0), egui::vec2(120.0, 24.0));
+        let clip = egui::Rect::from_min_max(egui::pos2(0.0, 210.0), egui::pos2(80.0, 300.0));
+        let visible = live_semantic_rect(chrome, clip).unwrap();
+        assert_eq!(visible, chrome.intersect(clip));
+        assert!(live_semantic_rect(chrome, egui::Rect::NOTHING).is_none());
+        assert!(live_semantic_rect(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(f32::NAN, 24.0)),
+            clip
+        )
+        .is_none());
+        assert!(live_semantic_rect(chrome, egui::Rect::EVERYTHING).is_none());
+    }
+
+    #[test]
+    fn live_semantic_label_has_no_focus_click_or_live_announcement() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let context = PreviewPose::Concerned.context();
+        let text = live_semantic_text(context);
+        let mut identity = None;
+        for _ in 0..2 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 240.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let rect =
+                        egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(120.0, 24.0));
+                    let response = live_semantic_response(ui, rect, context).unwrap();
+                    assert!(!response.sense.is_focusable());
+                    assert!(!response.sense.senses_click());
+                    assert!(!response.sense.senses_drag());
+                    if let Some(previous) = identity {
+                        assert_eq!(previous, response.id);
+                    }
+                    identity = Some(response.id);
+                },
+            );
+            let update = output.platform_output.accesskit_update.unwrap();
+            let node = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Label
+                        && node
+                            .value()
+                            .is_some_and(|value| value.starts_with("ASCII Organism: "))
+                })
+                .expect("full semantic label is exposed even in narrow chrome");
+            assert_eq!(node.1.value(), Some(text.as_str()));
+            assert!(!node.1.supports_action(egui::accesskit::Action::Focus));
+            assert!(!node.1.supports_action(egui::accesskit::Action::Click));
+            assert_eq!(node.1.live(), None);
+        }
+    }
+
+    #[test]
+    fn live_tooltip_defers_to_busy_pointer_and_keyboard_input() {
+        assert!(live_tooltip_allowed(false, false, false));
+        for state in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(!live_tooltip_allowed(state.0, state.1, state.2));
+        }
+    }
+
+    #[test]
+    fn live_semantics_follow_visible_final_context_without_new_scheduler() {
+        let source = include_str!("organism_ui.rs");
+        let draw = source
+            .split_once("egui::Panel::bottom(\"ascii_organism_chrome\")")
+            .unwrap()
+            .1
+            .split_once("struct PendingCommand")
+            .unwrap()
+            .0;
+        assert!(
+            draw.find("if policy.inline_visible(now)").unwrap()
+                < draw
+                    .find("live_semantic_response(ui, rect, display)")
+                    .unwrap()
+        );
+        assert!(draw.contains("response.on_hover_text(live_semantic_text(display))"));
+        let helper = source
+            .split_once("fn live_semantic_response(")
+            .unwrap()
+            .1
+            .split_once("/// Content-free presentation clock.")
+            .unwrap()
+            .0;
+        assert!(!helper.contains("request_repaint"));
+        assert!(!helper.contains("request_focus"));
+        assert!(!helper.contains("Sense::click"));
+    }
 
     #[test]
     fn body_bridge_endpoint_requires_submitted_text_inside_the_clip() {
