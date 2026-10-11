@@ -30,6 +30,14 @@ fn host_geometry_allows(width: f32) -> bool {
     width.is_finite() && width >= 120.0
 }
 
+fn host_geometry_presentable(available: egui::Rect, clip: egui::Rect) -> bool {
+    if !available.is_finite() || !clip.is_finite() {
+        return false;
+    }
+    let visible = available.intersect(clip);
+    visible.is_positive() && host_geometry_allows(visible.width())
+}
+
 const LIVE_HOVER_DWELL: Duration = Duration::from_millis(600);
 
 /// Presentation-only attention: no reducer or life-state access. Cooldown is
@@ -567,8 +575,8 @@ impl OrganismHost {
         self.bridge_mode = active;
     }
 
-    fn set_available_width(&mut self, width: f32) {
-        self.presentable = host_geometry_allows(width);
+    fn set_available_geometry(&mut self, available: egui::Rect, clip: egui::Rect) {
+        self.presentable = host_geometry_presentable(available, clip);
         if !self.presentable {
             self.acquire(None, None, false);
         }
@@ -1127,9 +1135,12 @@ impl crate::TerminalApp {
     }
 
     pub(crate) fn render_organism(&mut self, ui: &mut Ui) {
-        // Resize events wake the host naturally. One root-UI width decision
-        // drives admission, painting and scheduling, avoiding threshold churn.
-        self.organism.set_available_width(ui.available_width());
+        // Resize events wake the host naturally. Use the actual remaining root
+        // layout intersected with its clip, including vertically exhausted UI.
+        // Before this layout is observed, input admission still uses the last
+        // observed geometry; it does not defer or replay a rejected request.
+        self.organism
+            .set_available_geometry(ui.available_rect_before_wrap(), ui.clip_rect());
         // Top-bar navigation may have changed the owner since event ingestion.
         self.prepare_organism(ui.ctx());
         let focused = ui
@@ -2724,7 +2735,7 @@ mod tests {
     #[test]
     fn explicit_hello_requires_original_owner_idle_motion_and_real_input_quiet() {
         let mut host = OrganismHost::default();
-        host.set_available_width(640.0);
+        host.set_available_geometry(host_rect(640.0, 96.0), host_rect(1000.0, 1000.0));
         host.acquire(Some("original"), None, false);
         let before = host.life.state();
         let now = Duration::from_secs(10);
@@ -3051,6 +3062,111 @@ mod tests {
         assert!(panel.contains("self.organism_preview.close();"));
     }
 
+    fn host_rect(width: f32, height: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height))
+    }
+
+    #[test]
+    fn observed_geometry_requires_positive_remaining_clipped_height() {
+        let available = host_rect(640.0, 96.0);
+        assert!(host_geometry_presentable(available, available));
+        for height in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(!host_geometry_presentable(
+                host_rect(640.0, height),
+                available
+            ));
+            assert!(!host_geometry_presentable(
+                available,
+                host_rect(640.0, height)
+            ));
+        }
+        assert!(!host_geometry_presentable(
+            available,
+            available.translate(egui::vec2(0.0, 96.0))
+        ));
+        assert!(!host_geometry_presentable(
+            available,
+            host_rect(119.9, 96.0)
+        ));
+        assert!(host_geometry_presentable(available, host_rect(120.0, 1.0)));
+    }
+
+    #[test]
+    fn zero_height_retires_live_attention_and_restores_without_replay() {
+        let mut host = OrganismHost::default();
+        let rect = host_rect(640.0, 96.0);
+        host.set_available_geometry(rect, rect);
+        host.acquire(Some("local"), Some((7, true)), false);
+        host.pending = Some(pending());
+        let config = Config {
+            ascii_organism_enabled: true,
+            ascii_organism_motion: Some(OrganismMotion::Full),
+            ..Default::default()
+        };
+        let now = Duration::from_secs(10);
+        assert!(host.request_hello_at(now, Some("local"), &config).is_ok());
+        let life = format!("{:?}", host.life.state());
+        host.set_available_geometry(host_rect(640.0, 0.0), rect);
+        assert!(!host.presentable);
+        assert!(host.owner.is_none());
+        assert!(host.pending.is_none());
+        assert!(host.greeting.greeting_until.is_none());
+        assert!(!host.greeting.explicit);
+        let hidden = PresentationPolicy {
+            focused_owner: host.presentable && host.owner.is_some(),
+            motion: config.ascii_organism_motion,
+            ..static_policy()
+        };
+        assert_eq!(
+            next_live_wake(hidden, now, now, false, &host.greeting),
+            None
+        );
+        assert_eq!(format!("{:?}", host.life.state()), life);
+        host.set_available_geometry(rect, rect);
+        host.acquire(Some("local"), Some((9, true)), false);
+        assert!(host.quarantine_batch);
+        assert!(host.pending.is_none());
+        assert!(host.greeting.greeting_until.is_none());
+        assert!(host.request_hello_at(now, Some("local"), &config).is_err());
+        assert_eq!(format!("{:?}", host.life.state()), life);
+    }
+
+    #[test]
+    fn observed_empty_geometry_refuses_hello_without_spending_cooldown() {
+        let mut host = OrganismHost::default();
+        let rect = host_rect(640.0, 96.0);
+        host.set_available_geometry(rect, rect);
+        host.acquire(Some("local"), None, false);
+        host.set_available_geometry(rect, host_rect(640.0, 0.0));
+        let now = Duration::from_secs(10);
+        let config = Config {
+            ascii_organism_enabled: true,
+            ascii_organism_motion: Some(OrganismMotion::Full),
+            ..Default::default()
+        };
+        assert!(host.request_hello_at(now, Some("local"), &config).is_err());
+        host.set_available_geometry(rect, rect);
+        host.acquire(Some("local"), None, false);
+        assert!(host.request_hello_at(now, Some("local"), &config).is_ok());
+        let source = include_str!("organism_ui.rs");
+        let render = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .split("pub(crate) fn render_organism")
+            .nth(1)
+            .unwrap()
+            .split("/// Accepted Full greetings")
+            .next()
+            .unwrap();
+        assert!(render
+            .contains("set_available_geometry(ui.available_rect_before_wrap(), ui.clip_rect())"));
+        assert!(
+            render.find("set_available_geometry").unwrap()
+                < render.find("self.prepare_organism").unwrap()
+        );
+    }
+
     #[test]
     fn host_geometry_is_fail_closed_at_the_paint_boundary() {
         for width in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0, 119.9] {
@@ -3063,10 +3179,10 @@ mod tests {
     #[test]
     fn hidden_geometry_revokes_owner_and_resize_reacquires_without_replay() {
         let mut host = OrganismHost::default();
-        host.set_available_width(120.0);
+        host.set_available_geometry(host_rect(120.0, 96.0), host_rect(1000.0, 1000.0));
         host.acquire(Some("local"), Some((7, true)), true);
         host.pending = Some(pending());
-        host.set_available_width(119.9);
+        host.set_available_geometry(host_rect(119.9, 96.0), host_rect(1000.0, 1000.0));
         assert!(host.owner.is_none());
         assert!(host.pending.is_none());
         assert!(!host.running);
@@ -3077,7 +3193,7 @@ mod tests {
             next_host_wake(policy, Duration::ZERO, Duration::from_secs(5), false),
             None
         );
-        host.set_available_width(120.0);
+        host.set_available_geometry(host_rect(120.0, 96.0), host_rect(1000.0, 1000.0));
         host.acquire(Some("local"), Some((9, true)), true);
         assert!(host.quarantine_batch);
         assert!(host.pending.is_none());
