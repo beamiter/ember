@@ -1318,7 +1318,7 @@ mod tests {
         let text = live_semantic_text(context);
         let mut identity = None;
         for _ in 0..2 {
-            let output = ctx.run_ui(
+            let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1339,6 +1339,8 @@ mod tests {
                     identity = Some(response.id);
                 },
             );
+            // This semantic-only fixture does not submit output to a renderer.
+            output.textures_delta.clear();
             let update = output.platform_output.accesskit_update.unwrap();
             let node = update
                 .nodes
