@@ -88,6 +88,11 @@ impl LiveGreeting {
         self.interaction.apply(now, context)
     }
 
+    fn pending(&self, now: Duration) -> bool {
+        self.candidate_since
+            .is_some_and(|start| now >= start && now.saturating_sub(start) < LIVE_HOVER_DWELL)
+    }
+
     fn next_wake(&self, now: Duration) -> Option<Duration> {
         [
             self.candidate_since
@@ -100,6 +105,19 @@ impl LiveGreeting {
         .map(|deadline| deadline - now)
         .min()
     }
+}
+
+/// A static attention cue, not a focus ring or a measure of work progress.
+fn hover_cue_rect(target: egui::Rect, clip: egui::Rect) -> Option<egui::Rect> {
+    if !target.is_finite() || !clip.is_finite() || target.width() < 28.0 || target.height() < 8.0 {
+        return None;
+    }
+    let cue = egui::Rect::from_min_size(
+        egui::pos2(target.min.x + 8.0, target.max.y - 4.0),
+        egui::vec2(12.0, 1.0),
+    );
+    let visible = cue.intersect(clip);
+    visible.is_positive().then_some(visible)
 }
 
 fn live_greeting_allowed(
@@ -784,6 +802,12 @@ impl OrganismHost {
                     );
                     let near = pointer.is_some_and(|point| hover_rect.contains(point));
                     let display = self.greeting.update(now, near, greeting_allowed, context);
+                    if self.greeting.pending(now) {
+                        if let Some(cue) = hover_cue_rect(hover_rect, ui.clip_rect()) {
+                            ui.painter()
+                                .rect_filled(cue, 0.0, ui.visuals().weak_text_color());
+                        }
+                    }
                     let (sprite, status) = host_text(display, frame, rect.width(), expanded);
                     if let Some(response) = live_semantic_response(ui, rect, display) {
                         if live_tooltip_allowed(
@@ -1864,6 +1888,90 @@ mod tests {
         }
         assert_eq!(watch.outputs, [None; 3]);
         assert_eq!(watch.rhythm(Duration::from_secs(10)), WatchRhythm::Steady);
+    }
+
+    #[test]
+    fn hover_cue_is_only_a_pending_candidate_without_extra_deadlines() {
+        let mut greeting = LiveGreeting::default();
+        let base = PreviewPose::Calm.context();
+        assert!(!greeting.pending(Duration::ZERO));
+        assert_eq!(greeting.update(Duration::ZERO, true, true, base), base);
+        assert!(greeting.pending(Duration::ZERO));
+        assert!(greeting.pending(Duration::from_millis(599)));
+        assert!(!greeting.pending(LIVE_HOVER_DWELL));
+        assert_eq!(greeting.next_wake(Duration::ZERO), Some(LIVE_HOVER_DWELL));
+        greeting.update(LIVE_HOVER_DWELL, true, true, base);
+        assert!(!greeting.pending(LIVE_HOVER_DWELL));
+        assert_eq!(
+            greeting.next_wake(LIVE_HOVER_DWELL),
+            Some(GentleInteraction::HOLD)
+        );
+        let now = Duration::from_secs(1);
+        greeting.update(now, false, true, base);
+        greeting.update(now, true, true, base);
+        assert!(!greeting.pending(now));
+        assert_eq!(greeting.next_wake(now), None);
+    }
+
+    #[test]
+    fn hover_cue_cancels_with_existing_motion_input_and_owner_rules() {
+        let base = PreviewPose::Calm.context();
+        let now = Duration::from_secs(10);
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            let mut policy = static_policy();
+            policy.motion = Some(motion);
+            let mut greeting = LiveGreeting::default();
+            greeting.update(
+                now,
+                true,
+                live_greeting_allowed(policy, now, false, false),
+                base,
+            );
+            assert_eq!(greeting.pending(now), motion != OrganismMotion::Static);
+            assert!(!greeting.pending(Duration::ZERO));
+            greeting.cancel();
+            assert!(!greeting.pending(now));
+            greeting.update(now, true, true, base);
+            assert!(!greeting.pending(now));
+        }
+        for (running, buttons) in [(true, false), (false, true)] {
+            let mut policy = static_policy();
+            policy.motion = Some(OrganismMotion::Calm);
+            let mut greeting = LiveGreeting::default();
+            greeting.update(now, true, true, base);
+            greeting.update(
+                now,
+                true,
+                live_greeting_allowed(policy, now, running, buttons),
+                base,
+            );
+            assert!(!greeting.pending(now));
+            assert_eq!(greeting.next_wake(now), None);
+        }
+    }
+
+    #[test]
+    fn hover_cue_geometry_is_fixed_inside_existing_chrome_and_clipped() {
+        for height in [24.0, 72.0] {
+            let target =
+                egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(96.0, height));
+            let cue = hover_cue_rect(target, target).unwrap();
+            assert_eq!(cue.size(), egui::vec2(12.0, 1.0));
+            assert!(target.contains_rect(cue));
+            assert_eq!(cue.min.x, target.min.x + 8.0);
+            assert!(hover_cue_rect(target, target.translate(egui::vec2(200.0, 0.0))).is_none());
+        }
+        assert!(hover_cue_rect(egui::Rect::NOTHING, egui::Rect::EVERYTHING).is_none());
+        assert!(hover_cue_rect(egui::Rect::EVERYTHING, egui::Rect::EVERYTHING).is_none());
+        assert!(hover_cue_rect(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(20.0, 7.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0))
+        )
+        .is_none());
     }
 
     #[test]
