@@ -291,13 +291,35 @@ fn host_text(
     )
 }
 
+/// Explain only the final observed watch rhythm, never command progress.
+fn live_behavior_explanation(context: RenderContext) -> std::borrow::Cow<'static, str> {
+    let base = behavior_explanation(context.behavior);
+    let activity = if matches!(
+        context.behavior,
+        Behavior::WatchCommand | Behavior::WatchSettled
+    ) {
+        match context.watch_rhythm {
+            WatchRhythm::Busy => Some("Recent output activity."),
+            WatchRhythm::Waiting => Some("No new output observed recently."),
+            WatchRhythm::Resumed => Some("Output activity resumed."),
+            WatchRhythm::Steady => None,
+        }
+    } else {
+        None
+    };
+    activity.map_or_else(
+        || base.into(),
+        |activity| format!("{base} {activity}").into(),
+    )
+}
+
 fn live_status_text(context: RenderContext, frame: u64, width: f32) -> String {
     let glyph = sticky_glyph_with_context(context, frame);
     if width.is_finite() && width >= 640.0 {
         format!(
             "{:<12}  {}  | Volatile",
             glyph,
-            behavior_explanation(context.behavior)
+            live_behavior_explanation(context)
         )
     } else {
         format!("{:<12}  Volatile", glyph)
@@ -309,7 +331,7 @@ fn live_semantic_text(context: RenderContext) -> String {
     // authoritative behavior, without a live-region announcement every tick.
     format!(
         "ASCII Organism: {} Memory is volatile.",
-        behavior_explanation(context.behavior)
+        live_behavior_explanation(context)
     )
 }
 
@@ -1650,6 +1672,86 @@ mod tests {
     use super::*;
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn watch_activity_explanation_matches_final_context_in_both_surfaces() {
+        for behavior in [Behavior::WatchCommand, Behavior::WatchSettled] {
+            for (rhythm, activity) in [
+                (WatchRhythm::Busy, "Recent output activity."),
+                (WatchRhythm::Waiting, "No new output observed recently."),
+                (WatchRhythm::Resumed, "Output activity resumed."),
+            ] {
+                let context = RenderContext::new(behavior, BodyLanguage::default(), false)
+                    .with_watch_rhythm(rhythm);
+                let expected = format!("{} {activity}", behavior_explanation(behavior));
+                assert_eq!(live_behavior_explanation(context), expected);
+                assert!(live_semantic_text(context).contains(&expected));
+                for frame in [0, 1, 9, 1000] {
+                    assert!(live_status_text(context, frame, 640.0).contains(&expected));
+                }
+                // Narrow chrome keeps its compact layout; semantics stay complete.
+                assert!(!live_status_text(context, 0, 120.0).contains(activity));
+                assert!(live_semantic_text(context).contains(activity));
+            }
+        }
+    }
+
+    #[test]
+    fn nonwatch_and_steady_contexts_keep_existing_behavior_explanation() {
+        for pose in PreviewPose::ALL {
+            for rhythm in [
+                WatchRhythm::Steady,
+                WatchRhythm::Busy,
+                WatchRhythm::Waiting,
+                WatchRhythm::Resumed,
+            ] {
+                let context = pose.context().with_watch_rhythm(rhythm);
+                if matches!(
+                    context.behavior,
+                    Behavior::WatchCommand | Behavior::WatchSettled
+                ) && rhythm != WatchRhythm::Steady
+                {
+                    continue;
+                }
+                assert_eq!(
+                    live_behavior_explanation(context),
+                    behavior_explanation(context.behavior)
+                );
+            }
+        }
+        let agent = RenderContext::new(Behavior::WatchAgent, BodyLanguage::default(), false)
+            .with_watch_rhythm(WatchRhythm::Busy);
+        assert_eq!(
+            live_behavior_explanation(agent),
+            behavior_explanation(Behavior::WatchAgent)
+        );
+    }
+
+    #[test]
+    fn static_watch_description_keeps_steady_even_when_activity_was_observed() {
+        let mut watch = WatchObservation::default();
+        watch.observe_running(Duration::ZERO, Some(1));
+        let now = Duration::from_secs(4);
+        assert_eq!(watch.rhythm(now), WatchRhythm::Waiting);
+        let context = watch.context(now, BodyLanguage::default(), false);
+        assert_eq!(context.watch_rhythm, WatchRhythm::Steady);
+        assert_eq!(
+            live_behavior_explanation(context),
+            behavior_explanation(context.behavior)
+        );
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let draw = production
+            .split("pub fn draw(&mut self, ui:")
+            .nth(1)
+            .unwrap()
+            .split("struct PendingCommand")
+            .next()
+            .unwrap();
+        assert!(draw.contains("host_text(display, frame"));
+        assert!(draw.contains("live_semantic_response(ui, rect, display)"));
+        assert!(draw.contains("response.on_hover_text(live_semantic_text(display))"));
+    }
 
     #[test]
     fn live_semantics_are_complete_and_independent_of_animation_or_width() {
