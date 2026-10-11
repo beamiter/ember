@@ -2,6 +2,22 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 /// 命令调色板模块
 use fuzzy_matcher::FuzzyMatcher;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_PALETTE_OPENING: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_palette_opening(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("palette opening identity exhausted");
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Ask-AI request budget, enforced fail-closed at the palette entry (forge's
 /// `MAX_AI_QUERY_BYTES`). The number is core's own `MAX_USER_PROMPT_BYTES`
@@ -97,6 +113,7 @@ impl CommandInfo {
 
 /// 命令调色板
 pub struct CommandPalette {
+    opening: u64,
     /// 所有可用的命令
     all_commands: Vec<CommandInfo>,
     pub(crate) organism_target: Option<String>,
@@ -127,6 +144,7 @@ impl CommandPalette {
         let all_commands = Self::build_commands();
 
         Self {
+            opening: 0,
             all_commands,
             organism_target: None,
             query_widget_id: None,
@@ -140,6 +158,21 @@ impl CommandPalette {
             max_recent: 10,
             matcher,
         }
+    }
+
+    /// Stable for one opening; no command or user query appears in this key.
+    pub fn window_id(&self) -> egui::Id {
+        egui::Id::new(("command_palette", self.opening))
+    }
+
+    /// Gesture identity follows the complete action, not its visible row index.
+    pub fn command_row_id(&self, command: &crate::keybindings::Command) -> egui::Id {
+        self.window_id().with(("command", command))
+    }
+
+    /// A changed request cannot inherit an earlier Ask-AI button press.
+    pub fn ask_ai_row_id(&self, request: &str) -> egui::Id {
+        self.window_id().with(("ask_ai", request))
     }
 
     /// 所有可用命令（供帮助面板等枚举使用）
@@ -641,6 +674,7 @@ impl CommandPalette {
 
     /// 打开调色板
     pub fn open(&mut self) {
+        self.opening = allocate_palette_opening(&NEXT_PALETTE_OPENING);
         self.organism_target = None;
         self.query_widget_id = None;
         self.is_open = true;
@@ -843,6 +877,127 @@ impl Default for CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gesture_frame(ctx: &egui::Context, id: egui::Id, events: Vec<egui::Event>) -> bool {
+        let mut clicked = false;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(200.0, 30.0));
+                clicked = ui.interact(rect, id, egui::Sense::click()).clicked();
+            },
+        );
+        output.textures_delta.clear();
+        clicked
+    }
+
+    fn release_on_replacement(pressed_id: egui::Id, released_id: egui::Id) -> bool {
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(30.0, 30.0);
+        gesture_frame(&ctx, pressed_id, vec![]);
+        gesture_frame(&ctx, pressed_id, vec![egui::Event::PointerMoved(pos)]);
+        assert!(!gesture_frame(
+            &ctx,
+            pressed_id,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        ));
+        // The filter replaces the row while the pointer is still held.
+        gesture_frame(&ctx, released_id, vec![]);
+        gesture_frame(
+            &ctx,
+            released_id,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+    }
+
+    #[test]
+    fn palette_pointer_release_cannot_dispatch_a_replacement_command() {
+        use crate::keybindings::Command;
+        let mut palette = CommandPalette::new();
+        palette.open();
+        palette.set_query("new tab");
+        let pressed = palette.command_row_id(&Command::SessionNew);
+        palette.set_query("close tab");
+        let replacement = palette.command_row_id(&Command::SessionClose);
+        assert!(!release_on_replacement(pressed, replacement));
+        // Same-action clicks remain valid even when the query text changes.
+        assert!(release_on_replacement(
+            pressed,
+            palette.command_row_id(&Command::SessionNew)
+        ));
+    }
+
+    #[test]
+    fn palette_pointer_release_cannot_change_ai_request_or_opening() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        let pressed = palette.ask_ai_row_id("explain listing files");
+        assert!(!release_on_replacement(
+            pressed,
+            palette.ask_ai_row_id("explain removing files")
+        ));
+        assert!(release_on_replacement(
+            pressed,
+            palette.ask_ai_row_id("explain listing files")
+        ));
+        let old_window = palette.window_id();
+        palette.close();
+        palette.open();
+        assert_ne!(old_window, palette.window_id());
+        assert!(!release_on_replacement(
+            pressed,
+            palette.ask_ai_row_id("explain listing files")
+        ));
+    }
+
+    #[test]
+    fn palette_opening_is_retained_while_editing_and_never_wraps() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        let opening = palette.window_id();
+        palette.set_query("session");
+        palette.select_next();
+        assert_eq!(palette.window_id(), opening);
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_palette_opening(&counter), u64::MAX - 1);
+        assert!(std::panic::catch_unwind(|| allocate_palette_opening(&counter)).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn palette_rendering_uses_opening_and_exact_action_gesture_keys() {
+        let source = include_str!("app/rendering.rs");
+        let palette = source
+            .split("egui::Window::new(\"Command Palette\")")
+            .nth(1)
+            .unwrap()
+            .split("// 历史命令选择器")
+            .next()
+            .unwrap();
+        assert!(palette.contains(".id(self.command_palette.window_id())"));
+        assert!(palette.contains("self.command_palette.command_row_id(&cmd_info.command)"));
+        assert!(palette.contains("self.command_palette.ask_ai_row_id(&request)"));
+        assert!(!palette.contains(".with(\"palette_click\")"));
+        assert!(!palette.contains(".with(\"palette_ask_ai\")"));
+    }
 
     #[test]
     fn organism_palette_target_and_query_identity_belong_to_one_opening() {

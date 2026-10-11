@@ -2852,6 +2852,7 @@ impl TerminalApp {
             let ask_ai_too_large = self.command_palette.ask_ai_request_too_large();
 
             egui::Window::new("Command Palette")
+                .id(self.command_palette.window_id())
                 .title_bar(false)
                 .resizable(false)
                 .movable(false)
@@ -2916,7 +2917,7 @@ impl TerminalApp {
                                 let click_response = ui
                                     .interact(
                                         row.response.rect,
-                                        row.response.id.with("palette_ask_ai"),
+                                        self.command_palette.ask_ai_row_id(&request),
                                         egui::Sense::click(),
                                     )
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3049,7 +3050,7 @@ impl TerminalApp {
                                 let click_response = ui
                                     .interact(
                                         item_response.response.rect,
-                                        item_response.response.id.with("palette_click"),
+                                        self.command_palette.command_row_id(&cmd_info.command),
                                         egui::Sense::click(),
                                     )
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
