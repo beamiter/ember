@@ -268,7 +268,7 @@ fn draw_workflow_picker(
     let mut selected = None;
     let pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
     let rect = history_picker_rect(ctx.content_rect());
-    let window_id = egui::Id::new("Workflows");
+    let window_id = egui::Id::new(("Workflows", state.opening_id()));
     ctx.memory_mut(|memory| {
         memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, window_id))
     });

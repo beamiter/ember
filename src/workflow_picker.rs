@@ -46,6 +46,7 @@ pub fn display_command_preview(command: &str) -> String {
 /// 工作流选择器状态。`entries` 在打开浮层时加载一次；之后磁盘上的新文件在
 /// 下一次打开时出现（与历史选择器的加载语义一致）。
 pub struct WorkflowPickerState {
+    opening_id: u64,
     target_session_id: Option<String>,
     /// 是否需要聚焦搜索框（egui 文本框在浮层打开后的第一帧取焦）。
     pub needs_focus: bool,
@@ -63,6 +64,7 @@ impl WorkflowPickerState {
     /// 加载顺序悄悄覆盖掉——两处口径一旦不同，用户看到的是这一处。
     pub fn new(entries: Vec<Workflow>) -> Self {
         Self {
+            opening_id: allocate_args_opening(&NEXT_ARGS_OPENING),
             target_session_id: None,
             needs_focus: true,
             confirm_requested: false,
@@ -70,6 +72,11 @@ impl WorkflowPickerState {
             scroll_to_selected: true,
             query_buffer: String::new(),
         }
+    }
+
+    /// Reopened pickers must not inherit query history or a held row gesture.
+    pub fn opening_id(&self) -> u64 {
+        self.opening_id
     }
 
     pub fn with_target(mut self, session_id: String) -> Self {
@@ -311,6 +318,50 @@ mod tests {
             description: String::new(),
             default: default.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn picker_opening_survives_query_navigation_but_not_reopening() {
+        let entries = vec![workflow("alpha", "", &[]), workflow("beta", "", &[])];
+        let mut picker = WorkflowPickerState::new(entries.clone()).with_target("A".to_owned());
+        let opening = picker.opening_id();
+        *picker.query_buffer_mut() = "beta".to_owned();
+        picker.sync_query();
+        picker.select(0);
+        picker.request_confirm();
+        assert!(picker.take_confirm_request());
+        assert_eq!(picker.opening_id(), opening);
+        assert_eq!(picker.query(), "beta");
+        assert_eq!(picker.target_session_id(), Some("A"));
+        let old_root = eframe::egui::Id::new(("Workflows", opening));
+        drop(picker);
+        let reopened = WorkflowPickerState::new(entries).with_target("A".to_owned());
+        assert_ne!(reopened.opening_id(), opening);
+        let new_root = eframe::egui::Id::new(("Workflows", reopened.opening_id()));
+        assert_ne!(
+            old_root.with(("workflow-row", "", 0)),
+            new_root.with(("workflow-row", "", 0))
+        );
+        assert_eq!(reopened.query(), "");
+        assert_eq!(reopened.target_session_id(), Some("A"));
+    }
+
+    #[test]
+    fn picker_window_namespace_contains_query_scroll_and_row_gestures() {
+        let source = include_str!("app/rendering.rs");
+        let body = source
+            .split_once("fn draw_workflow_picker(")
+            .unwrap()
+            .1
+            .split_once("fn workflow_row_label(")
+            .unwrap()
+            .0;
+        assert!(body.contains("egui::Id::new((\"Workflows\", state.opening_id()))"));
+        assert!(body.contains("egui::Order::Foreground, window_id"));
+        assert!(body.contains(".id(window_id)"));
+        assert!(body.contains("TextEdit::singleline(state.query_buffer_mut())"));
+        assert!(body.contains(".id_salt(\"workflow-results\")"));
+        assert!(body.contains("ui.make_persistent_id((\"workflow-row\", state.query(), index))"));
     }
 
     #[test]
