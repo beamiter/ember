@@ -955,13 +955,7 @@ impl OrganismHost {
                     );
                 }
             });
-        let next = [
-            next_host_wake(policy, now, self.reaction_until, dormant),
-            self.greeting.next_wake(now),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        let next = next_live_wake(policy, now, self.reaction_until, dormant, &self.greeting);
         if let Some(delay) = next {
             ui.ctx().request_repaint_after(delay);
         }
@@ -1121,6 +1115,32 @@ impl crate::TerminalApp {
             .input(|input| input.viewport().focused.unwrap_or(false));
         self.organism.draw(ui, &self.config, focused);
     }
+}
+
+/// Accepted Full greetings briefly use the existing frame cadence even after
+/// a quiet minute. Candidate attention and cooldown never leave dormant mode.
+fn next_live_wake(
+    policy: PresentationPolicy,
+    now: Duration,
+    reaction_until: Duration,
+    dormant: bool,
+    greeting: &LiveGreeting,
+) -> Option<Duration> {
+    let active_full_greeting = policy.inline_visible(now)
+        && resolved_motion(policy.motion) == OrganismMotion::Full
+        && greeting.greeting_until.is_some_and(|until| now < until);
+    [
+        next_host_wake(
+            policy,
+            now,
+            reaction_until,
+            dormant && !active_full_greeting,
+        ),
+        greeting.next_wake(now),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// Static has no heartbeat, but a transient reaction still needs one expiry
@@ -3357,6 +3377,124 @@ mod tests {
             motion: Some(OrganismMotion::Static),
             last_input: None,
         }
+    }
+
+    #[test]
+    fn dormant_full_hello_uses_frames_only_during_accepted_hold() {
+        let now = Duration::from_secs(60);
+        let full = PresentationPolicy {
+            motion: Some(OrganismMotion::Full),
+            ..static_policy()
+        };
+        let mut greeting = LiveGreeting::default();
+        assert_eq!(
+            next_live_wake(full, now, now, true, &greeting),
+            Some(Duration::from_millis(900))
+        );
+        assert!(greeting.request_explicit(now, PreviewPose::Calm.context()));
+        assert_eq!(
+            next_live_wake(full, now, now, true, &greeting),
+            Some(Duration::from_millis(100))
+        );
+        let almost_done = now + GentleInteraction::HOLD - Duration::from_millis(1);
+        assert_eq!(
+            next_live_wake(full, almost_done, now, true, &greeting),
+            Some(Duration::from_millis(1))
+        );
+        let done = now + GentleInteraction::HOLD;
+        assert_eq!(
+            next_live_wake(full, done, now, true, &greeting),
+            Some(Duration::from_millis(900))
+        );
+        greeting.update(done, false, true, PreviewPose::Calm.context());
+        assert!(!greeting.request_explicit(done, PreviewPose::Calm.context()));
+        assert_eq!(
+            next_live_wake(full, done, now, true, &greeting),
+            Some(Duration::from_millis(900))
+        );
+    }
+
+    #[test]
+    fn hover_candidate_keeps_deadline_then_acceptance_restores_full_frames() {
+        let now = Duration::from_secs(60);
+        let full = PresentationPolicy {
+            motion: Some(OrganismMotion::Full),
+            ..static_policy()
+        };
+        let mut greeting = LiveGreeting::default();
+        greeting.update(now, true, true, PreviewPose::Calm.context());
+        assert!(greeting.pending(now));
+        assert_eq!(
+            next_live_wake(full, now, now, true, &greeting),
+            Some(LIVE_HOVER_DWELL)
+        );
+        let accepted = now + LIVE_HOVER_DWELL;
+        greeting.update(accepted, true, true, PreviewPose::Calm.context());
+        assert!(!greeting.pending(accepted));
+        assert_eq!(
+            next_live_wake(full, accepted, now, true, &greeting),
+            Some(Duration::from_millis(100))
+        );
+        greeting.cancel();
+        assert_eq!(
+            next_live_wake(full, accepted, now, true, &greeting),
+            Some(Duration::from_millis(900))
+        );
+    }
+
+    #[test]
+    fn greeting_cadence_preserves_motion_retreat_and_owner_gates() {
+        let now = Duration::from_secs(60);
+        let mut greeting = LiveGreeting::default();
+        assert!(greeting.request_explicit(now, PreviewPose::Calm.context()));
+        let calm = PresentationPolicy {
+            motion: Some(OrganismMotion::Calm),
+            ..static_policy()
+        };
+        assert_eq!(
+            next_live_wake(calm, now, now, true, &greeting),
+            Some(Duration::from_millis(900))
+        );
+        // Static and input/owner suppression cancel attention before scheduling.
+        greeting.cancel();
+        assert_eq!(
+            next_live_wake(static_policy(), now, now, true, &greeting),
+            None
+        );
+        let retreat = PresentationPolicy {
+            motion: Some(OrganismMotion::Full),
+            last_input: Some(now),
+            ..static_policy()
+        };
+        assert_eq!(
+            next_live_wake(retreat, now, now, true, &greeting),
+            Some(Duration::from_millis(900))
+        );
+        assert_eq!(
+            next_live_wake(
+                PresentationPolicy {
+                    focused_owner: false,
+                    ..retreat
+                },
+                now,
+                now,
+                true,
+                &greeting,
+            ),
+            None
+        );
+        let source = include_str!("organism_ui.rs");
+        let draw = source
+            .split("pub fn draw(&mut self, ui:")
+            .nth(1)
+            .unwrap()
+            .split("struct PendingCommand")
+            .next()
+            .unwrap();
+        assert!(
+            draw.find("self.greeting.update(now").unwrap()
+                < draw.find("let next = next_live_wake(").unwrap()
+        );
     }
 
     #[test]
