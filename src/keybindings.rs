@@ -125,6 +125,8 @@ pub enum Command {
     #[allow(clippy::enum_variant_names)]
     CommandPaletteToggle,
     HelpToggle,
+    /// Explicit local companion greeting; no default shortcut.
+    OrganismHello,
 
     // === 配置 ===
     ConfigOpen,
@@ -232,6 +234,7 @@ impl std::fmt::Display for Command {
             Command::WindowClose => write!(f, "window:close"),
             Command::CommandPaletteToggle => write!(f, "command_palette:toggle"),
             Command::HelpToggle => write!(f, "help:toggle"),
+            Command::OrganismHello => write!(f, "organism:hello"),
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
             Command::ConfigToggle => write!(f, "config:toggle"),
@@ -318,6 +321,7 @@ impl std::str::FromStr for Command {
             "window:close" => Ok(Command::WindowClose),
             "command_palette:toggle" => Ok(Command::CommandPaletteToggle),
             "help:toggle" => Ok(Command::HelpToggle),
+            "organism:hello" => Ok(Command::OrganismHello),
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
             "config:toggle" => Ok(Command::ConfigToggle),
@@ -740,6 +744,21 @@ impl Default for KeyBindings {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn organism_hello_roundtrips_without_a_default_shortcut() {
+        assert_eq!(
+            "organism:hello".parse::<Command>().unwrap(),
+            Command::OrganismHello
+        );
+        assert_eq!(Command::OrganismHello.to_string(), "organism:hello");
+        assert!(!KeyBindings::default_bindings()
+            .bindings
+            .values()
+            .any(|value| value == "organism:hello"));
+        fn require_send<T: Send>() {}
+        require_send::<Command>();
+    }
 
     #[test]
     fn invalid_binding_warnings_are_safe_at_the_output_boundary() {

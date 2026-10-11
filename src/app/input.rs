@@ -1385,8 +1385,21 @@ impl TerminalApp {
                     self.set_status("Command palette closed");
                 } else {
                     self.command_palette.open();
+                    self.command_palette.organism_target = self
+                        .session_manager
+                        .sessions()
+                        .get(self.session_manager.active_index())
+                        .map(|session| session.metadata.session_id.clone());
                     self.set_status("Command palette open — type to search commands");
                 }
+            }
+            keybindings::Command::OrganismHello => {
+                let target = self
+                    .session_manager
+                    .sessions()
+                    .get(self.session_manager.active_index())
+                    .map(|session| session.metadata.session_id.clone());
+                self.say_hello_to_organism(ctx, target.as_deref());
             }
             keybindings::Command::HelpToggle => {
                 self.help_panel.toggle();
@@ -1467,8 +1480,18 @@ impl TerminalApp {
             self.save_ui_history();
             return close_requested;
         }
+        let hello_target = self.command_palette.organism_target.clone();
+        let query_id = self.command_palette.query_widget_id;
         self.command_palette.close();
         self.save_ui_history();
+        if command == keybindings::Command::OrganismHello {
+            // Release only this palette's actual editor, never another overlay.
+            if let Some(id) = query_id {
+                ctx.memory_mut(|memory| memory.surrender_focus(id));
+            }
+            self.say_hello_to_organism(ctx, hello_target.as_deref());
+            return false;
+        }
         self.dispatch_command(ctx, command)
     }
 

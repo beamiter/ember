@@ -39,16 +39,28 @@ struct LiveGreeting {
     near: bool,
     candidate_since: Option<Duration>,
     greeting_until: Option<Duration>,
+    explicit: bool,
 }
 
 impl LiveGreeting {
     fn cancel(&mut self) {
         self.interaction.cancel();
+        self.explicit = false;
         // Consume the current entry until an outside sample is observed.
         // Suppression or owner replacement must not manufacture a new entry.
         self.near = true;
         self.candidate_since = None;
         self.greeting_until = None;
+    }
+
+    fn request_explicit(&mut self, now: Duration, context: RenderContext) -> bool {
+        if !self.interaction.request(now, context) {
+            return false;
+        }
+        self.candidate_since = None;
+        self.greeting_until = Some(now.saturating_add(GentleInteraction::HOLD));
+        self.explicit = true;
+        true
     }
 
     fn update(
@@ -58,6 +70,21 @@ impl LiveGreeting {
         allowed: bool,
         context: RenderContext,
     ) -> RenderContext {
+        if self.explicit {
+            if !allowed || !GentleInteraction::default().request(now, context) {
+                self.cancel();
+                return context;
+            }
+            // Explicit requests do not require hovering. Still observe the real
+            // pointer so completion never manufactures a new hover entry.
+            self.near = near;
+            if self.greeting_until.is_some_and(|until| now < until) {
+                return self.interaction.apply(now, context);
+            }
+            self.explicit = false;
+            self.greeting_until = None;
+            return context;
+        }
         if !near {
             self.cancel();
             self.near = false;
@@ -118,6 +145,15 @@ fn hover_cue_rect(target: egui::Rect, clip: egui::Rect) -> Option<egui::Rect> {
     );
     let visible = cue.intersect(clip);
     visible.is_positive().then_some(visible)
+}
+
+fn explicit_window_available(
+    focused: Option<bool>,
+    visible: Option<bool>,
+    buttons_down: bool,
+    buttons_pressed: bool,
+) -> bool {
+    focused.unwrap_or(false) && visible.unwrap_or(true) && !buttons_down && !buttons_pressed
 }
 
 fn live_greeting_allowed(
@@ -545,6 +581,63 @@ impl OrganismHost {
         self.reaction_until = now;
     }
 
+    fn request_hello(
+        &mut self,
+        available: bool,
+        target: Option<&str>,
+        config: &Config,
+    ) -> Result<(), &'static str> {
+        self.request_hello_available_at(self.born.elapsed(), available, target, config)
+    }
+
+    fn request_hello_available_at(
+        &mut self,
+        now: Duration,
+        available: bool,
+        target: Option<&str>,
+        config: &Config,
+    ) -> Result<(), &'static str> {
+        if !available {
+            return Err("ASCII Organism is giving the window or pointer priority");
+        }
+        self.request_hello_at(now, target, config)
+    }
+
+    fn request_hello_at(
+        &mut self,
+        now: Duration,
+        target: Option<&str>,
+        config: &Config,
+    ) -> Result<(), &'static str> {
+        if !config.ascii_organism_enabled {
+            return Err("Enable ASCII Organism before saying hello");
+        }
+        if resolved_motion(config.ascii_organism_motion) == OrganismMotion::Static {
+            return Err("Choose Full or Calm to say hello");
+        }
+        if target.is_none() || target != self.owner.as_deref() || !self.presentable {
+            return Err("ASCII Organism is unavailable for the original terminal");
+        }
+        let policy = PresentationPolicy {
+            enabled: true,
+            focused_owner: true,
+            local: true,
+            alternate_screen: false,
+            motion: config.ascii_organism_motion,
+            last_input: self.last_input,
+        };
+        if self.running || !policy.inline_visible(now) {
+            return Err("ASCII Organism is giving terminal activity priority");
+        }
+        if !GentleInteraction::default().request(now, self.context) {
+            return Err("ASCII Organism is busy with its current reaction");
+        }
+        if !self.greeting.request_explicit(now, self.context) {
+            return Err("ASCII Organism is cooling down; try again later");
+        }
+        Ok(())
+    }
+
     pub fn accepted_input(&mut self, session: &str) {
         if self.owner.as_deref() == Some(session) {
             let now = self.born.elapsed();
@@ -919,6 +1012,28 @@ impl crate::TerminalApp {
         if hidden {
             self.organism.acquire(None, None, false);
             self.config_panel.suspend_organism_preview();
+        }
+    }
+
+    pub(crate) fn say_hello_to_organism(&mut self, ctx: &egui::Context, target: Option<&str>) {
+        // Admission is a single current-state check, never a deferred request.
+        let available = ctx.input(|input| {
+            let viewport = input.viewport();
+            explicit_window_available(
+                viewport.focused,
+                viewport.visible(),
+                input.pointer.any_down(),
+                input.pointer.any_pressed(),
+            )
+        });
+        if available {
+            self.prepare_organism(ctx);
+        }
+        match self.organism.request_hello(available, target, &self.config) {
+            // Pointer activation may occur after this frame's companion paint.
+            // One immediate UI repaint also covers a dormant Calm host.
+            Ok(()) => ctx.request_repaint(),
+            Err(message) => self.set_status_for(message, Duration::from_secs(3)),
         }
     }
 
@@ -1888,6 +2003,146 @@ mod tests {
         }
         assert_eq!(watch.outputs, [None; 3]);
         assert_eq!(watch.rhythm(Duration::from_secs(10)), WatchRhythm::Steady);
+    }
+
+    #[test]
+    fn explicit_hello_wiring_keeps_palette_target_and_admission_one_shot() {
+        let input = include_str!("app/input.rs");
+        let palette = input
+            .split("pub(crate) fn dispatch_palette_command")
+            .nth(1)
+            .unwrap()
+            .split("/// 切换活跃会话")
+            .next()
+            .unwrap();
+        assert!(
+            palette.find("organism_target.clone()").unwrap()
+                < palette.find("self.command_palette.close()").unwrap()
+        );
+        assert!(palette.contains("memory.surrender_focus(id)"));
+        assert!(palette.contains("self.say_hello_to_organism(ctx, hello_target.as_deref())"));
+        let rendering = include_str!("app/rendering.rs");
+        let palette_render = rendering
+            .split(".hint_text(\"Search commands... (? asks AI)\")")
+            .nth(1)
+            .unwrap()
+            .split("ui.separator()")
+            .next()
+            .unwrap();
+        assert!(palette_render
+            .contains("self.command_palette.query_widget_id = Some(search_response.id)"));
+        let source = include_str!("organism_ui.rs");
+        let admission = source
+            .split("pub(crate) fn say_hello_to_organism")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn prepare_organism")
+            .next()
+            .unwrap();
+        assert_eq!(admission.matches("self.prepare_organism(ctx)").count(), 1);
+        assert_eq!(admission.matches("self.organism.request_hello").count(), 1);
+        assert!(!admission.contains("request_repaint_after"));
+    }
+
+    #[test]
+    fn explicit_hello_holds_without_hover_and_shares_cooldown() {
+        let mut greeting = LiveGreeting::default();
+        let base = PreviewPose::Calm.context();
+        assert!(greeting.request_explicit(Duration::ZERO, base));
+        assert!(!greeting.pending(Duration::ZERO));
+        assert_eq!(
+            greeting
+                .update(Duration::from_secs(1), false, true, base)
+                .behavior,
+            Behavior::Approach
+        );
+        assert!(!greeting.near);
+        assert_eq!(
+            greeting.update(GentleInteraction::HOLD, false, true, base),
+            base
+        );
+        assert!(!greeting.explicit);
+        assert!(!greeting.request_explicit(Duration::from_secs(3), base));
+        greeting.update(Duration::from_secs(3), true, true, base);
+        assert!(!greeting.pending(Duration::from_secs(3)));
+        assert!(greeting.request_explicit(Duration::from_secs(9), base));
+        greeting.cancel();
+        assert!(!greeting.explicit);
+        assert!(!greeting.request_explicit(Duration::from_secs(10), base));
+        let mut pointer = LiveGreeting::default();
+        pointer.update(Duration::ZERO, true, true, base);
+        pointer.update(LIVE_HOVER_DWELL, true, true, base);
+        assert!(!pointer.request_explicit(Duration::from_secs(1), base));
+    }
+
+    #[test]
+    fn explicit_hello_cancels_for_activity_and_never_replays_hover() {
+        let base = PreviewPose::Calm.context();
+        for (allowed, context) in [(false, base), (true, PreviewPose::Working.context())] {
+            let mut greeting = LiveGreeting::default();
+            assert!(greeting.request_explicit(Duration::ZERO, base));
+            assert_eq!(
+                greeting.update(Duration::from_millis(1), true, allowed, context),
+                context
+            );
+            assert!(!greeting.explicit);
+            assert_eq!(greeting.next_wake(Duration::from_millis(1)), None);
+            greeting.update(Duration::from_secs(10), true, true, base);
+            assert!(!greeting.pending(Duration::from_secs(10)));
+        }
+        let mut greeting = LiveGreeting::default();
+        assert!(greeting.request_explicit(Duration::ZERO, base));
+        greeting.update(Duration::from_secs(1), true, true, base);
+        greeting.update(GentleInteraction::HOLD, true, true, base);
+        greeting.update(Duration::from_secs(10), true, true, base);
+        assert!(!greeting.pending(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn explicit_hello_requires_original_owner_idle_motion_and_real_input_quiet() {
+        let mut host = OrganismHost::default();
+        host.set_available_width(640.0);
+        host.acquire(Some("original"), None, false);
+        let before = host.life.state();
+        let now = Duration::from_secs(10);
+        let mut config = Config::default();
+        config.ascii_organism_enabled = true;
+        config.ascii_organism_motion = Some(OrganismMotion::Calm);
+        assert!(host.request_hello_at(now, None, &config).is_err());
+        assert!(host
+            .request_hello_at(now, Some("replacement"), &config)
+            .is_err());
+        config.ascii_organism_motion = Some(OrganismMotion::Static);
+        assert!(host
+            .request_hello_at(now, Some("original"), &config)
+            .is_err());
+        config.ascii_organism_motion = Some(OrganismMotion::Full);
+        host.running = true;
+        assert!(host
+            .request_hello_at(now, Some("original"), &config)
+            .is_err());
+        host.running = false;
+        host.last_input = Some(now);
+        assert!(host
+            .request_hello_at(now, Some("original"), &config)
+            .is_err());
+        host.last_input = None;
+        let pressed = explicit_window_available(Some(true), Some(true), false, true);
+        assert!(!pressed);
+        assert!(host
+            .request_hello_available_at(now, pressed, Some("original"), &config)
+            .is_err());
+        assert!(!host.greeting.explicit);
+        assert!(host
+            .request_hello_available_at(
+                now,
+                explicit_window_available(Some(true), Some(true), false, false),
+                Some("original"),
+                &config
+            )
+            .is_ok());
+        assert_eq!(format!("{:?}", host.life.state()), format!("{:?}", before));
+        assert!(host.pending.is_none());
     }
 
     #[test]

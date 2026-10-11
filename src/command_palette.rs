@@ -99,6 +99,8 @@ impl CommandInfo {
 pub struct CommandPalette {
     /// 所有可用的命令
     all_commands: Vec<CommandInfo>,
+    pub(crate) organism_target: Option<String>,
+    pub(crate) query_widget_id: Option<egui::Id>,
     /// 搜索结果（包含匹配分数）
     search_results: Vec<(CommandInfo, i64)>,
     /// 搜索输入
@@ -126,6 +128,8 @@ impl CommandPalette {
 
         Self {
             all_commands,
+            organism_target: None,
+            query_widget_id: None,
             search_results: Vec::new(),
             search_query: String::new(),
             ask_ai_input_too_large: false,
@@ -590,6 +594,12 @@ impl CommandPalette {
                 "Open or close the keyboard shortcut reference",
                 crate::keybindings::Command::HelpToggle,
             ),
+            CommandInfo::new(
+                "ASCII Organism: Say hello",
+                CommandCategory::Window,
+                "Greet the local companion in Full or Calm mode; shared 8-second cooldown",
+                crate::keybindings::Command::OrganismHello,
+            ),
             // === 配置 ===
             CommandInfo::new(
                 "Open Settings",
@@ -631,6 +641,8 @@ impl CommandPalette {
 
     /// 打开调色板
     pub fn open(&mut self) {
+        self.organism_target = None;
+        self.query_widget_id = None;
         self.is_open = true;
         self.needs_focus = true;
         self.search_query.clear();
@@ -831,6 +843,39 @@ impl Default for CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn organism_palette_target_and_query_identity_belong_to_one_opening() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        palette.organism_target = Some("original".to_owned());
+        let id = egui::Id::new("actual query");
+        palette.query_widget_id = Some(id);
+        palette.set_query("ASCII Organism: Say hello");
+        assert_eq!(palette.organism_target.as_deref(), Some("original"));
+        assert_eq!(palette.query_widget_id, Some(id));
+        assert!(palette
+            .all_commands()
+            .iter()
+            .any(|entry| entry.command == crate::keybindings::Command::OrganismHello));
+        palette.close();
+        palette.open();
+        assert!(palette.organism_target.is_none());
+        assert!(palette.query_widget_id.is_none());
+    }
+
+    #[test]
+    fn palette_hello_surrenders_only_its_exact_query_focus() {
+        let ctx = egui::Context::default();
+        let query = egui::Id::new("palette query");
+        let other = egui::Id::new("other editor");
+        ctx.memory_mut(|memory| memory.request_focus(other));
+        ctx.memory_mut(|memory| memory.surrender_focus(query));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(other));
+        ctx.memory_mut(|memory| memory.request_focus(query));
+        ctx.memory_mut(|memory| memory.surrender_focus(query));
+        assert_eq!(ctx.memory(|memory| memory.focused()), None);
+    }
 
     #[test]
     fn test_command_palette_open() {
@@ -1061,6 +1106,7 @@ mod tests {
             Command::SearchReplaceToggle,
             Command::HistoryPickerToggle,
             Command::WorkflowPickerToggle,
+            Command::OrganismHello,
             Command::TerminalSendSigint,
             Command::TerminalSendEof,
             Command::TerminalClear,

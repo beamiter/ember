@@ -2876,6 +2876,7 @@ impl TerminalApp {
                             egui::TextEdit::singleline(&mut self.command_palette.search_query)
                                 .hint_text("Search commands... (? asks AI)"),
                         );
+                        self.command_palette.query_widget_id = Some(search_response.id);
                         if search_response.changed() {
                             let query = std::mem::take(&mut self.command_palette.search_query);
                             self.command_palette.set_query(query);
