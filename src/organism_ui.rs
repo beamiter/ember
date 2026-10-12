@@ -13,6 +13,10 @@ use jterm_core::organism::{
     AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
+use jterm_core::organism_live::{
+    LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
+    LiveAttentionRejection, LiveAttentionSnapshot,
+};
 
 use crate::config::{Config, OrganismMotion};
 use crate::organism::{
@@ -38,109 +42,52 @@ fn host_geometry_presentable(available: egui::Rect, clip: egui::Rect) -> bool {
     visible.is_positive() && host_geometry_allows(visible.width())
 }
 
-const LIVE_HOVER_DWELL: Duration = Duration::from_millis(600);
-
-/// Presentation-only attention: no reducer or life-state access. Cooldown is
-/// window-local and survives owner changes; a stationary pointer never loops.
-#[derive(Default)]
-struct LiveGreeting {
-    interaction: GentleInteraction,
-    near: bool,
-    candidate_since: Option<Duration>,
-    greeting_until: Option<Duration>,
-    explicit: bool,
-}
-
-impl LiveGreeting {
-    fn cancel(&mut self) {
-        self.interaction.cancel();
-        self.explicit = false;
-        // Consume the current entry until an outside sample is observed.
-        // Suppression or owner replacement must not manufacture a new entry.
-        self.near = true;
-        self.candidate_since = None;
-        self.greeting_until = None;
+/// Native pointer observation only; all dwell, hold, cooldown and source policy
+/// lives in jterm_core. Layout changes synchronize position without an entry.
+fn observe_live_attention(
+    attention: &mut LiveAttention<String>,
+    pointer_inside: &mut bool,
+    now: Duration,
+    owner: &String,
+    mut input: LiveAttentionInput,
+    target: egui::Rect,
+    events: &[egui::Event],
+) -> Option<LiveAttentionSnapshot> {
+    if attention.owner() != Some(owner) {
+        return None;
     }
-
-    fn request_explicit(&mut self, now: Duration, context: RenderContext) -> bool {
-        if !self.interaction.request(now, context) {
-            return false;
+    let final_inside = input.pointer_inside;
+    for event in events {
+        let inside = match event {
+            egui::Event::PointerMoved(position) => target.contains(*position),
+            egui::Event::PointerGone => false,
+            _ => continue,
+        };
+        input.pointer_inside = inside;
+        let event = if !inside {
+            attention
+                .entry_ticket()
+                .map(|ticket| LiveAttentionEvent::PointerLeft { ticket })
+        } else if !*pointer_inside {
+            attention
+                .entry_offer()
+                .map(|ticket| LiveAttentionEvent::PointerEntered { ticket })
+        } else {
+            None
+        };
+        if let Some(event) = event {
+            attention.advance(now, owner, input, event).ok()?;
         }
-        self.candidate_since = None;
-        self.greeting_until = Some(now.saturating_add(GentleInteraction::HOLD));
-        self.explicit = true;
-        true
+        *pointer_inside = inside;
     }
-
-    fn update(
-        &mut self,
-        now: Duration,
-        near: bool,
-        allowed: bool,
-        context: RenderContext,
-    ) -> RenderContext {
-        if self.explicit {
-            if !allowed || !GentleInteraction::default().request(now, context) {
-                self.cancel();
-                return context;
-            }
-            // Explicit requests do not require hovering. Still observe the real
-            // pointer so completion never manufactures a new hover entry.
-            self.near = near;
-            if self.greeting_until.is_some_and(|until| now < until) {
-                return self.interaction.apply(now, context);
-            }
-            self.explicit = false;
-            self.greeting_until = None;
-            return context;
-        }
-        if !near {
-            self.cancel();
-            self.near = false;
-            return context;
-        }
-        if !allowed || !GentleInteraction::default().request(now, context) {
-            self.cancel();
-            return context;
-        }
-        if !self.near {
-            self.near = true;
-            if self.interaction.clone().request(now, context) {
-                self.candidate_since = Some(now);
-            }
-        }
-        if self
-            .candidate_since
-            .is_some_and(|start| now.saturating_sub(start) >= LIVE_HOVER_DWELL)
-        {
-            self.candidate_since = None;
-            if self.interaction.request(now, context) {
-                self.greeting_until = Some(now.saturating_add(GentleInteraction::HOLD));
-            }
-        }
-        if self.greeting_until.is_some_and(|until| now >= until) {
-            self.greeting_until = None;
-        }
-        self.interaction.apply(now, context)
-    }
-
-    fn pending(&self, now: Duration) -> bool {
-        self.candidate_since
-            .is_some_and(|start| now >= start && now.saturating_sub(start) < LIVE_HOVER_DWELL)
-    }
-
-    fn next_wake(&self, now: Duration) -> Option<Duration> {
-        [
-            self.candidate_since
-                .map(|start| start.saturating_add(LIVE_HOVER_DWELL)),
-            self.greeting_until,
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|deadline| *deadline > now)
-        .map(|deadline| deadline - now)
-        .min()
-    }
+    // The final native position may change because layout moved, without a
+    // pointer event. It is a fact for cancellation, never permission to rearm.
+    input.pointer_inside = final_inside;
+    let snapshot = attention
+        .advance(now, owner, input, LiveAttentionEvent::Reconcile)
+        .ok()?;
+    *pointer_inside = final_inside;
+    Some(snapshot)
 }
 
 /// A static attention cue, not a focus ring or a measure of work progress.
@@ -533,7 +480,8 @@ pub struct OrganismHost {
     ambient: AmbientMind,
     context: RenderContext,
     reaction_until: Duration,
-    greeting: LiveGreeting,
+    attention: LiveAttention<String>,
+    pointer_inside: bool,
     watch: WatchObservation,
     bridge: PaintedBridge,
     bridge_mode: bool,
@@ -558,7 +506,8 @@ impl Default for OrganismHost {
             ambient: AmbientMind::seeded(0x656d626572),
             context: PreviewPose::Calm.context(),
             reaction_until: Duration::ZERO,
-            greeting: LiveGreeting::default(),
+            attention: LiveAttention::default(),
+            pointer_inside: false,
             watch: WatchObservation::default(),
             bridge: PaintedBridge::default(),
             bridge_mode: false,
@@ -599,7 +548,7 @@ impl OrganismHost {
         self.watch.observe_running(now, generation);
         self.life
             .advance(now, false, false, CircadianPhase::Unlearned);
-        self.greeting.cancel();
+        self.attention.set_owner(owner.map(str::to_owned));
         self.owner = owner.map(str::to_owned);
         self.cursor = tail;
         self.quarantine_batch = owner.is_some();
@@ -610,6 +559,12 @@ impl OrganismHost {
         self.ambient.interrupt();
         self.context = PreviewPose::Calm.context();
         self.reaction_until = now;
+    }
+
+    fn cancel_attention(&mut self) {
+        if let Some(owner) = self.owner.as_ref() {
+            self.attention.cancel(owner);
+        }
     }
 
     fn request_hello(
@@ -660,19 +615,36 @@ impl OrganismHost {
         if self.running || !policy.inline_visible(now) {
             return Err("ASCII Organism is giving terminal activity priority");
         }
-        if !GentleInteraction::default().request(now, self.context) {
-            return Err("ASCII Organism is busy with its current reaction");
+        let owner = self
+            .owner
+            .as_ref()
+            .ok_or("ASCII Organism is unavailable for the original terminal")?;
+        let input = LiveAttentionInput {
+            base_context: self.context,
+            hard_eligible: true,
+            hover_available: self.presentable,
+            pointer_inside: self.pointer_inside,
+        };
+        let snapshot = self
+            .attention
+            .advance(now, owner, input, LiveAttentionEvent::Explicit)
+            .map_err(|_| "ASCII Organism is unavailable for the original terminal")?;
+        match snapshot.outcome {
+            LiveAttentionOutcome::Accepted(_) => Ok(()),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::BusyContext) => {
+                Err("ASCII Organism is busy with its current reaction")
+            }
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown) => {
+                Err("ASCII Organism is cooling down; try again later")
+            }
+            _ => Err("ASCII Organism is unavailable for the original terminal"),
         }
-        if !self.greeting.request_explicit(now, self.context) {
-            return Err("ASCII Organism is cooling down; try again later");
-        }
-        Ok(())
     }
 
     pub fn accepted_input(&mut self, session: &str) {
         if self.owner.as_deref() == Some(session) {
             let now = self.born.elapsed();
-            self.greeting.cancel();
+            self.cancel_attention();
             self.watch.reset();
             self.bridge.reset();
             self.last_input = Some(now);
@@ -697,7 +669,7 @@ impl OrganismHost {
             return;
         }
         let now = self.born.elapsed();
-        self.greeting.cancel();
+        self.cancel_attention();
         self.life.note_output(now);
         self.ambient.interrupt();
         let running = records.back().is_some_and(|record| {
@@ -815,7 +787,7 @@ impl OrganismHost {
     }
 
     fn react(&mut self, reaction: Reaction, now: Duration) {
-        self.greeting.cancel();
+        self.cancel_attention();
         self.ambient.interrupt();
         self.context = RenderContext::new(
             reaction.behavior,
@@ -883,17 +855,26 @@ impl OrganismHost {
         } else {
             self.context
         };
-        let (pointer, buttons_down) = ui.ctx().input(|input| {
+        let (pointer, buttons_down, pointer_events) = ui.ctx().input(|input| {
             (
                 input.pointer.hover_pos(),
                 input.pointer.any_down() || input.pointer.any_pressed(),
+                input
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            egui::Event::PointerMoved(_) | egui::Event::PointerGone
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
         });
         let greeting_allowed = live_greeting_allowed(policy, now, self.running, buttons_down);
-        if !greeting_allowed {
-            self.greeting.cancel();
-        }
         let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
+        let mut attention_snapshot = None;
         // Allocate exactly the same strip while suppressed. Typing, switching
         // panes and alternate screen must not change the terminal's grid size.
         egui::Panel::bottom("ascii_organism_chrome")
@@ -904,29 +885,46 @@ impl OrganismHost {
             .frame(egui::Frame::NONE.inner_margin(0.0))
             .resizable(false)
             .show(ui, |ui| {
+                let rect = ui
+                    .available_rect_before_wrap()
+                    .shrink2(egui::vec2(8.0, 0.0));
+                // Observe only the bounded glyph footprint. No widget,
+                // click handler, focus request or terminal input is created.
+                let expanded = config.ascii_organism_expanded;
+                let status_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, (rect.max.y - 24.0).max(rect.min.y)),
+                    rect.max,
+                );
+                let body_rect =
+                    egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, status_rect.min.y));
+                let target = if expanded { body_rect } else { status_rect };
+                let hover_rect = egui::Rect::from_min_size(
+                    target.min,
+                    egui::vec2(96.0_f32.min(target.width()), target.height()),
+                );
+                let near = pointer.is_some_and(|point| hover_rect.contains(point));
+                if let Some(owner) = self.owner.as_ref() {
+                    attention_snapshot = observe_live_attention(
+                        &mut self.attention,
+                        &mut self.pointer_inside,
+                        now,
+                        owner,
+                        LiveAttentionInput {
+                            base_context: context,
+                            hard_eligible: greeting_allowed,
+                            hover_available: hover_rect.intersect(ui.clip_rect()).is_positive(),
+                            pointer_inside: near,
+                        },
+                        hover_rect,
+                        &pointer_events,
+                    );
+                } else {
+                    self.pointer_inside = near;
+                }
                 if policy.inline_visible(now) {
-                    let rect = ui
-                        .available_rect_before_wrap()
-                        .shrink2(egui::vec2(8.0, 0.0));
-                    // Observe only the bounded glyph footprint. No widget,
-                    // click handler, focus request or terminal input is created.
-                    let expanded = config.ascii_organism_expanded;
-                    let status_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.min.x, (rect.max.y - 24.0).max(rect.min.y)),
-                        rect.max,
-                    );
-                    let body_rect = egui::Rect::from_min_max(
-                        rect.min,
-                        egui::pos2(rect.max.x, status_rect.min.y),
-                    );
-                    let target = if expanded { body_rect } else { status_rect };
-                    let hover_rect = egui::Rect::from_min_size(
-                        target.min,
-                        egui::vec2(96.0_f32.min(target.width()), target.height()),
-                    );
-                    let near = pointer.is_some_and(|point| hover_rect.contains(point));
-                    let display = self.greeting.update(now, near, greeting_allowed, context);
-                    if self.greeting.pending(now) {
+                    let display =
+                        attention_snapshot.map_or(context, |snapshot| snapshot.presentation);
+                    if attention_snapshot.is_some_and(|snapshot| snapshot.candidate_visible) {
                         if let Some(cue) = hover_cue_rect(hover_rect, ui.clip_rect()) {
                             ui.painter()
                                 .rect_filled(cue, 0.0, ui.visuals().weak_text_color());
@@ -946,10 +944,8 @@ impl OrganismHost {
                     if let Some(sprite) = sprite {
                         let clip = body_rect.intersect(ui.clip_rect());
                         let visible = clip.is_positive();
-                        let greeting = self
-                            .greeting
-                            .greeting_until
-                            .is_some_and(|until| now < until);
+                        let greeting =
+                            attention_snapshot.is_some_and(|snapshot| snapshot.active.is_some());
                         let plan = if bridge_allowed(expanded, full, visible, greeting) {
                             Some(self.bridge.plan_at_cadence(now, display, frame, !dormant))
                         } else {
@@ -985,7 +981,13 @@ impl OrganismHost {
                     );
                 }
             });
-        let next = next_live_wake(policy, now, self.reaction_until, dormant, &self.greeting);
+        let next = next_live_wake(
+            policy,
+            self.born.elapsed(),
+            self.reaction_until,
+            dormant,
+            attention_snapshot,
+        );
         if let Some(delay) = next {
             ui.ctx().request_repaint_after(delay);
         }
@@ -1157,11 +1159,11 @@ fn next_live_wake(
     now: Duration,
     reaction_until: Duration,
     dormant: bool,
-    greeting: &LiveGreeting,
+    attention: Option<LiveAttentionSnapshot>,
 ) -> Option<Duration> {
     let active_full_greeting = policy.inline_visible(now)
         && resolved_motion(policy.motion) == OrganismMotion::Full
-        && greeting.greeting_until.is_some_and(|until| now < until);
+        && attention.is_some_and(|snapshot| snapshot.active.is_some());
     [
         next_host_wake(
             policy,
@@ -1169,7 +1171,9 @@ fn next_live_wake(
             reaction_until,
             dormant && !active_full_greeting,
         ),
-        greeting.next_wake(now),
+        attention
+            .and_then(|snapshot| snapshot.wake_after(now))
+            .map(|delay| delay.max(Duration::from_millis(1))),
     ]
     .into_iter()
     .flatten()
@@ -2679,60 +2683,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hello_holds_without_hover_and_shares_cooldown() {
-        let mut greeting = LiveGreeting::default();
-        let base = PreviewPose::Calm.context();
-        assert!(greeting.request_explicit(Duration::ZERO, base));
-        assert!(!greeting.pending(Duration::ZERO));
-        assert_eq!(
-            greeting
-                .update(Duration::from_secs(1), false, true, base)
-                .behavior,
-            Behavior::Approach
-        );
-        assert!(!greeting.near);
-        assert_eq!(
-            greeting.update(GentleInteraction::HOLD, false, true, base),
-            base
-        );
-        assert!(!greeting.explicit);
-        assert!(!greeting.request_explicit(Duration::from_secs(3), base));
-        greeting.update(Duration::from_secs(3), true, true, base);
-        assert!(!greeting.pending(Duration::from_secs(3)));
-        assert!(greeting.request_explicit(Duration::from_secs(9), base));
-        greeting.cancel();
-        assert!(!greeting.explicit);
-        assert!(!greeting.request_explicit(Duration::from_secs(10), base));
-        let mut pointer = LiveGreeting::default();
-        pointer.update(Duration::ZERO, true, true, base);
-        pointer.update(LIVE_HOVER_DWELL, true, true, base);
-        assert!(!pointer.request_explicit(Duration::from_secs(1), base));
-    }
-
-    #[test]
-    fn explicit_hello_cancels_for_activity_and_never_replays_hover() {
-        let base = PreviewPose::Calm.context();
-        for (allowed, context) in [(false, base), (true, PreviewPose::Working.context())] {
-            let mut greeting = LiveGreeting::default();
-            assert!(greeting.request_explicit(Duration::ZERO, base));
-            assert_eq!(
-                greeting.update(Duration::from_millis(1), true, allowed, context),
-                context
-            );
-            assert!(!greeting.explicit);
-            assert_eq!(greeting.next_wake(Duration::from_millis(1)), None);
-            greeting.update(Duration::from_secs(10), true, true, base);
-            assert!(!greeting.pending(Duration::from_secs(10)));
-        }
-        let mut greeting = LiveGreeting::default();
-        assert!(greeting.request_explicit(Duration::ZERO, base));
-        greeting.update(Duration::from_secs(1), true, true, base);
-        greeting.update(GentleInteraction::HOLD, true, true, base);
-        greeting.update(Duration::from_secs(10), true, true, base);
-        assert!(!greeting.pending(Duration::from_secs(10)));
-    }
-
-    #[test]
     fn explicit_hello_requires_original_owner_idle_motion_and_real_input_quiet() {
         let mut host = OrganismHost::default();
         host.set_available_geometry(host_rect(640.0, 96.0), host_rect(1000.0, 1000.0));
@@ -2768,7 +2718,7 @@ mod tests {
         assert!(host
             .request_hello_available_at(now, pressed, Some("original"), &config)
             .is_err());
-        assert!(!host.greeting.explicit);
+        assert!(host_attention_snapshot(&host, now).active.is_none());
         assert!(host
             .request_hello_available_at(
                 now,
@@ -2779,70 +2729,6 @@ mod tests {
             .is_ok());
         assert_eq!(format!("{:?}", host.life.state()), format!("{:?}", before));
         assert!(host.pending.is_none());
-    }
-
-    #[test]
-    fn hover_cue_is_only_a_pending_candidate_without_extra_deadlines() {
-        let mut greeting = LiveGreeting::default();
-        let base = PreviewPose::Calm.context();
-        assert!(!greeting.pending(Duration::ZERO));
-        assert_eq!(greeting.update(Duration::ZERO, true, true, base), base);
-        assert!(greeting.pending(Duration::ZERO));
-        assert!(greeting.pending(Duration::from_millis(599)));
-        assert!(!greeting.pending(LIVE_HOVER_DWELL));
-        assert_eq!(greeting.next_wake(Duration::ZERO), Some(LIVE_HOVER_DWELL));
-        greeting.update(LIVE_HOVER_DWELL, true, true, base);
-        assert!(!greeting.pending(LIVE_HOVER_DWELL));
-        assert_eq!(
-            greeting.next_wake(LIVE_HOVER_DWELL),
-            Some(GentleInteraction::HOLD)
-        );
-        let now = Duration::from_secs(1);
-        greeting.update(now, false, true, base);
-        greeting.update(now, true, true, base);
-        assert!(!greeting.pending(now));
-        assert_eq!(greeting.next_wake(now), None);
-    }
-
-    #[test]
-    fn hover_cue_cancels_with_existing_motion_input_and_owner_rules() {
-        let base = PreviewPose::Calm.context();
-        let now = Duration::from_secs(10);
-        for motion in [
-            OrganismMotion::Full,
-            OrganismMotion::Calm,
-            OrganismMotion::Static,
-        ] {
-            let mut policy = static_policy();
-            policy.motion = Some(motion);
-            let mut greeting = LiveGreeting::default();
-            greeting.update(
-                now,
-                true,
-                live_greeting_allowed(policy, now, false, false),
-                base,
-            );
-            assert_eq!(greeting.pending(now), motion != OrganismMotion::Static);
-            assert!(!greeting.pending(Duration::ZERO));
-            greeting.cancel();
-            assert!(!greeting.pending(now));
-            greeting.update(now, true, true, base);
-            assert!(!greeting.pending(now));
-        }
-        for (running, buttons) in [(true, false), (false, true)] {
-            let mut policy = static_policy();
-            policy.motion = Some(OrganismMotion::Calm);
-            let mut greeting = LiveGreeting::default();
-            greeting.update(now, true, true, base);
-            greeting.update(
-                now,
-                true,
-                live_greeting_allowed(policy, now, running, buttons),
-                base,
-            );
-            assert!(!greeting.pending(now));
-            assert_eq!(greeting.next_wake(now), None);
-        }
     }
 
     #[test]
@@ -2863,109 +2749,6 @@ mod tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0))
         )
         .is_none());
-    }
-
-    #[test]
-    fn live_hover_dwells_once_and_requires_a_new_entry() {
-        let mut greeting = LiveGreeting::default();
-        let base = PreviewPose::Calm.context();
-        assert_eq!(greeting.update(Duration::ZERO, true, true, base), base);
-        assert_eq!(greeting.next_wake(Duration::ZERO), Some(LIVE_HOVER_DWELL));
-        let almost = Duration::from_millis(599);
-        assert_eq!(greeting.update(almost, true, true, base), base);
-        let start = LIVE_HOVER_DWELL;
-        assert_eq!(
-            greeting.update(start, true, true, base).behavior,
-            Behavior::Approach
-        );
-        assert_eq!(greeting.next_wake(start), Some(GentleInteraction::HOLD));
-        let end = start + GentleInteraction::HOLD;
-        assert_eq!(greeting.update(end, true, true, base), base);
-        assert_eq!(greeting.next_wake(end), None);
-        let later = Duration::from_secs(10);
-        assert_eq!(greeting.update(later, true, true, base), base);
-        assert_eq!(greeting.next_wake(later), None);
-        greeting.update(later, false, true, base);
-        greeting.update(later, true, true, base);
-        assert_eq!(greeting.next_wake(later), Some(LIVE_HOVER_DWELL));
-    }
-
-    #[test]
-    fn stationary_hover_cannot_rearm_after_suppression_or_output() {
-        let base = PreviewPose::Calm.context();
-        let mut greeting = LiveGreeting::default();
-        greeting.update(Duration::ZERO, true, true, base);
-        greeting.update(Duration::from_millis(100), true, false, base);
-        let later = Duration::from_secs(2);
-        assert_eq!(greeting.update(later, true, true, base), base);
-        assert_eq!(greeting.next_wake(later), None);
-        greeting.update(later, false, true, base);
-        greeting.update(later, true, true, base);
-        assert_eq!(greeting.next_wake(later), Some(LIVE_HOVER_DWELL));
-        // Output and ownership hooks call this same cancellation operation.
-        greeting.cancel();
-        assert_eq!(greeting.update(later, true, true, base), base);
-        assert_eq!(greeting.next_wake(later), None);
-        greeting.update(later, false, true, base);
-        greeting.update(later, true, true, base);
-        assert_eq!(greeting.next_wake(later), Some(LIVE_HOVER_DWELL));
-    }
-
-    #[test]
-    fn live_hover_cooldown_entry_never_queues_a_later_greeting() {
-        let mut greeting = LiveGreeting::default();
-        let base = PreviewPose::Calm.context();
-        greeting.update(Duration::ZERO, true, true, base);
-        greeting.update(LIVE_HOVER_DWELL, true, true, base);
-        let early = Duration::from_secs(1);
-        greeting.update(early, false, true, base);
-        greeting.update(early, true, true, base);
-        assert_eq!(greeting.next_wake(early), None);
-        let later = Duration::from_secs(20);
-        assert_eq!(greeting.update(later, true, true, base), base);
-        assert_eq!(greeting.next_wake(later), None);
-    }
-
-    #[test]
-    fn live_hover_cancellation_preserves_window_cooldown_and_life() {
-        let mut host = OrganismHost::default();
-        host.acquire(Some("one"), None, false);
-        let base = PreviewPose::Calm.context();
-        let before = format!("{:?}", host.life.state());
-        host.greeting.update(Duration::ZERO, false, true, base);
-        host.greeting.update(Duration::ZERO, true, true, base);
-        host.greeting.update(LIVE_HOVER_DWELL, true, true, base);
-        host.acquire(Some("two"), None, false);
-        let now = Duration::from_secs(1);
-        assert_eq!(host.greeting.update(now, true, true, base), base);
-        assert_eq!(host.greeting.next_wake(now), None);
-        host.greeting.update(now, false, true, base);
-        assert_eq!(host.greeting.update(now, true, true, base), base);
-        assert_eq!(host.greeting.next_wake(now), None);
-        assert_eq!(format!("{:?}", host.life.state()), before);
-    }
-
-    #[test]
-    fn live_hover_busy_or_suppressed_context_cancels_without_wakes() {
-        let base = PreviewPose::Calm.context();
-        for context in [
-            PreviewPose::Working.context(),
-            PreviewPose::Concerned.context(),
-            PreviewPose::Success.context(),
-            RenderContext::new(Behavior::UnknownOutcome, BodyLanguage::default(), false),
-        ] {
-            let mut greeting = LiveGreeting::default();
-            greeting.update(Duration::ZERO, true, true, base);
-            assert_eq!(
-                greeting.update(LIVE_HOVER_DWELL, true, true, context),
-                context
-            );
-            assert_eq!(greeting.next_wake(LIVE_HOVER_DWELL), None);
-        }
-        let mut greeting = LiveGreeting::default();
-        greeting.update(Duration::ZERO, true, true, base);
-        assert_eq!(greeting.update(LIVE_HOVER_DWELL, true, false, base), base);
-        assert_eq!(greeting.next_wake(LIVE_HOVER_DWELL), None);
     }
 
     #[test]
@@ -3062,6 +2845,355 @@ mod tests {
         assert!(panel.contains("self.organism_preview.close();"));
     }
 
+    fn attention_input(inside: bool, eligible: bool) -> LiveAttentionInput {
+        LiveAttentionInput {
+            base_context: PreviewPose::Calm.context(),
+            hard_eligible: eligible,
+            hover_available: true,
+            pointer_inside: inside,
+        }
+    }
+
+    fn host_attention_snapshot(host: &OrganismHost, now: Duration) -> LiveAttentionSnapshot {
+        host.attention
+            .snapshot(
+                now,
+                host.owner.as_ref().unwrap(),
+                attention_input(host.pointer_inside, true),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn native_attention_layout_sync_does_not_manufacture_an_entry() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let mut inside = false;
+        let rect = host_rect(96.0, 24.0);
+        let now = Duration::from_secs(10);
+        let layout = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(true, true),
+            rect,
+            &[],
+        )
+        .unwrap();
+        assert!(inside);
+        assert!(layout.entry.is_none());
+        assert!(layout.candidate.is_none());
+        let entered = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(true, true),
+            rect,
+            &[
+                egui::Event::PointerMoved(egui::pos2(120.0, 12.0)),
+                egui::Event::PointerMoved(egui::pos2(12.0, 12.0)),
+            ],
+        )
+        .unwrap();
+        assert!(entered.candidate_visible);
+        assert_eq!(
+            entered.next_deadline(),
+            Some(now + LiveAttention::<String>::DWELL)
+        );
+    }
+
+    #[test]
+    fn native_attention_preserves_same_frame_leave_and_reentry_order() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let mut inside = false;
+        let rect = host_rect(96.0, 24.0);
+        let now = Duration::from_secs(10);
+        let first = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(true, true),
+            rect,
+            &[egui::Event::PointerMoved(egui::pos2(12.0, 12.0))],
+        )
+        .unwrap();
+        let second = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(true, true),
+            rect,
+            &[
+                egui::Event::PointerGone,
+                egui::Event::PointerMoved(egui::pos2(12.0, 12.0)),
+            ],
+        )
+        .unwrap();
+        assert_ne!(first.entry, second.entry);
+        assert!(second.candidate_visible);
+        assert!(inside);
+    }
+
+    #[test]
+    fn native_attention_discard_pass_does_not_replay_pointer_edges() {
+        let ctx = egui::Context::default();
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let mut inside = false;
+        let rect = host_rect(96.0, 24.0);
+        let mut snapshots = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(host_rect(320.0, 240.0)),
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(12.0, 12.0)),
+                    egui::Event::PointerMoved(egui::pos2(120.0, 12.0)),
+                    egui::Event::PointerMoved(egui::pos2(12.0, 12.0)),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let events = ui.input(|input| input.events.clone());
+                let now =
+                    Duration::from_secs(10) + Duration::from_millis(snapshots.len() as u64 * 100);
+                let snapshot = observe_live_attention(
+                    &mut attention,
+                    &mut inside,
+                    now,
+                    &owner,
+                    attention_input(true, true),
+                    rect,
+                    &events,
+                )
+                .unwrap();
+                if snapshots.is_empty() {
+                    assert_eq!(events.len(), 3);
+                    ui.ctx().request_discard("verify native event retirement");
+                } else {
+                    assert!(events.is_empty());
+                }
+                snapshots.push(snapshot);
+            },
+        );
+        // CPU-only input fixture deliberately does not render generated output.
+        output.textures_delta.clear();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots[0].candidate_visible);
+        assert_eq!(snapshots[0].entry, snapshots[1].entry);
+        assert_eq!(snapshots[0].next_deadline(), snapshots[1].next_deadline());
+    }
+
+    #[test]
+    fn native_attention_retreat_releases_real_leave_without_rearming() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let mut inside = false;
+        let rect = host_rect(96.0, 24.0);
+        let now = Duration::from_secs(10);
+        observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(true, true),
+            rect,
+            &[egui::Event::PointerMoved(egui::pos2(12.0, 12.0))],
+        )
+        .unwrap();
+        let left = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(false, false),
+            rect,
+            &[egui::Event::PointerGone],
+        )
+        .unwrap();
+        assert!(left.entry.is_none());
+        let suppressed = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            attention_input(true, false),
+            rect,
+            &[egui::Event::PointerMoved(egui::pos2(12.0, 12.0))],
+        )
+        .unwrap();
+        assert!(suppressed.entry.is_some());
+        assert!(suppressed.candidate.is_none());
+        let restored = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now + Duration::from_secs(1),
+            &owner,
+            attention_input(true, true),
+            rect,
+            &[],
+        )
+        .unwrap();
+        assert!(restored.candidate.is_none());
+        assert!(restored.active.is_none());
+    }
+
+    #[test]
+    fn native_attention_stale_owner_cannot_replace_pointer_facts() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let mut inside = true;
+        let offer = attention.entry_offer();
+        assert!(observe_live_attention(
+            &mut attention,
+            &mut inside,
+            Duration::from_secs(10),
+            &String::from("old"),
+            attention_input(false, false),
+            host_rect(96.0, 24.0),
+            &[egui::Event::PointerGone]
+        )
+        .is_none());
+        assert!(inside);
+        assert_eq!(attention.owner(), Some(&owner));
+        assert_eq!(attention.entry_offer(), offer);
+    }
+
+    #[test]
+    fn shared_attention_snapshot_drives_final_host_deadline() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let now = Duration::from_secs(90);
+        let input = attention_input(false, true);
+        let accepted = attention
+            .advance(now, &owner, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        assert!(accepted.active.is_some());
+        let full = PresentationPolicy {
+            motion: Some(OrganismMotion::Full),
+            ..static_policy()
+        };
+        assert_eq!(
+            next_live_wake(full, now, now, true, Some(accepted)),
+            Some(Duration::from_millis(100))
+        );
+        let calm = PresentationPolicy {
+            motion: Some(OrganismMotion::Calm),
+            ..full
+        };
+        assert_eq!(
+            next_live_wake(calm, now, now, true, Some(accepted)),
+            Some(Duration::from_millis(900))
+        );
+        let expiry = accepted.active.unwrap().deadline;
+        assert_eq!(
+            next_live_wake(
+                full,
+                expiry - Duration::from_millis(1),
+                now,
+                true,
+                Some(accepted)
+            ),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            next_live_wake(full, expiry, now, true, Some(accepted)),
+            Some(Duration::from_millis(1))
+        );
+        let expired = attention
+            .advance(expiry, &owner, input, LiveAttentionEvent::Reconcile)
+            .unwrap();
+        assert!(expired.active.is_none());
+        assert_eq!(
+            next_live_wake(full, expiry, now, true, Some(expired)),
+            Some(Duration::from_millis(900))
+        );
+    }
+
+    #[test]
+    fn shared_attention_motion_changes_keep_the_original_deadline() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let now = Duration::from_secs(10);
+        let full = PresentationPolicy {
+            motion: Some(OrganismMotion::Full),
+            ..static_policy()
+        };
+        let calm = PresentationPolicy {
+            motion: Some(OrganismMotion::Calm),
+            ..full
+        };
+        let mut input = attention_input(false, live_greeting_allowed(full, now, false, false));
+        let accepted = attention
+            .advance(now, &owner, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        input.hard_eligible = live_greeting_allowed(calm, now, false, false);
+        let continued = attention
+            .advance(
+                now + Duration::from_millis(500),
+                &owner,
+                input,
+                LiveAttentionEvent::Reconcile,
+            )
+            .unwrap();
+        assert_eq!(accepted.active, continued.active);
+        input.hard_eligible = live_greeting_allowed(static_policy(), now, false, false);
+        let cancelled = attention
+            .advance(
+                now + Duration::from_millis(600),
+                &owner,
+                input,
+                LiveAttentionEvent::Reconcile,
+            )
+            .unwrap();
+        assert!(cancelled.active.is_none());
+        input.hard_eligible = live_greeting_allowed(full, now, false, false);
+        let rejected = attention
+            .advance(
+                now + Duration::from_secs(1),
+                &owner,
+                input,
+                LiveAttentionEvent::Explicit,
+            )
+            .unwrap();
+        assert_eq!(
+            rejected.outcome,
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
+        );
+    }
+
+    #[test]
+    fn shared_attention_adapter_has_one_policy_owner_and_snapshot() {
+        let source = include_str!("organism_ui.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains("attention: LiveAttention<String>"));
+        assert!(!source.contains("struct LiveGreeting"));
+        let draw = source
+            .split("pub fn draw(")
+            .nth(1)
+            .unwrap()
+            .split("impl crate::app::TermApp")
+            .next()
+            .unwrap();
+        assert!(draw.contains("observe_live_attention("));
+        assert!(draw.contains("snapshot.candidate_visible"));
+        assert!(draw.contains("snapshot.presentation"));
+        assert!(draw.contains("self.born.elapsed()"));
+    }
+
     fn host_rect(width: f32, height: f32) -> egui::Rect {
         egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height))
     }
@@ -3110,23 +3242,26 @@ mod tests {
         assert!(!host.presentable);
         assert!(host.owner.is_none());
         assert!(host.pending.is_none());
-        assert!(host.greeting.greeting_until.is_none());
-        assert!(!host.greeting.explicit);
+        assert!(
+            host.attention.owner().is_none()
+                || host_attention_snapshot(&host, now).active.is_none()
+        );
+        assert!(host.attention.owner().is_none());
         let hidden = PresentationPolicy {
             focused_owner: host.presentable && host.owner.is_some(),
             motion: config.ascii_organism_motion,
             ..static_policy()
         };
-        assert_eq!(
-            next_live_wake(hidden, now, now, false, &host.greeting),
-            None
-        );
+        assert_eq!(next_live_wake(hidden, now, now, false, None), None);
         assert_eq!(format!("{:?}", host.life.state()), life);
         host.set_available_geometry(rect, rect);
         host.acquire(Some("local"), Some((9, true)), false);
         assert!(host.quarantine_batch);
         assert!(host.pending.is_none());
-        assert!(host.greeting.greeting_until.is_none());
+        assert!(
+            host.attention.owner().is_none()
+                || host_attention_snapshot(&host, now).active.is_none()
+        );
         assert!(host.request_hello_at(now, Some("local"), &config).is_err());
         assert_eq!(format!("{:?}", host.life.state()), life);
     }
@@ -3595,124 +3730,6 @@ mod tests {
             motion: Some(OrganismMotion::Static),
             last_input: None,
         }
-    }
-
-    #[test]
-    fn dormant_full_hello_uses_frames_only_during_accepted_hold() {
-        let now = Duration::from_secs(60);
-        let full = PresentationPolicy {
-            motion: Some(OrganismMotion::Full),
-            ..static_policy()
-        };
-        let mut greeting = LiveGreeting::default();
-        assert_eq!(
-            next_live_wake(full, now, now, true, &greeting),
-            Some(Duration::from_millis(900))
-        );
-        assert!(greeting.request_explicit(now, PreviewPose::Calm.context()));
-        assert_eq!(
-            next_live_wake(full, now, now, true, &greeting),
-            Some(Duration::from_millis(100))
-        );
-        let almost_done = now + GentleInteraction::HOLD - Duration::from_millis(1);
-        assert_eq!(
-            next_live_wake(full, almost_done, now, true, &greeting),
-            Some(Duration::from_millis(1))
-        );
-        let done = now + GentleInteraction::HOLD;
-        assert_eq!(
-            next_live_wake(full, done, now, true, &greeting),
-            Some(Duration::from_millis(900))
-        );
-        greeting.update(done, false, true, PreviewPose::Calm.context());
-        assert!(!greeting.request_explicit(done, PreviewPose::Calm.context()));
-        assert_eq!(
-            next_live_wake(full, done, now, true, &greeting),
-            Some(Duration::from_millis(900))
-        );
-    }
-
-    #[test]
-    fn hover_candidate_keeps_deadline_then_acceptance_restores_full_frames() {
-        let now = Duration::from_secs(60);
-        let full = PresentationPolicy {
-            motion: Some(OrganismMotion::Full),
-            ..static_policy()
-        };
-        let mut greeting = LiveGreeting::default();
-        greeting.update(now, true, true, PreviewPose::Calm.context());
-        assert!(greeting.pending(now));
-        assert_eq!(
-            next_live_wake(full, now, now, true, &greeting),
-            Some(LIVE_HOVER_DWELL)
-        );
-        let accepted = now + LIVE_HOVER_DWELL;
-        greeting.update(accepted, true, true, PreviewPose::Calm.context());
-        assert!(!greeting.pending(accepted));
-        assert_eq!(
-            next_live_wake(full, accepted, now, true, &greeting),
-            Some(Duration::from_millis(100))
-        );
-        greeting.cancel();
-        assert_eq!(
-            next_live_wake(full, accepted, now, true, &greeting),
-            Some(Duration::from_millis(900))
-        );
-    }
-
-    #[test]
-    fn greeting_cadence_preserves_motion_retreat_and_owner_gates() {
-        let now = Duration::from_secs(60);
-        let mut greeting = LiveGreeting::default();
-        assert!(greeting.request_explicit(now, PreviewPose::Calm.context()));
-        let calm = PresentationPolicy {
-            motion: Some(OrganismMotion::Calm),
-            ..static_policy()
-        };
-        assert_eq!(
-            next_live_wake(calm, now, now, true, &greeting),
-            Some(Duration::from_millis(900))
-        );
-        // Static and input/owner suppression cancel attention before scheduling.
-        greeting.cancel();
-        assert_eq!(
-            next_live_wake(static_policy(), now, now, true, &greeting),
-            None
-        );
-        let retreat = PresentationPolicy {
-            motion: Some(OrganismMotion::Full),
-            last_input: Some(now),
-            ..static_policy()
-        };
-        assert_eq!(
-            next_live_wake(retreat, now, now, true, &greeting),
-            Some(Duration::from_millis(900))
-        );
-        assert_eq!(
-            next_live_wake(
-                PresentationPolicy {
-                    focused_owner: false,
-                    ..retreat
-                },
-                now,
-                now,
-                true,
-                &greeting,
-            ),
-            None
-        );
-        let source = include_str!("organism_ui.rs");
-        let draw = source
-            .split("pub fn draw(&mut self, ui:")
-            .nth(1)
-            .unwrap()
-            .split("struct PendingCommand")
-            .next()
-            .unwrap();
-        assert!(
-            draw.find("self.greeting.update(now").unwrap()
-                < draw.find("let next = next_live_wake(").unwrap()
-        );
     }
 
     #[test]
