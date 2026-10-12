@@ -2568,6 +2568,7 @@ impl TerminalApp {
             jsh_notice: jsh_ui::JshNotice::default(),
             config: cfg.clone(),
             config_save_pending: false,
+            config_save_retry: Default::default(),
             config_save_deadline: std::time::Instant::now(),
             session_save_pending: !session_persistence_blocked,
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),

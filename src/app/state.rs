@@ -372,6 +372,7 @@ pub struct TerminalApp {
     // Config system
     pub config: config::Config,
     pub config_save_pending: bool,
+    pub config_save_retry: super::window::ConfigSaveRetry,
     pub config_save_deadline: std::time::Instant,
 
     // Session persistence

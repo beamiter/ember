@@ -2077,7 +2077,7 @@ mod tests {
             .split_once("config_panel::ConfigAction::ResetToDefaults => {")
             .unwrap()
             .0;
-        assert!(save.contains("let save_result = self.config.save();"));
+        assert!(save.contains("let save_result = self.save_config_now();"));
         assert!(save.contains("let saved = save_result.is_ok();"));
         assert!(save.contains("match save_result"));
         assert!(save.contains("self.config_panel.finish_save(&self.config, saved)"));

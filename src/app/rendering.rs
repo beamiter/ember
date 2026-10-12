@@ -3793,7 +3793,7 @@ impl TerminalApp {
                     // Apply runtime changes (fonts, GPU, renderer)
                     self.apply_runtime_config(ctx);
                     // Save to file
-                    let save_result = self.config.save();
+                    let save_result = self.save_config_now();
                     let saved = save_result.is_ok();
                     match save_result {
                         Ok(()) => {
@@ -4507,7 +4507,7 @@ impl TerminalApp {
         // 取消粘贴时也尊重选择,符合"我不想再被打扰"的语义。
         if dont_ask_again && self.config.paste_confirm {
             self.config.paste_confirm = false;
-            match self.config.save() {
+            match self.save_config_now() {
                 Ok(()) => {}
                 Err(error) => {
                     eprintln!(

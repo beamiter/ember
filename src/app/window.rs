@@ -8,6 +8,34 @@ use crate::session_persistence;
 // retain more title than this function is ever willing to display.
 use crate::terminal::MAX_WINDOW_TITLE_CHARS;
 
+/// Retry bookkeeping is separate from dirty state: pausing a deterministic
+/// failure must not make hot reload or Drop forget unsaved local preferences.
+#[derive(Default)]
+pub struct ConfigSaveRetry {
+    failures: u8,
+    paused: bool,
+}
+
+impl ConfigSaveRetry {
+    fn failed(&mut self, error: &(dyn std::error::Error + 'static)) -> Option<std::time::Duration> {
+        let retryable = error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            !matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::FileTooLarge
+                    | std::io::ErrorKind::Unsupported
+            )
+        });
+        let delay = std::time::Duration::from_millis(500u64 << self.failures.min(6))
+            .min(std::time::Duration::from_secs(30));
+        self.failures = self.failures.saturating_add(1);
+        self.paused = !retryable;
+        retryable.then_some(delay)
+    }
+}
+
 /// Parser diagnostics include source lines and may be much larger than status
 /// chrome, or contain untrusted display controls from the config file.
 fn config_hot_reload_error_status(error: &str) -> String {
@@ -154,24 +182,65 @@ impl TerminalApp {
     // 配置保存相关方法
     pub fn schedule_config_save(&mut self) {
         self.config_save_pending = true;
+        self.config_save_retry = ConfigSaveRetry::default();
         self.config_save_deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(500);
     }
 
+    /// Save once, preserving dirty state on ordinary failures. Config::save
+    /// alone decides whether bytes were published or an exact-revision CAS
+    /// conflicted; do not infer either from an error message.
+    pub(crate) fn save_config_now(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.config_save_retry = ConfigSaveRetry::default();
+        self.save_config_now_at(std::time::Instant::now())
+    }
+
+    fn save_config_now_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let result = self.config.save();
+        match &result {
+            Ok(()) => {
+                self.config_save_pending = false;
+                self.config_save_retry = ConfigSaveRetry::default();
+            }
+            Err(_) if self.config.load_error.is_some() => {
+                // Preserve the existing CAS/unparsable-file recovery policy:
+                // stop automatic writes; a later external edit can reload.
+                self.config_save_pending = false;
+                self.config_save_retry = ConfigSaveRetry::default();
+            }
+            Err(error) => {
+                self.config_save_pending = true;
+                if let Some(delay) = self.config_save_retry.failed(error.as_ref()) {
+                    self.config_save_deadline = now + delay;
+                }
+            }
+        }
+        result
+    }
+
     pub fn flush_config_save(&mut self) {
-        if self.config_save_pending && std::time::Instant::now() >= self.config_save_deadline {
-            self.config_save_pending = false;
-            if let Err(e) = self.config.save() {
-                eprintln!("[Config] Failed to save: {}", e);
-                // 只写 stderr 的话,拒写保护生效时用户会以为字号等改动已经落盘,
-                // 直到下次启动才发现全都没了。
-                self.set_status_for(
-                    format!("Config was not saved: {e}"),
-                    std::time::Duration::from_secs(6),
-                );
-            } else {
-                // Config::save adopts the exact bytes it published, so the
-                // hot-reload watcher recognizes this generation immediately.
+        self.flush_config_save_at(std::time::Instant::now());
+    }
+
+    fn flush_config_save_at(&mut self, now: std::time::Instant) {
+        if self.config_save_pending
+            && !self.config_save_retry.paused
+            && now >= self.config_save_deadline
+        {
+            let report_failure = self.config_save_retry.failures == 0;
+            if let Err(e) = self.save_config_now_at(now) {
+                if report_failure {
+                    eprintln!("[Config] Failed to save: {}", e);
+                    // A failure chain gets one notice, not one per repaint or
+                    // retry. An explicit edit starts a new chain.
+                    self.set_status_for(
+                        format!("Config was not saved: {e}"),
+                        std::time::Duration::from_secs(6),
+                    );
+                }
             }
         }
     }
@@ -473,6 +542,49 @@ mod config_hot_reload_status_tests {
 #[cfg(test)]
 mod tests {
     use super::{safe_window_title, sessions_snapshot_for_persistence};
+
+    #[test]
+    fn config_save_retry_backs_off_without_forgetting_failure_chain() {
+        let mut retry = super::ConfigSaveRetry::default();
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        for expected_ms in [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000] {
+            assert_eq!(
+                retry.failed(&error),
+                Some(std::time::Duration::from_millis(expected_ms))
+            );
+            assert!(!retry.paused);
+        }
+        for _ in 0..300 {
+            assert_eq!(
+                retry.failed(&error),
+                Some(std::time::Duration::from_secs(30))
+            );
+        }
+        assert_eq!(retry.failures, u8::MAX);
+    }
+
+    #[test]
+    fn config_save_retry_pauses_deterministic_errors_until_explicit_edit() {
+        for kind in [
+            std::io::ErrorKind::FileTooLarge,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let mut retry = super::ConfigSaveRetry::default();
+            assert_eq!(retry.failed(&std::io::Error::from(kind)), None);
+            assert!(retry.paused);
+            assert_eq!(retry.failures, 1);
+        }
+        let deterministic: Box<dyn std::error::Error> = "serialization failed".into();
+        let mut retry = super::ConfigSaveRetry::default();
+        assert_eq!(retry.failed(deterministic.as_ref()), None);
+        assert!(retry.paused);
+        retry = super::ConfigSaveRetry::default();
+        assert!(!retry.paused);
+        assert_eq!(retry.failures, 0);
+    }
 
     #[test]
     fn empty_or_control_only_osc_title_uses_a_safe_fallback() {
