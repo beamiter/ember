@@ -119,8 +119,8 @@ pub struct Config {
     #[serde(default)]
     pub ascii_organism_enabled: bool,
 
-    /// Explicitly reserve a fixed expanded companion area instead of compact status.
-    #[serde(default)]
+    /// Show the full companion card unless explicitly collapsed.
+    #[serde(default = "default_true")]
     pub ascii_organism_expanded: bool,
 
     /// Missing means Automatic. Until a platform animation-preference adapter
@@ -610,7 +610,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             ascii_organism_enabled: false,
-            ascii_organism_expanded: false,
+            ascii_organism_expanded: true,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
@@ -1414,9 +1414,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expanded_organism_is_opt_in_and_round_trips() {
+    fn expanded_organism_defaults_visible_and_round_trips() {
         let old: Config = toml::from_str("ascii_organism_enabled = true").unwrap();
-        assert!(!old.ascii_organism_expanded);
+        assert!(old.ascii_organism_expanded);
         let expanded: Config = toml::from_str("ascii_organism_expanded = true").unwrap();
         assert!(expanded.ascii_organism_expanded);
         let restored: Config = toml::from_str(&toml::to_string(&expanded).unwrap()).unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
     fn organism_preferences_default_off_and_round_trip_all_motion_modes() {
         let default: Config = toml::from_str("").unwrap();
         assert!(!default.ascii_organism_enabled);
-        assert!(!default.ascii_organism_expanded);
+        assert!(default.ascii_organism_expanded);
         assert_eq!(default.ascii_organism_motion, None);
         for (text, mode) in [
             ("full", OrganismMotion::Full),
@@ -1456,6 +1456,42 @@ mod tests {
                 .unwrap()
                 .contains(&format!("ascii_organism_motion = \"{canonical}\"")));
         }
+    }
+
+    #[test]
+    fn organism_card_legacy_off_and_collapsed_survive_actual_serializers() {
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                let input = format!(
+                    "ascii_organism_enabled = {enabled}\nascii_organism_expanded = {expanded}\n"
+                );
+                let config: Config = toml::from_str(&input).unwrap();
+                let toml_copy: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+                let json_copy: Config =
+                    serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                for copy in [config, toml_copy, json_copy] {
+                    assert_eq!(copy.ascii_organism_enabled, enabled);
+                    assert_eq!(copy.ascii_organism_expanded, expanded);
+                }
+            }
+        }
+        for config in [
+            Config::default(),
+            toml::from_str("").unwrap(),
+            serde_json::from_str("{}").unwrap(),
+        ] {
+            assert!(!config.ascii_organism_enabled);
+            assert!(config.ascii_organism_expanded);
+        }
+        let off: Config = serde_json::from_str(r#"{"ascii_organism_enabled":false}"#).unwrap();
+        assert!(!off.ascii_organism_enabled);
+        assert!(off.ascii_organism_expanded);
+        let collapsed: Config = serde_json::from_str(
+            r#"{"ascii_organism_enabled":true,"ascii_organism_expanded":false}"#,
+        )
+        .unwrap();
+        assert!(collapsed.ascii_organism_enabled);
+        assert!(!collapsed.ascii_organism_expanded);
     }
 
     fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {

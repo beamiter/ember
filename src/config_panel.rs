@@ -760,9 +760,9 @@ impl ConfigPanel {
                 });
         });
         organism_changed |= ui
-            .checkbox(&mut self.edit_organism_expanded, "Expanded companion")
+            .checkbox(&mut self.edit_organism_expanded, "Expanded companion card")
             .changed();
-        ui.small("Reserves a fixed companion area while enabled. Turning ASCII Organism off releases it.");
+        ui.small("Full body and details stay visible while enabled; collapse to a compact strip. Turning ASCII Organism off releases it.");
         ui.label("Local terminal chrome; command cards optional. Memory is volatile.");
         ui.label(organism_motion_explanation(self.edit_organism_motion));
         ui.label(

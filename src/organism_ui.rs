@@ -251,6 +251,119 @@ fn host_height(enabled: bool, expanded: bool) -> f32 {
     }
 }
 
+/// All content is clipped to reserved chrome; controls never overlap the body.
+#[derive(Clone, Copy)]
+struct CompanionLayout {
+    card: egui::Rect,
+    body: egui::Rect,
+    details: egui::Rect,
+    control: egui::Rect,
+}
+
+fn companion_layout(rect: egui::Rect, expanded: bool) -> CompanionLayout {
+    if !rect.is_finite() || !rect.is_positive() {
+        return CompanionLayout {
+            card: egui::Rect::NOTHING,
+            body: egui::Rect::NOTHING,
+            details: egui::Rect::NOTHING,
+            control: egui::Rect::NOTHING,
+        };
+    }
+    let card = rect.shrink2(egui::vec2(
+        0.0,
+        if expanded {
+            4.0_f32.min(rect.height() / 2.0)
+        } else {
+            0.0
+        },
+    ));
+    let inner = card.shrink2(egui::vec2(
+        12.0_f32.min(card.width() / 2.0),
+        if expanded {
+            8.0_f32.min(card.height() / 2.0)
+        } else {
+            0.0
+        },
+    ));
+    let control = egui::Rect::from_min_max(
+        egui::pos2((inner.max.x - 28.0).max(inner.min.x), inner.min.y),
+        inner.max,
+    );
+    let body = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2((inner.min.x + 104.0).min(control.min.x), inner.max.y),
+    );
+    let details = egui::Rect::from_min_max(
+        egui::pos2((body.max.x + 12.0).min(control.min.x), inner.min.y),
+        egui::pos2((control.min.x - 8.0).max(body.max.x), inner.max.y),
+    );
+    CompanionLayout {
+        card,
+        body,
+        details,
+        control,
+    }
+}
+
+fn companion_line(
+    ui: &Ui,
+    rect: egui::Rect,
+    text: impl Into<String>,
+    size: f32,
+    color: egui::Color32,
+) {
+    let clip = rect.intersect(ui.clip_rect());
+    if !clip.is_positive() || rect.width() < 8.0 {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple(
+        text.into(),
+        egui::FontId::proportional(size),
+        color,
+        rect.width(),
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    ui.painter()
+        .with_clip_rect(clip)
+        .galley(rect.min, galley, color);
+}
+
+/// A pointer-only control never requests keyboard focus or sends terminal input.
+fn companion_toggle(ui: &mut Ui, rect: egui::Rect, expanded: bool, interactive: bool) -> bool {
+    let rect = rect.intersect(ui.clip_rect());
+    if !rect.is_positive() {
+        return false;
+    }
+    let interactive = interactive && ui.is_enabled();
+    let sense = if interactive {
+        egui::Sense::CLICK
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, ui.make_persistent_id("ascii_organism_expand"), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            interactive,
+            if expanded {
+                "Collapse ASCII organism"
+            } else {
+                "Expand ASCII organism"
+            },
+        )
+    });
+    ui.painter().with_clip_rect(rect).text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if expanded { "⌄" } else { "⌃" },
+        egui::FontId::proportional(16.0),
+        ui.visuals().weak_text_color(),
+    );
+    interactive && response.clicked()
+}
+
 fn host_text(
     context: RenderContext,
     frame: u64,
@@ -839,7 +952,7 @@ impl OrganismHost {
         self.reaction_until = now + reaction_duration(&reaction);
     }
 
-    pub fn draw(&mut self, ui: &mut Ui, config: &Config, focused: bool) {
+    pub fn draw(&mut self, ui: &mut Ui, config: &Config, focused: bool, interactive: bool) -> bool {
         let now = self.born.elapsed();
         let presentable = self.presentable;
         if !presentable {
@@ -852,7 +965,7 @@ impl OrganismHost {
             .advance(now, eligible, self.running, CircadianPhase::Unlearned);
         if !config.ascii_organism_enabled {
             self.acquire(None, None, false);
-            return;
+            return false;
         }
         let policy = PresentationPolicy {
             enabled: true,
@@ -917,6 +1030,7 @@ impl OrganismHost {
         let greeting_allowed = live_greeting_allowed(policy, now, self.running, buttons_down);
         let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
         let mut attention_snapshot = None;
+        let mut toggle = false;
         // Allocate exactly the same strip while suppressed. Typing, switching
         // panes and alternate screen must not change the terminal's grid size.
         egui::Panel::bottom("ascii_organism_chrome")
@@ -930,20 +1044,30 @@ impl OrganismHost {
                 let rect = ui
                     .available_rect_before_wrap()
                     .shrink2(egui::vec2(8.0, 0.0));
-                // Observe only the bounded glyph footprint. No widget,
-                // click handler, focus request or terminal input is created.
+                // Observe only the bounded left body for greetings. The separate
+                // right control never requests focus or sends terminal input.
                 let expanded = config.ascii_organism_expanded;
-                let status_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, (rect.max.y - 24.0).max(rect.min.y)),
-                    rect.max,
-                );
-                let body_rect =
-                    egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, status_rect.min.y));
-                let target = if expanded { body_rect } else { status_rect };
-                let hover_rect = egui::Rect::from_min_size(
-                    target.min,
-                    egui::vec2(96.0_f32.min(target.width()), target.height()),
-                );
+                let layout = companion_layout(rect, expanded);
+                let body_rect = layout.body;
+                let status_rect = if expanded {
+                    layout.details
+                } else {
+                    egui::Rect::from_min_max(
+                        layout.body.min,
+                        egui::pos2(layout.control.min.x - 8.0, layout.body.max.y),
+                    )
+                };
+                let hover_rect = body_rect;
+                if expanded && layout.card.is_positive() {
+                    ui.painter().with_clip_rect(ui.clip_rect()).rect(
+                        layout.card,
+                        6.0,
+                        ui.visuals().faint_bg_color,
+                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                toggle |= companion_toggle(ui, layout.control, expanded, interactive);
                 let near = pointer.is_some_and(|point| hover_rect.contains(point));
                 if let Some(owner) = self.owner.as_ref() {
                     attention_snapshot = observe_live_attention(
@@ -974,6 +1098,7 @@ impl OrganismHost {
                         }
                     }
                     let (sprite, status) = host_text(display, frame, rect.width(), expanded);
+                    let rect = egui::Rect::from_min_max(layout.body.min, egui::pos2(layout.control.min.x - 8.0, layout.body.max.y));
                     if let Some(response) = live_semantic_response(ui, rect, display) {
                         if live_tooltip_allowed(
                             self.running,
@@ -1000,8 +1125,8 @@ impl OrganismHost {
                                 sprite_frame_with_context(plan.context, plan.frame)
                             });
                             let text_rect = ui.painter().with_clip_rect(clip).text(
-                                body_rect.left_center(),
-                                egui::Align2::LEFT_CENTER,
+                                body_rect.min,
+                                egui::Align2::LEFT_TOP,
                                 sprite,
                                 egui::FontId::monospace(14.0),
                                 ui.visuals().text_color(),
@@ -1015,13 +1140,100 @@ impl OrganismHost {
                             }
                         }
                     }
-                    ui.painter().with_clip_rect(status_rect).text(
-                        status_rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        status,
-                        egui::TextStyle::Monospace.resolve(ui.style()),
-                        ui.visuals().text_color(),
-                    );
+                    if expanded {
+                        let row = |offset: f32, height: f32| {
+                            egui::Rect::from_min_size(
+                                status_rect.min + egui::vec2(0.0, offset),
+                                egui::vec2(status_rect.width(), height),
+                            )
+                            .intersect(status_rect)
+                        };
+                        companion_line(
+                            ui,
+                            row(0.0, 20.0),
+                            "ASCII organism",
+                            14.0,
+                            ui.visuals().strong_text_color(),
+                        );
+                        companion_line(
+                            ui,
+                            row(24.0, 20.0),
+                            live_behavior_explanation(display).into_owned(),
+                            12.0,
+                            ui.visuals().text_color(),
+                        );
+                        companion_line(
+                            ui,
+                            row(48.0, 16.0),
+                            "Volatile memory · no LLM",
+                            11.0,
+                            ui.visuals().weak_text_color(),
+                        );
+                    } else {
+                        ui.painter()
+                            .with_clip_rect(status_rect.intersect(ui.clip_rect()))
+                            .text(
+                                status_rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                status,
+                                egui::TextStyle::Monospace.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            );
+                    }
+                } else {
+                    // Paint-only companion: never an owner, idle fact or greeting.
+                    // It does not consult physiology or start a new repaint timer.
+                    let semantic_rect = egui::Rect::from_min_max(layout.body.min, egui::pos2(layout.control.min.x - 8.0, layout.body.max.y));
+                    if let Some(rect) = live_semantic_rect(semantic_rect, ui.clip_rect()) {
+                        let response = ui.interact(rect, ui.make_persistent_id("ascii_organism_passive_semantics"), egui::Sense::hover());
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, false, "ASCII organism. Quietly here. Live reactions are paused. Memory is volatile."));
+                    }
+                    let context = PreviewPose::Calm.context();
+                    let text = if expanded {
+                        sprite_frame_with_context(context, 0)
+                    } else {
+                        sticky_glyph_with_context(context, 0)
+                    };
+                    let clip = body_rect.intersect(ui.clip_rect());
+                    if clip.is_positive() {
+                        ui.painter().with_clip_rect(clip).text(
+                            if expanded { body_rect.min } else { body_rect.left_center() },
+                            if expanded { egui::Align2::LEFT_TOP } else { egui::Align2::LEFT_CENTER },
+                            text,
+                            egui::FontId::monospace(14.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
+                    if expanded {
+                        let row = |offset: f32, height: f32| {
+                            egui::Rect::from_min_size(
+                                status_rect.min + egui::vec2(0.0, offset),
+                                egui::vec2(status_rect.width(), height),
+                            )
+                            .intersect(status_rect)
+                        };
+                        companion_line(
+                            ui,
+                            row(0.0, 20.0),
+                            "ASCII organism",
+                            14.0,
+                            ui.visuals().strong_text_color(),
+                        );
+                        companion_line(
+                            ui,
+                            row(24.0, 20.0),
+                            "Quietly here. Live reactions are paused.",
+                            12.0,
+                            ui.visuals().text_color(),
+                        );
+                        companion_line(
+                            ui,
+                            row(48.0, 16.0),
+                            "Volatile memory · no LLM",
+                            11.0,
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
                 }
             });
         let next = next_live_wake(
@@ -1034,6 +1246,7 @@ impl OrganismHost {
         if let Some(delay) = next {
             ui.ctx().request_repaint_after(delay);
         }
+        toggle
     }
 }
 
@@ -1205,7 +1418,16 @@ impl crate::TerminalApp {
         let focused = ui
             .ctx()
             .input(|input| input.viewport().focused.unwrap_or(false));
-        self.organism.draw(ui, &self.config, focused);
+        let interactive = focused
+            && !self.terminal_input_blocked(ui.ctx())
+            && !self.active_terminal_is_read_only();
+        if self.organism.draw(ui, &self.config, focused, interactive) {
+            self.config.ascii_organism_expanded = !self.config.ascii_organism_expanded;
+            self.config_panel.sync_from_config(&self.config);
+            self.force_resize_session = true;
+            self.schedule_config_save();
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -1745,6 +1967,377 @@ mod tests {
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
 
+    fn companion_sprite_samples() -> std::collections::BTreeSet<String> {
+        use jterm_core::organism::{
+            Behavior, BodyLanguage, RenderContext, VisualGrowthStage, VisualTransition, WatchRhythm,
+        };
+        let behaviors = [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ];
+        let mut samples = std::collections::BTreeSet::new();
+        let mut check = |context, frame| {
+            let sprite = sprite_frame_with_context(context, frame);
+            samples.insert(sprite.into_owned());
+        };
+        for behavior in behaviors {
+            for bits in 0..8 {
+                let language = BodyLanguage {
+                    drowsy: bits & 1 != 0,
+                    tense: bits & 2 != 0,
+                    listless: bits & 4 != 0,
+                };
+                for walking in [false, true] {
+                    for rhythm in [
+                        WatchRhythm::Steady,
+                        WatchRhythm::Busy,
+                        WatchRhythm::Waiting,
+                        WatchRhythm::Resumed,
+                    ] {
+                        for stage in [
+                            VisualGrowthStage::Juvenile,
+                            VisualGrowthStage::Adult,
+                            VisualGrowthStage::Seasoned,
+                        ] {
+                            let context = RenderContext::new(behavior, language, walking)
+                                .with_watch_rhythm(rhythm)
+                                .with_growth_stage(stage);
+                            for frame in 0..130 {
+                                check(context, frame);
+                            }
+                        }
+                    }
+                }
+            }
+            for target in behaviors {
+                if let Some(transition) = VisualTransition::between(behavior, target) {
+                    for stage in [
+                        VisualGrowthStage::Juvenile,
+                        VisualGrowthStage::Adult,
+                        VisualGrowthStage::Seasoned,
+                    ] {
+                        let context = RenderContext::new(target, BodyLanguage::default(), false)
+                            .with_growth_stage(stage)
+                            .with_transition(Some(transition));
+                        for frame in 0..transition.frame_count() {
+                            check(context, frame);
+                        }
+                    }
+                }
+            }
+        }
+        samples
+    }
+    #[test]
+    fn companion_every_shared_frame_has_three_rows_and_bounded_columns() {
+        for sprite in companion_sprite_samples() {
+            assert_eq!(sprite.lines().count(), 3);
+            assert!(sprite.lines().all(|line| line.chars().count() <= 12));
+        }
+    }
+
+    #[test]
+    fn companion_actual_galleys_fit_body_and_clip_long_unicode_details() {
+        let samples = companion_sprite_samples();
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(host_rect(640.0, 480.0)),
+                    ..Default::default()
+                },
+                |ui| {
+                    for sprite in &samples {
+                        let galley = ui.painter().layout_no_wrap(
+                            sprite.clone(),
+                            egui::FontId::monospace(14.0),
+                            egui::Color32::WHITE,
+                        );
+                        assert_eq!(galley.rows.len(), 3);
+                        assert!(galley.size().x <= 104.0, "{}: {}", galley.size().x, sprite);
+                        assert!(galley.size().y <= 72.0);
+                    }
+                    let layout = companion_layout(host_rect(360.0, 96.0), true);
+                    let row = egui::Rect::from_min_size(
+                        layout.details.min,
+                        egui::vec2(layout.details.width(), 20.0),
+                    );
+                    companion_line(
+                        ui,
+                        row,
+                        "状态 λ output 活动 🦊 ".repeat(1000),
+                        12.0,
+                        egui::Color32::WHITE,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            let layout = companion_layout(host_rect(360.0, 96.0), true);
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((shape.clip_rect, text)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(text.1.galley.rows.len(), 1);
+            assert!(layout.details.contains_rect(text.0));
+            assert!(!text.0.intersect(layout.control).is_positive());
+            assert!(!text.0.intersect(layout.body).is_positive());
+        }
+    }
+
+    #[test]
+    fn companion_geometry_keeps_body_details_and_control_separate() {
+        for expanded in [false, true] {
+            for width in [1.0, 24.0, 80.0, 120.0, 180.0, 220.0, 360.0, 640.0, 1024.0] {
+                for height in [1.0, 8.0, 24.0, 40.0, 96.0] {
+                    let rect = host_rect(width, height);
+                    let layout = companion_layout(rect, expanded);
+                    for part in [layout.card, layout.body, layout.details, layout.control] {
+                        assert!(part.is_finite());
+                        if part.is_positive() {
+                            assert!(rect.contains_rect(part));
+                        }
+                    }
+                    assert!(!layout.body.intersect(layout.control).is_positive());
+                    assert!(!layout.details.intersect(layout.control).is_positive());
+                    assert!(!layout.body.intersect(layout.details).is_positive());
+                }
+            }
+        }
+        for rect in [
+            host_rect(0.0, 96.0),
+            host_rect(640.0, 0.0),
+            host_rect(0.0, 0.0),
+        ] {
+            let layout = companion_layout(rect, true);
+            for part in [layout.card, layout.body, layout.details, layout.control] {
+                assert!(!part.is_positive());
+            }
+        }
+        let layout = companion_layout(host_rect(640.0, 96.0), true);
+        assert_eq!(layout.body.width(), 104.0);
+        assert_eq!(layout.details.min.x - layout.body.max.x, 12.0);
+        assert_eq!(layout.body.height(), 72.0);
+    }
+
+    #[test]
+    fn companion_toggle_is_pointer_only_and_excludes_terminal_on_resize_frame() {
+        for interactive in [false, true] {
+            let ctx = egui::Context::default();
+            let mut expanded = true;
+            let mut point = egui::Pos2::ZERO;
+            let mut previous_terminal = egui::Rect::NOTHING;
+            let mut clicks = 0;
+            for frame in 0..4 {
+                let events = match frame {
+                    1 => vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    2 => vec![egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    _ => vec![],
+                };
+                if matches!(frame, 1 | 2) {
+                    assert!(!previous_terminal.contains(point));
+                }
+                let mut discarded = false;
+                let mut passes = 0;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(host_rect(640.0, 480.0)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        passes += 1;
+                        let has_edge = ui.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .any(|event| matches!(event, egui::Event::PointerButton { .. }))
+                        });
+                        if frame == 2 && discarded {
+                            assert!(!has_edge);
+                            assert!(!ui.input(|input| input.pointer.any_released()));
+                        }
+                        let mut toggle = false;
+                        egui::Panel::bottom("card_test")
+                            .exact_size(host_height(true, expanded))
+                            .resizable(false)
+                            .frame(egui::Frame::NONE.inner_margin(0.0))
+                            .show(ui, |ui| {
+                                let layout = companion_layout(
+                                    ui.available_rect_before_wrap()
+                                        .shrink2(egui::vec2(8.0, 0.0)),
+                                    expanded,
+                                );
+                                if frame == 0 {
+                                    point = layout.control.center();
+                                }
+                                assert!(!layout.body.contains(point));
+                                toggle =
+                                    companion_toggle(ui, layout.control, expanded, interactive);
+                                let id = ui.make_persistent_id("ascii_organism_expand");
+                                let response = ui.ctx().read_response(id).unwrap();
+                                assert!(!response.sense.is_focusable());
+                                assert!(!response.has_focus());
+                            });
+                        let terminal = ui.available_rect_before_wrap();
+                        if has_edge {
+                            assert!(!terminal.contains(point));
+                        }
+                        if toggle {
+                            clicks += 1;
+                            expanded = !expanded;
+                        }
+                        previous_terminal = terminal;
+                        if frame == 2 && !discarded {
+                            discarded = true;
+                            ui.ctx().request_discard(
+                                "verify collapse release is not replayed after layout",
+                            );
+                        }
+                    },
+                );
+                output.textures_delta.clear();
+                if frame == 2 {
+                    assert!(passes >= 2);
+                }
+            }
+            assert_eq!(clicks, usize::from(interactive));
+            assert_eq!(expanded, !interactive);
+        }
+    }
+
+    #[test]
+    fn companion_fallback_paints_without_owner_or_new_activity_in_every_motion_mode() {
+        for motion in [
+            Some(OrganismMotion::Full),
+            Some(OrganismMotion::Calm),
+            Some(OrganismMotion::Static),
+            None,
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut host = OrganismHost::default();
+            let config = Config {
+                ascii_organism_enabled: true,
+                ascii_organism_expanded: true,
+                ascii_organism_motion: motion,
+                ..Config::default()
+            };
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(host_rect(640.0, 480.0)),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(!host.draw(ui, &config, false, false));
+                    },
+                );
+                output.textures_delta.clear();
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "ASCII organism")));
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Quietly here. Live reactions are paused.")));
+                let accessible = output.platform_output.accesskit_update.as_ref().unwrap();
+                assert!(accessible.nodes.iter().any(|(_, node)| node.role()
+                    == egui::accesskit::Role::Label
+                    && node
+                        .value()
+                        .is_some_and(|value| value.contains("Live reactions are paused"))));
+                assert!(host.owner.is_none());
+                assert_eq!(host.activity, LiveActivityKnowledge::Unknown);
+                assert!(host.attention.owner().is_none());
+                assert!(host.bridge.active.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn companion_is_shared_chrome_before_both_terminal_views_and_preserves_input_bounds() {
+        let main = include_str!("main.rs");
+        let render = main
+            .split("self.render_bottom_bar(root_ui);")
+            .nth(1)
+            .unwrap()
+            .split("self.render_floating_panels(ctx);")
+            .next()
+            .unwrap();
+        assert!(
+            render.find("self.render_organism(root_ui);").unwrap()
+                < render.find("egui::CentralPanel::default()").unwrap()
+        );
+        assert!(!render.contains("block_mode"));
+        let route = main
+            .split("let pointer_routes_to_terminal =")
+            .nth(1)
+            .unwrap()
+            .split("let sequence_reports_to_app")
+            .next()
+            .unwrap();
+        let route: String = route.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(
+            route,
+            "pointer_over_active_terminal||capture_for_route.is_some();"
+        );
+        let bounds = main
+            .split("let pointer_over_active_terminal =")
+            .nth(1)
+            .unwrap()
+            .split("// 获取当前活跃会话")
+            .next()
+            .unwrap();
+        let bounds: String = bounds.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(bounds.contains(".is_some_and(|(pointer,rect)|rect.contains(pointer))"));
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let fallback = production
+            .split("// Paint-only companion:")
+            .nth(1)
+            .unwrap()
+            .split("let next = next_live_wake(")
+            .next()
+            .unwrap();
+        assert!(!fallback.contains("request_repaint"));
+        assert!(!fallback.contains("acquire("));
+        assert!(!fallback.contains("LiveActivityKnowledge::KnownIdle"));
+        let render = production
+            .split("pub(crate) fn render_organism(")
+            .nth(1)
+            .unwrap();
+        assert!(render.contains("self.schedule_config_save();"));
+        assert!(render.contains("!self.terminal_input_blocked(ui.ctx())"));
+    }
+
     #[test]
     fn watch_activity_explanation_matches_final_context_in_both_surfaces() {
         for behavior in [Behavior::WatchCommand, Behavior::WatchSettled] {
@@ -1814,7 +2407,7 @@ mod tests {
         let source = include_str!("organism_ui.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         let draw = production
-            .split("pub fn draw(&mut self, ui:")
+            .split("pub fn draw(")
             .nth(1)
             .unwrap()
             .split("struct PendingCommand")
