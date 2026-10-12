@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "gui"]
 [dependencies]
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "9db447630d7a612c64eb8e3ff29715fa107ebbc8" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e677a6116a29917a9d9abca56b50536de3d715ee" }
 log = "0.4"
 env_logger = "0.11"
 crossbeam-channel = "0.5"

@@ -14,8 +14,8 @@ use jterm_core::organism::{
 };
 use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 use jterm_core::organism_live::{
-    LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
-    LiveAttentionRejection, LiveAttentionSnapshot,
+    LiveActivityKnowledge, LiveAttention, LiveAttentionEvent, LiveAttentionInput,
+    LiveAttentionOutcome, LiveAttentionRejection, LiveAttentionSnapshot,
 };
 
 use crate::config::{Config, OrganismMotion};
@@ -40,6 +40,23 @@ fn host_geometry_presentable(available: egui::Rect, clip: egui::Rect) -> bool {
     }
     let visible = available.intersect(clip);
     visible.is_positive() && host_geometry_allows(visible.width())
+}
+
+/// Evidence only: a dirty draft or uncertain submission is not a running job.
+fn live_activity_knowledge(
+    running: bool,
+    clean_prompt: bool,
+    pending_input: bool,
+    input_barrier: bool,
+    agent_uncertain: bool,
+) -> LiveActivityKnowledge {
+    if running {
+        LiveActivityKnowledge::Busy
+    } else if clean_prompt && !pending_input && !input_barrier && !agent_uncertain {
+        LiveActivityKnowledge::KnownIdle
+    } else {
+        LiveActivityKnowledge::Unknown
+    }
 }
 
 /// Native pointer observation only; all dwell, hold, cooldown and source policy
@@ -473,6 +490,7 @@ pub struct OrganismHost {
     cursor: Option<(u64, bool)>,
     quarantine_batch: bool,
     running: bool,
+    activity: LiveActivityKnowledge,
     pending: Option<PendingCommand>,
     work_context: Option<String>,
     remote_checked: Option<(String, Instant, bool)>,
@@ -499,6 +517,7 @@ impl Default for OrganismHost {
             cursor: None,
             quarantine_batch: false,
             running: false,
+            activity: LiveActivityKnowledge::Unknown,
             pending: None,
             work_context: None,
             remote_checked: None,
@@ -540,6 +559,11 @@ impl OrganismHost {
             .flatten();
         if self.owner.as_deref() == owner {
             self.running = owner.is_some() && running;
+            if self.running {
+                self.activity = LiveActivityKnowledge::Busy;
+            } else if self.activity == LiveActivityKnowledge::Busy {
+                self.activity = LiveActivityKnowledge::Unknown;
+            }
             self.watch.observe_running(now, generation);
             return;
         }
@@ -553,6 +577,11 @@ impl OrganismHost {
         self.cursor = tail;
         self.quarantine_batch = owner.is_some();
         self.running = owner.is_some() && running;
+        self.activity = if self.running {
+            LiveActivityKnowledge::Busy
+        } else {
+            LiveActivityKnowledge::Unknown
+        };
         self.pending = None;
         self.work_context = None;
         self.native = NativeOrganism::from_persisted_state(self.life.state());
@@ -621,6 +650,7 @@ impl OrganismHost {
             .ok_or("ASCII Organism is unavailable for the original terminal")?;
         let input = LiveAttentionInput {
             base_context: self.context,
+            activity: self.activity,
             hard_eligible: true,
             hover_available: self.presentable,
             pointer_inside: self.pointer_inside,
@@ -645,6 +675,11 @@ impl OrganismHost {
         if self.owner.as_deref() == Some(session) {
             let now = self.born.elapsed();
             self.cancel_attention();
+            self.activity = if self.running {
+                LiveActivityKnowledge::Busy
+            } else {
+                LiveActivityKnowledge::Unknown
+            };
             self.watch.reset();
             self.bridge.reset();
             self.last_input = Some(now);
@@ -676,6 +711,13 @@ impl OrganismHost {
             record.state == crate::terminal::CommandState::Running && record.start_mark_seen
         });
         self.running = running;
+        // This parsed batch may have changed the prompt. Re-establish clean
+        // idle evidence in prepare; lack of a Running record is insufficient.
+        self.activity = if running {
+            LiveActivityKnowledge::Busy
+        } else {
+            LiveActivityKnowledge::Unknown
+        };
         let generation = running
             .then(|| records.back().map(|record| record.sequence))
             .flatten();
@@ -911,6 +953,7 @@ impl OrganismHost {
                         owner,
                         LiveAttentionInput {
                             base_context: context,
+                            activity: self.activity,
                             hard_eligible: greeting_allowed,
                             hover_available: hover_rect.intersect(ui.clip_rect()).is_positive(),
                             pointer_inside: near,
@@ -1122,18 +1165,32 @@ impl crate::TerminalApp {
         if cached.is_none() {
             self.organism.remote_checked = Some((id.clone(), now, local));
         }
+        let input_barrier = self.direct_input_is_blocked_for_session(id);
+        let agent_uncertain = self.agent_panel.session_active()
+            && self.agent_panel.bound_session_id() == Some(id.as_str());
         let terminal = session.terminal.lock();
         let allowed = local && !terminal.is_alt_buffer_active();
+        let running = terminal.command_records().back().is_some_and(|record| {
+            record.state == crate::terminal::CommandState::Running && record.start_mark_seen
+        });
+        let activity = live_activity_knowledge(
+            running,
+            !running && terminal.prompt_input_is_empty(),
+            !session.pending_input.is_empty(),
+            input_barrier,
+            agent_uncertain,
+        );
         self.organism.acquire(
             allowed.then_some(id.as_str()),
             terminal
                 .command_records()
                 .back()
                 .map(|record| (record.sequence, record.start_mark_seen)),
-            terminal.command_records().back().is_some_and(|record| {
-                record.state == crate::terminal::CommandState::Running && record.start_mark_seen
-            }),
+            running,
         );
+        if allowed {
+            self.organism.activity = activity;
+        }
     }
 
     pub(crate) fn render_organism(&mut self, ui: &mut Ui) {
@@ -2848,6 +2905,7 @@ mod tests {
     fn attention_input(inside: bool, eligible: bool) -> LiveAttentionInput {
         LiveAttentionInput {
             base_context: PreviewPose::Calm.context(),
+            activity: LiveActivityKnowledge::KnownIdle,
             hard_eligible: eligible,
             hover_available: true,
             pointer_inside: inside,
@@ -2862,6 +2920,171 @@ mod tests {
                 attention_input(host.pointer_inside, true),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn native_activity_requires_positive_clean_prompt_evidence() {
+        use LiveActivityKnowledge::{Busy, KnownIdle, Unknown};
+        assert_eq!(
+            live_activity_knowledge(false, true, false, false, false),
+            KnownIdle
+        );
+        // Startup/no integration, completed command without a new prompt,
+        // dirty draft and tainted accepted input all lack clean prompt proof.
+        assert_eq!(
+            live_activity_knowledge(false, false, false, false, false),
+            Unknown
+        );
+        for (pending, barrier, agent) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                live_activity_knowledge(false, true, pending, barrier, agent),
+                Unknown
+            );
+            assert_eq!(
+                live_activity_knowledge(true, true, pending, barrier, agent),
+                Busy
+            );
+        }
+        assert_eq!(
+            live_activity_knowledge(true, false, false, false, false),
+            Busy
+        );
+        // Clearing uncertainty with fresh positive evidence does not persist
+        // an Agent/pending-input block or manufacture a running command.
+        assert_eq!(
+            live_activity_knowledge(false, true, false, false, false),
+            KnownIdle
+        );
+    }
+
+    #[test]
+    fn native_activity_maps_real_prompt_evidence_and_delayed_start() {
+        use LiveActivityKnowledge::{Busy, KnownIdle, Unknown};
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        let classify = |terminal: &crate::terminal::TerminalState| {
+            let running = terminal.command_records().back().is_some_and(|record| {
+                record.state == crate::terminal::CommandState::Running && record.start_mark_seen
+            });
+            live_activity_knowledge(
+                running,
+                terminal.prompt_input_is_empty(),
+                false,
+                false,
+                false,
+            )
+        };
+        assert_eq!(classify(&terminal), Unknown);
+        terminal.process_input(b"\x1b]133;A\x07");
+        assert_eq!(classify(&terminal), Unknown);
+        terminal.process_input(b"$ \x1b]133;B\x07");
+        assert_eq!(classify(&terminal), KnownIdle);
+        // Local admission is recorded before echo or the command-start mark.
+        terminal.note_user_input(b"echo hello\r");
+        assert_eq!(classify(&terminal), Unknown);
+        terminal.process_input(b"echo hello");
+        assert_eq!(classify(&terminal), Unknown);
+        terminal.process_input(b"\r\n\x1b]133;C\x07");
+        assert_eq!(classify(&terminal), Busy);
+        terminal.process_input(b"hello\r\n\x1b]133;D;0\x07");
+        assert_eq!(classify(&terminal), Unknown);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(classify(&terminal), KnownIdle);
+    }
+
+    #[test]
+    fn native_activity_unknown_requires_explicit_intent_and_existing_gates() {
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let mut inside = false;
+        let now = Duration::from_secs(10);
+        let mut input = attention_input(true, true);
+        input.activity = live_activity_knowledge(false, false, false, false, false);
+        let pointer = observe_live_attention(
+            &mut attention,
+            &mut inside,
+            now,
+            &owner,
+            input,
+            host_rect(96.0, 24.0),
+            &[egui::Event::PointerMoved(egui::pos2(12.0, 12.0))],
+        )
+        .unwrap();
+        assert!(pointer.candidate.is_none());
+        input.hard_eligible = false;
+        let blocked = attention
+            .advance(now, &owner, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        assert!(blocked.active.is_none());
+        input.hard_eligible = true;
+        let accepted = attention
+            .advance(now, &owner, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        assert!(matches!(
+            accepted.outcome,
+            LiveAttentionOutcome::Accepted(_)
+        ));
+        input.activity = LiveActivityKnowledge::Busy;
+        let busy = attention
+            .advance(now, &owner, input, LiveAttentionEvent::Reconcile)
+            .unwrap();
+        assert!(busy.active.is_none());
+    }
+
+    #[test]
+    fn native_activity_snapshot_is_invalidated_without_a_submission_ledger() {
+        let mut host = OrganismHost::default();
+        assert_eq!(host.activity, LiveActivityKnowledge::Unknown);
+        host.acquire(Some("local"), None, false);
+        host.activity = LiveActivityKnowledge::KnownIdle;
+        host.accepted_input("local");
+        assert_eq!(host.activity, LiveActivityKnowledge::Unknown);
+        // A delayed OSC C has not established Running. A later actual start
+        // is positive Busy; completion without new prompt is Unknown again.
+        host.acquire(Some("local"), Some((7, true)), true);
+        assert_eq!(host.activity, LiveActivityKnowledge::Busy);
+        host.acquire(Some("local"), Some((7, true)), false);
+        assert_eq!(host.activity, LiveActivityKnowledge::Unknown);
+        host.activity = LiveActivityKnowledge::KnownIdle;
+        host.batch("local", &VecDeque::new(), &[], false, false);
+        assert_eq!(host.activity, LiveActivityKnowledge::Unknown);
+        host.activity = LiveActivityKnowledge::KnownIdle;
+        host.acquire(Some("other"), None, false);
+        assert_eq!(host.activity, LiveActivityKnowledge::Unknown);
+    }
+
+    #[test]
+    fn native_activity_uses_existing_facts_in_both_shared_inputs() {
+        let source = include_str!("organism_ui.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let prepare = source
+            .split("pub(crate) fn prepare_organism(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn render_organism(")
+            .next()
+            .unwrap();
+        for fact in [
+            "terminal.prompt_input_is_empty()",
+            "!session.pending_input.is_empty()",
+            "direct_input_is_blocked_for_session(id)",
+            "self.agent_panel.session_active()",
+            "self.agent_panel.bound_session_id() == Some(id.as_str())",
+        ] {
+            assert!(
+                prepare.contains(fact),
+                "missing current native fact: {fact}"
+            );
+        }
+        assert_eq!(source.matches("activity: self.activity,").count(), 2);
+        assert!(!prepare.contains("shell.write("));
+        assert!(!prepare.contains("queue_input("));
     }
 
     #[test]
