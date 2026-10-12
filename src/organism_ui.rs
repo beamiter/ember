@@ -313,6 +313,17 @@ fn companion_line(
     size: f32,
     color: egui::Color32,
 ) {
+    companion_text(ui, rect, text, size, color, 1);
+}
+
+fn companion_text(
+    ui: &Ui,
+    rect: egui::Rect,
+    text: impl Into<String>,
+    size: f32,
+    color: egui::Color32,
+    max_rows: usize,
+) {
     let clip = rect.intersect(ui.clip_rect());
     if !clip.is_positive() || rect.width() < 8.0 {
         return;
@@ -323,12 +334,66 @@ fn companion_line(
         color,
         rect.width(),
     );
-    job.wrap.max_rows = 1;
+    job.wrap.max_rows = max_rows;
     job.wrap.break_anywhere = true;
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
     ui.painter()
         .with_clip_rect(clip)
         .galley(rect.min, galley, color);
+}
+
+/// Preserve the body/control slots; details alone adapt to the available width.
+fn companion_details(ui: &Ui, rect: egui::Rect, status: impl Into<String>) {
+    let row = |x: f32, y: f32, width: f32, height: f32| {
+        egui::Rect::from_min_size(rect.min + egui::vec2(x, y), egui::vec2(width, height))
+            .intersect(rect)
+    };
+    let title = "ASCII organism";
+    let badge = "Volatile memory · no LLM";
+    let measure = |text: &str, size| {
+        ui.painter()
+            .layout_no_wrap(
+                text.to_owned(),
+                egui::FontId::proportional(size),
+                ui.visuals().text_color(),
+            )
+            .size()
+            .x
+    };
+    let title_width = measure(title, 14.0);
+    let badge_width = measure(badge, 11.0);
+    let wide = rect.width() >= title_width + 16.0 + badge_width;
+    companion_line(
+        ui,
+        row(
+            0.0,
+            0.0,
+            if wide { title_width } else { rect.width() },
+            20.0,
+        ),
+        title,
+        14.0,
+        ui.visuals().strong_text_color(),
+    );
+    companion_line(
+        ui,
+        if wide {
+            row(rect.width() - badge_width, 2.0, badge_width, 18.0)
+        } else {
+            row(0.0, 54.0, rect.width(), 18.0)
+        },
+        badge,
+        11.0,
+        ui.visuals().weak_text_color(),
+    );
+    companion_text(
+        ui,
+        row(0.0, 22.0, rect.width(), 32.0),
+        status,
+        12.0,
+        ui.visuals().text_color(),
+        2,
+    );
 }
 
 /// A pointer-only control never requests keyboard focus or sends terminal input.
@@ -355,13 +420,38 @@ fn companion_toggle(ui: &mut Ui, rect: egui::Rect, expanded: bool, interactive: 
             },
         )
     });
-    ui.painter().with_clip_rect(rect).text(
+    let visuals = if interactive {
+        ui.style().interact(&response)
+    } else {
+        &ui.visuals().widgets.noninteractive
+    };
+    let painter = ui.painter().with_clip_rect(rect);
+    if interactive && (response.hovered() || response.is_pointer_button_down_on()) {
+        painter.rect(
+            rect,
+            4.0,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         if expanded { "⌄" } else { "⌃" },
         egui::FontId::proportional(16.0),
-        ui.visuals().weak_text_color(),
+        visuals.fg_stroke.color,
     );
+    if interactive {
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if expanded {
+                "Collapse ASCII organism"
+            } else {
+                "Expand ASCII organism"
+            });
+    }
     interactive && response.clicked()
 }
 
@@ -1022,34 +1112,7 @@ impl OrganismHost {
                         }
                     }
                     if expanded {
-                        let row = |offset: f32, height: f32| {
-                            egui::Rect::from_min_size(
-                                status_rect.min + egui::vec2(0.0, offset),
-                                egui::vec2(status_rect.width(), height),
-                            )
-                            .intersect(status_rect)
-                        };
-                        companion_line(
-                            ui,
-                            row(0.0, 20.0),
-                            "ASCII organism",
-                            14.0,
-                            ui.visuals().strong_text_color(),
-                        );
-                        companion_line(
-                            ui,
-                            row(24.0, 20.0),
-                            live_behavior_explanation(display).into_owned(),
-                            12.0,
-                            ui.visuals().text_color(),
-                        );
-                        companion_line(
-                            ui,
-                            row(48.0, 16.0),
-                            "Volatile memory · no LLM",
-                            11.0,
-                            ui.visuals().weak_text_color(),
-                        );
+                        companion_details(ui, status_rect, live_behavior_explanation(display).into_owned());
                     } else {
                         ui.painter()
                             .with_clip_rect(status_rect.intersect(ui.clip_rect()))
@@ -1086,34 +1149,7 @@ impl OrganismHost {
                         );
                     }
                     if expanded {
-                        let row = |offset: f32, height: f32| {
-                            egui::Rect::from_min_size(
-                                status_rect.min + egui::vec2(0.0, offset),
-                                egui::vec2(status_rect.width(), height),
-                            )
-                            .intersect(status_rect)
-                        };
-                        companion_line(
-                            ui,
-                            row(0.0, 20.0),
-                            "ASCII organism",
-                            14.0,
-                            ui.visuals().strong_text_color(),
-                        );
-                        companion_line(
-                            ui,
-                            row(24.0, 20.0),
-                            "Quietly here. Live reactions are paused.",
-                            12.0,
-                            ui.visuals().text_color(),
-                        );
-                        companion_line(
-                            ui,
-                            row(48.0, 16.0),
-                            "Volatile memory · no LLM",
-                            11.0,
-                            ui.visuals().weak_text_color(),
-                        );
+                        companion_details(ui, status_rect, "Quietly here. Live reactions are paused.");
                     }
                 }
             });
@@ -1994,6 +2030,174 @@ mod tests {
             assert!(layout.details.contains_rect(text.0));
             assert!(!text.0.intersect(layout.control).is_positive());
             assert!(!text.0.intersect(layout.body).is_positive());
+        }
+    }
+
+    #[test]
+    fn companion_details_use_two_bounded_rows_and_responsive_badge() {
+        for width in [32.0, 120.0, 220.0, 480.0] {
+            for status in [
+                "Quietly here. Live reactions are paused.".to_owned(),
+                "状态 λ output activity resumed 🦊 ".repeat(80),
+            ] {
+                let ctx = egui::Context::default();
+                let details = host_rect(width, 72.0);
+                for _ in 0..2 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(host_rect(640.0, 480.0)),
+                            ..Default::default()
+                        },
+                        |ui| companion_details(ui, details, status.clone()),
+                    );
+                    output.textures_delta.clear();
+                    let text: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| {
+                            if let egui::Shape::Text(text) = &shape.shape {
+                                Some((shape.clip_rect, text))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    assert_eq!(text.len(), 3);
+                    for (clip, shape) in &text {
+                        assert!(details.contains_rect(*clip));
+                        assert!(shape.galley.rows.len() <= 2);
+                    }
+                    assert_eq!(text[0].1.galley.rows.len(), 1);
+                    assert_eq!(text[1].1.galley.rows.len(), 1);
+                    assert_eq!(text[2].1.pos.y, 22.0);
+                    assert!(text[2].1.galley.size().y <= 32.0);
+                    if width == 480.0 {
+                        assert_eq!(text[1].1.pos.y, 2.0);
+                        assert!(text[1].1.pos.x > text[0].1.pos.x + text[0].1.galley.size().x);
+                    } else {
+                        assert_eq!(text[1].1.pos.y, 54.0);
+                    }
+                    assert!(!text[1].0.intersect(text[2].0).is_positive());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_details_header_boundary_and_short_height_are_clipped() {
+        let ctx = egui::Context::default();
+        let mut boundary = 0.0;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            boundary = ui
+                .painter()
+                .layout_no_wrap(
+                    "ASCII organism".into(),
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+                + 16.0
+                + ui.painter()
+                    .layout_no_wrap(
+                        "Volatile memory · no LLM".into(),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x;
+        });
+        output.textures_delta.clear();
+        for width in [boundary - 0.5, boundary, boundary + 0.5] {
+            for height in [1.0, 18.0, 30.0, 54.0, 60.0, 72.0] {
+                let rect = host_rect(width, height);
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(host_rect(640.0, 480.0)),
+                        ..Default::default()
+                    },
+                    |ui| companion_details(ui, rect, "Output activity resumed. Watching quietly."),
+                );
+                output.textures_delta.clear();
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        assert!(rect.contains_rect(shape.clip_rect));
+                        if text.galley.text() == "Volatile memory · no LLM" {
+                            assert_eq!(text.pos.y, if width >= boundary { 2.0 } else { 54.0 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_toggle_feedback_is_visible_only_when_interactive() {
+        for interactive in [false, true] {
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(28.0, 72.0));
+            let mut fills = Vec::new();
+            for frame in 0..4 {
+                let point = if frame == 0 {
+                    egui::pos2(200.0, 200.0)
+                } else {
+                    rect.center()
+                };
+                let mut events = vec![egui::Event::PointerMoved(point)];
+                if frame == 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                if frame == 3 {
+                    events.push(egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(host_rect(640.0, 480.0)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let clicked = companion_toggle(ui, rect, true, interactive);
+                        assert_eq!(clicked, interactive && frame == 3);
+                        let response = ui
+                            .ctx()
+                            .read_response(ui.make_persistent_id("ascii_organism_expand"))
+                            .unwrap();
+                        assert!(!response.has_focus());
+                        assert!(!response.sense.is_focusable());
+                    },
+                );
+                output.textures_delta.clear();
+                let fill = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(r) if r.rect == rect => Some(r.fill),
+                    _ => None,
+                });
+                fills.push(fill);
+                if interactive && frame > 0 {
+                    assert_eq!(
+                        output.platform_output.cursor_icon,
+                        egui::CursorIcon::PointingHand
+                    );
+                }
+            }
+            assert!(fills[0].is_none());
+            if interactive {
+                assert!(fills[1].is_some());
+                assert!(fills[2].is_some());
+                assert_ne!(fills[1], fills[2]);
+            } else {
+                assert!(fills.iter().all(Option::is_none));
+            }
         }
     }
 
