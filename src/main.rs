@@ -31,6 +31,7 @@ mod link;
 mod native_enter;
 mod organism;
 mod organism_ui;
+mod output_batch;
 mod pane_header;
 mod persistence_file;
 mod pty;
@@ -50,6 +51,7 @@ mod tab_manager;
 mod terminal;
 mod theme;
 mod ui;
+mod watch_adapter;
 mod windows_compat;
 mod workflow_picker;
 mod workflows;
@@ -6397,12 +6399,17 @@ impl eframe::App for TerminalApp {
                 // requests until their older replies have entered the bounded
                 // shell writer. The current chunk precedes the split-off tail.
                 accumulated_data.append(&mut session.pending_output);
+                accumulated_data.quarantine();
+                self.organism.watch_parked(&active_session_id);
                 session.pending_output = accumulated_data;
                 has_more_data = true;
             } else {
                 let mut terminal = session.terminal.lock();
                 let active_parse_started = std::time::Instant::now();
-                terminal.process_batch(&accumulated_data);
+                terminal.process_output_buffer(&accumulated_data, |update| {
+                    self.organism
+                        .watch_parsed(&active_session_id, update, has_more_data);
+                });
                 terminal.check_sync_output_timeout();
                 terminal_parse_time += active_parse_started.elapsed();
                 active_processed_bytes = accumulated_data.len();

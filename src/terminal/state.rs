@@ -413,6 +413,7 @@ impl super::TerminalState {
             row_identity_revision: 1,
             full_screen_scroll_revision: 1,
             command_marks: VecDeque::new(),
+            watch: super::watch::ParserWatch::default(),
             command_records: VecDeque::new(),
             next_command_sequence: 1,
             consumed_command_ids: VecDeque::new(),
@@ -1900,7 +1901,10 @@ impl super::TerminalState {
         let next_raw_row_id = self.next_raw_row_id;
         let row_identity_revision = self.row_identity_revision;
         let next_command_sequence = self.next_command_sequence;
+        self.watch.prompt();
+        let watch = std::mem::take(&mut self.watch);
         *self = Self::new(cols, rows);
+        self.watch = watch;
         self.pending_completed_command_outputs = pending_completed_command_outputs;
         self.consumed_command_ids = consumed_command_ids;
         self.default_colors = default_colors;
@@ -2883,6 +2887,7 @@ impl super::TerminalState {
             }
         }
 
+        self.watch.prompt();
         // If a shell omitted D, preserve a closed semantic range rather than
         // leaving an earlier record permanently "running".
         if let Some(index) = self.active_record_index() {
@@ -2973,6 +2978,7 @@ impl super::TerminalState {
             // otherwise rebind an already-observed Start generation to output
             // that was captured for the first one.
             if !record.start_mark_seen {
+                self.watch.start(record.sequence);
                 record.session_id = start_identity.session_id;
                 record.seq = start_identity.seq;
                 record.started_at_ms = start_identity.started_at_ms;
@@ -3251,6 +3257,7 @@ impl super::TerminalState {
             } else {
                 None
             };
+            self.watch.finish(record.sequence);
             record.state = CommandState::Complete;
             record.complete = true;
             record.completion_provenance = completion_provenance;

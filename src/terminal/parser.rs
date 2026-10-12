@@ -2295,6 +2295,7 @@ impl super::TerminalState {
             &mut self.keyboard_enhancement_stack,
             &mut self.alt_keyboard_enhancement_stack,
         );
+        self.watch.boundary();
         self.use_alt_buffer = true;
         // Retained cells keep their own keys, but an unterminated primary-screen
         // OSC 8 link must not arm alternate-screen text.
@@ -2338,6 +2339,7 @@ impl super::TerminalState {
             &mut self.keyboard_enhancement_stack,
             &mut self.alt_keyboard_enhancement_stack,
         );
+        self.watch.boundary();
         self.use_alt_buffer = false;
         // A TUI's DECSCUSR (vim's insert-mode beam) belongs to its screen.
         if let Some(shape) = self.saved_primary_cursor_shape.take() {

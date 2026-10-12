@@ -1,8 +1,10 @@
+mod watch;
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
 use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+pub use watch::{WatchCommand, WatchParsed};
 
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
@@ -771,6 +773,7 @@ pub struct TerminalState {
     /// evicted from scrollback are pruned lazily during navigation.
     pub command_marks: VecDeque<CommandMark>,
 
+    watch: watch::ParserWatch,
     command_records: VecDeque<CommandRecord>,
     next_command_sequence: u64,
     /// Recently closed OSC execution ids. Records can be evicted or cleared

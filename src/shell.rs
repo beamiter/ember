@@ -1,3 +1,4 @@
+use crate::output_batch::{OutputBuffer, OutputSource};
 use crate::pty::Pty;
 use crate::terminal::clamp_terminal_dimensions;
 use crossbeam_channel::{bounded, Receiver};
@@ -14,7 +15,7 @@ use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub enum ShellEvent {
-    Output(Vec<u8>),
+    Output(OutputBuffer),
     Exit(i32),
     Error(String),
 }
@@ -26,6 +27,7 @@ pub enum ShellEvent {
 const EXIT_DRAIN_BYTE_CAP: usize = 1024 * 1024;
 
 fn drain_exited_pty_output(
+    source: &mut OutputSource,
     buffer: &mut [u8],
     mut read: impl FnMut(&mut [u8]) -> Result<crate::pty::ReadOutcome, String>,
     mut emit: impl FnMut(ShellEvent) -> bool,
@@ -49,8 +51,11 @@ fn drain_exited_pty_output(
                 ));
             }
             Ok(crate::pty::ReadOutcome::Data(bytes)) => {
+                let read_at = std::time::Instant::now();
                 drained += bytes;
-                if !emit(ShellEvent::Output(buffer[..bytes].to_vec())) {
+                if !emit(ShellEvent::Output(
+                    source.batch(buffer[..bytes].to_vec(), read_at),
+                )) {
                     return false;
                 }
             }
@@ -334,6 +339,7 @@ impl ShellWriteSender {
 
 /// ShellSession 管理 PTY 和后台 I/O 线程
 pub struct ShellSession {
+    output_source: Option<u64>,
     pty: Arc<Mutex<Pty>>,
     event_rx: Receiver<ShellEvent>,
     child_pid: i32,            // 存储 shell 子进程的 PID
@@ -430,8 +436,16 @@ impl ShellSession {
                 let writer_event_tx = event_tx.clone();
                 let writer_repaint_ctx = repaint_ctx.clone();
 
+                let source = OutputSource::default();
+                let output_source = source.epoch();
                 thread::spawn(move || {
-                    Self::io_loop(pty_clone, event_tx, repaint_ctx_clone, shutdown_clone);
+                    Self::io_loop(
+                        pty_clone,
+                        event_tx,
+                        repaint_ctx_clone,
+                        shutdown_clone,
+                        source,
+                    );
                 });
 
                 // 单一 writer 线程串行消费按字节和消息数双重有界的 FIFO。
@@ -485,6 +499,7 @@ impl ShellSession {
                 }
 
                 Ok(ShellSession {
+                    output_source,
                     pty,
                     event_rx,
                     child_pid,
@@ -496,6 +511,10 @@ impl ShellSession {
             }
             Err(e) => Err(format!("Failed to create shell session: {}", e)),
         }
+    }
+
+    pub fn output_source(&self) -> Option<u64> {
+        self.output_source
     }
 
     /// 获取事件接收器（用于读取 shell 事件）
@@ -535,10 +554,12 @@ impl ShellSession {
         repaint_ctx: &egui::Context,
         shutdown: &AtomicBool,
         buffer: &mut [u8],
+        source: &mut OutputSource,
         event: ShellEvent,
     ) {
         if matches!(&event, ShellEvent::Exit(_))
             && !drain_exited_pty_output(
+                source,
                 buffer,
                 |buffer| pty.lock().read(buffer).map_err(|error| error.to_string()),
                 |output| Self::send_event(event_tx, repaint_ctx, output),
@@ -557,6 +578,7 @@ impl ShellSession {
         event_tx: crossbeam_channel::Sender<ShellEvent>,
         repaint_ctx: egui::Context,
         shutdown: Arc<AtomicBool>,
+        mut source: OutputSource,
     ) {
         const BUFFER_SIZE: usize = 65536;
         const BATCH_SIZE_THRESHOLD: usize = 131072;
@@ -567,6 +589,7 @@ impl ShellSession {
 
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut accumulated = Vec::with_capacity(BATCH_SIZE_THRESHOLD);
+        let mut first_read_at = None;
         let mut last_alive_check = std::time::Instant::now();
         let mut last_batch_time = std::time::Instant::now();
         // EOF/EIO means the slave stream is closed, not necessarily that the
@@ -589,7 +612,11 @@ impl ShellSession {
             if read_closed {
                 if !accumulated.is_empty() {
                     let data = std::mem::take(&mut accumulated);
-                    if !Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data)) {
+                    if !Self::send_event(
+                        &event_tx,
+                        &repaint_ctx,
+                        ShellEvent::Output(source.coalesced(data, first_read_at.take())),
+                    ) {
                         return;
                     }
                 }
@@ -602,6 +629,9 @@ impl ShellSession {
                 };
                 match recovery_probe {
                     Ok(crate::pty::ReadOutcome::Data(n)) => {
+                        if n > 0 && accumulated.is_empty() {
+                            first_read_at = Some(std::time::Instant::now());
+                        }
                         accumulated.extend_from_slice(&buf[..n]);
                         read_error_reported = false;
                         read_closed = false;
@@ -637,6 +667,7 @@ impl ShellSession {
                         &repaint_ctx,
                         &shutdown,
                         &mut buf,
+                        &mut source,
                         ShellEvent::Exit(exit_code),
                     );
                     return;
@@ -683,6 +714,9 @@ impl ShellSession {
                             match pty_guard.read(&mut buf) {
                                 Ok(crate::pty::ReadOutcome::Data(n)) => {
                                     read_error_reported = false;
+                                    if n > 0 && accumulated.is_empty() {
+                                        first_read_at = Some(std::time::Instant::now());
+                                    }
                                     accumulated.extend_from_slice(&buf[..n]);
                                     if accumulated.len() >= BATCH_SIZE_THRESHOLD {
                                         break;
@@ -730,7 +764,11 @@ impl ShellSession {
                             || !matches!(after, After::Continue))
                     {
                         let data = std::mem::take(&mut accumulated);
-                        if !Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data)) {
+                        if !Self::send_event(
+                            &event_tx,
+                            &repaint_ctx,
+                            ShellEvent::Output(source.coalesced(data, first_read_at.take())),
+                        ) {
                             return;
                         }
                         last_batch_time = std::time::Instant::now();
@@ -749,6 +787,7 @@ impl ShellSession {
                                 &repaint_ctx,
                                 &shutdown,
                                 &mut buf,
+                                &mut source,
                                 ev,
                             );
                             return;
@@ -764,7 +803,11 @@ impl ShellSession {
                         && last_batch_time.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
                     {
                         let data = std::mem::take(&mut accumulated);
-                        if !Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data)) {
+                        if !Self::send_event(
+                            &event_tx,
+                            &repaint_ctx,
+                            ShellEvent::Output(source.coalesced(data, first_read_at.take())),
+                        ) {
                             crate::debug_log!("[IOLoop] 接收者已断开，退出循环");
                             return;
                         }
@@ -803,7 +846,11 @@ impl ShellSession {
                 if let Some(exit_event) = exit_event {
                     if !accumulated.is_empty() {
                         let data = std::mem::take(&mut accumulated);
-                        let _ = Self::send_event(&event_tx, &repaint_ctx, ShellEvent::Output(data));
+                        let _ = Self::send_event(
+                            &event_tx,
+                            &repaint_ctx,
+                            ShellEvent::Output(source.coalesced(data, first_read_at.take())),
+                        );
                     }
                     Self::send_final_io_event(
                         &pty,
@@ -811,6 +858,7 @@ impl ShellSession {
                         &repaint_ctx,
                         &shutdown,
                         &mut buf,
+                        &mut source,
                         exit_event,
                     );
                     return;
@@ -986,6 +1034,7 @@ mod tests {
         let mut events = Vec::new();
         let mut read_calls = 0;
         let result = drain_exited_pty_output(
+            &mut OutputSource::default(),
             &mut vec![0; buffer_size],
             |buffer| {
                 read_calls += 1;
@@ -1013,6 +1062,41 @@ mod tests {
     }
 
     #[test]
+    fn exited_tail_keeps_the_same_reader_epoch_and_sequence_allocator() {
+        let mut source = OutputSource::default();
+        let read_at = std::time::Instant::now();
+        let ordinary = source.coalesced(b"before".to_vec(), Some(read_at));
+        let first = ordinary.fragments().next().unwrap().origin.unwrap();
+        let mut read_once = false;
+        let mut events = Vec::new();
+        let finish = drain_exited_pty_output(
+            &mut source,
+            &mut [0; 8],
+            |buffer| {
+                if read_once {
+                    return Ok(crate::pty::ReadOutcome::WouldBlock);
+                }
+                read_once = true;
+                buffer[..4].copy_from_slice(b"tail");
+                Ok(crate::pty::ReadOutcome::Data(4))
+            },
+            |event| {
+                events.push(event);
+                true
+            },
+            || false,
+        );
+        assert!(finish);
+        let ShellEvent::Output(tail) = &events[0] else {
+            panic!("missing tail");
+        };
+        let last = tail.fragments().next().unwrap().origin.unwrap();
+        assert_eq!(last.source, first.source);
+        assert_eq!(last.sequence, first.sequence + 1);
+        assert!(last.read_at >= first.read_at);
+    }
+
+    #[test]
     fn exited_tail_stops_immediately_at_would_block_eof_or_hangup() {
         for stop in [
             crate::pty::ReadOutcome::WouldBlock,
@@ -1030,7 +1114,7 @@ mod tests {
             assert!(finish);
             assert_eq!(reads, 2);
             assert_eq!(events.len(), 1);
-            assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes == b"tail"));
+            assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes.as_bytes() == b"tail"));
         }
     }
 
@@ -1046,7 +1130,7 @@ mod tests {
         assert!(finish);
         assert_eq!(reads, 2);
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes == b"tail"));
+        assert!(matches!(&events[0], ShellEvent::Output(bytes) if bytes.as_bytes() == b"tail"));
         assert!(
             matches!(&events[1], ShellEvent::Error(error) if error.contains("read fixture failure") && error.contains("may be omitted"))
         );
@@ -1076,6 +1160,7 @@ mod tests {
     #[test]
     fn exited_tail_cancellation_and_receiver_loss_stop_without_exit_permission() {
         let finish = drain_exited_pty_output(
+            &mut OutputSource::default(),
             &mut [0; 8],
             |_| panic!("cancelled tail must not read"),
             |_| panic!("cancelled tail must not publish"),
@@ -1085,6 +1170,7 @@ mod tests {
 
         let mut reads = 0;
         let finish = drain_exited_pty_output(
+            &mut OutputSource::default(),
             &mut [0; 8],
             |buffer| {
                 reads += 1;
@@ -1404,7 +1490,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for the test shell");
             match session.events().recv_timeout(remaining).unwrap() {
-                ShellEvent::Output(bytes) => output.extend(bytes),
+                ShellEvent::Output(bytes) => output.extend_from_slice(bytes.as_bytes()),
                 ShellEvent::Exit(code) => break code,
                 ShellEvent::Error(error) => panic!("unexpected shell error: {error}"),
             }

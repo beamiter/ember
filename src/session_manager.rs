@@ -739,8 +739,9 @@ impl SessionManager {
             }
 
             if share == 0 {
+                data.quarantine();
                 session.pending_output = data;
-                data = Vec::new();
+                data = crate::output_batch::OutputBuffer::default();
                 if !session.pending_output.is_empty() || !session.shell.events().is_empty() {
                     result.has_more = true;
                 }
@@ -764,7 +765,7 @@ impl SessionManager {
             // frozen forever if an application dies after its begin marker.
             let mut terminal = session.terminal.lock();
             if !data.is_empty() {
-                terminal.process_batch(&data);
+                terminal.process_output_buffer(&data, |_| {});
             }
             terminal.check_sync_output_timeout();
             let response = terminal.get_output();

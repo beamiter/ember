@@ -140,7 +140,7 @@ pub struct Session {
     /// can happen between frames, and feeding the old tab's remaining ANSI
     /// stream into the newly active terminal corrupts both its screen and its
     /// terminal modes.
-    pub pending_output: Vec<u8>,
+    pub pending_output: crate::output_batch::OutputBuffer,
     /// Session-owned view policy. Renderers are reused across tabs/panes and
     /// must never carry collapse state or projected scroll between sessions.
     pub projection_policy: ProjectionPolicy,
@@ -209,13 +209,14 @@ impl Session {
         shell: ShellSession,
         session_id: String,
     ) -> Self {
+        terminal.lock().bind_watch_source(shell.output_source());
         Session {
             metadata: SessionMetadata::with_session_id(name, tags, session_id),
             terminal,
             shell,
             purpose: SessionPurpose::Interactive,
             pending_input: Vec::new(),
-            pending_output: Vec::new(),
+            pending_output: crate::output_batch::OutputBuffer::default(),
             projection_policy: ProjectionPolicy::new(),
             projection_view_state: ProjectionViewState::new(),
             collapse_availability_cache: None,
