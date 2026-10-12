@@ -3200,6 +3200,31 @@ mod tests {
         let mut ready_pipe = [-1; 2];
         // SAFETY: ready_pipe points to two writable integers.
         assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+        // This fixture pauses instead of execing. Do not let it retain raw
+        // lock files opened by other parallel tests. Keep the original target
+        // descriptor out of isolation so only the explicit close below can
+        // satisfy the live-child lock-release assertion.
+        let mut kept_fds = [inherited_fd as libc::c_uint, ready_pipe[1] as libc::c_uint];
+        kept_fds.sort_unstable();
+        let mut close_ranges = [(0, 0); 3];
+        let mut range_count = 0;
+        let mut first = 3;
+        for kept in kept_fds {
+            if kept >= first {
+                if kept > first {
+                    close_ranges[range_count] = (first, kept - 1);
+                    range_count += 1;
+                }
+                first = kept + 1;
+            }
+        }
+        close_ranges[range_count] = (first, libc::c_uint::MAX);
+        range_count += 1;
+        // Resolve the fallback limit before fork; the child must not call
+        // runtime/library helpers that might acquire a process-wide lock.
+        let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        assert!((3..=libc::c_int::MAX as libc::c_long).contains(&fd_limit));
+
         // SAFETY: both branches below restrict their post-fork work to raw
         // async-signal-safe syscalls until the child exits.
         let child_pid = unsafe { libc::fork() };
@@ -3209,6 +3234,19 @@ mod tests {
             // child never returns into Rust or runs destructors.
             unsafe {
                 libc::close(ready_pipe[0]);
+                #[cfg(target_os = "linux")]
+                let close_range_unavailable = close_ranges[..range_count]
+                    .iter()
+                    .any(|&(first, last)| libc::close_range(first, last, 0) != 0);
+                #[cfg(not(target_os = "linux"))]
+                let close_range_unavailable = true;
+                if close_range_unavailable {
+                    for fd in 3..fd_limit as libc::c_int {
+                        if fd != inherited_fd && fd != ready_pipe[1] {
+                            libc::close(fd);
+                        }
+                    }
+                }
                 libc::close(inherited_fd);
                 let marker = [1u8];
                 libc::write(
@@ -3245,6 +3283,10 @@ mod tests {
             assert_eq!(read, 1);
         }
 
+        assert!(
+            try_acquire_instance_lock_at(&path).unwrap().is_none(),
+            "closing the child's copy must not release the parent's lock"
+        );
         drop(owner);
         assert_eq!(
             inherited_instance_lock_fd(),
