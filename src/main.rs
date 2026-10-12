@@ -1136,17 +1136,35 @@ fn enqueue_worker_protocol_response(
     }
 }
 
-fn send_osc5522_worker_response(response_tx: &ProtocolResponseSender, response: Vec<u8>) {
-    enqueue_worker_protocol_response(
-        response_tx,
-        response,
-        osc_5522_packet("type=read:status=EBUSY", None),
-        "OSC 5522",
-    );
+fn send_osc5522_worker_response(
+    response_tx: &ProtocolResponseSender,
+    read_allowed: &AtomicBool,
+    response: Vec<u8>,
+) {
+    let refusal = osc_5522_packet("type=read:status=EPERM", None);
+    // The MIME read may finish after settings revoke clipboard access. The
+    // session FIFO rechecks this same permission after every capacity wait.
+    match response_tx.enqueue_clipboard_response(response, refusal.clone(), read_allowed) {
+        Ok(()) => {}
+        Err(ProtocolResponseQueueError::Closed) => {
+            log::debug!("OSC 5522 target session closed before its response was queued");
+        }
+        Err(error) => {
+            log::warn!("OSC 5522 response replaced by bounded fallback: {error}");
+            if let Err(fallback_error) = response_tx.enqueue_clipboard_response(
+                osc_5522_packet("type=read:status=EBUSY", None),
+                refusal,
+                read_allowed,
+            ) {
+                log::debug!("OSC 5522 fallback was cancelled: {fallback_error}");
+            }
+        }
+    }
 }
 
 fn service_osc5522_clipboard_requests(
     clipboard_available: bool,
+    read_allowed: &Arc<AtomicBool>,
     in_flight: &Arc<AtomicBool>,
     terminal: Arc<ParkingMutex<TerminalState>>,
     response_tx: ProtocolResponseSender,
@@ -1181,6 +1199,7 @@ fn service_osc5522_clipboard_requests(
         return;
     }
 
+    let read_allowed = Arc::clone(read_allowed);
     let in_flight_for_thread = Arc::clone(in_flight);
     let error_tx = response_tx.clone();
     let error_terminal = Arc::clone(&terminal);
@@ -1194,6 +1213,7 @@ fn service_osc5522_clipboard_requests(
                 for _ in 0..request_count {
                     send_osc5522_worker_response(
                         &response_tx,
+                        &read_allowed,
                         osc_5522_packet("type=read:status=ENOSYS", None),
                     );
                 }
@@ -1213,7 +1233,7 @@ fn service_osc5522_clipboard_requests(
                     mime_type,
                     data.len()
                 );
-                send_osc5522_worker_response(&response_tx, response);
+                send_osc5522_worker_response(&response_tx, &read_allowed, response);
             }
         });
     if let Err(error) = spawn_result {
@@ -5541,6 +5561,7 @@ impl eframe::App for TerminalApp {
                     if let Some(response_tx) = response_tx {
                         service_osc5522_clipboard_requests(
                             self.clipboard.is_some(),
+                            &self.osc52_read_allowed,
                             &self.clipboard_request_in_flight,
                             Arc::clone(&session.terminal),
                             response_tx,
@@ -6503,6 +6524,7 @@ impl eframe::App for TerminalApp {
             if self.config.osc52_clipboard_read {
                 service_osc5522_clipboard_requests(
                     self.clipboard.is_some(),
+                    &self.osc52_read_allowed,
                     &self.clipboard_request_in_flight,
                     Arc::clone(&session.terminal),
                     active_protocol_responses.clone(),
@@ -8692,6 +8714,47 @@ mod tests {
         );
         assert!(!responses.defer_osc52_query(b"\x07"));
         assert!(!other.has_pending());
+    }
+
+    #[test]
+    fn osc5522_permission_revoked_while_reading_refuses_data_in_fifo_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let other = ProtocolResponseSender::new(egui::Context::default());
+        let allowed = AtomicBool::new(true);
+        let older = b"older protocol response".to_vec();
+        responses.enqueue_blocking(older.clone()).unwrap();
+        let data = crate::clipboard_5522_response_for_mime("text/plain", b"secret");
+        allowed.store(false, Ordering::Release);
+        crate::send_osc5522_worker_response(&responses, &allowed, data);
+        let mut expected = older;
+        expected.extend(crate::osc_5522_packet("type=read:status=EPERM", None));
+        assert_eq!(responses.pending_bytes_for_test(), expected);
+        assert!(!other.has_pending());
+    }
+
+    #[test]
+    fn osc5522_allowed_worker_preserves_exact_mime_response() {
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let allowed = std::sync::atomic::AtomicBool::new(true);
+        let response = crate::clipboard_5522_response_for_mime("image/png", &[0, 255, 1]);
+        crate::send_osc5522_worker_response(&responses, &allowed, response.clone());
+        assert_eq!(responses.pending_bytes_for_test(), response);
+    }
+
+    #[test]
+    fn osc5522_revocation_also_replaces_worker_error_responses() {
+        let responses = ProtocolResponseSender::new(egui::Context::default());
+        let allowed = std::sync::atomic::AtomicBool::new(false);
+        crate::send_osc5522_worker_response(
+            &responses,
+            &allowed,
+            crate::osc_5522_packet("type=read:status=ENOSYS", None),
+        );
+        assert_eq!(
+            responses.pending_bytes_for_test(),
+            crate::osc_5522_packet("type=read:status=EPERM", None)
+        );
     }
 
     #[test]
