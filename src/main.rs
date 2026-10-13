@@ -2133,6 +2133,13 @@ enum FsMenuAction {
     Refresh(std::path::PathBuf),
 }
 
+/// 文件树右键菜单使用的条目、选择集与目标目录。
+struct FsMenuTarget<'a> {
+    entry: Option<(&'a std::path::Path, bool)>,
+    targets: &'a [(std::path::PathBuf, bool)],
+    target_dir: &'a std::path::Path,
+}
+
 /// 点击时的选择模式（修饰键语义）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsSelectMode {
@@ -3767,9 +3774,11 @@ impl TerminalApp {
                                 egui::Popup::context_menu(&root_resp).style(crate::theme::configure_popup_style).show(|ui| {
                                     Self::fs_context_menu(
                                         ui,
-                                        None,
-                                        &[],
-                                        &root_dir,
+                                        FsMenuTarget {
+                                            entry: None,
+                                            targets: &[],
+                                            target_dir: &root_dir,
+                                        },
                                         &mut fs_menu_action,
                                         paste_state,
                                         files_are_local,
@@ -4534,9 +4543,11 @@ impl TerminalApp {
                         sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
                     Self::fs_context_menu(
                         ui,
-                        Some((&node.path, node.is_dir)),
-                        &targets,
-                        &target_dir,
+                        FsMenuTarget {
+                            entry: Some((&node.path, node.is_dir)),
+                            targets: &targets,
+                            target_dir: &target_dir,
+                        },
                         menu,
                         paste,
                         files_are_local,
@@ -4654,14 +4665,17 @@ impl TerminalApp {
 
     fn fs_context_menu(
         ui: &mut egui::Ui,
-        entry: Option<(&std::path::Path, bool)>,
-        targets: &[(std::path::PathBuf, bool)],
-        target_dir: &std::path::Path,
+        target: FsMenuTarget<'_>,
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
         files_are_local: bool,
         font_size: f32,
     ) {
+        let FsMenuTarget {
+            entry,
+            targets,
+            target_dir,
+        } = target;
         crate::theme::configure_popup_text(ui, font_size);
         let multi = targets.len() > 1;
         if let Some((path, false)) = entry {
