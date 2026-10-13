@@ -8160,3 +8160,370 @@ fn block_spacing_zero_width_commands_sharing_first_prompt_do_not_gain_leading_ga
     let mut state = ProjectionViewState::new();
     assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
 }
+
+#[test]
+fn native_block_chrome_first_prompt_keeps_status_and_six_row_input_visible() {
+    let mut terminal = TerminalState::new(40, 20);
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 4);
+    let mut state = ProjectionViewState::new();
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    let original = terminal.get_visible_cells();
+    let cursor = terminal.get_cursor_pos();
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(viewport.document_rows(), 20);
+    assert_eq!(viewport.cursor().row, 4);
+    assert_eq!(viewport.application_cell(viewport.cursor()), Some(cursor));
+    for row in 0..4 {
+        assert!(
+            matches!(viewport.row_kind(row), Some(ProjectedRowKind::CompanionStatus { index, total: 4, .. }) if index == row)
+        );
+        assert_eq!(viewport.view_row_absolute(row), None);
+        for column in 0..viewport.columns() {
+            let point = DisplayPoint::new(row, column);
+            assert_eq!(viewport.raw_anchor_at(point), None);
+            assert_eq!(viewport.application_cell(point), None);
+        }
+        terminal.start_selection_projected(&viewport, (row, 0));
+        assert!(!terminal.has_text_selection());
+    }
+    assert!((4..10).all(|row| viewport
+        .application_cell(DisplayPoint::new(row, 0))
+        .is_some()));
+    assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 20));
+    assert_cell_grids_equal(
+        original.as_ref(),
+        terminal.get_visible_cells().as_ref(),
+        "native chrome leaves raw cells untouched",
+    );
+}
+
+#[test]
+fn native_block_chrome_metadata_spacer_status_order_and_copy_are_exact() {
+    let mut terminal = TerminalState::new(24, 20);
+    terminal.process_input(b"\x1b]133;A\x07one\x1b]133;C\x07\x1b]133;D;0\x07\r\n\x1b]133;A\x07two");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    policy.set_block_chrome(true, 4);
+    let mut state = ProjectionViewState::new();
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(matches!(
+        viewport.row_kind(0),
+        Some(ProjectedRowKind::BlockHeader { .. })
+    ));
+    assert_eq!(viewport.cells()[1][0].character, 'o');
+    assert!(matches!(
+        viewport.row_kind(2),
+        Some(ProjectedRowKind::BlockSpacer { .. })
+    ));
+    assert!((3..7).all(|row| matches!(
+        viewport.row_kind(row),
+        Some(ProjectedRowKind::CompanionStatus { .. })
+    )));
+    assert_eq!(viewport.cells()[7][0].character, 't');
+    terminal.start_selection_projected(&viewport, (1, 0));
+    terminal.update_selection_projected(&viewport, (7, 2));
+    assert_eq!(
+        terminal.copy_selection().as_deref(),
+        Some("one                     \ntwo")
+    );
+    assert_eq!(viewport.application_cell(DisplayPoint::new(0, 0)), None);
+    assert_eq!(viewport.raw_anchor_at(DisplayPoint::new(0, 0)), None);
+    terminal.clear_text_selection();
+    terminal.start_selection_projected(&viewport, (0, 0));
+    assert!(!terminal.has_text_selection());
+}
+
+#[test]
+fn native_block_chrome_collapse_resize_modes_and_status_toggle_preserve_anchors() {
+    let mut terminal = TerminalState::new(24, 20);
+    let sequence = emit_completed_block(&mut terminal, 0);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    let prompt = terminal.command_records().back().unwrap().prompt_start;
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    policy.set_block_chrome(true, 4);
+    policy.collapse(sequence);
+    let mut state = ProjectionViewState::new();
+    for width in [24, 8, 1, 40] {
+        terminal.on_resize(width, 20);
+        let viewport = spaced_view(&mut terminal, &policy, &mut state);
+        assert_eq!(
+            viewport.effective_collapsed().contains(&sequence),
+            terminal.finished_output_range(sequence).is_some(),
+            "width={width}"
+        );
+        assert!(viewport.row_kinds().iter().any(|kind| matches!(kind, ProjectedRowKind::BlockHeader { sequence: candidate, .. } if *candidate == sequence)));
+        let cursor = viewport.cursor();
+        assert_eq!(
+            viewport.application_cell(cursor),
+            Some(terminal.get_cursor_pos())
+        );
+        let buffer = terminal
+            .buffer_anchor_to_projected(&viewport, prompt)
+            .unwrap();
+        assert_eq!(
+            viewport.application_cell(buffer).unwrap().0,
+            terminal.buffer_anchor_to_absolute(prompt).unwrap().0 - terminal.scrollback.len()
+        );
+    }
+    policy.set_block_chrome(true, 0);
+    assert!(!spaced_view(&mut terminal, &policy, &mut state)
+        .row_kinds()
+        .iter()
+        .any(|kind| matches!(kind, ProjectedRowKind::CompanionStatus { .. })));
+    policy.set_block_chrome(true, 2);
+    assert_eq!(
+        spaced_view(&mut terminal, &policy, &mut state)
+            .row_kinds()
+            .iter()
+            .filter(|kind| matches!(kind, ProjectedRowKind::CompanionStatus { .. }))
+            .count(),
+        2
+    );
+    let bypass = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        false,
+        &policy,
+        &mut state,
+    );
+    assert!(!bypass.is_transformed());
+    terminal.process_input(b"\x1b[?1049h");
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    terminal.process_input(b"\x1b[?1049l");
+    assert!(spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+}
+
+#[test]
+fn native_block_chrome_rejects_shared_prompts_and_preserves_lower_grid_content() {
+    let mut terminal = TerminalState::new(24, 20);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07prompt");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 4);
+    let mut state = ProjectionViewState::new();
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    let mut terminal = TerminalState::new(24, 20);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b[20;1Hbottom\x1b[1;3H");
+    let viewport = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+    assert_eq!(viewport.document_rows(), 24);
+    assert!(viewport.cells().iter().any(|row| row
+        .iter()
+        .map(|cell| cell.character)
+        .collect::<String>()
+        .starts_with("bottom")));
+}
+
+#[test]
+fn native_block_chrome_status_top_anchor_survives_stream_and_row_count_change() {
+    let mut terminal = TerminalState::new(24, 8);
+    for index in 0..4 {
+        emit_completed_block(&mut terminal, index);
+    }
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;C\x07");
+    terminal.process_input(b"\r\nline\r\nline\r\nline\r\nline\r\n");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 4);
+    let mut state = ProjectionViewState::new();
+    let bottom = spaced_view(&mut terminal, &policy, &mut state);
+    let mut anchored = None;
+    for offset in 1..=bottom.max_scroll_offset() {
+        state.set_offset(offset, &bottom);
+        let viewport = spaced_view(&mut terminal, &policy, &mut state);
+        if matches!(
+            viewport.row_kind(0),
+            Some(ProjectedRowKind::CompanionStatus { index: 0, .. })
+        ) {
+            anchored = Some(viewport);
+            break;
+        }
+    }
+    let before = anchored.expect("status can anchor a scrolled viewport");
+    terminal.process_input(b"\r\noutput\r\n");
+    let after = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(after.row_kind(0), before.row_kind(0));
+    let Some(ProjectedRowKind::CompanionStatus { before: prompt, .. }) = before.row_kind(0) else {
+        unreachable!()
+    };
+    policy.set_block_chrome(true, 0);
+    let hidden = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(hidden.raw_anchor_at(DisplayPoint::new(0, 0)), Some(prompt));
+}
+
+#[test]
+fn native_block_chrome_never_trims_rendition_or_hyperlink_blank_tail() {
+    for rendition in [
+        "\x1b[41m",
+        "\x1b[31m",
+        "\x1b[1m",
+        "\x1b]8;;https://example.com\x07",
+    ] {
+        let mut terminal = TerminalState::new(24, 20);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(format!("\x1b[20;1H{rendition} \x1b[1;3H").as_bytes());
+        let tail = terminal.grid[19].to_vec();
+        let mut policy = ProjectionPolicy::new();
+        policy.set_block_chrome(true, 4);
+        let viewport = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+        assert_eq!(viewport.document_rows(), 24, "rendition {rendition:?}");
+        assert_cell_grids_equal(
+            &[tail],
+            &[viewport.cells().last().unwrap().clone()],
+            "decorated tail retained",
+        );
+    }
+}
+
+#[test]
+fn native_block_chrome_streaming_keeps_incremental_history_and_matches_cold_eviction() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.set_max_scrollback(16);
+    emit_completed_block(&mut terminal, 0);
+    emit_completed_block(&mut terminal, 1);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;C\x07");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    policy.set_block_chrome(true, 4);
+    let mut state = ProjectionViewState::new();
+    for _ in 0..8 {
+        terminal.process_input(b"line\r\n");
+    }
+    drop(spaced_view(&mut terminal, &policy, &mut state));
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    for _ in 0..4 {
+        terminal.process_input(b"line\r\n");
+        let viewport = spaced_view(&mut terminal, &policy, &mut state);
+        assert_eq!(
+            viewport.application_cell(viewport.cursor()),
+            Some(terminal.get_cursor_pos())
+        );
+    }
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get()), 0);
+    assert_eq!(
+        PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.get()),
+        4
+    );
+    for tick in 0..20 {
+        terminal.process_input(b"line\r\n");
+        let incremental = spaced_view(&mut terminal, &policy, &mut state);
+        terminal.projection_plan_cache = None;
+        terminal.transformed_viewport_cache = None;
+        let cold = spaced_view(&mut terminal, &policy, &mut state);
+        assert_eq!(
+            incremental.document_rows(),
+            cold.document_rows(),
+            "tick {tick}"
+        );
+        assert_eq!(incremental.row_kinds(), cold.row_kinds(), "tick {tick}");
+        assert_cell_grids_equal(incremental.cells(), cold.cells(), "native chrome streaming");
+    }
+}
+
+#[test]
+fn native_block_chrome_search_reveal_keeps_exact_raw_anchor_across_status_changes() {
+    let mut terminal = TerminalState::new(24, 8);
+    for index in 0..6 {
+        emit_completed_block(&mut terminal, index);
+    }
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    let anchor = terminal.command_records()[1].output_start.unwrap();
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    policy.set_block_chrome(true, 4);
+    let mut state = ProjectionViewState::new();
+    drop(spaced_view(&mut terminal, &policy, &mut state));
+    assert!(matches!(
+        terminal.reveal_buffer_anchor_in_projection(&policy, &mut state, anchor),
+        ProjectedBufferAnchorLocation::Visible { .. }
+    ));
+    let before = spaced_view(&mut terminal, &policy, &mut state);
+    let first = terminal
+        .buffer_anchor_to_projected(&before, anchor)
+        .unwrap();
+    assert_eq!(first.row, 0);
+    let raw = before.raw_anchor_at(first).unwrap();
+    policy.set_block_chrome(true, 2);
+    let after = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(
+        after.raw_anchor_at(terminal.buffer_anchor_to_projected(&after, anchor).unwrap()),
+        Some(raw)
+    );
+    policy.set_block_chrome(false, 0);
+    let hidden = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(
+        hidden.raw_anchor_at(
+            terminal
+                .buffer_anchor_to_projected(&hidden, anchor)
+                .unwrap()
+        ),
+        Some(raw)
+    );
+}
+
+#[test]
+fn native_block_chrome_never_trims_blank_rows_owned_by_kitty_images() {
+    let mut terminal = TerminalState::new(24, 20);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b[20;1H");
+    terminal.process_input(KITTY_ONE_PIXEL_RGBA_APC);
+    terminal.process_input(b"\x1b_Ga=p,i=41,c=1,r=1,C=1\x1b\\\x1b[1;3H");
+    assert_eq!(terminal.kitty_graphics.get_placements().len(), 1);
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 4);
+    let viewport = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+    assert_eq!(viewport.document_rows(), 24);
+    assert_eq!(
+        viewport.application_cell(DisplayPoint::new(19, 0)),
+        Some((19, 0))
+    );
+    assert_eq!(terminal.kitty_graphics.get_placements()[0].y, 19);
+}
+
+#[test]
+fn native_block_chrome_never_trims_wrapped_default_spaces_or_their_continuation() {
+    let mut terminal = TerminalState::new(24, 20);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b[19;1H");
+    terminal.process_input(&[b' '; 25]);
+    terminal.process_input(b"\x1b[1;3H");
+    assert!(terminal.grid.row_wrapped[18]);
+    assert!(terminal.grid[18]
+        .iter()
+        .chain(terminal.grid[19].iter())
+        .all(|cell| cell.character == ' ' && cell.background == Color::Default));
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 4);
+    let viewport = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+    assert_eq!(viewport.document_rows(), 24);
+    assert!(viewport.row_wrapped()[18]);
+    assert_eq!(
+        viewport.application_cell(DisplayPoint::new(18, 0)),
+        Some((18, 0))
+    );
+    assert_eq!(
+        viewport.application_cell(DisplayPoint::new(19, 0)),
+        Some((19, 0))
+    );
+}
+
+#[test]
+fn native_block_chrome_keeps_header_when_background_output_is_fully_collapsed() {
+    let mut terminal = TerminalState::new(24, 20);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=background\x07background\r\n\x1b]133;D;0;id=background\x07\x1b]133;A\x07$ ");
+    let record = &terminal.command_records()[0];
+    assert_eq!(record.prompt_start, record.output_start.unwrap());
+    let sequence = record.sequence;
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 4);
+    policy.collapse(sequence);
+    let viewport = spaced_view(&mut terminal, &policy, &mut ProjectionViewState::new());
+    let header = viewport.row_kinds().iter().position(|kind| matches!(kind, ProjectedRowKind::BlockHeader { sequence: owner, .. } if *owner == sequence)).expect("completed background card retains metadata");
+    assert!(
+        matches!(viewport.row_kind(header + 1), Some(ProjectedRowKind::CollapsedSummary { key, .. }) if key.zone_id == sequence)
+    );
+    assert_eq!(
+        viewport.application_cell(DisplayPoint::new(header, 0)),
+        None
+    );
+    assert_eq!(viewport.raw_anchor_at(DisplayPoint::new(header, 0)), None);
+    assert_eq!(viewport.row_kinds().iter().filter(|kind| matches!(kind, ProjectedRowKind::BlockHeader { sequence: owner, .. } if *owner == sequence)).count(), 1);
+}

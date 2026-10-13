@@ -624,6 +624,8 @@ struct BlockChromeEntry {
     /// fail-closed answer, not permission to fall back to raw scroll geometry.
     projected_header_range: Option<(DisplayPoint, DisplayPoint)>,
     projected_geometry: bool,
+    metadata_row: Option<usize>,
+    metadata_projection: Option<ProjectionCacheKey>,
     /// Whether `span.first_row` is a real terminal row rather than a synthetic
     /// projected row (a collapsed summary or padding). The badge fallback onto
     /// a block's first VISIBLE row is only honest on a real row: a synthetic
@@ -850,6 +852,17 @@ fn block_action_button(
     emphasized: bool,
     label: &str,
 ) -> Response {
+    block_action_button_symbol(ui, id, rect, emphasized, label, None)
+}
+
+fn block_action_button_symbol(
+    ui: &mut Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    emphasized: bool,
+    label: &str,
+    symbol: Option<&str>,
+) -> Response {
     let response = ui.interact(rect, id, egui::Sense::click());
     if ui.is_enabled() {
         let frame = ui.ctx().cumulative_frame_nr();
@@ -871,12 +884,22 @@ fn block_action_button(
     }
     // Paint the affordance instead of depending on a font's ellipsis glyph.
     let radius = (rect.height() * 0.07).clamp(0.75, 1.25);
-    for offset in [-4.0, 0.0, 4.0] {
-        ui.painter().circle_filled(
-            rect.center() + egui::vec2(offset, 0.0),
-            radius,
+    if let Some(symbol) = symbol {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            symbol,
+            FontId::proportional((rect.height() * 0.7).clamp(8.0, 16.0)),
             visuals.text_color(),
         );
+    } else {
+        for offset in [-4.0, 0.0, 4.0] {
+            ui.painter().circle_filled(
+                rect.center() + egui::vec2(offset, 0.0),
+                radius,
+                visuals.text_color(),
+            );
+        }
     }
     if response.has_focus() {
         ui.painter()
@@ -921,6 +944,79 @@ fn block_action_rect(
     (height >= 8.0 && rect.left() >= pane.left() && rect.right() <= content.left() - 8.0)
         .then_some(rect)
 }
+/// Right-side controls live exclusively inside a synthetic metadata row.
+fn block_metadata_cwd(cwd: Option<&str>) -> String {
+    format!(
+        "cwd · {}",
+        crate::review_text::bound_toast_text(cwd.unwrap_or("—"))
+    )
+}
+
+fn block_header_actions(
+    content: egui::Rect,
+    row: usize,
+    line_height: f32,
+) -> Option<(egui::Rect, egui::Rect)> {
+    if !content.is_finite()
+        || !line_height.is_finite()
+        || line_height <= 0.0
+        || content.width() < 72.0
+    {
+        return None;
+    }
+    let (top, height) = snapped_span(content.top(), row, line_height);
+    let width = height.clamp(16.0, 24.0);
+    let collapse = egui::Rect::from_min_size(
+        egui::pos2(content.right() - width - 4.0, top),
+        egui::vec2(width, height),
+    );
+    Some((collapse.translate(egui::vec2(-width - 2.0, 0.0)), collapse))
+}
+
+fn companion_status_region(
+    viewport: &ProjectedViewport,
+    content: egui::Rect,
+    line_height: f32,
+) -> Option<egui::Rect> {
+    if !content.is_finite() || !line_height.is_finite() || line_height <= 0.0 {
+        return None;
+    }
+    let (start, before, total) =
+        viewport
+            .row_kinds()
+            .iter()
+            .enumerate()
+            .find_map(|(row, kind)| match *kind {
+                crate::terminal::ProjectedRowKind::CompanionStatus {
+                    before,
+                    index: 0,
+                    total,
+                } => Some((row, before, total)),
+                _ => None,
+            })?;
+    if total == 0 || start.checked_add(total)? > viewport.rows() {
+        return None;
+    }
+    for index in 0..total {
+        if viewport.row_kind(start + index)
+            != Some(crate::terminal::ProjectedRowKind::CompanionStatus {
+                before,
+                index,
+                total,
+            })
+        {
+            return None;
+        }
+    }
+    let (top, _) = snapped_span(content.top(), start, line_height);
+    let (bottom, _) = snapped_span(content.top(), start + total, line_height);
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(content.left(), top),
+        egui::pos2(content.right(), bottom),
+    );
+    (rect.is_positive() && rect.bottom() <= content.bottom() + 0.5).then_some(rect)
+}
+
 const BLOCK_CARD_NORMAL_GAP: f32 = 2.0;
 const BLOCK_CARD_COMPACT_GAP: f32 = 0.5;
 const BLOCK_CARD_NORMAL_RADIUS: u8 = 10;
@@ -1205,6 +1301,9 @@ pub struct TerminalRenderer {
     /// Same-frame native active-card free space; never terminal or PTY allocation.
     pub companion_surface: Option<(String, ProjectionCacheKey, egui::Rect)>,
     pub companion_enabled: bool,
+    pub companion_status_surface: Option<egui::Rect>,
+    pub companion_status_enabled: bool,
+    pub companion_expanded: bool,
     pub opacity: f32,
     /// Whether to enable font ligatures (HarfRust shaping of ASCII runs)
     pub font_ligatures: bool,
@@ -1269,6 +1368,7 @@ pub struct TerminalRenderer {
     /// Terminal identity that armed `click_tracker`. A reused renderer that
     /// starts drawing a different PTY must drop the in-flight gesture.
     click_tracker_terminal: Option<usize>,
+    click_tracker_projection: Option<ProjectionCacheKey>,
     /// Sub-line pixel offset for smooth scrolling animation
     pub scroll_pixel_offset: f32,
 
@@ -1305,6 +1405,22 @@ pub struct TerminalRenderer {
 }
 
 impl TerminalRenderer {
+    pub fn companion_status_rows(&self) -> usize {
+        if !self.block_mode
+            || !self.companion_status_enabled
+            || !self.line_height.is_finite()
+            || self.line_height <= 0.0
+        {
+            return 0;
+        }
+        if !self.companion_expanded {
+            return 1;
+        }
+        ((3.0 * self.font_size.max(1.0) * 0.82 * 1.2 + 22.0) / self.line_height)
+            .ceil()
+            .clamp(1.0, 32.0) as usize
+    }
+
     const SCROLLBAR_WIDTH: f32 = 8.0;
     const SCROLLBAR_GAP: f32 = 2.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
@@ -1344,6 +1460,9 @@ impl TerminalRenderer {
             last_content_rect: None,
             companion_surface: None,
             companion_enabled: false,
+            companion_status_surface: None,
+            companion_status_enabled: false,
+            companion_expanded: true,
             last_ime_rect: None,
             opacity: 1.0,
             font_ligatures: true,
@@ -1375,6 +1494,7 @@ impl TerminalRenderer {
             cursor_move_terminal_ptr: None,
             click_tracker: jterm_core::click_cursor::ClickTracker::default(),
             click_tracker_terminal: None,
+            click_tracker_projection: None,
             scroll_pixel_offset: 0.0,
             cached_links: std::sync::Arc::new(Vec::new()),
             cached_links_projection_key: None,
@@ -1992,6 +2112,8 @@ impl TerminalRenderer {
                 header_range,
                 projected_header_range: None,
                 projected_geometry: false,
+                metadata_row: None,
+                metadata_projection: None,
                 first_row_is_raw: true,
                 outcome,
                 start_mark_seen: record.start_mark_seen,
@@ -2176,6 +2298,10 @@ impl TerminalRenderer {
                 continue;
             };
             let record_index = match kind {
+                crate::terminal::ProjectedRowKind::BlockHeader { sequence, .. } => {
+                    command_record_index_for_sequence(records, sequence)
+                        .filter(|index| records[*index].complete)
+                }
                 crate::terminal::ProjectedRowKind::CollapsedSummary { key, .. } => {
                     command_record_index_for_sequence(records, key.zone_id)
                         .filter(|index| records[*index].complete)
@@ -2244,7 +2370,8 @@ impl TerminalRenderer {
                     })
                 }
                 crate::terminal::ProjectedRowKind::Padding
-                | crate::terminal::ProjectedRowKind::BlockSpacer { .. } => None,
+                | crate::terminal::ProjectedRowKind::BlockSpacer { .. }
+                | crate::terminal::ProjectedRowKind::CompanionStatus { .. } => None,
             };
             if let Some(index) = record_index {
                 rows_by_record
@@ -2303,14 +2430,20 @@ impl TerminalRenderer {
                     )
                 })
                 .and_then(|next| Self::projected_buffer_point(terminal, viewport, next));
+            let metadata_row = (first_row..=last_row).find(|row| matches!(viewport.row_kind(*row), Some(crate::terminal::ProjectedRowKind::BlockHeader { sequence, .. }) if sequence == record.sequence));
             let (starts_in_viewport, ends_in_viewport) =
                 projected_span_edge_flags(prompt, next_prompt, first_row, last_row);
+            let starts_in_viewport = starts_in_viewport || metadata_row == Some(first_row);
             // A display-only separator proves the card ended even when the
             // next prompt itself is just below the viewport.
             let ends_in_viewport = ends_in_viewport
                 || matches!(
                     viewport.row_kind(last_row.saturating_add(1)),
-                    Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })
+                    Some(
+                        crate::terminal::ProjectedRowKind::BlockSpacer { .. }
+                            | crate::terminal::ProjectedRowKind::CompanionStatus { .. }
+                            | crate::terminal::ProjectedRowKind::BlockHeader { .. }
+                    )
                 );
             // The newest card has no next prompt to cap it, and its idle input
             // surface has a six-row floor. Route it through the same pure rule
@@ -2341,6 +2474,8 @@ impl TerminalRenderer {
                 header_range,
                 projected_header_range,
                 projected_geometry: true,
+                metadata_row,
+                metadata_projection: Some(viewport.key()),
                 first_row_is_raw: matches!(
                     viewport.row_kind(first_row),
                     Some(crate::terminal::ProjectedRowKind::Raw)
@@ -2554,7 +2689,9 @@ impl TerminalRenderer {
         } else {
             0
         };
-        let header = if entry.projected_geometry {
+        let header = if entry.metadata_row == Some(row) {
+            true
+        } else if entry.projected_geometry {
             projected_header_contains(entry.projected_header_range, DisplayPoint::new(row, col))
         } else {
             let point = (entry.viewport_top_line_id.saturating_add(row as u64), col);
@@ -2857,13 +2994,68 @@ impl TerminalRenderer {
             let Some(geometry) = self.card_geometry(entry, content_rect, line_height, rows) else {
                 continue;
             };
-            let Some(rect) = block_action_rect(content_rect, geometry.rect, pane_rect, line_height)
-            else {
+            let header_actions = entry
+                .metadata_row
+                .and_then(|row| block_header_actions(content_rect, row, line_height));
+            if let Some((_, collapse_rect)) = header_actions {
+                let record = &terminal.command_records()[entry.span.record_index];
+                let collapsed = self.requested_collapsed_zone_ids.contains(&record.sequence);
+                let available =
+                    collapsed || terminal.finished_output_range(record.sequence).is_some();
+                let id = ui.id().with((
+                    "block-header-collapse",
+                    rendered_terminal,
+                    &entry.id,
+                    entry.metadata_row,
+                    entry.metadata_projection,
+                ));
+                let response = ui
+                    .scope_builder(
+                        egui::UiBuilder::new().id_salt(id).max_rect(collapse_rect),
+                        |ui| {
+                            ui.set_clip_rect(collapse_rect.intersect(ui.clip_rect()));
+                            ui.add_enabled_ui(interaction_enabled && available, |ui| {
+                                block_action_button_symbol(
+                                    ui,
+                                    id,
+                                    collapse_rect,
+                                    entry.active || entry.hovered,
+                                    crate::block_mode::output_collapse_menu_label(collapsed),
+                                    Some(if collapsed { "▸" } else { "▾" }),
+                                )
+                            })
+                            .inner
+                        },
+                    )
+                    .inner;
+                if response.clicked() {
+                    self.block_menu_action = Some(crate::block_mode::BlockMenuRequest {
+                        record_id: entry.id.clone(),
+                        action: if collapsed {
+                            crate::block_mode::BlockMenuAction::ExpandOutput
+                        } else {
+                            crate::block_mode::BlockMenuAction::CollapseOutput
+                        },
+                    });
+                }
+                response.on_hover_text(crate::block_mode::output_collapse_menu_label(collapsed));
+            }
+            let Some(rect) = header_actions.map(|(overflow, _)| overflow).or_else(|| {
+                entry
+                    .metadata_row
+                    .is_none()
+                    .then(|| block_action_rect(content_rect, geometry.rect, pane_rect, line_height))
+                    .flatten()
+            }) else {
                 continue;
             };
-            let id = ui
-                .id()
-                .with(("block-actions", rendered_terminal, &entry.id));
+            let id = ui.id().with((
+                "block-actions",
+                rendered_terminal,
+                &entry.id,
+                entry.metadata_row,
+                entry.metadata_projection,
+            ));
             let command = terminal
                 .command_records()
                 .iter()
@@ -2886,7 +3078,18 @@ impl TerminalRenderer {
                 .scope_builder(egui::UiBuilder::new().id_salt(id).max_rect(rect), |ui| {
                     ui.set_clip_rect(rect.intersect(ui.clip_rect()));
                     ui.add_enabled_ui(interaction_enabled, |ui| {
-                        block_action_button(ui, id, rect, entry.active || entry.hovered, &label)
+                        if entry.metadata_row.is_some() {
+                            block_action_button_symbol(
+                                ui,
+                                id,
+                                rect,
+                                entry.active || entry.hovered,
+                                &label,
+                                Some("⋮"),
+                            )
+                        } else {
+                            block_action_button(ui, id, rect, entry.active || entry.hovered, &label)
+                        }
                     })
                     .inner
                 })
@@ -3389,6 +3592,79 @@ impl TerminalRenderer {
         }
     }
 
+    fn draw_block_metadata(
+        &self,
+        painter: &egui::Painter,
+        terminal: &TerminalState,
+        entries: &[BlockChromeEntry],
+        content: egui::Rect,
+        line_height: f32,
+    ) {
+        for entry in entries {
+            let Some(row) = entry.metadata_row else {
+                continue;
+            };
+            let Some(record) = terminal.command_records().get(entry.span.record_index) else {
+                continue;
+            };
+            let (top, height) = snapped_span(content.top(), row, line_height);
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(content.left(), top),
+                egui::pos2(content.right(), top + height),
+            );
+            let Some(geometry) =
+                self.card_geometry(entry, content, line_height, terminal.grid.rows())
+            else {
+                continue;
+            };
+            let rect = rect.intersect(geometry.rect);
+            let foreground = self.theme.terminal_foreground();
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: 6,
+                    ne: 6,
+                    sw: 0,
+                    se: 0,
+                },
+                foreground.gamma_multiply(0.035),
+            );
+            let right = block_header_actions(content, row, line_height)
+                .map_or(rect.right() - 4.0, |(overflow, _)| overflow.left() - 6.0);
+            let dot = egui::pos2(rect.left() + 9.0, rect.center().y);
+            if right > dot.x + 3.0 {
+                painter.circle_filled(dot, 2.5, self.block_outcome_color(entry.outcome));
+            }
+            let mut parts = vec![block_metadata_cwd(record.cwd.as_deref())];
+            if let Some(seconds) = record
+                .started_at
+                .or(record.finished_at)
+                .and_then(crate::block_mode::epoch_secs)
+            {
+                parts.push(crate::block_mode::format_local_time_of_day(
+                    seconds,
+                    crate::block_mode::local_utc_offset_secs(seconds),
+                ));
+            }
+            if let Some(duration) = record.duration_ms {
+                parts.push(crate::block_mode::format_block_duration(duration));
+            }
+            let clip = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 19.0, top),
+                egui::pos2(right, top + height),
+            );
+            if clip.is_positive() {
+                painter.with_clip_rect(clip).text(
+                    clip.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    parts.join(" · "),
+                    FontId::proportional((self.font_size * 0.78).min(height * 0.8).max(1.0)),
+                    foreground.gamma_multiply(0.58),
+                );
+            }
+        }
+    }
+
     /// Paint foreground-only card chrome: thin border, 3px outcome stripe and
     /// a blank-cell-safe badge. The translucent card fill is intentionally a
     /// separate pre-grid pass above.
@@ -3467,6 +3743,10 @@ impl TerminalRenderer {
                     2.2,
                     egui::Stroke::new(0.7, self.theme.terminal_foreground()),
                 );
+            }
+
+            if entry.metadata_row.is_some() {
+                continue;
             }
 
             // Right-aligned outcome badge, drawn only where every cell it
@@ -3771,6 +4051,7 @@ impl TerminalRenderer {
         char_width: f32,
     ) -> Response {
         self.companion_surface = None;
+        self.companion_status_surface = None;
         let initial_scroll_offset = terminal.scroll_offset;
         let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
         terminal.kitty_graphics.set_cell_size_pixels(
@@ -3787,7 +4068,7 @@ impl TerminalRenderer {
         self.projected_kitty_rows_remaining = viewport
             .is_transformed()
             .then(|| projected_kitty_row_budget(viewport.rows()));
-        let grid = viewport.cells_arc();
+        let mut grid = viewport.cells_arc();
         let rows = viewport.rows();
         let cols = viewport.columns();
 
@@ -3814,6 +4095,29 @@ impl TerminalRenderer {
         // `None` while chrome is gated off (config, alt screen, reflow).
         let summaries = Self::projected_summary_rows(terminal, &viewport);
         let mut block_chrome = self.block_chrome_snapshot(terminal, &viewport, rows);
+        if let Some(entries) = block_chrome.as_deref() {
+            let command_ranges: Vec<_> = entries
+                .iter()
+                .filter(|entry| !entry.live)
+                .filter_map(|entry| entry.projected_header_range)
+                .collect();
+            if !command_ranges.is_empty() {
+                let cells = std::sync::Arc::make_mut(&mut grid);
+                for (start, end) in command_ranges {
+                    for row in start.row..=end.row.min(cells.len().saturating_sub(1)) {
+                        let left = if row == start.row { start.column } else { 0 };
+                        let right = if row == end.row {
+                            end.column.saturating_add(1)
+                        } else {
+                            cols
+                        };
+                        for cell in cells[row].iter_mut().take(right).skip(left) {
+                            cell.foreground = crate::terminal::Color::Blue;
+                        }
+                    }
+                }
+            }
+        }
         if block_chrome.is_none() || !interaction_enabled {
             if let Some(id) = self.context_action_popup.take() {
                 egui::Popup::close_id(ui.ctx(), id);
@@ -4202,25 +4506,34 @@ impl TerminalRenderer {
             let press_cell = click_pos.filter(|pos| pos.x < scrollbar_x).map(|pos| {
                 display_cell_from_content(pos, content_rect, char_width, line_height, cols, rows)
             });
-            let plain = press_cell.is_some()
-                && click_cursor_press_is_plain(
-                    interaction_enabled,
-                    pointer_in_content,
-                    self.dragging_scrollbar,
-                    modifiers,
-                    mouse_enabled && press_app_mouse_eligible,
-                    primary_block_gesture.is_some(),
-                    self.summary_primary_press.is_some(),
-                );
+            let plain = press_cell.is_some_and(|cell| {
+                viewport
+                    .raw_anchor_at(DisplayPoint::new(
+                        cell.row.max(0) as usize,
+                        cell.col.max(0) as usize,
+                    ))
+                    .is_some()
+            }) && click_cursor_press_is_plain(
+                interaction_enabled,
+                pointer_in_content,
+                self.dragging_scrollbar,
+                modifiers,
+                mouse_enabled && press_app_mouse_eligible,
+                primary_block_gesture.is_some(),
+                self.summary_primary_press.is_some(),
+            );
             if let Some(cell) = press_cell {
                 self.click_tracker.press(cell, plain);
                 self.click_tracker_terminal = Some(rendered_terminal);
+                self.click_tracker_projection = Some(viewport.key());
             } else {
                 self.click_tracker
                     .press(jterm_core::click_cursor::Cell::new(0, 0), false);
                 self.click_tracker_terminal = None;
             }
-        } else if self.click_tracker_terminal != Some(rendered_terminal) {
+        } else if self.click_tracker_terminal != Some(rendered_terminal)
+            || self.click_tracker_projection != Some(viewport.key())
+        {
             self.click_tracker.cancel();
             self.click_tracker_terminal = None;
         } else if let Some(cell) = pointer_display_cell {
@@ -4482,6 +4795,7 @@ impl TerminalRenderer {
         // verified against blank cells; the stripe lives wholly in the
         // layout-owned gutter, so neither path covers a glyph.
         if let Some(entries) = &block_chrome {
+            self.draw_block_metadata(&painter, terminal, entries, content_rect, line_height);
             self.draw_block_chrome(
                 &painter,
                 entries,
@@ -4722,6 +5036,15 @@ impl TerminalRenderer {
             scroll_stable: terminal.scroll_offset == initial_scroll_offset,
             projected_scroll_pending: self.projected_scroll_request.is_some(),
         };
+        if self.block_mode
+            && self.companion_status_enabled
+            && !terminal.is_alt_buffer_active()
+            && companion_facts.scroll_stable
+            && !companion_facts.projected_scroll_pending
+        {
+            self.companion_status_surface =
+                companion_status_region(&viewport, content_rect, line_height);
+        }
         if self.companion_enabled && companion_facts.allows() {
             self.companion_surface = block_chrome
                 .as_deref()
@@ -8402,6 +8725,8 @@ mod tests {
             header_range: None,
             projected_header_range: None,
             projected_geometry: false,
+            metadata_row: None,
+            metadata_projection: None,
             first_row_is_raw: true,
             outcome,
             start_mark_seen: true,
@@ -8738,5 +9063,198 @@ mod block_spacing_tests {
                 assert_eq!(terminal.grid.rows(), 16);
             }
         }
+    }
+    #[test]
+    fn native_block_header_and_status_geometry_follow_font_scale_and_dpi() {
+        for font_size in [9.0, 14.0, 24.0, 36.0] {
+            for pixels_per_point in [1.0, 1.5, 2.0] {
+                let mut renderer = TerminalRenderer::new(
+                    font_size,
+                    8.0,
+                    1.0,
+                    crate::config::ScrollbarVisibility::Auto,
+                    crate::theme::Theme::default(),
+                );
+                renderer.block_mode = true;
+                renderer.companion_status_enabled = true;
+                renderer.line_height =
+                    (font_size * 1.4 * pixels_per_point).round() / pixels_per_point;
+                for expanded in [false, true] {
+                    renderer.companion_expanded = expanded;
+                    let count = renderer.companion_status_rows();
+                    let required = if expanded {
+                        3.0 * font_size * 0.82 * 1.2 + 22.0
+                    } else {
+                        renderer.line_height
+                    };
+                    if !expanded {
+                        assert_eq!(count, 1);
+                    }
+                    assert!(count as f32 * renderer.line_height >= required);
+                    let mut terminal = TerminalState::new(40, 24);
+                    terminal.process_input(b"\x1b]133;A\x07$ ");
+                    let mut policy = crate::terminal::ProjectionPolicy::new();
+                    policy.set_block_chrome(true, count);
+                    let viewport = terminal.projected_viewport_with_state(
+                        HistoryProjection::identity(),
+                        true,
+                        &policy,
+                        &mut crate::terminal::ProjectionViewState::new(),
+                    );
+                    for width in [20.0, 70.0, 320.0, 1200.0] {
+                        let content = egui::Rect::from_min_size(
+                            egui::pos2(8.0, 8.0),
+                            egui::vec2(width, 24.0 * renderer.line_height),
+                        );
+                        let status =
+                            companion_status_region(&viewport, content, renderer.line_height)
+                                .unwrap();
+                        assert!(
+                            status.bottom()
+                                <= content.top()
+                                    + viewport.cursor().row as f32 * renderer.line_height
+                                    + 1.0
+                        );
+                        if let Some((overflow, collapse)) =
+                            block_header_actions(content, 0, renderer.line_height)
+                        {
+                            assert!(content.contains_rect(overflow));
+                            assert!(content.contains_rect(collapse));
+                            assert!(overflow.right() < collapse.left());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_metadata_row_owns_header_hit_without_owning_terminal_mouse_or_copy() {
+        let mut terminal = TerminalState::new(40, 24);
+        terminal
+            .process_input(b"\x1b]133;A\x07one\x1b]133;C\x07\x1b]133;D;0\x07\r\n\x1b]133;A\x07two");
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        policy.set_block_chrome(true, 4);
+        let viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut crate::terminal::ProjectionViewState::new(),
+        );
+        let entries = renderer
+            .compute_projected_block_chrome(&terminal, &viewport)
+            .unwrap();
+        let entry = entries.iter().find(|entry| !entry.live).unwrap();
+        assert_eq!(entry.metadata_row, Some(0));
+        assert!(entry.span.starts_in_viewport);
+        assert!(entry.span.ends_in_viewport);
+        let content = egui::Rect::from_min_size(
+            egui::pos2(40.0, 10.0),
+            egui::vec2(320.0, 24.0 * renderer.line_height),
+        );
+        renderer.last_content_rect = Some(content);
+        let point = content.min + egui::vec2(30.0, renderer.line_height * 0.5);
+        assert!(
+            renderer
+                .finished_block_at_position(
+                    &entries,
+                    point,
+                    content,
+                    renderer.line_height,
+                    viewport.rows()
+                )
+                .unwrap()
+                .1
+        );
+        assert!(!renderer.pointer_app_mouse_eligible_projected(&terminal, &viewport, point));
+        assert!(!renderer.pointer_link_eligible_projected(&terminal, &viewport, point));
+    }
+    #[test]
+    fn native_status_projection_change_between_press_and_release_never_moves_cursor() {
+        for starts_with_status in [false, true] {
+            let ctx = egui::Context::default();
+            let mut renderer = TerminalRenderer::new(
+                14.0,
+                0.0,
+                1.0,
+                crate::config::ScrollbarVisibility::Auto,
+                crate::theme::Theme::default(),
+            );
+            renderer.block_mode = true;
+            renderer.click_moves_cursor = true;
+            let mut terminal = TerminalState::new(40, 24);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07hello");
+            let mut policy = crate::terminal::ProjectionPolicy::new();
+            policy.set_block_chrome(true, if starts_with_status { 4 } else { 0 });
+            let mut state = crate::terminal::ProjectionViewState::new();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(440.0, 400.0));
+            let pointer = egui::pos2(
+                BLOCK_GUTTER_WIDTH + renderer.char_width * 3.0,
+                renderer.line_height * 0.5,
+            );
+            for phase in 0..3 {
+                if phase == 2 {
+                    policy.set_block_chrome(true, if starts_with_status { 0 } else { 4 });
+                    renderer.block_click = None;
+                }
+                let viewport = terminal.projected_viewport_with_state(
+                    HistoryProjection::identity(),
+                    true,
+                    &policy,
+                    &mut state,
+                );
+                renderer.set_projection_frame(&terminal, viewport, &policy);
+                let mut input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                if phase > 0 {
+                    input.events = vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::PointerButton {
+                            pos: pointer,
+                            button: egui::PointerButton::Primary,
+                            pressed: phase == 1,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ];
+                }
+                let mut output = ctx.run_ui(input, |ui| {
+                    renderer.render_in_rect(
+                        ui,
+                        &mut terminal,
+                        true,
+                        true,
+                        true,
+                        &crate::search::SearchState::default(),
+                        &[],
+                        &None,
+                        screen,
+                    );
+                });
+                output.textures_delta.clear();
+            }
+            assert!(renderer.cursor_move_input.is_empty());
+            assert!(renderer.block_click.is_none());
+            assert!(!terminal.has_text_selection());
+        }
+    }
+    #[test]
+    fn native_metadata_cwd_is_single_line_spoof_safe_and_bounded() {
+        let label = block_metadata_cwd(Some("/tmp/safe\nforged\u{202e}hidden\u{1b}"));
+        assert!(!label.chars().any(char::is_control));
+        assert!(!label.contains('\u{202e}'));
+        let long = block_metadata_cwd(Some(&"路".repeat(4096)));
+        assert!(long.len() <= "cwd · ".len() + crate::review_text::MAX_TOAST_BYTES);
+        assert_eq!(block_metadata_cwd(Some("/tmp/雪")), "cwd · /tmp/雪");
     }
 }

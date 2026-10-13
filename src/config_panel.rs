@@ -8,10 +8,12 @@ use jterm_core::jsh_remote::RemoteHostConfig;
 fn organism_motion_explanation(motion: Option<OrganismMotion>) -> &'static str {
     match motion {
         None => "Automatic currently uses Calm; system motion preferences are not detected.",
-        Some(OrganismMotion::Full) => "Animated poses, work rhythm and hover greetings.",
+        Some(OrganismMotion::Full) => {
+            "Animated poses, safe in-block wandering, work rhythm and hover greetings."
+        }
         Some(OrganismMotion::Calm) => "Still poses respond to work, with hover greetings.",
         Some(OrganismMotion::Static) => {
-            "Still status poses; hover greetings and output rhythm are off."
+            "Still status poses; the live body, hover greetings and output rhythm are off."
         }
     }
 }
@@ -762,13 +764,13 @@ impl ConfigPanel {
         organism_changed |= ui
             .checkbox(&mut self.edit_organism_expanded, "Expanded companion card")
             .changed();
-        ui.small("Full body and details stay visible while enabled; collapse to a compact strip. Turning ASCII Organism off releases it.");
+        ui.small("In Block mode, a low status card sits above the current input block, with a separate live body in proven empty space. Collapse the status card for a compact row.");
         ui.label("Local terminal chrome; command cards optional. Memory is volatile.");
         ui.label(organism_motion_explanation(self.edit_organism_motion));
         ui.label(
             "The live organism pauses while Settings or terminal-input overlays are open. Preview is independent.",
         );
-        ui.label("In Full or Calm, hover over the live glyph briefly to say hello.");
+        ui.label("In Full or Calm, hover over the live body briefly to say hello. It holds still during a visit; typing hides it briefly.");
         ui.label("Changes apply now; Save persists them.");
         if organism_changed {
             self.has_changes = true;

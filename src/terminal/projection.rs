@@ -51,6 +51,17 @@ pub enum ProjectedRowKind {
     BlockSpacer {
         before: RawCellAnchor,
     },
+    /// Display-only metadata. Never a terminal selection or mouse origin.
+    BlockHeader {
+        before: RawCellAnchor,
+        sequence: u64,
+    },
+    /// One row in the status card immediately preceding the live prompt.
+    CompanionStatus {
+        before: RawCellAnchor,
+        index: usize,
+        total: usize,
+    },
     CollapsedSummary {
         key: SyntheticRowKey,
         hidden_range: FinishedOutputRange,
@@ -79,6 +90,8 @@ pub struct ProjectionPolicy {
     revision: u64,
     collapsed: BTreeSet<u64>,
     block_spacing: bool,
+    block_headers: bool,
+    companion_status_rows: usize,
 }
 
 impl Default for ProjectionPolicy {
@@ -87,6 +100,8 @@ impl Default for ProjectionPolicy {
             revision: 1,
             collapsed: BTreeSet::new(),
             block_spacing: false,
+            block_headers: false,
+            companion_status_rows: 0,
         }
     }
 }
@@ -101,7 +116,10 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty() && !self.block_spacing
+        self.collapsed.is_empty()
+            && !self.block_spacing
+            && !self.block_headers
+            && self.companion_status_rows == 0
     }
 
     pub fn block_spacing(&self) -> bool {
@@ -118,6 +136,29 @@ impl ProjectionPolicy {
             return false;
         };
         self.block_spacing = enabled;
+        self.revision = revision;
+        true
+    }
+
+    pub fn block_headers(&self) -> bool {
+        self.block_headers
+    }
+
+    pub fn companion_status_rows(&self) -> usize {
+        self.companion_status_rows
+    }
+
+    /// Native card chrome changes display geometry, never PTY dimensions.
+    pub fn set_block_chrome(&mut self, headers: bool, status_rows: usize) -> bool {
+        let status_rows = status_rows.min(32);
+        if self.block_headers == headers && self.companion_status_rows == status_rows {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.block_headers = headers;
+        self.companion_status_rows = status_rows;
         self.revision = revision;
         true
     }
@@ -274,6 +315,7 @@ pub(super) struct ProjectionPlan {
     pub(super) policy_revision: u64,
     pub(super) effective_collapsed: BTreeSet<u64>,
     pub(super) spacer_count: usize,
+    pub(super) chrome_row_count: usize,
     pub(super) resolved_collapses: Vec<ResolvedCollapse>,
     /// Exact prior key and number of document rows appended by the most
     /// recent validated streaming advance. A scrolled-up view can preserve
@@ -299,6 +341,9 @@ pub(super) struct ProjectionPlanCacheKey {
     pub(super) policy_revision: u64,
     pub(super) policy_ids: SmallVec<[u64; 4]>,
     pub(super) block_spacing: bool,
+    pub(super) block_headers: bool,
+    pub(super) companion_status_rows: usize,
+    pub(super) chrome_tail_keep: usize,
     /// Canonical count of full-screen primary-buffer row transfers. Combined
     /// with the row-identity delta, this rejects any batch containing a
     /// noncanonical move. Zero is the uncacheable overflow sentinel.
@@ -417,6 +462,7 @@ impl ProjectionPlan {
             policy_revision: 0,
             effective_collapsed: BTreeSet::new(),
             spacer_count: 0,
+            chrome_row_count: 0,
             resolved_collapses: Vec::new(),
             incremental_from: None,
             incremental_appended_rows: 0,
@@ -509,6 +555,13 @@ impl ProjectionPlan {
                         self.raw_slice_count.saturating_sub(row.raw_slices.len());
                     if matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }) {
                         self.spacer_count = self.spacer_count.saturating_sub(1);
+                    }
+                    if matches!(
+                        row.kind,
+                        ProjectedRowKind::BlockHeader { .. }
+                            | ProjectedRowKind::CompanionStatus { .. }
+                    ) {
+                        self.chrome_row_count = self.chrome_row_count.saturating_sub(1);
                     }
                     self.display_row_base = self.display_row_base.saturating_add(1);
                 }
@@ -1106,7 +1159,7 @@ impl ProjectionPlan {
     }
 
     pub(super) fn has_transforms(&self) -> bool {
-        self.spacer_count > 0 || !self.effective_collapsed.is_empty()
+        self.spacer_count > 0 || self.chrome_row_count > 0 || !self.effective_collapsed.is_empty()
     }
 
     /// Splice only before a prompt which is still the first exact cell of a
@@ -1153,6 +1206,120 @@ impl ProjectionPlan {
             output.push_back(row);
         }
         self.rows = output;
+        self.rebuild_raw_row_placements();
+        self
+    }
+
+    /// Only exact whole-row prompt boundaries may gain native chrome. Empty
+    /// synthetic rows carry neither slices nor row provenance.
+    pub(super) fn splice_block_chrome(
+        mut self,
+        headers: &[(RawCellAnchor, u64)],
+        status: Option<(RawCellAnchor, usize)>,
+        retained_grid_rows: usize,
+        viewport_rows: usize,
+    ) -> Self {
+        let headers: std::collections::HashMap<_, _> = headers.iter().copied().collect();
+        let mut output = VecDeque::with_capacity(
+            self.rows.len() + headers.len() + status.map_or(0, |(_, count)| count),
+        );
+        for row in self.rows.drain(..) {
+            let first = row
+                .raw_slices
+                .first()
+                .and_then(|slice| {
+                    let origin = slice.origin?;
+                    (slice.view_col_start == 0 && origin.col_start == 0).then_some(RawCellAnchor {
+                        row_id: origin.row,
+                        column: 0,
+                    })
+                })
+                .or_else(|| {
+                    row.raw_slices
+                        .is_empty()
+                        .then_some(row.row_source)
+                        .flatten()
+                        .map(|source| RawCellAnchor {
+                            row_id: source.raw_row,
+                            column: 0,
+                        })
+                });
+            // Background output can start exactly at its column-zero prompt,
+            // so collapsing it removes the entire raw prompt row. Its exact
+            // summary owner still proves where the metadata header belongs.
+            if let ProjectedRowKind::CollapsedSummary {
+                key, hidden_range, ..
+            } = row.kind
+            {
+                let before = RawCellAnchor {
+                    row_id: hidden_range.start.row,
+                    column: hidden_range.start.col,
+                };
+                if headers.get(&before) == Some(&key.zone_id) {
+                    output.push_back(ProjectionPlanRow {
+                        raw_slices: SmallVec::new(),
+                        row_source: None,
+                        wrapped: false,
+                        kind: ProjectedRowKind::BlockHeader {
+                            before,
+                            sequence: key.zone_id,
+                        },
+                    });
+                    self.chrome_row_count += 1;
+                }
+            }
+            if matches!(row.kind, ProjectedRowKind::Raw) {
+                if let Some(before) = first {
+                    let mut push = |kind| {
+                        output.push_back(ProjectionPlanRow {
+                            raw_slices: SmallVec::new(),
+                            row_source: None,
+                            wrapped: false,
+                            kind,
+                        });
+                        self.chrome_row_count += 1;
+                    };
+                    if let Some(&sequence) = headers.get(&before) {
+                        push(ProjectedRowKind::BlockHeader { before, sequence });
+                    }
+                    if let Some((anchor, total)) = status.filter(|(anchor, _)| *anchor == before) {
+                        for index in 0..total {
+                            push(ProjectedRowKind::CompanionStatus {
+                                before: anchor,
+                                index,
+                                total,
+                            });
+                        }
+                    }
+                }
+            }
+            output.push_back(row);
+        }
+        self.rows = output;
+        // Reuse only proven trailing blank live-grid space. The raw grid is
+        // untouched and the active card retains its six-row floor. Without
+        // this bounded display trim, bottom-follow would hide a first prompt's
+        // status by scrolling down exactly the number of inserted rows.
+        if self.chrome_row_count > 0 {
+            let grid_rows = self.raw_rows.len().saturating_sub(self.history_rows);
+            let trim = grid_rows
+                .saturating_sub(retained_grid_rows)
+                .min(self.chrome_row_count + self.spacer_count)
+                .min(self.rows.len().saturating_sub(viewport_rows));
+            for _ in 0..trim {
+                if !self
+                    .rows
+                    .back()
+                    .is_some_and(|row| matches!(row.kind, ProjectedRowKind::Raw))
+                {
+                    break;
+                }
+                if let Some(row) = self.rows.pop_back() {
+                    self.raw_slice_count =
+                        self.raw_slice_count.saturating_sub(row.raw_slices.len());
+                }
+            }
+        }
         self.rebuild_raw_row_placements();
         self
     }
@@ -1263,6 +1430,8 @@ impl ProjectionPlan {
     /// that was expanded falls back to its first retained raw cell/row.
     pub(super) fn document_row_for_anchor(&self, anchor: ProjectedTopAnchor) -> Option<usize> {
         match anchor {
+            ProjectedTopAnchor::Decoration { before, kind } => self.rows.iter().position(|row| row.kind == kind)
+                .or_else(|| self.raw_cell_document_row(before)).or_else(|| self.raw_row_document_row(before.row_id)),
             ProjectedTopAnchor::Spacer { before } => self.rows.iter().position(|row| {
                 matches!(row.kind, ProjectedRowKind::BlockSpacer { before: candidate } if candidate == before)
             }).or_else(|| self.raw_cell_document_row(before))
@@ -1364,6 +1533,10 @@ pub enum ProjectionMode {
 pub(super) enum ProjectedTopAnchor {
     RawCell(RawCellAnchor),
     RawRow(RawRowId),
+    Decoration {
+        before: RawCellAnchor,
+        kind: ProjectedRowKind,
+    },
     Spacer {
         before: RawCellAnchor,
     },
@@ -2167,6 +2340,10 @@ impl ProjectedViewport {
         let view_row = self.top_padding;
         match self.row_kinds.get(view_row).copied()? {
             ProjectedRowKind::Padding => None,
+            kind @ (ProjectedRowKind::BlockHeader { before, .. }
+            | ProjectedRowKind::CompanionStatus { before, .. }) => {
+                Some(ProjectedTopAnchor::Decoration { before, kind })
+            }
             ProjectedRowKind::BlockSpacer { before } => Some(ProjectedTopAnchor::Spacer { before }),
             ProjectedRowKind::CollapsedSummary {
                 key, hidden_range, ..

@@ -2240,11 +2240,13 @@ impl TerminalApp {
         );
         let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
-        let companion_enabled = self.config.ascii_organism_enabled
-            && self.config.block_mode
+        let companion_status_enabled = self.config.ascii_organism_enabled && self.config.block_mode;
+        let companion_enabled = companion_status_enabled
             && crate::organism::resolved_motion(self.config.ascii_organism_motion)
                 != crate::config::OrganismMotion::Static;
         self.renderer.companion_enabled = companion_enabled;
+        self.renderer.companion_status_enabled = companion_status_enabled;
+        self.renderer.companion_expanded = self.config.ascii_organism_expanded;
         if !terminal_interaction_enabled {
             self.dragging_divider = None;
         }
@@ -2303,6 +2305,7 @@ impl TerminalApp {
         // Block-mode gutter clicks reported by whichever renderer drew the
         // clicked pane this frame, applied after every pane has rendered.
         let mut companion_surface = None;
+        let mut companion_status_surface = None;
         let mut pending_block_click: Option<(String, crate::block_mode::BlockClick)> = None;
         let mut pending_block_menu: Option<(String, crate::block_mode::BlockMenuRequest)> = None;
 
@@ -2351,6 +2354,14 @@ impl TerminalApp {
                     session
                         .projection_policy
                         .set_block_spacing(!self.pane_renderers[pane_idx].block_compact);
+                    self.pane_renderers[pane_idx].companion_status_enabled =
+                        companion_status_enabled && pane.focused;
+                    self.pane_renderers[pane_idx].companion_expanded =
+                        self.config.ascii_organism_expanded;
+                    session.projection_policy.set_block_chrome(
+                        self.pane_renderers[pane_idx].block_mode,
+                        self.pane_renderers[pane_idx].companion_status_rows(),
+                    );
                     let projection_policy = &session.projection_policy;
                     let projection_view_state = &mut session.projection_view_state;
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
@@ -2421,6 +2432,9 @@ impl TerminalApp {
                         content_rect,
                     );
                     if pane.focused {
+                        companion_status_surface = renderer
+                            .companion_status_surface
+                            .map(|rect| (session.metadata.session_id.clone(), rect));
                         companion_surface =
                             renderer
                                 .companion_surface
@@ -2432,6 +2446,7 @@ impl TerminalApp {
                     if let Some(request) = renderer.take_projected_scroll_request() {
                         if pane.focused {
                             companion_surface = None;
+                            companion_status_surface = None;
                         }
                         match request {
                             crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
@@ -2616,6 +2631,10 @@ impl TerminalApp {
                 session
                     .projection_policy
                     .set_block_spacing(!self.renderer.block_compact);
+                session.projection_policy.set_block_chrome(
+                    self.renderer.block_mode,
+                    self.renderer.companion_status_rows(),
+                );
                 let projection_policy = &session.projection_policy;
                 let projection_view_state = &mut session.projection_view_state;
 
@@ -2653,6 +2672,10 @@ impl TerminalApp {
                     &self.cached_links,
                     &self.hovered_link,
                 );
+                companion_status_surface = self
+                    .renderer
+                    .companion_status_surface
+                    .map(|rect| (session_id.clone(), rect));
                 companion_surface = self
                     .renderer
                     .companion_surface
@@ -2660,6 +2683,7 @@ impl TerminalApp {
                     .map(|(block, projection, rect)| (session_id.clone(), block, projection, rect));
                 if let Some(request) = self.renderer.take_projected_scroll_request() {
                     companion_surface = None;
+                    companion_status_surface = None;
                     match request {
                         crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
                             projection_view_state.set_offset(offset, &viewport);
@@ -2679,7 +2703,12 @@ impl TerminalApp {
             }
         }
 
-        self.render_native_organism(ui, companion_surface, terminal_interaction_enabled);
+        self.render_native_organism(
+            ui,
+            companion_surface,
+            companion_status_surface,
+            terminal_interaction_enabled,
+        );
 
         self.render_tab_to_pane_drop_zones(ui, ctx, &pane_drop_targets, interaction_enabled);
 

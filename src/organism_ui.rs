@@ -1,4 +1,5 @@
-//! Opt-in, volatile organism in existing egui chrome. No terminal drawing or I/O.
+//! Opt-in, volatile organism in native egui chrome and proven empty Block space.
+//! Decoration never mutates terminal cells, selection origins or terminal I/O.
 //!
 //! A single focused local session owns observation. Only authoritative Start
 //! generations admitted after a conservative acquisition quarantine can pair
@@ -25,6 +26,7 @@ use crate::organism::{
     PresentationPolicy, PreviewPose, Reaction, RenderContext, WindowLife,
 };
 use crate::terminal::{CommandRecord, CompletedCommandEvent};
+use crate::theme::ThemeExt;
 use crate::watch_adapter::WatchAdapter;
 
 const BATCH_RECORD_LIMIT: usize = 32;
@@ -133,6 +135,141 @@ fn native_body_rect(region: egui::Rect, size: egui::Vec2) -> Option<egui::Rect> 
         return None;
     }
     Some(egui::Rect::from_min_size(region.max - size, size))
+}
+
+/// Native theme tokens match the reference GTK card; no hard-coded theme.
+#[derive(Clone, Copy)]
+struct NativePalette {
+    background: egui::Color32,
+    foreground: egui::Color32,
+    quiet: egui::Color32,
+    active: egui::Color32,
+    success: egui::Color32,
+    error: egui::Color32,
+    warning: egui::Color32,
+}
+
+impl Default for NativePalette {
+    fn default() -> Self {
+        Self::from_theme(&crate::theme::Theme::default())
+    }
+}
+
+impl NativePalette {
+    fn from_theme(theme: &crate::theme::Theme) -> Self {
+        Self {
+            background: theme.terminal_background(),
+            foreground: theme.terminal_foreground(),
+            quiet: theme.ansi_color(4),
+            active: crate::theme::Theme::rgb_to_color32(theme.tabbar.active_border),
+            success: theme.ansi_color(2),
+            error: theme.ansi_color(1),
+            warning: theme.ansi_color(3),
+        }
+    }
+
+    fn body(self, behavior: Behavior) -> egui::Color32 {
+        match behavior {
+            Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => self.active,
+            Behavior::Celebrate | Behavior::CelebrateBig | Behavior::RestAfterPush => self.success,
+            Behavior::InspectError | Behavior::SitNearError => self.error,
+            Behavior::UnknownOutcome => self.warning,
+            _ => self.quiet,
+        }
+    }
+}
+
+fn alpha(color: egui::Color32, opacity: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), opacity)
+}
+
+fn organism_font(ui: &Ui, size: f32) -> egui::FontId {
+    let family = egui::FontFamily::Name("organism-monospace-bold".into());
+    let registered = ui.fonts(|fonts| fonts.definitions().families.contains_key(&family));
+    egui::FontId::new(
+        size,
+        if registered {
+            family
+        } else {
+            egui::FontFamily::Monospace
+        },
+    )
+}
+
+/// Same restrained 80-second edge-to-edge route as Anvil/Forge. Geometry is
+/// presentation only; no new life state or attention controller lives here.
+fn native_wander_phase(frame: u64, language: BodyLanguage) -> (f32, bool) {
+    if language.drowsy {
+        return (0.0, false);
+    }
+    let walk = if language.listless { 120 } else { 40 };
+    let phase = frame % 800;
+    let sit = (800 - 2 * walk) / 2;
+    if phase < sit {
+        (0.0, false)
+    } else if phase < sit + walk {
+        (((phase - sit) * 40 / walk) as f32 / 40.0, true)
+    } else if phase < 2 * sit + walk {
+        (1.0, false)
+    } else {
+        (
+            (40 - (phase - 2 * sit - walk) * 40 / walk) as f32 / 40.0,
+            true,
+        )
+    }
+}
+
+fn native_placement(
+    region: egui::Rect,
+    size: egui::Vec2,
+    context: RenderContext,
+    frame: u64,
+    wandering: bool,
+) -> Option<egui::Rect> {
+    let fitting = native_body_rect(region, size)?;
+    let fraction = if wandering {
+        native_wander_phase(
+            frame,
+            BodyLanguage {
+                listless: context.body_language.listless || context.behavior == Behavior::Explore,
+                ..context.body_language
+            },
+        )
+        .0
+    } else if matches!(
+        context.behavior,
+        Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent
+    ) {
+        1.0
+    } else {
+        0.0
+    };
+    Some(egui::Rect::from_min_size(
+        egui::pos2(
+            region.left() + (region.width() - size.x) * fraction,
+            fitting.top(),
+        ),
+        size,
+    ))
+}
+
+/// The GTK reference approaches its route target by one cell per presentation
+/// beat. Missed beats never catch up, and unrelated redraws never accelerate it.
+fn native_walk_step(
+    previous: egui::Rect,
+    target: egui::Rect,
+    cell_width: f32,
+    new_frame: bool,
+) -> egui::Rect {
+    if previous.size() != target.size() || !cell_width.is_finite() || cell_width <= 0.0 {
+        return target;
+    }
+    let x = if new_frame {
+        previous.left() + (target.left() - previous.left()).clamp(-cell_width, cell_width)
+    } else {
+        previous.left()
+    };
+    egui::Rect::from_min_size(egui::pos2(x, target.top()), target.size())
 }
 
 fn explicit_window_available(
@@ -614,6 +751,11 @@ pub struct OrganismHost {
     pointer_inside: bool,
     native_surface_identity: Option<(String, String, crate::terminal::ProjectionCacheKey)>,
     native_surface_rect: Option<egui::Rect>,
+    native_surface_region: Option<egui::Rect>,
+    native_surface_frame: Option<u64>,
+    native_surface_walking: bool,
+    palette: NativePalette,
+    reaction_status: String,
     watch: WatchAdapter,
     bridge: PaintedBridge,
     bridge_mode: bool,
@@ -643,6 +785,11 @@ impl Default for OrganismHost {
             pointer_inside: false,
             native_surface_identity: None,
             native_surface_rect: None,
+            native_surface_region: None,
+            native_surface_frame: None,
+            native_surface_walking: false,
+            palette: NativePalette::default(),
+            reaction_status: "quiet · waiting for a real Block event".into(),
             watch: WatchAdapter::default(),
             bridge: PaintedBridge::default(),
             bridge_mode: false,
@@ -974,6 +1121,7 @@ impl OrganismHost {
             BodyLanguage::from_state(self.life.state()),
             false,
         );
+        self.reaction_status = reaction.description.clone();
         self.reaction_until = now + reaction.hold_duration();
     }
 
@@ -996,6 +1144,9 @@ impl OrganismHost {
                 self.cancel_attention();
             }
             self.native_surface_rect = None;
+            self.native_surface_region = None;
+            self.native_surface_frame = None;
+            self.native_surface_walking = false;
             return;
         }
         let now = self.born.elapsed();
@@ -1034,6 +1185,9 @@ impl OrganismHost {
             self.cancel_attention();
             self.native_surface_identity = None;
             self.native_surface_rect = None;
+            self.native_surface_region = None;
+            self.native_surface_frame = None;
+            self.native_surface_walking = false;
             self.pointer_inside = false;
             return;
         }
@@ -1054,40 +1208,85 @@ impl OrganismHost {
                     .collect::<Vec<_>>(),
             )
         });
-        let layout = |context| {
+        let palette = self.palette;
+        let layout = |context: RenderContext| {
             ui.painter().layout_no_wrap(
                 sprite_frame_with_context(context, frame).into_owned(),
-                egui::FontId::monospace(14.0),
-                ui.visuals().text_color(),
+                organism_font(ui, config.font_size),
+                palette.body(context.behavior),
             )
         };
         // Measure native text; neither terminal font scaling nor a narrower
         // pane may silently clip a body over the input row.
         let base_galley = layout(context);
-        let target = surface
-            .as_ref()
-            .and_then(|(_, _, _, region)| {
-                // A stable bounded envelope keeps animated glyph widths from
-                // moving the hover target and cancelling a genuine dwell visit.
-                let size = egui::vec2(region.width().min(196.0), region.height().min(96.0));
-                let target = native_body_rect(*region, size)?;
-                native_body_rect(target, base_galley.size()).map(|_| target)
-            })
-            .filter(|_| !buttons_down);
+        // Keep a measured twelve-column envelope across all shared ASCII poses.
+        // This includes the reference 6x3 padding and 1px border on every side.
+        let envelope = ui.painter().layout_no_wrap(
+            "MMMMMMMMMMMM\nMMMMMMMMMMMM\nMMMMMMMMMMMM".into(),
+            organism_font(ui, config.font_size),
+            self.palette.quiet,
+        );
+        let size = envelope.size().max(base_galley.size()) + egui::vec2(14.0, 8.0);
         let identity = surface
             .as_ref()
             .map(|(session, block, projection, _)| (session.clone(), block.clone(), *projection));
-        let changed =
-            self.native_surface_identity != identity || self.native_surface_rect != target;
+        let region = surface.as_ref().map(|(_, _, _, region)| *region);
+        let geometry_changed =
+            self.native_surface_identity != identity || self.native_surface_region != region;
+        let previous = (!geometry_changed)
+            .then_some(self.native_surface_rect)
+            .flatten();
+        // Hover freezes even during cooldown: a visit never has to chase the cat.
+        let pointer_over_previous =
+            previous.is_some_and(|rect| pointer.is_some_and(|point| rect.contains(point)));
+        let wandering = full
+            && !self.running
+            && now >= self.reaction_until
+            && !context.body_language.drowsy
+            && matches!(context.behavior, Behavior::Idle | Behavior::Explore);
+        let mut target = region
+            .and_then(|region| {
+                if pointer_over_previous
+                    && previous
+                        .is_some_and(|rect| region.contains_rect(rect) && rect.size() == size)
+                {
+                    previous
+                } else {
+                    native_placement(region, size, context, frame, wandering)
+                }
+            })
+            .filter(|_| !buttons_down);
+        let new_frame = self.native_surface_frame != Some(frame);
+        if full && !pointer_over_previous {
+            if let Some((previous, desired)) = previous.zip(target) {
+                let cell_width = envelope.size().x / 12.0;
+                target = Some(native_walk_step(previous, desired, cell_width, new_frame));
+            }
+        }
+        let changed = geometry_changed || self.native_surface_rect != target;
         if changed {
             self.cancel_attention();
-            // Geometry is an observation, never PointerEntered. A move that
-            // carries the body underneath a stationary pointer cannot greet.
+            // Neither wandering nor a resized surface can manufacture entry
+            // underneath a stationary pointer. A physical exit/re-entry is required.
             self.pointer_inside =
-                target.is_some_and(|rect| pointer.is_some_and(|p| rect.contains(p)));
+                target.is_some_and(|rect| pointer.is_some_and(|point| rect.contains(point)));
         }
+        let walking = full
+            && wandering
+            && !pointer_over_previous
+            && !geometry_changed
+            && if new_frame {
+                previous
+                    .zip(target)
+                    .is_some_and(|(old, new)| old.min != new.min)
+            } else {
+                self.native_surface_walking
+            };
         self.native_surface_identity = identity;
+        self.native_surface_region = region;
         self.native_surface_rect = target;
+        self.native_surface_frame = target.map(|_| frame);
+        self.native_surface_walking = walking;
         let Some(owner) = self.owner.as_ref() else {
             return;
         };
@@ -1101,30 +1300,52 @@ impl OrganismHost {
                 base_context: context,
                 activity: self.activity,
                 hard_eligible: policy.body_visible(now) && !buttons_down && target.is_positive(),
-                hover_available: target.is_positive(),
+                hover_available: target.is_positive()
+                    && resolved_motion(policy.motion) != OrganismMotion::Static,
                 pointer_inside: pointer.is_some_and(|p| target.contains(p)),
             },
             target,
             if changed { &[] } else { &events },
         );
         if target.is_positive() {
-            let display = snapshot.map_or(context, |value| value.presentation);
+            let mut display = snapshot.map_or(context, |value| value.presentation);
+            display.walking = walking;
             let galley = layout(display);
-            // A greeting may be wider than the resting sprite. Recheck before
-            // paint, rather than allowing the alternate pose to escape safety.
+            let inner = target.shrink2(egui::vec2(7.0, 4.0));
             if let Some((_, _, _, region)) = surface {
-                if let Some(rect) = native_body_rect(target, galley.size()) {
-                    ui.painter().with_clip_rect(region).galley(
-                        rect.min,
-                        galley,
-                        ui.visuals().text_color(),
+                if galley.size().x <= inner.width() && galley.size().y <= inner.height() {
+                    let painter = ui.painter().with_clip_rect(region);
+                    let color = self.palette.body(display.behavior);
+                    let border = if snapshot.is_some_and(|value| value.candidate_visible)
+                        || pointer.is_some_and(|point| target.contains(point))
+                    {
+                        alpha(self.palette.foreground, 115)
+                    } else {
+                        alpha(
+                            color,
+                            if matches!(
+                                display.behavior,
+                                Behavior::InspectError | Behavior::SitNearError
+                            ) {
+                                140 // Reference error border: .55.
+                            } else if color == self.palette.quiet {
+                                82
+                            } else {
+                                128
+                            },
+                        )
+                    };
+                    // Immediate-mode decoration: each frame submits only its
+                    // current rectangle. Neither terminal cells nor GPU grid
+                    // caches contain the old body, so movement leaves no trail.
+                    painter.rect(
+                        target,
+                        6.0,
+                        alpha(self.palette.background, 204),
+                        egui::Stroke::new(1.0, border),
+                        egui::StrokeKind::Inside,
                     );
-                    if snapshot.is_some_and(|value| value.candidate_visible) {
-                        if let Some(cue) = hover_cue_rect(target, region) {
-                            ui.painter()
-                                .rect_filled(cue, 0.0, ui.visuals().weak_text_color());
-                        }
-                    }
+                    painter.galley(inner.min, galley, color);
                 } else {
                     self.cancel_attention();
                     self.native_surface_rect = None;
@@ -1137,6 +1358,278 @@ impl OrganismHost {
             ui.ctx()
                 .request_repaint_after(delay.max(Duration::from_millis(1)));
         }
+    }
+
+    /// Persistent status is part of the projected Block document, between
+    /// history and the active prompt. The host supplies origin-free rows; this
+    /// method creates no terminal text, selection origins or focus ownership.
+    fn draw_block_status(
+        &self,
+        ui: &mut Ui,
+        config: &Config,
+        surface: Option<(String, egui::Rect)>,
+        interactive: bool,
+    ) -> bool {
+        if !config.block_mode || !config.ascii_organism_enabled {
+            return false;
+        }
+        let Some((session, region)) =
+            surface.filter(|(_, rect)| rect.is_finite() && rect.is_positive())
+        else {
+            return false;
+        };
+        let now = self.born.elapsed();
+        let live = self.owner.as_deref() == Some(session.as_str());
+        let context = if live && self.running {
+            self.watch.context(
+                now,
+                BodyLanguage::from_state(self.life.state()),
+                self.rhythm_enabled,
+            )
+        } else if live {
+            self.context
+        } else {
+            PreviewPose::Calm.context()
+        };
+        let display = if live {
+            self.attention
+                .snapshot(
+                    now,
+                    &session,
+                    LiveAttentionInput {
+                        base_context: context,
+                        activity: self.activity,
+                        hard_eligible: interactive
+                            && resolved_motion(config.ascii_organism_motion)
+                                != OrganismMotion::Static,
+                        hover_available: self.native_surface_rect.is_some(),
+                        pointer_inside: self.pointer_inside,
+                    },
+                )
+                .ok()
+                .map_or(context, |snapshot| snapshot.presentation)
+        } else {
+            context
+        };
+        let palette = self.palette;
+        let color = palette.body(display.behavior);
+        let expanded = config.ascii_organism_expanded;
+        let card = region.shrink2(egui::vec2(0.0, if expanded { 3.0 } else { 1.0 }));
+        let clip = card.intersect(ui.clip_rect());
+        if !clip.is_positive() {
+            return false;
+        }
+        let painter = ui.painter().with_clip_rect(clip);
+        let (fill_alpha, border_alpha) = match display.behavior {
+            Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => (18, 230),
+            Behavior::Celebrate | Behavior::CelebrateBig | Behavior::RestAfterPush => (20, 140),
+            Behavior::InspectError | Behavior::SitNearError => (26, 178),
+            Behavior::UnknownOutcome => (18, 158),
+            _ => (9, 178),
+        };
+        painter.rect(
+            card,
+            6.0,
+            alpha(color, fill_alpha),
+            egui::Stroke::new(1.0, alpha(color, border_alpha)),
+            egui::StrokeKind::Inside,
+        );
+        let stripe =
+            egui::Rect::from_min_max(card.min, egui::pos2(card.left() + 2.0, card.bottom()));
+        painter.rect_filled(stripe, 1.0, alpha(color, 178));
+        let inner = card.shrink2(egui::vec2(12.0, if expanded { 8.0 } else { 0.0 }));
+        if !inner.is_positive() {
+            return false;
+        }
+        let control = egui::Rect::from_min_max(
+            egui::pos2((inner.right() - 24.0).max(inner.left()), inner.top()),
+            inner.max,
+        );
+        // A press belongs to this inline card at this exact allocation. It
+        // cannot migrate to the footer, another session, or a resized slot.
+        let toggle = ui
+            .push_id(
+                (
+                    "ascii-organism-block-status",
+                    &session,
+                    region.min.x.to_bits(),
+                    region.min.y.to_bits(),
+                    region.max.x.to_bits(),
+                    region.max.y.to_bits(),
+                ),
+                |ui| companion_toggle(ui, control, expanded, interactive),
+            )
+            .inner;
+        let text_right = (control.left() - 8.0).max(inner.left());
+        // The upper status card uses the reference's quieter 0.82 scale;
+        // only the independent live body uses the full terminal font size.
+        let font_size = Config::clamp_font_size(config.font_size) * 0.82;
+        let font_size = if expanded {
+            font_size
+        } else {
+            font_size.min(inner.height() / 1.2)
+        };
+        let full = resolved_motion(config.ascii_organism_motion) == OrganismMotion::Full;
+        let frame = if live && full {
+            now.as_millis() as u64 / 100
+        } else {
+            0
+        };
+        let line_height = font_size * 1.2;
+        let line = |rect: egui::Rect, text: String, size: f32, color, mono: bool| {
+            let clip = rect.intersect(clip);
+            if !clip.is_positive() || rect.width() < 8.0 {
+                return;
+            }
+            let mut job = egui::text::LayoutJob::simple(
+                text,
+                if mono {
+                    egui::FontId::monospace(size)
+                } else {
+                    egui::FontId::proportional(size)
+                },
+                color,
+                rect.width(),
+            );
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            painter.with_clip_rect(clip).galley(rect.min, galley, color);
+        };
+        if !expanded {
+            line(
+                egui::Rect::from_min_max(inner.min, egui::pos2(text_right, inner.bottom())),
+                format!(
+                    "{}  ASCII organism · {}",
+                    sticky_glyph_with_context(display, frame),
+                    live_behavior_explanation(display)
+                ),
+                font_size,
+                color,
+                true,
+            );
+            return toggle;
+        }
+        let sprite = ui.painter().layout_no_wrap(
+            sprite_frame_with_context(display, frame).into_owned(),
+            organism_font(ui, font_size),
+            color,
+        );
+        let body_width = ui
+            .painter()
+            .layout_no_wrap("MMMMMMMMMMMM".into(), organism_font(ui, font_size), color)
+            .size()
+            .x;
+        let body = egui::Rect::from_min_max(
+            inner.min,
+            egui::pos2((inner.left() + body_width).min(text_right), inner.bottom()),
+        );
+        if sprite.size().x <= body.width() && sprite.size().y <= body.height() {
+            painter.with_clip_rect(body.intersect(clip)).galley(
+                egui::pos2(body.left(), body.center().y - sprite.size().y * 0.5),
+                sprite,
+                color,
+            );
+        }
+        let details = egui::Rect::from_min_max(
+            egui::pos2((body.right() + 12.0).min(text_right), inner.top()),
+            egui::pos2(text_right, inner.bottom()),
+        );
+        let row = |index: f32| {
+            egui::Rect::from_min_size(
+                details.min + egui::vec2(0.0, index * line_height),
+                egui::vec2(details.width(), line_height),
+            )
+            .intersect(details)
+        };
+        let badge = "volatile · no LLM";
+        let badge_size = font_size * 0.82;
+        let badge_width = painter
+            .layout_no_wrap(
+                badge.into(),
+                egui::FontId::monospace(badge_size),
+                palette.foreground,
+            )
+            .size()
+            .x;
+        let title_width = painter
+            .layout_no_wrap(
+                "ASCII organism".into(),
+                egui::FontId::proportional(font_size),
+                palette.foreground,
+            )
+            .size()
+            .x;
+        let wide = details.width() >= title_width + badge_width + 16.0;
+        let mut title = row(0.0);
+        if wide {
+            title.max.x = title.min.x + title_width;
+            let badge_rect = egui::Rect::from_min_max(
+                egui::pos2(details.right() - badge_width, details.top()),
+                egui::pos2(details.right(), details.top() + line_height),
+            );
+            line(
+                badge_rect,
+                badge.into(),
+                badge_size,
+                alpha(palette.foreground, 140),
+                true,
+            );
+        }
+        line(
+            title,
+            "ASCII organism".into(),
+            font_size,
+            palette.foreground,
+            false,
+        );
+        let status = if !live {
+            "quiet · live reactions paused".to_owned()
+        } else if self.running {
+            "watching · command active".to_owned()
+        } else if now < self.reaction_until {
+            self.reaction_status.clone()
+        } else if self.cursor.is_none() {
+            "quiet · waiting for a real Block event".to_owned()
+        } else {
+            "quiet · between commands".to_owned()
+        };
+        let status_color = match display.behavior {
+            Behavior::Celebrate
+            | Behavior::CelebrateBig
+            | Behavior::RestAfterPush
+            | Behavior::InspectError
+            | Behavior::SitNearError => color,
+            _ => palette.foreground,
+        };
+        line(row(1.0), status, font_size, status_color, false);
+        let mut caption = live_behavior_explanation(display).into_owned();
+        if display.body_language.drowsy {
+            caption.push_str(" · sleepy");
+        }
+        if display.body_language.tense {
+            caption.push_str(" · subdued");
+        }
+        if display.body_language.listless {
+            caption.push_str(" · curious");
+        }
+        if !wide {
+            caption.push_str(" · volatile");
+        }
+        line(
+            row(2.0),
+            caption,
+            badge_size,
+            alpha(palette.foreground, 140),
+            true,
+        );
+        // Passive semantic surface only. The live body's bounded rectangle is
+        // the sole shared greeting target and never captures terminal input.
+        let semantic = egui::Rect::from_min_max(inner.min, egui::pos2(text_right, inner.bottom()));
+        if let Some(response) = live_semantic_response(ui, semantic, display) {
+            response.on_hover_text("ASCII organism · volatile memory · no LLM");
+        }
+        toggle
     }
 
     pub fn draw(&mut self, ui: &mut Ui, config: &Config, focused: bool, interactive: bool) -> bool {
@@ -1196,6 +1689,21 @@ impl OrganismHost {
         } else {
             self.context
         };
+        if config.block_mode {
+            // Block mode owns real display-only rows immediately above input.
+            // Do not reserve a duplicate bottom panel or make footer hover the
+            // only way to see the organism. Physiology still advances above.
+            let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
+            let next = next_host_wake(policy, now, self.reaction_until, dormant);
+            let watch_wake = self
+                .rhythm_enabled
+                .then(|| self.watch.wake_after(now))
+                .flatten();
+            if let Some(delay) = next.into_iter().chain(watch_wake).min() {
+                ui.ctx().request_repaint_after(delay);
+            }
+            return false;
+        }
         let (pointer, buttons_down, pointer_events) = ui.ctx().input(|input| {
             (
                 input.pointer.hover_pos(),
@@ -1564,6 +2072,7 @@ impl crate::TerminalApp {
             crate::terminal::ProjectionCacheKey,
             egui::Rect,
         )>,
+        status_surface: Option<(String, egui::Rect)>,
         frame_interactive: bool,
     ) {
         // Pane focus may have changed during this same terminal frame.
@@ -1571,8 +2080,19 @@ impl crate::TerminalApp {
         let interactive = frame_interactive
             && !self.terminal_input_blocked(ui.ctx())
             && !self.active_terminal_is_read_only();
+        self.organism.palette = NativePalette::from_theme(&self.current_theme);
         self.organism
             .draw_native_body(ui, &self.config, surface, interactive);
+        if self
+            .organism
+            .draw_block_status(ui, &self.config, status_surface, interactive)
+        {
+            self.config.ascii_organism_expanded = !self.config.ascii_organism_expanded;
+            self.config_panel.sync_from_config(&self.config);
+            self.force_resize_session = true;
+            self.schedule_config_save();
+            ui.ctx().request_repaint();
+        }
     }
 
     pub(crate) fn render_organism(&mut self, ui: &mut Ui) {
@@ -2244,6 +2764,261 @@ mod tests {
     }
 
     #[test]
+    fn native_wander_matches_reference_cycle_and_never_leaves_safe_space() {
+        let ordinary = BodyLanguage::default();
+        assert_eq!(native_wander_phase(0, ordinary), (0.0, false));
+        assert_eq!(native_wander_phase(359, ordinary), (0.0, false));
+        assert_eq!(native_wander_phase(380, ordinary), (0.5, true));
+        assert_eq!(native_wander_phase(400, ordinary), (1.0, false));
+        assert_eq!(native_wander_phase(780, ordinary), (0.5, true));
+        assert_eq!(native_wander_phase(800, ordinary), (0.0, false));
+        for scale in [0.75, 1.0, 1.25, 1.5, 2.0, 3.0] {
+            let region = egui::Rect::from_min_size(
+                egui::pos2(20.0, 100.0),
+                egui::vec2(640.0, 160.0) * scale,
+            );
+            let size = egui::vec2(116.0, 62.0) * scale;
+            let context = PreviewPose::Calm.context();
+            for frame in 0..1600 {
+                let rect = native_placement(region, size, context, frame, true).unwrap();
+                assert!(region.contains_rect(rect), "scale {scale}, frame {frame}");
+                assert_eq!(rect.bottom(), region.bottom());
+                assert_eq!(
+                    native_placement(region, size, context, frame, false),
+                    native_placement(region, size, context, 0, false)
+                );
+                assert_eq!(
+                    native_wander_phase(
+                        frame,
+                        BodyLanguage {
+                            drowsy: true,
+                            ..ordinary
+                        }
+                    ),
+                    (0.0, false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_walk_speed_matches_cell_cadence_without_redraw_or_resume_catchup() {
+        let old = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(120.0, 60.0));
+        let far = old.translate(egui::vec2(1200.0, 0.0));
+        assert_eq!(native_walk_step(old, far, 8.0, false), old);
+        let step = native_walk_step(old, far, 8.0, true);
+        assert_eq!(step.left(), old.left() + 8.0);
+        assert_eq!(step.size(), old.size());
+        assert_eq!(native_walk_step(step, old, 8.0, true), old);
+        let nearby = old.translate(egui::vec2(3.0, 0.0));
+        assert_eq!(native_walk_step(old, nearby, 8.0, true), nearby);
+        // Safety-critical output/resize y snaps immediately; horizontal motion
+        // still cannot catch up after a hidden/suspended interval.
+        let below = far.translate(egui::vec2(0.0, 40.0));
+        assert_eq!(native_walk_step(old, below, 8.0, true).top(), below.top());
+    }
+
+    #[test]
+    fn native_hover_freezes_wander_without_resizing_or_capturing_input() {
+        let ctx = egui::Context::default();
+        let mut host = OrganismHost::default();
+        host.acquire(Some("local"), None, false);
+        host.context = PreviewPose::Calm.context();
+        host.activity = LiveActivityKnowledge::KnownIdle;
+        let config = Config {
+            block_mode: true,
+            ascii_organism_enabled: true,
+            ascii_organism_motion: Some(OrganismMotion::Full),
+            ..Config::default()
+        };
+        let region = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(600.0, 240.0));
+        native_test_frame(
+            &mut host,
+            &ctx,
+            &config,
+            "active",
+            region,
+            vec![egui::Event::PointerMoved(egui::pos2(20.0, 20.0))],
+            true,
+        );
+        let nest = host.native_surface_rect.unwrap();
+        native_test_frame(
+            &mut host,
+            &ctx,
+            &config,
+            "active",
+            region,
+            vec![egui::Event::PointerMoved(nest.center())],
+            true,
+        );
+        host.born = Instant::now() - Duration::from_secs(39);
+        native_test_frame(&mut host, &ctx, &config, "active", region, vec![], true);
+        assert_eq!(
+            host.native_surface_rect,
+            Some(nest),
+            "hover holds the complete target"
+        );
+        host.born = Instant::now() - Duration::from_millis(39_100);
+        native_test_frame(
+            &mut host,
+            &ctx,
+            &config,
+            "active",
+            region,
+            vec![egui::Event::PointerMoved(egui::pos2(20.0, 20.0))],
+            true,
+        );
+        let moved = host.native_surface_rect.unwrap();
+        assert!(moved.left() > nest.left());
+        assert_eq!(moved.size(), nest.size());
+        assert!(region.contains_rect(moved));
+    }
+
+    #[test]
+    fn block_status_is_visible_without_hover_and_all_annotation_paint_is_clipped() {
+        for expanded in [false, true] {
+            for width in [32.0, 120.0, 220.0, 640.0, 1800.0] {
+                for font_size in [8.0, 14.0, 24.0, 40.0] {
+                    let ctx = egui::Context::default();
+                    let host = OrganismHost::default();
+                    let config = Config {
+                        block_mode: true,
+                        ascii_organism_enabled: true,
+                        ascii_organism_expanded: expanded,
+                        font_size,
+                        ascii_organism_motion: Some(OrganismMotion::Static),
+                        ..Config::default()
+                    };
+                    let height = if expanded {
+                        font_size * 0.82 * 1.2 * 3.0 + 22.0
+                    } else {
+                        font_size
+                    };
+                    let region = egui::Rect::from_min_size(
+                        egui::pos2(20.0, 40.0),
+                        egui::vec2(width, height),
+                    );
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(2048.0, 600.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            assert!(!host.draw_block_status(
+                                ui,
+                                &config,
+                                Some(("local".into(), region)),
+                                false
+                            ));
+                        },
+                    );
+                    let text: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) => Some((shape.clip_rect, text)),
+                            _ => None,
+                        })
+                        .collect();
+                    if width >= 640.0 && font_size <= 24.0 {
+                        assert!(
+                            text.iter()
+                                .any(|(_, text)| text.galley.text().contains("ASCII organism")),
+                            "resting status must not require pointer hover"
+                        );
+                    }
+                    for (clip, text) in text {
+                        assert!(region.contains_rect(clip), "{clip:?} escapes {region:?}");
+                        assert!(text.galley.rows.len() <= 3);
+                    }
+                    output.textures_delta.clear();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_status_resize_does_not_migrate_an_armed_toggle_press() {
+        for resize in [false, true] {
+            let ctx = egui::Context::default();
+            let host = OrganismHost::default();
+            let config = Config {
+                block_mode: true,
+                ascii_organism_enabled: true,
+                ascii_organism_expanded: true,
+                ..Config::default()
+            };
+            let point = egui::pos2(636.0, 75.0);
+            let mut clicks = 0;
+            for frame in 0..3 {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(20.0, 40.0),
+                    egui::vec2(if resize && frame == 2 { 642.0 } else { 640.0 }, 84.0),
+                );
+                let events = match frame {
+                    1 => vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    2 => vec![egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    _ => vec![],
+                };
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        clicks += usize::from(host.draw_block_status(
+                            ui,
+                            &config,
+                            Some(("local".into(), rect)),
+                            true,
+                        ));
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert_eq!(clicks, usize::from(!resize));
+        }
+    }
+
+    #[test]
+    fn block_mode_advances_host_without_reserving_duplicate_footer() {
+        let ctx = egui::Context::default();
+        let mut host = OrganismHost::default();
+        let config = Config {
+            block_mode: true,
+            ascii_organism_enabled: true,
+            ascii_organism_expanded: true,
+            ..Config::default()
+        };
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let before = ui.available_rect_before_wrap();
+            assert!(!host.draw(ui, &config, true, true));
+            assert_eq!(before, ui.available_rect_before_wrap());
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn native_body_projection_change_retires_old_core_ticket_at_same_rectangle() {
         let ctx = egui::Context::default();
         let mut host = OrganismHost::default();
@@ -2271,7 +3046,7 @@ mod tests {
             &config,
             "same",
             region,
-            vec![egui::Event::PointerMoved(egui::pos2(450.0, 200.0))],
+            vec![egui::Event::PointerMoved(egui::pos2(140.0, 200.0))],
             true,
         );
         let owner = String::from("local");
@@ -2357,7 +3132,7 @@ mod tests {
             &config,
             "block-a",
             region,
-            vec![egui::Event::PointerMoved(egui::pos2(450.0, 200.0))],
+            vec![egui::Event::PointerMoved(egui::pos2(140.0, 200.0))],
             true,
         );
         let owner = String::from("local");
@@ -2405,7 +3180,7 @@ mod tests {
             &config,
             "block-b",
             shifted,
-            vec![egui::Event::PointerMoved(egui::pos2(440.0, 200.0))],
+            vec![egui::Event::PointerMoved(egui::pos2(130.0, 200.0))],
             true,
         );
         assert!(host
@@ -2439,7 +3214,10 @@ mod tests {
         assert!(host.native_surface_rect.is_none());
         config.ascii_organism_motion = Some(OrganismMotion::Static);
         native_test_frame(&mut host, &ctx, &config, "current", region, vec![], true);
-        assert!(host.native_surface_rect.is_none());
+        assert!(
+            host.native_surface_rect.is_none(),
+            "Static keeps only the status card"
+        );
         config.ascii_organism_motion = Some(OrganismMotion::Calm);
         native_test_frame(
             &mut host,
@@ -2478,7 +3256,7 @@ mod tests {
             .split("    fn draw_native_body(")
             .nth(1)
             .unwrap()
-            .split("    pub fn draw(")
+            .split("    fn draw_block_status(")
             .next()
             .unwrap();
         for forbidden in [
@@ -2971,6 +3749,7 @@ mod tests {
             ctx.enable_accesskit();
             let mut host = OrganismHost::default();
             let config = Config {
+                block_mode: false,
                 ascii_organism_enabled: true,
                 ascii_organism_expanded: true,
                 ascii_organism_motion: motion,

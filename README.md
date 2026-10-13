@@ -65,6 +65,30 @@ claimed.
 - Crash-safe atomic state writes, bounded session restore, corrupt-snapshot
   quarantine and hardened private lock/journal files
 
+### Block presentation and ASCII organism
+
+Block Mode uses a quiet metadata header above each completed command: outcome,
+working directory, time and duration, with overflow and collapse controls
+on the right. Commands use the theme's blue; output keeps its terminal colors.
+The live input retains its accent border and six-row minimum. Metadata and
+inter-card spacing are display-only rows, with no terminal copy, selection or
+application mouse origin.
+
+When ASCII Organism is enabled, its compact status card appears between history
+and the current input block, rather than duplicating the bottom companion strip.
+The separate live body uses only fully visible, proven empty space in the active
+card. Its font follows terminal scaling; its rounded border, subdued background
+and hover border match the Anvil/Forge native presentation. Typing, selection,
+composition, images, unsafe clipping and application mouse ownership hide the
+body instead of allowing it to cover text.
+
+Full motion uses the reference's restrained 80-second edge-to-edge wander cycle;
+hovering holds its position. Calm retains a still body. Static keeps only the
+status card and disables the live body, hover greetings and periodic animation.
+The shared organism model remains the source of poses, body language, reactions
+and attention. Memory stays volatile.
+Outside Block Mode, the existing bottom companion remains available.
+
 ### Kitty graphics compatibility
 
 ember implements the core 7-bit Kitty graphics APC path for direct RGB,

@@ -607,6 +607,22 @@ fn configure_fonts_and_gpu(
         data
     };
 
+    let mut organism_bold_fallbacks = fonts
+        .families
+        .get(&egui::FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(bytes) = bold_font_data.as_ref() {
+        fonts.font_data.insert(
+            "organism-monospace-bold".to_owned(),
+            egui::FontData::from_owned(bytes.clone()).into(),
+        );
+        organism_bold_fallbacks.insert(0, "organism-monospace-bold".to_owned());
+    }
+    fonts.families.insert(
+        egui::FontFamily::Name("organism-monospace-bold".into()),
+        organism_bold_fallbacks,
+    );
     ctx.set_fonts(fonts);
 
     if let (Some(render_state), Some(font_bytes)) = (wgpu_render_state, mono_font_data) {
@@ -1315,6 +1331,9 @@ fn projected_viewport_for_session(
     session
         .projection_policy
         .set_block_spacing(!renderer.block_compact);
+    session
+        .projection_policy
+        .set_block_chrome(renderer.block_mode, renderer.companion_status_rows());
     let policy = &session.projection_policy;
     let view_state = &mut session.projection_view_state;
     let mut terminal = terminal.lock();
@@ -1338,9 +1357,9 @@ fn application_cell_at_pointer(
     viewport.application_cell(terminal::DisplayPoint::new(row, col))
 }
 
-/// Display-only block whitespace cannot inject a PRIMARY/clipboard paste.
-/// Keep the existing host behavior for real history rows and pane padding.
-fn pointer_is_block_spacer(
+/// Display-only block chrome cannot inject a PRIMARY/clipboard paste.
+/// Real history rows remain eligible inside the terminal content rectangle.
+fn pointer_is_block_decoration(
     pointer: egui::Pos2,
     content_rect: egui::Rect,
     char_width: f32,
@@ -1360,8 +1379,111 @@ fn pointer_is_block_spacer(
     );
     matches!(
         viewport.row_kind(row),
-        Some(terminal::ProjectedRowKind::BlockSpacer { .. })
+        Some(
+            terminal::ProjectedRowKind::BlockSpacer { .. }
+                | terminal::ProjectedRowKind::BlockHeader { .. }
+                | terminal::ProjectedRowKind::CompanionStatus { .. }
+                | terminal::ProjectedRowKind::CollapsedSummary { .. }
+        )
     )
+}
+
+/// Admission is evaluated at each native button event, including its own Shift
+/// modifier. A later pointer position or modifier cannot turn an outside/app
+/// press into a host paste gesture in the same frame. Motion has no modifier
+/// payload (`None`), so it can only cancel on geometry/decoration; it never arms
+/// a gesture or changes the button events' ownership decision.
+fn middle_paste_event_eligible(
+    renderer: &TerminalRenderer,
+    terminal: &TerminalState,
+    viewport: &terminal::ProjectedViewport,
+    pos: egui::Pos2,
+    modifiers: Option<egui::Modifiers>,
+) -> bool {
+    let Some(content_rect) = renderer.last_content_rect.filter(|rect| {
+        rect.is_finite()
+            && rect.contains(pos)
+            && renderer.char_width.is_finite()
+            && renderer.char_width > 0.0
+            && renderer.line_height.is_finite()
+            && renderer.line_height > 0.0
+    }) else {
+        return false;
+    };
+    !pointer_is_block_decoration(
+        pos,
+        content_rect,
+        renderer.char_width,
+        renderer.line_height,
+        viewport,
+    ) && modifiers.is_none_or(|modifiers| {
+        !terminal.is_mouse_enabled()
+            || modifiers.shift
+            || !renderer.pointer_app_mouse_eligible_projected(terminal, viewport, pos)
+    })
+}
+
+/// Host PRIMARY paste owns a gesture separately from the application's mouse
+/// capture. Neither projection changes nor an initially synthetic press can
+/// migrate into permission to paste on release.
+#[derive(Clone, Debug, PartialEq)]
+struct MiddlePastePress {
+    session_id: String,
+    terminal: usize,
+    projection: terminal::ProjectionCacheKey,
+    content_rect: egui::Rect,
+    metrics: [u32; 2],
+}
+
+fn track_middle_paste_gesture(
+    press: &mut Option<MiddlePastePress>,
+    current: &MiddlePastePress,
+    host_allowed: bool,
+    eligible_at: impl Fn(egui::Pos2, Option<egui::Modifiers>) -> bool,
+    events: &[egui::Event],
+    clicked: bool,
+    down: bool,
+) -> bool {
+    if !host_allowed || press.as_ref().is_some_and(|origin| origin != current) {
+        *press = None;
+    }
+    let mut accepted = false;
+    for event in events {
+        match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers,
+            } => {
+                accepted = false;
+                *press =
+                    (host_allowed && eligible_at(*pos, Some(*modifiers))).then(|| current.clone());
+            }
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Middle,
+                pressed: false,
+                modifiers,
+            } => {
+                accepted = clicked
+                    && host_allowed
+                    && eligible_at(*pos, Some(*modifiers))
+                    && press.as_ref() == Some(current);
+                *press = None;
+            }
+            egui::Event::PointerMoved(pos) if !eligible_at(*pos, None) => *press = None,
+            egui::Event::PointerGone | egui::Event::WindowFocused(false) => {
+                *press = None;
+                accepted = false;
+            }
+            _ => {}
+        }
+    }
+    if !down {
+        *press = None;
+    }
+    accepted
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6966,27 +7088,69 @@ impl eframe::App for TerminalApp {
             ctx.request_repaint();
         }
 
-        let pointer_on_block_spacer = pointer_pos.is_some_and(|pos| {
-            let renderer = active_pane_renderer_idx
-                .and_then(|index| self.pane_renderers.get(index))
-                .unwrap_or(&self.renderer);
-            renderer.last_content_rect.is_some_and(|rect| {
-                pointer_is_block_spacer(
-                    pos,
-                    rect,
-                    renderer.char_width,
-                    renderer.line_height,
-                    &mouse_projection_viewport,
-                )
-            })
-        });
-        let middle_paste_requested = session.purpose
+        let middle_host_allowed = session.purpose
             != crate::session::SessionPurpose::RetainedCommand
             && !terminal_pointer_input_blocked
-            && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
-            && pointer_over_active_terminal
-            && !pointer_on_block_spacer
-            && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
+            && pointer_over_active_terminal;
+        let middle_gesture_id = egui::Id::new("terminal-host-middle-paste-gesture");
+        let mut middle_press =
+            ctx.data(|data| data.get_temp::<MiddlePastePress>(middle_gesture_id));
+        let renderer = active_pane_renderer_idx
+            .and_then(|index| self.pane_renderers.get(index))
+            .unwrap_or(&self.renderer);
+        let middle_paste_requested = if let Some(content_rect) =
+            renderer.last_content_rect.filter(|rect| {
+                rect.is_finite()
+                    && renderer.char_width.is_finite()
+                    && renderer.char_width > 0.0
+                    && renderer.line_height.is_finite()
+                    && renderer.line_height > 0.0
+            }) {
+            let current = MiddlePastePress {
+                session_id: active_session_id.clone(),
+                terminal: Arc::as_ptr(&session.terminal) as usize,
+                projection: mouse_projection_viewport.key(),
+                content_rect,
+                metrics: [
+                    renderer.char_width.to_bits(),
+                    renderer.line_height.to_bits(),
+                ],
+            };
+            let (clicked, down) = ctx.input(|input| {
+                (
+                    input.pointer.button_clicked(egui::PointerButton::Middle),
+                    input.pointer.button_down(egui::PointerButton::Middle),
+                )
+            });
+            let terminal = session.terminal.lock();
+            track_middle_paste_gesture(
+                &mut middle_press,
+                &current,
+                middle_host_allowed,
+                |pos, modifiers| {
+                    middle_paste_event_eligible(
+                        renderer,
+                        &terminal,
+                        &mouse_projection_viewport,
+                        pos,
+                        modifiers,
+                    )
+                },
+                &self.frame_events,
+                clicked,
+                down,
+            )
+        } else {
+            middle_press = None;
+            false
+        };
+        ctx.data_mut(|data| {
+            if let Some(press) = middle_press {
+                data.insert_temp(middle_gesture_id, press);
+            } else {
+                data.remove::<MiddlePastePress>(middle_gesture_id);
+            }
+        });
 
         if !terminal_pointer_input_blocked
             && pointer_over_active_terminal
@@ -7891,18 +8055,19 @@ mod tests {
         encode_submitted_command, ensure_direct_paste_route_available,
         flush_pending_mouse_controls, fontconfig_match_family_file, kitty_graphics_payload,
         link_activation_dragged, link_activation_ready, link_activation_release_allowed,
-        link_at_pointer, maybe_notify_long_command, mouse_capture_accepts_new_press,
-        mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
-        mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
-        normalized_paste_body, osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
-        paste_requires_confirmation, pointer_is_block_spacer, primary_copy_route,
+        link_at_pointer, maybe_notify_long_command, middle_paste_event_eligible,
+        mouse_capture_accepts_new_press, mouse_cell_for_current_dimensions,
+        mouse_lossy_reports_allowed, mouse_press_reports_to_app, mouse_protocol_input_is_blocked,
+        mouse_sequence_allows_lossy, mouse_sequence_is_complete, normalized_paste_body,
+        osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
+        paste_requires_confirmation, pointer_is_block_decoration, primary_copy_route,
         queue_mouse_control, reported_capture_button, roll_notification_rate_window,
         should_notify_long_command, should_send_alternate_scroll, show_desktop_notification,
-        snapshot_age_label, take_tagged_cursor_move, workspace_drag_pointer_cancelled,
-        ClipboardRequestGuard, DesktopNotification, Osc52ReadRateLimit, PasteOrigin,
-        PasteWriteError, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
-        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
-        OSC_5522_DATA_CHUNK_BYTES,
+        snapshot_age_label, take_tagged_cursor_move, track_middle_paste_gesture,
+        workspace_drag_pointer_cancelled, ClipboardRequestGuard, DesktopNotification,
+        MiddlePastePress, Osc52ReadRateLimit, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
+        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
+        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -8135,21 +8300,21 @@ mod tests {
                     content.top() + (row as f32 + 0.5) * line_height,
                 )
             };
-            assert!(pointer_is_block_spacer(
+            assert!(pointer_is_block_decoration(
                 point(spacer),
                 content,
                 10.0,
                 line_height,
                 &viewport
             ));
-            assert!(!pointer_is_block_spacer(
+            assert!(!pointer_is_block_decoration(
                 point(spacer + 1),
                 content,
                 10.0,
                 line_height,
                 &viewport
             ));
-            assert!(!pointer_is_block_spacer(
+            assert!(!pointer_is_block_decoration(
                 content.min - egui::vec2(1.0, 1.0),
                 content,
                 10.0,
@@ -8170,7 +8335,7 @@ mod tests {
         );
         let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 160.0));
         for row in 0..8 {
-            assert!(!pointer_is_block_spacer(
+            assert!(!pointer_is_block_decoration(
                 egui::pos2(5.0, row as f32 * 20.0 + 10.0),
                 content,
                 10.0,
@@ -8178,6 +8343,430 @@ mod tests {
                 &compact
             ));
         }
+    }
+
+    #[test]
+    fn middle_paste_rejects_all_native_block_decorations_and_keeps_app_release_pairing() {
+        let mut terminal = crate::terminal::TerminalState::new(24, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07out2\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let sequence = terminal.command_records()[0].sequence;
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        policy.set_block_chrome(true, 4);
+        policy.collapse(sequence);
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut crate::terminal::ProjectionViewState::new(),
+        );
+        let mut seen = [false; 4];
+        for line_height in [12.0, 20.0, 32.0] {
+            let content = egui::Rect::from_min_size(
+                egui::pos2(30.0, 40.0),
+                egui::vec2(240.0, line_height * 24.0),
+            );
+            for (row, kind) in viewport.row_kinds().iter().enumerate() {
+                let index = match kind {
+                    crate::terminal::ProjectedRowKind::BlockSpacer { .. } => Some(0),
+                    crate::terminal::ProjectedRowKind::BlockHeader { .. } => Some(1),
+                    crate::terminal::ProjectedRowKind::CompanionStatus { .. } => Some(2),
+                    crate::terminal::ProjectedRowKind::CollapsedSummary { .. } => Some(3),
+                    _ => None,
+                };
+                let point = content.min + egui::vec2(5.0, (row as f32 + 0.5) * line_height);
+                assert_eq!(
+                    pointer_is_block_decoration(point, content, 10.0, line_height, &viewport),
+                    index.is_some()
+                );
+                if let Some(index) = index {
+                    seen[index] = true;
+                    let cell =
+                        application_cell_at_pointer(point, content, 10.0, line_height, &viewport);
+                    assert_eq!(cell, None);
+                    assert!(!app_mouse_press_reports_from_snapshot(true, cell));
+                    let route = app_mouse_frame_route(true, Some(cell), Some((3, 7)));
+                    assert_eq!(route.lossy_cell, None);
+                    assert_eq!(route.release_cell, Some((3, 7)));
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|seen| seen));
+    }
+
+    #[test]
+    fn middle_paste_synthetic_press_cannot_migrate_to_raw_on_release() {
+        let mut terminal = crate::terminal::TerminalState::new(24, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        policy.set_block_chrome(true, 4);
+        policy.collapse(terminal.command_records()[0].sequence);
+        let synthetic = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut crate::terminal::ProjectionViewState::new(),
+        );
+        let raw =
+            terminal.projected_viewport(crate::terminal::HistoryProjection::identity(), false);
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 480.0));
+        let identity = |view: &crate::terminal::ProjectedViewport| MiddlePastePress {
+            session_id: "same-session".into(),
+            terminal: 7,
+            projection: view.key(),
+            content_rect: content,
+            metrics: [10.0f32.to_bits(), 20.0f32.to_bits()],
+        };
+        let down = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let up = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut checked = 0;
+        for row in 0..synthetic.rows() {
+            let pos = egui::pos2(5.0, row as f32 * 20.0 + 10.0);
+            if !pointer_is_block_decoration(pos, content, 10.0, 20.0, &synthetic) {
+                continue;
+            }
+            checked += 1;
+            let mut press = None;
+            assert!(!track_middle_paste_gesture(
+                &mut press,
+                &identity(&synthetic),
+                true,
+                |point, _| !pointer_is_block_decoration(point, content, 10.0, 20.0, &synthetic),
+                &[down(pos)],
+                false,
+                true
+            ));
+            assert!(press.is_none());
+            assert!(raw
+                .raw_anchor_at(crate::terminal::DisplayPoint::new(row, 0))
+                .is_some());
+            assert!(!track_middle_paste_gesture(
+                &mut press,
+                &identity(&raw),
+                true,
+                |_, _| true,
+                &[up(pos)],
+                true,
+                false
+            ));
+            let route = app_mouse_frame_route(true, Some(None), Some((4, 9)));
+            assert_eq!(route.release_cell, Some((4, 9)));
+        }
+        assert!(checked >= 4);
+        let pos = egui::pos2(5.0, 10.0);
+        let raw_identity = identity(&raw);
+        for mutation in 0..6 {
+            let mut press = None;
+            assert!(!track_middle_paste_gesture(
+                &mut press,
+                &raw_identity,
+                true,
+                |_, _| true,
+                &[down(pos)],
+                false,
+                true
+            ));
+            let mut release = raw_identity.clone();
+            match mutation {
+                0 => release.session_id.push('2'),
+                1 => release.terminal += 1,
+                2 => release.projection = synthetic.key(),
+                3 => release.content_rect = release.content_rect.translate(egui::vec2(1.0, 0.0)),
+                4 => release.metrics[1] = 21.0f32.to_bits(),
+                _ => {}
+            }
+            assert_eq!(
+                track_middle_paste_gesture(
+                    &mut press,
+                    &release,
+                    true,
+                    |_, _| true,
+                    &[up(pos)],
+                    true,
+                    false
+                ),
+                mutation == 5
+            );
+            assert!(press.is_none());
+        }
+        let mut app_press = None;
+        assert!(!track_middle_paste_gesture(
+            &mut app_press,
+            &raw_identity,
+            false,
+            |_, _| true,
+            &[down(pos)],
+            false,
+            true
+        ));
+        assert!(!track_middle_paste_gesture(
+            &mut app_press,
+            &raw_identity,
+            true,
+            |_, _| true,
+            &[up(pos)],
+            true,
+            false
+        ));
+        let mut interrupted = None;
+        assert!(!track_middle_paste_gesture(
+            &mut interrupted,
+            &raw_identity,
+            true,
+            |_, _| true,
+            &[down(pos)],
+            false,
+            true
+        ));
+        assert!(!track_middle_paste_gesture(
+            &mut interrupted,
+            &raw_identity,
+            true,
+            |_, _| true,
+            &[egui::Event::WindowFocused(false), up(pos)],
+            true,
+            false
+        ));
+        let mut press = None;
+        assert!(!track_middle_paste_gesture(
+            &mut press,
+            &raw_identity,
+            true,
+            |point, _| point.y > 20.0,
+            &[down(pos), up(egui::pos2(5.0, 30.0))],
+            true,
+            false
+        ));
+    }
+
+    fn middle_paste_event_test_surface() -> (
+        crate::ui::TerminalRenderer,
+        TerminalState,
+        crate::terminal::ProjectedViewport,
+        MiddlePastePress,
+    ) {
+        let mut terminal = TerminalState::new(24, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b[?1000h");
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        policy.set_block_chrome(true, 4);
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut crate::terminal::ProjectionViewState::new(),
+        );
+        let mut renderer = crate::ui::TerminalRenderer::new(
+            14.0,
+            0.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        renderer.char_width = 10.0;
+        renderer.line_height = 20.0;
+        let content = egui::Rect::from_min_size(egui::pos2(30.0, 40.0), egui::vec2(240.0, 480.0));
+        renderer.last_content_rect = Some(content);
+        let identity = MiddlePastePress {
+            session_id: "event-local-session".into(),
+            terminal: 7,
+            projection: viewport.key(),
+            content_rect: content,
+            metrics: [10.0f32.to_bits(), 20.0f32.to_bits()],
+        };
+        (renderer, terminal, viewport, identity)
+    }
+
+    #[test]
+    fn middle_paste_same_batch_outside_press_cannot_migrate_inside() {
+        let (renderer, terminal, viewport, identity) = middle_paste_event_test_surface();
+        let content = identity.content_rect;
+        let eligible = |pos, modifiers| {
+            middle_paste_event_eligible(&renderer, &terminal, &viewport, pos, modifiers)
+        };
+        let host = (0..viewport.rows())
+            .map(|row| content.min + egui::vec2(5.0, row as f32 * 20.0 + 10.0))
+            .find(|pos| eligible(*pos, Some(egui::Modifiers::NONE)))
+            .expect("a real finished command row is host-owned");
+        for outside in [
+            egui::pos2(content.left() - 1.0, host.y),
+            egui::pos2(content.right() + 1.0, host.y),
+            egui::pos2(host.x, content.top() - 1.0),
+            egui::pos2(host.x, content.bottom() + 1.0),
+        ] {
+            assert!(!eligible(outside, Some(egui::Modifiers::NONE)));
+            let events = [
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Middle,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: host,
+                    button: egui::PointerButton::Middle,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let mut press = None;
+            assert!(!track_middle_paste_gesture(
+                &mut press, &identity, true, eligible, &events, true, false,
+            ));
+            assert!(press.is_none());
+        }
+    }
+
+    #[test]
+    fn middle_paste_same_batch_ownership_uses_each_button_events_shift() {
+        let (renderer, terminal, viewport, identity) = middle_paste_event_test_surface();
+        let content = identity.content_rect;
+        let eligible = |pos, modifiers| {
+            middle_paste_event_eligible(&renderer, &terminal, &viewport, pos, modifiers)
+        };
+        let mut points =
+            (0..viewport.rows()).map(|row| content.min + egui::vec2(5.0, row as f32 * 20.0 + 10.0));
+        let host = points
+            .clone()
+            .find(|pos| eligible(*pos, Some(egui::Modifiers::NONE)))
+            .expect("a real finished command row is host-owned");
+        let app = points
+            .find(|pos| renderer.pointer_app_mouse_eligible_projected(&terminal, &viewport, *pos))
+            .expect("the live prompt is app-owned");
+        assert!(!eligible(app, Some(egui::Modifiers::NONE)));
+        assert!(eligible(app, Some(egui::Modifiers::SHIFT)));
+        for (origin, down_modifiers, target, up_modifiers, expected) in [
+            (
+                app,
+                egui::Modifiers::NONE,
+                host,
+                egui::Modifiers::NONE,
+                false,
+            ),
+            (
+                app,
+                egui::Modifiers::NONE,
+                host,
+                egui::Modifiers::SHIFT,
+                false,
+            ),
+            (
+                app,
+                egui::Modifiers::NONE,
+                app,
+                egui::Modifiers::SHIFT,
+                false,
+            ),
+            (
+                app,
+                egui::Modifiers::SHIFT,
+                app,
+                egui::Modifiers::NONE,
+                false,
+            ),
+            (
+                app,
+                egui::Modifiers::SHIFT,
+                app,
+                egui::Modifiers::SHIFT,
+                true,
+            ),
+            (
+                host,
+                egui::Modifiers::NONE,
+                host,
+                egui::Modifiers::NONE,
+                true,
+            ),
+        ] {
+            let events = [
+                egui::Event::PointerButton {
+                    pos: origin,
+                    button: egui::PointerButton::Middle,
+                    pressed: true,
+                    modifiers: down_modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Middle,
+                    pressed: false,
+                    modifiers: up_modifiers,
+                },
+            ];
+            let mut press = None;
+            assert_eq!(
+                track_middle_paste_gesture(
+                    &mut press, &identity, true, eligible, &events, true, false,
+                ),
+                expected,
+                "origin={origin:?} down={down_modifiers:?} target={target:?} up={up_modifiers:?}"
+            );
+            assert!(press.is_none());
+        }
+        // Native motion has no modifier payload. A sub-threshold movement
+        // must not cancel a Shift-owned host gesture over an app mouse surface.
+        let shifted_motion = [
+            egui::Event::PointerButton {
+                pos: app,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+            egui::Event::PointerMoved(app + egui::vec2(0.5, 0.5)),
+            egui::Event::PointerButton {
+                pos: app + egui::vec2(0.5, 0.5),
+                button: egui::PointerButton::Middle,
+                pressed: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+        ];
+        let mut press = None;
+        assert!(track_middle_paste_gesture(
+            &mut press,
+            &identity,
+            true,
+            eligible,
+            &shifted_motion,
+            true,
+            false,
+        ));
+        // Motion still cancels outside the content rectangle and cannot arm an
+        // initially app-owned down, even when the eventual release uses Shift.
+        for (down_modifiers, motion) in [
+            (egui::Modifiers::NONE, app + egui::vec2(0.5, 0.5)),
+            (egui::Modifiers::SHIFT, content.min - egui::vec2(1.0, 1.0)),
+        ] {
+            let events = [
+                egui::Event::PointerButton {
+                    pos: app,
+                    button: egui::PointerButton::Middle,
+                    pressed: true,
+                    modifiers: down_modifiers,
+                },
+                egui::Event::PointerMoved(motion),
+                shifted_motion[2].clone(),
+            ];
+            let mut press = None;
+            assert!(!track_middle_paste_gesture(
+                &mut press, &identity, true, eligible, &events, true, false,
+            ));
+        }
+        // Host admission never consumes or cancels the separate PTY release.
+        let route = app_mouse_frame_route(true, Some(None), Some((4, 9)));
+        assert_eq!(route.release_cell, Some((4, 9)));
     }
 
     #[test]

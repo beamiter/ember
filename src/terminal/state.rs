@@ -160,6 +160,11 @@ impl BoundedTextBuilder {
     }
 }
 
+struct BlockChromePrompts {
+    headers: Vec<(RawCellAnchor, u64)>,
+    status: Option<(RawCellAnchor, usize)>,
+}
+
 impl super::TerminalState {
     /// 解析 CSI 参数字节。
     ///
@@ -4990,6 +4995,81 @@ impl super::TerminalState {
         prompts
     }
 
+    fn block_chrome_prompts(&self, policy: &ProjectionPolicy) -> BlockChromePrompts {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        let mut shared = HashSet::new();
+        for record in &self.command_records {
+            let Some((absolute, _)) = self.buffer_anchor_to_absolute(record.prompt_start) else {
+                continue;
+            };
+            let Some(row_id) = self
+                .raw_row_id_at_absolute(absolute)
+                .filter(|id| id.is_tracked())
+            else {
+                continue;
+            };
+            if !seen.insert(row_id) {
+                shared.insert(row_id);
+            }
+            if record.prompt_start.column == 0 {
+                candidates.push((RawCellAnchor { row_id, column: 0 }, record));
+            }
+        }
+        candidates.retain(|(anchor, _)| !shared.contains(&anchor.row_id));
+        let headers = candidates
+            .iter()
+            .filter(|(_, record)| record.complete && policy.block_headers())
+            .map(|(anchor, record)| (*anchor, record.sequence))
+            .collect();
+        let status = candidates
+            .last()
+            .filter(|(_, record)| !record.complete && policy.companion_status_rows() > 0)
+            .map(|(anchor, _)| (*anchor, policy.companion_status_rows()));
+        BlockChromePrompts { headers, status }
+    }
+
+    fn block_chrome_tail_keep(&self, policy: &ProjectionPolicy) -> usize {
+        if (!policy.block_headers() && policy.companion_status_rows() == 0)
+            || !self.kitty_graphics.get_placements().is_empty()
+        {
+            return self.grid.rows();
+        }
+        // A rendition-aware erase cell is not proof of empty presentation:
+        // preserve styled, colored, linked and wide blank cells exactly.
+        let blank = TerminalCell::default();
+        let last_content_row = (0..self.grid.rows())
+            .rfind(|row| {
+                self.grid.row_wrapped[*row]
+                    || self.grid[*row].iter().any(|cell| {
+                        cell.character != blank.character
+                            || cell.foreground != blank.foreground
+                            || cell.background != blank.background
+                            || cell.flags != blank.flags
+                            || cell.hyperlink_id != blank.hyperlink_id
+                    })
+            })
+            .map(|row| {
+                // A wrapped blank row and its continuation are terminal
+                // content, even after CUP moved the cursor above them.
+                row.saturating_add(usize::from(self.grid.row_wrapped[row]))
+                    .min(self.grid.rows().saturating_sub(1))
+            })
+            .unwrap_or(0);
+        let content = self
+            .total_lines_scrolled
+            .saturating_add(last_content_row.max(self.cursor_row) as u64);
+        let end = self
+            .command_records
+            .back()
+            .filter(|record| !record.complete)
+            .map_or(content.saturating_add(1), |record| {
+                crate::block_mode::live_block_end_exclusive(record.prompt_start.line_id, content)
+            });
+        end.saturating_sub(self.total_lines_scrolled)
+            .min(self.grid.rows() as u64) as usize
+    }
+
     fn projection_plan_cache_key(
         &self,
         cols: usize,
@@ -5006,6 +5086,9 @@ impl super::TerminalState {
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing(),
+            block_headers: policy.block_headers(),
+            companion_status_rows: policy.companion_status_rows(),
+            chrome_tail_keep: self.block_chrome_tail_keep(policy),
             full_screen_scroll_revision: self.full_screen_scroll_revision,
         }
     }
@@ -5065,7 +5148,11 @@ impl super::TerminalState {
         }
 
         let resolved = self.resolved_collapses(policy);
-        if resolved.is_empty() && !policy.block_spacing() {
+        if resolved.is_empty()
+            && !policy.block_spacing()
+            && !policy.block_headers()
+            && policy.companion_status_rows() == 0
+        {
             return None;
         }
         #[cfg(test)]
@@ -5076,6 +5163,11 @@ impl super::TerminalState {
         if policy.block_spacing() {
             let prompts = self.block_spacing_prompts();
             plan = plan.splice_block_spacing(&prompts);
+        }
+        if policy.block_headers() || policy.companion_status_rows() > 0 {
+            let BlockChromePrompts { headers, status } = self.block_chrome_prompts(policy);
+            plan =
+                plan.splice_block_chrome(&headers, status, key.chrome_tail_keep, self.grid.rows());
         }
         if !plan.has_transforms() {
             self.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
@@ -5113,7 +5205,11 @@ impl super::TerminalState {
         else {
             return false;
         };
-        if old_key.finished_output_revision == 0
+        if old_key.block_headers != new_key.block_headers
+            || old_key.companion_status_rows != new_key.companion_status_rows
+            || old_key.chrome_tail_keep != old_key.rows
+            || new_key.chrome_tail_keep != new_key.rows
+            || old_key.finished_output_revision == 0
             || old_key.full_screen_scroll_revision == 0
             || new_key.full_screen_scroll_revision == 0
             || new_key
@@ -5435,7 +5531,8 @@ impl super::TerminalState {
         }
         let row = match state.top_anchor {
             Some(ProjectedTopAnchor::RawCell(anchor))
-            | Some(ProjectedTopAnchor::Spacer { before: anchor }) => Some(anchor.row_id),
+            | Some(ProjectedTopAnchor::Spacer { before: anchor })
+            | Some(ProjectedTopAnchor::Decoration { before: anchor, .. }) => Some(anchor.row_id),
             Some(ProjectedTopAnchor::RawRow(row)) => Some(row),
             Some(ProjectedTopAnchor::Summary { hidden_range, .. }) => Some(hidden_range.start.row),
             None => None,
@@ -6425,6 +6522,12 @@ impl super::TerminalState {
             && key.rows == self.grid.rows()
             && key.cols == self.grid.row_len().max(1)
             && key.row_wrapped.as_slice() == self.grid.row_wrapped.as_slice()
+            && (!(key.block_headers || key.companion_status_rows > 0)
+                || key.chrome_tail_keep == {
+                    let mut policy = ProjectionPolicy::new();
+                    policy.set_block_chrome(key.block_headers, key.companion_status_rows);
+                    self.block_chrome_tail_keep(&policy)
+                })
     }
 
     fn projected_selection_plan_revision(&self, viewport: &ProjectedViewport) -> Option<u64> {
