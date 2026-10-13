@@ -1338,6 +1338,32 @@ fn application_cell_at_pointer(
     viewport.application_cell(terminal::DisplayPoint::new(row, col))
 }
 
+/// Display-only block whitespace cannot inject a PRIMARY/clipboard paste.
+/// Keep the existing host behavior for real history rows and pane padding.
+fn pointer_is_block_spacer(
+    pointer: egui::Pos2,
+    content_rect: egui::Rect,
+    char_width: f32,
+    line_height: f32,
+    viewport: &terminal::ProjectedViewport,
+) -> bool {
+    if !content_rect.contains(pointer) || !line_height.is_finite() || line_height <= 0.0 {
+        return false;
+    }
+    let (row, _) = grid_position_from_content(
+        pointer,
+        content_rect,
+        char_width,
+        line_height,
+        viewport.columns(),
+        viewport.rows(),
+    );
+    matches!(
+        viewport.row_kind(row),
+        Some(terminal::ProjectedRowKind::BlockSpacer { .. })
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AppMouseFrameRoute {
     /// A pointer cell that may produce press, motion or wheel reports.
@@ -6940,11 +6966,26 @@ impl eframe::App for TerminalApp {
             ctx.request_repaint();
         }
 
+        let pointer_on_block_spacer = pointer_pos.is_some_and(|pos| {
+            let renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            renderer.last_content_rect.is_some_and(|rect| {
+                pointer_is_block_spacer(
+                    pos,
+                    rect,
+                    renderer.char_width,
+                    renderer.line_height,
+                    &mouse_projection_viewport,
+                )
+            })
+        });
         let middle_paste_requested = session.purpose
             != crate::session::SessionPurpose::RetainedCommand
             && !terminal_pointer_input_blocked
             && (!mouse_enabled || shift_mouse_bypass || !pointer_app_mouse_eligible)
             && pointer_over_active_terminal
+            && !pointer_on_block_spacer
             && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
 
         if !terminal_pointer_input_blocked
@@ -7854,13 +7895,14 @@ mod tests {
         mouse_cell_for_current_dimensions, mouse_lossy_reports_allowed, mouse_press_reports_to_app,
         mouse_protocol_input_is_blocked, mouse_sequence_allows_lossy, mouse_sequence_is_complete,
         normalized_paste_body, osc52_clipboard_response_with_limit, parse_bold_match, paste_policy,
-        paste_requires_confirmation, primary_copy_route, queue_mouse_control,
-        reported_capture_button, roll_notification_rate_window, should_notify_long_command,
-        should_send_alternate_scroll, show_desktop_notification, snapshot_age_label,
-        take_tagged_cursor_move, workspace_drag_pointer_cancelled, ClipboardRequestGuard,
-        DesktopNotification, Osc52ReadRateLimit, PasteOrigin, PasteWriteError, PrimaryCopyRoute,
-        DESKTOP_NOTIFICATION_QUEUE_CAPACITY, KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW,
-        OSC52_READ_RATE_WINDOW, OSC_5522_DATA_CHUNK_BYTES,
+        paste_requires_confirmation, pointer_is_block_spacer, primary_copy_route,
+        queue_mouse_control, reported_capture_button, roll_notification_rate_window,
+        should_notify_long_command, should_send_alternate_scroll, show_desktop_notification,
+        snapshot_age_label, take_tagged_cursor_move, workspace_drag_pointer_cancelled,
+        ClipboardRequestGuard, DesktopNotification, Osc52ReadRateLimit, PasteOrigin,
+        PasteWriteError, PrimaryCopyRoute, DESKTOP_NOTIFICATION_QUEUE_CAPACITY,
+        KITTY_BASE64_CHUNK_BYTES, MAX_OSC52_READS_PER_WINDOW, OSC52_READ_RATE_WINDOW,
+        OSC_5522_DATA_CHUNK_BYTES,
     };
     use crate::app::events::{
         normalize_terminal_shortcut_events, restore_missing_image_paste_key_event,
@@ -8062,6 +8104,80 @@ mod tests {
             .any(|name| name == "fallback_test"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn middle_paste_rejects_block_spacing_but_keeps_real_rows_and_paired_release() {
+        let mut terminal = crate::terminal::TerminalState::new(24, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        let mut state = crate::terminal::ProjectionViewState::new();
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut state,
+        );
+        let spacer = viewport
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, crate::terminal::ProjectedRowKind::BlockSpacer { .. }))
+            .unwrap();
+        for line_height in [12.0, 20.0, 32.0] {
+            let content = egui::Rect::from_min_size(
+                egui::pos2(30.0, 40.0),
+                egui::vec2(240.0, line_height * 8.0),
+            );
+            let point = |row: usize| {
+                egui::pos2(
+                    content.left() + 4.0,
+                    content.top() + (row as f32 + 0.5) * line_height,
+                )
+            };
+            assert!(pointer_is_block_spacer(
+                point(spacer),
+                content,
+                10.0,
+                line_height,
+                &viewport
+            ));
+            assert!(!pointer_is_block_spacer(
+                point(spacer + 1),
+                content,
+                10.0,
+                line_height,
+                &viewport
+            ));
+            assert!(!pointer_is_block_spacer(
+                content.min - egui::vec2(1.0, 1.0),
+                content,
+                10.0,
+                line_height,
+                &viewport
+            ));
+            let last_real = (2, 3);
+            let route = app_mouse_frame_route(true, Some(None), Some(last_real));
+            assert_eq!(route.lossy_cell, None);
+            assert_eq!(route.release_cell, Some(last_real));
+        }
+        policy.set_block_spacing(false);
+        let compact = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut state,
+        );
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 160.0));
+        for row in 0..8 {
+            assert!(!pointer_is_block_spacer(
+                egui::pos2(5.0, row as f32 * 20.0 + 10.0),
+                content,
+                10.0,
+                20.0,
+                &compact
+            ));
+        }
     }
 
     #[test]
