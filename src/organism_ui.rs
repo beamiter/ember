@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use jterm_core::organism::{
-    AmbientMind, Behavior, BodyLanguage, RepoVigil, Tone, VisualTransition, WatchRhythm,
+    AmbientMind, Behavior, BodyLanguage, RepoVigil, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 use jterm_core::organism_live::{
@@ -974,7 +974,7 @@ impl OrganismHost {
             BodyLanguage::from_state(self.life.state()),
             false,
         );
-        self.reaction_until = now + reaction_duration(&reaction);
+        self.reaction_until = now + reaction.hold_duration();
     }
 
     /// Paint-only native overlay. The renderer supplies same-frame, proven
@@ -1663,21 +1663,6 @@ fn fresh_start(cursor: Option<(u64, bool)>, sequence: u64, started: bool) -> boo
     started
         && cursor
             .is_none_or(|(seen, was_started)| sequence > seen || (sequence == seen && !was_started))
-}
-
-fn reaction_duration(reaction: &Reaction) -> Duration {
-    Duration::from_millis(match reaction.behavior {
-        Behavior::Idle => 1500,
-        Behavior::Celebrate if reaction.tone == Tone::Quiet => 1800,
-        Behavior::Celebrate => 2500,
-        Behavior::GlanceAside => 1400,
-        Behavior::InspectError => 5000,
-        Behavior::SitNearError => 10000,
-        Behavior::CelebrateBig => 7000,
-        Behavior::RestAfterPush => 5000,
-        Behavior::UnknownOutcome => 4500,
-        _ => 2500,
-    })
 }
 
 static NEXT_PREVIEW_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -5103,6 +5088,84 @@ mod tests {
     }
 
     #[test]
+    fn sustained_completion_batch_is_quiet_consumed_once_and_owner_scoped() {
+        let mut host = OrganismHost::default();
+        host.acquire(Some("local-a"), Some((7, true)), false);
+        host.quarantine_batch = false;
+        host.pending = Some(pending());
+        let mut done = completion(Some(0));
+        done.duration_ms = Some(60_000);
+        host.batch("local-b", &VecDeque::new(), &[done.clone()], false, false);
+        assert!(host.pending.is_some());
+        assert_eq!(host.context.behavior, Behavior::Idle);
+        host.batch("local-a", &VecDeque::new(), &[done.clone()], false, false);
+        assert!(host.pending.is_none());
+        assert_eq!(host.context.behavior, Behavior::Celebrate);
+        let deadline = host.reaction_until;
+        let state = format!("{:?}", host.life.state());
+        host.batch("local-a", &VecDeque::new(), &[done], false, false);
+        assert_eq!(host.reaction_until, deadline);
+        assert_eq!(format!("{:?}", host.life.state()), state);
+        // An owner handoff discards the old reaction, even if the old drain
+        // is encountered again. Returning starts a fresh quarantine.
+        host.acquire(Some("local-b"), None, false);
+        host.acquire(Some("local-a"), Some((7, true)), false);
+        assert_eq!(host.context.behavior, Behavior::Idle);
+        assert!(host.quarantine_batch);
+        assert!(host.pending.is_none());
+    }
+
+    #[test]
+    fn sustained_completion_uses_finite_static_expiry_and_new_work_wins() {
+        let mut host = OrganismHost::default();
+        host.acquire(Some("local-a"), None, false);
+        let now = Duration::from_secs(60);
+        let mut done = completion(Some(0));
+        done.duration_ms = Some(60_000);
+        host.finish(&pending(), &done, now);
+        assert_eq!(host.context.behavior, Behavior::Celebrate);
+        assert_eq!(host.reaction_until, now + Duration::from_millis(1800));
+        assert_eq!(
+            next_host_wake(static_policy(), now, host.reaction_until, false),
+            Some(Duration::from_millis(1800))
+        );
+        assert_eq!(
+            next_host_wake(
+                static_policy(),
+                host.reaction_until,
+                host.reaction_until,
+                false
+            ),
+            None
+        );
+        for policy in [
+            PresentationPolicy {
+                enabled: false,
+                ..static_policy()
+            },
+            PresentationPolicy {
+                focused_owner: false,
+                ..static_policy()
+            },
+            PresentationPolicy {
+                alternate_screen: true,
+                ..static_policy()
+            },
+        ] {
+            assert_eq!(
+                next_host_wake(policy, now, host.reaction_until, false),
+                None
+            );
+        }
+        let started = host.native.command_started(CommandKind::Other);
+        host.react(started, now + Duration::from_millis(1));
+        assert_eq!(host.context.behavior, Behavior::WatchCommand);
+        host.acquire(None, None, false);
+        assert_eq!(host.context.behavior, Behavior::Idle);
+        assert!(host.pending.is_none());
+    }
+
+    #[test]
     fn missing_and_inferred_exit_are_unknown_never_success() {
         for provenance in [
             CompletionProvenance::ShellReported,
@@ -5110,6 +5173,7 @@ mod tests {
         ] {
             let mut host = OrganismHost::default();
             let mut done = completion(None);
+            done.duration_ms = Some(60_000);
             done.completion_provenance = provenance;
             if provenance == CompletionProvenance::BoundaryInferred {
                 done.exit_code = Some(0);
