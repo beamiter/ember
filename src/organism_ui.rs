@@ -4278,7 +4278,69 @@ mod tests {
                 "missing current native fact: {fact}"
             );
         }
-        assert_eq!(source.matches("activity: self.activity,").count(), 2);
+        // Every actual shared input, including the native body's observer and
+        // the read-only chrome snapshot, must carry the same native evidence.
+        // Check bounded surfaces rather than an obsolete global occurrence
+        // count: adding a renderer is not a change to activity knowledge.
+        let carries_native_activity = |section: &str| {
+            let mut seen = false;
+            for input in section.split("LiveAttentionInput {").skip(1) {
+                seen = true;
+                let fields = input.split('}').next().unwrap();
+                if !fields
+                    .lines()
+                    .any(|line| line.trim() == "activity: self.activity,")
+                {
+                    return false;
+                }
+            }
+            seen
+        };
+        for (label, start, end) in [
+            (
+                "explicit greeting",
+                "    fn request_hello_at(",
+                "    pub fn accepted_input(",
+            ),
+            (
+                "native body",
+                "    fn draw_native_body(",
+                "    pub fn draw(",
+            ),
+            (
+                "chrome observer and snapshot",
+                "    pub fn draw(",
+                "struct PendingCommand",
+            ),
+        ] {
+            let section = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(
+                carries_native_activity(section),
+                "native evidence missing in {label}"
+            );
+            // A single caller substituting an idle claim must fail even if all
+            // other inputs in that surface remain correct.
+            let invented_idle = section.replacen(
+                "activity: self.activity,",
+                "activity: LiveActivityKnowledge::KnownIdle,",
+                1,
+            );
+            assert!(
+                !carries_native_activity(&invented_idle),
+                "weak contract for {label}"
+            );
+            let unrelated_decoy = format!("{invented_idle}\n// activity: self.activity,\n");
+            assert!(
+                !carries_native_activity(&unrelated_decoy),
+                "a matching string outside the input cannot establish evidence for {label}"
+            );
+        }
         assert!(!prepare.contains("shell.write("));
         assert!(!prepare.contains("queue_input("));
     }
