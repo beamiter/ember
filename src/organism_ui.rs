@@ -398,8 +398,11 @@ fn companion_details(ui: &Ui, rect: egui::Rect, status: impl Into<String>) {
 
 /// A pointer-only control never requests keyboard focus or sends terminal input.
 fn companion_toggle(ui: &mut Ui, rect: egui::Rect, expanded: bool, interactive: bool) -> bool {
+    let id = ui.make_persistent_id("ascii_organism_expand");
+    let press_id = id.with("press_expanded");
     let rect = rect.intersect(ui.clip_rect());
     if !rect.is_positive() {
+        ui.data_mut(|data| data.remove::<bool>(press_id));
         return false;
     }
     let interactive = interactive && ui.is_enabled();
@@ -408,7 +411,39 @@ fn companion_toggle(ui: &mut Ui, rect: egui::Rect, expanded: bool, interactive: 
     } else {
         egui::Sense::hover()
     };
-    let response = ui.interact(rect, ui.make_persistent_id("ascii_organism_expand"), sense);
+    let response = ui.interact(rect, id, sense);
+    // egui retains click ownership when a widget temporarily becomes hover-only.
+    // An old press must not cross disabled frames or a change of toggle action.
+    let (pressed, down, released) = ui.input(|input| {
+        let button = egui::PointerButton::Primary;
+        (
+            input.pointer.button_pressed(button),
+            input.pointer.button_down(button),
+            input.pointer.button_released(button),
+        )
+    });
+    let native_clicked = response.clicked();
+    let pointer_down_on = response.is_pointer_button_down_on();
+    let clicked = ui.data_mut(|data| {
+        let mut armed = data.get_temp::<bool>(press_id);
+        if !interactive || armed.is_some_and(|action| action != expanded) {
+            armed = None;
+        }
+        if interactive && pressed && (pointer_down_on || native_clicked) {
+            armed = Some(expanded);
+        }
+        let clicked = interactive && released && native_clicked && armed == Some(expanded);
+        if down {
+            if let Some(action) = armed {
+                data.insert_temp(press_id, action);
+            } else {
+                data.remove::<bool>(press_id);
+            }
+        } else {
+            data.remove::<bool>(press_id);
+        }
+        clicked
+    });
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -452,7 +487,7 @@ fn companion_toggle(ui: &mut Ui, rect: egui::Rect, expanded: bool, interactive: 
                 "Expand ASCII organism"
             });
     }
-    interactive && response.clicked()
+    clicked
 }
 
 fn host_text(
@@ -2332,6 +2367,103 @@ mod tests {
             }
             assert_eq!(clicks, usize::from(interactive));
             assert_eq!(expanded, !interactive);
+        }
+    }
+
+    #[test]
+    fn companion_toggle_cancels_interrupted_press_and_accepts_fresh_click() {
+        for interruption in [
+            "none",
+            "expanded",
+            "round_trip",
+            "disabled",
+            "parent_disabled",
+            "hidden",
+            "clipped",
+            "dragged_out",
+            "same_frame",
+            "secondary",
+        ] {
+            let ctx = egui::Context::default();
+            let point = egui::pos2(612.0, 462.0);
+            let mut clicks = Vec::new();
+            for frame in 0..8 {
+                let expanded = match interruption {
+                    "expanded" => frame < 2,
+                    "round_trip" => frame != 2,
+                    _ => true,
+                };
+                let card = egui::Rect::from_min_max(
+                    egui::pos2(8.0, 480.0 - host_height(true, expanded)),
+                    egui::pos2(632.0, 480.0),
+                );
+                let rect = companion_layout(card, expanded).control;
+                assert!(rect.contains(point));
+                let pointer = if interruption == "dragged_out" && frame == 4 {
+                    egui::pos2(300.0, 300.0)
+                } else {
+                    point
+                };
+                let mut events = vec![egui::Event::PointerMoved(pointer)];
+                let button = |pressed| egui::Event::PointerButton {
+                    pos: pointer,
+                    button: if interruption == "secondary" && frame < 6 {
+                        egui::PointerButton::Secondary
+                    } else {
+                        egui::PointerButton::Primary
+                    },
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                if frame == 1 || frame == 6 {
+                    events.push(button(true));
+                }
+                if (frame == 4 && interruption != "same_frame")
+                    || frame == 7
+                    || (frame == 1 && interruption == "same_frame")
+                {
+                    events.push(button(false));
+                }
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(host_rect(640.0, 480.0)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if interruption == "hidden" && frame == 2 {
+                            return;
+                        }
+                        let interactive = !(interruption == "disabled" && frame == 2);
+                        if interruption == "parent_disabled" && frame == 2 {
+                            ui.disable();
+                        }
+                        let rect = if interruption == "clipped" && frame == 2 {
+                            egui::Rect::NOTHING
+                        } else {
+                            rect
+                        };
+                        if companion_toggle(ui, rect, expanded, interactive) {
+                            clicks.push(frame);
+                        }
+                        if rect.is_positive() {
+                            let response = ui
+                                .ctx()
+                                .read_response(ui.make_persistent_id("ascii_organism_expand"))
+                                .unwrap();
+                            assert!(!response.has_focus());
+                            assert!(!response.sense.is_focusable());
+                        }
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            let expected = match interruption {
+                "none" => vec![4, 7],
+                "same_frame" => vec![1, 7],
+                _ => vec![7],
+            };
+            assert_eq!(clicks, expected, "{interruption}");
         }
     }
 
