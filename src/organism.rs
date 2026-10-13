@@ -235,7 +235,12 @@ mod tests {
         running.advance(Duration::ZERO, true, false, phase);
         resting.advance(Duration::from_secs(60), true, false, phase);
         running.advance(Duration::from_secs(60), true, true, phase);
-        assert!(resting.state().energy > LifeState::default().energy);
+        // Reaching 60 seconds ends an awake interval; rest starts after it.
+        assert!((resting.state().energy - LifeState::default().energy + 0.002).abs() < 0.000001);
+        let at_threshold = resting.state().energy;
+        resting.advance(Duration::from_secs(61), true, false, phase);
+        running.advance(Duration::from_secs(61), true, true, phase);
+        assert!((resting.state().energy - at_threshold - 0.030).abs() < 0.000001);
         assert!(running.state().energy < LifeState::default().energy);
     }
 
