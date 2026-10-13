@@ -2243,7 +2243,8 @@ impl TerminalRenderer {
                         index
                     })
                 }
-                crate::terminal::ProjectedRowKind::Padding => None,
+                crate::terminal::ProjectedRowKind::Padding
+                | crate::terminal::ProjectedRowKind::BlockSpacer { .. } => None,
             };
             if let Some(index) = record_index {
                 rows_by_record
@@ -2304,6 +2305,13 @@ impl TerminalRenderer {
                 .and_then(|next| Self::projected_buffer_point(terminal, viewport, next));
             let (starts_in_viewport, ends_in_viewport) =
                 projected_span_edge_flags(prompt, next_prompt, first_row, last_row);
+            // A display-only separator proves the card ended even when the
+            // next prompt itself is just below the viewport.
+            let ends_in_viewport = ends_in_viewport
+                || matches!(
+                    viewport.row_kind(last_row.saturating_add(1)),
+                    Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })
+                );
             // The newest card has no next prompt to cap it, and its idle input
             // surface has a six-row floor. Route it through the same pure rule
             // the raw path uses, on a real content extent rather than on
@@ -4643,12 +4651,50 @@ impl TerminalRenderer {
             // Failed-block markers, painted AFTER the thumb so a large thumb
             // never hides them (frost draws them over the thumb too). Same
             // red as the Failed gutter stripe.
-            if self.block_mode && !terminal.is_alt_buffer_active() && !viewport.is_transformed() {
+            if self.block_mode && !terminal.is_alt_buffer_active() {
                 let marker_color =
                     self.block_outcome_color(crate::block_mode::BlockOutcome::Failed(1));
                 // ~3 physical px tall regardless of DPI scale.
                 let marker_height = 3.0 / ui.ctx().pixels_per_point();
-                for fraction in Self::failed_block_marker_fractions(terminal) {
+                let fractions = if viewport.is_transformed() {
+                    terminal
+                        .command_records()
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, record)| {
+                            matches!(
+                                crate::block_mode::classify_outcome(
+                                    record.command.as_deref(),
+                                    record.command_truncated,
+                                    record.exit_code,
+                                    record.state,
+                                    record.complete,
+                                    index + 1 == terminal.command_records().len(),
+                                ),
+                                crate::block_mode::BlockOutcome::Failed(_)
+                            )
+                        })
+                        .filter_map(|(_, record)| {
+                            let (line_id, column) = normalized_block_anchor(
+                                record.prompt_start.line_id,
+                                record.prompt_start.column,
+                                cols,
+                            );
+                            terminal
+                                .projected_document_row(
+                                    &viewport,
+                                    crate::terminal::BufferAnchor { line_id, column },
+                                )
+                                .map(|row| {
+                                    row as f32
+                                        / viewport.document_rows().saturating_sub(1).max(1) as f32
+                                })
+                        })
+                        .collect()
+                } else {
+                    Self::failed_block_marker_fractions(terminal)
+                };
+                for fraction in fractions {
                     let marker_y =
                         scrollbar_rect.top() + fraction * (scrollbar_rect.height() - marker_height);
                     painter.rect_filled(
@@ -8603,5 +8649,94 @@ mod tests {
         // the surface's clean rows remain associated with the same GPU buffer.
         renderer_b.invalidate_font_cache();
         assert_eq!(renderer_b.gpu_surface_id, original_b);
+    }
+}
+
+#[cfg(test)]
+mod block_spacing_tests {
+    use super::*;
+
+    #[test]
+    fn spaced_card_layout_has_a_real_row_gap_without_changing_grid_or_organism() {
+        for line_height in [12.0, 16.8, 20.0, 32.0] {
+            for width in [32.0, 640.0] {
+                let mut terminal = TerminalState::new(24, 16);
+                for index in 0..2 {
+                    terminal.process_input(format!("\x1b]133;A\x07$ \x1b]133;B\x07c{index}\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07").as_bytes());
+                }
+                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                let renderer = TerminalRenderer::new(
+                    14.0,
+                    2.0,
+                    1.0,
+                    crate::config::ScrollbarVisibility::Auto,
+                    crate::theme::Theme::default(),
+                );
+                let mut policy = crate::terminal::ProjectionPolicy::new();
+                policy.set_block_spacing(true);
+                let mut state = crate::terminal::ProjectionViewState::new();
+                let bottom =
+                    renderer.projected_viewport_with_state(&mut terminal, &policy, &mut state);
+                state.set_offset(bottom.max_scroll_offset(), &bottom);
+                let viewport =
+                    renderer.projected_viewport_with_state(&mut terminal, &policy, &mut state);
+                let entries = renderer
+                    .compute_projected_block_chrome(&terminal, &viewport)
+                    .unwrap();
+                assert_eq!(entries.len(), 3);
+                let content = egui::Rect::from_min_size(
+                    egui::pos2(40.0, 20.0),
+                    egui::vec2(width, 16.0 * line_height),
+                );
+                for pair in entries.windows(2) {
+                    let before = renderer
+                        .card_geometry(&pair[0], content, line_height, 16)
+                        .unwrap();
+                    let after = renderer
+                        .card_geometry(&pair[1], content, line_height, 16)
+                        .unwrap();
+                    assert!(before.bottom_closed && after.top_closed);
+                    let gap = after.rect.top() - before.rect.bottom();
+                    assert!(
+                        (gap - (line_height + 4.0)).abs() <= 1.0,
+                        "height {line_height}, gap {gap}"
+                    );
+                    let spacer_row = pair[0].span.last_row + 1;
+                    let point = egui::pos2(
+                        content.left() + 1.0,
+                        content.top() + (spacer_row as f32 + 0.5) * line_height,
+                    );
+                    assert!(renderer
+                        .finished_block_at_position(&entries, point, content, line_height, 16)
+                        .is_none());
+                    assert_eq!(
+                        viewport.application_cell(DisplayPoint::new(spacer_row, 0)),
+                        None
+                    );
+                }
+                let live = entries.last().unwrap();
+                assert!(live.live);
+                assert_eq!(
+                    live.span.last_row - live.span.first_row + 1,
+                    crate::block_mode::MIN_INPUT_ROWS
+                );
+                let region = active_companion_region(
+                    &viewport,
+                    live.span,
+                    viewport.cursor().row,
+                    content,
+                    line_height,
+                    false,
+                )
+                .unwrap();
+                assert!(
+                    region.top()
+                        >= content.top() + (viewport.cursor().row + 1) as f32 * line_height
+                );
+                assert!(content.contains_rect(region));
+                assert_eq!(terminal.grid.row_len(), 24);
+                assert_eq!(terminal.grid.rows(), 16);
+            }
+        }
     }
 }

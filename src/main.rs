@@ -1312,6 +1312,9 @@ fn projected_viewport_for_session(
     renderer: &TerminalRenderer,
 ) -> terminal::ProjectedViewport {
     let terminal = Arc::clone(&session.terminal);
+    session
+        .projection_policy
+        .set_block_spacing(!renderer.block_compact);
     let policy = &session.projection_policy;
     let view_state = &mut session.projection_view_state;
     let mut terminal = terminal.lock();

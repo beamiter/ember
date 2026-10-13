@@ -46,6 +46,11 @@ pub struct SyntheticRowKey {
 pub enum ProjectedRowKind {
     Raw,
     Padding,
+    /// One display-only row before a proven, distinct command prompt. It has
+    /// no terminal cells, selection origins or application mouse coordinates.
+    BlockSpacer {
+        before: RawCellAnchor,
+    },
     CollapsedSummary {
         key: SyntheticRowKey,
         hidden_range: FinishedOutputRange,
@@ -73,6 +78,7 @@ pub enum ProjectedBufferAnchorLocation {
 pub struct ProjectionPolicy {
     revision: u64,
     collapsed: BTreeSet<u64>,
+    block_spacing: bool,
 }
 
 impl Default for ProjectionPolicy {
@@ -80,6 +86,7 @@ impl Default for ProjectionPolicy {
         Self {
             revision: 1,
             collapsed: BTreeSet::new(),
+            block_spacing: false,
         }
     }
 }
@@ -94,7 +101,25 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty()
+        self.collapsed.is_empty() && !self.block_spacing
+    }
+
+    pub fn block_spacing(&self) -> bool {
+        self.block_spacing
+    }
+
+    /// Normal density reserves one actual display row between cards. Compact
+    /// density keeps the terminal's original row rhythm.
+    pub fn set_block_spacing(&mut self, enabled: bool) -> bool {
+        if self.block_spacing == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.block_spacing = enabled;
+        self.revision = revision;
+        true
     }
 
     pub fn is_collapsed(&self, zone_id: u64) -> bool {
@@ -248,6 +273,7 @@ pub(super) struct ProjectionPlan {
     pub(super) raw_slice_count: usize,
     pub(super) policy_revision: u64,
     pub(super) effective_collapsed: BTreeSet<u64>,
+    pub(super) spacer_count: usize,
     pub(super) resolved_collapses: Vec<ResolvedCollapse>,
     /// Exact prior key and number of document rows appended by the most
     /// recent validated streaming advance. A scrolled-up view can preserve
@@ -272,6 +298,7 @@ pub(super) struct ProjectionPlanCacheKey {
     pub(super) row_wrapped: SmallVec<[bool; 64]>,
     pub(super) policy_revision: u64,
     pub(super) policy_ids: SmallVec<[u64; 4]>,
+    pub(super) block_spacing: bool,
     /// Canonical count of full-screen primary-buffer row transfers. Combined
     /// with the row-identity delta, this rejects any batch containing a
     /// noncanonical move. Zero is the uncacheable overflow sentinel.
@@ -389,6 +416,7 @@ impl ProjectionPlan {
             raw_slice_count,
             policy_revision: 0,
             effective_collapsed: BTreeSet::new(),
+            spacer_count: 0,
             resolved_collapses: Vec::new(),
             incremental_from: None,
             incremental_appended_rows: 0,
@@ -415,6 +443,18 @@ impl ProjectionPlan {
         if old_grid_rows == 0
             || self.rows.len() < old_grid_rows
             || appended_history.iter().any(|layout| layout.wrapped)
+            || self
+                .rows
+                .iter()
+                .rev()
+                .take(old_grid_rows)
+                .zip(self.raw_rows.iter().rev())
+                .any(|(row, raw)| {
+                    !matches!(row.kind, ProjectedRowKind::Raw)
+                        || row
+                            .row_source
+                            .is_none_or(|source| source.raw_row != raw.raw_row)
+                })
         {
             return false;
         }
@@ -467,10 +507,24 @@ impl ProjectionPlan {
                     };
                     self.raw_slice_count =
                         self.raw_slice_count.saturating_sub(row.raw_slices.len());
+                    if matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }) {
+                        self.spacer_count = self.spacer_count.saturating_sub(1);
+                    }
                     self.display_row_base = self.display_row_base.saturating_add(1);
                 }
             }
             self.raw_absolute_base = self.raw_absolute_base.saturating_add(1);
+        }
+        // No outer margin before the first retained display row. This also
+        // matches a cold splice after the preceding history row is evicted.
+        while self
+            .rows
+            .front()
+            .is_some_and(|row| matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }))
+        {
+            self.rows.pop_front();
+            self.spacer_count = self.spacer_count.saturating_sub(1);
+            self.display_row_base = self.display_row_base.saturating_add(1);
         }
         self.history_rows = self
             .history_rows
@@ -1051,6 +1105,58 @@ impl ProjectionPlan {
         self
     }
 
+    pub(super) fn has_transforms(&self) -> bool {
+        self.spacer_count > 0 || !self.effective_collapsed.is_empty()
+    }
+
+    /// Splice only before a prompt which is still the first exact cell of a
+    /// display row after reflow and collapse. Never split a shared raw row or
+    /// manufacture a new raw source. A set deduplicates repeated OSC marks.
+    pub(super) fn splice_block_spacing(mut self, prompts: &[RawCellAnchor]) -> Self {
+        let prompts: std::collections::HashSet<_> = prompts.iter().copied().collect();
+        if prompts.is_empty() {
+            return self;
+        }
+        let mut output = VecDeque::with_capacity(self.rows.len() + prompts.len());
+        for row in self.rows.drain(..) {
+            let first = row
+                .raw_slices
+                .first()
+                .and_then(|slice| {
+                    let origin = slice.origin?;
+                    (slice.view_col_start == 0 && origin.col_start == 0).then_some(RawCellAnchor {
+                        row_id: origin.row,
+                        column: 0,
+                    })
+                })
+                .or_else(|| {
+                    row.raw_slices
+                        .is_empty()
+                        .then_some(row.row_source)
+                        .flatten()
+                        .map(|source| RawCellAnchor {
+                            row_id: source.raw_row,
+                            column: 0,
+                        })
+                });
+            if !output.is_empty() && matches!(row.kind, ProjectedRowKind::Raw) {
+                if let Some(before) = first.filter(|anchor| prompts.contains(anchor)) {
+                    output.push_back(ProjectionPlanRow {
+                        raw_slices: SmallVec::new(),
+                        row_source: None,
+                        wrapped: false,
+                        kind: ProjectedRowKind::BlockSpacer { before },
+                    });
+                    self.spacer_count += 1;
+                }
+            }
+            output.push_back(row);
+        }
+        self.rows = output;
+        self.rebuild_raw_row_placements();
+        self
+    }
+
     fn raw_absolute_row(&self, row: RawRowId) -> Option<usize> {
         row.is_tracked().then_some(())?;
         self.raw_rows
@@ -1157,6 +1263,10 @@ impl ProjectionPlan {
     /// that was expanded falls back to its first retained raw cell/row.
     pub(super) fn document_row_for_anchor(&self, anchor: ProjectedTopAnchor) -> Option<usize> {
         match anchor {
+            ProjectedTopAnchor::Spacer { before } => self.rows.iter().position(|row| {
+                matches!(row.kind, ProjectedRowKind::BlockSpacer { before: candidate } if candidate == before)
+            }).or_else(|| self.raw_cell_document_row(before))
+                .or_else(|| self.raw_row_document_row(before.row_id)),
             ProjectedTopAnchor::RawCell(anchor) => self
                 .raw_cell_document_row(anchor)
                 .or_else(|| self.summary_owning_raw_cell(anchor)),
@@ -1254,6 +1364,9 @@ pub enum ProjectionMode {
 pub(super) enum ProjectedTopAnchor {
     RawCell(RawCellAnchor),
     RawRow(RawRowId),
+    Spacer {
+        before: RawCellAnchor,
+    },
     Summary {
         zone_id: u64,
         hidden_range: FinishedOutputRange,
@@ -1264,6 +1377,7 @@ pub(super) enum ProjectedTopAnchor {
 /// off and the alternate screen bypass projection without discarding it.
 #[derive(Clone, Debug)]
 pub struct ProjectionViewState {
+    pub(super) active_transformed: bool,
     pub(super) offset_from_bottom: usize,
     pub(super) follow_bottom: bool,
     pub(super) top_anchor: Option<ProjectedTopAnchor>,
@@ -1273,6 +1387,7 @@ pub struct ProjectionViewState {
 impl Default for ProjectionViewState {
     fn default() -> Self {
         Self {
+            active_transformed: false,
             offset_from_bottom: 0,
             follow_bottom: true,
             top_anchor: None,
@@ -1284,6 +1399,12 @@ impl Default for ProjectionViewState {
 impl ProjectionViewState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the latest snapshot actually applied a transform. Requested
+    /// spacing may be ineffective for a single or shared-row prompt.
+    pub fn is_transformed(&self) -> bool {
+        self.active_transformed
     }
 
     pub fn offset_from_bottom(&self) -> usize {
@@ -2046,6 +2167,7 @@ impl ProjectedViewport {
         let view_row = self.top_padding;
         match self.row_kinds.get(view_row).copied()? {
             ProjectedRowKind::Padding => None,
+            ProjectedRowKind::BlockSpacer { before } => Some(ProjectedTopAnchor::Spacer { before }),
             ProjectedRowKind::CollapsedSummary {
                 key, hidden_range, ..
             } => Some(ProjectedTopAnchor::Summary {

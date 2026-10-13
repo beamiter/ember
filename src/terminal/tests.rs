@@ -7769,3 +7769,394 @@ fn raw_snapshot_copy_refuses_alt_buffer_without_rebasing_selection() {
     assert_eq!(terminal.selection, selection);
     assert_eq!(terminal.copy_selection(), before);
 }
+
+fn spaced_view(
+    terminal: &mut TerminalState,
+    policy: &ProjectionPolicy,
+    state: &mut ProjectionViewState,
+) -> super::ProjectedViewport {
+    terminal.projected_viewport_with_state(HistoryProjection::identity(), true, policy, state)
+}
+
+#[test]
+fn block_spacing_inserts_real_origin_free_rows_and_preserves_terminal_and_cursor() {
+    let mut terminal = TerminalState::new(24, 12);
+    emit_completed_block(&mut terminal, 0);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    let raw: Vec<_> = terminal.grid.iter().map(|row| row.to_vec()).collect();
+    let ids = terminal.grid.row_ids.clone();
+    let version = terminal.grid_version;
+    let cursor = terminal.get_cursor_pos();
+    let mut policy = ProjectionPolicy::new();
+    assert!(policy.set_block_spacing(true));
+    let mut state = ProjectionViewState::new();
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(viewport.is_transformed());
+    assert_eq!(viewport.document_rows(), 13);
+    let spacer = viewport
+        .row_kinds()
+        .iter()
+        .position(|kind| matches!(kind, ProjectedRowKind::BlockSpacer { .. }))
+        .unwrap();
+    assert_eq!(
+        viewport
+            .row_kinds()
+            .iter()
+            .filter(|kind| matches!(kind, ProjectedRowKind::BlockSpacer { .. }))
+            .count(),
+        1
+    );
+    for column in 0..24 {
+        let point = DisplayPoint::new(spacer, column);
+        assert_eq!(viewport.raw_anchor_at(point), None);
+        assert_eq!(viewport.application_cell(point), None);
+        assert_eq!(viewport.cells()[spacer][column].character, ' ');
+        assert_eq!(viewport.cells()[spacer][column].background, Color::Default);
+    }
+    assert!(!viewport.row_wrapped()[spacer]);
+    assert_eq!(viewport.view_row_absolute(spacer), None);
+    assert_eq!(viewport.application_cell(viewport.cursor()), Some(cursor));
+    assert_cell_grids_equal(
+        &raw,
+        &terminal
+            .grid
+            .iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>(),
+        "spaced raw grid",
+    );
+    assert_eq!(terminal.grid.row_ids, ids);
+    assert_eq!(terminal.grid_version, version);
+    terminal.start_selection_projected(&viewport, (spacer, 0));
+    assert!(!terminal.has_text_selection());
+}
+
+#[test]
+fn block_spacing_copy_omits_separator_and_density_returns_identity() {
+    let mut terminal = TerminalState::new(24, 8);
+    terminal.process_input(b"\x1b]133;A\x07one\x1b]133;C\x07\x1b]133;D;0\x07\r\n\x1b]133;A\x07two");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    let bottom = spaced_view(&mut terminal, &policy, &mut state);
+    state.set_offset(bottom.max_scroll_offset(), &bottom);
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    let first = viewport
+        .cells()
+        .iter()
+        .position(|row| row[0].character == 'o')
+        .unwrap();
+    let second = viewport
+        .cells()
+        .iter()
+        .position(|row| row[0].character == 't')
+        .unwrap();
+    assert_eq!(second - first, 2);
+    terminal.start_selection_projected(&viewport, (first, 0));
+    terminal.update_selection_projected(&viewport, (second, 2));
+    assert_eq!(
+        terminal.copy_selection().as_deref(),
+        Some("one                     \ntwo")
+    );
+    assert!(policy.set_block_spacing(false));
+    assert!(!policy.set_block_spacing(false));
+    let compact = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(!compact.is_transformed());
+    assert!(compact
+        .row_kinds()
+        .iter()
+        .all(|kind| *kind == ProjectedRowKind::Raw));
+    assert!(std::sync::Arc::ptr_eq(
+        &compact.cells_arc(),
+        &terminal.get_visible_cells()
+    ));
+}
+
+#[test]
+fn block_spacing_new_prompt_invalidates_cached_plan_before_output_completes() {
+    let mut terminal = TerminalState::new(24, 12);
+    emit_completed_block(&mut terminal, 0);
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    let second = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(second.is_transformed());
+    let cached = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(std::sync::Arc::ptr_eq(
+        &second.cells_arc(),
+        &cached.cells_arc()
+    ));
+    terminal.process_input(b"\x1b]133;A\x07");
+    let repeated = spaced_view(&mut terminal, &policy, &mut state);
+    // A new A after "$ " is a second, mid-row prompt on the same raw row.
+    // That makes the former boundary ambiguous: drop its separator rather
+    // than retaining a stale gap or inserting a second one.
+    assert_eq!(repeated.document_rows() + 1, second.document_rows());
+    assert!(!repeated.is_transformed());
+}
+
+#[test]
+fn block_spacing_same_row_prompts_and_alternate_screen_fail_closed() {
+    let mut terminal = TerminalState::new(24, 8);
+    terminal.process_input(b"\x1b]133;A\x07one\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07two");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    terminal.process_input(b"\r\n\x1b]133;C\x07\x1b]133;D;0\x07\r\n\x1b]133;A\x07three");
+    assert!(spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    terminal.process_input(b"\x1b[?1049hALT");
+    let alternate = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(!alternate.is_transformed());
+    assert!(alternate
+        .row_kinds()
+        .iter()
+        .all(|kind| *kind == ProjectedRowKind::Raw));
+    terminal.process_input(b"\x1b[?1049l");
+    assert!(spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    let bypass = terminal.projected_viewport_with_state(
+        HistoryProjection::identity(),
+        false,
+        &policy,
+        &mut state,
+    );
+    assert!(!bypass.is_transformed());
+}
+
+#[test]
+fn block_spacing_collapsed_cards_keep_exactly_one_separator_per_boundary() {
+    let mut terminal = TerminalState::new(24, 12);
+    let first = emit_completed_block(&mut terminal, 0);
+    let second = emit_completed_block(&mut terminal, 1);
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    policy.collapse(first);
+    policy.collapse(second);
+    let mut state = ProjectionViewState::new();
+    let bottom = spaced_view(&mut terminal, &policy, &mut state);
+    state.set_offset(bottom.max_scroll_offset(), &bottom);
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(
+        viewport
+            .row_kinds()
+            .iter()
+            .filter(|kind| matches!(kind, ProjectedRowKind::CollapsedSummary { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        viewport
+            .row_kinds()
+            .iter()
+            .filter(|kind| matches!(kind, ProjectedRowKind::BlockSpacer { .. }))
+            .count(),
+        2
+    );
+    let before = viewport.document_rows();
+    policy.set_block_spacing(false);
+    let compact = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(compact.document_rows(), before - 2);
+    assert_eq!(compact.effective_collapsed().len(), 2);
+}
+
+#[test]
+fn block_spacing_top_anchor_survives_streaming_and_density_changes() {
+    let mut terminal = TerminalState::new(24, 6);
+    for index in 0..8 {
+        emit_completed_block(&mut terminal, index);
+    }
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    let bottom = spaced_view(&mut terminal, &policy, &mut state);
+    let max = bottom.max_scroll_offset();
+    let mut spacer_view = None;
+    for offset in 1..=max {
+        state.set_offset(offset, &bottom);
+        let viewport = spaced_view(&mut terminal, &policy, &mut state);
+        if matches!(
+            viewport.row_kind(0),
+            Some(ProjectedRowKind::BlockSpacer { .. })
+        ) {
+            spacer_view = Some(viewport);
+            break;
+        }
+    }
+    let before = spacer_view.expect("one spacer can anchor the top");
+    let Some(ProjectedRowKind::BlockSpacer { before: prompt }) = before.row_kind(0) else {
+        unreachable!()
+    };
+    terminal.process_input(b"\r\nstream\r\n");
+    let after = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(after.row_kind(0), before.row_kind(0));
+    policy.set_block_spacing(false);
+    let compact = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(compact.raw_anchor_at(DisplayPoint::new(0, 0)), Some(prompt));
+}
+
+#[test]
+fn block_spacing_clear_and_undo_refresh_boundaries_and_marker_positions() {
+    let mut terminal = TerminalState::new(24, 8);
+    for index in 0..3 {
+        emit_completed_block(&mut terminal, index);
+    }
+    terminal.process_input(b"\x1b]133;A\x07$ ");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    let anchor = terminal.command_records()[1].prompt_start;
+    assert_eq!(terminal.projected_document_row(&viewport, anchor), Some(3));
+    assert_eq!(terminal.clear_completed_blocks(), 3);
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+    assert_eq!(terminal.undo_clear_blocks(), 3);
+    assert_eq!(
+        spaced_view(&mut terminal, &policy, &mut state).document_rows(),
+        viewport.document_rows()
+    );
+}
+
+#[test]
+fn block_spacing_streaming_keeps_historical_spacers_on_incremental_path() {
+    let mut terminal = TerminalState::new(24, 4);
+    emit_completed_block(&mut terminal, 0);
+    emit_completed_block(&mut terminal, 1);
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;C\x07");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    for _ in 0..8 {
+        terminal.process_input(b"line\r\n");
+    }
+    let before = spaced_view(&mut terminal, &policy, &mut state);
+    drop(before);
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    for _ in 0..20 {
+        terminal.process_input(b"line\r\n");
+        let viewport = spaced_view(&mut terminal, &policy, &mut state);
+        assert!(viewport.is_transformed());
+        assert_eq!(
+            viewport.application_cell(viewport.cursor()),
+            Some(terminal.get_cursor_pos())
+        );
+    }
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get()), 0);
+    assert_eq!(
+        PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.get()),
+        20
+    );
+}
+
+#[test]
+fn block_spacing_incremental_matches_cold_plan_through_history_eviction() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.set_max_scrollback(10);
+    for index in 0..4 {
+        emit_completed_block(&mut terminal, index);
+    }
+    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;C\x07");
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    for tick in 0..20 {
+        terminal.process_input(b"line\r\n");
+        let incremental = spaced_view(&mut terminal, &policy, &mut state);
+        let prior_plan = terminal
+            .projection_plan_cache
+            .as_ref()
+            .map(|(_, plan)| plan.clone());
+        terminal.projection_plan_cache = None;
+        terminal.transformed_viewport_cache = None;
+        let cold = spaced_view(&mut terminal, &policy, &mut state);
+        assert_eq!(
+            incremental.document_rows(),
+            cold.document_rows(),
+            "tick {tick}"
+        );
+        assert_eq!(incremental.row_kinds(), cold.row_kinds(), "tick {tick}");
+        assert_cell_grids_equal(incremental.cells(), cold.cells(), "incremental spacing");
+        if let (Some(before), Some((_, after))) = (prior_plan, &terminal.projection_plan_cache) {
+            assert_eq!(before.rows, after.rows, "tick {tick}: full projected rows");
+        }
+    }
+}
+
+#[test]
+fn block_spacing_reflow_never_splits_joined_or_mid_row_prompt() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal.process_input(
+        b"\x1b]133;A\x07abcdefgh\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07IJKL\r\n",
+    );
+    for _ in 0..8 {
+        terminal.process_input(b"tail\r\n");
+    }
+    terminal.on_resize(16, 4);
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    // An old-width pending-wrap sentinel is ambiguous after widening. Its
+    // apparent mid-row boundary cannot produce a synthetic separator.
+    assert!(!viewport.is_transformed());
+}
+
+#[test]
+fn ineffective_block_spacing_keeps_raw_reveal_and_history_state() {
+    let mut terminal = TerminalState::new(24, 4);
+    terminal.process_input(b"\x1b]133;A\x07one\r\n");
+    for _ in 0..8 {
+        terminal.process_input(b"tail\r\n");
+    }
+    let anchor = terminal.command_records()[0].prompt_start;
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    terminal.scroll_offset = 2;
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(!viewport.is_transformed());
+    assert!(!state.is_transformed());
+    assert_eq!(terminal.scroll_offset, 2);
+    assert_eq!(
+        terminal.reveal_buffer_anchor_in_projection(&policy, &mut state, anchor),
+        ProjectedBufferAnchorLocation::Identity
+    );
+}
+
+#[test]
+fn block_spacing_narrowing_does_not_turn_midrow_prompt_into_false_boundary() {
+    let mut terminal = TerminalState::new(8, 4);
+    terminal.process_input(b"\x1b]133;A\x07abc\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07DEF\r\n");
+    for _ in 0..8 {
+        terminal.process_input(b"tail\r\n");
+    }
+    assert_eq!(terminal.command_records()[1].prompt_start.column, 3);
+    terminal.on_resize(2, 4);
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    let viewport = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(!viewport.is_transformed());
+    assert!(!state.is_transformed());
+}
+
+#[test]
+fn block_spacing_zero_width_commands_sharing_first_prompt_do_not_gain_leading_gap() {
+    let mut terminal = TerminalState::new(24, 8);
+    terminal.process_input(
+        b"banner\r\n\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07prompt",
+    );
+    assert_eq!(terminal.command_records().len(), 2);
+    assert_eq!(
+        terminal.command_records()[0].prompt_start,
+        terminal.command_records()[1].prompt_start
+    );
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_spacing(true);
+    let mut state = ProjectionViewState::new();
+    assert!(!spaced_view(&mut terminal, &policy, &mut state).is_transformed());
+}

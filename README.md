@@ -317,9 +317,11 @@ click_moves_cursor = true
 # unknown-status card keeps its outcome color and only brightens it; hover
 # never repaints a failure in the neutral wash.
 # Block Mode reserves a 34px action lane before column zero. Card menus live
-# outside terminal cells, so they never cover commands or output. Compact only
-# tightens visual chrome and never changes
-# the PTY/cell geometry relative to non-compact Block Mode.
+# outside terminal cells, so they never cover commands or output. Normal
+# density reserves one real display-only row between distinct command cards.
+# Compact removes that extra row and tightens the chrome. Both preserve the
+# PTY grid, font metrics and terminal columns; separators never enter copied
+# output, searches, or application mouse coordinates.
 # Turning block mode off also clears/disables whole-block selection, so arrows
 # and Enter retain their ordinary terminal meaning.
 block_mode = true
@@ -1407,8 +1409,10 @@ TerminalApp coordinates tabs, panes, input, search, config and persistence.
 `HistoryProjection` keeps an allocation-sharing identity fast path and provides
 fail-closed raw/display origins for renderer consumers. In Block Mode, a
 session-owned projection policy can splice finished output into synthetic
-collapse summaries before the viewport is sliced, with independent projected
-scroll anchoring and without mutating terminal history. Filter and Delete are
+collapse summaries and, at normal density, insert one origin-free separator
+row before each distinct command prompt. Both happen before viewport slicing,
+with stable projected scroll anchors and without mutating terminal history.
+Shared-row prompts and ambiguous reflow boundaries do not gain separators. Filter and Delete are
 not implemented.
 
 Important modules:

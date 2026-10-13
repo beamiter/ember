@@ -2827,6 +2827,9 @@ impl super::TerminalState {
             captured_output: None,
             started_instant: None,
         });
+        // A new prompt changes display-only card boundaries even before any
+        // output is finalized. Reuse the structural revision, never grid bytes.
+        self.mark_finished_output_provenance_changed();
         let index = self.command_records.len() - 1;
         self.apply_record_metadata(index, id, command, cwd, command_truncated);
         Some(index)
@@ -3629,6 +3632,7 @@ impl super::TerminalState {
         self.captured_command_output_bytes = self
             .captured_command_output_bytes
             .saturating_sub(captured_output_bytes);
+        self.mark_finished_output_provenance_changed();
         self.cleared_blocks_stash = Some(ClearedBlocksStash {
             records: cleared,
             provenance,
@@ -3702,6 +3706,7 @@ impl super::TerminalState {
                     .saturating_sub(output.text.len());
             }
         }
+        self.mark_finished_output_provenance_changed();
         stashed.saturating_sub(evicted.min(stashed))
     }
 
@@ -4008,6 +4013,54 @@ impl super::TerminalState {
         viewport.display_point_for(RawCellAnchor { row_id, column })
     }
 
+    /// Map a marker through this exact frame's full document without changing
+    /// scroll state. The cached plan is shared with selection and painting.
+    pub fn projected_document_row(
+        &self,
+        viewport: &ProjectedViewport,
+        anchor: BufferAnchor,
+    ) -> Option<usize> {
+        let (absolute, column) = self.buffer_anchor_to_absolute(anchor)?;
+        if !viewport.is_transformed() {
+            return Some(absolute);
+        }
+        let (key, plan) = self.projection_plan_cache.as_ref()?;
+        if viewport.plan_revision() != Some(plan.plan_revision)
+            || !self.projection_plan_key_matches_current_source(key)
+        {
+            return None;
+        }
+        let raw = RawCellAnchor {
+            row_id: self.raw_row_id_at_absolute(absolute)?,
+            column,
+        };
+        // Raw placements are retained in source order. Do not scan the full
+        // history once per scrollbar marker on every frame.
+        let placement = plan.raw_rows.get(absolute)?;
+        if placement.raw_row != raw.row_id {
+            return None;
+        }
+        let first = placement
+            .first_view_row?
+            .checked_sub(plan.display_row_base)?;
+        let last = placement
+            .last_view_row?
+            .checked_sub(plan.display_row_base)?;
+        (first..=last)
+            .find(|row| {
+                plan.rows.get(*row).is_some_and(|row| {
+                    row.raw_slices.iter().any(|slice| {
+                        slice.origin.is_some_and(|origin| {
+                            origin.row == raw.row_id
+                                && raw.column >= origin.col_start
+                                && raw.column < origin.col_start.saturating_add(slice.len)
+                        })
+                    })
+                })
+            })
+            .or(Some(first))
+    }
+
     /// Classify and, when visible, reveal a stable buffer anchor in the exact
     /// current projected plan. Hidden output is reported to the caller but is
     /// never expanded here; stale or ambiguous provenance fails closed.
@@ -4031,7 +4084,15 @@ impl super::TerminalState {
         let cols = self.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
         let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
-            return ProjectedBufferAnchorLocation::Unmapped;
+            return if self
+                .projection_plan_cache
+                .as_ref()
+                .is_some_and(|(cached_key, plan)| *cached_key == plan_key && !plan.has_transforms())
+            {
+                ProjectedBufferAnchorLocation::Identity
+            } else {
+                ProjectedBufferAnchorLocation::Unmapped
+            };
         };
         if plan.plan_revision == 0 || !self.projection_plan_key_matches_current_source(&plan_key) {
             return ProjectedBufferAnchorLocation::Unmapped;
@@ -4899,6 +4960,36 @@ impl super::TerminalState {
         resolved
     }
 
+    fn block_spacing_prompts(&self) -> Vec<RawCellAnchor> {
+        let mut prompts = Vec::new();
+        let mut seen = HashSet::new();
+        let mut shared = HashSet::new();
+        for (index, record) in self.command_records.iter().enumerate() {
+            let anchor = record.prompt_start;
+            let Some((absolute, _)) = self.buffer_anchor_to_absolute(anchor) else {
+                continue;
+            };
+            let Some(row_id) = self
+                .raw_row_id_at_absolute(absolute)
+                .filter(|id| id.is_tracked())
+            else {
+                continue;
+            };
+            if !seen.insert(row_id) {
+                shared.insert(row_id);
+            }
+            // A nonzero column may be a true shared-row prompt OR an old-width
+            // pending-wrap sentinel. The recording width is not retained, so
+            // current width cannot distinguish them after resize. Only a
+            // recorded column-zero boundary can safely gain whitespace.
+            if index > 0 && anchor.column == 0 {
+                prompts.push(RawCellAnchor { row_id, column: 0 });
+            }
+        }
+        prompts.retain(|anchor| !shared.contains(&anchor.row_id));
+        prompts
+    }
+
     fn projection_plan_cache_key(
         &self,
         cols: usize,
@@ -4914,6 +5005,7 @@ impl super::TerminalState {
             row_wrapped: self.grid.row_wrapped.iter().copied().collect(),
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
+            block_spacing: policy.block_spacing(),
             full_screen_scroll_revision: self.full_screen_scroll_revision,
         }
     }
@@ -4941,14 +5033,14 @@ impl super::TerminalState {
         let key = self.projection_plan_cache_key(cols, policy);
         if let Some((cached_key, plan)) = &self.projection_plan_cache {
             if self.finished_output_revision != 0 && *cached_key == key {
-                return (!plan.effective_collapsed.is_empty()).then(|| std::sync::Arc::clone(plan));
+                return plan.has_transforms().then(|| std::sync::Arc::clone(plan));
             }
         }
 
         if let Some((cached_key, mut cached_plan)) = self.projection_plan_cache.take() {
             if let Some(plan) = std::sync::Arc::get_mut(&mut cached_plan) {
                 if self.try_advance_collapsed_projection_plan(&cached_key, &key, plan) {
-                    if plan.effective_collapsed.is_empty() {
+                    if !plan.has_transforms() {
                         self.projection_plan_cache = Some((key, cached_plan));
                         return None;
                     }
@@ -4973,7 +5065,7 @@ impl super::TerminalState {
         }
 
         let resolved = self.resolved_collapses(policy);
-        if resolved.is_empty() {
+        if resolved.is_empty() && !policy.block_spacing() {
             return None;
         }
         #[cfg(test)]
@@ -4981,7 +5073,11 @@ impl super::TerminalState {
         let mut plan = self
             .identity_projection_plan(cols)
             .splice_collapses(&resolved, policy.revision());
-        if plan.effective_collapsed.is_empty() {
+        if policy.block_spacing() {
+            let prompts = self.block_spacing_prompts();
+            plan = plan.splice_block_spacing(&prompts);
+        }
+        if !plan.has_transforms() {
             self.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
             return None;
         }
@@ -5031,6 +5127,7 @@ impl super::TerminalState {
             || old_key.finished_output_revision != new_key.finished_output_revision
             || old_key.policy_revision != new_key.policy_revision
             || old_key.policy_ids != new_key.policy_ids
+            || old_key.block_spacing != new_key.block_spacing
             || old_key.cols != new_key.cols
             || old_key.rows != new_key.rows
             || plan.history_rows != old_key.scrollback_len
@@ -5337,7 +5434,8 @@ impl super::TerminalState {
             return;
         }
         let row = match state.top_anchor {
-            Some(ProjectedTopAnchor::RawCell(anchor)) => Some(anchor.row_id),
+            Some(ProjectedTopAnchor::RawCell(anchor))
+            | Some(ProjectedTopAnchor::Spacer { before: anchor }) => Some(anchor.row_id),
             Some(ProjectedTopAnchor::RawRow(row)) => Some(row),
             Some(ProjectedTopAnchor::Summary { hidden_range, .. }) => Some(hidden_range.start.row),
             None => None,
@@ -5361,6 +5459,7 @@ impl super::TerminalState {
         policy: &ProjectionPolicy,
         view_state: &mut ProjectionViewState,
     ) -> ProjectedViewport {
+        view_state.active_transformed = false;
         if !block_mode || self.use_alt_buffer {
             self.leave_transformed_selection_space();
             return self.projected_viewport(projection, block_mode);
@@ -5525,6 +5624,7 @@ impl super::TerminalState {
             .then(|| self.projected_top_anchor(&viewport))
             .flatten();
         view_state.last_plan_key = Some(plan_key);
+        view_state.active_transformed = true;
         viewport
     }
 

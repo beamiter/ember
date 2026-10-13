@@ -2103,7 +2103,7 @@ impl TerminalApp {
         if running.is_some() && active.is_none() && !terminal.is_alt_buffer_active() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
-        let in_history = if session.projection_policy.is_identity() {
+        let in_history = if !session.projection_view_state.is_transformed() {
             terminal.scroll_offset > 0
         } else {
             session.projection_view_state.offset_from_bottom() > 0
@@ -2136,7 +2136,7 @@ impl TerminalApp {
                 .is_some_and(|record| session.projection_policy.is_collapsed(record.sequence)),
             collapse_available: active
                 .is_some_and(|record| terminal.finished_output_range(record.sequence).is_some()),
-            in_history: if session.projection_policy.is_identity() {
+            in_history: if !session.projection_view_state.is_transformed() {
                 terminal.scroll_offset > 0
             } else {
                 session.projection_view_state.offset_from_bottom() > 0
@@ -2348,6 +2348,9 @@ impl TerminalApp {
                         &terminal_guard,
                         &mut session.collapse_availability_cache,
                     );
+                    session
+                        .projection_policy
+                        .set_block_spacing(!self.pane_renderers[pane_idx].block_compact);
                     let projection_policy = &session.projection_policy;
                     let projection_view_state = &mut session.projection_view_state;
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
@@ -2610,6 +2613,9 @@ impl TerminalApp {
                     &terminal_guard,
                     &mut session.collapse_availability_cache,
                 );
+                session
+                    .projection_policy
+                    .set_block_spacing(!self.renderer.block_compact);
                 let projection_policy = &session.projection_policy;
                 let projection_view_state = &mut session.projection_view_state;
 
