@@ -6,6 +6,13 @@ use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 pub use watch::{WatchCommand, WatchParsed};
 
+/// An explicit Chat button action bound to one observed shell lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatInputAction {
+    Submit { sequence: u64 },
+    Interrupt { sequence: u64 },
+}
+
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
 enum CharClass {
@@ -312,9 +319,10 @@ pub(crate) use hyperlink::is_supported_hyperlink_uri;
 pub use hyperlink::HyperlinkId;
 #[allow(unused_imports)] // Public P1 contract; UI consumers land in the next slice.
 pub use projection::{
-    DisplayPoint, FinishedOutputRange, HistoryProjection, ProjectedBufferAnchorLocation,
-    ProjectedRowKind, ProjectedViewport, ProjectionCacheKey, ProjectionLayoutKey, ProjectionPolicy,
-    ProjectionViewState, RawCellAnchor, RawCellBoundary, SyntheticRowKey,
+    ChatCommandSpan, DisplayPoint, FinishedOutputRange, HistoryProjection,
+    ProjectedBufferAnchorLocation, ProjectedRowKind, ProjectedViewport, ProjectionCacheKey,
+    ProjectionLayoutKey, ProjectionPolicy, ProjectionViewState, RawCellAnchor, RawCellBoundary,
+    SyntheticRowKey,
 };
 
 #[derive(Clone, Debug)]
@@ -694,7 +702,10 @@ pub struct TerminalState {
     pub dirty_region: DirtyRegion,
 
     // P4 优化：行版本化追踪
-    pub grid_version: u64,      // 全局网格版本号
+    pub grid_version: u64, // 全局网格版本号
+    chat_pending_submit: Option<u64>,
+    // A main-screen takeover stays native for this foreground command.
+    chat_native_takeover_sequence: Option<u64>,
     pub row_versions: Vec<u64>, // 每行的修改版本号
 
     // Cached visible cells to avoid per-frame cloning

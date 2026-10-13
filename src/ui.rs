@@ -1,3 +1,4 @@
+pub(crate) mod chat;
 use crate::color;
 use crate::gpu;
 use crate::terminal::{
@@ -1312,6 +1313,14 @@ pub struct TerminalRenderer {
     /// Whether to draw command-block chrome (`block_mode`): gutter stripes,
     /// separators and outcome badges derived from OSC 133 records.
     pub block_mode: bool,
+    /// Distinct conversation presentation; never changes terminal input ownership.
+    pub chat_mode: bool,
+    /// Same-frame explicit input action; target identity must be revalidated by the app.
+    pub chat_input_action: Option<(usize, crate::terminal::ChatInputAction, i32)>,
+    /// Native shell/foreground identity supplied by the owning session.
+    pub chat_native_owner: Option<(i32, i32)>,
+    /// Pointer-down lifecycle token; a release can never target a replacement prompt.
+    chat_pressed_action: Option<(usize, crate::terminal::ChatInputAction, i32)>,
     /// Projection-only state is renderer-owned and versioned independently
     /// from PTY/grid mutations. P0 exposes only the identity policy.
     history_projection: HistoryProjection,
@@ -1407,6 +1416,7 @@ pub struct TerminalRenderer {
 impl TerminalRenderer {
     pub fn companion_status_rows(&self) -> usize {
         if !self.block_mode
+            || self.chat_mode
             || !self.companion_status_enabled
             || !self.line_height.is_finite()
             || self.line_height <= 0.0
@@ -1468,6 +1478,10 @@ impl TerminalRenderer {
             font_ligatures: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
+            chat_mode: false,
+            chat_input_action: None,
+            chat_native_owner: None,
+            chat_pressed_action: None,
             history_projection: HistoryProjection::identity(),
             frame_projection: None,
             requested_collapsed_zone_ids: std::collections::HashSet::new(),
@@ -1527,7 +1541,20 @@ impl TerminalRenderer {
     /// its link/mouse frontends. Repeated calls with an unchanged key clone
     /// only small `Arc`s; the cells and origin index stay shared.
     pub fn projected_viewport(&self, terminal: &mut TerminalState) -> ProjectedViewport {
-        terminal.projected_viewport(self.history_projection, self.block_mode)
+        if self.chat_mode {
+            let mut policy = crate::terminal::ProjectionPolicy::new();
+            policy.set_chat_mode(true);
+            policy.set_block_spacing(true);
+            policy.set_block_chrome(true, 0);
+            terminal.projected_viewport_with_state(
+                self.history_projection,
+                self.block_mode,
+                &policy,
+                &mut crate::terminal::ProjectionViewState::new(),
+            )
+        } else {
+            terminal.projected_viewport(self.history_projection, self.block_mode)
+        }
     }
 
     pub fn projected_viewport_with_state(
@@ -2269,6 +2296,9 @@ impl TerminalRenderer {
         viewport: &ProjectedViewport,
         rows: usize,
     ) -> Option<Vec<BlockChromeEntry>> {
+        if self.chat_mode && viewport.key().is_bypass() {
+            return None;
+        }
         if viewport.is_transformed() || !terminal.viewport_buffer_mapping_is_exact() {
             self.compute_projected_block_chrome(terminal, viewport)
         } else {
@@ -2409,8 +2439,19 @@ impl TerminalRenderer {
                 record.output_start,
                 cols,
             );
-            let projected_header_range =
-                Self::projected_header_range(terminal, viewport, header_range, cols);
+            let projected_header_range = viewport
+                .chat_command_spans()
+                .iter()
+                .find(|command| command.sequence == record.sequence)
+                .and_then(|command| {
+                    let last = command.rows.end.checked_sub(1)?;
+                    let (_, right) = viewport.real_column_bounds(last)?;
+                    Some((
+                        DisplayPoint::new(command.rows.start, command.column),
+                        DisplayPoint::new(last, right),
+                    ))
+                })
+                .or_else(|| Self::projected_header_range(terminal, viewport, header_range, cols));
             let prompt = normalized_block_anchor(
                 record.prompt_start.line_id,
                 record.prompt_start.column,
@@ -3021,7 +3062,17 @@ impl TerminalRenderer {
                                     collapse_rect,
                                     entry.active || entry.hovered,
                                     crate::block_mode::output_collapse_menu_label(collapsed),
-                                    Some(if collapsed { "▸" } else { "▾" }),
+                                    Some(if self.chat_mode {
+                                        if collapsed {
+                                            "+"
+                                        } else {
+                                            "-"
+                                        }
+                                    } else if collapsed {
+                                        "▸"
+                                    } else {
+                                        "▾"
+                                    }),
                                 )
                             })
                             .inner
@@ -3085,7 +3136,7 @@ impl TerminalRenderer {
                                 rect,
                                 entry.active || entry.hovered,
                                 &label,
-                                Some("⋮"),
+                                Some(if self.chat_mode { "..." } else { "⋮" }),
                             )
                         } else {
                             block_action_button(ui, id, rect, entry.active || entry.hovered, &label)
@@ -3619,16 +3670,18 @@ impl TerminalRenderer {
             };
             let rect = rect.intersect(geometry.rect);
             let foreground = self.theme.terminal_foreground();
-            painter.rect_filled(
-                rect,
-                egui::CornerRadius {
-                    nw: 6,
-                    ne: 6,
-                    sw: 0,
-                    se: 0,
-                },
-                foreground.gamma_multiply(0.035),
-            );
+            if !self.chat_mode {
+                painter.rect_filled(
+                    rect,
+                    egui::CornerRadius {
+                        nw: 6,
+                        ne: 6,
+                        sw: 0,
+                        se: 0,
+                    },
+                    foreground.gamma_multiply(0.035),
+                );
+            }
             let right = block_header_actions(content, row, line_height)
                 .map_or(rect.right() - 4.0, |(overflow, _)| overflow.left() - 6.0);
             let dot = egui::pos2(rect.left() + 9.0, rect.center().y);
@@ -4052,6 +4105,7 @@ impl TerminalRenderer {
     ) -> Response {
         self.companion_surface = None;
         self.companion_status_surface = None;
+        self.chat_input_action = None;
         let initial_scroll_offset = terminal.scroll_offset;
         let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
         terminal.kitty_graphics.set_cell_size_pixels(
@@ -4095,7 +4149,7 @@ impl TerminalRenderer {
         // `None` while chrome is gated off (config, alt screen, reflow).
         let summaries = Self::projected_summary_rows(terminal, &viewport);
         let mut block_chrome = self.block_chrome_snapshot(terminal, &viewport, rows);
-        if let Some(entries) = block_chrome.as_deref() {
+        if let Some(entries) = block_chrome.as_deref().filter(|_| !self.chat_mode) {
             let command_ranges: Vec<_> = entries
                 .iter()
                 .filter(|entry| !entry.live)
@@ -4134,8 +4188,18 @@ impl TerminalRenderer {
             );
         }
         let block_row_backdrops = if let Some(entries) = block_chrome.as_deref() {
-            self.draw_block_card_backgrounds(&painter, entries, content_rect, line_height, rows);
-            self.block_row_backdrops(entries, rows, bg)
+            if self.chat_mode {
+                self.draw_chat_backgrounds(&painter, terminal, &viewport, entries, content_rect, bg)
+            } else {
+                self.draw_block_card_backgrounds(
+                    &painter,
+                    entries,
+                    content_rect,
+                    line_height,
+                    rows,
+                );
+                self.block_row_backdrops(entries, rows, bg)
+            }
         } else {
             Vec::new()
         };
@@ -4796,14 +4860,18 @@ impl TerminalRenderer {
         // layout-owned gutter, so neither path covers a glyph.
         if let Some(entries) = &block_chrome {
             self.draw_block_metadata(&painter, terminal, entries, content_rect, line_height);
-            self.draw_block_chrome(
-                &painter,
-                entries,
-                &grid,
-                content_rect,
-                char_width,
-                line_height,
-            );
+            if self.chat_mode {
+                self.draw_chat_foreground(&painter, terminal, &viewport, entries, content_rect);
+            } else {
+                self.draw_block_chrome(
+                    &painter,
+                    entries,
+                    &grid,
+                    content_rect,
+                    char_width,
+                    line_height,
+                );
+            }
         }
         self.draw_collapsed_summaries(&painter, &summaries, content_rect, line_height);
         if let Some(entries) = &block_chrome {
@@ -4817,6 +4885,18 @@ impl TerminalRenderer {
                 rows,
                 interaction_enabled,
             );
+        }
+
+        if self.chat_mode
+            && self.draw_chat_controls(
+                ui,
+                terminal,
+                &viewport,
+                content_rect,
+                interaction_enabled && focus_enabled,
+            )
+        {
+            response.request_focus();
         }
 
         // Zero/positive z-index images are above terminal text and UI chrome;

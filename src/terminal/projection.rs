@@ -92,6 +92,7 @@ pub struct ProjectionPolicy {
     block_spacing: bool,
     block_headers: bool,
     companion_status_rows: usize,
+    chat_mode: bool,
 }
 
 impl Default for ProjectionPolicy {
@@ -102,6 +103,7 @@ impl Default for ProjectionPolicy {
             block_spacing: false,
             block_headers: false,
             companion_status_rows: 0,
+            chat_mode: false,
         }
     }
 }
@@ -116,10 +118,27 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty()
+        !self.chat_mode
+            && self.collapsed.is_empty()
             && !self.block_spacing
             && !self.block_headers
             && self.companion_status_rows == 0
+    }
+
+    pub fn chat_mode(&self) -> bool {
+        self.chat_mode
+    }
+
+    pub fn set_chat_mode(&mut self, enabled: bool) -> bool {
+        if self.chat_mode == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.chat_mode = enabled;
+        self.revision = revision;
+        true
     }
 
     pub fn block_spacing(&self) -> bool {
@@ -324,6 +343,9 @@ pub(super) struct ProjectionPlan {
     pub(super) incremental_appended_rows: usize,
     /// Non-zero identity of this exact cached plan instance.
     pub(super) plan_revision: u64,
+    pub(super) chat_commands: Vec<ChatCommandSpan>,
+    pub(super) chat_dock_start: Option<usize>,
+    pub(super) chat_mode: bool,
 }
 
 /// Exact structural identity of a full-document transformed plan. Cell bytes
@@ -344,6 +366,9 @@ pub(super) struct ProjectionPlanCacheKey {
     pub(super) block_headers: bool,
     pub(super) companion_status_rows: usize,
     pub(super) chrome_tail_keep: usize,
+    pub(super) chat_mode: bool,
+    pub(super) chat_prompt_ready: bool,
+    pub(super) chat_content_revision: u64,
     /// Canonical count of full-screen primary-buffer row transfers. Combined
     /// with the row-identity delta, this rejects any batch containing a
     /// noncanonical move. Zero is the uncacheable overflow sentinel.
@@ -467,6 +492,9 @@ impl ProjectionPlan {
             incremental_from: None,
             incremental_appended_rows: 0,
             plan_revision: 0,
+            chat_commands: Vec::new(),
+            chat_dock_start: None,
+            chat_mode: false,
         };
         plan.rebuild_raw_row_placements();
         plan
@@ -822,7 +850,7 @@ impl ProjectionPlan {
         }
     }
 
-    fn rebuild_raw_row_placements(&mut self) {
+    pub(super) fn rebuild_raw_row_placements(&mut self) {
         for placement in &mut self.raw_rows {
             placement.first_view_row = None;
             placement.last_view_row = None;
@@ -1159,7 +1187,10 @@ impl ProjectionPlan {
     }
 
     pub(super) fn has_transforms(&self) -> bool {
-        self.spacer_count > 0 || self.chrome_row_count > 0 || !self.effective_collapsed.is_empty()
+        self.chat_mode
+            || self.spacer_count > 0
+            || self.chrome_row_count > 0
+            || !self.effective_collapsed.is_empty()
     }
 
     /// Splice only before a prompt which is still the first exact cell of a
@@ -2076,6 +2107,14 @@ impl OriginSpan {
     }
 }
 
+/// A command capsule's exact display cells. Its horizontal padding has no raw origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatCommandSpan {
+    pub sequence: u64,
+    pub rows: std::ops::Range<usize>,
+    pub column: usize,
+}
+
 /// Immutable materialized viewport plus its stable raw-cell provenance.
 ///
 /// The cell `Arc` is the exact allocation returned by the pre-projection
@@ -2095,6 +2134,9 @@ pub struct ProjectedViewport {
     document_start: usize,
     top_padding: usize,
     effective_collapsed: Arc<BTreeSet<u64>>,
+    chat_documents: Option<Arc<Vec<Option<usize>>>>,
+    chat_commands: Arc<Vec<ChatCommandSpan>>,
+    chat_composer: Option<std::ops::Range<usize>>,
 }
 
 impl ProjectedViewport {
@@ -2133,6 +2175,9 @@ impl ProjectedViewport {
             document_start: key.scrollback_len.saturating_sub(key.scroll_offset),
             top_padding: 0,
             effective_collapsed: Arc::new(BTreeSet::new()),
+            chat_documents: None,
+            chat_commands: Arc::new(Vec::new()),
+            chat_composer: None,
         }
     }
 
@@ -2172,7 +2217,30 @@ impl ProjectedViewport {
             document_start,
             top_padding,
             effective_collapsed: Arc::new(effective_collapsed),
+            chat_documents: None,
+            chat_commands: Arc::new(Vec::new()),
+            chat_composer: None,
         }
+    }
+
+    pub(super) fn with_chat_layout(
+        mut self,
+        documents: Vec<Option<usize>>,
+        commands: Vec<ChatCommandSpan>,
+        composer: Option<std::ops::Range<usize>>,
+    ) -> Self {
+        self.chat_documents = Some(Arc::new(documents));
+        self.chat_commands = Arc::new(commands);
+        self.chat_composer = composer;
+        self
+    }
+
+    pub fn chat_command_spans(&self) -> &[ChatCommandSpan] {
+        &self.chat_commands
+    }
+
+    pub fn chat_composer_rows(&self) -> Option<std::ops::Range<usize>> {
+        self.chat_composer.clone()
     }
 
     pub fn key(&self) -> ProjectionCacheKey {
@@ -2247,6 +2315,9 @@ impl ProjectedViewport {
     }
 
     pub fn view_document_row(&self, display_row: usize) -> Option<usize> {
+        if let Some(documents) = &self.chat_documents {
+            return documents.get(display_row).copied().flatten();
+        }
         (display_row >= self.top_padding && display_row < self.rows()).then(|| {
             self.document_start
                 .saturating_add(display_row - self.top_padding)
@@ -2274,7 +2345,7 @@ impl ProjectedViewport {
         self.row_sources.get(display_row).copied().flatten()
     }
 
-    pub(super) fn real_column_bounds(&self, display_row: usize) -> Option<(usize, usize)> {
+    pub(crate) fn real_column_bounds(&self, display_row: usize) -> Option<(usize, usize)> {
         let start = self
             .origins_by_display
             .partition_point(|span| span.display_start.row < display_row);

@@ -971,7 +971,7 @@ impl TerminalApp {
     }
 
     pub(crate) fn block_chrome_owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        self.config.block_mode
+        self.config.command_cards_enabled()
             && (super::rendering::block_workspace_has_focus(ctx)
                 || crate::ui::block_action_has_focus(ctx))
     }
@@ -1646,7 +1646,7 @@ impl TerminalApp {
             return;
         };
         self.search_state.clear_projection_diagnostic();
-        let block_mode = self.config.block_mode;
+        let block_mode = self.config.command_cards_enabled();
         let (location, policy_revision) = {
             let session = self.session_manager.get_active_session_mut();
             let terminal_arc = std::sync::Arc::clone(&session.terminal);
@@ -1734,7 +1734,7 @@ impl TerminalApp {
             let mut terminal = terminal_arc.lock();
             let viewport = terminal.projected_viewport_with_state(
                 crate::terminal::HistoryProjection::identity(),
-                self.config.block_mode,
+                self.config.command_cards_enabled(),
                 policy,
                 view_state,
             );
@@ -1772,7 +1772,7 @@ impl TerminalApp {
     }
 
     fn scroll_active_terminal(&mut self, lines: isize) {
-        let block_mode = self.config.block_mode;
+        let block_mode = self.config.command_cards_enabled();
         let session = self.session_manager.get_active_session_mut();
         let terminal_arc = std::sync::Arc::clone(&session.terminal);
         let policy = &session.projection_policy;
@@ -1792,7 +1792,7 @@ impl TerminalApp {
     }
 
     fn jump_adjacent_command(&mut self, next: bool) -> bool {
-        let block_mode = self.config.block_mode;
+        let block_mode = self.config.command_cards_enabled();
         let session = self.session_manager.get_active_session_mut();
         let terminal_arc = std::sync::Arc::clone(&session.terminal);
         let policy = &session.projection_policy;
@@ -2349,7 +2349,7 @@ impl TerminalApp {
         ui_input_blocked: bool,
         terminal_input_blocked: bool,
     ) -> (bool, bool, bool) {
-        if !self.config.block_mode && self.block_selection.is_some() {
+        if !self.config.command_cards_enabled() && self.block_selection.is_some() {
             self.clear_block_selection();
         }
 
@@ -2507,7 +2507,7 @@ impl TerminalApp {
     /// range has no commands; validation/backpressure failures are consumed and
     /// surfaced so they cannot submit unrelated prompt text.
     fn handle_block_selection_key_event(&mut self, event: &egui::Event) -> bool {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return false;
         }
@@ -2523,7 +2523,7 @@ impl TerminalApp {
             })
             .unwrap_or((None, false));
         let has_selection = block_selection_context_available(
-            self.config.block_mode,
+            self.config.command_cards_enabled(),
             block_canvas_visible,
             active_session_id.as_ref().is_some_and(|session_id| {
                 self.block_selection

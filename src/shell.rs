@@ -869,7 +869,9 @@ impl ShellSession {
     }
 
     /// 处理大数据写入：循环写入并在 poll 等待时释放锁，避免与 io_loop 死锁。
-    /// 仅由 writer 线程调用,保证全局只有一个写者 —— 字节流不会与其他写入交错。
+    /// Normal FIFO writes run only on the writer thread. The optional immediate
+    /// one-byte control path excludes queued/in-flight work under the same
+    /// queue lock, so it cannot interleave with this loop.
     fn write_to_pty(pty: &Arc<Mutex<Pty>>, data: &[u8]) -> std::result::Result<(), String> {
         let mut offset = 0;
         let mut last_progress = std::time::Instant::now();
@@ -948,6 +950,56 @@ impl ShellSession {
     /// 都保证一个字节也没有入队，调用方可以安全保留原输入后重试。
     pub fn write(&self, data: &[u8]) -> Result<(), ShellWriteError> {
         self.write_tx.queue.try_enqueue_slice(data)
+    }
+
+    /// Observe the actual PTY foreground owner for a rendered Chat gesture.
+    /// Missing or contended native state disables the optional control.
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        let pty = self.pty.try_lock()?;
+        // SAFETY: the live Pty guard pins the master descriptor.
+        let pgid = unsafe { libc::tcgetpgrp(pty.master_fd()) };
+        (pgid > 0).then_some(pgid)
+    }
+
+    /// Single-byte, non-retrying control admission on the existing writer's
+    /// synchronization boundary. Holding queue state excludes every producer
+    /// and proves there is no queued/in-flight writer. Never enqueue a Chat
+    /// control for later delivery, and never partially send an escape sequence.
+    pub(crate) fn try_write_control_byte(
+        &self,
+        byte: u8,
+        validate: impl FnOnce(i32) -> bool,
+    ) -> bool {
+        let Some(state) = self.write_tx.queue.state.try_lock() else {
+            return false;
+        };
+        if state.closed || state.accounted_messages != 0 || self.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(mut pty) = self.pty.try_lock() else {
+            return false;
+        };
+        if !pty.is_alive() {
+            return false;
+        }
+        // The constructor's best-effort flag setup is not sufficient for an
+        // immediate UI-thread write. Fail closed unless this live descriptor
+        // can be confirmed nonblocking, before invoking lifecycle validation.
+        // SAFETY: the live Pty guard pins the descriptor through the write.
+        let flags = unsafe { libc::fcntl(pty.master_fd(), libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_NONBLOCK == 0 {
+            return false;
+        }
+        // SAFETY: the live Pty guard pins the master descriptor. Foreground
+        // validation and the one-byte nonblocking write share this boundary.
+        let foreground = unsafe { libc::tcgetpgrp(pty.master_fd()) };
+        if foreground <= 0 || !validate(foreground) {
+            return false;
+        }
+        // One syscall only: even EINTR is a refusal, never a later retry.
+        // SAFETY: the guard pins the nonblocking master; one byte cannot have
+        // a partially-written escape-sequence suffix.
+        unsafe { libc::write(pty.master_fd(), (&byte as *const u8).cast(), 1) == 1 }
     }
 
     /// 返回写入队列的发送端,供需要先做阻塞 I/O(如读剪贴板)再写 PTY 的后台线程使用。
@@ -1336,6 +1388,232 @@ mod tests {
         let chunks = RAW_BYTES.div_ceil(CHUNK_BYTES);
         let conservative_response_bytes = base64_bytes + chunks * 256 + 1024;
         assert!(conservative_response_bytes <= WRITE_MESSAGE_BYTE_CAP);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_control_rejects_real_queued_inflight_and_closed_writer_without_retry() {
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo; printf READY; sleep 30".into(),
+        ];
+        let shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            None,
+            None,
+            None,
+            Some(&argv),
+            egui::Context::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(ShellEvent::Output(bytes)) =
+                shell.events().recv_timeout(Duration::from_millis(20))
+            {
+                if bytes.as_bytes().windows(5).any(|word| word == b"READY") {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline);
+        }
+        // A real FIFO write becomes in-flight while its PTY lock is held.
+        let pty = shell.pty.lock();
+        shell.write(b"older").unwrap();
+        assert!(!shell.try_write_control_byte(3, |_| panic!("must reject before validation")));
+        while !shell.write_tx.queue.state.lock().pending.is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(shell.write_tx.queue.state.lock().accounted_messages, 1);
+        assert!(
+            !shell.try_write_control_byte(3, |_| panic!("in-flight bytes still own the writer"))
+        );
+        drop(pty);
+        while shell.write_tx.queue.state.lock().accounted_messages != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        shell.write_tx.queue.close();
+        let terminal = Arc::new(Mutex::new(crate::terminal::TerminalState::new(80, 24)));
+        terminal
+            .lock()
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let action = crate::terminal::ChatInputAction::Submit {
+            sequence: terminal.lock().command_records().back().unwrap().sequence,
+        };
+        let mut session = crate::session::Session::new_with_session_id(
+            "closed".into(),
+            vec![],
+            terminal,
+            shell,
+            "closed".into(),
+        );
+        let foreground = session.shell.foreground_pgid().unwrap();
+        assert!(!session.try_chat_input(
+            action,
+            b"\r",
+            foreground,
+            None,
+            &crate::session_manager::SessionInputBarriers::default(),
+            &crate::session_manager::ProtocolResponseSender::new(egui::Context::default())
+        ));
+        assert!(session.pending_input.is_empty());
+        assert!(
+            action.is_current(&session.terminal.lock()),
+            "closed writer never arms the Run latch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_control_requires_nonblocking_before_validation() {
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo; printf READY; read line; printf DONE".into(),
+        ];
+        let shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            None,
+            None,
+            None,
+            Some(&argv),
+            egui::Context::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut output = Vec::new();
+        while !output.windows(5).any(|word| word == b"READY") {
+            if let Ok(ShellEvent::Output(bytes)) =
+                shell.events().recv_timeout(Duration::from_millis(20))
+            {
+                output.extend_from_slice(bytes.as_bytes());
+            }
+            assert!(Instant::now() < deadline);
+        }
+        let terminal = Arc::new(Mutex::new(crate::terminal::TerminalState::new(80, 24)));
+        terminal
+            .lock()
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let action = crate::terminal::ChatInputAction::Submit {
+            sequence: terminal.lock().command_records().back().unwrap().sequence,
+        };
+        let mut session = crate::session::Session::new_with_session_id(
+            "nonblocking".into(),
+            vec![],
+            terminal,
+            shell,
+            "nonblocking".into(),
+        );
+        let foreground = session.shell.foreground_pgid().unwrap();
+        let barriers = crate::session_manager::SessionInputBarriers::default();
+        let responses =
+            crate::session_manager::ProtocolResponseSender::new(egui::Context::default());
+        let set_flags = |flags: libc::c_int| {
+            let pty = session.shell.pty.lock();
+            // SAFETY: the live guard pins this idle fixture's master fd.
+            assert_eq!(
+                unsafe { libc::fcntl(pty.master_fd(), libc::F_SETFL, flags) },
+                0
+            );
+        };
+        let flags = {
+            let pty = session.shell.pty.lock();
+            // SAFETY: the live guard pins the descriptor queried here.
+            unsafe { libc::fcntl(pty.master_fd(), libc::F_GETFL) }
+        };
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+        // No queued input and no output after READY: never fill this PTY or
+        // intentionally attempt a blocking write. A red-test callback also
+        // returns false, so a missing admission guard cannot issue a syscall.
+        set_flags(flags & !libc::O_NONBLOCK);
+        let called = std::cell::Cell::new(false);
+        let accepted = session.shell.try_write_control_byte(b'\r', |_| {
+            called.set(true);
+            false
+        });
+        set_flags(flags);
+        assert!(!accepted);
+        assert!(
+            !called.get(),
+            "reject before lifecycle/foreground validation"
+        );
+
+        set_flags(flags & !libc::O_NONBLOCK);
+        let accepted =
+            session.try_chat_input(action, b"\r", foreground, None, &barriers, &responses);
+        {
+            let pty = session.shell.pty.lock();
+            // SAFETY: restore before assertions; the live guard pins the fd.
+            assert_eq!(
+                unsafe { libc::fcntl(pty.master_fd(), libc::F_SETFL, flags) },
+                0
+            );
+        }
+        assert!(!accepted);
+        assert!(session.pending_input.is_empty());
+        assert!(action.is_current(&session.terminal.lock()));
+        assert_eq!(
+            session.shell.write_tx.queue.state.lock().accounted_messages,
+            0
+        );
+        assert!(session.shell.write_tx.queue.state.lock().pending.is_empty());
+        assert!(session.try_chat_input(action, b"\r", foreground, None, &barriers, &responses));
+        assert!(!action.is_current(&session.terminal.lock()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_control_kernel_backpressure_has_no_delayed_suffix_or_retry() {
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo; printf READY; sleep 30".into(),
+        ];
+        let shell = ShellSession::new_with_cwd(
+            80,
+            24,
+            None,
+            None,
+            None,
+            Some(&argv),
+            egui::Context::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(ShellEvent::Output(bytes)) =
+                shell.events().recv_timeout(Duration::from_millis(20))
+            {
+                if bytes.as_bytes().windows(5).any(|word| word == b"READY") {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline);
+        }
+        // Saturate the real nonblocking kernel PTY while its child is not
+        // reading. This fixture holds the same descriptor lock as production.
+        for _ in 0..3 {
+            let mut pty = shell.pty.lock();
+            let mut written = 0;
+            loop {
+                match pty.write(b"x") {
+                    Ok(crate::pty::WriteOutcome::Written(1)) => written += 1,
+                    Ok(crate::pty::WriteOutcome::WouldBlock) => break,
+                    result => panic!("unexpected fill outcome: {result:?}"),
+                }
+                assert!(written < 1_000_000);
+            }
+            drop(pty);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!shell.try_write_control_byte(b'\r', |_| true));
+        assert_eq!(shell.write_tx.queue.state.lock().accounted_messages, 0);
+        assert!(shell.write_tx.queue.state.lock().pending.is_empty());
     }
 
     #[cfg(unix)]

@@ -391,6 +391,8 @@ impl super::TerminalState {
             // IMPORTANT: row_versions must match grid.rows(), not the parameter 'rows'
             // This ensures dirty tracking works correctly even with scrollback
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
+            chat_pending_submit: None,
+            chat_native_takeover_sequence: None,
             visible_cells_cache: None,
             projected_viewport_cache: None,
             projection_plan_cache: None,
@@ -2868,6 +2870,19 @@ impl super::TerminalState {
         if self.use_alt_buffer {
             return;
         }
+        // A/B alone may be emitted by an application. A latched takeover
+        // survives them until a shell-reported D and a later safe prompt.
+        if self.chat_native_takeover_sequence.is_some()
+            && self.command_records.back().is_some_and(|record| {
+                record.complete
+                    && record.completion_provenance
+                        == crate::block_mode::CompletionProvenance::ShellReported
+            })
+            && !self.is_mouse_enabled()
+            && self.kitty_graphics.get_placements().is_empty()
+        {
+            self.chat_native_takeover_sequence = None;
+        }
         // A fresh shell prompt is the only unambiguous boundary that clears
         // local input and any approval that never reached command start.
         self.agent_prompt_input_tainted = false;
@@ -2935,6 +2950,7 @@ impl super::TerminalState {
         let Some(index) = self.ensure_active_record() else {
             return;
         };
+        self.chat_pending_submit = None;
         self.apply_record_metadata(index, id, command, cwd, command_truncated);
         let anchor = self.current_buffer_anchor();
         if let Some(record) = self.command_records.get_mut(index) {
@@ -5030,7 +5046,7 @@ impl super::TerminalState {
     }
 
     fn block_chrome_tail_keep(&self, policy: &ProjectionPolicy) -> usize {
-        if (!policy.block_headers() && policy.companion_status_rows() == 0)
+        if (!policy.chat_mode() && !policy.block_headers() && policy.companion_status_rows() == 0)
             || !self.kitty_graphics.get_placements().is_empty()
         {
             return self.grid.rows();
@@ -5089,6 +5105,13 @@ impl super::TerminalState {
             block_headers: policy.block_headers(),
             companion_status_rows: policy.companion_status_rows(),
             chrome_tail_keep: self.block_chrome_tail_keep(policy),
+            chat_mode: policy.chat_mode(),
+            chat_prompt_ready: policy.chat_mode() && self.chat_surface().composer_docked(),
+            chat_content_revision: if policy.chat_mode() {
+                self.chat_content_revision()
+            } else {
+                0
+            },
             full_screen_scroll_revision: self.full_screen_scroll_revision,
         }
     }
@@ -5148,7 +5171,8 @@ impl super::TerminalState {
         }
 
         let resolved = self.resolved_collapses(policy);
-        if resolved.is_empty()
+        if !policy.chat_mode()
+            && resolved.is_empty()
             && !policy.block_spacing()
             && !policy.block_headers()
             && policy.companion_status_rows() == 0
@@ -5168,6 +5192,9 @@ impl super::TerminalState {
             let BlockChromePrompts { headers, status } = self.block_chrome_prompts(policy);
             plan =
                 plan.splice_block_chrome(&headers, status, key.chrome_tail_keep, self.grid.rows());
+        }
+        if policy.chat_mode() {
+            self.apply_chat_plan(&mut plan, key.chrome_tail_keep);
         }
         if !plan.has_transforms() {
             self.projection_plan_cache = Some((key, std::sync::Arc::new(plan)));
@@ -5205,7 +5232,22 @@ impl super::TerminalState {
         else {
             return false;
         };
-        if old_key.block_headers != new_key.block_headers
+        // Once command capsules are entirely in the immutable history prefix,
+        // streaming output can reuse the existing O(viewport + appended) plan
+        // advance. A dock or a mutable command row still requires a cold plan.
+        let chat_incremental = old_key.chat_mode
+            && new_key.chat_mode
+            && !old_key.chat_prompt_ready
+            && !new_key.chat_prompt_ready
+            && old_key.chat_content_revision == new_key.chat_content_revision
+            && plan.chat_dock_start.is_none()
+            && plan
+                .chat_commands
+                .iter()
+                .all(|command| command.rows.end <= plan.rows.len().saturating_sub(old_key.rows));
+        if old_key.chat_mode != new_key.chat_mode
+            || new_key.chat_mode && !chat_incremental
+            || old_key.block_headers != new_key.block_headers
             || old_key.companion_status_rows != new_key.companion_status_rows
             || old_key.chrome_tail_keep != old_key.rows
             || new_key.chrome_tail_keep != new_key.rows
@@ -5309,7 +5351,18 @@ impl super::TerminalState {
                 self.grid.row_wrapped[row],
             )
         });
-        plan.advance_full_screen_scroll(evicted_old_history, appended_layouts, grid_layouts)
+        let previous_base = plan.display_row_base;
+        let advanced =
+            plan.advance_full_screen_scroll(evicted_old_history, appended_layouts, grid_layouts);
+        if advanced && plan.chat_mode {
+            let evicted = plan.display_row_base.saturating_sub(previous_base);
+            plan.chat_commands.retain_mut(|command| {
+                command.rows = command.rows.start.saturating_sub(evicted)
+                    ..command.rows.end.saturating_sub(evicted);
+                !command.rows.is_empty()
+            });
+        }
+        advanced
     }
 
     fn bump_selection_revision(&mut self) {
@@ -5557,9 +5610,10 @@ impl super::TerminalState {
         view_state: &mut ProjectionViewState,
     ) -> ProjectedViewport {
         view_state.active_transformed = false;
-        if !block_mode || self.use_alt_buffer {
+        self.observe_chat_native_takeover();
+        if !block_mode || self.use_alt_buffer || policy.chat_mode() && self.chat_native_takeover() {
             self.leave_transformed_selection_space();
-            return self.projected_viewport(projection, block_mode);
+            return self.projected_viewport(projection, block_mode && !policy.chat_mode());
         }
         if policy.is_identity() {
             self.leave_transformed_selection_space();
@@ -5617,96 +5671,15 @@ impl super::TerminalState {
             cursor_row: cursor_row_id,
             cursor_col: self.cursor_col,
         };
-        let viewport = if let Some((cached_key, viewport)) = &self.transformed_viewport_cache {
-            if *cached_key == viewport_key {
-                viewport.clone()
-            } else {
-                let materialized =
-                    self.materialize_projection_plan(&plan, document_start, viewport_rows);
-                let cursor = materialized
-                    .origins
-                    .iter()
-                    .find_map(|span| {
-                        let end = span.raw_start.column.saturating_add(span.len);
-                        (span.raw_start.row_id == cursor_row_id
-                            && (span.raw_start.column..end).contains(&self.cursor_col))
-                        .then(|| {
-                            DisplayPoint::new(
-                                span.display_start.row,
-                                span.display_start.column + self.cursor_col - span.raw_start.column,
-                            )
-                        })
-                    })
-                    .unwrap_or_else(|| DisplayPoint::new(usize::MAX, usize::MAX));
-                let key = ProjectionCacheKey::new(
-                    self.grid_version,
-                    plan.plan_revision,
-                    self.total_lines_scrolled,
-                    self.row_identity_revision,
-                    self.scrollback.len(),
-                    view_state.offset_from_bottom,
-                    viewport_rows,
-                    cols,
-                    false,
-                    ProjectionMode::Transformed,
-                );
-                ProjectedViewport::new_transformed(
-                    key,
-                    materialized.cells,
-                    materialized.row_wrapped,
-                    materialized.row_kinds,
-                    materialized.row_sources,
-                    materialized.origins,
-                    cursor,
-                    plan.document_rows(),
-                    materialized.document_start,
-                    materialized.top_padding,
-                    plan.effective_collapsed.clone(),
-                )
-            }
-        } else {
-            let materialized =
-                self.materialize_projection_plan(&plan, document_start, viewport_rows);
-            let cursor = materialized
-                .origins
-                .iter()
-                .find_map(|span| {
-                    let end = span.raw_start.column.saturating_add(span.len);
-                    (span.raw_start.row_id == cursor_row_id
-                        && (span.raw_start.column..end).contains(&self.cursor_col))
-                    .then(|| {
-                        DisplayPoint::new(
-                            span.display_start.row,
-                            span.display_start.column + self.cursor_col - span.raw_start.column,
-                        )
-                    })
-                })
-                .unwrap_or_else(|| DisplayPoint::new(usize::MAX, usize::MAX));
-            let key = ProjectionCacheKey::new(
-                self.grid_version,
-                plan.plan_revision,
-                self.total_lines_scrolled,
-                self.row_identity_revision,
-                self.scrollback.len(),
-                view_state.offset_from_bottom,
+        let viewport = match &self.transformed_viewport_cache {
+            Some((cached_key, viewport)) if *cached_key == viewport_key => viewport.clone(),
+            _ => self.materialize_chat_or_block_viewport(
+                &plan,
+                document_start,
                 viewport_rows,
-                cols,
-                false,
-                ProjectionMode::Transformed,
-            );
-            ProjectedViewport::new_transformed(
-                key,
-                materialized.cells,
-                materialized.row_wrapped,
-                materialized.row_kinds,
-                materialized.row_sources,
-                materialized.origins,
-                cursor,
-                plan.document_rows(),
-                materialized.document_start,
-                materialized.top_padding,
-                plan.effective_collapsed.clone(),
-            )
+                cursor_row_id,
+                view_state.offset_from_bottom,
+            ),
         };
         if self
             .transformed_viewport_cache
@@ -6230,11 +6203,10 @@ impl super::TerminalState {
             self.use_alt_buffer,
             mode,
         );
-        if let Some(cached) = self
-            .projected_viewport_cache
-            .as_ref()
-            .filter(|cached| cached.key() == key)
-        {
+        if let Some(cached) = self.projected_viewport_cache.as_ref().filter(|cached| {
+            cached.key() == key
+                && cached.cursor() == DisplayPoint::new(self.cursor_row, self.cursor_col)
+        }) {
             return cached.clone();
         }
 
@@ -6522,10 +6494,14 @@ impl super::TerminalState {
             && key.rows == self.grid.rows()
             && key.cols == self.grid.row_len().max(1)
             && key.row_wrapped.as_slice() == self.grid.row_wrapped.as_slice()
-            && (!(key.block_headers || key.companion_status_rows > 0)
+            && (!key.chat_mode
+                || (key.chat_content_revision == self.chat_content_revision()
+                    && key.chat_prompt_ready == self.chat_surface().composer_docked()))
+            && (!(key.chat_mode || key.block_headers || key.companion_status_rows > 0)
                 || key.chrome_tail_keep == {
                     let mut policy = ProjectionPolicy::new();
                     policy.set_block_chrome(key.block_headers, key.companion_status_rows);
+                    policy.set_chat_mode(key.chat_mode);
                     self.block_chrome_tail_keep(&policy)
                 })
     }
@@ -6736,6 +6712,16 @@ impl super::TerminalState {
                 self.clear_text_selection();
                 return;
             };
+            if let Some(selection) = &self.projected_selection {
+                if let Some(composer) = viewport.chat_composer_rows() {
+                    if let Some(composer_document) = viewport.view_document_row(composer.start) {
+                        let anchor_in_composer = selection.anchor.point.0 >= composer_document;
+                        if anchor_in_composer != composer.contains(&display_pos.0) {
+                            return;
+                        }
+                    }
+                }
+            }
             let Some(point) = Self::projected_selection_point(viewport, display_pos) else {
                 // Dragging across a summary/padding row keeps the last valid
                 // endpoint; synthetic rows never become anchors themselves.
@@ -7650,3 +7636,6 @@ impl super::TerminalState {
         self.preedit_cursor = 0;
     }
 }
+
+#[path = "chat.rs"]
+mod chat;

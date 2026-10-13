@@ -4,6 +4,7 @@ use super::state::{
     PROJECTION_PLAN_ORACLE_HISTORY_DECOMPRESSES, PROJECTION_VIEW_HISTORY_DECOMPRESSES,
     VISIBLE_CELLS_RECYCLE_COUNT,
 };
+use super::ChatInputAction;
 use super::{
     ClipboardReadKind, ClipboardReadRequest, Color, CommandState, CursorShape, DisplayPoint,
     ExtractedText, HistoryProjection, HyperlinkId, ProjectedBufferAnchorLocation, ProjectedRowKind,
@@ -8526,4 +8527,501 @@ fn native_block_chrome_keeps_header_when_background_output_is_fully_collapsed() 
     );
     assert_eq!(viewport.raw_anchor_at(DisplayPoint::new(header, 0)), None);
     assert_eq!(viewport.row_kinds().iter().filter(|kind| matches!(kind, ProjectedRowKind::BlockHeader { sequence: owner, .. } if *owner == sequence)).count(), 1);
+}
+
+fn chat_policy() -> ProjectionPolicy {
+    let mut policy = ProjectionPolicy::new();
+    policy.set_chat_mode(true);
+    policy.set_block_spacing(true);
+    policy.set_block_chrome(true, 0);
+    policy
+}
+
+fn chat_pair(terminal: &mut TerminalState, command: &str, output: &str) {
+    terminal.process_input(
+        format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+        )
+        .as_bytes(),
+    );
+}
+
+fn chat_prompt(terminal: &mut TerminalState, input: &str) {
+    terminal.process_input(format!("\x1b]133;A\x07$ \x1b]133;B\x07{input}").as_bytes());
+}
+
+#[test]
+fn chat_projection_pins_real_prompt_and_right_aligns_command_without_fake_cells() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_pair(&mut terminal, "printf hello", "hello");
+    chat_prompt(&mut terminal, "draft");
+    let raw_before = terminal.grid.clone();
+    let raw_cursor = terminal.get_cursor_pos();
+    let viewport = spaced_view(
+        &mut terminal,
+        &chat_policy(),
+        &mut ProjectionViewState::new(),
+    );
+    let composer = viewport.chat_composer_rows().expect("ready prompt docks");
+    assert_eq!(composer.end, 24);
+    assert!(composer.start > 12);
+    let command = &viewport.chat_command_spans()[0];
+    assert!(command.column > 40, "short command is a right-hand capsule");
+    assert_eq!(
+        viewport.raw_anchor_at(DisplayPoint::new(command.rows.start, command.column - 1)),
+        None
+    );
+    assert_eq!(
+        viewport.application_cell(DisplayPoint::new(command.rows.start, command.column - 1)),
+        None
+    );
+    let mapped = viewport.application_cell(viewport.cursor()).unwrap();
+    assert_eq!(mapped, raw_cursor);
+    assert!(composer.contains(&viewport.cursor().row));
+    assert_eq!(terminal.grid.rows(), raw_before.rows());
+    assert_eq!(terminal.grid.row_len(), raw_before.row_len());
+    for row in 0..raw_before.rows() {
+        assert_eq!(
+            terminal.grid[row]
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>(),
+            raw_before[row]
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+        );
+    }
+    let start = command.rows.start;
+    let left = command.column;
+    terminal.start_selection_projected(&viewport, (start, left));
+    terminal.update_selection_projected(&viewport, (start, left + "$ printf hello".len() - 1));
+    assert_eq!(terminal.copy_selection().as_deref(), Some("$ printf hello"));
+    terminal.start_selection_projected(&viewport, (start, left - 1));
+    assert!(
+        !terminal.has_text_selection(),
+        "capsule padding cannot become terminal text"
+    );
+}
+
+#[test]
+fn chat_history_scroll_keeps_prompt_raw_origins_and_document_rows_independent() {
+    let mut terminal = TerminalState::new(80, 20);
+    for index in 0..40 {
+        chat_pair(
+            &mut terminal,
+            &format!("echo line{index}"),
+            &format!("line{index}"),
+        );
+    }
+    chat_prompt(&mut terminal, "pending");
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let bottom = spaced_view(&mut terminal, &policy, &mut state);
+    let dock = bottom.chat_composer_rows().unwrap();
+    let cursor = bottom.cursor();
+    let origin = bottom.raw_anchor_at(cursor).unwrap();
+    state.set_offset(70, &bottom);
+    let history = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(history.scroll_offset() > 0);
+    assert_eq!(history.chat_composer_rows(), Some(dock.clone()));
+    assert_eq!(history.cursor(), cursor);
+    assert_eq!(history.raw_anchor_at(cursor), Some(origin));
+    assert_eq!(
+        history.view_document_row(dock.start),
+        bottom.view_document_row(dock.start)
+    );
+    assert!(
+        history.view_document_row(dock.start - 1).unwrap() + 1
+            < history.view_document_row(dock.start).unwrap()
+    );
+    let command = history.chat_command_spans().first().unwrap();
+    terminal.start_selection_projected(&history, (command.rows.start, command.column));
+    let before = terminal.copy_selection();
+    terminal.update_selection_projected(&history, (cursor.row, cursor.column));
+    assert_eq!(
+        terminal.copy_selection(),
+        before,
+        "dragging into the separate composer never selects hidden history"
+    );
+}
+
+#[test]
+fn chat_running_password_and_alternate_screen_keep_native_input_ownership() {
+    use jterm_core::chat_mode::ChatSurface;
+    let mut terminal = TerminalState::new(80, 24);
+    chat_prompt(&mut terminal, "read secret");
+    let sequence = terminal.command_records().back().unwrap().sequence;
+    let submit = ChatInputAction::Submit { sequence };
+    assert!(submit.is_current(&terminal));
+    terminal.process_input(b"\r\n\x1b]133;C\x07Password: ");
+    assert_eq!(terminal.chat_surface(), ChatSurface::Running);
+    assert!(!submit.is_current(&terminal));
+    assert!(ChatInputAction::Interrupt { sequence }.is_current(&terminal));
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let running = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(running.chat_composer_rows(), None);
+    assert_eq!(
+        running.application_cell(running.cursor()),
+        Some(terminal.get_cursor_pos())
+    );
+    terminal.process_input(b"\x1b[?1049h\x1b[?1000hFULLSCREEN");
+    let full = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(full.key().is_bypass());
+    assert_eq!(terminal.chat_surface(), ChatSurface::Fullscreen);
+    assert!(full.chat_command_spans().is_empty());
+    assert_eq!(full.chat_composer_rows(), None);
+    assert!(!ChatInputAction::Interrupt { sequence }.is_current(&terminal));
+    terminal.process_input(b"\x1b[?1000l\x1b[?1049l\r\n\x1b]133;D;0\x07");
+    assert_eq!(terminal.chat_surface(), ChatSurface::Passthrough);
+    chat_prompt(&mut terminal, "");
+    let ready = spaced_view(&mut terminal, &policy, &mut state);
+    assert_eq!(terminal.chat_surface(), ChatSurface::Prompt);
+    assert!(ready.chat_composer_rows().is_some());
+    assert!(
+        !submit.is_current(&terminal),
+        "old prompt buttons cannot target a new command"
+    );
+}
+
+#[test]
+fn chat_unknown_boundaries_are_exact_native_passthrough() {
+    let mut terminal = TerminalState::new(40, 12);
+    terminal.process_input(b"login: user\r\nPassword: ");
+    let native = terminal.projected_viewport(HistoryProjection::identity(), false);
+    let chat = spaced_view(
+        &mut terminal,
+        &chat_policy(),
+        &mut ProjectionViewState::new(),
+    );
+    assert!(chat.key().is_bypass());
+    assert!(std::sync::Arc::ptr_eq(
+        &native.cells_arc(),
+        &chat.cells_arc()
+    ));
+    assert_eq!(chat.cursor(), native.cursor());
+    assert!(chat.chat_composer_rows().is_none());
+}
+
+#[test]
+fn chat_submit_waits_for_shell_acknowledgment_and_interrupt_never_marks_complete() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_prompt(&mut terminal, "echo hello");
+    let sequence = terminal.command_records().back().unwrap().sequence;
+    let submit = ChatInputAction::Submit { sequence };
+    terminal.note_chat_input_accepted(submit);
+    assert!(
+        !submit.is_current(&terminal),
+        "repeated button clicks cannot append another Enter"
+    );
+    terminal.process_input(b"unrelated output");
+    assert!(
+        !submit.is_current(&terminal),
+        "arbitrary output is not a prompt acknowledgment"
+    );
+    terminal.process_input(b"\x1b]133;B\x07");
+    assert!(submit.is_current(&terminal));
+    terminal.process_input(b"\r\n\x1b]133;C\x07waiting");
+    let interrupt = ChatInputAction::Interrupt { sequence };
+    terminal.note_chat_input_accepted(interrupt);
+    assert_eq!(
+        terminal.chat_surface(),
+        jterm_core::chat_mode::ChatSurface::Running
+    );
+    assert!(!terminal.command_records().back().unwrap().complete);
+}
+
+#[test]
+fn chat_multiline_wide_commands_and_resizes_preserve_raw_search_and_copy() {
+    for cols in [20, 40, 80] {
+        let mut terminal = TerminalState::new(80, 24);
+        chat_pair(&mut terminal, "echo 你好\r\nsecond line", "结果");
+        chat_prompt(&mut terminal, "");
+        terminal.on_resize(cols, 24);
+        let viewport = spaced_view(
+            &mut terminal,
+            &chat_policy(),
+            &mut ProjectionViewState::new(),
+        );
+        let command_anchor = terminal.command_records()[0].command_start.unwrap();
+        let point = terminal
+            .buffer_anchor_to_projected(&viewport, command_anchor)
+            .unwrap();
+        let raw = viewport.raw_anchor_at(point).unwrap();
+        assert_eq!(raw.column, command_anchor.column);
+        assert_eq!(viewport.cells()[point.row][point.column].character, 'e');
+        terminal.select_word_at_projected(&viewport, point.row, point.column);
+        assert_eq!(terminal.copy_selection().as_deref(), Some("echo"));
+        assert_eq!(
+            viewport.application_cell(viewport.cursor()),
+            Some(terminal.get_cursor_pos())
+        );
+    }
+}
+
+#[test]
+fn chat_preserves_styled_tail_and_oversized_multiline_prompt_without_docking_crop() {
+    let mut terminal = TerminalState::new(40, 12);
+    chat_prompt(&mut terminal, "");
+    terminal.process_input(b"\x1b[12;1H\x1b[41m \x1b[0m\x1b[1;3H");
+    let viewport = spaced_view(
+        &mut terminal,
+        &chat_policy(),
+        &mut ProjectionViewState::new(),
+    );
+    assert_eq!(viewport.chat_composer_rows(), None);
+    assert_eq!(viewport.cells()[11][0].background, Color::Red);
+    terminal.process_input(b"\x1b[0m\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued\r\nend");
+    let viewport = spaced_view(
+        &mut terminal,
+        &chat_policy(),
+        &mut ProjectionViewState::new(),
+    );
+    assert_eq!(viewport.chat_composer_rows(), None);
+    assert_eq!(
+        viewport.application_cell(viewport.cursor()),
+        Some(terminal.get_cursor_pos())
+    );
+}
+
+#[test]
+fn chat_large_stream_keeps_the_incremental_history_plan() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_prompt(&mut terminal, "stream logs");
+    terminal.process_input(b"\r\n\x1b]133;C\x07");
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    for _ in 0..200 {
+        terminal.process_input(b"streamed output\r\n");
+        let _ = spaced_view(&mut terminal, &policy, &mut state);
+    }
+    PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+    PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(|count| count.set(0));
+    for _ in 0..100 {
+        terminal.process_input(b"more streamed output\r\n");
+        let viewport = spaced_view(&mut terminal, &policy, &mut state);
+        assert_eq!(
+            viewport.application_cell(viewport.cursor()),
+            Some(terminal.get_cursor_pos())
+        );
+    }
+    assert_eq!(PROJECTION_PLAN_BUILD_COUNT.with(std::cell::Cell::get), 0);
+    assert!(PROJECTION_PLAN_HISTORY_LAYOUT_VISITS.with(std::cell::Cell::get) <= 200);
+}
+
+#[test]
+fn chat_main_screen_mouse_and_cursor_takeover_restore_native_geometry() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_pair(&mut terminal, "echo before", "before");
+    chat_prompt(&mut terminal, "interactive");
+    terminal.process_input(b"\r\n\x1b]133;C\x07live\x1b[?1000h");
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let mouse = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(mouse.key().is_bypass());
+    assert_eq!(
+        mouse.application_cell(DisplayPoint::new(0, 0)),
+        Some((0, 0))
+    );
+    terminal.process_input(b"\x1b[?1000l\x1b[1;1H");
+    let addressed = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(addressed.key().is_bypass());
+    assert_eq!(addressed.application_cell(addressed.cursor()), Some((0, 0)));
+    terminal.process_input(b"\x1b[10;1Hback inside output");
+    let still_native = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(
+        still_native.key().is_bypass(),
+        "takeover remains owned by the same command even after mouse reset or cursor return"
+    );
+    terminal.process_input(b"\x1b[10;1H\x1b]133;D;0\x07");
+    chat_prompt(&mut terminal, "");
+    let restored = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(restored.chat_composer_rows().is_some());
+}
+
+#[test]
+fn native_projection_cursor_only_motion_does_not_reuse_a_stale_snapshot() {
+    for block_mode in [false, true] {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_input(b"first\r\nsecond");
+        let before = terminal.projected_viewport(HistoryProjection::identity(), block_mode);
+        assert_eq!(before.application_cell(before.cursor()), Some((1, 6)));
+        terminal.process_input(b"\x1b[1;1H");
+        let after = terminal.projected_viewport(HistoryProjection::identity(), block_mode);
+        assert_eq!(after.application_cell(after.cursor()), Some((0, 0)));
+    }
+}
+
+#[test]
+fn chat_kitty_placement_uses_exact_native_geometry_until_removed() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_prompt(&mut terminal, "show image");
+    terminal.process_input(b"\r\n\x1b]133;C\x07\x1b[20;1H");
+    terminal.process_input(KITTY_ONE_PIXEL_RGBA_APC);
+    terminal.process_input(b"\x1b_Ga=p,i=41,c=1,r=1,C=1\x1b\\");
+    assert_eq!(terminal.kitty_graphics.get_placements().len(), 1);
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let image = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(image.key().is_bypass());
+    assert_eq!(
+        image.application_cell(DisplayPoint::new(19, 0)),
+        Some((19, 0))
+    );
+    assert_eq!(terminal.kitty_graphics.get_placements()[0].y, 19);
+    terminal.process_input(b"\x1b_Ga=d,d=A\x1b\\\r\n\x1b]133;D;0\x07");
+    chat_prompt(&mut terminal, "");
+    assert!(terminal.kitty_graphics.get_placements().is_empty());
+    let ready = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(ready.chat_composer_rows().is_some());
+}
+
+#[test]
+fn chat_stream_eviction_drops_old_capsules_without_losing_output_or_prompt() {
+    let mut terminal = TerminalState::new(80, 24);
+    terminal.set_max_scrollback(32);
+    chat_pair(&mut terminal, "echo previous", "previous");
+    chat_prompt(&mut terminal, "stream logs");
+    terminal.process_input(b"\r\n\x1b]133;C\x07");
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    for index in 0..500 {
+        terminal.process_input(format!("line{index}\r\n").as_bytes());
+        let view = spaced_view(&mut terminal, &policy, &mut state);
+        assert_eq!(
+            view.application_cell(view.cursor()),
+            Some(terminal.get_cursor_pos())
+        );
+        if index > 100 {
+            assert!(view.chat_command_spans().is_empty());
+        }
+    }
+    terminal.process_input(b"\x1b]133;D;0\x07");
+    chat_prompt(&mut terminal, "next");
+    let view = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(view.chat_composer_rows().is_some());
+    assert!(view.cells().iter().any(|row| row
+        .iter()
+        .map(|cell| cell.character)
+        .collect::<String>()
+        .contains("line499")));
+    assert_eq!(
+        view.application_cell(view.cursor()),
+        Some(terminal.get_cursor_pos())
+    );
+}
+
+#[test]
+fn chat_review_batched_takeover_latches_without_a_render() {
+    for fragments in [false, true] {
+        let mut terminal = TerminalState::new(80, 24);
+        chat_pair(&mut terminal, "echo before", "before");
+        chat_prompt(&mut terminal, "interactive");
+        terminal.process_input(b"\r\n\x1b]133;C\x07live");
+        let takeover = b"\x1b[?1000h\x1b[1;1HREPAINTED\x1b[?1000l\x1b[10;1H";
+        if fragments {
+            for byte in takeover {
+                terminal.process_input(&[*byte]);
+            }
+        } else {
+            terminal.process_input(takeover);
+        }
+        let policy = chat_policy();
+        let mut state = ProjectionViewState::new();
+        assert!(spaced_view(&mut terminal, &policy, &mut state)
+            .key()
+            .is_bypass());
+        // A/B without a real D cannot silently end a latched native owner.
+        chat_prompt(&mut terminal, "unproven prompt");
+        assert!(spaced_view(&mut terminal, &policy, &mut state)
+            .key()
+            .is_bypass());
+        terminal.process_input(b"\r\n\x1b]133;D;0\x07");
+        chat_prompt(&mut terminal, "safe prompt");
+        assert!(spaced_view(&mut terminal, &policy, &mut state)
+            .chat_composer_rows()
+            .is_some());
+    }
+}
+
+#[test]
+fn chat_review_all_selection_modes_stop_at_both_dock_boundaries() {
+    for direction in [false, true] {
+        for mode in [0, 1, 2] {
+            let mut terminal = TerminalState::new(80, 20);
+            for index in 0..40 {
+                chat_pair(
+                    &mut terminal,
+                    &format!("echo line{index}"),
+                    &format!("line{index}"),
+                );
+            }
+            chat_prompt(&mut terminal, "pending text");
+            let policy = chat_policy();
+            let mut state = ProjectionViewState::new();
+            let bottom = spaced_view(&mut terminal, &policy, &mut state);
+            state.set_offset(70, &bottom);
+            let view = spaced_view(&mut terminal, &policy, &mut state);
+            let command = &view.chat_command_spans()[0];
+            let history = (command.rows.start, command.column + 2);
+            let composer = (view.cursor().row, 2);
+            let (start, end) = if direction {
+                (composer, history)
+            } else {
+                (history, composer)
+            };
+            match mode {
+                0 => terminal.start_selection_projected(&view, start),
+                1 => terminal.select_word_at_projected(&view, start.0, start.1),
+                _ => terminal.select_line_at_projected(&view, start.0),
+            }
+            let before = terminal.copy_selection();
+            terminal.update_selection_projected(&view, end);
+            assert_eq!(
+                terminal.copy_selection(),
+                before,
+                "direction={direction} mode={mode}"
+            );
+        }
+    }
+}
+
+#[test]
+fn chat_review_word_and_links_do_not_wrap_from_history_into_the_dock() {
+    let mut terminal = TerminalState::new(20, 12);
+    for index in 0..20 {
+        chat_pair(
+            &mut terminal,
+            &format!("echo {index}"),
+            &format!("https://history.example/{index}/{}", "long/path/".repeat(8)),
+        );
+    }
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;B\x07/current/path");
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let bottom = spaced_view(&mut terminal, &policy, &mut state);
+    let mut checked = 0;
+    for offset in 5..50 {
+        state.set_offset(offset, &bottom);
+        let view = spaced_view(&mut terminal, &policy, &mut state);
+        let composer = view.chat_composer_rows().unwrap();
+        let last_history = composer.start - 1;
+        if view.real_column_bounds(last_history).is_none() {
+            continue;
+        }
+        if view.cells()[last_history][0].character == ' ' {
+            continue;
+        }
+        checked += 1;
+        terminal.select_word_at_projected(&view, last_history, 10);
+        assert!(!terminal.copy_selection().unwrap_or_default().contains("/current/path"), "a double click cannot join an independently docked prompt into a history URL, offset={offset}");
+        terminal.select_word_at_projected(&view, composer.start, 5);
+        assert_eq!(terminal.copy_selection().as_deref(), Some("/current/path"));
+        assert!(
+            !view.row_wrapped()[last_history],
+            "link and word detection must stop at the independent dock boundary, offset={offset}"
+        );
+    }
+    assert!(checked > 0);
 }

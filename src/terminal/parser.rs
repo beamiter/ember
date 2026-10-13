@@ -115,6 +115,7 @@ impl super::TerminalState {
             };
             self.cursor_row = self.cursor_row.saturating_add(rows as usize).min(last_row);
         }
+        self.observe_chat_native_takeover();
         self.drain_kitty_graphics_responses();
     }
 
@@ -1337,6 +1338,7 @@ impl super::TerminalState {
                     i += 1;
                 }
             }
+            self.observe_chat_native_takeover();
         }
     }
 
@@ -2015,6 +2017,7 @@ impl super::TerminalState {
             }
             _ => {}
         }
+        self.observe_chat_native_takeover();
     }
 
     /// 解析从下标 `i`(38/48/58)开始的扩展颜色子序列,返回 `(颜色, 最后消费的下标)`。

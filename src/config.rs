@@ -113,6 +113,15 @@ impl<'de> Deserialize<'de> for OrganismMotion {
     }
 }
 
+/// Explicit presentation mode; an absent key preserves the legacy block_mode switch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    Normal,
+    Block,
+    Chat,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Opt-in ASCII organism in local terminal chrome, with or without command cards.
@@ -342,6 +351,10 @@ pub struct Config {
     /// `block:*` 命令(跳转/复制/召回)仍然可用。
     #[serde(default = "default_block_mode")]
     pub block_mode: bool,
+
+    /// Optional family-wide presentation override. Chat uses the existing PTY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_mode: Option<TerminalMode>,
 
     /// Denser visual treatment for command cards. Ember keeps its native
     /// continuous terminal grid (and therefore the exact PTY cell geometry)
@@ -606,6 +619,24 @@ fn default_font_ligatures() -> bool {
     true
 }
 
+impl Config {
+    pub fn effective_terminal_mode(&self) -> TerminalMode {
+        self.terminal_mode.unwrap_or(if self.block_mode {
+            TerminalMode::Block
+        } else {
+            TerminalMode::Normal
+        })
+    }
+
+    pub fn command_cards_enabled(&self) -> bool {
+        self.effective_terminal_mode() != TerminalMode::Normal
+    }
+
+    pub fn chat_mode_enabled(&self) -> bool {
+        self.effective_terminal_mode() == TerminalMode::Chat
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -663,6 +694,7 @@ impl Default for Config {
             bottom_bar: default_bottom_bar(),
             click_moves_cursor: default_click_moves_cursor(),
             block_mode: default_block_mode(),
+            terminal_mode: None,
             block_compact: false,
             command_history_enabled: default_command_history_enabled(),
             command_history_path: None,
@@ -2221,5 +2253,65 @@ ssh_args = ["-p", "2222"]
         assert_eq!(hosts[0].ssh_args, ["-p", "22"]);
         assert!(!hosts[0].docker);
         assert!(hosts[1].docker);
+    }
+}
+
+#[cfg(test)]
+mod chat_mode_config_tests {
+    use super::{Config, TerminalMode};
+
+    #[test]
+    fn chat_is_opt_in_and_explicit_mode_overrides_legacy_boolean() {
+        let default: Config = toml::from_str("").unwrap();
+        assert_eq!(default.terminal_mode, None);
+        assert_eq!(default.effective_terminal_mode(), TerminalMode::Block);
+        assert!(default.block_mode);
+        for legacy in [false, true] {
+            let old: Config = toml::from_str(&format!("block_mode = {legacy}\n")).unwrap();
+            assert_eq!(
+                old.effective_terminal_mode(),
+                if legacy {
+                    TerminalMode::Block
+                } else {
+                    TerminalMode::Normal
+                }
+            );
+            assert_eq!(old.terminal_mode, None);
+            for (value, expected) in [
+                ("normal", TerminalMode::Normal),
+                ("block", TerminalMode::Block),
+                ("chat", TerminalMode::Chat),
+            ] {
+                let config: Config = toml::from_str(&format!(
+                    "block_mode = {legacy}\nterminal_mode = \"{value}\"\n"
+                ))
+                .unwrap();
+                assert_eq!(config.effective_terminal_mode(), expected);
+                assert_eq!(
+                    config.block_mode, legacy,
+                    "never rewrite the user's legacy preference"
+                );
+                assert_eq!(
+                    config.command_cards_enabled(),
+                    expected != TerminalMode::Normal
+                );
+                let saved = toml::to_string(&config).unwrap();
+                let loaded: Config = toml::from_str(&saved).unwrap();
+                assert_eq!(loaded.terminal_mode, Some(expected));
+                assert_eq!(loaded.block_mode, legacy);
+            }
+        }
+        let saved = toml::to_string(&default).unwrap();
+        assert!(!saved.contains("terminal_mode"));
+    }
+
+    #[test]
+    fn chat_mode_rejects_unknown_values_without_silent_fallback() {
+        for value in ["Chat", "chatbot", "capsule", "ai", "raw", ""] {
+            assert!(
+                toml::from_str::<Config>(&format!("terminal_mode = \"{value}\"\n")).is_err(),
+                "{value}"
+            );
+        }
     }
 }

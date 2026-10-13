@@ -1334,6 +1334,7 @@ fn projected_viewport_for_session(
     session
         .projection_policy
         .set_block_chrome(renderer.block_mode, renderer.companion_status_rows());
+    session.projection_policy.set_chat_mode(renderer.chat_mode);
     let policy = &session.projection_policy;
     let view_state = &mut session.projection_view_state;
     let mut terminal = terminal.lock();
@@ -1410,17 +1411,30 @@ fn middle_paste_event_eligible(
     }) else {
         return false;
     };
-    !pointer_is_block_decoration(
+    let (row, column) = crate::ui::grid_position_from_content(
         pos,
         content_rect,
         renderer.char_width,
         renderer.line_height,
-        viewport,
-    ) && modifiers.is_none_or(|modifiers| {
-        !terminal.is_mouse_enabled()
-            || modifiers.shift
-            || !renderer.pointer_app_mouse_eligible_projected(terminal, viewport, pos)
-    })
+        viewport.columns(),
+        viewport.rows(),
+    );
+    (!viewport.is_transformed()
+        || viewport
+            .raw_anchor_at(terminal::DisplayPoint::new(row, column))
+            .is_some())
+        && !pointer_is_block_decoration(
+            pos,
+            content_rect,
+            renderer.char_width,
+            renderer.line_height,
+            viewport,
+        )
+        && modifiers.is_none_or(|modifiers| {
+            !terminal.is_mouse_enabled()
+                || modifiers.shift
+                || !renderer.pointer_app_mouse_eligible_projected(terminal, viewport, pos)
+        })
 }
 
 /// Host PRIMARY paste owns a gesture separately from the application's mouse
@@ -2600,7 +2614,8 @@ impl TerminalApp {
         renderer.opacity = cfg.opacity;
         renderer.font_ligatures = cfg.font_ligatures;
         renderer.click_moves_cursor = cfg.click_moves_cursor;
-        renderer.block_mode = cfg.block_mode;
+        renderer.block_mode = cfg.command_cards_enabled();
+        renderer.chat_mode = cfg.chat_mode_enabled();
         renderer.block_compact = cfg.block_compact;
         renderer.gpu_rendering = cfg.gpu_rendering;
         renderer.wgpu_render_state = wgpu_render_state.clone();
@@ -2779,7 +2794,7 @@ impl TerminalApp {
     fn apply_runtime_config(&mut self, ctx: &egui::Context) {
         self.osc52_read_allowed
             .store(self.config.osc52_clipboard_read, Ordering::Release);
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
         }
         let effective_sidebar_view =
@@ -2821,7 +2836,8 @@ impl TerminalApp {
         self.renderer.opacity = self.config.opacity;
         self.renderer.font_ligatures = self.config.font_ligatures;
         self.renderer.click_moves_cursor = self.config.click_moves_cursor;
-        self.renderer.block_mode = self.config.block_mode;
+        self.renderer.block_mode = self.config.command_cards_enabled();
+        self.renderer.chat_mode = self.config.chat_mode_enabled();
         self.renderer.block_compact = self.config.block_compact;
         self.renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
         self.renderer.sync_font_metrics(ctx);
@@ -2836,7 +2852,8 @@ impl TerminalApp {
             renderer.opacity = self.config.opacity;
             renderer.font_ligatures = self.config.font_ligatures;
             renderer.click_moves_cursor = self.config.click_moves_cursor;
-            renderer.block_mode = self.config.block_mode;
+            renderer.block_mode = self.config.command_cards_enabled();
+            renderer.chat_mode = self.config.chat_mode_enabled();
             renderer.block_compact = self.config.block_compact;
             renderer.gpu_rendering = runtime_uses_wgpu && self.config.gpu_rendering;
             renderer.sync_font_metrics(ctx);
@@ -8269,6 +8286,63 @@ mod tests {
             .any(|name| name == "fallback_test"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chat_review_middle_paste_rejects_capsule_horizontal_padding() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07next");
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        policy.set_block_spacing(true);
+        policy.set_block_chrome(true, 0);
+        let viewport = terminal.projected_viewport_with_state(
+            crate::terminal::HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut crate::terminal::ProjectionViewState::new(),
+        );
+        let mut renderer = crate::ui::TerminalRenderer::new(
+            16.0,
+            12.0,
+            1.3,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.char_width = 10.0;
+        renderer.line_height = 20.0;
+        renderer.last_content_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 480.0),
+        ));
+        let command = &viewport.chat_command_spans()[0];
+        assert!(command.column > 0);
+        let point = |column| {
+            egui::pos2(
+                (column as f32 + 0.5) * 10.0,
+                (command.rows.start as f32 + 0.5) * 20.0,
+            )
+        };
+        for modifiers in [
+            None,
+            Some(egui::Modifiers::NONE),
+            Some(egui::Modifiers::SHIFT),
+        ] {
+            assert!(!middle_paste_event_eligible(
+                &renderer,
+                &terminal,
+                &viewport,
+                point(command.column - 1),
+                modifiers
+            ));
+            assert!(middle_paste_event_eligible(
+                &renderer,
+                &terminal,
+                &viewport,
+                point(command.column),
+                modifiers
+            ));
+        }
     }
 
     #[test]

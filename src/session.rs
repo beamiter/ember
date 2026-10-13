@@ -171,6 +171,59 @@ impl Session {
         queued
     }
 
+    /// Attempt a lifecycle-bound control immediately, never through either
+    /// retry FIFO. Admission includes the actual foreground captured by the
+    /// pointer gesture, producer gates and the writer's idle synchronization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_chat_input(
+        &mut self,
+        action: crate::terminal::ChatInputAction,
+        bytes: &[u8],
+        expected_foreground: i32,
+        mouse_barrier_session_id: Option<&str>,
+        barriers: &crate::session_manager::SessionInputBarriers,
+        responses: &crate::session_manager::ProtocolResponseSender,
+    ) -> bool {
+        if self.purpose != SessionPurpose::Interactive
+            || !self.pending_input.is_empty()
+            || !self.pending_output.is_empty()
+            || !self.shell.events().is_empty()
+            || bytes.len() != 1
+            || expected_foreground <= 0
+        {
+            return false;
+        }
+        let expected_byte = match action {
+            crate::terminal::ChatInputAction::Submit { .. } => b'\r',
+            crate::terminal::ChatInputAction::Interrupt { .. } => 0x03,
+        };
+        if bytes[0] != expected_byte {
+            return false;
+        }
+        let Some(mut terminal) = self.terminal.try_lock() else {
+            return false;
+        };
+        let shell_pid = self.get_shell_pid();
+        let accepted = barriers.try_admit_control(
+            &self.metadata.session_id,
+            mouse_barrier_session_id,
+            responses,
+            || {
+                self.shell.try_write_control_byte(bytes[0], |foreground| {
+                    action.is_current(&terminal)
+                        && foreground == expected_foreground
+                        && (!matches!(action, crate::terminal::ChatInputAction::Submit { .. })
+                            || foreground == shell_pid)
+                })
+            },
+        );
+        if accepted {
+            terminal.note_user_input(bytes);
+            terminal.note_chat_input_accepted(action);
+        }
+        accepted
+    }
+
     /// Queue an already-armed Agent command without marking it as unrelated
     /// local input. Callers must arm the terminal generation first.
     pub fn queue_agent_input(&mut self, input: &[u8]) -> bool {

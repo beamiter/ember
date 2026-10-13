@@ -1553,6 +1553,7 @@ impl TerminalApp {
             renderer.font_ligatures = self.renderer.font_ligatures;
             renderer.click_moves_cursor = self.renderer.click_moves_cursor;
             renderer.block_mode = self.renderer.block_mode;
+            renderer.chat_mode = self.renderer.chat_mode;
             renderer.block_compact = self.renderer.block_compact;
             renderer.gpu_rendering = self.renderer.gpu_rendering;
             renderer.wgpu_render_state = self.renderer.wgpu_render_state.clone();
@@ -2062,7 +2063,7 @@ impl TerminalApp {
             return;
         };
         let terminal = session.terminal.lock();
-        if !self.config.block_mode
+        if !self.config.command_cards_enabled()
             || !block_workspace_has_room(ui.available_size(), self.renderer.line_height)
         {
             drop(terminal);
@@ -2240,7 +2241,8 @@ impl TerminalApp {
         );
         let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
-        let companion_status_enabled = self.config.ascii_organism_enabled && self.config.block_mode;
+        let companion_status_enabled =
+            self.config.ascii_organism_enabled && self.config.command_cards_enabled();
         let companion_enabled = companion_status_enabled
             && crate::organism::resolved_motion(self.config.ascii_organism_motion)
                 != crate::config::OrganismMotion::Static;
@@ -2362,11 +2364,18 @@ impl TerminalApp {
                         self.pane_renderers[pane_idx].block_mode,
                         self.pane_renderers[pane_idx].companion_status_rows(),
                     );
+                    session
+                        .projection_policy
+                        .set_chat_mode(self.pane_renderers[pane_idx].chat_mode);
                     let projection_policy = &session.projection_policy;
                     let projection_view_state = &mut session.projection_view_state;
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
                     // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
                     let renderer = &mut self.pane_renderers[pane_idx];
+                    renderer.chat_native_owner = session
+                        .shell
+                        .foreground_pgid()
+                        .map(|foreground| (session.shell.get_child_pid(), foreground));
                     let viewport = renderer.projected_viewport_with_state(
                         &mut terminal_guard,
                         projection_policy,
@@ -2635,6 +2644,9 @@ impl TerminalApp {
                     self.renderer.block_mode,
                     self.renderer.companion_status_rows(),
                 );
+                session
+                    .projection_policy
+                    .set_chat_mode(self.renderer.chat_mode);
                 let projection_policy = &session.projection_policy;
                 let projection_view_state = &mut session.projection_view_state;
 
@@ -2663,6 +2675,10 @@ impl TerminalApp {
                     self.cached_links_projection_key = Some(projection_key);
                     self.cached_links_terminal_ptr = terminal_ptr;
                 }
+                self.renderer.chat_native_owner = session
+                    .shell
+                    .foreground_pgid()
+                    .map(|foreground| (session.shell.get_child_pid(), foreground));
                 self.renderer.render(
                     ui,
                     &mut terminal_guard,
@@ -2711,6 +2727,60 @@ impl TerminalApp {
         );
 
         self.render_tab_to_pane_drop_zones(ui, ctx, &pane_drop_targets, interaction_enabled);
+        let actions: Vec<_> = self
+            .renderer
+            .chat_input_action
+            .take()
+            .into_iter()
+            .chain(
+                self.pane_renderers
+                    .iter_mut()
+                    .filter_map(|renderer| renderer.chat_input_action.take()),
+            )
+            .collect();
+        if terminal_interaction_enabled && self.config.chat_mode_enabled() {
+            let mouse_barrier = self
+                .terminal_mouse_capture
+                .as_ref()
+                .filter(|capture| capture.reported_to_app && !capture.pending_controls.is_empty())
+                .map(|capture| capture.session_id.clone());
+            for (target, action, foreground) in actions {
+                let index = self
+                    .session_manager
+                    .sessions()
+                    .iter()
+                    .position(|session| session.terminal.data_ptr() as usize == target);
+                let responses =
+                    index.and_then(|index| self.session_manager.protocol_response_sender(index));
+                let result = index.zip(responses).and_then(|(index, responses)| {
+                    self.session_manager.get_session_mut(index).map(|session| {
+                        let bytes =
+                            self.renderer
+                                .chat_action_bytes(ctx, &session.terminal.lock(), action);
+                        let accepted = session.try_chat_input(
+                            action,
+                            &bytes,
+                            foreground,
+                            mouse_barrier.as_deref(),
+                            &self.osc_paste_input_barriers,
+                            &responses,
+                        );
+                        (session.metadata.session_id.clone(), accepted)
+                    })
+                });
+                if let Some((session_id, accepted)) = result {
+                    if accepted {
+                        self.clear_block_selection_for_session(&session_id);
+                        self.organism.accepted_input(&session_id);
+                        ctx.request_repaint();
+                    } else {
+                        self.set_status(
+                            "Shell state changed or input is busy; the Chat action was not sent. Use the native keyboard.",
+                        );
+                    }
+                }
+            }
+        }
 
         if let Some((session_id, click)) = pending_block_click {
             match click {

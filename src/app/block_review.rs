@@ -493,12 +493,9 @@ impl TerminalApp {
             return;
         };
         let active = self.session_manager.active_index();
-        let Some(session) = self
-            .session_manager
-            .sessions()
-            .get(active)
-            .filter(|s| s.metadata.session_id == review.session_id && self.config.block_mode)
-        else {
+        let Some(session) = self.session_manager.sessions().get(active).filter(|s| {
+            s.metadata.session_id == review.session_id && self.config.command_cards_enabled()
+        }) else {
             self.return_focus_to_terminal(ctx);
             return;
         };

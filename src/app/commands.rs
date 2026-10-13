@@ -868,7 +868,7 @@ impl TerminalApp {
                             // click selects the block, just as selecting a
                             // block highlights the sidebar row.
                             self.block_selection =
-                                (self.config.block_mode && row.complete).then(|| {
+                                (self.config.command_cards_enabled() && row.complete).then(|| {
                                     crate::block_mode::BlockSelection::single(
                                         row.target.session_id.clone(),
                                         row.target.execution_id.clone(),
@@ -1183,7 +1183,7 @@ impl TerminalApp {
             return;
         }
         let jumped = {
-            let block_mode = self.config.block_mode;
+            let block_mode = self.config.command_cards_enabled();
             let Some(session) = self.session_manager.sessions_mut().get_mut(index) else {
                 self.set_status("Command session is no longer available");
                 return;
@@ -1674,7 +1674,7 @@ impl TerminalApp {
         record_id: &str,
         gesture: crate::block_mode::BlockSelectionGesture,
     ) {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return;
         }
@@ -1889,7 +1889,7 @@ impl TerminalApp {
     }
 
     fn block_scroll_target_edge(&mut self, target: &CommandTarget, bottom: bool) {
-        let block_mode = self.config.block_mode;
+        let block_mode = self.config.command_cards_enabled();
         let jumped = self
             .target_session_index(target)
             .and_then(|index| self.session_manager.sessions_mut().get_mut(index))
@@ -3207,7 +3207,7 @@ impl TerminalApp {
     /// `block:undo_clear` 可原样恢复。书签按既有 reconcile 逻辑随 deque
     /// 身份变化自动剪枝（undo 恢复相同 sequence,未剪枝的书签随之复活）。
     pub(crate) fn block_clear_blocks(&mut self) {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return;
         }
@@ -3240,7 +3240,7 @@ impl TerminalApp {
     /// `block:clear` in the active pane. 单级 undo:stash 随之消耗;
     /// 全屏应用下拒绝且不消耗 stash(anvil 语义,退出应用后仍可 undo)。
     pub(crate) fn block_undo_clear(&mut self) {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             return;
         }
         let session = self.session_manager.get_active_session_mut();
@@ -3270,7 +3270,7 @@ impl TerminalApp {
         &mut self,
         format: crate::block_export::SessionExportFormat,
     ) {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return;
         }
@@ -3430,7 +3430,7 @@ impl TerminalApp {
         &mut self,
         review: Option<&super::block_review::BlockReview>,
     ) -> Result<usize, SelectedReplayError> {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return Err(SelectedReplayError::NoSelection);
         }
@@ -3532,7 +3532,7 @@ impl TerminalApp {
     /// a multi-block range collapses onto the newest block first, so one stray
     /// step never discards the whole range (see `block_mode::block_step`).
     pub(crate) fn block_context_scroll(&mut self, step: crate::block_mode::SelectStep) -> bool {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return false;
         }
@@ -3626,7 +3626,7 @@ impl TerminalApp {
     /// and running rows always remain PTY-owned and can never enter a block
     /// selection through keyboard navigation or range extension.
     fn selectable_block_ids(&mut self) -> Option<(String, Vec<String>)> {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return None;
         }
@@ -3719,7 +3719,7 @@ impl TerminalApp {
         &mut self,
         pick: impl FnOnce(&[crate::block_mode::BlockOutcome], Option<usize>) -> Option<usize>,
     ) -> Option<BlockNavigation> {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return None;
         }
@@ -3777,7 +3777,7 @@ impl TerminalApp {
     /// Commands-sidebar row, and scroll to the block (the same jump path as
     /// `block:jump_first_failed`).
     fn apply_block_selection(&mut self, target: CommandTarget) -> bool {
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return false;
         }
@@ -3840,7 +3840,7 @@ impl TerminalApp {
             self.block_search.close();
             return;
         }
-        if !self.config.block_mode {
+        if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return;
         }
@@ -4172,7 +4172,7 @@ impl TerminalApp {
                         let transformed = terminal
                             .projected_viewport_with_state(
                                 crate::terminal::HistoryProjection::identity(),
-                                self.config.block_mode,
+                                self.config.command_cards_enabled(),
                                 policy,
                                 view_state,
                             )
@@ -4192,7 +4192,7 @@ impl TerminalApp {
                                     terminal.clear_text_selection();
                                     let _ = terminal.projected_viewport_with_state(
                                         crate::terminal::HistoryProjection::identity(),
-                                        self.config.block_mode,
+                                        self.config.command_cards_enabled(),
                                         policy,
                                         view_state,
                                     );

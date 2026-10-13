@@ -100,7 +100,7 @@ pub struct ProtocolResponseSender {
 }
 
 impl ProtocolResponseSender {
-    pub(crate) fn new(repaint_ctx: egui::Context) -> Self {
+    pub fn new(repaint_ctx: egui::Context) -> Self {
         Self::new_with_limits(repaint_ctx, ProtocolResponseLimits::PRODUCTION)
     }
 
@@ -492,6 +492,38 @@ impl SessionInputBarriers {
             barriers: self.clone(),
             session_id,
         }
+    }
+
+    /// Keep both producer and protocol ordering gates held through an optional
+    /// immediate control write. A later barrier cannot be overtaken by a
+    /// check-then-queue race. Contention rejects the control without retry.
+    pub(crate) fn try_admit_control(
+        &self,
+        session_id: &str,
+        mouse_barrier_session_id: Option<&str>,
+        responses: &ProtocolResponseSender,
+        admit: impl FnOnce() -> bool,
+    ) -> bool {
+        if mouse_barrier_session_id == Some(session_id) {
+            return false;
+        }
+        let Some(counts) = self.counts.try_lock() else {
+            return false;
+        };
+        if counts.contains_key(session_id) {
+            return false;
+        }
+        let Some(responses) = responses.queue.state.try_lock() else {
+            return false;
+        };
+        if responses.closed
+            || responses.accounted_messages != 0
+            || responses.osc52_read_pending
+            || !responses.osc52_refusals.is_empty()
+        {
+            return false;
+        }
+        admit()
     }
 
     pub fn blocks(&self, session_id: &str) -> bool {

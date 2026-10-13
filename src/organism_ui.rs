@@ -1139,7 +1139,7 @@ impl OrganismHost {
         )>,
         interactive: bool,
     ) {
-        if !config.block_mode {
+        if !config.command_cards_enabled() {
             if self.native_surface_identity.take().is_some() {
                 self.cancel_attention();
             }
@@ -1174,7 +1174,7 @@ impl OrganismHost {
             self.context
         };
         let surface = surface.filter(|(session, _, _, region)| {
-            config.block_mode
+            config.command_cards_enabled()
                 && policy.body_visible(now)
                 && self.owner.as_deref() == Some(session.as_str())
                 && region.is_finite()
@@ -1370,7 +1370,7 @@ impl OrganismHost {
         surface: Option<(String, egui::Rect)>,
         interactive: bool,
     ) -> bool {
-        if !config.block_mode || !config.ascii_organism_enabled {
+        if !config.command_cards_enabled() || !config.ascii_organism_enabled {
             return false;
         }
         let Some((session, region)) =
@@ -1689,7 +1689,7 @@ impl OrganismHost {
         } else {
             self.context
         };
-        if config.block_mode {
+        if config.command_cards_enabled() {
             // Block mode owns real display-only rows immediately above input.
             // Do not reserve a duplicate bottom panel or make footer hover the
             // only way to see the organism. Physiology still advances above.
@@ -1764,7 +1764,7 @@ impl OrganismHost {
                 toggle |= companion_toggle(ui, layout.control, expanded, interactive);
                 let near = pointer.is_some_and(|point| hover_rect.contains(point));
                 if let Some(owner) = self.owner.as_ref() {
-                    attention_snapshot = if config.block_mode {
+                    attention_snapshot = if config.command_cards_enabled() {
                         // Native Block owns passive attention. Chrome reads the
                         // one shared model without fabricating another visit.
                         self.attention.snapshot(now, owner, LiveAttentionInput {
@@ -6143,5 +6143,82 @@ mod tests {
             next_host_wake(full, now, now + Duration::from_millis(50), true),
             Some(Duration::from_millis(50))
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_offscreen_tests {
+    use super::*;
+    use crate::terminal::{
+        HistoryProjection, ProjectionPolicy, ProjectionViewState, TerminalState,
+    };
+
+    #[test]
+    fn chat_native_composer_exposes_safe_ascii_surface_and_offscreen_fixture() {
+        let ctx = egui::Context::default();
+        let config = Config {
+            terminal_mode: Some(crate::config::TerminalMode::Chat),
+            block_mode: false,
+            ascii_organism_enabled: true,
+            ascii_organism_motion: Some(OrganismMotion::Calm),
+            font_size: 18.0,
+            ..Config::default()
+        };
+        let mut renderer = crate::ui::TerminalRenderer::new(
+            config.font_size,
+            16.0,
+            1.4,
+            crate::config::ScrollbarVisibility::Always,
+            crate::theme::Theme::default(),
+        );
+        renderer.block_mode = true;
+        renderer.chat_mode = true;
+        renderer.chat_native_owner = Some((7, 7)); // Synthetic fixture authority.
+        renderer.gpu_rendering = false;
+        renderer.companion_enabled = true;
+        let mut host = OrganismHost::default();
+        host.acquire(Some("chat-fixture"), None, false);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
+        let mut terminal = None;
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        policy.set_block_spacing(true);
+        policy.set_block_chrome(true, 0);
+        let mut state = ProjectionViewState::new();
+        let mut accumulated = egui::FullOutput::default();
+        for _ in 0..3 {
+            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                renderer.sync_font_metrics(&ctx);
+                let (cols, rows) = renderer.grid_dimensions(screen.size());
+                let terminal = terminal.get_or_insert_with(|| {
+                    let mut terminal = TerminalState::new(cols, rows);
+                    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07printf 'hello, terminal'\r\n\x1b]133;C;cwd=/workspace/ember\x07hello, terminal\r\n\x1b]133;D;0\x07");
+                    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test --lib\r\n\x1b]133;C;cwd=/workspace/ember\x07   Compiling ember v0.4.0\r\nrunning fixture tests\r\n\x1b[32mtest result: ok. All synthetic fixture tests passed.\x1b[0m\r\n\x1b]133;D;0\x07");
+                    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07false\r\n\x1b]133;C;cwd=/workspace/ember\x07Deliberate fixture failure for status styling.\r\n\x1b]133;D;7\x07");
+                    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo next");
+                    terminal
+                });
+                let viewport = terminal.projected_viewport_with_state(HistoryProjection::identity(), true, &policy, &mut state);
+                assert!(viewport.chat_composer_rows().is_some());
+                assert_eq!(viewport.chat_command_spans().len(), 3);
+                renderer.set_projection_frame(terminal, viewport, &policy);
+                renderer.render_in_rect(ui, terminal, true, true, true, &crate::search::SearchState::default(), &[], &None, screen);
+                let surface = renderer.companion_surface.clone().map(|(block, key, region)| ("chat-fixture".to_owned(), block, key, region));
+                assert!(surface.is_some(), "Chat offers the existing organism a real, proven blank composer region");
+                host.draw_native_body(ui, &config, surface, true);
+                assert!(host.native_surface_rect.is_some(), "the real native ASCII body fits inside the composer");
+            });
+            accumulated.append(output);
+        }
+        if let Ok(path) = std::env::var("EMBER_CHAT_RENDER_DUMP") {
+            crate::ui::chat::export_native_frame(
+                std::path::Path::new(&path),
+                &ctx,
+                accumulated,
+                [1024, 768],
+            );
+        } else {
+            accumulated.textures_delta.clear();
+        }
     }
 }

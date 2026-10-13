@@ -145,6 +145,7 @@ pub struct ConfigPanel {
     edit_organism_motion: Option<OrganismMotion>,
     organism_preview: crate::organism_ui::PreviewUi,
     edit_block_mode: bool,
+    edit_terminal_mode: Option<crate::config::TerminalMode>,
     edit_block_compact: bool,
     edit_ai_enabled: bool,
     edit_ai_provider: String,
@@ -223,6 +224,7 @@ impl ConfigPanel {
             edit_organism_motion: None,
             organism_preview: crate::organism_ui::PreviewUi::default(),
             edit_block_mode: true,
+            edit_terminal_mode: None,
             edit_block_compact: false,
             edit_ai_enabled: false,
             edit_ai_provider: "anthropic".to_string(),
@@ -331,6 +333,7 @@ impl ConfigPanel {
         self.edit_organism_expanded = config.ascii_organism_expanded;
         self.edit_organism_motion = config.ascii_organism_motion;
         self.edit_block_mode = config.block_mode;
+        self.edit_terminal_mode = config.terminal_mode;
         self.edit_block_compact = config.block_compact;
         self.edit_ai_enabled = config.ai_enabled;
         self.edit_ai_provider = config.ai_provider.clone();
@@ -400,6 +403,7 @@ impl ConfigPanel {
         config.ascii_organism_expanded = self.edit_organism_expanded;
         config.ascii_organism_motion = self.edit_organism_motion;
         config.block_mode = self.edit_block_mode;
+        config.terminal_mode = self.edit_terminal_mode;
         config.block_compact = self.edit_block_compact;
         config.ai_enabled = self.edit_ai_enabled;
         config.ai_provider = self.edit_ai_provider.clone();
@@ -1644,21 +1648,38 @@ impl ConfigPanel {
             self.has_changes = true;
         }
 
-        if ui
-            .checkbox(
-                &mut self.edit_block_mode,
-                "Show command cards (status stripe, border, outcome badge)",
-            )
-            .changed()
-        {
+        let mut mode = self.edit_terminal_mode.unwrap_or(if self.edit_block_mode {
+            crate::config::TerminalMode::Block
+        } else {
+            crate::config::TerminalMode::Normal
+        });
+        let old_mode = mode;
+        ui.horizontal(|ui| {
+            ui.label("Terminal mode");
+            egui::ComboBox::from_id_salt("terminal-mode")
+                .selected_text(match mode {
+                    crate::config::TerminalMode::Normal => "Normal",
+                    crate::config::TerminalMode::Block => "Block",
+                    crate::config::TerminalMode::Chat => "Chat",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut mode, crate::config::TerminalMode::Normal, "Normal");
+                    ui.selectable_value(&mut mode, crate::config::TerminalMode::Block, "Block");
+                    ui.selectable_value(&mut mode, crate::config::TerminalMode::Chat, "Chat");
+                });
+        });
+        if mode != old_mode {
+            self.edit_terminal_mode = Some(mode);
             self.has_changes = true;
+        }
+        if mode == crate::config::TerminalMode::Chat {
+            ui.label("Conversation transcript with a docked live shell. Tab, history, multiline input and interactive programs keep their native PTY.");
         }
         if ui
             .add_enabled(
-                self.edit_block_mode,
-                egui::Checkbox::new(&mut self.edit_block_compact, "Compact Block Spacing"),
+                mode != crate::config::TerminalMode::Normal,
+                egui::Checkbox::new(&mut self.edit_block_compact, "Compact spacing"),
             )
-            .on_disabled_hover_text("Enable command cards first")
             .changed()
         {
             self.has_changes = true;

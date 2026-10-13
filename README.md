@@ -87,7 +87,58 @@ hovering holds its position. Calm retains a still body. Static keeps only the
 status card and disables the live body, hover greetings and periodic animation.
 The shared organism model remains the source of poses, body language, reactions
 and attention. Memory stays volatile.
-Outside Block Mode, the existing bottom companion remains available.
+In Normal mode, the existing bottom companion remains available.
+
+### Chat mode (opt-in)
+
+Select **Settings → Terminal mode → Chat**, or add this to `config.toml`:
+
+```toml
+terminal_mode = "chat"
+```
+
+Chat is an independent conversation layout alongside Normal and Block modes.
+Submitted command cells appear in right-aligned capsules and their output stays
+in wide, left-aligned result cards. At a proven shell prompt, the real live
+terminal is pinned in a rounded bottom composer while history scrolls above it.
+The ASCII companion can use the composer's verified empty space when enabled.
+The composer is the existing long-lived shell, so `cd`, environment changes,
+Tab completion, shell history, multiline editing, IME, and native keyboard
+shortcuts keep their normal semantics. There is no shadow text editor or second
+command-execution channel.
+
+The Run button sends one native Enter, never copies or re-pastes the command.
+Optional buttons require a supported single-byte key and an idle writer: pending
+input, protocol/mouse barriers or native foreground changes refuse the click
+without queuing or retrying it. Run also verifies that the actual shell owns the
+PTY foreground; an application's OSC prompt cannot authorize it. A successful
+write waits for a fresh shell prompt acknowledgment before another button
+submission. Native keyboard input, including enhanced encodings, remains available. A running foreground program keeps
+all stdin in its native terminal surface, including `read`, password prompts and
+REPLs. Interrupt sends Ctrl+C and does not claim the process has stopped. Status
+comes from the existing OSC 133 lifecycle. Alternate-screen applications use the
+full terminal; Chat returns after exit. Main-screen programs requesting mouse or
+image control, or addressing above their output boundary, also retain native
+geometry until shell-reported completion and a later safe prompt. This is
+recorded during parsing, including transitions within one output batch. Without trustworthy shell boundaries,
+Ember keeps native terminal passthrough rather than inventing command bubbles.
+Long or shared-row commands retain full-width rendering. Oversized multiline
+prompts/menus keep the scrolling terminal instead of being cropped into a dock.
+
+Capsule indentation, inter-message spacing, the footer and the history/composer
+split are display geometry only. Selection, copy, search, links, application
+mouse reports and click-to-place-cursor use retained raw-cell origins. Dragging
+between independently scrolled history and the composer does not select the
+hidden text between them. Explicit ANSI styling remains authoritative.
+
+`terminal_mode` accepts `normal`, `block`, or `chat` and overrides the legacy
+`block_mode` boolean. When absent, `block_mode` continues to work exactly as
+before; defaults and existing configuration files are unchanged.
+The setting applies to the whole window, including its panes; changing it keeps
+existing PTYs and queued native input. Per-pane mixed modes are not offered.
+
+See [Chat mode usage and acceptance checks](docs/chat-mode.md) for fallback details
+and the explicit real-PTY test.
 
 ### Kitty graphics compatibility
 
