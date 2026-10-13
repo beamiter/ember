@@ -844,16 +844,20 @@ impl TerminalApp {
                                     "sidebar_tab_context_menu",
                                     &menu_snapshot[*i].0,
                                 ) {
-                                    egui::Popup::context_menu(&resp).id(popup_id).show(|ui| {
-                                        Self::sidebar_tab_menu(
-                                            ui,
-                                            info,
-                                            infos.len(),
-                                            marked_count,
-                                            &remote_entries,
-                                            &mut menu_action,
-                                        );
-                                    });
+                                    egui::Popup::context_menu(&resp)
+                                        .id(popup_id)
+                                        .style(crate::theme::configure_popup_style)
+                                        .show(|ui| {
+                                            Self::sidebar_tab_menu(
+                                                ui,
+                                                info,
+                                                infos.len(),
+                                                marked_count,
+                                                &remote_entries,
+                                                &mut menu_action,
+                                                self.config.font_size,
+                                            );
+                                        });
                                 }
                             }
                         });
@@ -1042,7 +1046,9 @@ impl TerminalApp {
         marked_count: usize,
         remote_entries: &[RemoteMenuEntry],
         action: &mut Option<SidebarTabAction>,
+        font_size: f32,
     ) {
+        crate::theme::configure_popup_text(ui, font_size);
         let index = info.index;
         ui.label(egui::RichText::new(&info.title).weak().small());
         ui.separator();
@@ -2023,6 +2029,7 @@ impl TerminalApp {
                 {
                     egui::Popup::context_menu(&response)
                         .id(popup_id)
+                        .style(crate::theme::configure_popup_style)
                         .show(|ui| {
                             Self::sidebar_tab_menu(
                                 ui,
@@ -2031,6 +2038,7 @@ impl TerminalApp {
                                 marked_count_for_menu,
                                 &remote_entries_for_menu,
                                 &mut top_menu_action,
+                                self.config.font_size,
                             );
                         });
                 }

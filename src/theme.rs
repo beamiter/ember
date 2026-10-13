@@ -44,6 +44,24 @@ pub(crate) fn validate_saved_custom_theme_name(name: &str) -> Result<(), String>
     Theme::validate_custom_theme_name(name)
 }
 
+/// Keep semantic popup surfaces on the shared panel palette.
+#[allow(dead_code)] // Shared with the binary popup builders.
+pub(crate) fn configure_popup_style(style: &mut egui::Style) {
+    egui::containers::menu::menu_style(style);
+    style.visuals.window_fill = style.visuals.panel_fill;
+}
+
+/// Popup labels follow the configured terminal font without changing global UI typography.
+#[allow(dead_code)] // Shared with the binary popup builders.
+pub(crate) fn configure_popup_text(ui: &mut egui::Ui, size: f32) {
+    let font = egui::FontId::monospace(crate::config::Config::clamp_font_size(size));
+    let style = ui.style_mut();
+    style.override_font_id = Some(font.clone());
+    for text_font in style.text_styles.values_mut() {
+        *text_font = font.clone();
+    }
+}
+
 /// egui color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color32;
@@ -106,6 +124,42 @@ impl ThemeExt for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_surface_uses_effective_panel_color_instead_of_window_color() {
+        for panel in [
+            egui::Color32::from_rgb(30, 31, 33),
+            egui::Color32::from_rgb(245, 246, 248),
+            egui::Color32::from_rgb(27, 49, 71),
+        ] {
+            let mut style = egui::Style::default();
+            style.visuals.window_fill = egui::Color32::MAGENTA;
+            style.visuals.panel_fill = panel;
+            configure_popup_style(&mut style);
+            assert_eq!(style.visuals.window_fill, panel);
+            assert_eq!(style.visuals.window_fill.a(), 255);
+        }
+    }
+
+    #[test]
+    fn popup_font_uses_configured_monospace_size_without_changing_parent_style() {
+        let context = egui::Context::default();
+        let output = context.run_ui(Default::default(), |ui| {
+            let before = ui.style().override_font_id.clone();
+            ui.scope(|ui| {
+                configure_popup_text(ui, 19.0);
+                let expected = egui::FontId::monospace(19.0);
+                assert_eq!(ui.style().override_font_id, Some(expected.clone()));
+                assert!(ui
+                    .style()
+                    .text_styles
+                    .values()
+                    .all(|font| *font == expected));
+            });
+            assert_eq!(ui.style().override_font_id, before);
+        });
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope() {

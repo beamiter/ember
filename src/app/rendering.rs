@@ -1080,6 +1080,7 @@ fn draw_block_workspace(
     snapshot: &BlockWorkspaceSnapshot,
     focus: &mut BlockWorkspaceFocus,
     accent: egui::Color32,
+    font_size: f32,
 ) -> Option<BlockWorkspaceAction> {
     use crate::block_mode::BlockMenuAction as Target;
     use crate::keybindings::Command;
@@ -1166,7 +1167,11 @@ fn draw_block_workspace(
                 .popups
                 .push(egui::Popup::default_response_id(&response));
             egui::Popup::menu(&response)
-                .show(|ui| block_workspace_overflow(ui, focus, snapshot, &mut action));
+                .style(crate::theme::configure_popup_style)
+                .show(|ui| {
+                    crate::theme::configure_popup_text(ui, font_size);
+                    block_workspace_overflow(ui, focus, snapshot, &mut action);
+                });
             if roomy {
                 let status = if snapshot.in_history {
                     "Browsing history"
@@ -1230,7 +1235,11 @@ fn draw_block_workspace(
                 .popups
                 .push(egui::Popup::default_response_id(&response));
             egui::Popup::menu(&response)
-                .show(|ui| block_workspace_selection_menu(ui, focus, snapshot, &mut action));
+                .style(crate::theme::configure_popup_style)
+                .show(|ui| {
+                    crate::theme::configure_popup_text(ui, font_size);
+                    block_workspace_selection_menu(ui, focus, snapshot, &mut action);
+                });
             if !compact
                 && block_workspace_control(
                     ui,
@@ -2168,7 +2177,14 @@ impl TerminalApp {
         if !enabled || snapshot.alternate_screen {
             toolbar_ui.disable();
         }
-        let action = draw_block_workspace(&mut toolbar_ui, rect, &snapshot, &mut focus, accent);
+        let action = draw_block_workspace(
+            &mut toolbar_ui,
+            rect,
+            &snapshot,
+            &mut focus,
+            accent,
+            self.config.font_size,
+        );
         ctx.data_mut(|data| data.insert_temp(block_workspace_focus_id(), focus));
         let Some(action) = action else {
             return;
@@ -5971,7 +5987,8 @@ mod tests {
                                 rect,
                                 &snapshot,
                                 &mut focus,
-                                egui::Color32::WHITE
+                                egui::Color32::WHITE,
+                                crate::config::DEFAULT_FONT_SIZE,
                             ),
                             None
                         );
@@ -6011,8 +6028,14 @@ mod tests {
                 egui::vec2(500.0, BLOCK_WORKSPACE_HEIGHT),
                 egui::Sense::hover(),
             );
-            *action.borrow_mut() =
-                draw_block_workspace(ui, rect, &snapshot, &mut focus, egui::Color32::WHITE);
+            *action.borrow_mut() = draw_block_workspace(
+                ui,
+                rect,
+                &snapshot,
+                &mut focus,
+                egui::Color32::WHITE,
+                crate::config::DEFAULT_FONT_SIZE,
+            );
             id.set(focus.controls.first().copied());
             ui.ctx()
                 .data_mut(|data| data.insert_temp(block_workspace_focus_id(), focus));
@@ -6613,7 +6636,7 @@ mod tests {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BLOCK_WORKSPACE_HEIGHT), egui::Sense::hover());
                     ui.painter().rect_filled(rect, 0.0, crate::theme::Theme::rgb_to_color32(theme.ui.panel_bg));
                     let mut focus = BlockWorkspaceFocus::default();
-                    draw_block_workspace(ui, rect, &snapshot, &mut focus, accent);
+                    draw_block_workspace(ui, rect, &snapshot, &mut focus, accent, crate::config::DEFAULT_FONT_SIZE);
                     assert!(focus.control_rects.iter().all(|control| rect.contains_rect(*control)), "{name}: toolbar targets must remain in their reserved area");
                     if name == "wide-collapsed" {
                         let mut policy = crate::terminal::ProjectionPolicy::default();

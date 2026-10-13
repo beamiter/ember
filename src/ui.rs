@@ -3029,8 +3029,10 @@ impl TerminalRenderer {
         } else {
             egui::Popup::context_menu(response)
         };
+        let popup = popup.style(crate::theme::configure_popup_style);
         let popup_id = popup.get_id();
         let shown = popup.show(|ui| {
+            crate::theme::configure_popup_text(ui, self.font_size);
             let viewport = ui.ctx().viewport_rect();
             ui.set_min_width(240.0_f32.min((viewport.width() - 24.0).max(96.0)));
             ui.set_max_width(360.0_f32.min((viewport.width() - 24.0).max(96.0)));

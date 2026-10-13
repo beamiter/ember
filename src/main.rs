@@ -3764,7 +3764,7 @@ impl TerminalApp {
                                         FsSelectMode::Single,
                                     ));
                                 }
-                                root_resp.context_menu(|ui| {
+                                egui::Popup::context_menu(&root_resp).style(crate::theme::configure_popup_style).show(|ui| {
                                     Self::fs_context_menu(
                                         ui,
                                         None,
@@ -3773,6 +3773,7 @@ impl TerminalApp {
                                         &mut fs_menu_action,
                                         paste_state,
                                         files_are_local,
+                                        self.config.font_size,
                                     );
                                 });
                                 files_popup_open |= root_resp.context_menu_opened();
@@ -3861,6 +3862,7 @@ impl TerminalApp {
                                         &mut fs_menu_action,
                                         paste_state,
                                         files_are_local,
+                                        self.config.font_size,
                                         indent_guide,
                                         1,
                                         &mut tree_row_rects,
@@ -4453,6 +4455,7 @@ impl TerminalApp {
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
         files_are_local: bool,
+        font_size: f32,
         indent_guide: egui::Color32,
         depth: usize,
         rows: &mut Vec<(egui::Rect, std::path::PathBuf, bool)>,
@@ -4524,19 +4527,22 @@ impl TerminalApp {
                     .map(std::path::Path::to_path_buf)
                     .unwrap_or_else(|| node.path.clone())
             };
-            resp.clone().context_menu(|ui| {
-                let (_, targets) =
-                    sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
-                Self::fs_context_menu(
-                    ui,
-                    Some((&node.path, node.is_dir)),
-                    &targets,
-                    &target_dir,
-                    menu,
-                    paste,
-                    files_are_local,
-                );
-            });
+            egui::Popup::context_menu(&resp)
+                .style(crate::theme::configure_popup_style)
+                .show(|ui| {
+                    let (_, targets) =
+                        sidebar::Sidebar::resolve_menu_targets(selection, &node.path, node.is_dir);
+                    Self::fs_context_menu(
+                        ui,
+                        Some((&node.path, node.is_dir)),
+                        &targets,
+                        &target_dir,
+                        menu,
+                        paste,
+                        files_are_local,
+                        font_size,
+                    );
+                });
             *files_popup_open |= resp.context_menu_opened();
             resp.on_hover_text(hover)
         });
@@ -4617,6 +4623,7 @@ impl TerminalApp {
                     menu,
                     paste,
                     files_are_local,
+                    font_size,
                     indent_guide,
                     depth + 1,
                     rows,
@@ -4653,7 +4660,9 @@ impl TerminalApp {
         menu: &mut Option<FsMenuAction>,
         paste: FsPasteState,
         files_are_local: bool,
+        font_size: f32,
     ) {
+        crate::theme::configure_popup_text(ui, font_size);
         let multi = targets.len() > 1;
         if let Some((path, false)) = entry {
             let open = ui.add_enabled(files_are_local && !multi, egui::Button::new("Open  Enter"));

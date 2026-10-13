@@ -879,85 +879,90 @@ impl TerminalApp {
                                 kind: CommandActionKind::Jump,
                             });
                         }
-                        response.context_menu(|ui| {
-                            command_menu_item(
-                                ui,
-                                &mut action,
-                                row,
-                                "Copy command",
-                                CommandActionKind::CopyCommand,
-                                (!row.command_exact)
-                                    .then_some("The shell did not provide exact command metadata"),
-                            );
-                            command_menu_item(
-                                ui,
-                                &mut action,
-                                row,
-                                "Copy output",
-                                CommandActionKind::CopyOutput,
-                                (!row.output_copy_available)
-                                    .then_some("Rendered command output is unavailable or empty"),
-                            );
-                            command_menu_item(
-                                ui,
-                                &mut action,
-                                row,
-                                "Copy command + output",
-                                CommandActionKind::CopyCombined,
-                                combined_copy_disabled_reason(row),
-                            );
-                            ui.separator();
-                            command_menu_item(
-                                ui,
-                                &mut action,
-                                row,
-                                "Fill at prompt",
-                                CommandActionKind::Fill,
-                                replay_disabled_reason(row, replay_guard, false),
-                            );
-                            command_menu_item(
-                                ui,
-                                &mut action,
-                                row,
-                                if completed_command_row_is_failed(row) {
-                                    "Retry"
-                                } else {
-                                    "Run again"
-                                },
-                                CommandActionKind::RunAgain,
-                                replay_disabled_reason(row, replay_guard, true),
-                            );
-                            if completed_command_row_is_failed(row) {
+                        egui::Popup::context_menu(&response)
+                            .style(crate::theme::configure_popup_style)
+                            .show(|ui| {
+                                crate::theme::configure_popup_text(ui, self.config.font_size);
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Copy command",
+                                    CommandActionKind::CopyCommand,
+                                    (!row.command_exact).then_some(
+                                        "The shell did not provide exact command metadata",
+                                    ),
+                                );
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Copy output",
+                                    CommandActionKind::CopyOutput,
+                                    (!row.output_copy_available).then_some(
+                                        "Rendered command output is unavailable or empty",
+                                    ),
+                                );
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Copy command + output",
+                                    CommandActionKind::CopyCombined,
+                                    combined_copy_disabled_reason(row),
+                                );
                                 ui.separator();
-                                let disabled = agent_task_disabled_reason(row);
-                                for provider in fix_providers_ordered(preferred_fix_provider) {
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    "Fill at prompt",
+                                    CommandActionKind::Fill,
+                                    replay_disabled_reason(row, replay_guard, false),
+                                );
+                                command_menu_item(
+                                    ui,
+                                    &mut action,
+                                    row,
+                                    if completed_command_row_is_failed(row) {
+                                        "Retry"
+                                    } else {
+                                        "Run again"
+                                    },
+                                    CommandActionKind::RunAgain,
+                                    replay_disabled_reason(row, replay_guard, true),
+                                );
+                                if completed_command_row_is_failed(row) {
+                                    ui.separator();
+                                    let disabled = agent_task_disabled_reason(row);
+                                    for provider in fix_providers_ordered(preferred_fix_provider) {
+                                        command_menu_item(
+                                            ui,
+                                            &mut action,
+                                            row,
+                                            &format!("Fix with {}", provider.display_name()),
+                                            CommandActionKind::FixWithAgent(provider),
+                                            disabled,
+                                        );
+                                    }
                                     command_menu_item(
                                         ui,
                                         &mut action,
                                         row,
-                                        &format!("Fix with {}", provider.display_name()),
-                                        CommandActionKind::FixWithAgent(provider),
+                                        "Explain with Agent",
+                                        CommandActionKind::ExplainWithAgent,
+                                        disabled,
+                                    );
+                                    command_menu_item(
+                                        ui,
+                                        &mut action,
+                                        row,
+                                        "Create Agent Task",
+                                        CommandActionKind::CreateAgentTask,
                                         disabled,
                                     );
                                 }
-                                command_menu_item(
-                                    ui,
-                                    &mut action,
-                                    row,
-                                    "Explain with Agent",
-                                    CommandActionKind::ExplainWithAgent,
-                                    disabled,
-                                );
-                                command_menu_item(
-                                    ui,
-                                    &mut action,
-                                    row,
-                                    "Create Agent Task",
-                                    CommandActionKind::CreateAgentTask,
-                                    disabled,
-                                );
-                            }
-                        });
+                            });
                         if selected {
                             if let Some(detail) = selected_detail
                                 .as_ref()
