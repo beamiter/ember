@@ -973,6 +973,94 @@ fn block_card_emphasis(
     }
 }
 
+#[derive(Clone, Copy)]
+struct CompanionFrameFacts {
+    interactive: bool,
+    focused: bool,
+    alternate: bool,
+    app_mouse: bool,
+    selection: bool,
+    preedit: bool,
+    images: bool,
+    scroll_stable: bool,
+    projected_scroll_pending: bool,
+}
+
+impl CompanionFrameFacts {
+    fn allows(self) -> bool {
+        self.interactive
+            && self.focused
+            && !self.alternate
+            && !self.app_mouse
+            && !self.selection
+            && !self.preedit
+            && !self.images
+            && self.scroll_stable
+            && !self.projected_scroll_pending
+    }
+}
+
+fn companion_cell_is_empty(cell: &crate::terminal::TerminalCell) -> bool {
+    cell.character == ' '
+        && cell.background == crate::terminal::Color::Default
+        && cell.flags == crate::terminal::StyleFlags::new()
+        && cell.hyperlink_id.is_none()
+}
+
+/// Find only existing blank rows in the current active card. This is native
+/// geometry evidence, not idle/activity inference. Inspect at most six rows;
+/// a missing cursor, clipped card, synthetic row or styled space fails closed.
+fn active_companion_region(
+    viewport: &ProjectedViewport,
+    span: crate::block_mode::VisibleBlockSpan,
+    cursor_row: usize,
+    content: egui::Rect,
+    line_height: f32,
+    compact: bool,
+) -> Option<egui::Rect> {
+    if !span.starts_in_viewport
+        || !span.ends_in_viewport
+        || !content.is_finite()
+        || !line_height.is_finite()
+        || line_height <= 0.0
+        || cursor_row >= viewport.rows()
+        || cursor_row < span.first_row
+        || cursor_row > span.last_row
+    {
+        return None;
+    }
+    let first = span
+        .first_row
+        .max(cursor_row.saturating_add(1))
+        .max(span.last_row.saturating_sub(5));
+    if first > span.last_row {
+        return None;
+    }
+    let mut blank_start = span.last_row.saturating_add(1);
+    for row in (first..=span.last_row).rev() {
+        if viewport.row_kind(row) != Some(crate::terminal::ProjectedRowKind::Raw)
+            || !viewport
+                .cells()
+                .get(row)?
+                .iter()
+                .all(companion_cell_is_empty)
+        {
+            break;
+        }
+        blank_start = row;
+    }
+    if blank_start > span.last_row {
+        return None;
+    }
+    let card = block_card_geometry(content, span, line_height, compact, true)?.rect;
+    let top = snapped_span(content.top(), blank_start, line_height).0;
+    let region = egui::Rect::from_min_max(
+        egui::pos2(card.left() + 8.0, top + 4.0),
+        egui::pos2(card.right() - 8.0, card.bottom() - 4.0),
+    );
+    (region.is_positive() && content.contains_rect(region)).then_some(region)
+}
+
 fn block_card_geometry(
     content_rect: egui::Rect,
     span: crate::block_mode::VisibleBlockSpan,
@@ -1114,6 +1202,9 @@ pub struct TerminalRenderer {
     projected_kitty_rows_remaining: Option<usize>,
     /// The content rect from the last render, used for mouse-to-grid coordinate conversion
     pub last_content_rect: Option<egui::Rect>,
+    /// Same-frame native active-card free space; never terminal or PTY allocation.
+    pub companion_surface: Option<(String, ProjectionCacheKey, egui::Rect)>,
+    pub companion_enabled: bool,
     pub opacity: f32,
     /// Whether to enable font ligatures (HarfRust shaping of ASCII runs)
     pub font_ligatures: bool,
@@ -1251,6 +1342,8 @@ impl TerminalRenderer {
             requested_initial_focus: false,
             ime_enabled: false,
             last_content_rect: None,
+            companion_surface: None,
+            companion_enabled: false,
             last_ime_rect: None,
             opacity: 1.0,
             font_ligatures: true,
@@ -3667,6 +3760,8 @@ impl TerminalRenderer {
         line_height: f32,
         char_width: f32,
     ) -> Response {
+        self.companion_surface = None;
+        let initial_scroll_offset = terminal.scroll_offset;
         let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
         terminal.kitty_graphics.set_cell_size_pixels(
             (char_width * pixels_per_point).round().max(1.0) as u32,
@@ -4564,6 +4659,46 @@ impl TerminalRenderer {
                     );
                 }
             }
+        }
+
+        // Reuse this frame's exact chrome/projection AFTER native input. No
+        // stale geometry survives a scrollbar move, composition or selection.
+        let companion_facts = CompanionFrameFacts {
+            interactive: interaction_enabled,
+            focused: focus_enabled,
+            alternate: terminal.is_alt_buffer_active(),
+            app_mouse: terminal.is_mouse_enabled(),
+            selection: terminal.has_text_selection(),
+            preedit: !terminal.preedit_text.is_empty(),
+            images: !terminal.kitty_graphics.get_placements().is_empty(),
+            scroll_stable: terminal.scroll_offset == initial_scroll_offset,
+            projected_scroll_pending: self.projected_scroll_request.is_some(),
+        };
+        if self.companion_enabled && companion_facts.allows() {
+            self.companion_surface = block_chrome
+                .as_deref()
+                .and_then(|entries| entries.iter().find(|entry| entry.live))
+                .and_then(|entry| {
+                    let cursor = Self::projected_buffer_point(
+                        terminal,
+                        &viewport,
+                        (
+                            terminal
+                                .total_lines_scrolled
+                                .saturating_add(terminal.get_cursor_pos().0 as u64),
+                            terminal.get_cursor_pos().1,
+                        ),
+                    )?;
+                    active_companion_region(
+                        &viewport,
+                        entry.span,
+                        cursor.row,
+                        content_rect,
+                        line_height,
+                        self.block_compact,
+                    )
+                    .map(|region| (entry.id.clone(), viewport.key(), region))
+                });
         }
 
         // Clear dirty region after rendering
@@ -5762,6 +5897,171 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_companion_frame_facts_fail_closed_individually() {
+        let clear = CompanionFrameFacts {
+            interactive: true,
+            focused: true,
+            alternate: false,
+            app_mouse: false,
+            selection: false,
+            preedit: false,
+            images: false,
+            scroll_stable: true,
+            projected_scroll_pending: false,
+        };
+        assert!(clear.allows());
+        for blocked in [
+            CompanionFrameFacts {
+                interactive: false,
+                ..clear
+            },
+            CompanionFrameFacts {
+                focused: false,
+                ..clear
+            },
+            CompanionFrameFacts {
+                alternate: true,
+                ..clear
+            },
+            CompanionFrameFacts {
+                app_mouse: true,
+                ..clear
+            },
+            CompanionFrameFacts {
+                selection: true,
+                ..clear
+            },
+            CompanionFrameFacts {
+                preedit: true,
+                ..clear
+            },
+            CompanionFrameFacts {
+                images: true,
+                ..clear
+            },
+            CompanionFrameFacts {
+                scroll_stable: false,
+                ..clear
+            },
+            CompanionFrameFacts {
+                projected_scroll_pending: true,
+                ..clear
+            },
+        ] {
+            assert!(!blocked.allows());
+        }
+    }
+
+    #[test]
+    fn active_companion_cell_evidence_rejects_wide_invisible_style_and_link() {
+        use crate::terminal::{StyleFlags, TerminalCell};
+        let blank = TerminalCell::default();
+        assert!(companion_cell_is_empty(&blank));
+        for character in ['X', '\u{200b}', '\u{00a0}', '\0', '界'] {
+            assert!(!companion_cell_is_empty(&TerminalCell {
+                character,
+                ..blank
+            }));
+        }
+        let setters: [fn(&mut StyleFlags, bool); 7] = [
+            StyleFlags::set_wide,
+            StyleFlags::set_wide_continuation,
+            StyleFlags::set_protected,
+            StyleFlags::set_inverse,
+            StyleFlags::set_blink,
+            StyleFlags::set_dim,
+            StyleFlags::set_strikethrough,
+        ];
+        for setter in setters {
+            let mut cell = blank;
+            setter(&mut cell.flags, true);
+            assert!(!companion_cell_is_empty(&cell));
+        }
+        let mut terminal = TerminalState::new(80, 12);
+        terminal.process_input(b"\x1b]8;;https://example.com\x07 \x1b]8;;\x07");
+        assert!(!terminal.grid.get(0, 0).hyperlink_id.is_none());
+        assert!(!companion_cell_is_empty(terminal.grid.get(0, 0)));
+    }
+
+    #[test]
+    fn active_companion_uses_only_native_blank_rows_after_cursor() {
+        let mut terminal = TerminalState::new(80, 12);
+        let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+        let span = crate::block_mode::visible_live_block_span(0, 0, 0, 0, 12).unwrap();
+        let content = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(640.0, 240.0));
+        let region = active_companion_region(&viewport, span, 0, content, 20.0, false).unwrap();
+        assert!(region.top() > 40.0, "the entire cursor row is excluded");
+        assert!(
+            region.bottom() < 140.0,
+            "the body belongs to the six-row Block, not the viewport bottom"
+        );
+        assert!(content.contains_rect(region));
+        assert!(
+            active_companion_region(&viewport, span, 5, content, 20.0, false).is_none(),
+            "multiline input using the card's final row leaves no safe body space"
+        );
+        assert!(
+            active_companion_region(&viewport, span, usize::MAX, content, 20.0, false).is_none()
+        );
+        let mut clipped = span;
+        clipped.starts_in_viewport = false;
+        assert!(active_companion_region(&viewport, clipped, 0, content, 20.0, false).is_none());
+        clipped = span;
+        clipped.ends_in_viewport = false;
+        assert!(active_companion_region(&viewport, clipped, 0, content, 20.0, false).is_none());
+        for line_height in [f32::NAN, 0.0, -1.0] {
+            assert!(
+                active_companion_region(&viewport, span, 0, content, line_height, false).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn active_companion_never_covers_output_or_styled_empty_cells() {
+        let span = crate::block_mode::visible_live_block_span(0, 0, 0, 0, 12).unwrap();
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 240.0));
+        for bytes in [
+            b"\x1b[6;1HX".as_slice(),
+            b"\x1b[6;1H\x1b[41m ",
+            b"\x1b[6;1H\x1b[4m ",
+        ] {
+            let mut terminal = TerminalState::new(80, 12);
+            terminal.process_input(bytes);
+            let viewport = terminal.projected_viewport(HistoryProjection::identity(), true);
+            assert!(active_companion_region(&viewport, span, 0, content, 20.0, false).is_none());
+        }
+    }
+
+    #[test]
+    fn active_companion_uses_current_projection_and_never_resizes_terminal() {
+        let source = include_str!("ui.rs");
+        let gate = source
+            .split("// Reuse this frame's exact chrome/projection AFTER native input.")
+            .nth(1)
+            .unwrap()
+            .split("// Clear dirty region")
+            .next()
+            .unwrap();
+        for required in [
+            "terminal.is_alt_buffer_active()",
+            "terminal.is_mouse_enabled()",
+            "terminal.has_text_selection()",
+            "terminal.preedit_text.is_empty()",
+            "terminal.kitty_graphics.get_placements().is_empty()",
+            "terminal.scroll_offset == initial_scroll_offset",
+            "self.projected_scroll_request.is_some()",
+            "Self::projected_buffer_point",
+            "entry.live",
+        ] {
+            assert!(
+                gate.contains(required),
+                "missing native safety evidence: {required}"
+            );
+        }
+        assert!(!gate.contains("resize("));
+    }
 
     #[test]
     fn command_sequence_lookup_is_exact_for_monotonic_retained_history() {

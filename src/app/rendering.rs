@@ -2224,6 +2224,11 @@ impl TerminalApp {
         );
         let workspace_drag_active = self.tab_drag_is_active(ctx) || self.pane_drag.is_some();
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
+        let companion_enabled = self.config.ascii_organism_enabled
+            && self.config.block_mode
+            && crate::organism::resolved_motion(self.config.ascii_organism_motion)
+                != crate::config::OrganismMotion::Static;
+        self.renderer.companion_enabled = companion_enabled;
         if !terminal_interaction_enabled {
             self.dragging_divider = None;
         }
@@ -2281,6 +2286,7 @@ impl TerminalApp {
 
         // Block-mode gutter clicks reported by whichever renderer drew the
         // clicked pane this frame, applied after every pane has rendered.
+        let mut companion_surface = None;
         let mut pending_block_click: Option<(String, crate::block_mode::BlockClick)> = None;
         let mut pending_block_menu: Option<(String, crate::block_mode::BlockMenuRequest)> = None;
 
@@ -2380,6 +2386,9 @@ impl TerminalApp {
                         self.block_bookmarks.get(&session.metadata.session_id),
                     );
 
+                    // Only the focused enabled non-Static owner needs a
+                    // bounded safe-area scan; disabled/background panes do none.
+                    renderer.companion_enabled = companion_enabled && pane.focused;
                     // 在指定矩形内渲染（多窗格模式专用方法）
                     renderer.render_in_rect(
                         ui,
@@ -2392,7 +2401,19 @@ impl TerminalApp {
                         pane_hovered_link,
                         content_rect,
                     );
+                    if pane.focused {
+                        companion_surface =
+                            renderer
+                                .companion_surface
+                                .clone()
+                                .map(|(block, projection, rect)| {
+                                    (session.metadata.session_id.clone(), block, projection, rect)
+                                });
+                    }
                     if let Some(request) = renderer.take_projected_scroll_request() {
+                        if pane.focused {
+                            companion_surface = None;
+                        }
                         match request {
                             crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
                                 projection_view_state.set_offset(offset, &viewport);
@@ -2610,7 +2631,13 @@ impl TerminalApp {
                     &self.cached_links,
                     &self.hovered_link,
                 );
+                companion_surface = self
+                    .renderer
+                    .companion_surface
+                    .clone()
+                    .map(|(block, projection, rect)| (session_id.clone(), block, projection, rect));
                 if let Some(request) = self.renderer.take_projected_scroll_request() {
+                    companion_surface = None;
                     match request {
                         crate::ui::ProjectedScrollRequest::SetOffset(offset) => {
                             projection_view_state.set_offset(offset, &viewport);
@@ -2629,6 +2656,8 @@ impl TerminalApp {
                 }
             }
         }
+
+        self.render_native_organism(ui, companion_surface, terminal_interaction_enabled);
 
         self.render_tab_to_pane_drop_zones(ui, ctx, &pane_drop_targets, interaction_enabled);
 
