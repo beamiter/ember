@@ -2355,7 +2355,7 @@ impl TerminalApp {
                     );
                     session
                         .projection_policy
-                        .set_block_spacing(!self.pane_renderers[pane_idx].block_compact);
+                        .set_block_spacing(self.pane_renderers[pane_idx].block_spacer_rows());
                     self.pane_renderers[pane_idx].companion_status_enabled =
                         companion_status_enabled && pane.focused;
                     self.pane_renderers[pane_idx].companion_expanded =
@@ -2639,7 +2639,7 @@ impl TerminalApp {
                 );
                 session
                     .projection_policy
-                    .set_block_spacing(!self.renderer.block_compact);
+                    .set_block_spacing(self.renderer.block_spacer_rows());
                 session.projection_policy.set_block_chrome(
                     self.renderer.block_mode,
                     self.renderer.companion_status_rows(),
@@ -6656,6 +6656,91 @@ mod tests {
             0
         ));
     }
+    /// Compare actual native-card paint with/without the former full-row spacer.
+    /// Output, cursor, grid size and the live companion surface remain unchanged.
+    #[test]
+    fn native_block_spacing_offscreen_regression() {
+        let destination = std::env::var_os("EMBER_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
+        if let Some(path) = &destination {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for (name, width, font_size, collapsed, running, status_rows) in [
+            ("native-wide", 1000, 14.0, false, false, 0),
+            ("native-large", 1000, 24.0, false, false, 0),
+            ("native-narrow", 360, 14.0, false, false, 0),
+            ("native-collapsed", 1000, 14.0, true, false, 0),
+            ("native-running", 1000, 14.0, false, true, 0),
+            ("native-organism", 1000, 14.0, false, false, 4),
+        ] {
+            for spacing in [true, false] {
+                let ctx = egui::Context::default();
+                let theme = crate::theme::Theme::default();
+                crate::apply_theme_visuals(&ctx, &theme);
+                let mut renderer = crate::ui::TerminalRenderer::new(
+                    font_size,
+                    8.0,
+                    1.0,
+                    crate::config::ScrollbarVisibility::Always,
+                    theme,
+                );
+                renderer.gpu_rendering = false;
+                renderer.block_mode = true;
+                let mut terminal = None;
+                let mut capture = super::super::visual_test_support::OffscreenCapture::default();
+                for pass in 0..3 {
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        time: Some(pass as f64 * 0.25),
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, 720.0))),
+                        ..Default::default()
+                    }, |ui| {
+                        let (cols, rows) = renderer.grid_dimensions(ui.available_size());
+                        let terminal = terminal.get_or_insert_with(|| {
+                            let mut terminal = crate::terminal::TerminalState::new(cols, rows);
+                            for (id, command, result) in [("one", "cd assets/", ""), ("two", "ls", "wallpapers\r\n"), ("three", "printf lines", "first\r\n\r\nthird\r\n")] {
+                                terminal.process_input(format!("\x1b]133;A\x07~/projects/demo\r\n$ \x1b]133;B;jsh_id={id}\x07{command}\r\n\x1b]133;C;jsh_id={id}\x07{result}\x1b]133;D;0;jsh_id={id}\x07").as_bytes());
+                            }
+                            terminal.process_input(b"\x1b]133;A\x07~/projects/demo\r\n$ \x1b]133;B;jsh_id=live\x07");
+                            if running {
+                                terminal.process_input(b"cargo test\r\n\x1b]133;C;jsh_id=live\x07running tests\r\n");
+                            }
+                            terminal
+                        });
+                        let raw_grid = format!("{:?}", terminal.grid.to_vec());
+                        let raw_cursor = terminal.get_cursor_pos();
+                        let mut policy = crate::terminal::ProjectionPolicy::default();
+                        policy.set_block_spacing(spacing);
+                        policy.set_block_chrome(true, status_rows);
+                        if collapsed {
+                            policy.collapse(terminal.command_record("three").unwrap().sequence);
+                        }
+                        let viewport = renderer.projected_viewport_with_state(terminal, &policy, &mut crate::terminal::ProjectionViewState::default());
+                        if !spacing {
+                            assert!((0..viewport.rows()).all(|row| !matches!(viewport.row_kind(row), Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. }))));
+                        }
+                        renderer.set_projection_frame(terminal, viewport, &policy);
+                        renderer.render(ui, terminal, true, true, &crate::search::SearchState::default(), &[], &None);
+                        assert_eq!(format!("{:?}", terminal.grid.to_vec()), raw_grid);
+                        assert_eq!(terminal.get_cursor_pos(), raw_cursor);
+                        assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (cols, rows));
+                    });
+                    if let Some(path) = &destination {
+                        capture.save(
+                            &ctx,
+                            &mut output,
+                            [width, 720],
+                            &path.join(format!(
+                                "{name}-{}.png",
+                                if spacing { "before" } else { "after" }
+                            )),
+                        );
+                    } else {
+                        output.textures_delta.clear();
+                    }
+                }
+            }
+        }
+    }
+
     /// Set EMBER_UI_SNAPSHOT_DIR to export actual egui/CPU-terminal meshes.
     /// The fixture intentionally needs no display server or GPU socket.
     #[test]

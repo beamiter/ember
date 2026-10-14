@@ -70,8 +70,9 @@ claimed.
 Block Mode uses a quiet metadata header above each completed command: outcome,
 working directory, time and duration, with overflow and collapse controls
 on the right. Commands use the theme's blue; output keeps its terminal colors.
-The live input retains its accent border and six-row minimum. Metadata and
-inter-card spacing are display-only rows, with no terminal copy, selection or
+The live input retains its accent border and six-row minimum. Native Block
+cards use a small four-pixel edge gap at normal density, without reserving a
+full blank terminal row between commands. Metadata rows have no terminal copy, selection or
 application mouse origin.
 
 When ASCII Organism is enabled, its compact status card appears between history

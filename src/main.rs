@@ -1328,9 +1328,12 @@ fn projected_viewport_for_session(
     renderer: &TerminalRenderer,
 ) -> terminal::ProjectedViewport {
     let terminal = Arc::clone(&session.terminal);
+    // Native Block headers already separate commands. Do not add a whole
+    // terminal-height blank row on top of their small paint-only edge gap.
+    // Chat retains its independent capsule spacing.
     session
         .projection_policy
-        .set_block_spacing(!renderer.block_compact);
+        .set_block_spacing(renderer.block_spacer_rows());
     session
         .projection_policy
         .set_block_chrome(renderer.block_mode, renderer.companion_status_rows());

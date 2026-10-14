@@ -1528,6 +1528,12 @@ impl TerminalRenderer {
         }
     }
 
+    /// Native Block cards already have metadata headers and small edge gaps.
+    /// Only Chat keeps full display-row separators between its capsules.
+    pub fn block_spacer_rows(&self) -> bool {
+        self.chat_mode && !self.block_compact
+    }
+
     /// Return the immutable viewport snapshot consumed by this renderer and
     /// its link/mouse frontends. Repeated calls with an unchanged key clone
     /// only small `Arc`s; the cells and origin index stay shared.
@@ -9426,6 +9432,86 @@ mod tests {
 #[cfg(test)]
 mod block_spacing_tests {
     use super::*;
+
+    #[test]
+    fn native_card_density_never_reserves_a_full_spacer_row() {
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            2.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        for compact in [false, true] {
+            renderer.block_compact = compact;
+            renderer.chat_mode = false;
+            assert!(!renderer.block_spacer_rows());
+            renderer.chat_mode = true;
+            assert_eq!(renderer.block_spacer_rows(), !compact);
+        }
+    }
+
+    #[test]
+    fn native_headers_keep_small_card_gaps_without_reserving_blank_rows() {
+        for line_height in [12.0, 16.8, 24.0, 32.0] {
+            let mut terminal = TerminalState::new(40, 24);
+            for _ in 0..2 {
+                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07lines\r\n\x1b]133;C\x07first\r\n\r\nlast\r\n\x1b]133;D;0\x07");
+            }
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            let renderer = TerminalRenderer::new(
+                14.0,
+                2.0,
+                1.0,
+                crate::config::ScrollbarVisibility::Auto,
+                crate::theme::Theme::default(),
+            );
+            let mut policy = crate::terminal::ProjectionPolicy::new();
+            policy.set_block_chrome(true, 0);
+            let viewport = renderer.projected_viewport_with_state(
+                &mut terminal,
+                &policy,
+                &mut crate::terminal::ProjectionViewState::new(),
+            );
+            let entries = renderer
+                .compute_projected_block_chrome(&terminal, &viewport)
+                .unwrap();
+            assert_eq!(entries.len(), 3);
+            let content = egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(640.0, 24.0 * line_height),
+            );
+            for pair in entries.windows(2) {
+                assert_eq!(pair[0].span.last_row + 1, pair[1].span.first_row);
+                let before = renderer
+                    .card_geometry(&pair[0], content, line_height, 24)
+                    .unwrap();
+                let after = renderer
+                    .card_geometry(&pair[1], content, line_height, 24)
+                    .unwrap();
+                assert!(before.bottom_closed && after.top_closed);
+                assert!((after.rect.top() - before.rect.bottom() - 4.0).abs() <= 1.0);
+            }
+            assert!((0..viewport.rows()).all(|row| !matches!(
+                viewport.row_kind(row),
+                Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })
+            )));
+            // Each empty output line is a real source row, not presentation
+            // whitespace, and must survive the spacing change untouched.
+            for entry in entries.iter().filter(|entry| !entry.live) {
+                assert!(
+                    (entry.span.first_row..=entry.span.last_row).any(|row| matches!(
+                        viewport.row_kind(row),
+                        Some(crate::terminal::ProjectedRowKind::Raw)
+                    ) && viewport.cells()
+                        [row]
+                        .iter()
+                        .all(|cell| cell.character == ' '))
+                );
+            }
+            assert_eq!((terminal.grid.row_len(), terminal.grid.rows()), (40, 24));
+        }
+    }
 
     #[test]
     fn spaced_card_layout_has_a_real_row_gap_without_changing_grid_or_organism() {
