@@ -8551,6 +8551,71 @@ fn chat_prompt(terminal: &mut TerminalState, input: &str) {
 }
 
 #[test]
+fn chat_history_redraw_and_mode_switch_preserve_draft_and_command_identity() {
+    let mut terminal = TerminalState::new(80, 24);
+    chat_pair(&mut terminal, "printf first", "first");
+    chat_pair(&mut terminal, "printf second", "second");
+    let draft = "printf 'unfinished draft café'";
+    chat_prompt(&mut terminal, draft);
+    let records = format!("{:?}", terminal.command_records());
+    let prompt = terminal.command_records().back().unwrap().clone();
+    let mut state = ProjectionViewState::new();
+    let mut policy = ProjectionPolicy::new();
+
+    // Shell history owns the draft. Model its actual terminal redraws for
+    // Up, Up, Down, Down, including shorter and Unicode replacements. No C
+    // marker or Enter is emitted: browsing must remain the same editing block.
+    for input in [
+        draft,
+        "printf second",
+        "printf first",
+        "printf second",
+        draft,
+    ] {
+        terminal.process_input(format!("\r\x1b[2K$ {input}").as_bytes());
+        let raw_cursor = terminal.get_cursor_pos();
+        let raw_rows: Vec<String> = terminal
+            .grid
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.character).collect())
+            .collect();
+        assert_eq!(raw_rows[raw_cursor.0].trim_end(), format!("$ {input}"));
+        for mode in [2, 0, 1, 2, 1, 0, 2] {
+            policy.set_block_spacing(mode != 0);
+            policy.set_block_chrome(mode != 0, 0);
+            policy.set_chat_mode(mode == 2);
+            let view = terminal.projected_viewport_with_state(
+                HistoryProjection::identity(),
+                mode != 0,
+                &policy,
+                &mut state,
+            );
+            assert_eq!(view.application_cell(view.cursor()), Some(raw_cursor));
+            assert_eq!(view.chat_composer_rows().is_some(), mode == 2);
+            assert_eq!(format!("{:?}", terminal.command_records()), records);
+            assert!(terminal.shell_is_prompt_ready());
+            assert!(!terminal.prompt_input_is_empty());
+            assert!(ChatInputAction::Submit {
+                sequence: prompt.sequence
+            }
+            .is_current(&terminal));
+            for (row, expected) in raw_rows.iter().enumerate() {
+                let actual: String = terminal.grid[row]
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect();
+                assert_eq!(&actual, expected, "mode {mode} changed shell-owned text");
+            }
+        }
+    }
+    assert_eq!(terminal.command_records().len(), 3);
+    assert_eq!(
+        terminal.command_records().back().unwrap().state,
+        CommandState::Editing
+    );
+}
+
+#[test]
 fn chat_projection_pins_real_prompt_and_right_aligns_command_without_fake_cells() {
     let mut terminal = TerminalState::new(80, 24);
     chat_pair(&mut terminal, "printf hello", "hello");
