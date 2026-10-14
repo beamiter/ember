@@ -216,6 +216,20 @@ fn chat_mode_keeps_cwd_environment_completion_multiline_hidden_input_and_interru
     poll_until(&mut session, |terminal, _| {
         terminal.chat_surface() == jterm_core::chat_mode::ChatSurface::Running
     });
+    // Optional controls reject enhanced native encodings rather than sending
+    // a raw ETX fallback or retaining bytes for a later foreground process.
+    for encoded in [b"\x1b[99;5u".as_slice(), b"\x1b[27;5;99~".as_slice()] {
+        assert!(!button(
+            &mut session,
+            ChatInputAction::Interrupt { sequence },
+            encoded
+        ));
+        assert!(session.pending_input.is_empty());
+        assert_eq!(
+            session.terminal.lock().chat_surface(),
+            jterm_core::chat_mode::ChatSurface::Running
+        );
+    }
     assert!(button(
         &mut session,
         ChatInputAction::Interrupt { sequence },

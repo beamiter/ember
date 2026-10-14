@@ -372,9 +372,14 @@ impl TerminalRenderer {
         if !action.is_current(terminal) {
             return Vec::new();
         }
-        if matches!(action, crate::terminal::ChatInputAction::Interrupt { .. }) {
-            return vec![0x03];
-        }
+        let (key, modifiers) = match action {
+            crate::terminal::ChatInputAction::Submit { .. } => {
+                (egui::Key::Enter, egui::Modifiers::NONE)
+            }
+            crate::terminal::ChatInputAction::Interrupt { .. } => {
+                (egui::Key::C, egui::Modifiers::CTRL)
+            }
+        };
         let mut bytes = Vec::new();
         self.handle_keyboard_input(
             ctx,
@@ -390,11 +395,11 @@ impl TerminalRenderer {
             terminal.is_meta_sends_escape(),
             false,
             &[egui::Event::Key {
-                key: egui::Key::Enter,
+                key,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
-                modifiers: egui::Modifiers::NONE,
+                modifiers,
             }],
         );
         bytes
@@ -484,6 +489,7 @@ mod tests {
         assert!(renderer
             .chat_action_bytes(&ctx, &terminal, submit)
             .is_empty());
+        terminal.process_input(b"\x1b[<u");
         let interrupt = ChatInputAction::Interrupt { sequence };
         assert_eq!(
             renderer.chat_action_bytes(&ctx, &terminal, interrupt),
@@ -493,6 +499,136 @@ mod tests {
         assert!(renderer
             .chat_action_bytes(&ctx, &terminal, interrupt)
             .is_empty());
+    }
+
+    #[test]
+    fn chat_interrupt_matches_native_ctrl_c_and_disables_multibyte_clicks() {
+        for flags in [0, 1, 8, 9] {
+            for modify_other_keys in [0, 1, 2] {
+                for format_other_keys in [0, 1] {
+                    let ctx = egui::Context::default();
+                    let mut renderer = renderer();
+                    let mut terminal = TerminalState::new(80, 24);
+                    prompt(&mut terminal);
+                    terminal.process_input(b"\r\n\x1b]133;C\x07");
+                    terminal.process_input(
+                        format!(
+                            "\x1b[>{flags}u\x1b[>4;{modify_other_keys}m\x1b[>4;{format_other_keys}f"
+                        )
+                        .as_bytes(),
+                    );
+                    assert_eq!(terminal.keyboard_enhancement_flags(), flags);
+                    assert_eq!(terminal.xterm_modify_other_keys(), modify_other_keys);
+                    assert_eq!(terminal.xterm_format_other_keys(), format_other_keys);
+                    let sequence = terminal.command_records().back().unwrap().sequence;
+                    let action = ChatInputAction::Interrupt { sequence };
+                    let mut native = Vec::new();
+                    renderer.handle_keyboard_input(
+                        &ctx,
+                        &mut native,
+                        &std::collections::HashSet::new(),
+                        false,
+                        terminal.keyboard_enhancement_flags(),
+                        terminal.is_report_all_keys_enabled(),
+                        terminal.xterm_modify_other_keys(),
+                        terminal.xterm_format_other_keys(),
+                        terminal.is_application_cursor_keys(),
+                        terminal.is_alt_buffer_active(),
+                        terminal.is_meta_sends_escape(),
+                        false,
+                        &[egui::Event::Key {
+                            key: egui::Key::C,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::CTRL,
+                        }],
+                    );
+                    let expected: &[u8] =
+                        if flags != 0 || (modify_other_keys == 2 && format_other_keys == 1) {
+                            b"\x1b[99;5u"
+                        } else if modify_other_keys == 2 {
+                            b"\x1b[27;5;99~"
+                        } else {
+                            b"\x03"
+                        };
+                    assert_eq!(native, expected);
+                    assert_eq!(renderer.chat_action_bytes(&ctx, &terminal, action), native);
+
+                    let screen =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 650.0));
+                    let mut policy = ProjectionPolicy::new();
+                    policy.set_chat_mode(true);
+                    policy.set_block_chrome(true, 0);
+                    let mut state = ProjectionViewState::new();
+                    let mut pointer = egui::Pos2::ZERO;
+                    for phase in 0..3 {
+                        let view = renderer.projected_viewport_with_state(
+                            &mut terminal,
+                            &policy,
+                            &mut state,
+                        );
+                        if phase == 0 {
+                            let row = view
+                                .chat_command_spans()
+                                .iter()
+                                .find(|command| command.sequence == sequence)
+                                .unwrap()
+                                .rows
+                                .end;
+                            assert!(matches!(
+                                view.row_kind(row),
+                                Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })
+                            ));
+                            let content = renderer.layout_rects(screen).0;
+                            pointer = content.min
+                                + egui::vec2(20.0, (row as f32 + 0.5) * renderer.line_height);
+                        }
+                        renderer.set_projection_frame(&terminal, view, &policy);
+                        let events = if phase == 0 {
+                            Vec::new()
+                        } else {
+                            vec![
+                                egui::Event::PointerMoved(pointer),
+                                egui::Event::PointerButton {
+                                    pos: pointer,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: phase == 1,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ]
+                        };
+                        let mut output = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                events,
+                                ..Default::default()
+                            },
+                            |ui| {
+                                renderer.render_in_rect(
+                                    ui,
+                                    &mut terminal,
+                                    true,
+                                    true,
+                                    true,
+                                    &crate::search::SearchState::default(),
+                                    &[],
+                                    &None,
+                                    screen,
+                                );
+                            },
+                        );
+                        output.textures_delta.clear();
+                    }
+                    assert_eq!(renderer.chat_input_action.is_some(), native.len() == 1);
+                    assert!(renderer.cursor_move_input.is_empty());
+                    terminal.process_input(b"\x1b]133;D;0\x07");
+                    assert!(renderer
+                        .chat_action_bytes(&ctx, &terminal, action)
+                        .is_empty());
+                }
+            }
+        }
     }
 
     #[test]

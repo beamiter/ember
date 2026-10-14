@@ -1124,6 +1124,7 @@ impl TerminalApp {
         };
         if accepted_terminal_input_clears_block_selection(accepted, false) {
             self.clear_block_selection_for_session(&session_id);
+            self.organism.accepted_input(&session_id);
         } else {
             self.set_status("Terminal input retry buffer is full");
         }
