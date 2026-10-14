@@ -305,6 +305,27 @@ impl TerminalRenderer {
         if !rect.is_positive() {
             return false;
         }
+        // A manual max_rect does not constrain egui's Button minimum size or
+        // wrapping. Hide an unreadable control in a tiny pane; the native
+        // keyboard remains available. Clip both paint and hit testing to the
+        // same footer/header rectangle without changing any global styles.
+        let label_size = ui
+            .painter()
+            .layout_no_wrap(
+                label.to_owned(),
+                FontId::proportional(self.font_size * 0.78),
+                self.theme.terminal_foreground(),
+            )
+            .size();
+        if rect.width() < label_size.x + 12.0 || rect.height() < label_size.y + 2.0 {
+            if self
+                .chat_pressed_action
+                .is_some_and(|(owner, _, _)| owner == terminal as *const TerminalState as usize)
+            {
+                self.chat_pressed_action = None;
+            }
+            return false;
+        }
         let native_owner = self.chat_native_owner.filter(|(shell, foreground)| {
             *foreground > 0
                 && (!matches!(action, ChatInputAction::Submit { .. }) || shell == foreground)
@@ -321,11 +342,14 @@ impl TerminalRenderer {
                 ),
                 |ui| {
                     ui.add_enabled_ui(can_send, |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(rect));
                         ui.put(
                             rect,
                             egui::Button::new(
                                 egui::RichText::new(label).size(self.font_size * 0.78),
                             )
+                            .small()
+                            .truncate()
                             .corner_radius(12),
                         )
                     })
@@ -343,12 +367,19 @@ impl TerminalRenderer {
         let pressed = ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
         let released =
             ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
+        // egui also considers nearby widgets within its pointer aim radius.
+        // An optional shell action must own the exact clipped physical point.
+        let pointer_inside = ui
+            .input(|input| input.pointer.interact_pos())
+            .is_some_and(|point| rect.intersect(ui.clip_rect()).contains(point));
         if pressed {
-            self.chat_pressed_action = (can_send && response.contains_pointer()).then_some(target);
+            self.chat_pressed_action =
+                (can_send && pointer_inside && response.contains_pointer()).then_some(target);
         }
         // Bind the whole pointer gesture, not just its release, to one shell
         // lifecycle. egui may otherwise transfer a click across a moved widget.
         let accepted = released
+            && pointer_inside
             && self.chat_pressed_action == Some(target)
             && response.clicked_by(egui::PointerButton::Primary)
             && action.is_current(terminal);
@@ -758,6 +789,210 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn chat_run_button_stays_inside_narrow_composer_footer() {
+        // Real egui allocation, paint clips, hit regions and pointer events.
+        // ui.put's max_rect alone is not a hard bound for a wrapping Button.
+        for font in [10.0, 16.0, 32.0] {
+            for width in [48.0, 64.0, 80.0, 120.0, 240.0] {
+                for dpi in [1.0, 1.5, 2.0] {
+                    for sample in 0..3 {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(dpi);
+                        let mut renderer = renderer();
+                        renderer.font_size = font;
+                        renderer.char_width = font * 0.6;
+                        renderer.line_height = font * 1.4;
+                        let screen =
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
+                        let pane = egui::Rect::from_min_size(
+                            egui::pos2(100.0, 40.0),
+                            egui::vec2(width, 800.0),
+                        );
+                        let (cols, rows) = renderer.grid_dimensions(pane.size());
+                        let mut terminal = TerminalState::new(cols, rows);
+                        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                        let mut policy = ProjectionPolicy::new();
+                        policy.set_chat_mode(true);
+                        policy.set_block_chrome(true, 0);
+                        let view = renderer.projected_viewport_with_state(
+                            &mut terminal,
+                            &policy,
+                            &mut ProjectionViewState::new(),
+                        );
+                        let content = renderer.layout_rects(pane).0;
+                        let row = view.chat_composer_rows().unwrap().end - 1;
+                        let footer = row_rect(content, row..row + 1, renderer.line_height)
+                            .shrink2(egui::vec2(8.0, 1.0));
+                        let button = egui::Rect::from_min_max(
+                            egui::pos2(
+                                footer.right() - (font * 4.4).min(footer.width()),
+                                footer.top(),
+                            ),
+                            footer.max,
+                        );
+                        let pointer = match sample {
+                            0 => button.center(),
+                            1 => egui::pos2(button.center().x, footer.bottom() + 1.0),
+                            _ => egui::pos2(button.left() - 1.0, button.center().y),
+                        };
+                        let mut expected_visible = false;
+                        for phase in 0..3 {
+                            let events = if phase == 0 {
+                                Vec::new()
+                            } else {
+                                vec![
+                                    egui::Event::PointerMoved(pointer),
+                                    egui::Event::PointerButton {
+                                        pos: pointer,
+                                        button: egui::PointerButton::Primary,
+                                        pressed: phase == 1,
+                                        modifiers: egui::Modifiers::NONE,
+                                    },
+                                ]
+                            };
+                            let mut output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    events,
+                                    ..Default::default()
+                                },
+                                |ui| {
+                                    let text_size = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            "Run".to_owned(),
+                                            FontId::proportional(font * 0.78),
+                                            Color32::WHITE,
+                                        )
+                                        .size();
+                                    expected_visible = button.width() >= text_size.x + 12.0
+                                        && button.height() >= text_size.y + 2.0;
+                                    renderer
+                                        .draw_chat_controls(ui, &terminal, &view, content, true);
+                                },
+                            );
+                            output.textures_delta.clear();
+                            let hits = ctx.interactive_rects_last_pass();
+                            assert_eq!(
+                                hits.len(),
+                                usize::from(expected_visible),
+                                "font={font}, width={width}"
+                            );
+                            for hit in &hits {
+                                assert!(button.contains_rect(*hit), "font={font}, width={width}: actual egui hit {hit:?} escapes button {button:?}");
+                            }
+                            let mut run_labels = 0;
+                            for shape in output.shapes {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    if text.galley.job.text == "Run" {
+                                        run_labels += 1;
+                                        let text_rect =
+                                            egui::Rect::from_min_size(text.pos, text.galley.size());
+                                        assert!(button.contains_rect(text_rect), "Run label must fit entirely: font={font}, width={width}, dpi={dpi}, {text_rect:?} vs {button:?}");
+                                    }
+                                }
+                                let visible = shape
+                                    .shape
+                                    .visual_bounding_rect()
+                                    .intersect(shape.clip_rect);
+                                if visible.is_positive() {
+                                    assert!(footer.contains_rect(visible), "font={font}, width={width}: painted {visible:?} escapes footer {footer:?}");
+                                }
+                            }
+                            assert_eq!(run_labels, usize::from(expected_visible));
+                        }
+                        assert_eq!(
+                            renderer.chat_input_action.is_some(),
+                            sample == 0 && expected_visible,
+                            "font={font}, width={width}, sample={sample}"
+                        );
+                        assert!(renderer.cursor_move_input.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chat_run_control_does_not_steal_adjacent_raw_row_clicks() {
+        for font in [10.0, 16.0, 32.0] {
+            for width in [80.0, 120.0, 240.0] {
+                let ctx = egui::Context::default();
+                let mut renderer = renderer();
+                renderer.font_size = font;
+                renderer.char_width = font * 0.6;
+                renderer.line_height = font * 1.4;
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
+                let pane =
+                    egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(width, 800.0));
+                let (cols, rows) = renderer.grid_dimensions(pane.size());
+                let mut terminal = TerminalState::new(cols, rows);
+                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                let mut policy = ProjectionPolicy::new();
+                policy.set_chat_mode(true);
+                policy.set_block_chrome(true, 0);
+                let mut state = ProjectionViewState::new();
+                let content = renderer.layout_rects(pane).0;
+                let mut pane_clicked = false;
+                for phase in 0..3 {
+                    let view =
+                        renderer.projected_viewport_with_state(&mut terminal, &policy, &mut state);
+                    let footer_row = view.chat_composer_rows().unwrap().end - 1;
+                    assert_eq!(
+                        view.row_kind(footer_row - 1),
+                        Some(crate::terminal::ProjectedRowKind::Raw)
+                    );
+                    let pointer = egui::pos2(
+                        content.right() - 10.0,
+                        content.top() + footer_row as f32 * renderer.line_height - 1.0,
+                    );
+                    renderer.set_projection_frame(&terminal, view, &policy);
+                    let events = if phase == 0 {
+                        Vec::new()
+                    } else {
+                        vec![
+                            egui::Event::PointerMoved(pointer),
+                            egui::Event::PointerButton {
+                                pos: pointer,
+                                button: egui::PointerButton::Primary,
+                                pressed: phase == 1,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    };
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let response = renderer.render_in_rect(
+                                ui,
+                                &mut terminal,
+                                true,
+                                true,
+                                true,
+                                &crate::search::SearchState::default(),
+                                &[],
+                                &None,
+                                pane,
+                            );
+                            pane_clicked |= response.clicked_by(egui::PointerButton::Primary);
+                        },
+                    );
+                    output.textures_delta.clear();
+                    assert!(
+                        renderer.chat_input_action.is_none(),
+                        "font={font}, width={width}, phase={phase}"
+                    );
+                }
+                assert!(pane_clicked, "native pane must retain the adjacent raw-row click: font={font}, width={width}");
             }
         }
     }
