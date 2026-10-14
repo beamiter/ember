@@ -391,8 +391,9 @@ click_moves_cursor = true
 # retries on that block's first visible row. Hovering a failed or
 # unknown-status card keeps its outcome color and only brightens it; hover
 # never repaints a failure in the neutral wash.
-# Block Mode reserves a 34px action lane before column zero. Card menus live
-# outside terminal cells, so they never cover commands or output. Normal
+# Block Mode reserves only an 8px status/selection stripe before column zero.
+# Card menus live in synthetic metadata headers; raw or clipped cards use
+# selection toolbar actions and right-click menus without covering text. Normal
 # density reserves one real display-only row between distinct command cards.
 # Compact removes that extra row and tightens the chrome. Both preserve the
 # PTY grid, font metrics and terminal columns; separators never enter copied
@@ -410,7 +411,7 @@ previous/next block navigation and **Go live** are discoverable above the termin
 selecting a block reveals its status, selected count and copy/reuse actions without
 changing the terminal viewport height. Narrow panes move secondary actions into menus.
 
-- Click a command header or press **Ctrl+↑** to select a completed block
+- Click a command header or its left status stripe, or press **Ctrl+↑**, to select a completed block
 - Use **↑ / ↓** to navigate and **Shift+↑ / Shift+↓** to extend a range
 - **Review** opens selected blocks in terminal order, with full retained command text, cwd,
   outcome, duration, lifecycle evidence and bounded captured output. It stays directly
@@ -425,7 +426,9 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
   Inside review Enter never inserts; use the explicit button. Insertion uses the current
   shell folder and never changes directory or submits the command
 - **Escape** clears selection, or returns keyboard focus from a block control to the terminal
-- Each completed card has a **⋯** action menu in the left lane; right-click remains available
+- Completed cards with a visible metadata header have an overflow menu there.
+  Select any completed card to reveal **Actions** above; right-click or **Shift+F10**
+  on the selected block opens its full card menu
 - Card menus group **Copy & share**, **Reuse**, and **Organize & navigate** actions, with command,
   working directory and completion status shown together
 - While reading history, new retained completions are counted without moving your view;
@@ -437,9 +440,9 @@ changing the terminal viewport height. Narrow panes move secondary actions into 
   snapshot notices, and a 256 KiB display cap per text pane. Output is a retained snapshot,
   not a claim that every original byte is available
 
-Terminal text remains selectable independently of whole-block selection. The action lane
-never covers terminal cells; very short clipped rows may omit their menu button, while
-right-click, workspace actions and keyboard navigation remain available. Run-again actions
+Terminal text remains selectable independently of whole-block selection. The compact stripe
+never covers terminal cells and its width stays fixed while scrolling. Raw/shared-row or
+clipped cards retain stripe selection, right-click, workspace actions and keyboard navigation. Run-again actions
 continue to use Ember's existing exact-command and safe-replay checks.
 
 For headless layout review, set `EMBER_UI_SNAPSHOT_DIR=/tmp/ember-ui` and run

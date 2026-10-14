@@ -1307,7 +1307,7 @@ fn draw_block_workspace(
                 hint.to_owned()
             };
             ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate())
-                .on_hover_text("Click a command header to select it; use the left ⋯ button for actions. Shift-click extends a range; Ctrl+Shift-click toggles a block. Block cards require OSC 133 shell integration.");
+                .on_hover_text("Click a command header or its left stripe to select it, then use Actions above; right-click opens the menu directly. Ctrl+↑ selects the previous block; Shift+F10 opens its full menu. Shift-click extends a range; Ctrl+Shift-click toggles a block. Block cards require OSC 133 shell integration.");
         }
     }
     action
@@ -6670,6 +6670,7 @@ mod tests {
             ("wide-collapsed", 1000, 1, false),
             ("wide-failed", 1000, 1, false),
             ("wide-menu", 1000, 1, false),
+            ("wide-header-menu", 1000, 1, false),
             ("wide-multiple", 1000, 2, false),
             ("wide-running", 1000, 0, true),
             ("narrow-failed", 360, 1, false),
@@ -6695,11 +6696,11 @@ mod tests {
                 let mut output = ctx.run_ui(egui::RawInput {
                     time: Some(pass as f64 * 0.25),
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, 640.0))),
-                    events: if name == "wide-menu" && pass == 1 {
+                    events: if name.ends_with("-menu") && pass == 1 {
                         vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
                             action: egui::accesskit::Action::Click,
                             target_tree: egui::accesskit::TreeId::ROOT,
-                            target_node: action_node.expect("completed command has an accessible action button"),
+                            target_node: action_node.expect("selected raw command has an accessible toolbar action button"),
                             data: None,
                         })]
                     } else { Vec::new() },
@@ -6742,10 +6743,20 @@ mod tests {
                     ui.painter().rect_filled(rect, 0.0, crate::theme::Theme::rgb_to_color32(theme.ui.panel_bg));
                     let mut focus = BlockWorkspaceFocus::default();
                     draw_block_workspace(ui, rect, &snapshot, &mut focus, accent, crate::config::DEFAULT_FONT_SIZE);
-                    assert!(focus.control_rects.iter().all(|control| rect.contains_rect(*control)), "{name}: toolbar targets must remain in their reserved area");
-                    if name == "wide-collapsed" {
+                    if name == "wide-menu" && pass > 0 {
+                        // Toolbar menu items are real controls outside the toolbar;
+                        // their targets must remain within the popup's viewport.
+                        assert!(focus.control_rects.iter().all(|control| ui.ctx().viewport_rect().contains_rect(*control)), "{name}: menu targets must stay on screen");
+                    } else {
+                        assert!(focus.control_rects.iter().all(|control| rect.contains_rect(*control)), "{name}: toolbar targets must remain in their reserved area");
+                    }
+                    if name == "wide-collapsed" || name == "wide-header-menu" {
                         let mut policy = crate::terminal::ProjectionPolicy::default();
-                        policy.collapse(terminal.command_record("test").unwrap().sequence);
+                        if name == "wide-collapsed" {
+                            policy.collapse(terminal.command_record("test").unwrap().sequence);
+                        } else {
+                            policy.set_block_chrome(true, 0);
+                        }
                         let mut view_state = crate::terminal::ProjectionViewState::default();
                         let viewport = renderer.projected_viewport_with_state(terminal, &policy, &mut view_state);
                         renderer.set_projection_frame(terminal, viewport, &policy);
@@ -6777,16 +6788,20 @@ mod tests {
                                 update.nodes.iter().find_map(|(id, node)| {
                                     node.label()
                                         .is_some_and(|label| {
-                                            label.starts_with("Block actions for cargo test")
+                                            if name == "wide-header-menu" {
+                                                label.starts_with("Block actions for cargo test")
+                                            } else {
+                                                label == "Actions"
+                                            }
                                         })
                                         .then_some(*id)
                                 })
                             });
                 }
-                if name == "wide-menu" && pass > 0 {
+                if name.ends_with("-menu") && pass > 0 {
                     assert!(
                         egui::Popup::is_any_open(&ctx),
-                        "the real card actions menu must open and remain stable"
+                        "the selected-block toolbar menu must open and remain stable"
                     );
                 }
                 if let Some(path) = &destination {

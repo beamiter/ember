@@ -850,6 +850,7 @@ enum BlockSelectionKeyAction {
     Move(crate::block_mode::SelectStep),
     Extend(crate::block_mode::SelectStep),
     Reinput,
+    ContextMenu,
     Clear,
 }
 
@@ -907,6 +908,9 @@ fn block_selection_key_action(
     };
     let no_command_modifier = !modifiers.ctrl && !modifiers.alt && !modifiers.command;
     match key {
+        egui::Key::F10 if no_command_modifier && modifiers.shift => {
+            Some(BlockSelectionKeyAction::ContextMenu)
+        }
         egui::Key::ArrowUp if no_command_modifier && modifiers.shift => Some(
             BlockSelectionKeyAction::Extend(crate::block_mode::SelectStep::Older),
         ),
@@ -942,6 +946,14 @@ fn block_chrome_claims_event(event: &egui::Event) -> bool {
             | egui::Event::Copy
             | egui::Event::Cut
     )
+}
+
+fn claim_pending_block_menu_events(events: &mut Vec<egui::Event>, requested: bool) {
+    if requested {
+        // The popup is painted later in this frame. Until then it already
+        // owns the remaining keyboard/IME/clipboard events, just like open chrome.
+        events.retain(|event| !block_chrome_claims_event(event));
+    }
 }
 
 fn block_chrome_escape_requested(events: &[egui::Event]) -> bool {
@@ -2454,11 +2466,23 @@ impl TerminalApp {
                 }
             } else if terminal_input_blocked || terminal_input_seen {
                 OrderedPressOutcome::Ignored
-            } else if self.handle_block_selection_key_event(&press.event) {
+            } else if self.handle_block_selection_key_event(ctx, &press.event) {
                 if self.block_selection.is_some() {
                     selection_postdates_terminal_input = true;
                 }
-                OrderedPressOutcome::Consumed
+                if self
+                    .renderer
+                    .block_context_menu_requested(ctx.cumulative_frame_nr())
+                    || self.pane_renderers.iter().any(|renderer| {
+                        renderer.block_context_menu_requested(ctx.cumulative_frame_nr())
+                    })
+                {
+                    // Shift+F10 opens chrome after input dispatch. Claim the
+                    // rest now so same-batch Enter/text never reaches the PTY.
+                    OrderedPressOutcome::ClaimRest
+                } else {
+                    OrderedPressOutcome::Consumed
+                }
             } else {
                 // This key remains for the deferred terminal encoder. Any
                 // selection action before it is older and must be cleared once
@@ -2496,6 +2520,13 @@ impl TerminalApp {
         for (key, modifiers) in dispatch.consumed {
             consume_bound_key_event(&mut self.frame_events, key, modifiers);
         }
+        let menu_requested =
+            self.renderer
+                .block_context_menu_requested(ctx.cumulative_frame_nr())
+                || self.pane_renderers.iter().any(|renderer| {
+                    renderer.block_context_menu_requested(ctx.cumulative_frame_nr())
+                });
+        claim_pending_block_menu_events(&mut self.frame_events, menu_requested);
         (
             dispatch.close_requested,
             selection_postdates_terminal_input,
@@ -2507,7 +2538,11 @@ impl TerminalApp {
     /// Enter returns false when the child owns it (running/alt screen) or the
     /// range has no commands; validation/backpressure failures are consumed and
     /// surfaced so they cannot submit unrelated prompt text.
-    fn handle_block_selection_key_event(&mut self, event: &egui::Event) -> bool {
+    fn handle_block_selection_key_event(
+        &mut self,
+        ctx: &egui::Context,
+        event: &egui::Event,
+    ) -> bool {
         if !self.config.command_cards_enabled() {
             self.clear_block_selection();
             return false;
@@ -2539,6 +2574,34 @@ impl TerminalApp {
             BlockSelectionKeyAction::Move(step) => self.block_move_selection(step, false),
             BlockSelectionKeyAction::Extend(step) => self.block_move_selection(step, true),
             BlockSelectionKeyAction::Reinput => self.block_reinput_selected_commands_from_enter(),
+            BlockSelectionKeyAction::ContextMenu => {
+                let Some(record_id) = self
+                    .block_selection
+                    .as_ref()
+                    .map(|selection| selection.active_id.clone())
+                else {
+                    return false;
+                };
+                let pane_index = (self.layout().panes().len() > 1)
+                    .then(|| self.layout().panes().iter().position(|pane| pane.focused))
+                    .flatten();
+                let session = self.session_manager.get_active_session_mut();
+                let terminal = session.terminal.lock();
+                let renderer = if let Some(index) = pane_index {
+                    let Some(renderer) = self.pane_renderers.get_mut(index) else {
+                        return false;
+                    };
+                    renderer
+                } else {
+                    &mut self.renderer
+                };
+                renderer.request_block_context_menu(
+                    &terminal,
+                    record_id,
+                    ctx.cumulative_frame_nr(),
+                );
+                true
+            }
             BlockSelectionKeyAction::Clear => {
                 self.clear_block_selection();
                 true
@@ -3797,6 +3860,68 @@ mod tests {
         assert_eq!(
             ctrl_wheel_zoom_delta(&[ctrl_wheel(1.0), ctrl_wheel(-1.0)]),
             0.0
+        );
+    }
+
+    #[test]
+    fn queued_block_menu_withholds_same_batch_terminal_events() {
+        let events = vec![
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("must not run".into()),
+            egui::Event::Paste("must not paste".into()),
+            egui::Event::Ime(egui::ImeEvent::Commit("must not commit".into())),
+            egui::Event::Copy,
+            egui::Event::Cut,
+            egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+        ];
+        let mut ordinary = events.clone();
+        claim_pending_block_menu_events(&mut ordinary, false);
+        assert_eq!(ordinary, events);
+        let mut pending = events;
+        claim_pending_block_menu_events(&mut pending, true);
+        assert_eq!(
+            pending,
+            vec![egui::Event::PointerMoved(egui::pos2(10.0, 10.0))]
+        );
+    }
+
+    #[test]
+    fn selected_block_menu_key_is_contextual_and_exact() {
+        let key = |modifiers, pressed| egui::Event::Key {
+            key: egui::Key::F10,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        assert_eq!(
+            block_selection_key_action(&key(egui::Modifiers::SHIFT, true), true),
+            Some(BlockSelectionKeyAction::ContextMenu)
+        );
+        assert_eq!(
+            block_selection_key_action(&key(egui::Modifiers::SHIFT, true), false),
+            None
+        );
+        assert_eq!(
+            block_selection_key_action(&key(egui::Modifiers::SHIFT, false), true),
+            None
+        );
+        assert_eq!(
+            block_selection_key_action(&key(egui::Modifiers::NONE, true), true),
+            None
+        );
+        assert_eq!(
+            block_selection_key_action(
+                &key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, true),
+                true
+            ),
+            None
         );
     }
 

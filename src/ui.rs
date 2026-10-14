@@ -802,9 +802,11 @@ pub enum ProjectedScrollRequest {
 }
 
 /// Layout-owned space before terminal column zero while Block Mode is on.
-/// The outcome stripe and card border live here and cannot cover glyphs.
-const BLOCK_GUTTER_WIDTH: f32 = 34.0;
-const BLOCK_ACTION_WIDTH: f32 = 24.0;
+/// Only the stripe/selection band belongs here. Completed cards put their
+/// controls in metadata headers; raw/shared-row cards use the selected-block
+/// toolbar and context menu instead of reserving an empty action column.
+/// Keep this independent of viewport contents so scrolling never resizes a PTY.
+const BLOCK_GUTTER_WIDTH: f32 = crate::block_mode::GUTTER_CLICK_BAND_PX;
 
 /// Card controls own keyboard input while focused or while their menu is open.
 /// The remembered IDs are checked against current egui state, so switching panes
@@ -928,23 +930,6 @@ fn block_badge_display_text(text: &str) -> String {
     text.to_owned()
 }
 
-fn block_action_rect(
-    content: egui::Rect,
-    card: egui::Rect,
-    pane: egui::Rect,
-    line_height: f32,
-) -> Option<egui::Rect> {
-    if !line_height.is_finite() || line_height <= 0.0 {
-        return None;
-    }
-    let height = line_height.min(card.height()).min(BLOCK_ACTION_WIDTH);
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(content.left() - BLOCK_GUTTER_WIDTH, card.top()),
-        egui::vec2(BLOCK_ACTION_WIDTH, height),
-    );
-    (height >= 8.0 && rect.left() >= pane.left() && rect.right() <= content.left() - 8.0)
-        .then_some(rect)
-}
 /// Right-side controls live exclusively inside a synthetic metadata row.
 fn block_metadata_cwd(cwd: Option<&str>) -> String {
     format!(
@@ -1351,6 +1336,9 @@ pub struct TerminalRenderer {
     context_block_id: Option<String>,
     context_block_terminal: Option<usize>,
     context_action_popup: Option<egui::Id>,
+    requested_block_context_menu: Option<(u64, usize, String)>,
+    keyboard_context_menu: bool,
+    focus_keyboard_context_menu: bool,
     /// Press-time whole-card ownership. Gesture, modifiers and stable target
     /// never get recomputed from the release position.
     block_primary_press: Option<BlockPrimaryPress>,
@@ -1495,6 +1483,9 @@ impl TerminalRenderer {
             context_block_id: None,
             context_block_terminal: None,
             context_action_popup: None,
+            requested_block_context_menu: None,
+            keyboard_context_menu: false,
+            focus_keyboard_context_menu: false,
             block_primary_press: None,
             summary_primary_press: None,
             projected_scroll_request: None,
@@ -1600,6 +1591,24 @@ impl TerminalRenderer {
     /// Return focus from block chrome to the next active terminal frame.
     pub fn request_keyboard_focus(&mut self) {
         self.requested_initial_focus = false;
+    }
+
+    /// Queue a single selected-block keyboard menu for this exact terminal.
+    /// Rendering revalidates both the selected record and terminal identity.
+    pub fn request_block_context_menu(
+        &mut self,
+        terminal: &TerminalState,
+        record_id: String,
+        frame: u64,
+    ) {
+        self.requested_block_context_menu =
+            Some((frame, terminal as *const TerminalState as usize, record_id));
+    }
+
+    pub fn block_context_menu_requested(&self, frame: u64) -> bool {
+        self.requested_block_context_menu
+            .as_ref()
+            .is_some_and(|(requested, _, _)| *requested == frame)
     }
 
     /// Mirror app-level block selection without cloning up to 1024 record ids
@@ -2730,7 +2739,7 @@ impl TerminalRenderer {
         } else {
             0
         };
-        let header = if entry.metadata_row == Some(row) {
+        let header = if pos.x < content_rect.left() || entry.metadata_row == Some(row) {
             true
         } else if entry.projected_geometry {
             projected_header_contains(entry.projected_header_range, DisplayPoint::new(row, col))
@@ -3011,7 +3020,7 @@ impl TerminalRenderer {
         terminal: &TerminalState,
         entries: &[BlockChromeEntry],
         content_rect: egui::Rect,
-        pane_rect: egui::Rect,
+        _pane_rect: egui::Rect,
         line_height: f32,
         rows: usize,
         interaction_enabled: bool,
@@ -3032,7 +3041,7 @@ impl TerminalRenderer {
             .iter()
             .filter(|entry| !entry.live && entry.outcome != crate::block_mode::BlockOutcome::Prompt)
         {
-            let Some(geometry) = self.card_geometry(entry, content_rect, line_height, rows) else {
+            let Some(_) = self.card_geometry(entry, content_rect, line_height, rows) else {
                 continue;
             };
             let header_actions = entry
@@ -3091,13 +3100,11 @@ impl TerminalRenderer {
                 }
                 response.on_hover_text(crate::block_mode::output_collapse_menu_label(collapsed));
             }
-            let Some(rect) = header_actions.map(|(overflow, _)| overflow).or_else(|| {
-                entry
-                    .metadata_row
-                    .is_none()
-                    .then(|| block_action_rect(content_rect, geometry.rect, pane_rect, line_height))
-                    .flatten()
-            }) else {
+            // No metadata row means there is no safe cell-free per-card
+            // button target. Selecting the stripe/header exposes Actions in
+            // the workspace toolbar; right-click and keyboard selection remain
+            // available even for shared rows and clipped history cards.
+            let Some((rect, _)) = header_actions else {
                 continue;
             };
             let id = ui.id().with((
@@ -3291,6 +3298,13 @@ impl TerminalRenderer {
         } else {
             egui::Popup::context_menu(response)
         };
+        let popup = if !from_action_button && self.keyboard_context_menu {
+            popup.at_position(
+                self.last_content_rect.unwrap_or(response.rect).left_top() + egui::vec2(8.0, 8.0),
+            )
+        } else {
+            popup
+        };
         let popup = popup.style(crate::theme::configure_popup_style);
         let popup_id = popup.get_id();
         let shown = popup.show(|ui| {
@@ -3334,12 +3348,11 @@ impl TerminalRenderer {
                         ui.label(egui::RichText::new(cwd).small().weak());
                     }
                     ui.separator();
-                    if block_menu_button(
-                        ui,
-                        "Review selected blocks",
-                        true,
-                        "Inspect commands, output and provenance",
-                    ) {
+                    let review = ui.button("Review selected blocks");
+                    if std::mem::take(&mut self.focus_keyboard_context_menu) {
+                        review.request_focus();
+                    }
+                    if review.clicked() {
                         chosen = Some(crate::block_mode::BlockMenuAction::Review);
                         ui.close();
                     }
@@ -4430,6 +4443,28 @@ impl TerminalRenderer {
             )
             .map(|(entry, header)| (entry.id.clone(), header))
         });
+        if interaction_enabled
+            && ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pos| {
+                    pos.x >= content_rect.left() - BLOCK_GUTTER_WIDTH
+                        && pos.x < content_rect.left()
+                        && block_chrome.as_deref().is_some_and(|entries| {
+                            self.finished_block_at_position(
+                                entries,
+                                pos,
+                                content_rect,
+                                line_height,
+                                rows,
+                            )
+                            .is_some()
+                        })
+                })
+        {
+            response.clone().on_hover_text(
+                "Select block to show Actions above · Right-click for menu · Ctrl+↑ selects the previous block · Shift+F10 opens its full menu",
+            );
+        }
         let summary_hit = click_pos.and_then(|pos| {
             Self::summary_at_position(&summaries, pos, content_rect, line_height, rows)
         });
@@ -4516,9 +4551,38 @@ impl TerminalRenderer {
                     )
             });
 
+        if let Some((requested_frame, target_terminal, record_id)) =
+            self.requested_block_context_menu.take()
+        {
+            if interaction_enabled
+                && focus_enabled
+                && self.block_mode
+                && requested_frame == ctx.cumulative_frame_nr()
+                && target_terminal == rendered_terminal
+                && !terminal.is_alt_buffer_active()
+                && self.active_block_id.as_deref() == Some(record_id.as_str())
+                && terminal
+                    .command_record(&record_id)
+                    .is_some_and(|record| record.complete)
+            {
+                if let Some(previous) = self.context_action_popup.take() {
+                    egui::Popup::close_id(ctx, previous);
+                }
+                self.context_block_id = Some(record_id);
+                self.context_block_terminal = Some(rendered_terminal);
+                self.keyboard_context_menu = true;
+                self.focus_keyboard_context_menu = true;
+                egui::Popup::open_id(ctx, egui::Popup::default_response_id(&response));
+            }
+        }
         let secondary_pressed = interaction_enabled
             && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary));
         if secondary_pressed {
+            if let Some(previous) = self.context_action_popup.take() {
+                egui::Popup::close_id(ctx, previous);
+            }
+            self.keyboard_context_menu = false;
+            self.focus_keyboard_context_menu = false;
             self.context_block_id = context_target_after_pointer_frame(
                 self.context_block_id.take(),
                 true,
@@ -8185,26 +8249,6 @@ mod tests {
     }
 
     #[test]
-    fn action_lane_never_overlaps_cells_stripes_or_neighboring_cards() {
-        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
-        let content = egui::Rect::from_min_max(egui::pos2(36.0, 2.0), egui::pos2(388.0, 198.0));
-        for height in [1.0, 8.0, 15.0, 16.0, 20.0, 40.0, 120.0] {
-            let card = egui::Rect::from_min_size(content.min, egui::vec2(content.width(), height));
-            if let Some(action) = block_action_rect(content, card, pane, 20.0) {
-                assert!(action.left() >= pane.left());
-                assert!(action.right() <= content.left() - crate::block_mode::GUTTER_CLICK_BAND_PX);
-                assert!(action.top() >= card.top() && action.bottom() <= card.bottom());
-                assert!(!action.intersects(content));
-            } else {
-                assert!(height < 8.0);
-            }
-        }
-        let clipped = egui::Rect::from_min_max(egui::pos2(10.0, 2.0), content.max);
-        assert!(block_action_rect(clipped, clipped, pane, 20.0).is_none());
-        assert!(block_action_rect(content, content, pane, f32::NAN).is_none());
-    }
-
-    #[test]
     fn block_action_control_exposes_one_accessible_click_and_owns_focus() {
         use std::cell::Cell;
         let ctx = egui::Context::default();
@@ -8376,23 +8420,309 @@ mod tests {
 
         renderer.block_mode = true;
         let (with_content, _) = renderer.layout_rects(pane);
-        assert_eq!(renderer.grid_dimensions(available), (6, 5));
+        assert_eq!(renderer.grid_dimensions(available), (10, 5));
         assert_eq!(with_content.left(), 2.0 + BLOCK_GUTTER_WIDTH);
-        assert_eq!(with_content.width(), 54.0);
+        assert_eq!(with_content.width(), 80.0);
 
         // Compact is paint density only: toggling it cannot resize the PTY.
         renderer.block_compact = true;
-        assert_eq!(renderer.grid_dimensions(available), (6, 5));
+        assert_eq!(renderer.grid_dimensions(available), (10, 5));
         assert_eq!(renderer.layout_rects(pane).0, with_content);
 
         // Disabling Block Mode removes the layout-owned gutter and recovers
-        // the layout-owned action lane. Mouse/cursor/Kitty all consume this
+        // the layout-owned stripe band. Mouse/cursor/Kitty all consume this
         // same content rect, so there is no independent coordinate offset.
         renderer.block_mode = false;
         let (without_content, _) = renderer.layout_rects(pane);
         assert_eq!(renderer.grid_dimensions(available), (11, 5));
         assert_eq!(without_content.left(), 2.0);
         assert_eq!(without_content.right(), with_content.right());
+    }
+
+    #[test]
+    fn compact_gutter_keeps_pty_cursor_and_pointer_aligned_across_pane_widths() {
+        let mut renderer = TerminalRenderer::new(
+            14.0,
+            2.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        renderer.line_height = 20.0;
+        // Sidebar open/closed and split-pane offsets must only affect the
+        // available rectangle, never introduce a second text-origin offset.
+        for char_width in [7.0, 8.5, 14.0] {
+            renderer.char_width = char_width;
+            for width in [80.0, 180.0, 360.0, 1000.0, 1390.0] {
+                for left in [0.0, 240.0, 700.0] {
+                    for (block, chat) in [(false, false), (true, false), (true, true)] {
+                        renderer.block_mode = block;
+                        renderer.chat_mode = chat;
+                        let pane = egui::Rect::from_min_size(
+                            egui::pos2(left, 80.0),
+                            egui::vec2(width, 400.0),
+                        );
+                        let (content, _) = renderer.layout_rects(pane);
+                        let (cols, rows) = renderer.grid_dimensions(pane.size());
+                        assert_eq!(cols, (content.width() / char_width).floor() as usize);
+                        assert_eq!(content.left() - pane.left(), if block { 10.0 } else { 2.0 });
+                        assert_eq!(pane.right() - content.right(), 12.0);
+                        let mut terminal = TerminalState::new(cols, rows);
+                        terminal.on_resize(cols, rows);
+                        assert_eq!(terminal.grid.row_len(), cols);
+                        for col in [0, cols / 2, cols - 1] {
+                            let cell = cursor_rect(content, 0, col, char_width, 20.0);
+                            assert_eq!(
+                                grid_position_from_content(
+                                    cell.center(),
+                                    content,
+                                    char_width,
+                                    20.0,
+                                    cols,
+                                    rows,
+                                ),
+                                (0, col)
+                            );
+                            assert!(cell.left() >= content.left() - 0.5);
+                            assert!(cell.right() <= content.right() + 0.5);
+                        }
+                        let before = renderer.layout_rects(pane);
+                        renderer.block_compact = !renderer.block_compact;
+                        assert_eq!(renderer.layout_rects(pane), before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_cards_keep_stripe_selection_and_context_menu_in_block_and_chat() {
+        for chat in [false, true] {
+            let ctx = egui::Context::default();
+            let mut renderer = TerminalRenderer::new(
+                14.0,
+                2.0,
+                1.0,
+                crate::config::ScrollbarVisibility::Auto,
+                crate::theme::Theme::default(),
+            );
+            renderer.chat_mode = chat;
+            renderer.gpu_rendering = false;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 240.0));
+            let mut terminal = TerminalState::new(40, 12);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=done\x07echo hi\r\n\x1b]133;C;jsh_id=done;cmdline_url=echo%20hi\x07hi\r\n\x1b]133;D;0;jsh_id=done\x07\r\n\x1b]133;A\x07$ ");
+            let record_id = terminal
+                .command_records()
+                .iter()
+                .find(|record| record.complete)
+                .unwrap()
+                .id
+                .clone();
+            let mut stripe = None;
+            for (button, pressed) in [
+                (None, false),
+                (Some(egui::PointerButton::Primary), true),
+                (Some(egui::PointerButton::Primary), false),
+                (Some(egui::PointerButton::Secondary), true),
+                (Some(egui::PointerButton::Secondary), false),
+            ] {
+                let events = button.map_or_else(Vec::new, |button| {
+                    vec![
+                        egui::Event::PointerMoved(stripe.unwrap()),
+                        egui::Event::PointerButton {
+                            pos: stripe.unwrap(),
+                            button,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                });
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let policy = crate::terminal::ProjectionPolicy::default();
+                        let viewport = terminal.projected_viewport_with_state(
+                            HistoryProjection::identity(),
+                            true,
+                            &policy,
+                            &mut crate::terminal::ProjectionViewState::default(),
+                        );
+                        let entries = renderer
+                            .block_chrome_snapshot(&terminal, &viewport, terminal.grid.rows())
+                            .unwrap();
+                        let entry = entries.iter().find(|entry| entry.id == record_id).unwrap();
+                        assert!(
+                            entry.metadata_row.is_none(),
+                            "fixture must exercise the raw fallback"
+                        );
+                        renderer.set_projection_frame(&terminal, viewport, &policy);
+                        renderer.render(
+                            ui,
+                            &mut terminal,
+                            true,
+                            true,
+                            &crate::search::SearchState::default(),
+                            &[],
+                            &None,
+                        );
+                        let content = renderer.last_content_rect.unwrap();
+                        stripe = Some(egui::pos2(
+                            content.left() - 4.0,
+                            content.top() + renderer.line_height * 1.5,
+                        ));
+                    },
+                );
+                output.textures_delta.clear();
+                if button.is_some() && pressed {
+                    assert!(
+                        matches!(&renderer.block_click, Some(crate::block_mode::BlockClick::Select { record_id: id, .. }) if id == &record_id)
+                    );
+                }
+                if button == Some(egui::PointerButton::Secondary) && !pressed {
+                    assert!(egui::Popup::is_any_open(&ctx));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_fallback_keyboard_menu_uses_full_context_menu_and_revalidates_target() {
+        for chat in [false, true] {
+            for (selected, enabled, focused, expired) in [
+                (false, true, true, false),
+                (true, true, true, false),
+                (true, false, true, false),
+                (true, true, false, false),
+                (true, true, true, true),
+            ] {
+                let opens = selected && enabled && focused && !expired;
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let mut renderer = TerminalRenderer::new(
+                    14.0,
+                    2.0,
+                    1.0,
+                    crate::config::ScrollbarVisibility::Auto,
+                    crate::theme::Theme::default(),
+                );
+                renderer.chat_mode = chat;
+                renderer.gpu_rendering = false;
+                let mut terminal = TerminalState::new(60, 20);
+                terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B;jsh_id=done\x07echo hi\r\n\x1b]133;C;jsh_id=done;cmdline_url=echo%20hi\x07hi\r\n\x1b]133;D;0;jsh_id=done\x07\r\n\x1b]133;A\x07$ ");
+                let id = terminal
+                    .command_records()
+                    .iter()
+                    .find(|record| record.complete)
+                    .unwrap()
+                    .id
+                    .clone();
+                if selected {
+                    renderer.set_block_selection(Some(&crate::block_mode::BlockSelection::single(
+                        "test".into(),
+                        id.clone(),
+                    )));
+                }
+                // A dismissed metadata-header menu must not retire the new
+                // raw keyboard menu during the action-rail cleanup pass.
+                renderer.context_action_popup = Some(egui::Id::new("dismissed-header-menu"));
+                renderer.request_block_context_menu(
+                    &terminal,
+                    id,
+                    if expired {
+                        u64::MAX
+                    } else {
+                        ctx.cumulative_frame_nr()
+                    },
+                );
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 1200.0));
+                for pass in 0..3 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events: if opens && pass == 2 {
+                                vec![egui::Event::Key {
+                                    key: egui::Key::Enter,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: egui::Modifiers::NONE,
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let policy = crate::terminal::ProjectionPolicy::default();
+                            let viewport = terminal.projected_viewport_with_state(
+                                HistoryProjection::identity(),
+                                true,
+                                &policy,
+                                &mut crate::terminal::ProjectionViewState::default(),
+                            );
+                            renderer.set_projection_frame(&terminal, viewport, &policy);
+                            renderer.render_in_rect(
+                                ui,
+                                &mut terminal,
+                                enabled,
+                                focused,
+                                true,
+                                &crate::search::SearchState::default(),
+                                &[],
+                                &None,
+                                screen,
+                            );
+                        },
+                    );
+                    output.textures_delta.clear();
+                    assert!(
+                        !renderer.block_context_menu_requested(ctx.cumulative_frame_nr()),
+                        "request consumed once"
+                    );
+                    assert_eq!(egui::Popup::is_any_open(&ctx), opens && pass < 2);
+                    if opens && pass == 2 {
+                        assert!(
+                            matches!(
+                                &renderer.block_menu_action,
+                                Some(crate::block_mode::BlockMenuRequest {
+                                    action: crate::block_mode::BlockMenuAction::Review,
+                                    ..
+                                })
+                            ),
+                            "Enter activates the focused real menu item"
+                        );
+                    }
+                    if opens && pass < 2 {
+                        assert!(
+                            block_action_has_focus(&ctx),
+                            "open keyboard menu must own keyboard input"
+                        );
+                        let labels: Vec<_> = output
+                            .platform_output
+                            .accesskit_update
+                            .as_ref()
+                            .unwrap()
+                            .nodes
+                            .iter()
+                            .filter_map(|(_, node)| node.label())
+                            .collect();
+                        assert!(
+                            labels.contains(&"Run Again"),
+                            "full replay menu available on pass {pass}: {labels:?}"
+                        );
+                        assert!(
+                            labels.iter().any(|label| label.starts_with("Advanced")),
+                            "same advanced agent/JSON submenu is retained: {labels:?}"
+                        );
+                    }
+                    output.textures_delta.clear();
+                }
+            }
+        }
     }
 
     #[test]
@@ -8818,6 +9148,42 @@ mod tests {
             hovered,
             duration_ms: None,
             finished_at: None,
+        }
+    }
+
+    #[test]
+    fn compact_stripe_selects_clipped_and_shared_row_fallback_without_claiming_text() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            2.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        let content = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(350.0, 200.0));
+        for projected in [false, true] {
+            for clipped in [false, true] {
+                let mut entry = chrome_entry(crate::block_mode::BlockOutcome::Success, false);
+                entry.projected_geometry = projected;
+                entry.span.starts_in_viewport = !clipped;
+                entry.span.last_row = 5;
+                // No visible command-header cells: shared-row output and
+                // scrolled-off headers still have a local stripe target.
+                let entries = [entry];
+                let (_, stripe) = renderer
+                    .finished_block_at_position(&entries, egui::pos2(6.0, 50.0), content, 20.0, 10)
+                    .unwrap();
+                assert!(stripe);
+                assert!(block_press_gesture(egui::Modifiers::NONE, stripe).is_some());
+                let (_, body) = renderer
+                    .finished_block_at_position(&entries, egui::pos2(30.0, 50.0), content, 20.0, 10)
+                    .unwrap();
+                assert!(!body);
+                assert!(block_press_gesture(egui::Modifiers::NONE, body).is_none());
+                assert!(renderer
+                    .finished_block_at_position(&entries, egui::pos2(1.0, 50.0), content, 20.0, 10,)
+                    .is_none());
+            }
         }
     }
 
