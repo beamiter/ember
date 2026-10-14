@@ -502,6 +502,45 @@ mod tests {
     }
 
     #[test]
+    fn chat_controls_preserve_pending_ime_until_commit_or_cancel() {
+        let renderer = renderer();
+        let ctx = egui::Context::default();
+        let mut terminal = TerminalState::new(80, 24);
+        prompt(&mut terminal);
+        let sequence = terminal.command_records().back().unwrap().sequence;
+        for action in [
+            ChatInputAction::Submit { sequence },
+            ChatInputAction::Interrupt { sequence },
+        ] {
+            if matches!(action, ChatInputAction::Interrupt { .. }) {
+                terminal.process_input(b"\r\n\x1b]133;C\x07");
+            }
+            let expected = renderer.chat_action_bytes(&ctx, &terminal, action);
+            assert_eq!(expected.len(), 1);
+            // A candidate may start after the control was rendered/pressed.
+            // is_current is also checked by the final Session writer, so this
+            // rejects stale activations without changing the native IME state.
+            terminal.ime_enabled = true;
+            terminal.set_preedit("nihao".into(), 5);
+            assert!(!action.is_current(&terminal));
+            assert!(renderer
+                .chat_action_bytes(&ctx, &terminal, action)
+                .is_empty());
+            assert_eq!(terminal.preedit_text, "nihao");
+            assert!(terminal.ime_enabled);
+            terminal.clear_preedit();
+            assert_eq!(
+                renderer.chat_action_bytes(&ctx, &terminal, action),
+                expected
+            );
+            assert!(
+                terminal.ime_enabled,
+                "enabled IME without preedit is allowed"
+            );
+        }
+    }
+
+    #[test]
     fn chat_interrupt_matches_native_ctrl_c_and_disables_multibyte_clicks() {
         for flags in [0, 1, 8, 9] {
             for modify_other_keys in [0, 1, 2] {

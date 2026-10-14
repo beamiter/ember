@@ -427,6 +427,12 @@ impl super::TerminalState {
 
 impl ChatInputAction {
     pub fn is_current(self, terminal: &super::TerminalState) -> bool {
+        // Optional controls bypass native IME key filtering. Never submit the
+        // committed prefix or interrupt its process while a candidate is still
+        // pending. This guard also runs at the final Session writer boundary.
+        if !terminal.preedit_text.is_empty() {
+            return false;
+        }
         let Some(record) = terminal.command_records.back() else {
             return false;
         };
