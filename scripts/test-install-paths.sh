@@ -581,3 +581,6 @@ assert_contains "symlinked DESTDIR uninstall diagnostic" \
     || fail "symlinked DESTDIR uninstall removed an outside binary"
 
 printf 'install/uninstall path contract: ok\n'
+
+# Exercise the shared repeat-install and recoverable configuration policy.
+bash "${SCRIPT_DIR}/test-install-upgrade.sh"

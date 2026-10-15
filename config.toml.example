@@ -1,0 +1,10 @@
+# ember configuration
+# Omitted values use the defaults of the installed binary, so upgrades pick
+# up the current defaults without duplicating them in this template.
+# The installer backs up your previous config.toml before replacing it.
+# Restore selected custom settings from config.toml.backup.* as needed.
+# Use scripts/install.sh --no-config to upgrade without resetting settings.
+# Example customizations:
+# font_size = 14.0
+# ascii_organism_enabled = true
+# terminal_mode = "block"

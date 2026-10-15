@@ -7,6 +7,11 @@ umask 077
 APP_ID="io.github.beamiter.ember"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=install-config.sh
+# The helper is checked separately by the installer regression suite.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-config.sh"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 DESTDIR_ACTIVE=0
@@ -18,6 +23,7 @@ BIN_DIR=""
 DATA_HOME=""
 PREBUILT_BINARY=""
 PREBUILT_FD=""
+INSTALL_CONFIG=1
 INSTALL_DESKTOP=1
 DRY_RUN=0
 INSTALL_TEMP=""
@@ -31,9 +37,13 @@ Options:
   --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
   --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
   --binary PATH          Install a prebuilt ember binary instead of building
+  --no-config            Keep the existing config unchanged
   --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
   -h, --help             Show this help
+
+By default, replace config.toml with bundled defaults after saving a private
+config.toml.backup.* copy. Use --no-config to keep your current settings.
 
 Environment:
   DESTDIR                Optional staging root for packaging
@@ -440,6 +450,10 @@ while (($# > 0)); do
             [[ -n "${PREBUILT_BINARY}" ]] || die "--binary must not be empty"
             shift
             ;;
+        --no-config)
+            INSTALL_CONFIG=0
+            shift
+            ;;
         --no-desktop)
             INSTALL_DESKTOP=0
             shift
@@ -481,6 +495,15 @@ if ((DESTDIR_ACTIVE == 1)); then
     fi
 fi
 
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
+CONFIG_DIR="${CONFIG_HOME}/ember"
+STAGED_CONFIG_DIR="${DESTDIR}${CONFIG_DIR}"
+if ((INSTALL_CONFIG == 1)); then
+    validate_absolute_path "XDG_CONFIG_HOME" "${CONFIG_HOME}"
+    validate_staging_target "${STAGED_CONFIG_DIR}"
+    require_source_file "${REPO_ROOT}/config.toml.example"
+fi
+
 validate_staging_target "${DESTDIR}${BIN_DIR}"
 validate_staging_target "${DESTDIR}${DATA_HOME}"
 if ((INSTALL_DESKTOP == 1)); then
@@ -505,6 +528,12 @@ fi
 
 # Fail before building or modifying a target if the transactional install
 # primitives needed later are unavailable.
+if ((INSTALL_CONFIG == 1)); then
+    for command in cp cmp stat chmod ln; do
+        require_command "${command}"
+    done
+fi
+
 require_command install
 require_command mktemp
 require_command mv
@@ -562,6 +591,12 @@ if ((INSTALL_DESKTOP == 1)); then
             "${SHARE_DIR}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
     done
     refresh_desktop_caches
+fi
+
+if ((INSTALL_CONFIG == 1)); then
+    run install -d -m 0700 "${STAGED_CONFIG_DIR}"
+    install_config_with_backup "${REPO_ROOT}/config.toml.example" \
+        "${STAGED_CONFIG_DIR}/config.toml" "${CONFIG_DIR}/config.toml"
 fi
 
 printf 'Installed ember to %s\n' "${BIN_DIR}/ember"
