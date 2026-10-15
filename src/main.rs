@@ -1344,6 +1344,17 @@ fn projected_viewport_for_session(
     renderer.projected_viewport_with_state(&mut terminal, policy, view_state)
 }
 
+fn projected_cursor_visible_for_session(
+    session: &mut Session,
+    renderer: &TerminalRenderer,
+) -> bool {
+    let viewport = projected_viewport_for_session(session, renderer);
+    session
+        .terminal
+        .lock()
+        .is_projected_cursor_visible(&viewport)
+}
+
 fn application_cell_at_pointer(
     pointer: egui::Pos2,
     content_rect: egui::Rect,
@@ -6820,9 +6831,10 @@ impl eframe::App for TerminalApp {
         // 优化逻辑：只有在完全空闲时才闪烁，有活动时保持常显
         let mut cursor_state_changed = false;
         {
-            let terminal = session.terminal.lock();
-            let app_wants_cursor_visible = terminal.is_cursor_visible();
-            drop(terminal);
+            let renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            let app_wants_cursor_visible = projected_cursor_visible_for_session(session, renderer);
 
             if app_wants_cursor_visible {
                 let now = std::time::Instant::now();
@@ -7878,8 +7890,10 @@ impl eframe::App for TerminalApp {
 
         // 检查光标闪烁是否需要进行（在render_ui之前完成）
         let app_wants_cursor_visible = {
-            let terminal = session.terminal.lock();
-            terminal.is_cursor_visible()
+            let renderer = active_pane_renderer_idx
+                .and_then(|index| self.pane_renderers.get(index))
+                .unwrap_or(&self.renderer);
+            projected_cursor_visible_for_session(session, renderer)
         };
 
         // 结束 session 的可变借用，render_ui 需要 &mut self

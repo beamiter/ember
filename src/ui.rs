@@ -5014,7 +5014,11 @@ impl TerminalRenderer {
         );
 
         // Render cursor - direct O(1) positioning instead of full grid scan
-        if cursor_visible && cursor_pos.0 < rows && cursor_pos.1 < cols {
+        if cursor_visible
+            && terminal.is_projected_cursor_visible(&viewport)
+            && cursor_pos.0 < rows
+            && cursor_pos.1 < cols
+        {
             let (crow, ccol) = cursor_pos;
             let cell = &grid[crow][ccol];
             if !cell.flags.wide_continuation() {

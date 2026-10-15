@@ -2409,7 +2409,7 @@ impl TerminalApp {
                     }
                     // O(1) clone Arc,规避 &mut renderer 与 &renderer.cached_links 借用冲突。
                     let links = renderer.cached_links.clone();
-                    let pane_cursor_visible = terminal_guard.is_cursor_visible()
+                    let pane_cursor_visible = terminal_guard.is_projected_cursor_visible(&viewport)
                         && (!pane.focused || self.cursor_visible);
                     let pane_search = if pane.focused {
                         &self.search_state

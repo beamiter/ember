@@ -9192,3 +9192,61 @@ fn shared_session_parity_corpus_uses_native_owner_and_projection() {
         }
     }
 }
+
+#[test]
+fn chat_docked_cursor_visibility_ignores_retained_vte_history_offset() {
+    let mut terminal = TerminalState::new(80, 20);
+    for index in 0..40 {
+        chat_pair(
+            &mut terminal,
+            &format!("echo line{index}"),
+            &format!("line{index}"),
+        );
+    }
+    chat_prompt(&mut terminal, "pending");
+    terminal.scroll(5);
+    assert!(!terminal.is_cursor_visible());
+    let policy = chat_policy();
+    let mut state = ProjectionViewState::new();
+    let view = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(view.chat_composer_rows().is_some());
+    assert!(view.raw_anchor_at(view.cursor()).is_some());
+    assert!(terminal.is_projected_cursor_visible(&view));
+    state.set_offset(70, &view);
+    let history = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(history.scroll_offset() > 0);
+    assert!(terminal.is_projected_cursor_visible(&history));
+    terminal.process_input(b"\x1b[?25l");
+    let hidden = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(!terminal.is_projected_cursor_visible(&hidden));
+}
+
+#[test]
+fn cursor_visibility_keeps_vte_and_undocked_block_history_hidden() {
+    let mut terminal = TerminalState::new(80, 20);
+    for index in 0..40 {
+        chat_pair(
+            &mut terminal,
+            &format!("echo line{index}"),
+            &format!("line{index}"),
+        );
+    }
+    chat_prompt(&mut terminal, "pending");
+    terminal.scroll(5);
+    let identity = terminal.projected_viewport(HistoryProjection::identity(), false);
+    assert!(!terminal.is_projected_cursor_visible(&identity));
+    terminal.scroll_to_bottom();
+    let mut policy = ProjectionPolicy::new();
+    policy.set_block_chrome(true, 0);
+    let mut state = ProjectionViewState::new();
+    let live = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(terminal.is_projected_cursor_visible(&live));
+    state.set_offset(live.max_scroll_offset(), &live);
+    let history = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(history.is_transformed());
+    assert!(history.raw_anchor_at(history.cursor()).is_none());
+    assert!(!terminal.is_projected_cursor_visible(&history));
+    state.scroll_to_bottom();
+    let restored = spaced_view(&mut terminal, &policy, &mut state);
+    assert!(terminal.is_projected_cursor_visible(&restored));
+}

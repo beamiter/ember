@@ -2133,6 +2133,16 @@ impl super::TerminalState {
         self.modes.contains(&25) && self.scroll_offset == 0
     }
 
+    /// The displayed projection owns cursor visibility. A Chat composer can
+    /// remain docked while its history is scrolled, and the legacy offset may
+    /// still describe the VTE view that preceded this transformed document.
+    pub fn is_projected_cursor_visible(&self, viewport: &ProjectedViewport) -> bool {
+        if !viewport.is_transformed() {
+            return self.is_cursor_visible();
+        }
+        self.modes.contains(&25) && viewport.raw_anchor_at(viewport.cursor()).is_some()
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
