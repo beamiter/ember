@@ -9,6 +9,7 @@ pub mod color;
 pub mod command_palette;
 pub mod config;
 pub mod debug;
+mod fold_preview;
 pub mod gpu;
 pub mod keybindings;
 pub mod kitty_graphics;
