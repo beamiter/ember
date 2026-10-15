@@ -1664,7 +1664,26 @@ impl TerminalRenderer {
         // Reserve their actual egui line box plus the footer's inset/padding,
         // including when the GPU atlas has tighter ascent/descent metrics.
         let control_line_height = if self.chat_mode {
-            ctx.fonts_mut(|fonts| fonts.row_height(&FontId::proportional(self.font_size))) + 4.0
+            ctx.fonts_mut(|fonts| {
+                // A laid-out galley is pixel-rounded, unlike row_height. Use
+                // the same labels/font as draw_chat_controls so its fit check
+                // cannot reject a normal footer after rounding (e.g. at 32pt).
+                ["Run", "Interrupt"]
+                    .into_iter()
+                    .map(|label| {
+                        fonts
+                            .layout_no_wrap(
+                                label.into(),
+                                FontId::proportional(self.font_size),
+                                Color32::WHITE,
+                            )
+                            .size()
+                            .y
+                    })
+                    .fold(0.0_f32, f32::max)
+                    .ceil()
+                    + 4.0
+            })
         } else {
             0.0
         };

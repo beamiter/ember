@@ -588,6 +588,11 @@ mod tests {
                 for format_other_keys in [0, 1] {
                     let ctx = egui::Context::default();
                     let mut renderer = renderer();
+                    // Production synchronizes native font metrics before projection.
+                    ctx.run_ui(Default::default(), |ui| {
+                        renderer.sync_font_metrics(ui.ctx())
+                    })
+                    .drop_without_applying_deltas();
                     let mut terminal = TerminalState::new(80, 24);
                     prompt(&mut terminal);
                     terminal.process_input(b"\r\n\x1b]133;C\x07");
@@ -872,67 +877,73 @@ mod tests {
 
     #[test]
     fn default_metrics_keep_run_and_interrupt_visible_and_clickable() {
-        for size in [8.0, 16.0, 32.0, 72.0] {
-            for running in [false, true] {
-                let ctx = egui::Context::default();
-                let mut renderer = renderer();
-                renderer.font_size = size;
-                renderer.line_spacing = crate::config::Config::default().line_spacing;
-                ctx.run_ui(Default::default(), |ui| {
-                    renderer.sync_font_metrics(ui.ctx())
-                })
-                .drop_without_applying_deltas();
-                let screen =
-                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1000.0));
-                let (cols, rows) = renderer.grid_dimensions(screen.size());
-                let mut terminal = TerminalState::new(cols, rows);
-                prompt(&mut terminal);
-                if running {
-                    terminal.process_input(b"\r\n\x1b]133;C\x07running");
-                }
-                let mut policy = ProjectionPolicy::new();
-                policy.set_chat_mode(true);
-                policy.set_block_chrome(true, 0);
-                let view = renderer.projected_viewport_with_state(
-                    &mut terminal,
-                    &policy,
-                    &mut ProjectionViewState::new(),
-                );
-                let content = renderer.layout_rects(screen).0;
-                let mut point = None;
-                for phase in 0..3 {
-                    let events = point.map_or_else(Vec::new, |pos| {
-                        vec![
-                            egui::Event::PointerMoved(pos),
-                            egui::Event::PointerButton {
-                                pos,
-                                button: egui::PointerButton::Primary,
-                                pressed: phase == 1,
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ]
-                    });
-                    let output = ctx.run_ui(
-                        egui::RawInput {
-                            screen_rect: Some(screen),
-                            events,
-                            ..Default::default()
-                        },
-                        |ui| {
-                            crate::theme::configure_workspace_text(ui.style_mut(), size);
-                            renderer.draw_chat_controls(ui, &terminal, &view, content, true);
-                        },
+        for dpi in [1.0, 1.5, 2.0] {
+            for size in [8.0, 16.0, 32.0, 72.0] {
+                for running in [false, true] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(dpi);
+                    let mut renderer = renderer();
+                    renderer.font_size = size;
+                    renderer.line_spacing = crate::config::Config::default().line_spacing;
+                    ctx.run_ui(Default::default(), |ui| {
+                        renderer.sync_font_metrics(ui.ctx())
+                    })
+                    .drop_without_applying_deltas();
+                    let screen =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1000.0));
+                    let (cols, rows) = renderer.grid_dimensions(screen.size());
+                    let mut terminal = TerminalState::new(cols, rows);
+                    prompt(&mut terminal);
+                    if running {
+                        terminal.process_input(b"\r\n\x1b]133;C\x07running");
+                    }
+                    let mut policy = ProjectionPolicy::new();
+                    policy.set_chat_mode(true);
+                    policy.set_block_chrome(true, 0);
+                    let view = renderer.projected_viewport_with_state(
+                        &mut terminal,
+                        &policy,
+                        &mut ProjectionViewState::new(),
                     );
-                    let hits = ctx.interactive_rects_last_pass();
-                    assert_eq!(hits.len(), 1, "size={size}, running={running}");
-                    point = Some(hits[0].center());
-                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == if running { "Interrupt" } else { "Run" })));
-                    output.drop_without_applying_deltas();
+                    let content = renderer.layout_rects(screen).0;
+                    let mut point = None;
+                    for phase in 0..3 {
+                        let events = point.map_or_else(Vec::new, |pos| {
+                            vec![
+                                egui::Event::PointerMoved(pos),
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: phase == 1,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ]
+                        });
+                        let mut output = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                events,
+                                ..Default::default()
+                            },
+                            |ui| {
+                                crate::theme::configure_workspace_text(ui.style_mut(), size);
+                                renderer.draw_chat_controls(ui, &terminal, &view, content, true);
+                            },
+                        );
+                        // Clear before assertions so a failed assertion reports normally
+                        // instead of aborting the whole suite in TexturesDelta::drop.
+                        output.textures_delta.clear();
+                        let hits = ctx.interactive_rects_last_pass();
+                        assert_eq!(hits.len(), 1, "dpi={dpi}, size={size}, running={running}");
+                        point = Some(hits[0].center());
+                        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == if running { "Interrupt" } else { "Run" })));
+                        output.drop_without_applying_deltas();
+                    }
+                    assert!(
+                        renderer.chat_input_action.is_some(),
+                        "dpi={dpi}, size={size}, running={running}"
+                    );
                 }
-                assert!(
-                    renderer.chat_input_action.is_some(),
-                    "size={size}, running={running}"
-                );
             }
         }
     }
@@ -1149,6 +1160,11 @@ mod tests {
         for transition in [0, 1, 2, 3] {
             let ctx = egui::Context::default();
             let mut renderer = renderer();
+            // Production synchronizes native font metrics before projection.
+            ctx.run_ui(Default::default(), |ui| {
+                renderer.sync_font_metrics(ui.ctx())
+            })
+            .drop_without_applying_deltas();
             let mut terminal = TerminalState::new(80, 24);
             prompt(&mut terminal);
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 650.0));
