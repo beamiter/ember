@@ -14,7 +14,6 @@ use crate::agent::{
 use crate::app::state::TerminalApp;
 use crate::review_text::{sanitize_prompt_payload, visible_bounded, VisualSpoofDisposition};
 use eframe::egui;
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,7 +102,6 @@ struct TaskRowSnapshot {
     status: TaskStatus,
     runtime_kind: TaskRuntimeKind,
     branch: String,
-    updated_at_ms: u64,
     has_agent_terminal: bool,
     has_validation_terminal: bool,
     has_active_agent_stream: bool,
@@ -124,26 +122,20 @@ impl TaskRowSnapshot {
             || self.has_active_agent_stream
             || self.native_preparing
     }
-
-    fn group_rank(&self) -> u8 {
-        if self.needs_attention {
-            0
-        } else if self.is_running() {
-            1
-        } else {
-            2
-        }
-    }
 }
 
-fn sort_rows(rows: &mut [TaskRowSnapshot]) {
-    rows.sort_by_key(|row| {
-        (
-            row.group_rank(),
-            Reverse(row.updated_at_ms),
-            row.id.to_string(),
-        )
-    });
+/// The shared projection owns ordering and filtering. Joining by stable ID
+/// preserves frontend action facts without re-sorting the same list twice.
+fn rows_in_dashboard_order(
+    rows: Vec<TaskRowSnapshot>,
+    dashboard: &jterm_core::agent_task::DashboardSnapshot,
+) -> Vec<TaskRowSnapshot> {
+    let mut by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id, row)).collect();
+    dashboard
+        .rows
+        .iter()
+        .filter_map(|row| by_id.remove(&row.id))
+        .collect()
 }
 
 fn render_native_codex_view(
@@ -735,7 +727,7 @@ impl TerminalApp {
     }
 
     pub(crate) fn render_sidebar_tasks(&mut self, ui: &mut egui::Ui) {
-        let mut rows: Vec<_> = self
+        let rows: Vec<_> = self
             .task_manager
             .tasks()
             .iter()
@@ -747,7 +739,6 @@ impl TerminalApp {
                 status: task.status,
                 runtime_kind: task.runtime_kind,
                 branch: visible_bounded(&task.branch, MAX_TASK_BRANCH_DISPLAY_BYTES),
-                updated_at_ms: task.updated_at_ms,
                 has_agent_terminal: task
                     .terminal_session_id
                     .as_deref()
@@ -782,7 +773,6 @@ impl TerminalApp {
                     .map(|detail| visible_bounded(detail, MAX_TASK_DETAIL_DISPLAY_BYTES)),
             })
             .collect();
-        sort_rows(&mut rows);
         let has_tasks = !rows.is_empty();
         ui.add(
             egui::TextEdit::singleline(&mut self.task_sidebar.dashboard_query)
@@ -838,12 +828,7 @@ impl TerminalApp {
             .small()
             .color(ui.visuals().weak_text_color()),
         );
-        let mut by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id, row)).collect();
-        let rows: Vec<_> = dashboard
-            .rows
-            .iter()
-            .filter_map(|row| by_id.remove(&row.id))
-            .collect();
+        let rows = rows_in_dashboard_order(rows, &dashboard);
         if has_tasks && rows.is_empty() {
             ui.label("No tasks match these filters.");
             if ui.button("Clear filters").clicked() {
@@ -1900,47 +1885,90 @@ mod tests {
     }
     use super::*;
 
-    fn row(status: TaskStatus, updated_at_ms: u64, title: &str) -> TaskRowSnapshot {
-        TaskRowSnapshot {
-            id: TaskId::new(),
-            title: title.to_string(),
-            provider: AgentProvider::Codex,
-            status,
-            runtime_kind: TaskRuntimeKind::Unassigned,
-            branch: "ember/task".to_string(),
-            updated_at_ms,
-            has_agent_terminal: true,
-            has_validation_terminal: false,
-            has_active_agent_stream: false,
-            native_preparing: false,
-            terminal_retry_available: false,
-            native_terminal_fallback_available: false,
-            validation_status: TaskValidationStatus::NotRun,
-            validation_attempt: 0,
-            validation_detail: None,
-            needs_attention: status.needs_attention(),
-            status_detail: None,
-        }
-    }
-
     #[test]
-    fn dashboard_orders_attention_then_running_then_finished() {
-        let mut preparing = row(TaskStatus::Created, 30, "preparing");
-        preparing.native_preparing = true;
-        assert!(preparing.is_running());
-        let mut rows = vec![
-            row(TaskStatus::Completed, 50, "done"),
-            preparing,
-            row(TaskStatus::Working, 10, "working"),
-            row(TaskStatus::Failed, 1, "failed-old"),
-            row(TaskStatus::WaitingForHuman, 20, "waiting-new"),
-        ];
-        sort_rows(&mut rows);
-        let titles: Vec<_> = rows.iter().map(|row| row.title.as_str()).collect();
+    fn dashboard_rows_follow_shared_order_and_filter_by_stable_id() {
+        use crate::agent::{NewTask, TaskManager};
+        use jterm_core::agent_task::{
+            DashboardActivity, DashboardFilter, DashboardSnapshot, DashboardView,
+        };
+        let mut manager = TaskManager::new();
+        for title in ["done", "preparing", "working", "failed-old", "waiting-new"] {
+            manager
+                .create(NewTask {
+                    title: title.into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/fixture".into(),
+                    worktree_path: "/fixture/worktree".into(),
+                    branch: "test/dashboard".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                })
+                .unwrap();
+        }
+        let mut tasks = manager.tasks().to_vec();
+        for (task, (status, timestamp)) in tasks.iter_mut().zip([
+            (TaskStatus::Completed, 50),
+            (TaskStatus::Created, 30),
+            (TaskStatus::Working, 10),
+            (TaskStatus::Failed, 1),
+            (TaskStatus::WaitingForHuman, 20),
+        ]) {
+            task.status = status;
+            task.updated_at_ms = timestamp;
+        }
+        let make_rows = || {
+            tasks
+                .iter()
+                .map(|task| TaskRowSnapshot {
+                    id: task.id,
+                    title: task.title.clone(),
+                    provider: task.provider,
+                    status: task.status,
+                    runtime_kind: task.runtime_kind,
+                    branch: task.branch.clone(),
+                    has_agent_terminal: false,
+                    has_validation_terminal: false,
+                    has_active_agent_stream: false,
+                    native_preparing: task.title == "preparing",
+                    terminal_retry_available: false,
+                    native_terminal_fallback_available: false,
+                    validation_status: TaskValidationStatus::NotRun,
+                    validation_attempt: 0,
+                    validation_detail: None,
+                    needs_attention: task.needs_attention(),
+                    status_detail: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let activity = |id| DashboardActivity {
+            native_preparing: id == tasks[1].id,
+            ..Default::default()
+        };
+        let all = DashboardSnapshot::project(&tasks, activity, DashboardFilter::default());
+        let ordered = rows_in_dashboard_order(make_rows(), &all);
         assert_eq!(
-            titles,
-            vec!["waiting-new", "failed-old", "preparing", "working", "done"]
+            ordered
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["waiting-new", "failed-old", "preparing", "working", "done"]
         );
+        let filtered = DashboardSnapshot::project(
+            &tasks,
+            activity,
+            DashboardFilter {
+                view: DashboardView::NeedsAttention,
+                ..Default::default()
+            },
+        );
+        let mut reversed = make_rows();
+        reversed.reverse();
+        let ordered = rows_in_dashboard_order(reversed, &filtered);
+        assert_eq!(
+            ordered.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [tasks[4].id, tasks[3].id]
+        );
+        assert!(rows_in_dashboard_order(Vec::new(), &filtered).is_empty());
     }
 
     #[test]
