@@ -816,7 +816,7 @@ fn block_workspace_control(
 }
 
 /// Only advertise a binding when the keyboard action has the same semantics.
-/// Review/Fill prompt and live navigation deliberately have no guessed aliases.
+/// Review and live navigation deliberately have no guessed aliases.
 fn block_workspace_shortcut(
     action: &BlockWorkspaceAction,
     keybindings: &crate::keybindings::KeyBindings,
@@ -873,6 +873,14 @@ fn block_workspace_menu_item(
     {
         *action = Some(choice);
         ui.close();
+    }
+}
+
+fn review_commands_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Review commands…"
+    } else {
+        "Review command…"
     }
 }
 
@@ -944,8 +952,8 @@ fn block_workspace_selection_menu(
         );
     }
     ui.separator();
-    block_workspace_menu_item(ui, focus, keybindings, action, "Fill prompt", valid && !snapshot.read_only,
-        "Insert selected commands at an empty prompt for review. Nothing is executed. Safe replay checks still apply.",
+    block_workspace_menu_item(ui, focus, keybindings, action, review_commands_menu_label(snapshot.selected_count), valid && !snapshot.read_only,
+        "Review selected commands before inserting. Opening review does not fill the prompt or run anything; insertion requires a separate explicit action.",
         BlockWorkspaceAction::Review);
     block_workspace_menu_item(
         ui,
@@ -7037,5 +7045,22 @@ mod tests {
             block_workspace_shortcut(&action, &bindings),
             Some(bindings.pretty_bindings_for("block:search").join(" / "))
         );
+    }
+    #[test]
+    fn review_menu_label_describes_the_intermediate_review_step() {
+        assert_eq!(review_commands_menu_label(1), "Review command…");
+        assert_eq!(review_commands_menu_label(2), "Review commands…");
+        assert_eq!(review_commands_menu_label(usize::MAX), "Review commands…");
+        let source = include_str!("rendering.rs");
+        let menu = source
+            .split_once("fn block_workspace_selection_menu(")
+            .unwrap()
+            .1
+            .split_once("fn block_workspace_overflow(")
+            .unwrap()
+            .0;
+        assert!(menu.contains("review_commands_menu_label(snapshot.selected_count)"));
+        assert!(menu.contains("insertion requires a separate explicit action"));
+        assert!(menu.contains("BlockWorkspaceAction::Review"));
     }
 }
