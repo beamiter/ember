@@ -767,6 +767,7 @@ struct BlockPrimaryPress {
 
 #[derive(Clone, Debug)]
 struct SummaryRowEntry {
+    preview: String,
     row: usize,
     key: crate::terminal::SyntheticRowKey,
     hidden_rows: usize,
@@ -2229,6 +2230,7 @@ impl TerminalRenderer {
                     return None;
                 }
                 Some(SummaryRowEntry {
+                    preview: record.output_preview.clone(),
                     row,
                     key,
                     hidden_rows: hidden_display_rows,
@@ -2621,7 +2623,14 @@ impl TerminalRenderer {
             painter.with_clip_rect(clip).text(
                 egui::pos2(content_rect.left() + self.char_width, y),
                 egui::Align2::LEFT_CENTER,
-                crate::block_mode::collapsed_summary_text(summary.hidden_rows),
+                {
+                    let mut label = crate::block_mode::collapsed_summary_text(summary.hidden_rows);
+                    if !summary.preview.is_empty() {
+                        label.push_str("  Preview: ");
+                        label.push_str(&summary.preview);
+                    }
+                    label
+                },
                 font.clone(),
                 color,
             );
@@ -6670,6 +6679,7 @@ mod tests {
             policy_revision: 3,
         };
         let current = SummaryRowEntry {
+            preview: String::new(),
             row: 0,
             key,
             hidden_rows: 2,
@@ -6845,6 +6855,54 @@ mod tests {
     /// live grid underflowed — an ordinary hover while a block is collapsed
     /// and the view is scrolled. Release builds discarded the wrapped value;
     /// debug builds panicked.
+    #[test]
+    fn collapsed_preview_follows_the_real_projected_record_and_capture() {
+        let mut terminal = TerminalState::new(80, 16);
+        for (index, result) in ["first result", "second result"].iter().enumerate() {
+            terminal.process_input(format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo {index}\r\n\x1b]133;C\x07progress\r\n\x1b[32m{result}\x1b[0m\r\n\x1b]133;D;0\x07"
+            ).as_bytes());
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        let records: Vec<_> = terminal
+            .command_records()
+            .iter()
+            .filter(|record| record.complete)
+            .map(|record| {
+                (
+                    record.sequence,
+                    record.id.clone(),
+                    record.output_preview.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].2, "first result");
+        assert_eq!(records[1].2, "second result");
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        for (sequence, _, _) in &records {
+            assert!(policy.collapse(*sequence));
+        }
+        let mut view_state = crate::terminal::ProjectionViewState::new();
+        let viewport = terminal.projected_viewport_with_state(
+            HistoryProjection::identity(),
+            true,
+            &policy,
+            &mut view_state,
+        );
+        let summaries = TerminalRenderer::projected_summary_rows(&terminal, &viewport);
+        assert_eq!(summaries.len(), 2);
+        for summary in summaries {
+            let record = records
+                .iter()
+                .find(|record| record.0 == summary.key.zone_id)
+                .unwrap();
+            assert_eq!(summary.record_id, record.1);
+            assert_eq!(summary.preview, record.2);
+            assert!(summary.hidden_rows > 0);
+        }
+    }
+
     #[test]
     fn hovering_a_scrolled_collapsed_projection_does_not_underflow() {
         let mut terminal = TerminalState::new(16, 8);

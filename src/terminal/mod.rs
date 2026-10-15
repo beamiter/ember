@@ -215,6 +215,8 @@ pub struct CommandRecord {
     /// Bounded normalized output captured at D. This survives scrollback
     /// eviction; `truncated`/`total_bytes` describe the original range.
     pub captured_output: Option<ExtractedText>,
+    /// Display-only bounded preview, cached with the finalized capture.
+    pub output_preview: String,
     started_instant: Option<std::time::Instant>,
 }
 

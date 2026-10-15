@@ -17,6 +17,7 @@ mod config_panel;
 mod debug;
 mod debug_panel;
 mod execution_journal;
+mod fold_preview;
 mod font_file;
 mod gpu;
 mod help;

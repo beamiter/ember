@@ -9250,3 +9250,36 @@ fn cursor_visibility_keeps_vte_and_undocked_block_history_hidden() {
     let restored = spaced_view(&mut terminal, &policy, &mut state);
     assert!(terminal.is_projected_cursor_visible(&restored));
 }
+
+#[test]
+fn finalized_preview_cache_is_replaced_and_evicted_with_its_capture() {
+    let mut terminal = TerminalState::new(80, 8);
+    emit_completed_block(&mut terminal, 0);
+    let index = terminal.command_records().len() - 1;
+    for text in ["old line\nlast result", "", "updated"] {
+        terminal.store_captured_command_output(
+            index,
+            ExtractedText {
+                text: text.to_owned(),
+                truncated: false,
+                total_bytes: text.len(),
+            },
+        );
+        assert_eq!(
+            terminal.command_records()[index].output_preview,
+            crate::fold_preview::from_plain(text)
+        );
+    }
+    // Rejecting a replacement larger than the capture budget must also
+    // retire the former preview, never leave stale successful output visible.
+    terminal.store_captured_command_output(
+        index,
+        ExtractedText {
+            text: "x".repeat(MAX_CAPTURED_COMMAND_OUTPUT_BYTES + 1),
+            truncated: false,
+            total_bytes: MAX_CAPTURED_COMMAND_OUTPUT_BYTES + 1,
+        },
+    );
+    assert!(terminal.command_records()[index].captured_output.is_none());
+    assert!(terminal.command_records()[index].output_preview.is_empty());
+}

@@ -2842,6 +2842,7 @@ impl super::TerminalState {
             finished_at: None,
             agent_generation: None,
             captured_output: None,
+            output_preview: String::new(),
             started_instant: None,
         });
         // A new prompt changes display-only card boundaries even before any
@@ -3074,7 +3075,10 @@ impl super::TerminalState {
         let previous_bytes = self
             .command_records
             .get_mut(index)
-            .and_then(|record| record.captured_output.take())
+            .and_then(|record| {
+                record.output_preview.clear();
+                record.captured_output.take()
+            })
             .map(|previous| previous.text.len())
             .unwrap_or(0);
         self.captured_command_output_bytes = self
@@ -3098,6 +3102,7 @@ impl super::TerminalState {
             else {
                 break;
             };
+            self.command_records[evict_index].output_preview.clear();
             if let Some(evicted) = self.command_records[evict_index].captured_output.take() {
                 self.captured_command_output_bytes = self
                     .captured_command_output_bytes
@@ -3110,6 +3115,7 @@ impl super::TerminalState {
                 .captured_command_output_bytes
                 .saturating_add(output_bytes);
             if let Some(record) = self.command_records.get_mut(index) {
+                record.output_preview = crate::fold_preview::from_plain(&output.text);
                 record.captured_output = Some(output);
             }
         }
@@ -3731,7 +3737,10 @@ impl super::TerminalState {
             if self.captured_command_output_bytes <= MAX_CAPTURED_COMMAND_OUTPUT_BYTES {
                 break;
             }
-            if let Some(output) = record.captured_output.take() {
+            if let Some(output) = {
+                record.output_preview.clear();
+                record.captured_output.take()
+            } {
                 self.captured_command_output_bytes = self
                     .captured_command_output_bytes
                     .saturating_sub(output.text.len());
