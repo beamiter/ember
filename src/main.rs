@@ -5421,7 +5421,11 @@ impl TerminalApp {
         let ctx = &ctx_owned;
         // Apply every frame, including startup, hot reload and shortcut zoom.
         // Update the already-created root as well as future floating surfaces.
-        ctx.style_mut(|style| theme::configure_workspace_text(style, self.config.font_size));
+        for visual_theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(visual_theme, |style| {
+                theme::configure_workspace_text(style, self.config.font_size)
+            });
+        }
         theme::configure_workspace_text(root_ui.style_mut(), self.config.font_size);
 
         // Bars register their pane-promotion targets before CentralPanel runs.
