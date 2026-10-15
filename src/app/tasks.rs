@@ -5,6 +5,34 @@
 //! egui closure, so a concurrent PTY exit or tab removal cannot redirect an
 //! action to an unrelated index.
 
+/// A display-only reason, selected from authoritative task/validation details.
+pub(crate) fn task_reason(
+    status: jterm_core::agent_task::TaskStatus,
+    validation: jterm_core::agent_task::TaskValidationStatus,
+    status_detail: Option<&str>,
+    validation_detail: Option<&str>,
+) -> Option<String> {
+    use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
+    let nonempty = |text: &&str| !text.trim().is_empty();
+    let validation_reason = matches!(
+        validation,
+        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
+    )
+    .then_some(validation_detail)
+    .flatten()
+    .filter(nonempty);
+    let task_reason = matches!(
+        status,
+        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
+    )
+    .then_some(status_detail)
+    .flatten()
+    .filter(nonempty);
+    validation_reason
+        .or(task_reason)
+        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
+}
+
 use crate::agent::{
     AgentProvider, AgentSessionOutcome, ApprovalDecision, ApprovalId, CodexAppServerApprovalKind,
     CodexAppServerPhase, CodexAppServerTurnHistory, CodexAppServerViewSnapshot, NativePromptPolicy,
@@ -774,24 +802,7 @@ impl TerminalApp {
             })
             .collect();
         let has_tasks = !rows.is_empty();
-        ui.add(
-            egui::TextEdit::singleline(&mut self.task_sidebar.dashboard_query)
-                .hint_text("Search tasks, providers or repositories")
-                .char_limit(256),
-        );
-        ui.horizontal_wrapped(|ui| {
-            use jterm_core::agent_task::DashboardView;
-            for (view, label) in [
-                (DashboardView::All, "All"),
-                (DashboardView::NeedsAttention, "Needs you"),
-                (DashboardView::Running, "Running"),
-                (DashboardView::NotStarted, "Not started"),
-                (DashboardView::Review, "Review"),
-                (DashboardView::Finished, "Finished"),
-            ] {
-                ui.selectable_value(&mut self.task_sidebar.dashboard_view, view, label);
-            }
-        });
+        let open_result = dashboard_search(ui, &mut self.task_sidebar.dashboard_query);
         let activity: HashMap<_, _> = rows
             .iter()
             .map(|row| {
@@ -806,21 +817,51 @@ impl TerminalApp {
                 )
             })
             .collect();
-        let dashboard = jterm_core::agent_task::DashboardSnapshot::project(
-            self.task_manager
-                .tasks()
-                .iter()
-                .filter(|task| task.status != TaskStatus::Archived),
-            |id| activity.get(&id).copied().unwrap_or_default(),
-            jterm_core::agent_task::DashboardFilter {
-                text: &self.task_sidebar.dashboard_query,
-                view: self.task_sidebar.dashboard_view,
-                ..Default::default()
-            },
-        );
+        let project_dashboard = |view| {
+            jterm_core::agent_task::DashboardSnapshot::project(
+                self.task_manager
+                    .tasks()
+                    .iter()
+                    .filter(|task| task.status != TaskStatus::Archived),
+                |id| activity.get(&id).copied().unwrap_or_default(),
+                jterm_core::agent_task::DashboardFilter {
+                    text: &self.task_sidebar.dashboard_query,
+                    view,
+                    ..Default::default()
+                },
+            )
+        };
+        let previous_view = self.task_sidebar.dashboard_view;
+        let mut dashboard = project_dashboard(previous_view);
+        ui.horizontal_wrapped(|ui| {
+            use jterm_core::agent_task::DashboardView;
+            for view in [
+                DashboardView::All,
+                DashboardView::NeedsAttention,
+                DashboardView::Running,
+                DashboardView::NotStarted,
+                DashboardView::Review,
+                DashboardView::Finished,
+            ] {
+                ui.selectable_value(
+                    &mut self.task_sidebar.dashboard_view,
+                    view,
+                    dashboard_filter_label(view, &dashboard.counts),
+                );
+            }
+        });
+        if self.task_sidebar.dashboard_view != previous_view {
+            dashboard = project_dashboard(self.task_sidebar.dashboard_view);
+        }
+        if open_result {
+            if let Some(row) = dashboard.rows.first() {
+                self.task_sidebar.selected = Some(row.id);
+            }
+        }
         ui.label(
             egui::RichText::new(format!(
-                "{} tasks · {} need you · {} awaiting approval",
+                "{} shown · {} search matches · {} need you · {} awaiting approval",
+                dashboard.rows.len(),
                 dashboard.counts.total,
                 dashboard.counts.attention,
                 dashboard.counts.pending_approval,
@@ -828,13 +869,27 @@ impl TerminalApp {
             .small()
             .color(ui.visuals().weak_text_color()),
         );
+        let selected_hidden = self.task_sidebar.selected.is_some_and(|id| {
+            rows.iter().any(|row| row.id == id) && dashboard.selected_index(Some(id)).is_none()
+        });
+        let mut clear_filters = false;
+        if !self.task_sidebar.dashboard_query.is_empty()
+            || self.task_sidebar.dashboard_view != jterm_core::agent_task::DashboardView::All
+        {
+            clear_filters |= ui.button("Clear filters").clicked();
+        }
+        if selected_hidden {
+            ui.label("Selected task is hidden by filters.");
+            clear_filters |= ui.button("Show selected task").clicked();
+        }
+        if clear_filters {
+            self.task_sidebar.dashboard_query.clear();
+            self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
+            ui.ctx().request_repaint();
+        }
         let rows = rows_in_dashboard_order(rows, &dashboard);
         if has_tasks && rows.is_empty() {
             ui.label("No tasks match these filters.");
-            if ui.button("Clear filters").clicked() {
-                self.task_sidebar.dashboard_query.clear();
-                self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
-            }
             return;
         }
 
@@ -925,6 +980,14 @@ impl TerminalApp {
                                 .truncate(),
                         );
                     });
+
+                    if let Some(reason) = task_reason(row.status, row.validation_status, row.status_detail.as_deref(), row.validation_detail.as_deref()) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(18.0);
+                            ui.add(egui::Label::new(egui::RichText::new(&reason).small().weak()).truncate())
+                                .on_hover_text(&reason);
+                        });
+                    }
 
                     if selected {
                         if let Some(notice) = native_start_notice(row.provider) {
@@ -1855,6 +1918,44 @@ fn task_status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
     }
 }
 
+/// Counts describe current search matches before the selected quick view.
+fn dashboard_filter_label(
+    view: jterm_core::agent_task::DashboardView,
+    counts: &jterm_core::agent_task::DashboardCounts,
+) -> String {
+    use jterm_core::agent_task::DashboardView;
+    let (label, count) = match view {
+        DashboardView::All => ("All", counts.total),
+        DashboardView::NeedsAttention => ("Needs you", counts.attention),
+        DashboardView::Running => ("Running", counts.running),
+        DashboardView::NotStarted => ("Not started", counts.created),
+        DashboardView::Review => ("Review", counts.review),
+        DashboardView::Finished => ("Finished", counts.done + counts.failed + counts.cancelled),
+    };
+    format!("{label} {count}")
+}
+
+/// Use TextEdit's own Enter/focus handling; this is not a terminal shortcut.
+fn dashboard_search(ui: &mut egui::Ui, query: &mut String) -> bool {
+    let search = ui.add(
+        egui::TextEdit::singleline(query)
+            .id(egui::Id::new("agent-task-search"))
+            .hint_text("Search tasks, providers or repositories · Enter to open")
+            .char_limit(256),
+    );
+    // Single-line TextEdit surrenders focus on its native Enter handling.
+    // Do not treat an IME commit in the same frame as an open gesture.
+    search.lost_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter)
+                && input.modifiers.is_none()
+                && !input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+        })
+}
+
 fn task_validation_color(ui: &egui::Ui, status: TaskValidationStatus) -> egui::Color32 {
     match status {
         TaskValidationStatus::Running => egui::Color32::from_rgb(90, 150, 230),
@@ -1870,6 +1971,95 @@ fn task_validation_color(ui: &egui::Ui, status: TaskValidationStatus) -> egui::C
 #[cfg(test)]
 mod tests {
     #[test]
+    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
+        use jterm_core::agent_task::{TaskStatus as S, TaskValidationStatus as V};
+        assert_eq!(
+            super::task_reason(
+                S::Failed,
+                V::Failed,
+                Some("task failed"),
+                Some("tests failed")
+            )
+            .as_deref(),
+            Some("tests failed")
+        );
+        assert_eq!(
+            super::task_reason(
+                S::Failed,
+                V::Inconclusive,
+                Some("task failed"),
+                Some("no exit status")
+            )
+            .as_deref(),
+            Some("no exit status")
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::Failed, Some("task failed"), Some("  ")).as_deref(),
+            Some("task failed")
+        );
+        for status in [S::WaitingForHuman, S::WaitingForApproval] {
+            assert_eq!(
+                super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
+                Some("needs a decision")
+            );
+        }
+        assert_eq!(
+            super::task_reason(
+                S::Completed,
+                V::Passed,
+                Some("old failure"),
+                Some("old tests")
+            ),
+            None
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some(" \n\t "), None),
+            None
+        );
+        assert_eq!(super::task_reason(S::Failed, V::NotRun, None, None), None);
+        let unsafe_detail = format!("bad\u{1b}\n\u{202e}{}", "界".repeat(800));
+        let reason = super::task_reason(S::Failed, V::NotRun, Some(&unsafe_detail), None).unwrap();
+        assert!(reason.len() <= 1024);
+        assert!(!reason.chars().any(char::is_control));
+        assert!(!reason.contains('\u{202e}'));
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some("updated"), None).as_deref(),
+            Some("updated")
+        );
+    }
+
+    #[test]
+    fn dashboard_filter_labels_map_activity_and_finished_counts() {
+        use jterm_core::agent_task::{DashboardCounts, DashboardView};
+        let counts = DashboardCounts {
+            total: 20,
+            attention: 7,
+            running: 9,
+            created: 3,
+            review: 4,
+            done: 2,
+            failed: 5,
+            cancelled: 1,
+            archived: 99,
+            ..Default::default()
+        };
+        for (view, expected) in [
+            (DashboardView::All, "All 20"),
+            (DashboardView::NeedsAttention, "Needs you 7"),
+            (DashboardView::Running, "Running 9"),
+            (DashboardView::NotStarted, "Not started 3"),
+            (DashboardView::Review, "Review 4"),
+            (DashboardView::Finished, "Finished 8"),
+        ] {
+            assert_eq!(super::dashboard_filter_label(view, &counts), expected);
+        }
+        assert_eq!(
+            super::dashboard_filter_label(DashboardView::Running, &DashboardCounts::default()),
+            "Running 0"
+        );
+    }
+
+    #[test]
     fn print_provider_notice_discloses_permissions_without_promising_a_sandbox() {
         use super::{native_start_notice, AgentProvider};
         let claude = native_start_notice(AgentProvider::Claude).unwrap();
@@ -1884,6 +2074,50 @@ mod tests {
         assert_eq!(native_start_notice(AgentProvider::OpenCode), None);
     }
     use super::*;
+
+    #[test]
+    fn dashboard_search_enter_is_local_and_ime_commits_are_not_submissions() {
+        let context = egui::Context::default();
+        let mut query = "review".to_string();
+        let mut frame = |events: Vec<egui::Event>, focused: bool| {
+            if focused {
+                context
+                    .memory_mut(|memory| memory.request_focus(egui::Id::new("agent-task-search")));
+            }
+            let mut submitted = false;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    submitted = dashboard_search(ui, &mut query);
+                },
+            );
+            output.textures_delta.clear();
+            submitted
+        };
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(
+            !frame(vec![enter()], false),
+            "terminal/global Enter is not a search action"
+        );
+        assert!(!frame(vec![], true), "focus and typing are not submission");
+        assert!(frame(vec![enter()], true));
+        assert!(!frame(
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("结果".into())),
+                enter()
+            ],
+            true
+        ));
+    }
 
     #[test]
     fn dashboard_rows_follow_shared_order_and_filter_by_stable_id() {

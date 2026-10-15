@@ -62,6 +62,34 @@ fn live_activity_knowledge(
     }
 }
 
+/// Local interactive-shell identity comes from launch, never terminal text.
+/// A busy lock or missing running observation provides no positive evidence.
+fn known_local_shell_running(
+    purpose: crate::session::SessionPurpose,
+    has_source_shell: bool,
+    running: Option<bool>,
+) -> bool {
+    purpose == crate::session::SessionPurpose::Interactive
+        && has_source_shell
+        && running == Some(true)
+}
+
+fn window_has_known_local_running(
+    facts: impl IntoIterator<Item = (crate::session::SessionPurpose, bool, Option<bool>)>,
+) -> bool {
+    facts.into_iter().any(|(purpose, source_shell, running)| {
+        known_local_shell_running(purpose, source_shell, running)
+    })
+}
+
+fn terminal_has_running_command(terminal: &crate::terminal::TerminalState) -> bool {
+    terminal.command_records().back().is_some_and(|record| {
+        record.state == crate::terminal::CommandState::Running
+            && record.start_mark_seen
+            && !record.complete
+    })
+}
+
 /// Native pointer observation only; all dwell, hold, cooldown and source policy
 /// lives in jterm_core. Layout changes synchronize position without an entry.
 fn observe_live_attention(
@@ -730,7 +758,44 @@ fn live_tooltip_allowed(running: bool, buttons_down: bool, keys_down: bool) -> b
     !running && !buttons_down && !keys_down
 }
 
+/// Content-free lifecycle edge detector. Disabled observers still advance their
+/// baseline, so enabling a companion never replays an old Agent reward.
+#[derive(Debug, Default)]
+struct AgentPulseTracker {
+    present: bool,
+    last: Option<jterm_core::organism::AgentPulse>,
+}
+
+impl AgentPulseTracker {
+    fn observe(
+        &mut self,
+        state: Option<jterm_core::agent::AgentState>,
+        busy: bool,
+        enabled: bool,
+    ) -> Option<jterm_core::organism::AgentPulse> {
+        let present = state.is_some();
+        let pulse = state.and_then(|state| jterm_core::organism::agent_state_pulse(state, busy));
+        let pulse = if !present && self.present {
+            Some(jterm_core::organism::AgentPulse::Gone)
+        } else {
+            pulse
+        };
+        let changed = pulse != self.last;
+        self.present = present;
+        // Preserve Gone across an absent session to avoid replaying a close.
+        if present || pulse.is_some() {
+            self.last = pulse;
+        }
+        if enabled && changed {
+            pulse
+        } else {
+            None
+        }
+    }
+}
+
 pub struct OrganismHost {
+    agent_pulses: AgentPulseTracker,
     born: Instant,
     life: WindowLife,
     native: NativeOrganism,
@@ -739,6 +804,8 @@ pub struct OrganismHost {
     cursor: Option<(u64, bool)>,
     quarantine_batch: bool,
     running: bool,
+    window_running: bool,
+    owner_activity_at: Duration,
     activity: LiveActivityKnowledge,
     pending: Option<PendingCommand>,
     work_context: Option<String>,
@@ -765,6 +832,7 @@ pub struct OrganismHost {
 impl Default for OrganismHost {
     fn default() -> Self {
         Self {
+            agent_pulses: Default::default(),
             born: Instant::now(),
             life: WindowLife::new_at(Duration::ZERO),
             native: NativeOrganism::from_persisted_state(crate::organism::LifeState::default()),
@@ -773,6 +841,8 @@ impl Default for OrganismHost {
             cursor: None,
             quarantine_batch: false,
             running: false,
+            window_running: false,
+            owner_activity_at: Duration::ZERO,
             activity: LiveActivityKnowledge::Unknown,
             pending: None,
             work_context: None,
@@ -944,6 +1014,7 @@ impl OrganismHost {
             self.watch.reset();
             self.bridge.reset();
             self.last_input = Some(now);
+            self.owner_activity_at = now;
             self.life.note_input(now);
             self.ambient.interrupt();
         }
@@ -966,6 +1037,7 @@ impl OrganismHost {
         }
         let now = self.born.elapsed();
         self.cancel_attention();
+        self.owner_activity_at = now;
         self.life.note_output(now);
         self.ambient.interrupt();
         let running = records.back().is_some_and(|record| {
@@ -1016,6 +1088,8 @@ impl OrganismHost {
             let kind = classify_command(record.command.as_deref().unwrap_or(""));
             self.set_work_context(record.cwd.as_deref());
             self.native.sync_state(self.life.state());
+            self.native
+                .set_agent_command(record.agent_generation.is_some());
             let start = self.native.command_started(kind);
             self.life.replace_state(self.native.state());
             self.react(start, now);
@@ -1106,6 +1180,8 @@ impl OrganismHost {
             .then_some(completed.exit_code)
             .flatten();
         self.native.sync_state(self.life.state());
+        self.native
+            .set_agent_command(completed.agent_generation.is_some());
         let reaction = self
             .native
             .command_finished(pending.kind, exit, completed.duration_ms);
@@ -1632,6 +1708,26 @@ impl OrganismHost {
         toggle
     }
 
+    fn advance_life(&mut self, now: Duration, eligible: bool) -> f32 {
+        if self.running {
+            self.owner_activity_at = now;
+        }
+        self.life.advance(
+            now,
+            eligible,
+            self.window_running || self.running,
+            CircadianPhase::Unlearned,
+        )
+    }
+
+    fn owner_idle_for(&self, now: Duration) -> Duration {
+        now.saturating_sub(self.owner_activity_at)
+    }
+
+    fn owner_dormant(&self, now: Duration) -> bool {
+        !self.running && self.owner_idle_for(now) >= Duration::from_secs(60)
+    }
+
     pub fn draw(&mut self, ui: &mut Ui, config: &Config, focused: bool, interactive: bool) -> bool {
         let now = self.born.elapsed();
         let presentable = self.presentable;
@@ -1640,9 +1736,7 @@ impl OrganismHost {
         }
         let eligible =
             config.ascii_organism_enabled && focused && presentable && self.owner.is_some();
-        let dt = self
-            .life
-            .advance(now, eligible, self.running, CircadianPhase::Unlearned);
+        let dt = self.advance_life(now, eligible);
         if !config.ascii_organism_enabled {
             self.acquire(None, None, false);
             return false;
@@ -1661,7 +1755,7 @@ impl OrganismHost {
         if eligible && now >= self.reaction_until && !self.running {
             let behavior = self.ambient.step(
                 self.life.state(),
-                self.life.idle_for(now).as_secs_f32(),
+                self.owner_idle_for(now).as_secs_f32(),
                 dt,
                 RepoVigil::None,
             );
@@ -1693,7 +1787,7 @@ impl OrganismHost {
             // Block mode owns real display-only rows immediately above input.
             // Do not reserve a duplicate bottom panel or make footer hover the
             // only way to see the organism. Physiology still advances above.
-            let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
+            let dormant = self.owner_dormant(now);
             let next = next_host_wake(policy, now, self.reaction_until, dormant);
             let watch_wake = self
                 .rhythm_enabled
@@ -1722,7 +1816,7 @@ impl OrganismHost {
             )
         });
         let greeting_allowed = live_greeting_allowed(policy, now, self.running, buttons_down);
-        let dormant = self.life.idle_for(now) >= Duration::from_secs(60) && !self.running;
+        let dormant = self.owner_dormant(now);
         let mut attention_snapshot = None;
         let mut toggle = false;
         // Allocate exactly the same strip while suppressed. Typing, switching
@@ -1937,6 +2031,27 @@ fn hidden_root_viewport(root: bool, focused: Option<bool>, visible: Option<bool>
 }
 
 impl crate::TerminalApp {
+    /// Recompute from current sessions after parsing and close handling. This
+    /// never blocks on a renderer's terminal lock or adds a process probe.
+    pub(crate) fn sync_organism_window_activity(&mut self) {
+        self.organism.window_running = self.config.ascii_organism_enabled
+            && window_has_known_local_running(self.session_manager.sessions().iter().map(
+                |session| {
+                    let has_source_shell = session.shell.shell_program().is_some();
+                    let running = (session.purpose == crate::session::SessionPurpose::Interactive
+                        && has_source_shell)
+                        .then(|| {
+                            session
+                                .terminal
+                                .try_lock()
+                                .map(|terminal| terminal_has_running_command(&terminal))
+                        })
+                        .flatten();
+                    (session.purpose, has_source_shell, running)
+                },
+            ));
+    }
+
     /// eframe skips App::ui in an observed hidden root pass, but still calls
     /// App::logic. Revoke only organism state here; never draw or request wakes.
     /// Rapid hide/restore transitions without a hidden pass remain unobserved.
@@ -1974,7 +2089,24 @@ impl crate::TerminalApp {
         }
     }
 
+    pub(crate) fn sync_organism_agent(&mut self) {
+        let (state, busy) = self.agent_panel.organism_state();
+        if let Some(pulse) =
+            self.organism
+                .agent_pulses
+                .observe(state, busy, self.config.ascii_organism_enabled)
+        {
+            self.organism
+                .life
+                .replace_state(jterm_core::organism::agent_pulse(
+                    self.organism.life.state(),
+                    pulse,
+                ));
+        }
+    }
+
     pub(crate) fn prepare_organism(&mut self, ctx: &egui::Context) {
+        self.sync_organism_agent();
         self.organism.configure_bridge(
             self.config.ascii_organism_expanded
                 && resolved_motion(self.config.ascii_organism_motion) == OrganismMotion::Full,
@@ -2643,8 +2775,170 @@ fn preview_next_wake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_lifecycle_edges_are_deduplicated_and_disabled_edges_are_consumed() {
+        use jterm_core::agent::AgentState;
+        use jterm_core::organism::AgentPulse;
+        let mut tracker = AgentPulseTracker::default();
+        assert_eq!(tracker.observe(None, false, true), None);
+        assert_eq!(tracker.observe(Some(AgentState::Ready), false, true), None);
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), true, true),
+            Some(AgentPulse::Working)
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), true, true),
+            None
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), false, true),
+            Some(AgentPulse::Finished)
+        );
+        assert_eq!(tracker.observe(Some(AgentState::Ready), false, true), None);
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), false, true),
+            Some(AgentPulse::Finished)
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::Cancelled), false, true),
+            Some(AgentPulse::Gone)
+        );
+        assert_eq!(tracker.observe(None, false, true), None);
+        assert_eq!(tracker.observe(None, false, true), None);
+        assert_eq!(
+            tracker.observe(Some(AgentState::AwaitingModel), false, false),
+            None
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::AwaitingModel), false, true),
+            None
+        );
+        assert_eq!(tracker.observe(None, false, true), Some(AgentPulse::Gone));
+        assert_eq!(tracker.observe(None, false, true), None);
+        let mut first = AgentPulseTracker::default();
+        assert_eq!(
+            first.observe(Some(AgentState::Cancelled), false, true),
+            Some(AgentPulse::Gone)
+        );
+    }
+
     use crate::block_mode::CompletionProvenance;
     use crate::terminal::CompletedCommandOutput;
+
+    #[test]
+    fn window_running_snapshot_tracks_non_owner_start_finish_close_and_switch() {
+        use crate::session::SessionPurpose;
+        let mut owner = crate::terminal::TerminalState::new(24, 5);
+        let mut background = crate::terminal::TerminalState::new(24, 5);
+        for terminal in [&mut owner, &mut background] {
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        }
+        let snapshot = |terminals: &[&crate::terminal::TerminalState]| {
+            window_has_known_local_running(terminals.iter().map(|terminal| {
+                (
+                    SessionPurpose::Interactive,
+                    true,
+                    Some(terminal_has_running_command(terminal)),
+                )
+            }))
+        };
+        let mut host = OrganismHost::default();
+        host.acquire(Some("owner"), None, false);
+        host.window_running = snapshot(&[&owner, &background]);
+        assert!(!host.window_running);
+
+        background.process_input(b"sleep 120\r\n\x1b]133;C;cmdline_url=sleep%20120\x07");
+        host.window_running = snapshot(&[&owner, &background]);
+        assert!(host.window_running);
+        assert!(!host.running, "background work cannot claim the owner pose");
+        host.acquire(Some("background"), None, true);
+        host.acquire(None, None, false);
+        host.acquire(Some("owner"), None, false);
+        assert!(
+            host.window_running,
+            "owner changes do not clear window facts"
+        );
+
+        background.process_input(b"\x1b]133;D;0\x07");
+        host.window_running = snapshot(&[&owner, &background]);
+        assert!(!host.window_running);
+        background.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 120\r\n\x1b]133;C;cmdline_url=sleep%20120\x07",
+        );
+        assert!(snapshot(&[&owner, &background]));
+        host.window_running = snapshot(&[&owner]);
+        assert!(
+            !host.window_running,
+            "closing a running session leaves no busy latch"
+        );
+        assert!(!window_has_known_local_running([]));
+    }
+
+    #[test]
+    fn window_running_requires_known_interactive_local_shell_facts() {
+        use crate::session::SessionPurpose::{EphemeralCommand, Interactive, RetainedCommand};
+        for purpose in [Interactive, EphemeralCommand, RetainedCommand] {
+            for source_shell in [false, true] {
+                for running in [None, Some(false), Some(true)] {
+                    assert_eq!(
+                        known_local_shell_running(purpose, source_shell, running),
+                        purpose == Interactive && source_shell && running == Some(true),
+                    );
+                }
+            }
+        }
+        let mut unmarked = crate::terminal::TerminalState::new(24, 5);
+        unmarked.process_input(b"compiling and running\r\n");
+        assert!(!terminal_has_running_command(&unmarked));
+    }
+
+    #[test]
+    fn background_work_prevents_rest_without_changing_owner_pose_or_cadence() {
+        let mut quiet = OrganismHost::default();
+        let mut working = OrganismHost::default();
+        quiet.acquire(Some("owner"), None, false);
+        working.acquire(Some("owner"), None, false);
+        working.window_running = true;
+        let context = working.context;
+        for second in 0..=61 {
+            let now = Duration::from_secs(second);
+            quiet.advance_life(now, true);
+            working.advance_life(now, true);
+        }
+        let now = Duration::from_secs(61);
+        assert!(working.life.state().energy < quiet.life.state().energy);
+        assert_eq!(working.context, context);
+        assert!(!working.running);
+        assert_eq!(working.activity, LiveActivityKnowledge::Unknown);
+        assert_eq!(working.owner_idle_for(now), quiet.owner_idle_for(now));
+        assert!(working.owner_dormant(now));
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            let policy = PresentationPolicy {
+                enabled: true,
+                focused_owner: true,
+                local: true,
+                motion: Some(motion),
+                ..Default::default()
+            };
+            let next = next_host_wake(policy, now, Duration::ZERO, working.owner_dormant(now));
+            assert_eq!(
+                next,
+                if motion == OrganismMotion::Static {
+                    None
+                } else {
+                    Some(Duration::from_millis(900))
+                }
+            );
+        }
+        let before = working.life.state().energy;
+        working.advance_life(now + Duration::from_secs(1), false);
+        assert_eq!(working.life.state().energy, before);
+    }
 
     fn companion_sprite_samples() -> std::collections::BTreeSet<String> {
         use jterm_core::organism::{
@@ -5805,6 +6099,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_agent_starts_and_completions_leave_later_human_work_unclaimed() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        let mut host = OrganismHost::default();
+        host.acquire(Some("local"), None, false);
+        host.quarantine_batch = false;
+        for (step, (generation, exit)) in [
+            (Some(1), 101),
+            (Some(2), 101),
+            (Some(3), 101),
+            (Some(4), 0),
+            (None, 101),
+            (None, 101),
+            (None, 101),
+            (None, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            if let Some(generation) = generation {
+                terminal
+                    .arm_agent_execution(generation, "cargo test")
+                    .unwrap();
+            }
+            terminal.process_input(
+                b"cargo test\r\n\x1b]133;C;cmdline_url=cargo%20test;cwd=/project\x07",
+            );
+            host.batch("local", terminal.command_records(), &[], false, false);
+            assert_eq!(
+                host.context.behavior,
+                if generation.is_some() {
+                    Behavior::WatchAgent
+                } else {
+                    Behavior::WatchCommand
+                }
+            );
+            let confidence = host.life.state().confidence;
+            terminal.process_input(format!("\x1b]133;D;{exit};duration_ms=100\x07").as_bytes());
+            let completed = terminal.take_completed_command_events();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].agent_generation, generation);
+            host.batch(
+                "local",
+                terminal.command_records(),
+                &completed,
+                false,
+                false,
+            );
+            if generation.is_some() {
+                assert!(host.reaction_status.contains("agent-driven"));
+                if exit != 0 {
+                    assert_eq!(host.life.state().confidence, confidence);
+                }
+            } else if exit != 0 {
+                assert!(host.life.state().confidence < confidence);
+            }
+            if step == 3 {
+                assert_eq!(host.context.behavior, Behavior::Celebrate);
+            } else if step == 7 {
+                assert_eq!(host.context.behavior, Behavior::CelebrateBig);
+            }
+        }
+    }
+
     // Synthetic data only: these tests never parse terminal text, construct a
     // renderer, open a file, or spawn a shell.
     fn completion(exit_code: Option<i32>) -> CompletedCommandEvent {
@@ -5864,6 +6223,45 @@ mod tests {
         done.session_id = Some("shell-1".to_owned());
         done.start_mark_seen = false;
         assert!(!start.matches(&done));
+    }
+
+    #[test]
+    fn agent_completion_attribution_uses_accepted_completion_not_previous_flag() {
+        let mut host = OrganismHost::default();
+        let mut start = pending();
+        start.kind = CommandKind::BuildOrTest;
+        let mut done = completion(Some(101));
+        done.completed.agent_generation = Some(7);
+        let confidence = host.life.state().confidence;
+        // A completion-only observation still carries its locally validated
+        // attribution; it does not need a busy Agent panel or a model request.
+        host.finish(&start, &done, Duration::ZERO);
+        assert_eq!(host.life.state().confidence, confidence);
+        assert!(host.reaction_status.contains("agent-driven"));
+
+        host.native.set_agent_command(true);
+        done.completed.agent_generation = None;
+        host.finish(&start, &done, Duration::ZERO);
+        assert!(host.life.state().confidence < confidence);
+        assert!(!host.reaction_status.contains("agent-driven"));
+
+        host.acquire(Some("local"), None, false);
+        host.quarantine_batch = false;
+        host.pending = Some(pending());
+        let before = format!("{:?}", host.life.state());
+        let mut stale = completion(Some(0));
+        stale.completed.agent_generation = Some(99);
+        stale.completed.id = "previous-command".to_owned();
+        host.batch("local", &VecDeque::new(), &[stale], false, false);
+        assert_eq!(format!("{:?}", host.life.state()), before);
+        assert!(host.pending.is_some());
+
+        let mut boundary = completion(Some(0));
+        boundary.completed.agent_generation = Some(100);
+        boundary.completed.duration_ms = Some(60_000);
+        boundary.completion_provenance = CompletionProvenance::BoundaryInferred;
+        host.finish(&start, &boundary, Duration::ZERO);
+        assert_eq!(host.context.behavior, Behavior::UnknownOutcome);
     }
 
     #[test]

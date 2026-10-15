@@ -2,7 +2,7 @@
 
 use super::events::build_keybinding_string;
 use super::state::TerminalApp;
-use crate::{config, keybindings, layout, search};
+use crate::{config, keybindings, layout};
 use eframe::egui;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,6 +396,33 @@ pub(crate) fn should_block_terminal_input(
         || history_picker_open
         || workflow_picker_open
         || text_edit_focused
+}
+
+/// Dispatch the search-owned prefix of one native event batch. Closing Find
+/// retires the remaining search actions, while the caller keeps the frame's
+/// existing terminal-input ownership until the next frame.
+fn dispatch_search_panel_keys(
+    events: &[egui::Event],
+    open: bool,
+    mut dispatch: impl FnMut(egui::Key, egui::Modifiers),
+) {
+    if !open {
+        return;
+    }
+    for event in events {
+        if let egui::Event::Key {
+            key,
+            modifiers,
+            pressed: true,
+            ..
+        } = event
+        {
+            dispatch(*key, *modifiers);
+            if *key == egui::Key::Escape {
+                break;
+            }
+        }
+    }
 }
 
 pub(crate) fn routed_terminal_events(
@@ -1575,69 +1602,14 @@ impl TerminalApp {
     /// 针对当前活跃会话重算搜索结果，并记录结果所属的 grid/session 版本。
     pub(super) fn refresh_search_matches(&mut self) {
         let session_idx = self.session_manager.active_index();
-        let previous_results_session_id = self.search_state.results_session_id.clone();
-        let previous_projection_message = self.search_state.projection_message.clone();
-        let previous_hidden_zone = self.search_state.hidden_projection_zone;
-        let previous_policy_revision = self.search_state.projection_policy_revision;
-        let selected_match = self
-            .search_state
-            .matches
-            .get(self.search_state.current_match_index)
-            .copied();
-        let (matches, error, truncated, grid_version, session_id, policy_revision) = {
-            let session = self.session_manager.get_active_session_mut();
-            let session_id = session.metadata.session_id.clone();
-            let policy_revision = session.projection_policy.revision();
-            let terminal = session.terminal.lock();
-            let (matches, error, truncated) = search::SearchEngine::search(
-                &terminal,
-                &self.search_state.query,
-                self.search_state.use_regex,
-                self.search_state.case_sensitive,
-                &mut self.search_state.regex_cache,
-            );
-            (
-                matches,
-                error,
-                truncated,
-                terminal.get_grid_version(),
-                session_id,
-                policy_revision,
-            )
-        };
-        self.search_state.matches = matches;
-        self.search_state.error_message = error;
-        self.search_state.results_truncated = truncated;
-        self.search_state.current_match_index = selected_match
-            .and_then(|selected| {
-                self.search_state
-                    .matches
-                    .iter()
-                    .position(|candidate| *candidate == selected)
-            })
-            .unwrap_or(0);
-        let selected_survived = selected_match.is_some_and(|selected| {
-            self.search_state
-                .matches
-                .get(self.search_state.current_match_index)
-                .is_some_and(|current| *current == selected)
-        });
-        let diagnostic_context_survived = selected_survived
-            && previous_results_session_id.as_deref() == Some(session_id.as_str())
-            && previous_policy_revision == Some(policy_revision);
-        self.search_state.projection_message = diagnostic_context_survived
-            .then_some(previous_projection_message)
-            .flatten();
-        self.search_state.hidden_projection_zone = diagnostic_context_survived
-            .then_some(previous_hidden_zone)
-            .flatten();
-        self.search_state.projection_policy_revision = diagnostic_context_survived
-            .then_some(previous_policy_revision)
-            .flatten();
-        self.search_state.results_grid_version = Some(grid_version);
-        self.search_state.results_session_idx = Some(session_idx);
-        self.search_state.results_session_id = Some(session_id);
-        self.search_state.results_refreshed_at = Some(std::time::Instant::now());
+        let session = self.session_manager.get_active_session_mut();
+        let terminal = session.terminal.lock();
+        self.search_state.refresh_for_terminal(
+            &terminal,
+            session_idx,
+            &session.metadata.session_id,
+            session.projection_policy.revision(),
+        );
     }
 
     pub(crate) fn reveal_current_search_match(&mut self) {
@@ -1876,12 +1848,26 @@ impl TerminalApp {
     }
 
     pub(super) fn select_next_search_match(&mut self) {
-        self.search_state.next_match();
-        self.reveal_current_search_match();
+        self.navigate_search_match(false);
     }
 
     pub(super) fn select_prev_search_match(&mut self) {
-        self.search_state.prev_match();
+        self.navigate_search_match(true);
+    }
+
+    fn navigate_search_match(&mut self, previous: bool) {
+        let session_idx = self.session_manager.active_index();
+        {
+            let session = self.session_manager.get_active_session_mut();
+            let terminal = session.terminal.lock();
+            self.search_state.navigate_in_terminal(
+                &terminal,
+                session_idx,
+                &session.metadata.session_id,
+                session.projection_policy.revision(),
+                previous,
+            );
+        }
         self.reveal_current_search_match();
     }
 
@@ -2017,41 +2003,32 @@ impl TerminalApp {
 
     /// 处理搜索面板打开时的键盘事件（Esc 关闭、Enter 跳转、上下键浏览历史）。
     pub fn handle_search_panel_input(&mut self) {
-        if self.search_state.is_open {
-            let events_copy = self.frame_events.clone();
-            for evt in &events_copy {
-                match evt {
-                    egui::Event::Key {
-                        key,
-                        modifiers,
-                        pressed,
-                        ..
-                    } if *pressed => match key {
-                        egui::Key::Escape => {
-                            self.search_state.close();
-                            self.save_ui_history();
-                        }
-                        egui::Key::Enter => {
-                            if !modifiers.shift {
-                                self.select_next_search_match();
-                            } else {
-                                self.select_prev_search_match();
-                            }
-                        }
-                        egui::Key::ArrowUp => {
-                            self.search_state.history_prev();
-                            self.refresh_search_matches();
-                        }
-                        egui::Key::ArrowDown => {
-                            self.search_state.history_next();
-                            self.refresh_search_matches();
-                        }
-                        _ => {}
-                    },
-                    _ => {}
+        if !self.search_state.is_open {
+            return;
+        }
+        let events = self.frame_events.clone();
+        dispatch_search_panel_keys(&events, true, |key, modifiers| match key {
+            egui::Key::Escape => {
+                self.search_state.close();
+                self.save_ui_history();
+            }
+            egui::Key::Enter => {
+                if modifiers.shift {
+                    self.select_prev_search_match();
+                } else {
+                    self.select_next_search_match();
                 }
             }
-        }
+            egui::Key::ArrowUp => {
+                self.search_state.history_prev();
+                self.refresh_search_matches();
+            }
+            egui::Key::ArrowDown => {
+                self.search_state.history_next();
+                self.refresh_search_matches();
+            }
+            _ => {}
+        });
     }
 
     /// Handle palette-owned keys without ending the frame. PTY parsing,
@@ -4587,6 +4564,154 @@ mod tests {
             OrderedPressOutcome::Consumed
         });
         assert_eq!(trace, ["scroll", "terminal", "terminal"]);
+    }
+
+    fn search_key(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn search_event_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        state: &mut crate::search::SearchState,
+        terminal: &crate::terminal::TerminalState,
+    ) -> (Vec<egui::Key>, Vec<egui::Event>) {
+        let mut actions = Vec::new();
+        let mut terminal_events = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let events = ui.ctx().input(|input| input.raw.events.clone());
+                let open_at_start = state.is_open;
+                // The exact production dispatcher owns ordering. These adapters
+                // use the real search model without creating a window or shell.
+                dispatch_search_panel_keys(&events, open_at_start, |key, modifiers| {
+                    actions.push(key);
+                    match key {
+                        egui::Key::Escape => state.close(),
+                        egui::Key::Enter => state.navigate_in_terminal(
+                            terminal,
+                            0,
+                            "search-event-test",
+                            0,
+                            modifiers.shift,
+                        ),
+                        egui::Key::ArrowUp => {
+                            state.history_prev();
+                            state.refresh_for_terminal(terminal, 0, "search-event-test", 0);
+                        }
+                        egui::Key::ArrowDown => {
+                            state.history_next();
+                            state.refresh_for_terminal(terminal, 0, "search-event-test", 0);
+                        }
+                        _ => {}
+                    }
+                });
+                terminal_events = routed_terminal_events(
+                    &events,
+                    terminal_input_blocked_after_commands(open_at_start, false, state.is_open),
+                );
+            },
+        );
+        output.textures_delta.clear();
+        (actions, terminal_events)
+    }
+
+    fn search_event_model() -> (crate::search::SearchState, crate::terminal::TerminalState) {
+        let mut terminal = crate::terminal::TerminalState::new(24, 4);
+        terminal.process_batch(b"needle A\r\nneedle B\r\nneedle C");
+        let mut state = crate::search::SearchState::new();
+        state.set_query("older query");
+        state.close();
+        state.set_query("needle");
+        state.open();
+        state.refresh_for_terminal(&terminal, 0, "search-event-test", 0);
+        (state, terminal)
+    }
+
+    #[test]
+    fn search_escape_retires_later_navigation_in_the_same_egui_frame() {
+        let ctx = egui::Context::default();
+        let (mut state, terminal) = search_event_model();
+        let (actions, routed) = search_event_frame(
+            &ctx,
+            vec![
+                search_key(egui::Key::Enter, true),
+                search_key(egui::Key::Enter, false),
+                search_key(egui::Key::Escape, true),
+                search_key(egui::Key::Enter, true),
+                search_key(egui::Key::ArrowUp, true),
+                search_key(egui::Key::ArrowDown, true),
+                egui::Event::Text("after close".into()),
+            ],
+            &mut state,
+            &terminal,
+        );
+        assert_eq!(actions, vec![egui::Key::Enter, egui::Key::Escape]);
+        assert!(!state.is_open);
+        assert_eq!(
+            state.current_match_index, 1,
+            "navigation before Escape remains accepted"
+        );
+        assert_eq!(state.query, "needle");
+        assert_eq!(state.history_nav_index, None);
+        assert!(
+            routed.is_empty(),
+            "the closing frame still belongs to Find, not the PTY"
+        );
+    }
+
+    #[test]
+    fn search_escape_does_not_suppress_the_next_frame_or_a_reopened_find() {
+        let ctx = egui::Context::default();
+        let (mut state, terminal) = search_event_model();
+        let (actions, routed) = search_event_frame(
+            &ctx,
+            vec![
+                search_key(egui::Key::Escape, true),
+                search_key(egui::Key::ArrowUp, true),
+            ],
+            &mut state,
+            &terminal,
+        );
+        assert_eq!(actions, vec![egui::Key::Escape]);
+        assert!(routed.is_empty());
+        assert_eq!(state.current_match_index, 0);
+        assert_eq!(state.query, "needle");
+
+        let fresh = vec![
+            egui::Event::Text("echo".into()),
+            search_key(egui::Key::Enter, true),
+        ];
+        let (actions, routed) = search_event_frame(&ctx, fresh.clone(), &mut state, &terminal);
+        assert!(actions.is_empty());
+        assert_eq!(
+            routed, fresh,
+            "normal terminal events resume on the next frame"
+        );
+
+        state.open();
+        let (actions, routed) = search_event_frame(
+            &ctx,
+            vec![search_key(egui::Key::Enter, true)],
+            &mut state,
+            &terminal,
+        );
+        assert_eq!(actions, vec![egui::Key::Enter]);
+        assert!(routed.is_empty());
+        assert_eq!(
+            state.current_match_index, 1,
+            "reopening Find starts no stale cancellation latch"
+        );
     }
 
     #[test]

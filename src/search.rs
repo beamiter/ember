@@ -164,6 +164,100 @@ impl Default for SearchState {
 }
 
 impl SearchState {
+    pub fn refresh_for_terminal(
+        &mut self,
+        terminal: &crate::terminal::TerminalState,
+        session_idx: usize,
+        session_id: &str,
+        policy_revision: u64,
+    ) {
+        let previous_results_session_id = self.results_session_id.clone();
+        let previous_projection_message = self.projection_message.clone();
+        let previous_hidden_zone = self.hidden_projection_zone;
+        let previous_policy_revision = self.projection_policy_revision;
+        let selected_match = (self.results_session_id.as_deref() == Some(session_id))
+            .then(|| self.matches.get(self.current_match_index).copied())
+            .flatten();
+        let (matches, error, truncated) = SearchEngine::search(
+            terminal,
+            &self.query,
+            self.use_regex,
+            self.case_sensitive,
+            &mut self.regex_cache,
+        );
+        let grid_version = terminal.get_grid_version();
+        self.matches = matches;
+        self.error_message = error;
+        self.results_truncated = truncated;
+        self.current_match_index = selected_match
+            .and_then(|selected| {
+                self.matches
+                    .iter()
+                    .position(|candidate| *candidate == selected)
+            })
+            .unwrap_or(0);
+        let selected_survived = selected_match.is_some_and(|selected| {
+            self.matches
+                .get(self.current_match_index)
+                .is_some_and(|current| *current == selected)
+        });
+        let diagnostic_context_survived = selected_survived
+            && previous_results_session_id.as_deref() == Some(session_id)
+            && previous_policy_revision == Some(policy_revision);
+        self.projection_message = diagnostic_context_survived
+            .then_some(previous_projection_message)
+            .flatten();
+        self.hidden_projection_zone = diagnostic_context_survived
+            .then_some(previous_hidden_zone)
+            .flatten();
+        self.projection_policy_revision = diagnostic_context_survived
+            .then_some(previous_policy_revision)
+            .flatten();
+        self.results_grid_version = Some(grid_version);
+        self.results_session_idx = Some(session_idx);
+        self.results_session_id = Some(session_id.to_owned());
+        self.results_refreshed_at = Some(std::time::Instant::now());
+    }
+
+    /// Refresh before moving the cursor, independently of the render debounce.
+    pub fn navigate_in_terminal(
+        &mut self,
+        terminal: &crate::terminal::TerminalState,
+        session_idx: usize,
+        session_id: &str,
+        policy_revision: u64,
+        previous: bool,
+    ) {
+        if self.results_grid_version != Some(terminal.get_grid_version())
+            || self.results_session_idx != Some(session_idx)
+            || self.results_session_id.as_deref() != Some(session_id)
+        {
+            let selected = (self.results_session_id.as_deref() == Some(session_id))
+                .then(|| self.matches.get(self.current_match_index).copied())
+                .flatten();
+            self.refresh_for_terminal(terminal, session_idx, session_id, policy_revision);
+            if let Some(index) = selected.and_then(|selected| {
+                self.matches
+                    .iter()
+                    .position(|candidate| *candidate == selected)
+            }) {
+                self.current_match_index = index;
+            } else {
+                self.current_match_index = if previous {
+                    self.matches.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                return;
+            }
+        }
+        if previous {
+            self.prev_match();
+        } else {
+            self.next_match();
+        }
+    }
+
     /// 创建新的搜索状态
     pub fn new() -> Self {
         Self {
@@ -671,6 +765,98 @@ impl SearchEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_navigation_refreshes_deleted_match_before_the_debounce_tick() {
+        for previous in [false, true] {
+            let mut terminal = crate::terminal::TerminalState::new(24, 4);
+            terminal.process_batch(b"needle A\r\nneedle B\r\nneedle C");
+            let mut state = SearchState::new();
+            state.set_query("needle");
+            state.refresh_for_terminal(&terminal, 0, "one", 0);
+            let old_matches = state.matches.clone();
+            assert_eq!(old_matches.len(), 3);
+            // The selected first match disappears while two matches survive.
+            terminal.process_batch(b"\x1b[1;1H\x1b[2Kgone");
+            assert_eq!(state.matches.len(), 3, "no timer/frame refreshed yet");
+            state.navigate_in_terminal(&terminal, 0, "one", 0, previous);
+            assert_eq!(state.matches.len(), 2);
+            assert_eq!(
+                state.matches.get(state.current_match_index).copied(),
+                Some(old_matches[if previous { 2 } else { 1 }]),
+                "a missing cursor lands at the direction's edge without skipping it"
+            );
+            assert_eq!(state.query, "needle");
+        }
+    }
+
+    #[test]
+    fn live_navigation_preserves_surviving_match_and_rejects_other_session_coordinates() {
+        for previous in [false, true] {
+            let mut terminal = crate::terminal::TerminalState::new(24, 4);
+            terminal.process_batch(b"needle A\r\nneedle B");
+            let mut state = SearchState::new();
+            state.set_query("needle");
+            state.refresh_for_terminal(&terminal, 0, "one", 0);
+            terminal.process_batch(b"\r\nneedle C");
+            state.navigate_in_terminal(&terminal, 0, "one", 0, previous);
+            assert_eq!(state.matches.len(), 3);
+            assert_eq!(
+                state.current_match_index,
+                if previous { 2 } else { 1 },
+                "a surviving cursor moves exactly once"
+            );
+
+            let mut other = crate::terminal::TerminalState::new(24, 4);
+            other.process_batch(b"needle X\r\nneedle Y");
+            // The other session deliberately reuses the same raw row/column IDs.
+            state.navigate_in_terminal(&other, 0, "two", 0, previous);
+            assert_eq!(state.matches.len(), 2);
+            assert_eq!(state.current_match_index, usize::from(previous));
+        }
+    }
+
+    #[test]
+    fn live_navigation_drops_erased_matches_and_refreshes_after_resize() {
+        let mut terminal = crate::terminal::TerminalState::new(24, 4);
+        terminal.process_batch(b"needle");
+        let mut state = SearchState::new();
+        state.set_query("needle");
+        state.refresh_for_terminal(&terminal, 0, "one", 0);
+        terminal.process_batch(b"\r\x1b[2Kgone");
+        let previous = false;
+        state.navigate_in_terminal(&terminal, 0, "one", 0, previous);
+        assert!(state.matches.is_empty());
+        assert_eq!(state.matches.get(state.current_match_index).copied(), None);
+
+        terminal.process_batch(b"\r\x1b[2Kneedle");
+        state.refresh_for_terminal(&terminal, 0, "one", 0);
+        terminal.on_resize(16, 6);
+        state.navigate_in_terminal(&terminal, 0, "one", 0, previous);
+        assert_eq!(state.matches.len(), 1);
+        assert!(state
+            .matches
+            .get(state.current_match_index)
+            .copied()
+            .is_some());
+    }
+
+    #[test]
+    fn live_navigation_without_grid_changes_keeps_the_existing_search_snapshot() {
+        let mut terminal = crate::terminal::TerminalState::new(24, 4);
+        terminal.process_batch(b"needle A\r\nneedle B");
+        let mut state = SearchState::new();
+        state.set_query("needle");
+        state.refresh_for_terminal(&terminal, 0, "one", 0);
+        let refreshed = state.results_refreshed_at;
+        state.navigate_in_terminal(&terminal, 0, "one", 0, false);
+        assert_eq!(state.current_match_index, 1);
+        assert_eq!(state.results_refreshed_at, refreshed);
+        assert_eq!(
+            state.results_grid_version,
+            Some(terminal.get_grid_version())
+        );
+    }
+
     use super::*;
 
     #[test]

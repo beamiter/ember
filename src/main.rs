@@ -7887,6 +7887,8 @@ impl eframe::App for TerminalApp {
             }
         }
 
+        self.sync_organism_window_activity();
+
         // Bookmark truth follows retained semantic records, not scrollback or
         // captured-output availability. The version-gated pass is O(1) on
         // static frames and scans only bookmarked sessions after a real deque

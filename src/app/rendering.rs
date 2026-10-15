@@ -4328,6 +4328,7 @@ impl TerminalApp {
         if self.ai_chat_panel.is_open {
             self.ai_chat_panel.show(ctx, &self.config);
         }
+        self.sync_organism_agent();
         // Palette `?` AI command suggestion: harvest the reply, render the
         // review card for its bound session, and apply an accept through the
         // same guarded prompt-write path as command correction. The generated

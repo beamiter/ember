@@ -29,6 +29,10 @@ claimed.
 - Full-scrollback search with auto-reveal navigation, bounded live refresh,
   selection-aware replace, and a continuous-grid
   [semantic command timeline](docs/jsh-semantic-executions.md) (OSC 133)
+- Search navigation refreshes changed output before moving, without reusing
+  old row coordinates when a match disappears or the active session changes
+- Closing Find stops the rest of that frame's search shortcuts, so a quick
+  Escape/Enter sequence cannot keep navigating an invisible search.
 - Failed semantic commands expose Fix, Explain, Retry, and Create Agent Task
   actions. Agent tasks retain the selected command's stable source identity,
   bounded C..D rendered-output snapshot and reported cwd. Experimental Codex
@@ -44,6 +48,13 @@ claimed.
   host's APT index or executable PATH where it can be, and an AI fallback only
   where command-context sharing is consented to. The engine is
   `jterm_core::command_correction`, shared with the sibling terminals
+- The Tasks sidebar distinguishes visible tasks from search matches. **Clear
+  filters** resets search and status filters; **Show selected task** restores a
+  filtered-out task's details while keeping the same selection. Press **Enter**
+  in task search to open the first matching task. Status filters include counts
+  for the current search.
+- Failed and waiting tasks show a reason preview in the list, with bounded full
+  details available on hover.
 - [Workflows](#workflows): saved command templates with named parameters, in
   TOML or YAML, opened with `Ctrl+Shift+M`. The rendered command is *inserted*
   at the prompt and never run for you. Discovery, both parsers, validation and
@@ -88,6 +99,13 @@ hovering holds its position. Calm retains a still body. Static keeps only the
 status card and disables the live body, hover greetings and periodic animation.
 The shared organism model remains the source of poses, body language, reactions
 and attention. Memory stays volatile.
+Shell Agent work, review, completion and cancellation feed the same local life
+model. Repeated frames do not repeat a phase, and enabling the companion does
+not replay phases observed while it was disabled.
+Agent-run commands receive quiet acknowledgments; commands typed by the user
+retain the companion's ordinary celebration and concern.
+Known running commands in other local shell panes also keep the window's life
+clock from counting that work as rest, without changing the focused pane's pose.
 In Normal mode, the existing bottom companion remains available.
 
 ### Chat mode (opt-in)

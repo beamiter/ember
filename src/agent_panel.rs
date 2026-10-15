@@ -651,6 +651,17 @@ impl AgentPanel {
         self.is_open && self.session.is_some()
     }
 
+    /// Only lifecycle metadata crosses into the ambient companion.
+    pub(crate) fn organism_state(&self) -> (Option<AgentState>, bool) {
+        (
+            self.session
+                .as_ref()
+                .filter(|_| self.is_open)
+                .map(|session| session.state()),
+            self.loading,
+        )
+    }
+
     /// Seal a task whose stable terminal binding disappeared. Keep the
     /// transcript and source provenance visible for review, but stop model
     /// work and reject every deferred PTY effect.
