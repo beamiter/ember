@@ -23,6 +23,13 @@ pub(crate) enum PromptFillEnterLatch {
     AwaitingRelease,
 }
 
+/// Optional mouse controls must not bypass a still-owned confirming Enter.
+/// This is separate from native keyboard/mouse admission: Ctrl+C and ordinary
+/// terminal gestures keep their existing routing while a recall key is held.
+pub(crate) fn chat_controls_allow_enter_state(down: bool, latch: PromptFillEnterLatch) -> bool {
+    !down && latch == PromptFillEnterLatch::Idle
+}
+
 /// Keep the physical confirming key owned until release. Repeat must not
 /// become a shell Enter merely because the picker disappeared after filling.
 fn route_prompt_fill_enter_key(
@@ -2810,6 +2817,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chat_controls_wait_for_a_focused_release_of_recall_enter() {
+        let mut down = false;
+        let mut latch = PromptFillEnterLatch::Idle;
+        assert!(chat_controls_allow_enter_state(down, latch));
+        let mut press = vec![workflow_enter(true, false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut press);
+        assert!(!chat_controls_allow_enter_state(down, latch));
+        claim_prompt_fill_enter(down, &mut latch);
+        assert_eq!(latch, PromptFillEnterLatch::Held);
+        let interrupt = egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: Some(egui::Key::C),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let mut native_events = vec![interrupt.clone()];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut native_events);
+        assert_eq!(
+            native_events,
+            vec![interrupt],
+            "native Ctrl+C stays available"
+        );
+        let mut blur = vec![
+            egui::Event::WindowFocused(false),
+            workflow_enter(false, false),
+        ];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut blur);
+        assert_eq!(latch, PromptFillEnterLatch::AwaitingRelease);
+        assert!(!chat_controls_allow_enter_state(down, latch));
+        assert!(!chat_controls_allow_enter_state(false, latch));
+        let mut refocus = vec![
+            egui::Event::WindowFocused(true),
+            workflow_enter(true, false),
+        ];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut refocus);
+        assert!(!chat_controls_allow_enter_state(down, latch));
+        let mut release = vec![workflow_enter(false, false)];
+        track_prompt_fill_enter(&mut down, &mut latch, &mut release);
+        assert!(chat_controls_allow_enter_state(down, latch));
     }
 
     #[test]

@@ -248,6 +248,12 @@ impl TerminalRenderer {
         enabled: bool,
     ) -> bool {
         use crate::terminal::ChatInputAction;
+        let enabled = enabled && self.chat_controls_enabled;
+        if !enabled {
+            // Once interrupted, the old physical press cannot revive merely
+            // because Enter is released before the mouse button is released.
+            self.chat_pressed_action = None;
+        }
         let Some(record) = terminal.command_records().back() else {
             return false;
         };
@@ -492,6 +498,7 @@ mod tests {
         );
         renderer.block_mode = true;
         renderer.chat_mode = true;
+        renderer.chat_controls_enabled = true;
         renderer.chat_native_owner = Some((7, 7));
         renderer.gpu_rendering = false;
         renderer
@@ -791,6 +798,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chat_control_interruption_retires_press_until_a_fresh_click() {
+        let ctx = egui::Context::default();
+        let mut renderer = renderer();
+        renderer.font_size = 16.0;
+        renderer.char_width = 9.6;
+        renderer.line_height = 22.4;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 800.0));
+        let (cols, rows) = renderer.grid_dimensions(screen.size());
+        let mut terminal = TerminalState::new(cols, rows);
+        prompt(&mut terminal);
+        let mut policy = ProjectionPolicy::new();
+        policy.set_chat_mode(true);
+        policy.set_block_chrome(true, 0);
+        let view = renderer.projected_viewport_with_state(
+            &mut terminal,
+            &policy,
+            &mut ProjectionViewState::new(),
+        );
+        let content = renderer.layout_rects(screen).0;
+        let row = view.chat_composer_rows().unwrap().end - 1;
+        let footer =
+            row_rect(content, row..row + 1, renderer.line_height).shrink2(egui::vec2(8.0, 1.0));
+        let pointer = egui::pos2(footer.right() - 24.0, footer.center().y);
+        let mut frame = |enabled, pressed: Option<bool>| {
+            renderer.chat_controls_enabled = enabled;
+            let mut events = vec![egui::Event::PointerMoved(pointer)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    renderer.draw_chat_controls(ui, &terminal, &view, content, true);
+                },
+            );
+            output.textures_delta.clear();
+            renderer.chat_input_action.take()
+        };
+        assert!(frame(true, None).is_none());
+        assert!(frame(true, Some(true)).is_none());
+        assert!(frame(false, None).is_none());
+        assert!(
+            frame(true, Some(false)).is_none(),
+            "old press must stay retired"
+        );
+        assert!(frame(false, Some(true)).is_none());
+        assert!(
+            frame(true, Some(false)).is_none(),
+            "blocked press cannot activate later"
+        );
+        assert!(frame(true, Some(true)).is_none());
+        assert!(
+            frame(true, Some(false)).is_some(),
+            "fresh click remains available"
+        );
     }
 
     #[test]

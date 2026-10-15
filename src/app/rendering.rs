@@ -2262,6 +2262,11 @@ impl TerminalApp {
         // from accepting input beneath the newly opened surface.
         let interaction_enabled = interaction_enabled && !self.terminal_input_blocked(ctx);
         let terminal_interaction_enabled = interaction_enabled && !workspace_drag_active;
+        let chat_controls_enabled = super::input::chat_controls_allow_enter_state(
+            self.prompt_fill_enter_down,
+            self.prompt_fill_enter_latch,
+        );
+        self.renderer.chat_controls_enabled = chat_controls_enabled;
         let available_rect = ui.available_rect_before_wrap();
         // Keep the focused pane's geometry current even in single-pane mode,
         // so split commands can validate the resulting child sizes before
@@ -2372,6 +2377,7 @@ impl TerminalApp {
                     // per-pane 链接缓存:仅当 grid 或滚动变化时重建,避免每帧重做
                     // 链接检测(含逐行 String 分配)。失效条件与单窗格路径一致。
                     let renderer = &mut self.pane_renderers[pane_idx];
+                    renderer.chat_controls_enabled = chat_controls_enabled;
                     renderer.chat_native_owner = session
                         .shell
                         .foreground_pgid()
@@ -2738,7 +2744,13 @@ impl TerminalApp {
                     .filter_map(|renderer| renderer.chat_input_action.take()),
             )
             .collect();
-        if terminal_interaction_enabled && self.config.chat_mode_enabled() {
+        if terminal_interaction_enabled
+            && self.config.chat_mode_enabled()
+            && super::input::chat_controls_allow_enter_state(
+                self.prompt_fill_enter_down,
+                self.prompt_fill_enter_latch,
+            )
+        {
             let mouse_barrier = self
                 .terminal_mouse_capture
                 .as_ref()

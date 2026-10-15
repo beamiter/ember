@@ -1300,6 +1300,8 @@ pub struct TerminalRenderer {
     pub block_mode: bool,
     /// Distinct conversation presentation; never changes terminal input ownership.
     pub chat_mode: bool,
+    /// App-level optional-control admission; never gates native terminal input.
+    pub chat_controls_enabled: bool,
     /// Same-frame explicit input action; target identity must be revalidated by the app.
     pub chat_input_action: Option<(usize, crate::terminal::ChatInputAction, i32)>,
     /// Native shell/foreground identity supplied by the owning session.
@@ -1467,6 +1469,7 @@ impl TerminalRenderer {
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             block_mode: true,
             chat_mode: false,
+            chat_controls_enabled: false,
             chat_input_action: None,
             chat_native_owner: None,
             chat_pressed_action: None,
