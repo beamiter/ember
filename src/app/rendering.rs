@@ -815,16 +815,62 @@ fn block_workspace_control(
         .on_disabled_hover_text(tooltip)
 }
 
+/// Only advertise a binding when the keyboard action has the same semantics.
+/// Review/Fill prompt and live navigation deliberately have no guessed aliases.
+fn block_workspace_shortcut(
+    action: &BlockWorkspaceAction,
+    keybindings: &crate::keybindings::KeyBindings,
+) -> Option<String> {
+    use crate::block_mode::BlockMenuAction as Target;
+    let command = match action {
+        BlockWorkspaceAction::Command(command) => command.to_string(),
+        BlockWorkspaceAction::Target(target) => match target {
+            Target::CopyCommands => "block:copy_command",
+            Target::CopyOutputs => "block:copy_output",
+            Target::CopyBlocks => "block:copy_block",
+            Target::CopyMarkdown => "block:copy_markdown",
+            Target::ToggleBookmark => "block:toggle_bookmark",
+            Target::Search => "block:search",
+            _ => return None,
+        }
+        .to_owned(),
+        _ => return None,
+    };
+    let labels = keybindings.pretty_bindings_for(&command);
+    (!labels.is_empty()).then(|| crate::review_text::visible_bounded(&labels.join(" / "), 96))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn block_workspace_menu_item(
     ui: &mut egui::Ui,
     focus: &mut BlockWorkspaceFocus,
+    keybindings: &crate::keybindings::KeyBindings,
     action: &mut Option<BlockWorkspaceAction>,
     label: &str,
     enabled: bool,
     tooltip: &str,
     choice: BlockWorkspaceAction,
 ) {
-    if block_workspace_control(ui, focus, label, enabled, tooltip).clicked() {
+    let shortcut = block_workspace_shortcut(&choice, keybindings);
+    let response = ui
+        .push_id(label, |ui| {
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(label)
+                    .shortcut_text(shortcut.unwrap_or_default())
+                    .min_size(egui::vec2(0.0, 24.0)),
+            )
+        })
+        .inner;
+    focus.controls.push(response.id);
+    if response.enabled() {
+        focus.control_rects.push(response.rect);
+    }
+    if response
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip)
+        .clicked()
+    {
         *action = Some(choice);
         ui.close();
     }
@@ -833,6 +879,7 @@ fn block_workspace_menu_item(
 fn block_workspace_selection_menu(
     ui: &mut egui::Ui,
     focus: &mut BlockWorkspaceFocus,
+    keybindings: &crate::keybindings::KeyBindings,
     snapshot: &BlockWorkspaceSnapshot,
     action: &mut Option<BlockWorkspaceAction>,
 ) {
@@ -841,6 +888,7 @@ fn block_workspace_selection_menu(
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         "Review selected blocks",
         valid,
@@ -887,6 +935,7 @@ fn block_workspace_selection_menu(
         block_workspace_menu_item(
             ui,
             focus,
+            keybindings,
             action,
             label,
             valid,
@@ -895,12 +944,13 @@ fn block_workspace_selection_menu(
         );
     }
     ui.separator();
-    block_workspace_menu_item(ui, focus, action, "Fill prompt", valid && !snapshot.read_only,
+    block_workspace_menu_item(ui, focus, keybindings, action, "Fill prompt", valid && !snapshot.read_only,
         "Insert selected commands at an empty prompt for review. Nothing is executed. Safe replay checks still apply.",
         BlockWorkspaceAction::Review);
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         if snapshot.bookmarked {
             "Remove bookmark"
@@ -911,7 +961,7 @@ fn block_workspace_selection_menu(
         "Toggle the bookmark on the active block in this selection",
         BlockWorkspaceAction::Target(Target::ToggleBookmark),
     );
-    block_workspace_menu_item(ui, focus, action,
+    block_workspace_menu_item(ui, focus, keybindings, action,
         if snapshot.collapsed { "Expand active output" } else { "Collapse active output" },
         valid && (snapshot.collapsed || snapshot.collapse_available),
         "Collapse or expand exact retained output for the active block; terminal output is preserved",
@@ -923,6 +973,7 @@ fn block_workspace_selection_menu(
         block_workspace_menu_item(
             ui,
             focus,
+            keybindings,
             action,
             label,
             valid,
@@ -934,6 +985,7 @@ fn block_workspace_selection_menu(
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         "Deselect blocks",
         true,
@@ -943,6 +995,7 @@ fn block_workspace_selection_menu(
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         "Return to live terminal",
         true,
@@ -954,6 +1007,7 @@ fn block_workspace_selection_menu(
 fn block_workspace_overflow(
     ui: &mut egui::Ui,
     focus: &mut BlockWorkspaceFocus,
+    keybindings: &crate::keybindings::KeyBindings,
     snapshot: &BlockWorkspaceSnapshot,
     action: &mut Option<BlockWorkspaceAction>,
 ) {
@@ -1013,6 +1067,7 @@ fn block_workspace_overflow(
         block_workspace_menu_item(
             ui,
             focus,
+            keybindings,
             action,
             label,
             !needs_blocks || snapshot.completed_count > 0,
@@ -1023,6 +1078,7 @@ fn block_workspace_overflow(
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         "Return to live terminal",
         true,
@@ -1040,6 +1096,7 @@ fn block_workspace_overflow(
         block_workspace_menu_item(
             ui,
             focus,
+            keybindings,
             action,
             label,
             snapshot.completed_count > 0,
@@ -1048,12 +1105,13 @@ fn block_workspace_overflow(
         );
     }
     ui.separator();
-    block_workspace_menu_item(ui, focus, action, "Clear completed blocks", snapshot.completed_count > 0,
+    block_workspace_menu_item(ui, focus, keybindings, action, "Clear completed blocks", snapshot.completed_count > 0,
         "Clear completed block cards in this pane. Terminal text remains, and Undo clear restores the cards.",
         BlockWorkspaceAction::Command(Command::BlockClear));
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         "Undo clear",
         true,
@@ -1064,6 +1122,7 @@ fn block_workspace_overflow(
     block_workspace_menu_item(
         ui,
         focus,
+        keybindings,
         action,
         "Block appearance settings",
         true,
@@ -1079,6 +1138,7 @@ fn draw_block_workspace(
     rect: egui::Rect,
     snapshot: &BlockWorkspaceSnapshot,
     focus: &mut BlockWorkspaceFocus,
+    keybindings: &crate::keybindings::KeyBindings,
     accent: egui::Color32,
     font_size: f32,
 ) -> Option<BlockWorkspaceAction> {
@@ -1170,7 +1230,7 @@ fn draw_block_workspace(
                 .style(crate::theme::configure_popup_style)
                 .show(|ui| {
                     crate::theme::configure_popup_text(ui, font_size);
-                    block_workspace_overflow(ui, focus, snapshot, &mut action);
+                    block_workspace_overflow(ui, focus, keybindings, snapshot, &mut action);
                 });
             if roomy {
                 let status = if snapshot.in_history {
@@ -1238,7 +1298,7 @@ fn draw_block_workspace(
                 .style(crate::theme::configure_popup_style)
                 .show(|ui| {
                     crate::theme::configure_popup_text(ui, font_size);
-                    block_workspace_selection_menu(ui, focus, snapshot, &mut action);
+                    block_workspace_selection_menu(ui, focus, keybindings, snapshot, &mut action);
                 });
             if !compact
                 && block_workspace_control(
@@ -1307,7 +1367,7 @@ fn draw_block_workspace(
                 hint.to_owned()
             };
             ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate())
-                .on_hover_text("Click a command header or its left stripe to select it, then use Actions above; right-click opens the menu directly. Ctrl+↑ selects the previous block; Shift+F10 opens its full menu. Shift-click extends a range; Ctrl+Shift-click toggles a block. Block cards require OSC 133 shell integration.");
+                .on_hover_text("Click a command header or its left stripe to select it, then use Actions above; right-click opens the menu directly. The More menu shows your current navigation shortcuts. Shift-click extends a range; Ctrl+Shift-click toggles a block. Block cards require OSC 133 shell integration.");
         }
     }
     action
@@ -2184,6 +2244,7 @@ impl TerminalApp {
             rect,
             &snapshot,
             &mut focus,
+            &self.keybindings,
             accent,
             self.config.font_size,
         );
@@ -6109,6 +6170,7 @@ mod tests {
                                 rect,
                                 &snapshot,
                                 &mut focus,
+                                &crate::keybindings::KeyBindings::default_bindings(),
                                 egui::Color32::WHITE,
                                 crate::config::DEFAULT_FONT_SIZE,
                             ),
@@ -6155,6 +6217,7 @@ mod tests {
                 rect,
                 &snapshot,
                 &mut focus,
+                &crate::keybindings::KeyBindings::default_bindings(),
                 egui::Color32::WHITE,
                 crate::config::DEFAULT_FONT_SIZE,
             );
@@ -6844,7 +6907,7 @@ mod tests {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BLOCK_WORKSPACE_HEIGHT), egui::Sense::hover());
                     ui.painter().rect_filled(rect, 0.0, crate::theme::Theme::rgb_to_color32(theme.ui.panel_bg));
                     let mut focus = BlockWorkspaceFocus::default();
-                    draw_block_workspace(ui, rect, &snapshot, &mut focus, accent, crate::config::DEFAULT_FONT_SIZE);
+                    draw_block_workspace(ui, rect, &snapshot, &mut focus, &crate::keybindings::KeyBindings::default_bindings(), accent, crate::config::DEFAULT_FONT_SIZE);
                     if name == "wide-menu" && pass > 0 {
                         // Toolbar menu items are real controls outside the toolbar;
                         // their targets must remain within the popup's viewport.
@@ -6921,5 +6984,58 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn block_menu_shortcuts_follow_rebinding_and_unbinding() {
+        let action = BlockWorkspaceAction::Target(crate::block_mode::BlockMenuAction::CopyOutputs);
+        let mut bindings = crate::keybindings::KeyBindings::new();
+        assert_eq!(block_workspace_shortcut(&action, &bindings), None);
+        bindings
+            .bindings
+            .insert("ctrl+alt+o".into(), "block:copy_output".into());
+        assert_eq!(
+            block_workspace_shortcut(&action, &bindings),
+            Some(
+                bindings
+                    .pretty_bindings_for("block:copy_output")
+                    .join(" / ")
+            )
+        );
+        bindings.bindings.clear();
+        bindings
+            .bindings
+            .insert("ctrl+shift+y".into(), "block:copy_output".into());
+        bindings
+            .bindings
+            .insert("ctrl+alt+x".into(), "block:copy_output".into());
+        assert_eq!(
+            block_workspace_shortcut(&action, &bindings),
+            Some(
+                bindings
+                    .pretty_bindings_for("block:copy_output")
+                    .join(" / ")
+            )
+        );
+        bindings.bindings.clear();
+        assert_eq!(block_workspace_shortcut(&action, &bindings), None);
+    }
+
+    #[test]
+    fn block_menu_shortcuts_do_not_claim_non_equivalent_review_or_live_actions() {
+        let bindings = crate::keybindings::KeyBindings::default_bindings();
+        for action in [
+            BlockWorkspaceAction::Review,
+            BlockWorkspaceAction::Live,
+            BlockWorkspaceAction::Deselect,
+            BlockWorkspaceAction::Target(crate::block_mode::BlockMenuAction::Reinput),
+            BlockWorkspaceAction::Target(crate::block_mode::BlockMenuAction::CollapseOutput),
+        ] {
+            assert_eq!(block_workspace_shortcut(&action, &bindings), None);
+        }
+        let action = BlockWorkspaceAction::Command(crate::keybindings::Command::BlockSearchToggle);
+        assert_eq!(
+            block_workspace_shortcut(&action, &bindings),
+            Some(bindings.pretty_bindings_for("block:search").join(" / "))
+        );
     }
 }
