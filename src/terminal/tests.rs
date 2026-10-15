@@ -9090,3 +9090,105 @@ fn chat_review_word_and_links_do_not_wrap_from_history_into_the_dock() {
     }
     assert!(checked > 0);
 }
+
+#[test]
+fn shared_session_parity_corpus_uses_native_owner_and_projection() {
+    use jterm_core::session_parity::{chunks, fixtures, Completion, Expected, CHUNKINGS};
+    for fixture in fixtures() {
+        for chunking in CHUNKINGS {
+            let mut terminal = TerminalState::new(80, 24);
+            let mut completed = Vec::new();
+            let mut identities = std::collections::HashMap::new();
+            let mut view_state = ProjectionViewState::new();
+            for (step_index, step) in fixture.steps.iter().enumerate() {
+                let context = format!("{} {chunking:?} checkpoint {step_index}", fixture.id);
+                for bytes in chunks(step.pty.as_bytes(), chunking) {
+                    terminal.process_input(bytes);
+                }
+                completed.extend(terminal.take_completed_command_events().into_iter().map(
+                    |event| {
+                        Completion {
+                            id: event.id.clone(),
+                            command: event
+                                .command
+                                .clone()
+                                .expect("fixture supplies exact command"),
+                            exit_code: event.exit_code,
+                        }
+                    },
+                ));
+                let running_id = terminal
+                    .command_records()
+                    .back()
+                    .filter(|record| !record.complete && record.state == CommandState::Running)
+                    .map(|record| record.id.clone());
+                let draft_text = step.expected.draft_text.as_ref().map(|draft| {
+                    let row: String = terminal.grid[terminal.get_cursor_pos().0]
+                        .iter()
+                        .filter(|cell| !cell.flags.wide_continuation())
+                        .map(|cell| cell.character)
+                        .collect();
+                    // Ignore only native grid padding; the corpus retains the prompt space.
+                    assert_eq!(
+                        terminal.get_cursor_pos().1,
+                        draft
+                            .chars()
+                            .map(crate::char_width::cached_char_width)
+                            .sum::<usize>(),
+                        "{context}: draft cursor"
+                    );
+                    row.trim_end().to_owned()
+                });
+                let mut expected = step.expected.clone();
+                expected.draft_text = expected.draft_text.map(|text| text.trim_end().to_owned());
+                let observed = Expected {
+                    draft_text,
+                    surface: format!("{:?}", terminal.chat_surface()).to_lowercase(),
+                    completed: completed.clone(),
+                    running_id,
+                };
+                assert_eq!(observed, expected, "{context}");
+                for record in terminal.command_records() {
+                    if let Some(previous) = identities.insert(record.id.clone(), record.sequence) {
+                        assert_eq!(
+                            previous, record.sequence,
+                            "{context}: local identity changed"
+                        );
+                    }
+                }
+                // Real presentation switches must not edit shell-owned draft cells,
+                // completion records, cursor, or local command identity.
+                let grid = format!("{:?}", terminal.grid.to_vec());
+                let cursor = terminal.get_cursor_pos();
+                let records = format!("{:?}", terminal.command_records());
+                for mode in [2, 0, 1, 2] {
+                    let mut policy = ProjectionPolicy::new();
+                    policy.set_block_spacing(mode != 0);
+                    policy.set_block_chrome(mode != 0, 0);
+                    policy.set_chat_mode(mode == 2);
+                    let _view = terminal.projected_viewport_with_state(
+                        HistoryProjection::identity(),
+                        mode != 0,
+                        &policy,
+                        &mut view_state,
+                    );
+                    assert_eq!(
+                        format!("{:?}", terminal.grid.to_vec()),
+                        grid,
+                        "{context}: mode {mode} changed cells"
+                    );
+                    assert_eq!(terminal.get_cursor_pos(), cursor, "{context}");
+                    assert_eq!(
+                        format!("{:?}", terminal.command_records()),
+                        records,
+                        "{context}"
+                    );
+                    assert!(
+                        terminal.take_completed_command_events().is_empty(),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+}

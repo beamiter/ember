@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use ember::terminal::TerminalState;
 use std::hint::black_box;
 
@@ -49,22 +49,31 @@ fn bench_ansi_parsing(c: &mut Criterion) {
 fn bench_grid_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("grid_operations");
 
-    group.bench_function("scroll_down", |b| {
+    // Measure an offset update from a known interior history position, not
+    // repeated clamping at the top/bottom. Setup and destruction are untimed.
+    let scroll_fixture = || {
         let mut terminal = TerminalState::new(80, 24);
-        // Fill with data first
-        terminal.process_batch(&vec![b'X'; 2000]);
-        b.iter(|| {
-            terminal.scroll(black_box(-3));
-        });
-    });
+        terminal.process_batch(&b"history line\r\n".repeat(128));
+        assert!(terminal.scrollback_len() >= 64);
+        terminal.scroll_offset = 32;
+        terminal
+    };
+    for (name, delta, expected_offset) in [("scroll_down", -3, 29), ("scroll_up", 3, 35)] {
+        let mut probe = scroll_fixture();
+        probe.scroll(delta);
+        assert_eq!(probe.scroll_offset, expected_offset);
 
-    group.bench_function("scroll_up", |b| {
-        let mut terminal = TerminalState::new(80, 24);
-        terminal.process_batch(&vec![b'X'; 2000]);
-        b.iter(|| {
-            terminal.scroll(black_box(3));
+        group.bench_function(name, |b| {
+            b.iter_batched_ref(
+                scroll_fixture,
+                |terminal| {
+                    terminal.scroll(black_box(delta));
+                    black_box(terminal.scroll_offset)
+                },
+                BatchSize::PerIteration,
+            );
         });
-    });
+    }
 
     group.bench_function("get_visible_cells", |b| {
         let mut terminal = TerminalState::new(80, 24);
@@ -109,39 +118,11 @@ fn bench_grid_operations(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark string conversion
-fn bench_string_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("string_operations");
-
-    // Benchmark the optimized key_to_string (now returns &'static str)
-    group.bench_function("key_to_string", |b| {
-        use egui::Key;
-        let keys = vec![
-            Key::A,
-            Key::B,
-            Key::F1,
-            Key::Enter,
-            Key::Escape,
-            Key::ArrowUp,
-            Key::Home,
-            Key::Delete,
-        ];
-        b.iter(|| {
-            for key in &keys {
-                // This would call the internal function if exported
-                black_box(key);
-            }
-        });
-    });
-
-    group.finish();
-}
-
 /// Benchmark link detection
 fn bench_link_detection(c: &mut Criterion) {
     let mut group = c.benchmark_group("link_detection");
 
-    let text_with_links = vec![
+    let text_with_links = [
         "https://github.com/rust-lang/rust",
         "Visit http://example.com for more info",
         "/usr/local/bin/cargo",
@@ -150,12 +131,11 @@ fn bench_link_detection(c: &mut Criterion) {
 
     group.bench_function("detect_links", |b| {
         use ember::link::{LinkDetectionConfig, LinkDetector};
-        let _detector = LinkDetector::new(LinkDetectionConfig::default());
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
 
         b.iter(|| {
-            for text in &text_with_links {
-                black_box(text);
-                // Would call detector.detect_links if the API was exposed
+            for (line_idx, text) in text_with_links.iter().enumerate() {
+                black_box(detector.detect_links_in_line(black_box(text), black_box(line_idx)));
             }
         });
     });
@@ -167,7 +147,6 @@ criterion_group!(
     benches,
     bench_ansi_parsing,
     bench_grid_operations,
-    bench_string_operations,
     bench_link_detection
 );
 
