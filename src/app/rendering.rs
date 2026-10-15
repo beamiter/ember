@@ -2829,7 +2829,10 @@ impl TerminalApp {
                 .search_state
                 .projection_diagnostic_is_current(&session_id, policy_revision)
             {
-                self.reveal_current_search_match();
+                // A mode/chrome change invalidates this explanation, not the
+                // user's reading position. Only explicit search navigation
+                // may reveal a match; maintenance must preserve Return Live.
+                self.search_state.clear_projection_diagnostic();
             }
         }
         let (search_needs_refresh, delayed_refresh) = if self.search_state.is_open {
