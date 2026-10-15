@@ -64,6 +64,8 @@ pub enum TaskSidebarAction {
 pub struct TaskSidebarState {
     pub selected: Option<TaskId>,
     pub pending_action: Option<TaskSidebarAction>,
+    dashboard_query: String,
+    dashboard_view: jterm_core::agent_task::DashboardView,
     pending_creation: Option<PendingTaskCreation>,
     follow_up_drafts: HashMap<TaskId, String>,
 }
@@ -781,6 +783,75 @@ impl TerminalApp {
             })
             .collect();
         sort_rows(&mut rows);
+        let has_tasks = !rows.is_empty();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.task_sidebar.dashboard_query)
+                .hint_text("Search tasks, providers or repositories")
+                .char_limit(256),
+        );
+        ui.horizontal_wrapped(|ui| {
+            use jterm_core::agent_task::DashboardView;
+            for (view, label) in [
+                (DashboardView::All, "All"),
+                (DashboardView::NeedsAttention, "Needs you"),
+                (DashboardView::Running, "Running"),
+                (DashboardView::NotStarted, "Not started"),
+                (DashboardView::Review, "Review"),
+                (DashboardView::Finished, "Finished"),
+            ] {
+                ui.selectable_value(&mut self.task_sidebar.dashboard_view, view, label);
+            }
+        });
+        let activity: HashMap<_, _> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id,
+                    jterm_core::agent_task::DashboardActivity {
+                        has_agent_terminal: row.has_agent_terminal,
+                        has_validation_terminal: row.has_validation_terminal,
+                        has_active_agent_stream: row.has_active_agent_stream,
+                        native_preparing: row.native_preparing,
+                    },
+                )
+            })
+            .collect();
+        let dashboard = jterm_core::agent_task::DashboardSnapshot::project(
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != TaskStatus::Archived),
+            |id| activity.get(&id).copied().unwrap_or_default(),
+            jterm_core::agent_task::DashboardFilter {
+                text: &self.task_sidebar.dashboard_query,
+                view: self.task_sidebar.dashboard_view,
+                ..Default::default()
+            },
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "{} tasks · {} need you · {} awaiting approval",
+                dashboard.counts.total,
+                dashboard.counts.attention,
+                dashboard.counts.pending_approval,
+            ))
+            .small()
+            .color(ui.visuals().weak_text_color()),
+        );
+        let mut by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id, row)).collect();
+        let rows: Vec<_> = dashboard
+            .rows
+            .iter()
+            .filter_map(|row| by_id.remove(&row.id))
+            .collect();
+        if has_tasks && rows.is_empty() {
+            ui.label("No tasks match these filters.");
+            if ui.button("Clear filters").clicked() {
+                self.task_sidebar.dashboard_query.clear();
+                self.task_sidebar.dashboard_view = jterm_core::agent_task::DashboardView::All;
+            }
+            return;
+        }
 
         if rows.is_empty() {
             ui.add_space(8.0);
