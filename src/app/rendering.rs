@@ -98,7 +98,7 @@ fn history_picker_row(
         detail_rect,
         egui::Label::new(
             egui::RichText::new(format!("{status} · {cwd}"))
-                .size(10.0)
+                .size(crate::theme::workspace_font_size(ui))
                 .color(ui.visuals().weak_text_color()),
         )
         .selectable(false)
@@ -221,7 +221,7 @@ fn draw_history_picker(
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new("↑↓ Navigate · Enter Fill at Prompt · Esc Cancel")
-                            .size(10.0)
+                            .size(crate::theme::workspace_font_size(ui))
                             .color(ui.visuals().weak_text_color()),
                     )
                     .wrap(),
@@ -335,7 +335,7 @@ fn draw_workflow_picker(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new("↑↓ Navigate · Enter Select · Esc Cancel")
-                        .size(10.0)
+                        .size(crate::theme::workspace_font_size(ui))
                         .color(ui.visuals().weak_text_color()),
                 )
                 .wrap(),
@@ -426,7 +426,7 @@ fn workflow_picker_row(
             ),
             egui::Label::new(
                 egui::RichText::new(&tags)
-                    .size(10.0)
+                    .size(crate::theme::workspace_font_size(ui))
                     .color(ui.visuals().weak_text_color()),
             )
             .selectable(false)
@@ -443,7 +443,7 @@ fn workflow_picker_row(
         ),
         egui::Label::new(
             egui::RichText::new(&detail)
-                .size(10.0)
+                .size(crate::theme::workspace_font_size(ui))
                 .color(ui.visuals().weak_text_color()),
         )
         .selectable(false)
@@ -525,7 +525,7 @@ fn draw_workflow_args(
                                 egui::RichText::new(crate::workflow_picker::display_label(
                                     &state.workflow().description,
                                 ))
-                                .size(10.0),
+                                .size(crate::theme::workspace_font_size(ui)),
                             )
                             .wrap(),
                         );
@@ -536,7 +536,7 @@ fn draw_workflow_args(
                                 &state.workflow().command,
                             ))
                             .monospace()
-                            .size(10.0),
+                            .size(crate::theme::workspace_font_size(ui)),
                         )
                         .wrap(),
                     );
@@ -558,7 +558,7 @@ fn draw_workflow_args(
                                         } else {
                                             name
                                         })
-                                        .size(11.0),
+                                        .size(crate::theme::workspace_font_size(ui)),
                                     )
                                     .wrap(),
                                 );
@@ -570,7 +570,7 @@ fn draw_workflow_args(
                                                     &arg.description,
                                                 ),
                                             )
-                                            .size(9.0)
+                                            .size(crate::theme::workspace_font_size(ui))
                                             .color(ui.visuals().weak_text_color()),
                                         )
                                         .wrap(),
@@ -641,7 +641,7 @@ fn draw_workflow_args(
                         egui::RichText::new(
                             "Enter Insert at Prompt · Esc Cancel · * needs a value",
                         )
-                        .size(10.0)
+                        .size(crate::theme::workspace_font_size(ui))
                         .color(ui.visuals().weak_text_color()),
                     )
                     .wrap(),
@@ -1886,6 +1886,7 @@ impl TerminalApp {
                     drag_source: drag_source == Some(pane.session_idx),
                     drop_target: is_target,
                 },
+                self.config.font_size,
             );
         }
 
@@ -2279,7 +2280,7 @@ impl TerminalApp {
                 .iter()
                 .map(|pane| {
                     let content_rect = if multi_pane {
-                        crate::pane_header::split_header(pane.rect).1
+                        crate::pane_header::split_header(pane.rect, self.config.font_size).1
                     } else {
                         pane.rect
                     };
@@ -2328,7 +2329,7 @@ impl TerminalApp {
             // content rect,不会被标题栏挤偏一行。
             let pane_chrome: Vec<(Option<egui::Rect>, egui::Rect)> = panes
                 .iter()
-                .map(|pane| crate::pane_header::split_header(pane.rect))
+                .map(|pane| crate::pane_header::split_header(pane.rect, self.config.font_size))
                 .collect();
 
             // 为每个窗格渲染
@@ -3071,7 +3072,7 @@ impl TerminalApp {
                                             egui::RichText::new(
                                                 "Draft a shell command with the configured AI provider; the result is inserted for review only and never runs automatically",
                                             )
-                                            .size(10.0)
+                                            .size(crate::theme::workspace_font_size(ui))
                                             .color(ui.visuals().weak_text_color()),
                                         );
                                     });
@@ -3165,7 +3166,7 @@ impl TerminalApp {
                                         ui.label(egui::RichText::new(&cmd_info.name).strong());
                                         ui.label(
                                             egui::RichText::new(&cmd_info.description)
-                                                .size(10.0)
+                                                .size(crate::theme::workspace_font_size(ui))
                                                 .color(ui.visuals().weak_text_color()),
                                         );
                                     });
@@ -3191,7 +3192,7 @@ impl TerminalApp {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             let text =
-                                                egui::RichText::new(keybinding_str).size(10.0);
+                                                egui::RichText::new(keybinding_str).size(crate::theme::workspace_font_size(ui));
                                             ui.label(if bound {
                                                 text.color(egui::Color32::from_rgb(100, 150, 200))
                                             } else {
@@ -3243,7 +3244,7 @@ impl TerminalApp {
                             } else {
                                 "↑↓ Navigate  Enter Execute  Esc Cancel  ·  ? Ask AI"
                             })
-                            .size(10.0)
+                            .size(crate::theme::workspace_font_size(ui))
                             .color(ui.visuals().weak_text_color()),
                         );
                     });
@@ -3567,7 +3568,7 @@ impl TerminalApp {
                     // the keyboard highlight made the scrollbar describe just
                     // that slice, so pointer users could not jump to later
                     // results in a broad query.
-                    const BLOCK_SEARCH_ROW_HEIGHT: f32 = 40.0;
+                    let block_search_row_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 10.0;
                     let hit_count = if query_error.is_none() {
                         self.block_search.hits.len()
                     } else {
@@ -3580,7 +3581,7 @@ impl TerminalApp {
                         "↑↓ Navigate · Enter Jump · Esc Close"
                     } else { FULL_HELP };
                     let help_height = ui.painter().layout(
-                        help.to_owned(), egui::FontId::proportional(10.0),
+                        help.to_owned(), egui::FontId::proportional(crate::theme::workspace_font_size(ui)),
                         ui.visuals().weak_text_color(), ui.available_width(),
                     ).size().y;
                     let list_height = (ui.available_height() - help_height
@@ -3596,7 +3597,7 @@ impl TerminalApp {
                         // underneath it.
                         if scroll_to_selected && !block_search_pointer_moved {
                             let stride =
-                                BLOCK_SEARCH_ROW_HEIGHT + ui.spacing().item_spacing.y;
+                                block_search_row_height + ui.spacing().item_spacing.y;
                             scroll = scroll.vertical_scroll_offset(
                                 crate::block_mode::block_search_centered_scroll_offset(
                                     hit_count,
@@ -3608,7 +3609,7 @@ impl TerminalApp {
                         }
                         scroll.show_rows(
                             ui,
-                            BLOCK_SEARCH_ROW_HEIGHT,
+                            block_search_row_height,
                             hit_count,
                             |ui, row_range| {
                                 for idx in row_range {
@@ -3618,7 +3619,7 @@ impl TerminalApp {
                                     let is_selected = idx == selected_index;
                                     let width = ui.available_width();
                                     let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(width, BLOCK_SEARCH_ROW_HEIGHT),
+                                        egui::vec2(width, block_search_row_height),
                                         egui::Sense::hover(),
                                     );
                                     let bookmark_width = 30.0;
@@ -3708,7 +3709,7 @@ impl TerminalApp {
                                                     egui::Label::new(
                                                         egui::RichText::new(context)
                                                             .monospace()
-                                                            .size(10.0)
+                                                            .size(crate::theme::workspace_font_size(ui))
                                                             .color(weak),
                                                     )
                                                     .truncate(),
@@ -3862,7 +3863,7 @@ impl TerminalApp {
 
                     ui.separator();
                     let help_response = ui.add(egui::Label::new(
-                        egui::RichText::new(help).size(10.0)
+                        egui::RichText::new(help).size(crate::theme::workspace_font_size(ui))
                             .color(ui.visuals().weak_text_color()),
                     ).wrap()).on_hover_text(FULL_HELP);
                     help_response.widget_info(|| egui::WidgetInfo::labeled(
@@ -4492,7 +4493,7 @@ impl TerminalApp {
                     ui.label(
                         egui::RichText::new(message)
                             .color(text_color.gamma_multiply(fade_alpha))
-                            .size(12.0),
+                            .size(crate::theme::workspace_font_size(ui)),
                     );
                     if ssh_retry
                         && ui

@@ -1284,7 +1284,8 @@ impl TerminalApp {
     /// Sidebar tab 模式下的精简顶部栏：仅含侧边栏 toggle(☰)，用于预留顶部空间，
     /// 避免用浮动按钮直接覆盖终端内容造成 UI 干扰。
     pub fn render_sidebar_mode_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let tab_height = 30.0;
+        let font_size = self.config.font_size;
+        let tab_height = crate::theme::workspace_control_height(font_size) + 10.0;
         let tab_rect = egui::Rect::from_min_size(
             ui.cursor().left_top(),
             egui::vec2(ui.available_width(), tab_height),
@@ -1329,7 +1330,7 @@ impl TerminalApp {
             toggle_btn_rect.center(),
             egui::Align2::CENTER_CENTER,
             "☰",
-            egui::FontId::proportional(15.0),
+            egui::FontId::proportional(font_size.min(18.0)),
             if btn_hovered {
                 tb_active_text
             } else {
@@ -1371,7 +1372,7 @@ impl TerminalApp {
             pos_btn_rect.center(),
             egui::Align2::CENTER_CENTER,
             "⬒",
-            egui::FontId::proportional(14.0),
+            egui::FontId::proportional(font_size.min(18.0)),
             if pos_hovered {
                 tb_active_text
             } else {
@@ -1453,8 +1454,9 @@ impl TerminalApp {
     pub fn render_tab_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
         self.refresh_unseen_flags_for_visible_panes();
         let menu_snapshot = self.tab_menu_snapshot();
-        let tab_height = 30.0;
-        let close_btn_size = 14.0;
+        let font_size = self.config.font_size;
+        let tab_height = crate::theme::workspace_control_height(font_size) + 10.0;
+        let close_btn_size = font_size.max(14.0);
         let tab_rect = egui::Rect::from_min_size(
             ui.cursor().left_top(),
             egui::vec2(ui.available_width(), tab_height),
@@ -1492,7 +1494,7 @@ impl TerminalApp {
         let base_left_margin: f32 = 5.0;
         // 顶栏左侧始终预留两个控件位：☰ 侧边栏开关 + ⬓ 标签栏位置切换。
         // 标签从这两个控件之后开始排布，避免遮挡。
-        let ctrl_btn_w: f32 = 28.0;
+        let ctrl_btn_w: f32 = font_size + 16.0;
         let left_margin: f32 = base_left_margin + ctrl_btn_w * 2.0 + 4.0;
         let reserved_right: f32 = 80.0; // "+"按钮 + 关闭窗口按钮 + margin
         let tab_clip_rect = egui::Rect::from_min_max(
@@ -1512,7 +1514,7 @@ impl TerminalApp {
             painter
                 .layout_no_wrap(
                     text.to_string(),
-                    egui::FontId::monospace(12.0),
+                    egui::FontId::monospace(font_size),
                     egui::Color32::WHITE,
                 )
                 .rect
@@ -1722,7 +1724,7 @@ impl TerminalApp {
                 sb_btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "☰",
-                egui::FontId::proportional(15.0),
+                egui::FontId::proportional(font_size.min(18.0)),
                 if self.sidebar.visible || sb_hovered {
                     tb_active_text
                 } else {
@@ -1749,7 +1751,7 @@ impl TerminalApp {
                 pos_btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "⬓",
-                egui::FontId::proportional(14.0),
+                egui::FontId::proportional(font_size.min(18.0)),
                 if pos_hovered {
                     tb_active_text
                 } else {
@@ -2148,7 +2150,7 @@ impl TerminalApp {
                     egui::pos2(text_left_x, tab_rect_item.center().y),
                     egui::Align2::LEFT_CENTER,
                     display_text,
-                    egui::FontId::monospace(12.0),
+                    egui::FontId::monospace(font_size),
                     if is_active {
                         tb_active_text
                     } else {
@@ -2308,7 +2310,7 @@ impl TerminalApp {
             plus_btn_rect.center(),
             egui::Align2::CENTER_CENTER,
             "+",
-            egui::FontId::monospace(14.0),
+            egui::FontId::monospace(font_size.min(18.0)),
             plus_text_color,
         );
 
@@ -2441,7 +2443,7 @@ impl TerminalApp {
                                 rect.size(),
                                 egui::TextEdit::singleline(&mut buf)
                                     .desired_width(rect.width() - 8.0)
-                                    .font(egui::FontId::monospace(12.0))
+                                    .font(egui::FontId::monospace(font_size))
                                     .hint_text("empty = clear custom name"),
                             );
                             r.request_focus();

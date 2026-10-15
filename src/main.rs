@@ -3481,7 +3481,7 @@ impl TerminalApp {
             .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(6.0))
             .show(root_ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     // Sessions 在两种 tab 栏布局下都可选：Top 模式下它是顶部
                     // tab 栏之外的一份纵向标签列表，而非替代品。
                     if ui
@@ -5419,6 +5419,10 @@ impl TerminalApp {
         // 这里克隆一份作为局部 ctx 供下游使用(Arc 引用计数,几乎零成本)。
         let ctx_owned = root_ui.ctx().clone();
         let ctx = &ctx_owned;
+        // Apply every frame, including startup, hot reload and shortcut zoom.
+        // Update the already-created root as well as future floating surfaces.
+        ctx.style_mut(|style| theme::configure_workspace_text(style, self.config.font_size));
+        theme::configure_workspace_text(root_ui.style_mut(), self.config.font_size);
 
         // Bars register their pane-promotion targets before CentralPanel runs.
         // They are frame-local geometry and must never survive a resize or a

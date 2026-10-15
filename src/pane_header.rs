@@ -15,10 +15,6 @@ use jterm_core::git_meta::RepoMeta;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// Height of the header strip. Deliberately smaller than a tab: it must cost
-/// at most one terminal row at typical font sizes.
-pub const PANE_HEADER_HEIGHT: f32 = 20.0;
-
 /// Probing `/proc` for every pane on every frame would be pure waste at 60 fps
 /// while telling the user nothing new. A command that finishes within this
 /// window is invisible either way.
@@ -210,16 +206,14 @@ pub struct PaneHeaderVisual<'a> {
 /// Header rect and the terminal content rect below it, for a pane occupying
 /// `pane_rect`. Panes too short to give up a row keep their full height and
 /// render no header, so a heavily split layout never loses its last line.
-pub fn split_header(pane_rect: Rect) -> (Option<Rect>, Rect) {
-    if pane_rect.height() < PANE_HEADER_HEIGHT * 3.0 {
+pub fn split_header(pane_rect: Rect, font_size: f32) -> (Option<Rect>, Rect) {
+    let height = crate::theme::workspace_control_height(font_size);
+    if pane_rect.height() < height * 3.0 {
         return (None, pane_rect);
     }
-    let header = Rect::from_min_size(
-        pane_rect.min,
-        Vec2::new(pane_rect.width(), PANE_HEADER_HEIGHT),
-    );
+    let header = Rect::from_min_size(pane_rect.min, Vec2::new(pane_rect.width(), height));
     let content = Rect::from_min_max(
-        egui::pos2(pane_rect.left(), pane_rect.top() + PANE_HEADER_HEIGHT),
+        egui::pos2(pane_rect.left(), pane_rect.top() + height),
         pane_rect.max,
     );
     (Some(header), content)
@@ -266,6 +260,7 @@ pub fn draw_pane_header(
     rect: Rect,
     theme: &Theme,
     visual: PaneHeaderVisual<'_>,
+    font_size: f32,
 ) {
     let accent = Theme::rgb_to_color32(theme.tabbar.active_border);
     let base_bg = Theme::rgb_to_color32(theme.tabbar.bg);
@@ -295,7 +290,7 @@ pub fn draw_pane_header(
         Stroke::new(1.0, fade(Theme::rgb_to_color32(theme.ui.border))),
     );
 
-    let font = FontId::proportional(11.0);
+    let font = FontId::proportional(crate::config::Config::clamp_font_size(font_size));
     let padding = 6.0;
     let mut cursor_x = rect.left() + padding;
     let center_y = rect.center().y;
@@ -306,8 +301,8 @@ pub fn draw_pane_header(
     let index_galley = painter.layout_no_wrap(index_text, font.clone(), fade(accent));
     let chip_width = index_galley.size().x + 8.0;
     let chip = Rect::from_min_size(
-        egui::pos2(cursor_x, center_y - PANE_HEADER_HEIGHT * 0.35),
-        Vec2::new(chip_width, PANE_HEADER_HEIGHT * 0.7),
+        egui::pos2(cursor_x, center_y - rect.height() * 0.35),
+        Vec2::new(chip_width, rect.height() * 0.7),
     );
     painter.rect_filled(
         chip,
@@ -527,14 +522,32 @@ mod tests {
     }
 
     #[test]
+    fn header_height_tracks_font_without_overlap_or_losing_a_tiny_pane() {
+        for font_size in [8.0, 14.0, 24.0, 48.0, 72.0] {
+            let height = crate::theme::workspace_control_height(font_size);
+            let pane = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, height * 4.0));
+            let (header, content) = split_header(pane, font_size);
+            let header = header.unwrap();
+            assert_eq!(header.height(), height);
+            assert_eq!(header.bottom(), content.top());
+            assert!(header.height() >= font_size + 8.0);
+            let tiny = Rect::from_min_size(pane.min, Vec2::new(100.0, height * 2.0));
+            assert_eq!(split_header(tiny, font_size), (None, tiny));
+        }
+    }
+
+    #[test]
     fn short_panes_keep_their_full_height_and_get_no_header() {
         let tall = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 300.0));
-        let (header, content) = split_header(tall);
+        let (header, content) = split_header(tall, 14.0);
         assert!(header.is_some());
-        assert_eq!(content.height(), 300.0 - PANE_HEADER_HEIGHT);
+        assert_eq!(
+            content.height(),
+            300.0 - crate::theme::workspace_control_height(14.0)
+        );
 
         let short = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 30.0));
-        let (header, content) = split_header(short);
+        let (header, content) = split_header(short, 14.0);
         assert!(header.is_none());
         assert_eq!(content, short);
     }

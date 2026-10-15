@@ -51,6 +51,31 @@ pub(crate) fn configure_popup_style(style: &mut egui::Style) {
     style.visuals.window_fill = style.visuals.panel_fill;
 }
 
+/// Workspace chrome uses the same egui logical points as TerminalRenderer.
+/// Physical pixel scaling remains egui's responsibility; do not multiply by DPI.
+#[allow(dead_code)]
+pub(crate) fn configure_workspace_text(style: &mut egui::Style, size: f32) {
+    let size = crate::config::Config::clamp_font_size(size);
+    for font in style.text_styles.values_mut() {
+        font.size = size;
+    }
+    if let Some(font) = style.override_font_id.as_mut() {
+        font.size = size;
+    }
+    // Explicit-height sidebar rows must accommodate the same labels as buttons.
+    style.spacing.interact_size.y = workspace_control_height(size);
+}
+
+#[allow(dead_code)]
+pub(crate) fn workspace_control_height(size: f32) -> f32 {
+    crate::config::Config::clamp_font_size(size) * 1.5 + 8.0
+}
+
+#[allow(dead_code)]
+pub(crate) fn workspace_font_size(ui: &egui::Ui) -> f32 {
+    egui::TextStyle::Body.resolve(ui.style()).size
+}
+
 /// Popup labels follow the configured terminal font without changing global UI typography.
 #[allow(dead_code)] // Shared with the binary popup builders.
 pub(crate) fn configure_popup_text(ui: &mut egui::Ui, size: f32) {
@@ -124,6 +149,58 @@ impl ThemeExt for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_font_and_control_height_follow_zoom_in_both_directions() {
+        let mut style = egui::Style::default();
+        for size in [8.0, 14.0, 32.0, 72.0, 14.0, 8.0] {
+            configure_workspace_text(&mut style, size);
+            assert!(style.text_styles.values().all(|font| font.size == size));
+            assert_eq!(
+                style.spacing.interact_size.y,
+                workspace_control_height(size)
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_labels_fit_scaled_rows_at_native_and_high_dpi() {
+        for dpi in [1.0, 2.0] {
+            let context = egui::Context::default();
+            context.set_pixels_per_point(dpi);
+            for size in [8.0, 14.0, 32.0, 72.0] {
+                let output = context.run_ui(Default::default(), |ui| {
+                    configure_workspace_text(ui.style_mut(), size);
+                    for text_style in [
+                        egui::TextStyle::Body,
+                        egui::TextStyle::Button,
+                        egui::TextStyle::Small,
+                        egui::TextStyle::Monospace,
+                    ] {
+                        let font = text_style.resolve(ui.style());
+                        assert_eq!(font.size, size);
+                        let galley = ui.painter().layout_no_wrap(
+                            "Sessions / project".into(),
+                            font,
+                            egui::Color32::WHITE,
+                        );
+                        assert!(galley.size().y <= ui.spacing().interact_size.y);
+                    }
+                    assert_eq!(workspace_font_size(ui), size);
+                    let plus = ui.painter().layout_no_wrap(
+                        "+".into(),
+                        egui::FontId::monospace(size.min(18.0)),
+                        egui::Color32::WHITE,
+                    );
+                    assert!(
+                        plus.size().x <= 25.0,
+                        "new-tab glyph must fit its exact hit width"
+                    );
+                });
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
 
     #[test]
     fn popup_surface_uses_effective_panel_color_instead_of_window_color() {

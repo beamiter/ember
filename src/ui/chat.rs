@@ -229,7 +229,7 @@ impl TerminalRenderer {
                         rect.right_center(),
                         egui::Align2::RIGHT_CENTER,
                         block_badge_display_text(&status),
-                        FontId::proportional(self.font_size * 0.76),
+                        FontId::proportional(self.font_size),
                         self.block_outcome_color(entry.outcome),
                     );
                 }
@@ -282,7 +282,7 @@ impl TerminalRenderer {
                     label_rect.left_center(),
                     egui::Align2::LEFT_CENTER,
                     "Shell  ·  Tab to complete  ·  Ctrl+C to interrupt",
-                    FontId::proportional(self.font_size * 0.73),
+                    FontId::proportional(self.font_size),
                     self.theme.terminal_foreground().gamma_multiply(0.50),
                 );
             }
@@ -299,7 +299,8 @@ impl TerminalRenderer {
                 .filter(|command| matches!(viewport.row_kind(command.rows.end), Some(crate::terminal::ProjectedRowKind::BlockSpacer { .. })))
                 .map(|command| {
                     let row = row_rect(content, command.rows.end..command.rows.end + 1, self.line_height).shrink2(egui::vec2(4.0, 1.0));
-                    let button = egui::Rect::from_min_size(row.min, egui::vec2((self.font_size * 6.0).min(row.width()), row.height()));
+                    let label_width = ui.painter().layout_no_wrap("Interrupt".into(), FontId::proportional(self.font_size), self.theme.terminal_foreground()).size().x + 12.0;
+                    let button = egui::Rect::from_min_size(row.min, egui::vec2((self.font_size * 6.0).max(label_width).min(row.width()), row.height()));
                     (ChatInputAction::Interrupt { sequence: record.sequence }, button, "Interrupt", "Send Ctrl+C to this terminal. Status changes only when the shell reports completion.")
                 })
         } else {
@@ -319,7 +320,7 @@ impl TerminalRenderer {
             .painter()
             .layout_no_wrap(
                 label.to_owned(),
-                FontId::proportional(self.font_size * 0.78),
+                FontId::proportional(self.font_size),
                 self.theme.terminal_foreground(),
             )
             .size();
@@ -349,10 +350,12 @@ impl TerminalRenderer {
                 |ui| {
                     ui.add_enabled_ui(can_send, |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(rect));
+                        ui.spacing_mut().interact_size.y = rect.height();
+                        ui.spacing_mut().button_padding.y = 0.0;
                         ui.put(
                             rect,
                             egui::Button::new(
-                                egui::RichText::new(label).size(self.font_size * 0.78),
+                                egui::RichText::new(label).size(self.font_size),
                             )
                             .small()
                             .truncate()
@@ -868,6 +871,73 @@ mod tests {
     }
 
     #[test]
+    fn default_metrics_keep_run_and_interrupt_visible_and_clickable() {
+        for size in [8.0, 16.0, 32.0, 72.0] {
+            for running in [false, true] {
+                let ctx = egui::Context::default();
+                let mut renderer = renderer();
+                renderer.font_size = size;
+                renderer.line_spacing = crate::config::Config::default().line_spacing;
+                ctx.run_ui(Default::default(), |ui| {
+                    renderer.sync_font_metrics(ui.ctx())
+                })
+                .drop_without_applying_deltas();
+                let screen =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1000.0));
+                let (cols, rows) = renderer.grid_dimensions(screen.size());
+                let mut terminal = TerminalState::new(cols, rows);
+                prompt(&mut terminal);
+                if running {
+                    terminal.process_input(b"\r\n\x1b]133;C\x07running");
+                }
+                let mut policy = ProjectionPolicy::new();
+                policy.set_chat_mode(true);
+                policy.set_block_chrome(true, 0);
+                let view = renderer.projected_viewport_with_state(
+                    &mut terminal,
+                    &policy,
+                    &mut ProjectionViewState::new(),
+                );
+                let content = renderer.layout_rects(screen).0;
+                let mut point = None;
+                for phase in 0..3 {
+                    let events = point.map_or_else(Vec::new, |pos| {
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: phase == 1,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    });
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            crate::theme::configure_workspace_text(ui.style_mut(), size);
+                            renderer.draw_chat_controls(ui, &terminal, &view, content, true);
+                        },
+                    );
+                    let hits = ctx.interactive_rects_last_pass();
+                    assert_eq!(hits.len(), 1, "size={size}, running={running}");
+                    point = Some(hits[0].center());
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == if running { "Interrupt" } else { "Run" })));
+                    output.drop_without_applying_deltas();
+                }
+                assert!(
+                    renderer.chat_input_action.is_some(),
+                    "size={size}, running={running}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn chat_run_button_stays_inside_narrow_composer_footer() {
         // Real egui allocation, paint clips, hit regions and pointer events.
         // ui.put's max_rect alone is not a hard bound for a wrapping Button.
@@ -879,8 +949,11 @@ mod tests {
                         ctx.set_pixels_per_point(dpi);
                         let mut renderer = renderer();
                         renderer.font_size = font;
-                        renderer.char_width = font * 0.6;
-                        renderer.line_height = font * 1.4;
+                        renderer.line_spacing = crate::config::Config::default().line_spacing;
+                        ctx.run_ui(Default::default(), |ui| {
+                            renderer.sync_font_metrics(ui.ctx())
+                        })
+                        .drop_without_applying_deltas();
                         let screen =
                             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
                         let pane = egui::Rect::from_min_size(
@@ -940,7 +1013,7 @@ mod tests {
                                         .painter()
                                         .layout_no_wrap(
                                             "Run".to_owned(),
-                                            FontId::proportional(font * 0.78),
+                                            FontId::proportional(font),
                                             Color32::WHITE,
                                         )
                                         .size();

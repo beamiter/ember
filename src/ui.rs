@@ -1660,6 +1660,14 @@ impl TerminalRenderer {
     }
 
     pub fn sync_font_metrics(&mut self, ctx: &egui::Context) {
+        // Chat's native Run/Interrupt labels share the terminal font size.
+        // Reserve their actual egui line box plus the footer's inset/padding,
+        // including when the GPU atlas has tighter ascent/descent metrics.
+        let control_line_height = if self.chat_mode {
+            ctx.fonts_mut(|fonts| fonts.row_height(&FontId::proportional(self.font_size))) + 4.0
+        } else {
+            0.0
+        };
         // When GPU rendering is active, derive cell size from the GPU atlas font
         // metrics (ascent + |descent| and advance width) which give tighter spacing
         // than egui's row_height (which includes extra leading).
@@ -1679,7 +1687,7 @@ impl TerminalRenderer {
                         self.char_width = cw;
                     }
                     if ch.is_finite() && ch > 0.0 {
-                        self.line_height = ch;
+                        self.line_height = ch.max(control_line_height);
                     }
                     return;
                 }
@@ -1698,7 +1706,7 @@ impl TerminalRenderer {
             self.char_width = char_width;
         }
 
-        let line_height = line_height * self.line_spacing.max(0.5);
+        let line_height = (line_height * self.line_spacing.max(0.5)).max(control_line_height);
 
         if line_height.is_finite() && line_height > 0.0 {
             self.line_height = line_height;
@@ -2583,7 +2591,7 @@ impl TerminalRenderer {
         line_height: f32,
     ) {
         let color = self.theme.terminal_foreground().gamma_multiply(0.72);
-        let font = FontId::monospace((self.font_size * 0.9).max(9.0));
+        let font = FontId::monospace(self.font_size);
         for summary in summaries {
             let (_, row_height) = snapped_span(content_rect.top(), summary.row, line_height);
             let y = content_rect.top() + summary.row as f32 * line_height + row_height * 0.5;
@@ -3733,7 +3741,7 @@ impl TerminalRenderer {
                     clip.left_center(),
                     egui::Align2::LEFT_CENTER,
                     parts.join(" · "),
-                    FontId::proportional((self.font_size * 0.78).min(height * 0.8).max(1.0)),
+                    FontId::proportional(self.font_size),
                     foreground.gamma_multiply(0.58),
                 );
             }
