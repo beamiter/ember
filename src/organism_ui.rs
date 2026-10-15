@@ -1428,12 +1428,30 @@ impl OrganismHost {
                 }
             }
         }
-        // Only existing shared attention deadlines. Ambient/body cadence and
-        // the one-shot typing return are already owned by the chrome host.
-        if let Some(delay) = snapshot.and_then(|value| value.wake_after(now)) {
-            ui.ctx()
-                .request_repaint_after(delay.max(Duration::from_millis(1)));
+        // Reconcile the same shared cadence as traditional chrome after this
+        // native body has accepted/expired attention. A dormant Block/Chat
+        // owner needs Full frames during a visit, not only its hold deadline.
+        if let Some(delay) = self.native_body_wake(policy, now, snapshot) {
+            ui.ctx().request_repaint_after(delay);
         }
+    }
+
+    fn native_body_wake(
+        &self,
+        policy: PresentationPolicy,
+        now: Duration,
+        snapshot: Option<LiveAttentionSnapshot>,
+    ) -> Option<Duration> {
+        if !policy.body_visible(now) {
+            return None;
+        }
+        next_live_wake(
+            policy,
+            now,
+            self.reaction_until,
+            self.owner_dormant(now),
+            snapshot,
+        )
     }
 
     /// Persistent status is part of the projected Block document, between
@@ -3544,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn native_body_has_no_widget_focus_or_additional_periodic_wake() {
+    fn native_body_reuses_live_wake_without_focus_or_additional_timer() {
         let source = include_str!("organism_ui.rs");
         let body = source
             .split("    fn draw_native_body(")
@@ -3553,6 +3571,8 @@ mod tests {
             .split("    fn draw_block_status(")
             .next()
             .unwrap();
+        assert!(body.contains("self.native_body_wake(policy, now, snapshot)"));
+        assert!(body.contains("next_live_wake("));
         for forbidden in [
             "ui.interact(",
             "request_focus(",
@@ -3569,7 +3589,6 @@ mod tests {
         assert!(body.contains("policy.body_visible(now)"));
         assert!(body.contains("self.owner.as_deref() == Some(session.as_str())"));
         assert!(body.contains("if changed { &[] } else { &events }"));
-        assert!(body.contains("value.wake_after(now)"));
     }
 
     #[test]
@@ -5657,6 +5676,64 @@ mod tests {
             next_live_wake(full, expiry, now, true, Some(expired)),
             Some(Duration::from_millis(900))
         );
+    }
+
+    #[test]
+    fn native_body_greeting_restores_full_frames_then_returns_to_dormant_cadence() {
+        let host = OrganismHost::default();
+        let owner = String::from("local");
+        let mut attention = LiveAttention::default();
+        attention.set_owner(Some(owner.clone()));
+        let now = Duration::from_secs(90);
+        assert!(host.owner_dormant(now));
+        let input = attention_input(false, true);
+        let accepted = attention
+            .advance(now, &owner, input, LiveAttentionEvent::Explicit)
+            .unwrap();
+        let full = PresentationPolicy {
+            motion: Some(OrganismMotion::Full),
+            ..static_policy()
+        };
+        let calm = PresentationPolicy {
+            motion: Some(OrganismMotion::Calm),
+            ..full
+        };
+        assert_eq!(
+            host.native_body_wake(full, now, Some(accepted)),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            host.native_body_wake(calm, now, Some(accepted)),
+            Some(Duration::from_millis(900))
+        );
+        // Static and withdrawn bodies stay asleep even with a copied old
+        // snapshot. Their ordinary host owns any remaining status deadline.
+        assert_eq!(
+            host.native_body_wake(static_policy(), now, Some(accepted)),
+            None
+        );
+        assert_eq!(
+            host.native_body_wake(
+                PresentationPolicy {
+                    enabled: false,
+                    ..full
+                },
+                now,
+                Some(accepted)
+            ),
+            None
+        );
+        let expiry = accepted.active.unwrap().deadline;
+        let expired = attention
+            .advance(expiry, &owner, input, LiveAttentionEvent::Reconcile)
+            .unwrap();
+        assert!(expired.active.is_none());
+        for policy in [full, calm] {
+            assert_eq!(
+                host.native_body_wake(policy, expiry, Some(expired)),
+                Some(Duration::from_millis(900))
+            );
+        }
     }
 
     #[test]
