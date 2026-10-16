@@ -17,6 +17,20 @@ driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
 
+def require_phrases(smoke, label, phrases, text=None):
+    if text is None:
+        text = ' '.join(row['text'] for row in smoke.words(label))
+    counts = [text.count(phrase) for phrase in phrases]
+    assert all(count <= 1 for count in counts), (phrases, text)
+    if 0 in counts:
+        # Only re-segment the SAME captured pixels. Keep exact spelling and
+        # uniqueness, retain both OCR outputs, and never retry an input action.
+        text = ' '.join(row['text'] for row in smoke.words(label, psm=6, capture=False))
+        (smoke.out / (label + '-ocr-psm6.txt')).write_text(text)
+    assert all(text.count(phrase) == 1 for phrase in phrases), (phrases, text)
+    return text
+
+
 def click_phrase(smoke, phrase, label):
     rows = smoke.words(label)
     wanted = phrase.split()
@@ -51,6 +65,9 @@ def exercise(smoke, case):
     smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
     driver.wait_for(smoke.app_window, 'Ember recovery startup')
     time.sleep(2)
+    # This one real terminal click also moves the pointer away from summary
+    # text; Wayland screenshots include the otherwise-obscuring I-beam.
+    smoke.click(900, 680)
     rows = smoke.words('startup')
     text = ' '.join(row['text'] for row in rows)
     (smoke.out / 'startup-ocr.txt').write_text(text)
@@ -59,27 +76,20 @@ def exercise(smoke, case):
         assert 'recovery summary' not in text.lower(), text
         smoke.command('quiet-startup-usable')
         return {'normal_startup_quiet': True}
-    assert 'recovery summary' in text.lower(), text
+    phrases = ['Session recovery summary']
     if case == 'over-limit':
-        assert '64 session records retained; 3 skipped' in text, text
+        phrases.append('64 session records retained; 3 skipped above the 64-session limit.')
     elif case == 'corrupt-layout':
-        cause = 'Saved pane layout adjusted: invalid or oversized layout references.'
-        if cause not in text:
-            # Re-segment the SAME pixels, retaining both OCR outputs. Exact
-            # phrase remains required; no input or app startup is retried.
-            text = ' '.join(row['text'] for row in smoke.words('startup', psm=6, capture=False))
-            (smoke.out / 'startup-ocr-psm6.txt').write_text(text)
-        assert cause in text, text
+        phrases.append('Saved pane layout adjusted: invalid or oversized layout references.')
     else:
-        assert 'Session 2:' in text and 'directory invalid or unavailable' in text, text
-    # Interact with a visible terminal region outside the nonmodal window.
-    smoke.click(900, 680)
+        phrases.extend(['Session 2:', 'directory invalid or unavailable'])
+    require_phrases(smoke, 'startup', phrases, text)
+    # Terminal input while the summary remains open proves nonmodal behavior.
     smoke.command('summary-nonmodal-usable')
     smoke.click_word('Dismiss', 'before-dismiss')
     smoke.click_word('details', 'reopen-summary')
     click_phrase(smoke, 'Recheck original metadata', 'before-recheck')
-    after = ' '.join(row['text'] for row in smoke.words('after-recheck'))
-    assert 'Live sessions unchanged' in after, after
+    require_phrases(smoke, 'after-recheck', ['Live sessions unchanged'])
     # Export requires an explicit UI path and click. Use the entry's hint to
     # find it, never an application-private action or command channel.
     smoke.click_word('absolute', 'export-path')
