@@ -5,6 +5,58 @@ use crate::theme::ThemeExt as _;
 use crate::{command_palette, config, config_panel, layout, search_replace_panel, theme};
 use eframe::egui;
 
+// Find owns Enter/Shift+Enter for match navigation, not text submission.
+fn find_query_edit(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
+    let output = egui::TextEdit::singleline(query)
+        .hint_text("Find in terminal")
+        .return_key(None)
+        .show(ui);
+    let selection_id = output.response.id.with("find_selection");
+    ui.ctx().data_mut(|data| {
+        if data
+            .get_temp::<(String, egui::text::CCursorRange)>(selection_id)
+            .is_some_and(|(saved_query, _)| saved_query != *query)
+        {
+            data.remove::<(String, egui::text::CCursorRange)>(selection_id);
+        }
+    });
+    if output.response.has_focus() {
+        // egui collapses a stored selection once the input loses IME ownership.
+        // Keep its last focused range for explicit Find-control activation only.
+        if let Some(range) = output.state.cursor.char_range() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(selection_id, (query.clone(), range)));
+        }
+    }
+    output.response.response
+}
+
+fn refocus_find_query(query: &egui::Response) {
+    if let Some((_, range)) = query.ctx.data(|data| {
+        data.get_temp::<(String, egui::text::CCursorRange)>(query.id.with("find_selection"))
+    }) {
+        if let Some(mut state) = egui::TextEdit::load_state(&query.ctx, query.id) {
+            state.cursor.set_char_range(Some(range));
+            state.store(&query.ctx, query.id);
+        }
+    }
+    query.request_focus();
+}
+
+fn find_option_control(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &str,
+    tooltip: &str,
+    query: &egui::Response,
+) -> egui::Response {
+    let response = ui.selectable_label(selected, label).on_hover_text(tooltip);
+    if response.clicked() {
+        refocus_find_query(query);
+    }
+    response
+}
+
 fn history_picker_rect(screen: egui::Rect) -> egui::Rect {
     let available = screen.shrink(16.0);
     let size = egui::vec2(
@@ -2971,28 +3023,33 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         // 搜索输入框
-                        let search_response = ui.add(
-                            egui::TextEdit::singleline(&mut self.search_state.query)
-                                .hint_text("Find in terminal"),
-                        );
+                        let search_response = find_query_edit(ui, &mut self.search_state.query);
 
                         // 自动 focus 搜索框
                         if self.search_state.search_focused {
-                            ui.memory_mut(|mem| mem.request_focus(search_response.id));
+                            refocus_find_query(&search_response);
                             self.search_state.search_focused = false;
                         }
 
                         // Aa / .* 切换按钮:用 selectable_label 表达 on/off 状态。
                         // 切换后需要立刻按新选项重新搜索,否则用户看不到效果。
-                        let case_btn = ui
-                            .selectable_label(self.search_state.case_sensitive, "Aa")
-                            .on_hover_text("Match case");
+                        let case_btn = find_option_control(
+                            ui,
+                            self.search_state.case_sensitive,
+                            "Aa",
+                            "Match case",
+                            &search_response,
+                        );
                         if case_btn.clicked() {
                             self.search_state.case_sensitive = !self.search_state.case_sensitive;
                         }
-                        let regex_btn = ui
-                            .selectable_label(self.search_state.use_regex, ".*")
-                            .on_hover_text("Regular expression");
+                        let regex_btn = find_option_control(
+                            ui,
+                            self.search_state.use_regex,
+                            ".*",
+                            "Regular expression",
+                            &search_response,
+                        );
                         if regex_btn.clicked() {
                             self.search_state.use_regex = !self.search_state.use_regex;
                         }
@@ -4818,6 +4875,244 @@ mod tests {
         let mut output = ctx.run_ui(input, f);
         output.textures_delta.clear();
         output
+    }
+
+    fn find_focus_frame(
+        ctx: &egui::Context,
+        query: &mut String,
+        events: Vec<egui::Event>,
+    ) -> (egui::Id, [egui::Rect; 3], [bool; 2]) {
+        let mut result = None;
+        run_frame(
+            ctx,
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    let input = find_query_edit(ui, query);
+                    let case = find_option_control(ui, false, "Aa", "Match case", &input);
+                    let regex = find_option_control(ui, false, ".*", "Regular expression", &input);
+                    let outside = ui.button("Other control");
+                    result = Some((
+                        input.id,
+                        [case.rect, regex.rect, outside.rect],
+                        [case.clicked(), regex.clicked()],
+                    ));
+                });
+            },
+        );
+        result.unwrap()
+    }
+
+    fn find_focus_key(key: egui::Key, shift: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn seed_find_cursor(
+        ctx: &egui::Context,
+        id: egui::Id,
+        start: usize,
+        end: usize,
+    ) -> egui::text::CCursorRange {
+        let range = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(start),
+            egui::text::CCursor::new(end),
+        );
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap();
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
+        range
+    }
+
+    #[test]
+    fn find_options_restore_native_focus_and_directed_unicode_selection() {
+        for control in 0..2 {
+            for (start, end) in [(2, 2), (1, 3), (3, 1)] {
+                let ctx = egui::Context::default();
+                let mut query = "a界🙂z".to_owned();
+                let (id, rects, _) = find_focus_frame(&ctx, &mut query, vec![]);
+                let range = seed_find_cursor(&ctx, id, start, end);
+                find_focus_frame(&ctx, &mut query, vec![]);
+                let pos = rects[control].center();
+                for pressed in [true, false] {
+                    let (_, _, clicked) = find_focus_frame(
+                        &ctx,
+                        &mut query,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                    if !pressed {
+                        assert!(clicked[control]);
+                    } else {
+                        find_focus_frame(&ctx, &mut query, vec![]);
+                        find_focus_frame(&ctx, &mut query, vec![]);
+                    }
+                }
+                assert!(ctx.memory(|m| m.has_focus(id)));
+                assert_eq!(
+                    egui::TextEdit::load_state(&ctx, id)
+                        .unwrap()
+                        .cursor
+                        .char_range(),
+                    Some(range)
+                );
+                assert_eq!(query, "a界🙂z");
+                // The next text event edits the saved range, never appends blindly.
+                find_focus_frame(&ctx, &mut query, vec![egui::Event::Text("X".into())]);
+                assert_eq!(query, if start == end { "a界X🙂z" } else { "aXz" });
+            }
+        }
+    }
+
+    #[test]
+    fn find_enter_navigation_keeps_focus_and_selection_for_next_edit() {
+        for shift in [false, true] {
+            let ctx = egui::Context::default();
+            let mut query = "a界🙂z".to_owned();
+            let (id, _, _) = find_focus_frame(&ctx, &mut query, vec![]);
+            let range = seed_find_cursor(&ctx, id, 3, 1);
+            find_focus_frame(
+                &ctx,
+                &mut query,
+                vec![find_focus_key(egui::Key::Enter, shift)],
+            );
+            assert!(ctx.memory(|m| m.has_focus(id)));
+            assert_eq!(
+                egui::TextEdit::load_state(&ctx, id)
+                    .unwrap()
+                    .cursor
+                    .char_range(),
+                Some(range)
+            );
+            assert_eq!(query, "a界🙂z");
+            find_focus_frame(&ctx, &mut query, vec![egui::Event::Text("X".into())]);
+            assert_eq!(query, "aXz");
+        }
+    }
+
+    #[test]
+    fn find_options_allow_keyboard_activation_then_resume_query_editing() {
+        for control in 0..2 {
+            let ctx = egui::Context::default();
+            let mut query = "a界🙂z".to_owned();
+            let (id, _, _) = find_focus_frame(&ctx, &mut query, vec![]);
+            let range = seed_find_cursor(&ctx, id, 3, 1);
+            find_focus_frame(&ctx, &mut query, vec![]);
+            for _ in 0..=control {
+                find_focus_frame(
+                    &ctx,
+                    &mut query,
+                    vec![find_focus_key(egui::Key::Tab, false)],
+                );
+                find_focus_frame(&ctx, &mut query, vec![]);
+            }
+            let (_, _, clicked) = find_focus_frame(
+                &ctx,
+                &mut query,
+                vec![find_focus_key(egui::Key::Space, false)],
+            );
+            assert!(clicked[control]);
+            assert!(ctx.memory(|m| m.has_focus(id)));
+            assert_eq!(
+                egui::TextEdit::load_state(&ctx, id)
+                    .unwrap()
+                    .cursor
+                    .char_range(),
+                Some(range)
+            );
+            find_focus_frame(&ctx, &mut query, vec![egui::Event::Text("X".into())]);
+            assert_eq!(query, "aXz");
+        }
+    }
+
+    #[test]
+    fn find_changed_query_invalidates_blurred_selection() {
+        let ctx = egui::Context::default();
+        let mut query = "a界🙂z".to_owned();
+        let (id, _, _) = find_focus_frame(&ctx, &mut query, vec![]);
+        seed_find_cursor(&ctx, id, 3, 1);
+        find_focus_frame(&ctx, &mut query, vec![]);
+        find_focus_frame(
+            &ctx,
+            &mut query,
+            vec![find_focus_key(egui::Key::Tab, false)],
+        );
+        find_focus_frame(&ctx, &mut query, vec![]);
+        query = "new history query".into();
+        find_focus_frame(&ctx, &mut query, vec![]);
+        assert!(ctx
+            .data(|data| data
+                .get_temp::<(String, egui::text::CCursorRange)>(id.with("find_selection")))
+            .is_none());
+        let (_, _, clicked) = find_focus_frame(
+            &ctx,
+            &mut query,
+            vec![find_focus_key(egui::Key::Space, false)],
+        );
+        assert!(clicked[0]);
+        assert!(ctx.memory(|m| m.has_focus(id)));
+        assert_eq!(query, "new history query");
+        // Editing the new query replaces the old saved range for later controls.
+        let latest = seed_find_cursor(&ctx, id, 4, 7);
+        find_focus_frame(&ctx, &mut query, vec![]);
+        assert_eq!(
+            ctx.data(|data| data
+                .get_temp::<(String, egui::text::CCursorRange)>(id.with("find_selection"))),
+            Some((query, latest))
+        );
+    }
+
+    #[test]
+    fn find_focus_does_not_capture_tab_or_unrelated_clicks() {
+        let ctx = egui::Context::default();
+        let mut query = "draft".to_owned();
+        let (id, rects, _) = find_focus_frame(&ctx, &mut query, vec![]);
+        seed_find_cursor(&ctx, id, 2, 2);
+        find_focus_frame(
+            &ctx,
+            &mut query,
+            vec![find_focus_key(egui::Key::Tab, false)],
+        );
+        find_focus_frame(&ctx, &mut query, vec![]);
+        assert!(!ctx.memory(|m| m.has_focus(id)));
+        seed_find_cursor(&ctx, id, 2, 2);
+        for pressed in [true, false] {
+            let pos = rects[2].center();
+            find_focus_frame(
+                &ctx,
+                &mut query,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(!ctx.memory(|m| m.has_focus(id)));
+        assert_eq!(query, "draft");
     }
 
     #[test]
