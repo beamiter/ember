@@ -245,10 +245,7 @@ impl TerminalState {
         cursor: Option<&RawSearchCursor>,
         budget: SearchChunkBudget,
     ) -> SearchChunkOutcome {
-        let records_examined = match self.validate_search_seal_with_work(seal) {
-            Ok(work) => work,
-            Err(outcome) => return Err(outcome),
-        };
+        let records_examined = self.validate_search_seal_with_work(seal)?;
         let mut outcome = self.search_output_chunk_with_source(
             seal.record_sequence,
             &seal.record_id,
@@ -1376,14 +1373,13 @@ mod seal_tests {
                 }
             }
             assert!(t.validate_search_seal(&seal).is_err());
-            assert!(!matches!(
-                t.search_sealed_output_chunk(
+            assert!(t
+                .search_sealed_output_chunk(
                     &seal,
                     chunk.continuation.as_ref(),
                     SearchChunkBudget::default()
-                ),
-                Ok(_)
-            ));
+                )
+                .is_err());
         }
         let (a, sequence) = terminal(80, 200);
         let seal = a.seal_search_output(sequence, "sealed").unwrap();

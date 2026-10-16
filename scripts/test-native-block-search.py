@@ -144,10 +144,57 @@ class Tests(unittest.TestCase):
         self.assertNotIn("self.key('f', ('ctrl', 'shift'))", source)
 
     def test_generic_find_and_partial_controls_are_rejected(self):
-        controls = [row('Cmd'), row('Out', 30), row('Latest', 60)]
+        controls = [row('Scope'), row('Cmd', 30), row('Out', 60),
+                    dict(row('Latest', 40), top='40')]
         self.assertTrue(driver.block_picker_surface(controls))
-        for rows in [[], [row('E03EARLYHIT')], controls[:2], controls + [row('Out', line=2)]]:
+        for rows in [[], [row('E03EARLYHIT')], controls[:2], controls + [row('Out', line=2)],
+                     [dict(r, top='10') for r in controls]]:
             self.assertFalse(driver.block_picker_surface(rows))
+
+    def test_surface_label_case_only_and_geometry(self):
+        controls = [row('Scope'), row('cmd', 30), row('out', 60),
+                    dict(row('Latest', 40), top='40')]
+        self.assertTrue(driver.block_picker_surface(controls))
+        for bad in [controls + [row('CMD', 100)],
+                    controls[:1] + [row('commands', 30)] + controls[2:],
+                    [controls[0], dict(controls[1], left='90')] + controls[2:],
+                    controls[:3] + [dict(controls[3], left='200')],
+                    controls[:1] + [dict(controls[1], top='90')] + controls[2:]]:
+            self.assertFalse(driver.block_picker_surface(bad))
+        self.assertFalse(driver.exact_phrase([row('e03earlyhit')], 'E03EARLYHIT'))
+
+    def test_proven_surface_targets_observed_out_once(self):
+        controls = [row('Scope'), row('cmd', 30), row('out', 60),
+                    dict(row('Latest', 40), top='40')]
+        self.assertEqual(driver.output_scope_target(controls), (65, 15))
+        translated = [dict(r, left=str(int(r['left']) + 100),
+                           top=str(int(r['top']) + 100)) for r in controls]
+        self.assertEqual(driver.output_scope_target(translated), (165, 115))
+        for bad in [controls + [row('OUT', 90)],
+                    controls[:1] + [dict(controls[1], top='90')] + controls[2:],
+                    [dict(r, left=str(int(r['left']) + 1280)) for r in controls],
+                    controls[:2] + [dict(controls[2], width='0')] + controls[3:]]:
+            with self.assertRaises(RuntimeError):
+                driver.output_scope_target(bad)
+        class Observation:
+            events = []
+            last_observation_label = 'fresh-observation'
+            def observe(self, name):
+                self.observed = name
+                return translated
+            def click(self, *point):
+                self.clicked.append(point)
+        harness = Observation()
+        harness.clicked = []
+        driver.SearchSmoke.click_output_scope(harness)
+        self.assertEqual(harness.observed, 'output-scope')
+        self.assertEqual(harness.clicked, [(165, 115)])
+        self.assertEqual(harness.events[-1]['observation'], 'fresh-observation')
+        harness.clicked = []
+        harness.observe = lambda _: controls + [row('OUT', 90)]
+        with self.assertRaises(RuntimeError):
+            driver.SearchSmoke.click_output_scope(harness)
+        self.assertEqual(harness.clicked, [])
 
     def test_source_uses_real_binary_no_geometry_harness_or_controller(self):
         source = Path(__file__).with_name('native-block-search.py').read_text()

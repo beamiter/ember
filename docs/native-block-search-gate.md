@@ -67,3 +67,17 @@ eviction/alternate-screen races; continuous PTY contention; all replacement-path
 peak accounting; and native input/presentation measurements. Result JSON lists
 these exclusions even on success. No native pass exists until this exact built
 binary runs on a supported host, and no publication/completion is implied.
+
+The surface ownership check accepts only ASCII case variation for the four
+Scope/Cmd/Out/Latest control labels, as observed in the saved real X11 pixels.
+Each label must be unique; Scope/Cmd/Out must form the ordered same-height row
+and Latest must be below it within its horizontal span. Generic Find and
+misplaced or duplicate labels fail. Query, result and stable-anchor text remain
+exact and case-sensitive; this is not fuzzy text matching or a coordinate click.
+
+Out scope targeting uses a fresh full-screen observation and the same complete
+surface validator. It clicks the center of that observation's unique normalized
+Out rectangle once, with no cached or guessed coordinates. Control rectangles
+must be nonempty and inside the fixture's fixed 1280x900 full-screen capture.
+Invalid or duplicate surface controls produce no click. Other query/result
+clicks retain their exact text matcher.

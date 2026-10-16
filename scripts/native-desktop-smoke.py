@@ -7,6 +7,7 @@ The Settings driver uses rendered labels and saved configuration as independent
 oracles. This initial gate is not full E11/E05 completion.
 """
 import argparse
+import importlib.util
 import csv
 import io
 import tomllib
@@ -314,7 +315,13 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
                    int(row['top']) + int(row['height']) // 2)
         self.click_word(old.title(), new + '-mode-selector')
         self.click_word(new.title(), new + '-mode-menu')
-        self.click_word('Save', new + '-mode-save')
+        if self.backend == 'wayland':
+            spec = importlib.util.spec_from_file_location('settings_save', Path(__file__).with_name('native-settings-save-ocr.py'))
+            settings_save = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(settings_save)
+            settings_save.click_save(self, new + '-mode-save')
+        else:
+            self.click_word('Save', new + '-mode-save')
         wait_for(lambda: tomllib.loads(self.config.read_text()).get('terminal_mode') == new,
                  'Settings persisted mode ' + new)
         self.key('o', ('ctrl', 'shift'))

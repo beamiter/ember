@@ -57,9 +57,44 @@ def phrase_center(rows, phrase):
     return (left + right) // 2, (top + bottom) // 2
 
 
+def block_picker_controls(rows):
+    # OCR renders small Cmd/Out labels as cmd/out in the real X11 artifact.
+    # Normalize ASCII label case only; query/result/anchor matching stays exact.
+    found = {}
+    for label in ('scope', 'cmd', 'out', 'latest'):
+        matches = [r for r in rows if r['text'].isascii() and r['text'].lower() == label]
+        if len(matches) != 1:
+            return False
+        found[label] = matches[0]
+        rect = found[label]
+        if (int(rect['left']) < 0 or int(rect['top']) < 0
+                or int(rect['width']) <= 0 or int(rect['height']) <= 0
+                or int(rect['left']) + int(rect['width']) > 1280
+                or int(rect['top']) + int(rect['height']) > 900):
+            return None
+    scope, cmd, out, latest = (found[k] for k in ('scope', 'cmd', 'out', 'latest'))
+    x = lambda r: int(r['left'])
+    y = lambda r: int(r['top'])
+    line_height = max(int(r['height']) for r in (scope, cmd, out))
+    valid = (x(scope) < x(cmd) < x(out)
+            and max(y(r) for r in (scope, cmd, out))
+                - min(y(r) for r in (scope, cmd, out)) <= line_height
+            and y(latest) > max(y(r) + int(r['height']) for r in (scope, cmd, out))
+            and x(scope) <= x(latest) <= x(out) + int(out['width']))
+    return found if valid else None
+
+
 def block_picker_surface(rows):
-    # Generic terminal Find has none of these three Block Search controls.
-    return all(len(exact_phrase(rows, label)) == 1 for label in ('Cmd', 'Out', 'Latest'))
+    return bool(block_picker_controls(rows))
+
+
+def output_scope_target(rows):
+    controls = block_picker_controls(rows)
+    if not controls:
+        raise RuntimeError('No fully validated Block Search surface for Out targeting')
+    out = controls['out']
+    return (int(out['left']) + int(out['width']) // 2,
+            int(out['top']) + int(out['height']) // 2)
 
 
 def raw_hit_claim(rows, token):
@@ -154,6 +189,15 @@ class SearchSmoke(native.Smoke):
                                 monotonic_ns=time.monotonic_ns()))
         self.click(*point)  # Once only. Observations may repeat, actions may not.
 
+    def click_output_scope(self):
+        # One fresh full-screen observation proves surface and target together.
+        rows = self.observe('output-scope')
+        point = output_scope_target(rows)
+        self.events.append(dict(event='explicit-click', phrase='Out', point=point,
+                                observation=self.last_observation_label,
+                                monotonic_ns=time.monotonic_ns()))
+        self.click(*point)  # Exactly once; no fallback action or cached rectangle.
+
     def emit(self, mode, record=0):
         path = self.fixture_dir / f'{mode}-{record:02d}.json'
         assert not path.exists()
@@ -193,7 +237,7 @@ class SearchSmoke(native.Smoke):
             # uniqueness still mandatory. Never retry the chord or query input.
             rows = self.words(self.last_observation_label, psm=6, capture=False)
             self.query_point = phrase_center(rows, query)
-        self.click_phrase('Out', 'output-scope')
+        self.click_output_scope()
 
     def navigate(self, token, row, pointer=False, raw=False, expected_claim=None):
         rows = self.wait_phrase(token, 'hit-visible')

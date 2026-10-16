@@ -34,3 +34,18 @@ Excluded from this stage: switching while preedit is active, X11 XIM, a full
 IBus/Fcitx engine, fractional-scale composition/selection/copy, and the broader
 E05 focus/task/image-only/cross-frame/latency matrix. This stage does not close
 E11 or E05.
+
+## Same-image Settings Save fallback
+
+In hosted run 38974054847 the first three live IME segments completed, but
+both original OCR passes missed the visibly present Save button on the final
+Chat-to-Normal transition. Only the Wayland Settings mode-save lookup now permits
+one additional pass after both original PSM11 and PSM6 return zero exact Save
+matches. It applies ImageMagick `-colorspace Gray -negate` to the same saved PNG
+and runs PSM11 once. Original and transformed images, TSVs, algorithm metadata,
+and owned compositor geometry snapshots are retained. Both images must remain
+1280×900; exactly one literal Save must lie fully within the focused Ember
+rectangle. Ambiguity, absence, clipping, geometry change, or dimension mismatch
+fails without a click. A successful lookup dispatches one click and retains the
+existing persisted-mode and exact shell/PTY/transcript oracles. Original images
+remain the UI acceptance evidence. This does not change the application style.

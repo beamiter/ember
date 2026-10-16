@@ -328,6 +328,7 @@ jobs:
         timeout-minutes: 8
         shell: bash
         run: |
+          python3 scripts/test-native-settings-save-ocr.py
           python3 scripts/test-native-ime-live-switch.py
           python3 scripts/native-ime-live-switch.py \
             --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
