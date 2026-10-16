@@ -5,7 +5,7 @@ initial Normal, Block and Chat configuration. Existing desktop, Find ownership,
 session recovery and private-bus motion gates remain unchanged.
 
 An input-method-v2 client receives actual compositor keyboard-grab events. It
-sends fixed synthetic preedit `ni`; a real native Return press commits `你`, and
+sends fixed synthetic preedit `EMBERPREEDITMARKER`; a real native Return press commits `你`, and
 the matching release ends the grab. It never forwards or replays keys. XKB
 keymaps are read from protocol descriptors with a 1 MiB size bound, checked NUL
 termination, read-only mappings and explicit descriptor cleanup. All protocol
@@ -22,11 +22,12 @@ these tests. The helper is compiled with strict warnings from checked-in source
 and the official protocol XML; distro development packages provide dependencies.
 
 This gate exercises genuine compositor input-method protocol and Return
-consumption with synthetic input, not a full IBus/Fcitx engine. It retains
-preedit screenshots but does not assert visual preedit rendering. Initial-mode
-coverage is not live mode-switch coverage. X11 XIM, real-device IME toggles,
-visual preedit, live switching, scaling and the remaining clipboard matrix stay
-open acceptance items. No application event injection or production test mode
+consumption with synthetic input, not a full IBus/Fcitx engine. The visual gate requires exact token absence before preedit, unique presence
+during preedit, and absence after commit inside the same verified app rectangle,
+plus exact restoration of the token-region pixels to the before image.
+Initial-mode coverage is not live mode-switch coverage. X11 XIM, real-device IME
+toggles, live switching, scaling and the remaining clipboard matrix stay open
+acceptance items. No application event injection or production test mode
 is used, and no user display or clipboard is accessed.
 
 ## Owned keyboard readiness and cancellation
@@ -54,3 +55,34 @@ The diagnostic artifact reported active text input, no protocol error, and no
 keymap before any preedit or composition Return was sent. Sway 1.9's public
 modifier handler selects the sending keyboard as active. No application
 keyboard routing or ownership guard is changed.
+
+## Exact rendered-preedit evidence
+
+Each screenshot is bracketed by Sway tree queries requiring exactly one Ember
+surface, the owned application PID, current focus and an unchanged positive
+rectangle contained in the output. The single output must have its expected
+1280x900 geometry, normal transform and scale one; each actual screenshot must
+also be exactly 1280x900. The rectangle and node identity match all three captures.
+Tesseract psm6 reads each original full screenshot once. Empty or malformed word
+evidence fails. Every capture requires one literal `master` status-bar health
+anchor inside the owned surface and at the same bounding box. This fixture's
+checkout supplies that branch label; a missing or changed label fails closed.
+The anchor has been observed in the retained during/after images for all three
+modes, but its new pre-composition baseline still requires hosted validation.
+
+Matching is literal and case-sensitive: no punctuation trimming, substring,
+fuzzy recognition, coordinate fallback or repeated input. Missing or duplicate
+present-token rows fail. Any exact token row crossing or outside the owned
+surface fails in every phase, including an expected-absent phase. OCR absence
+alone never establishes clearing: the entire unique during-token bounding box
+is cropped from all three original images into fixed 8-bit sRGB RGB bytes.
+During pixels must differ from before, and after pixels must equal before
+byte-for-byte. Crop bytes, region, hashes and equality results are retained.
+Cursor blinking, animations or other repaint differences are not masked or
+ignored; they fail this deliberately strict first-stage fixture for diagnosis.
+
+Source screenshots, both geometry queries, output metadata, TSVs and match
+results are retained. The preedit token never appears in shell input or displayed
+commands; it is supplied only through compositor preedit. The committed Chinese
+bytes and original zero-byte/no-CR oracles are unchanged. This fixture still
+requires hosted runtime validation before claiming visual acceptance.

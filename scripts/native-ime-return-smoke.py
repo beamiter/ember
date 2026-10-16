@@ -26,13 +26,16 @@ def main():
     keyboard_spec = importlib.util.spec_from_file_location('ime_keyboard', Path(__file__).with_name('native-ime-keyboard.py'))
     keyboard_module = importlib.util.module_from_spec(keyboard_spec)
     keyboard_spec.loader.exec_module(keyboard_module)
+    visual_spec = importlib.util.spec_from_file_location('ime_visual', Path(__file__).with_name('native-ime-visual.py'))
+    visual = importlib.util.module_from_spec(visual_spec)
+    visual_spec.loader.exec_module(visual)
     keyboard = None
     result = {'status': 'running', 'mode': args.mode,
               'binary_sha256': hashlib.sha256(smoke.binary.read_bytes()).hexdigest(),
               'helper_sha256': hashlib.sha256(args.ime_client.resolve(strict=True).read_bytes()).hexdigest(),
               'mechanism': 'input-method-v2 keyboard grab and compositor preedit/commit requests',
               'excluded': ['X11 XIM', 'full IBus/Fcitx engine behavior', 'physical-device IME toggle',
-                           'asserted visual preedit rendering', 'live mode switching']}
+                           'live mode switching']}
     try:
         smoke.start_desktop()
         smoke.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'ime-seat-keyboard')
@@ -60,10 +63,11 @@ def main():
         assert (capture / 'live.bin').read_bytes() == b'', 'Modifier readiness leaked PTY bytes'
         result['keyboard_arguments'] = keyboard_module.KEYBOARD_ARGS
         result['modifier_roundtrip_verified'] = True
+        before = visual.snapshot(smoke, 'ime-visual-before', None, False)
         (control / 'start').touch()
         wait_ime_marker('preedit', 'genuine compositor preedit')
         time.sleep(0.5)
-        smoke.screenshot('ime-preedit-zero-bytes')
+        during = visual.snapshot(smoke, 'ime-preedit-zero-bytes', before, True)
         preedit = (capture / 'live.bin').read_bytes()
         assert preedit == b'', ('preedit leaked terminal bytes', preedit.hex())
         (capture / 'preedit.bin').write_bytes(preedit)
@@ -71,7 +75,8 @@ def main():
         wait_ime_marker('committed', 'native composition Return consumed and grab released')
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected, 'commit text reaches PTY without CR')
-        smoke.screenshot('ime-commit-without-cr')
+        after = visual.snapshot(smoke, 'ime-commit-without-cr', before, False)
+        result['preedit_pixels'] = visual.verify_restoration(smoke, before, during, after)
         smoke.raw_finish(capture, identity, expected)
         (control / 'finish').touch()
         ime.wait(timeout=5)
@@ -83,7 +88,8 @@ def main():
         assert len(lines) == 2 and [line.split(':', 1)[0] for line in lines] == ['ime-ready', 'ime-input-resumed'], lines
         smoke.screenshot('ime-real-enter-resumed')
         result.update(status='pass', identity=identity, preedit_bytes=0,
-                      preedit_evidence='compositor request completed; screenshot retained without render assertion',
+                      preedit_evidence='healthy exact OCR lifecycle and exact token-region pixel restoration in stable owned app rectangle',
+                      visual_preedit=True,
                       committed_hex=expected.hex(), composition_return_cr_bytes=0,
                       resumed_submission_count=1)
     except Exception as error:

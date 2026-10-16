@@ -17,6 +17,8 @@
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include "input-method-unstable-v2-client-protocol.h"
 
+static const char preedit_token[] = "EMBERPREEDITMARKER";
+
 struct state {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -206,7 +208,8 @@ int main(int argc,char **argv) {
             s.stage="grab-keymap-ready";
             if(!s.keys)goto cleanup;
             s.stage="send-preedit";
-            zwp_input_method_v2_set_preedit_string(s.method,"ni",2,2);
+            zwp_input_method_v2_set_preedit_string(s.method,preedit_token,
+                (int32_t)strlen(preedit_token),(int32_t)strlen(preedit_token));
             zwp_input_method_v2_commit(s.method,s.serial);s.preedit=true;
             if(!sync_bounded(&s,deadline)||!marker(&s,"preedit",true))goto cleanup;
         }
