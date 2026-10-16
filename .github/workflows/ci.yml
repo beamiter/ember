@@ -216,7 +216,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             xvfb openbox xdotool xclip x11-utils sway wtype wl-clipboard grim \
-            imagemagick tesseract-ocr fonts-dejavu-core mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0
+            imagemagick tesseract-ocr fonts-dejavu-core mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin
 
       - name: Stage optimized desktop candidate
         id: desktop-install
@@ -239,6 +239,15 @@ jobs:
       - name: Gate X11 installed release interactions
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
+
+      - name: Build compositor protocol pointer helper
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ember-pointer"
+          wayland-scanner client-header scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+          wayland-scanner private-code scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/protocol.c"
+          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" scripts/native-pointer.c "$RUNNER_TEMP/ember-pointer/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-pointer/native-pointer"
+          echo "EMBER_POINTER_HELPER=$RUNNER_TEMP/ember-pointer/native-pointer" >> "$GITHUB_ENV"
 
       - name: Gate Wayland installed release interactions
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}

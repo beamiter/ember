@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import select
 import subprocess
 import time
 
@@ -96,6 +97,14 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             ipc = wait_for(lambda: next(runtime.glob('sway-ipc.*.sock'), None), 'Sway IPC')
             self.env['SWAYSOCK'] = str(ipc)
             assert server.poll() is None
+            helper = os.environ.get('EMBER_POINTER_HELPER')
+            assert helper, 'Wayland requires the persistent protocol pointer helper'
+            log = open(self.out / 'pointer.log', 'w')
+            self.logs.append(log)
+            self.pointer = subprocess.Popen([helper], env=self.env, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=log, text=True)
+            self.processes.append(self.pointer)
+            self.pointer_ack('ready')
         time.sleep(1)
 
     def key(self, key, modifiers=()):
@@ -160,10 +169,14 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
 
     def app_window(self):
         if self.backend == 'x11':
-            result = subprocess.run(['xdotool', 'search', '--onlyvisible', '--classname', 'io.github.beamiter.ember'],
+            result = subprocess.run(['xdotool', 'search', '--onlyvisible', '--pid', str(self.app.pid)],
                                     env=self.env, text=True, capture_output=True, timeout=3)
             if result.returncode == 0 and result.stdout.strip():
-                window = result.stdout.splitlines()[-1]
+                windows = result.stdout.splitlines()
+                assert len(windows) == 1, ('ambiguous app windows', windows)
+                window = windows[0]
+                metadata = self.run(['xprop', '-id', window, 'WM_CLASS', '_NET_WM_PID'], capture_output=True, text=True)
+                (self.out / 'x11-window.txt').write_text(metadata.stdout)
                 self.run(['xdotool', 'windowactivate', '--sync', window])
                 return window
             return None
@@ -184,13 +197,22 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             self.run(['swaymsg', '[con_id=' + str(found) + ']', 'focus'])
         return found
 
+    def pointer_ack(self, expected):
+        ready, _, _ = select.select([self.pointer.stdout], [], [], 5)
+        assert ready, 'Pointer protocol helper response timed out'
+        response = self.pointer.stdout.readline().strip()
+        assert response == expected, ('Pointer helper failed', response)
+
     def click(self, x, y):
         if self.backend == 'x11':
             self.run(['xdotool', 'mousemove', '--sync', str(x), str(y), 'click', '1'])
         else:
-            self.run(['swaymsg', 'seat', 'seat0', 'cursor', 'set', str(x), str(y)])
-            self.run(['swaymsg', 'seat', 'seat0', 'cursor', 'press', 'button1'])
-            self.run(['swaymsg', 'seat', 'seat0', 'cursor', 'release', 'button1'])
+            # Stage one has a single 1280x900 output at scale 1. Protocol
+            # absolute coordinates have explicit extents, unlike IPC cursor
+            # movement on a seat with no pointer capability.
+            self.pointer.stdin.write(f'click {x} {y} 1280 900\n')
+            self.pointer.stdin.flush()
+            self.pointer_ack('done')
         time.sleep(0.3)
 
     def words(self, label):
@@ -241,7 +263,7 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
     def exercise(self):
         self.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\n'
                                'initial_width = 1100\ninitial_height = 800\nrestore_session = false\n')
-        app = self.spawn([str(self.binary)], 'ember')
+        app = self.app = self.spawn([str(self.binary)], 'ember')
         wait_for(self.app_window, 'Ember window')
         time.sleep(2)
         assert app.poll() is None
