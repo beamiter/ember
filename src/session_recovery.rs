@@ -176,18 +176,47 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    fn temporary(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ember-recovery-{}-{}-{name}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ember-recovery-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                let metadata = std::fs::metadata(&path).unwrap();
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            Self(path)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
     }
     fn fixture(count: usize) -> serde_json::Value {
         serde_json::json!({"version":4,"sessions":(0..count).map(|index| serde_json::json!({"name":format!("private-{index}"),"tags":[],"session_id":format!("session-{index}")})).collect::<Vec<_>>()})
     }
-    fn load_fixture(value: &serde_json::Value) -> (PathBuf, Option<SessionRecovery>) {
-        let path = temporary("snapshot.json");
+    fn load_fixture(
+        directory: &TestDirectory,
+        value: &serde_json::Value,
+    ) -> (PathBuf, Option<SessionRecovery>) {
+        let path = directory.path("snapshot.json");
         crate::persistence_file::write_atomic(&path, &serde_json::to_vec(value).unwrap()).unwrap();
         let (loaded, recovery) = SessionRecovery::load(&path);
         assert!(loaded.is_ok());
@@ -195,10 +224,11 @@ mod tests {
     }
     #[test]
     fn normal_startup_is_quiet_and_over_limit_is_exact() {
-        let (path, recovery) = load_fixture(&fixture(64));
+        let directory = TestDirectory::new();
+        let (path, recovery) = load_fixture(&directory, &fixture(64));
         assert!(recovery.is_none());
         std::fs::remove_file(path).unwrap();
-        let (path, recovery) = load_fixture(&fixture(67));
+        let (path, recovery) = load_fixture(&directory, &fixture(67));
         let recovery = recovery.unwrap();
         let summary = recovery.summary.as_ref().unwrap();
         assert_eq!(summary.retained_sessions, 64);
@@ -208,11 +238,12 @@ mod tests {
     }
     #[test]
     fn invalid_layout_and_cwd_have_structured_causes() {
+        let directory = TestDirectory::new();
         let mut value = fixture(2);
         value["tabs"] = serde_json::json!([{"root":{"kind":"unknown"}}]);
         value["sessions"][0]["cwd"] = serde_json::json!("bad\npath");
-        value["sessions"][1]["cwd"] = serde_json::json!(temporary("missing-directory"));
-        let (path, recovery) = load_fixture(&value);
+        value["sessions"][1]["cwd"] = serde_json::json!(directory.path("missing-directory"));
+        let (path, recovery) = load_fixture(&directory, &value);
         let summary = recovery.unwrap().summary.unwrap();
         assert!(summary.layout_adjusted);
         assert_eq!(summary.retained_sessions, 2);
@@ -224,9 +255,10 @@ mod tests {
     }
     #[test]
     fn dismiss_recheck_and_export_retain_exact_original() {
+        let directory = TestDirectory::new();
         let mut value = fixture(1);
-        value["sessions"][0]["cwd"] = serde_json::json!(temporary("missing-directory"));
-        let (path, recovery) = load_fixture(&value);
+        value["sessions"][0]["cwd"] = serde_json::json!(directory.path("missing-directory"));
+        let (path, recovery) = load_fixture(&directory, &value);
         let bytes = std::fs::read(&path).unwrap();
         let mut recovery = recovery.unwrap();
         let report = recovery.summary.clone();
@@ -238,7 +270,7 @@ mod tests {
         assert_eq!(report, recovery.summary);
         assert_eq!(recovery.original.as_deref().unwrap(), &bytes);
         assert!(!recovery.open);
-        let output = temporary("export.json");
+        let output = directory.path("export.json");
         export_original(&output, recovery.original.as_deref().unwrap()).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
         assert!(export_original(&output, b"overwrite").is_err());
@@ -256,7 +288,8 @@ mod tests {
     }
     #[test]
     fn decode_failure_diagnostics_never_echo_session_data() {
-        let path = temporary("private-invalid-version");
+        let directory = TestDirectory::new();
+        let path = directory.path("private-invalid-version");
         crate::persistence_file::write_atomic(
             &path,
             br#"{"version":"PRIVATE_SECRET_SENTINEL","sessions":[]}"#,
@@ -286,7 +319,8 @@ mod tests {
 
     #[test]
     fn corrupt_utf8_remains_exportable_but_unknown_count() {
-        let path = temporary("invalid-utf8");
+        let directory = TestDirectory::new();
+        let path = directory.path("invalid-utf8");
         crate::persistence_file::write_atomic(&path, &[0xff, 0xfe]).unwrap();
         let (result, recovery) = SessionRecovery::load(&path);
         assert!(result.is_err());
@@ -298,9 +332,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn unsafe_sources_and_destinations_are_not_followed() {
+        let directory = TestDirectory::new();
         use std::os::unix::fs::symlink;
-        let path = temporary("original");
-        let link = temporary("symlink");
+        let path = directory.path("original");
+        let link = directory.path("symlink");
         crate::persistence_file::write_atomic(&path, b"{}").unwrap();
         symlink(&path, &link).unwrap();
         let (result, recovery) = SessionRecovery::load(&link);
@@ -313,9 +348,10 @@ mod tests {
     }
     #[test]
     fn recovery_panel_renders_nonmodal_and_dismissal_reopens() {
+        let directory = TestDirectory::new();
         let mut value = fixture(1);
         value["tabs"] = serde_json::json!([{"root":{"kind":"unknown"}}]);
-        let (path, recovery) = load_fixture(&value);
+        let (path, recovery) = load_fixture(&directory, &value);
         let mut recovery = recovery.unwrap();
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(Default::default(), |ui| recovery.show(ui.ctx()));

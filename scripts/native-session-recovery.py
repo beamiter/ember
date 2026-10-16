@@ -10,6 +10,7 @@ import importlib.util
 import json
 from pathlib import Path
 import time
+import tempfile
 
 spec = importlib.util.spec_from_file_location('desktop_smoke', Path(__file__).with_name('native-desktop-smoke.py'))
 driver = importlib.util.module_from_spec(spec)
@@ -62,7 +63,13 @@ def exercise(smoke, case):
     if case == 'over-limit':
         assert '64 session records retained; 3 skipped' in text, text
     elif case == 'corrupt-layout':
-        assert 'pane layout adjusted' in text, text
+        cause = 'Saved pane layout adjusted: invalid or oversized layout references.'
+        if cause not in text:
+            # Re-segment the SAME pixels, retaining both OCR outputs. Exact
+            # phrase remains required; no input or app startup is retried.
+            text = ' '.join(row['text'] for row in smoke.words('startup', psm=6, capture=False))
+            (smoke.out / 'startup-ocr-psm6.txt').write_text(text)
+        assert cause in text, text
     else:
         assert 'Session 2:' in text and 'directory invalid or unavailable' in text, text
     # Interact with a visible terminal region outside the nonmodal window.
@@ -95,6 +102,11 @@ def main():
     args = parser.parse_args()
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=False)
     smoke = driver.Smoke(args.binary.resolve(strict=True), args.backend, out)
+    # Sway's IPC pathname must fit sockaddr_un even when evidence lives in
+    # a deep CI checkout. Keep only its private runtime under a short owned
+    # directory; all screenshots/logs/results retain their original paths.
+    runtime = tempfile.TemporaryDirectory(prefix='ember-r-', dir='/tmp')
+    smoke.env['XDG_RUNTIME_DIR'] = runtime.name
     result = {'case': args.case, 'backend': args.backend, 'binary_sha256': hashlib.sha256(smoke.binary.read_bytes()).hexdigest()}
     try:
         smoke.start_desktop()
@@ -106,7 +118,10 @@ def main():
         raise
     finally:
         (out / 'result.json').write_text(json.dumps(result, indent=2))
-        smoke.close()
+        try:
+            smoke.close()
+        finally:
+            runtime.cleanup()
 
 
 if __name__ == '__main__':
