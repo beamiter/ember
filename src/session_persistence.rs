@@ -150,6 +150,9 @@ struct DecodeBudget {
     extra_sessions: usize,
     layout_repaired: bool,
     active_tab_repaired: bool,
+    session_fields: [usize; MAX_RESTORED_SESSIONS],
+    invalid_cwds: [bool; MAX_RESTORED_SESSIONS],
+    current_session: usize,
 }
 
 impl DecodeBudget {
@@ -161,6 +164,9 @@ impl DecodeBudget {
             extra_sessions: 0,
             layout_repaired: false,
             active_tab_repaired: false,
+            session_fields: [0; MAX_RESTORED_SESSIONS],
+            invalid_cwds: [false; MAX_RESTORED_SESSIONS],
+            current_session: 0,
         }
     }
 
@@ -403,6 +409,9 @@ impl OptionalTextValueVisitor<'_> {
             ),
         };
         if retained.as_deref() != Some(value) {
+            if field == "cwd" {
+                self.budget.invalid_cwds[self.budget.current_session] = true;
+            }
             self.budget.repaired_fields += 1;
         }
         if let Some(retained) = retained {
@@ -599,12 +608,15 @@ impl<'de> serde::de::Visitor<'de> for SessionsSeed<'_> {
         let mut sessions =
             Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_RESTORED_SESSIONS));
         while sessions.len() < MAX_RESTORED_SESSIONS {
+            budget.current_session = sessions.len();
+            let before = budget.repaired_fields;
             let Some(session) = seq.next_element_seed(SessionSeed {
                 budget: &mut *budget,
             })?
             else {
                 return Ok(sessions);
             };
+            budget.session_fields[sessions.len()] = budget.repaired_fields - before;
             sessions.push(session);
         }
         while seq.next_element_seed(DiscardSessionSeed)?.is_some() {
@@ -1371,10 +1383,10 @@ fn raw_is_null(raw: &serde_json::value::RawValue) -> bool {
     raw.get().trim() == "null"
 }
 
-fn decode_bounded_snapshot_with_text_budget(
+fn decode_bounded_snapshot_details(
     content: &str,
     text_budget: usize,
-) -> Result<(SessionsSnapshot, Vec<String>), serde_json::Error> {
+) -> Result<(SessionsSnapshot, Vec<String>, RepairSummary), serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(content);
     let raw = serde::de::DeserializeSeed::deserialize(RawSessionsSeed, &mut deserializer)?;
     deserializer.end()?;
@@ -1435,6 +1447,7 @@ fn decode_bounded_snapshot_with_text_budget(
         warnings.push("active tab index was outside the restored list".to_string());
     }
 
+    let sessions_len = sessions.len();
     Ok((
         SessionsSnapshot {
             version: raw.version,
@@ -1445,13 +1458,85 @@ fn decode_bounded_snapshot_with_text_budget(
             active_tab,
         },
         warnings,
+        RepairSummary {
+            skipped_sessions: budget.extra_sessions,
+            session_fields: budget.session_fields,
+            invalid_cwds: budget.invalid_cwds,
+            layout_adjusted: budget.layout_repaired
+                || budget.repaired_fields > budget.session_fields.iter().sum(),
+            selection_adjusted: budget.active_tab_repaired,
+            retained_sessions: sessions_len,
+        },
     ))
+}
+
+fn decode_bounded_snapshot_with_text_budget(
+    content: &str,
+    text_budget: usize,
+) -> Result<(SessionsSnapshot, Vec<String>), serde_json::Error> {
+    decode_bounded_snapshot_details(content, text_budget)
+        .map(|(snapshot, warnings, _)| (snapshot, warnings))
 }
 
 fn decode_bounded_snapshot(
     content: &str,
 ) -> Result<(SessionsSnapshot, Vec<String>), serde_json::Error> {
     decode_bounded_snapshot_with_text_budget(content, MAX_RESTORED_TEXT_BYTES)
+}
+
+/// Bounded structured evidence, indexed by original one-based session position.
+/// Names and paths are deliberately absent: private titles remain private.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepairSummary {
+    pub skipped_sessions: usize,
+    pub session_fields: [usize; MAX_RESTORED_SESSIONS],
+    pub invalid_cwds: [bool; MAX_RESTORED_SESSIONS],
+    pub layout_adjusted: bool,
+    pub selection_adjusted: bool,
+    pub retained_sessions: usize,
+}
+
+#[allow(dead_code)] // used by binary-only startup recovery panel
+impl RepairSummary {
+    pub fn is_empty(&self) -> bool {
+        self.skipped_sessions == 0
+            && !self.layout_adjusted
+            && !self.selection_adjusted
+            && self.session_fields.iter().all(|count| *count == 0)
+            && self.invalid_cwds.iter().all(|invalid| !invalid)
+    }
+}
+
+/// Revalidate metadata only. This never starts a shell or executes a command.
+#[allow(dead_code)] // used by binary-only startup recovery panel
+pub(crate) fn inspect_recovery(
+    content: &str,
+) -> Result<(SessionsSnapshot, RepairSummary), serde_json::Error> {
+    let (mut snapshot, _, mut summary) =
+        decode_bounded_snapshot_details(content, MAX_RESTORED_TEXT_BYTES)?;
+    let layouts = (snapshot.layout.clone(), snapshot.tabs.clone());
+    let selection = (snapshot.active_index, snapshot.active_tab);
+    snapshot.sanitize();
+    // Migration from a legacy layout to tabs is normal, not a repair.
+    if !layouts.1.is_empty() {
+        summary.layout_adjusted |= layouts.1 != snapshot.tabs;
+    } else if let Some(layout) = layouts.0 {
+        summary.layout_adjusted |= snapshot.tabs.first() != Some(&layout);
+    }
+    summary.selection_adjusted |= selection != (snapshot.active_index, snapshot.active_tab);
+    for (index, session) in snapshot.sessions.iter_mut().enumerate() {
+        if session
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| !std::path::Path::new(cwd).is_dir())
+        {
+            summary.invalid_cwds[index] = true;
+            // Same safe default-cwd fallback as startup; original metadata is
+            // retained in the recovery source, never written by this function.
+            session.cwd = None;
+        }
+    }
+    Ok((snapshot, summary))
 }
 
 impl SessionsSnapshot {

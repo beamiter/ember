@@ -4231,6 +4231,10 @@ impl TerminalApp {
             }
         }
 
+        if let Some(recovery) = &mut self.session_recovery {
+            recovery.show(ctx);
+        }
+
         // Render after every surface that can create a pending paste. This
         // gives the modal top focus in the same frame as Find & Replace's
         // "Type into terminal" action, so Enter/Escape cannot return to the

@@ -248,6 +248,7 @@ jobs:
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
 
       - name: Build compositor protocol pointer helper
+        id: desktop-pointer
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         run: |
           mkdir -p "$RUNNER_TEMP/ember-pointer"
@@ -259,6 +260,24 @@ jobs:
       - name: Gate Wayland installed release interactions
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend wayland --output native-smoke-artifacts/wayland
+
+      - name: Gate installed session recovery on both desktops
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-pointer.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          status=0
+          for backend in x11 wayland; do
+            for case in normal corrupt-layout over-limit invalid-cwd; do
+              if ! python3 scripts/native-session-recovery.py \
+                --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+                --backend "$backend" --case "$case" \
+                --output "native-smoke-artifacts/recovery-$backend-$case"; then
+                status=1
+              fi
+            done
+          done
+          exit "$status"
 
       - name: Preserve real desktop evidence
         if: always()

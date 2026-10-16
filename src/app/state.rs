@@ -385,6 +385,7 @@ pub struct TerminalApp {
     /// A corrupt snapshot that could not be moved aside must never be
     /// overwritten by the fresh fallback session on debounce or Drop.
     pub session_persistence_blocked: bool,
+    pub session_recovery: Option<crate::session_recovery::SessionRecovery>,
 
     /// A failed UI-history load/save pauses retries and keeps its recovery
     /// notice visible after ordinary transient status messages expire.

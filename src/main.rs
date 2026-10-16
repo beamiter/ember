@@ -45,6 +45,7 @@ mod search_replace_panel;
 mod session;
 mod session_manager;
 mod session_persistence;
+mod session_recovery;
 mod shell;
 mod sidebar;
 mod ssh_files_follow;
@@ -2466,6 +2467,7 @@ impl TerminalApp {
         let is_first_instance = lock_file.is_some();
 
         let mut session_restore_notice = None;
+        let mut session_recovery = None;
         let mut session_persistence_blocked = false;
 
         // 仅在首个实例且配置允许时恢复会话。损坏文件先移到旁路备份；
@@ -2473,19 +2475,10 @@ impl TerminalApp {
         let saved_snapshot = if cfg.restore_session && is_first_instance {
             match cfg.resolved_session_history_path() {
                 Ok(path) => {
-                    match session_persistence::SessionsSnapshot::load_with_warnings(&path) {
-                        Ok((snapshot, warnings)) => {
-                            if !warnings.is_empty() {
-                                for warning in &warnings {
-                                    eprintln!("[SessionPersistence] WARNING: {warning}");
-                                }
-                                session_restore_notice = Some(format!(
-                                    "Session restore adjusted {} unsafe value(s)",
-                                    warnings.len()
-                                ));
-                            }
-                            (!snapshot.sessions.is_empty()).then_some(snapshot)
-                        }
+                    let (loaded, recovery) = session_recovery::SessionRecovery::load(&path);
+                    session_recovery = recovery;
+                    match loaded {
+                        Ok(snapshot) => snapshot,
                         Err(error) => {
                             eprintln!(
                                 "[SessionPersistence] Failed to load {}: {error}",
@@ -2785,6 +2778,7 @@ impl TerminalApp {
             session_save_pending: !session_persistence_blocked,
             session_save_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             session_persistence_blocked,
+            session_recovery,
             ui_history_persistence,
             _lock_file: lock_file,
             mouse_line_wheel: jterm_core::wheel::WheelAccumulator::default(),
