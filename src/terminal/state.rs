@@ -1854,37 +1854,30 @@ impl super::TerminalState {
         }
     }
 
-    /// 处理一个 UTF-8 多字节引导字节。`expected` 是该序列总长度(2/3/4)。
-    /// - 缓冲区剩余字节不足:把引导字节暂存,等待下一批输入续接(跨 PTY 读边界)。
-    /// - 续接字节齐全且合法:解码并写入字符;非法则输出替换字符 U+FFFD。
-    /// - 续接字节非法(不是 10xxxxxx):序列残缺,输出 U+FFFD 且只消费引导字节本身,
-    ///   让那个意外字节按自身规则重新处理。
+    /// Decode one UTF-8 scalar, consuming only the maximal invalid subpart on
+    /// errors. The streaming path validates the same prefixes after each byte.
     pub(super) fn consume_utf8_lead(&mut self, byte: u8, expected: u8, data: &[u8], i: &mut usize) {
         let need = expected as usize;
         if *i + need > data.len() {
-            // 不完整:剩余字节不够,暂存等待下一批
             self.utf8_buf[0] = byte;
             self.utf8_len = 1;
             self.utf8_expected = expected;
             *i += 1;
             return;
         }
-
-        let all_continuation = (1..need).all(|k| (data[*i + k] & 0xC0) == 0x80);
-        if all_continuation {
-            match std::str::from_utf8(&data[*i..*i + need]) {
-                Ok(s) => {
-                    if let Some(ch) = s.chars().next() {
-                        self.put_char(ch);
-                    }
+        match std::str::from_utf8(&data[*i..*i + need]) {
+            Ok(s) => {
+                if let Some(ch) = s.chars().next() {
+                    self.put_char(ch);
                 }
-                Err(_) => self.put_char('\u{FFFD}'),
+                *i += need;
             }
-            *i += need;
-        } else {
-            // 引导字节后紧跟非续接字节:残缺序列
-            self.put_char('\u{FFFD}');
-            *i += 1;
+            Err(error) => {
+                self.put_char('\u{FFFD}');
+                // Leave the first unexpected byte (and any subsequent orphan
+                // continuations) for the ordinary parser, just as across reads.
+                *i += error.error_len().unwrap_or(need);
+            }
         }
     }
 }

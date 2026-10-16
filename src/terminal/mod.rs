@@ -307,6 +307,8 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     )
 }
 
+#[cfg(test)]
+mod fragmentation_tests;
 mod grid;
 mod hyperlink;
 mod parser;

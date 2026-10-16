@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "encoding": "raw bytes; no newline or encoding conversion",
+  "files": [
+    {
+      "name": "aborted",
+      "file": "aborted.bin",
+      "length": 82,
+      "sha256": "5410cef5103e807065840162d04ac2691332715e8d9a0097240a8c8f878c5ac3"
+    },
+    {
+      "name": "cancel",
+      "file": "cancel.bin",
+      "length": 47,
+      "sha256": "02112bc87b052fb835840d630b76454e6745fd13d0eb8d12fff8387a61f3f4b9"
+    },
+    {
+      "name": "dcs",
+      "file": "dcs.bin",
+      "length": 43,
+      "sha256": "dbef306f5e20dc0f6da6c0fce2768ccd5c11af3457d0ba610e947de1b9063b0f"
+    },
+    {
+      "name": "kitty",
+      "file": "kitty.bin",
+      "length": 71,
+      "sha256": "71ffc5562260a7525e625c2f2aebbef8c945943b5b8af1e3b380177e7c08cb16"
+    },
+    {
+      "name": "modes",
+      "file": "modes.bin",
+      "length": 61,
+      "sha256": "92dad298897bc941508fb9944029970b38498cc9f554fc4e019077d8526c34df"
+    },
+    {
+      "name": "osc133",
+      "file": "osc133.bin",
+      "length": 144,
+      "sha256": "2a0ae3e97abb34b609e9836cc2950c61241d10c0f7288bb7549f21aff6cd71cc"
+    },
+    {
+      "name": "osc52",
+      "file": "osc52.bin",
+      "length": 36,
+      "sha256": "11563f4cfda5161941ac74161bd576513880191558a88f2b02501fb03ff09dd1"
+    },
+    {
+      "name": "osc8",
+      "file": "osc8.bin",
+      "length": 55,
+      "sha256": "87d90546ef492b84e65378f28c62cb9ad29024ee3c21bc938dc348e86753b3cb"
+    },
+    {
+      "name": "utf8",
+      "file": "utf8.bin",
+      "length": 25,
+      "sha256": "3173d579e14f84cdb6a42628e4cbf15267b7a961489a147ee27a59912ea7539d"
+    }
+  ],
+  "generated_oversize": {
+    "prefix_hex": "1b5f47613d702c693d39392c713d303b",
+    "fill_byte_hex": "41",
+    "total_prefix_and_fill_bytes": 4194305,
+    "suffix_hex": "1b5c5a1b5b366e",
+    "description": "Concatenate prefix, enough fill bytes to reach the specified length, then suffix. Used with every designated cap boundary and100 deterministic partitions; full all-cut enumeration is deliberately not quadratic."
+  }
+}

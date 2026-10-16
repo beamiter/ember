@@ -130,20 +130,21 @@ impl super::TerminalState {
         let Some(payload) = self.pending_apc.strip_prefix(b"\x1b_") else {
             return;
         };
-        if payload.first() != Some(&b'G') {
-            return;
-        }
-
         // Usually i/I/q are already buffered. If fragmentation happened
         // unusually early, copy only a bounded control prefix from the new
         // fragment so an oversized rejection can still echo the identifier and
         // honor q without retaining the oversized packet.
-        let limit = jterm_core::kitty_graphics::MAX_CONTROL_BYTES;
+        // Recovery includes the G discriminator; the shared control cap does not.
+        let limit = jterm_core::kitty_graphics::MAX_CONTROL_BYTES + 1;
         let mut recovery =
             Vec::with_capacity(limit.min(payload.len().saturating_add(suffix.len())));
         recovery.extend_from_slice(&payload[..payload.len().min(limit)]);
         if recovery.len() < limit && !recovery.contains(&b';') {
             recovery.extend_from_slice(&suffix[..suffix.len().min(limit - recovery.len())]);
+        }
+        // The discriminator itself may be in the new read (ESC _ | G...).
+        if recovery.first() != Some(&b'G') {
+            return;
         }
         self.kitty_graphics
             .reject_graphics_payload(&recovery, error);
@@ -1047,7 +1048,20 @@ impl super::TerminalState {
                                     let payload = &data_slice[string_start..i];
 
                                     if is_apc {
-                                        self.handle_kitty_apc_payload(payload);
+                                        // Apply the same packet cap as the
+                                        // streaming path before dispatching a
+                                        // complete APC; read size is not policy.
+                                        if i + 2 - esc_start > MAX_PENDING_ESCAPE {
+                                            if payload.first() == Some(&b'G') {
+                                                self.kitty_graphics.reject_graphics_payload(
+                                                    payload,
+                                                    "Kitty graphics APC exceeded the parser size limit",
+                                                );
+                                                self.drain_kitty_graphics_responses();
+                                            }
+                                        } else {
+                                            self.handle_kitty_apc_payload(payload);
+                                        }
                                     } else if is_dcs {
                                         self.handle_dcs_payload(payload);
                                     }
@@ -1318,17 +1332,26 @@ impl super::TerminalState {
                     if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
                         self.utf8_buf[self.utf8_len as usize] = byte;
                         self.utf8_len += 1;
-                        if self.utf8_len == self.utf8_expected {
-                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
-                                Ok(s) => {
-                                    if let Some(ch) = s.chars().next() {
-                                        self.put_char(ch);
-                                    }
+                        match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
+                            Ok(s) => {
+                                debug_assert_eq!(self.utf8_len, self.utf8_expected);
+                                if let Some(ch) = s.chars().next() {
+                                    self.put_char(ch);
                                 }
-                                // 长度够但内容非法(如过长编码/代理区):输出替换字符。
-                                Err(_) => self.put_char('\u{FFFD}'),
+                                self.utf8_len = 0;
                             }
-                            self.utf8_len = 0;
+                            Err(error) => {
+                                if let Some(invalid_len) = error.error_len() {
+                                    // Validate each prefix, not only full-width
+                                    // sequences: E0 80, ED A0, F4 90 are already
+                                    // invalid at byte two. The remaining bytes
+                                    // here are orphan continuation bytes.
+                                    for _ in 0..=self.utf8_len as usize - invalid_len {
+                                        self.put_char('\u{FFFD}');
+                                    }
+                                    self.utf8_len = 0;
+                                }
+                            }
                         }
                     } else {
                         // 孤立的续接字节或非法引导字节。

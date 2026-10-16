@@ -1,0 +1,2 @@
+# Preserve raw parser streams, including CR/LF and malformed UTF-8.
+*.bin binary
