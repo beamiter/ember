@@ -5960,6 +5960,56 @@ fn block_search_output_line_anchor_counts_soft_wraps_and_fails_closed_when_trimm
 }
 
 #[test]
+fn block_search_truncated_capture_does_not_reveal_synthetic_or_tail_coordinates() {
+    let mut terminal = TerminalState::new(40, 24);
+    terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=capped\x07");
+    for n in 0..20 {
+        terminal.process_input(format!("original line {n:03}\r\n").as_bytes());
+    }
+    terminal.process_input(b"\x1b]133;D;0;id=capped\x07");
+    let record = terminal.command_record("capped").unwrap();
+    let captured = terminal
+        .extract_text_range(
+            record.output_start.unwrap(),
+            record.output_end.unwrap(),
+            100,
+        )
+        .unwrap();
+    assert!(captured.truncated);
+    assert!(captured.text.contains("019"));
+    let lines = captured.text.lines().map(str::to_owned).collect::<Vec<_>>();
+    terminal
+        .command_records
+        .iter_mut()
+        .find(|record| record.id == "capped")
+        .unwrap()
+        .captured_output = Some(captured.clone());
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 || line.contains("truncated") || line.contains("019") {
+            assert!(terminal
+                .command_output_line_anchor("capped", index + 1)
+                .is_none());
+            assert!(terminal
+                .command_output_match_anchor("capped", index + 1, 0, 3)
+                .is_none());
+        }
+    }
+    assert_eq!(
+        terminal
+            .command_record("capped")
+            .unwrap()
+            .captured_output
+            .as_ref(),
+        Some(&captured)
+    );
+    assert_eq!(
+        terminal.command_output_text("capped", 100).unwrap(),
+        captured
+    );
+    assert!(terminal.command_output_line_anchor("missing", 1).is_none());
+}
+
+#[test]
 fn block_search_match_anchor_rejects_a_reversed_same_row_range() {
     let mut terminal = TerminalState::new(20, 4);
     terminal.process_input(b"\x1b]133;A\x07\x1b]133;C;id=corrupt\x07abc");

@@ -4417,6 +4417,17 @@ impl super::TerminalState {
             return None;
         }
         let record = self.command_record(id)?;
+        // Search indexes the captured head+tail text. Once truncated, its
+        // logical line numbers (including the synthetic marker) no longer
+        // identify original rows. Without retained line provenance, fail
+        // closed for both line fallback and exact match navigation.
+        if record
+            .captured_output
+            .as_ref()
+            .is_some_and(|captured| captured.truncated)
+        {
+            return None;
+        }
         let start = record.output_start?;
         let end = record.output_end?;
         let (start_row, _) = self.buffer_anchor_to_absolute(start)?;

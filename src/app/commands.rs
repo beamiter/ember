@@ -17,6 +17,21 @@ const COMMAND_DETAIL_OUTPUT_BYTES: usize = 16 * 1024;
 const DETAIL_TRUNCATION_MARKER: &str = "\n… preview truncated …\n";
 const MAX_BLOCK_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 
+/// Keep provenance from the exact output snapshot used by the search index.
+/// A fallback extraction after capture eviction can be truncated too.
+fn block_search_output_source(
+    record_id: &str,
+    output: Option<crate::terminal::ExtractedText>,
+    unmapped: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    output.map(|output| {
+        if output.truncated {
+            unmapped.insert(record_id.to_owned());
+        }
+        output.text
+    })
+}
+
 /// OSC prompt metadata can also be emitted by a foreground editor or test.
 /// Review-only insertions and explicitly approved replays need both proofs at
 /// the final PTY write boundary, including a fail-closed process-group probe.
@@ -4069,6 +4084,7 @@ impl TerminalApp {
             .filter(|record| record.complete)
             .map(|record| (record.id.clone(), record.sequence))
             .collect::<std::collections::HashMap<_, _>>();
+        let mut unmapped_output_records = std::collections::HashSet::new();
         let snapshot = crate::block_mode::bounded_block_search_sources(
             terminal
                 .command_records()
@@ -4079,15 +4095,18 @@ impl TerminalApp {
                     let output = match record.captured_output.as_ref() {
                         // Captures are produced under MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
                         // so the snapshot is already bounded.
-                        Some(captured) => Some(captured.text.clone()),
+                        Some(captured) => Some(captured.clone()),
                         None => terminal
-                            .command_output_text(&record.id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES)
-                            .map(|text| text.text),
+                            .command_output_text(&record.id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES),
                     };
                     crate::block_mode::BlockSearchSource::new(
                         record.id.clone(),
                         record.command.clone(),
-                        output,
+                        block_search_output_source(
+                            &record.id,
+                            output,
+                            &mut unmapped_output_records,
+                        ),
                     )
                 }),
             crate::block_mode::BLOCK_SEARCH_SOURCE_MAX_BYTES,
@@ -4098,6 +4117,7 @@ impl TerminalApp {
             crate::block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
         );
         self.block_search.cache = build.records;
+        self.block_search.unmapped_output_records = unmapped_output_records;
         self.block_search.record_sequences = std::sync::Arc::new(record_sequences);
         self.block_search.older_not_indexed = build.older_not_indexed;
         self.block_search.session_id = Some(session_id.to_string());
@@ -4137,6 +4157,16 @@ impl TerminalApp {
         else {
             return;
         };
+        if hit.line_no.is_some()
+            && self
+                .block_search
+                .unmapped_output_records
+                .contains(&hit.record_id)
+        {
+            self.set_status("Output match position is unavailable for truncated output");
+            self.block_search.needs_focus = true;
+            return;
+        }
         let activation =
             block_search_activation(self.apply_block_selection(target.clone()), keep_open);
         if activation == BlockSearchActivation::RejectStale {
@@ -4147,6 +4177,7 @@ impl TerminalApp {
             self.refresh_block_search_hits();
             return;
         }
+        let mut output_revealed = hit.line_no.is_none();
         if let Some(line_no) = hit.line_no {
             if let Some(index) = self.session_manager.index_of(&target.session_id) {
                 if let Some(session) = self.session_manager.sessions_mut().get_mut(index) {
@@ -4180,6 +4211,10 @@ impl TerminalApp {
                         if transformed {
                             let location = terminal
                                 .reveal_buffer_anchor_in_projection(policy, view_state, anchor);
+                            output_revealed = matches!(
+                                location,
+                                crate::terminal::ProjectedBufferAnchorLocation::Visible { .. }
+                            );
                             if let crate::terminal::ProjectedBufferAnchorLocation::Hidden {
                                 zone_id,
                             } = location
@@ -4196,17 +4231,25 @@ impl TerminalApp {
                                         policy,
                                         view_state,
                                     );
-                                    let _ = terminal.reveal_buffer_anchor_in_projection(
-                                        policy, view_state, anchor,
+                                    output_revealed = matches!(
+                                        terminal.reveal_buffer_anchor_in_projection(
+                                            policy, view_state, anchor,
+                                        ),
+                                        crate::terminal::ProjectedBufferAnchorLocation::Visible { .. }
                                     );
                                 }
                             }
                         } else {
-                            let _ = terminal.scroll_to_buffer_anchor(anchor);
+                            output_revealed = terminal.scroll_to_buffer_anchor(anchor);
                         }
                     }
                 }
             }
+        }
+        if !output_revealed {
+            self.set_status("Output match position is unavailable in retained scrollback");
+            self.block_search.needs_focus = true;
+            return;
         }
         match activation {
             BlockSearchActivation::RejectStale => unreachable!(),
@@ -5471,6 +5514,44 @@ mod tests {
         assert!(!super::review_prompt_is_ready(false, false));
     }
     use super::*;
+
+    #[test]
+    fn output_index_preserves_truncation_provenance_for_capture_and_fallback() {
+        for source in ["stored", "fallback"] {
+            let mut unmapped = std::collections::HashSet::new();
+            let output = crate::terminal::ExtractedText {
+                text: "head\n… output truncated …\ntail".to_owned(),
+                truncated: true,
+                total_bytes: 1000,
+            };
+            let expected = output.text.clone();
+            assert_eq!(
+                block_search_output_source(source, Some(output), &mut unmapped),
+                Some(expected)
+            );
+            assert!(unmapped.contains(source));
+            assert!(!unmapped.contains("other"));
+        }
+    }
+    #[test]
+    fn output_index_keeps_nontruncated_fallback_navigable() {
+        let mut unmapped = std::collections::HashSet::new();
+        let output = crate::terminal::ExtractedText {
+            text: "retained output".to_owned(),
+            truncated: false,
+            total_bytes: 15,
+        };
+        assert_eq!(
+            block_search_output_source("fallback", Some(output), &mut unmapped),
+            Some("retained output".to_owned())
+        );
+        assert!(unmapped.is_empty());
+        assert_eq!(
+            block_search_output_source("absent", None, &mut unmapped),
+            None
+        );
+        assert!(unmapped.is_empty());
+    }
 
     fn workflow_refusal(path: &str, reason: &str) -> (std::path::PathBuf, String) {
         (std::path::PathBuf::from(path), reason.to_string())

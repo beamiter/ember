@@ -248,6 +248,9 @@ pub struct BlockSearchState {
     pub query_error: Option<String>,
     /// Bounded cache, oldest record first.
     pub cache: Vec<CachedBlockSearchRecord>,
+    /// Records whose indexed output lost original line coordinates to truncation.
+    /// Built from both captured and fallback extraction and released with the cache.
+    pub unmapped_output_records: std::collections::HashSet<String>,
     /// Execution id → terminal-owned sequence, for every completed record of
     /// the cached session. Bookmarks are keyed by sequence while hits and the
     /// cache are keyed by id, so this is the join between them.
@@ -323,6 +326,7 @@ impl BlockSearchState {
         self.query_error = None;
         self.cache = Vec::new();
         self.record_sequences = std::sync::Arc::default();
+        self.unmapped_output_records = std::collections::HashSet::new();
         self.session_id = None;
         self.record_version = None;
         self.bookmark_revision = None;
@@ -341,6 +345,7 @@ impl BlockSearchState {
         // large slice of scrollback and pane identities are stale on reopen.
         self.cache = Vec::new();
         self.record_sequences = std::sync::Arc::default();
+        self.unmapped_output_records = std::collections::HashSet::new();
         self.hits = Vec::new();
         self.capped = false;
         self.older_not_indexed = false;
@@ -411,6 +416,7 @@ impl BlockSearchState {
     pub fn release_index_for_rebuild(&mut self) {
         self.cache = Vec::new();
         self.record_sequences = std::sync::Arc::default();
+        self.unmapped_output_records = std::collections::HashSet::new();
         self.hits = Vec::new();
         self.capped = false;
         self.older_not_indexed = false;
@@ -647,6 +653,7 @@ mod tests {
         // avoid.
         let indexed = || BlockSearchState {
             cache: vec![CachedBlockSearchRecord::new("kept", Some("build"), None)],
+            unmapped_output_records: ["kept".to_string()].into(),
             record_sequences: std::sync::Arc::new(std::collections::HashMap::from([(
                 "kept".to_string(),
                 7u64,
@@ -669,6 +676,10 @@ mod tests {
             let mut state = indexed();
             release(&mut state);
             assert!(state.cache.is_empty(), "{name} must drop the cache");
+            assert!(
+                state.unmapped_output_records.is_empty(),
+                "{name} must drop output provenance"
+            );
             assert!(
                 state.record_sequences.is_empty(),
                 "{name}: the id-to-sequence join must not survive the cache it belongs to"
