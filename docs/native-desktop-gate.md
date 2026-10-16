@@ -38,3 +38,13 @@ must add its own independent oracle and retain failures without weakening guards
 
 Local syntax/oracle checks do not count as a compositor run. Run the script only
 on a supported display runner; do not work around sandbox socket restrictions.
+
+## Window-manager shortcut conflicts
+
+The X11 fixture preserves the installed Openbox configuration except its two
+Ctrl+Alt+Left/Right desktop-switch bindings, which otherwise grab Ember's pane
+focus shortcuts. Both original and effective XML configurations are artifacts;
+the driver verifies those exact bindings before removing them. The same real
+keyboard chords and strict Bash PID/TTY pane oracle remain in use. Users whose
+window manager grabs these chords must resolve that desktop shortcut conflict;
+this fixture does not certify behavior under a competing global grab.

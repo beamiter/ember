@@ -10,6 +10,7 @@ import argparse
 import csv
 import io
 import tomllib
+import xml.etree.ElementTree as ET
 import hashlib
 import json
 import os
@@ -88,7 +89,25 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             wait_for(lambda: subprocess.run(['xdpyinfo'], env=self.env, stdout=subprocess.DEVNULL,
                                             stderr=subprocess.DEVNULL, timeout=3).returncode == 0, 'X11 display')
             assert server.poll() is None
-            self.spawn(['openbox', '--sm-disable'], 'openbox')
+            # Stock Openbox grabs Ctrl+Alt+Left/Right for desktop switching.
+            # Keep the real Ember pane shortcuts; remove only those conflicting
+            # test-WM bindings, with the original and effective config recorded.
+            original = Path('/etc/xdg/openbox/rc.xml').read_bytes()
+            (self.out / 'openbox-system-rc.xml').write_bytes(original)
+            config = ET.fromstring(original)
+            ns = {'ob': 'http://openbox.org/3.4/rc'}
+            keyboard = config.find('ob:keyboard', ns)
+            assert keyboard is not None, 'Openbox keyboard configuration absent'
+            for chord in ('C-A-Left', 'C-A-Right'):
+                matches = [node for node in keyboard.findall('ob:keybind', ns)
+                           if node.get('key') == chord]
+                assert len(matches) == 1, ('Openbox conflict absent or ambiguous', chord)
+                actions = matches[0].findall('ob:action', ns)
+                assert len(actions) == 1 and actions[0].get('name') == 'GoToDesktop'
+                keyboard.remove(matches[0])
+            wm_config = self.out / 'openbox-test-rc.xml'
+            ET.ElementTree(config).write(wm_config, encoding='utf-8', xml_declaration=True)
+            self.spawn(['openbox', '--sm-disable', '--config', str(wm_config)], 'openbox')
         else:
             cfg = self.out / 'sway.conf'
             cfg.write_text('xwayland disable\noutput * resolution 1280x900\nseat seat0 fallback true\nfocus_follows_mouse no\n')
