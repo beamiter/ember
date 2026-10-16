@@ -223,7 +223,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             xvfb openbox xdotool xclip x11-utils sway wtype wl-clipboard grim \
-            imagemagick tesseract-ocr fonts-dejavu-core fonts-noto-cjk mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin
+            dbus python3-dbus at-spi2-core imagemagick tesseract-ocr fonts-dejavu-core fonts-noto-cjk mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin
 
       - name: Stage optimized desktop candidate
         id: desktop-install
@@ -246,6 +246,13 @@ jobs:
       - name: Gate X11 installed release interactions
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
+
+      - name: Probe owned Block Search accessibility on isolated X11
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          python3 scripts/test-native-block-search-atspi-probe.py
+          /usr/bin/python3 scripts/native-block-search-atspi-probe.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --output native-smoke-artifacts/block-search-atspi-discovery
 
       - name: Gate real X11 bounded block-search correctness
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
