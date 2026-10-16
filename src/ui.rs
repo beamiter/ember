@@ -299,6 +299,22 @@ fn display_cell_from_content(
     jterm_core::click_cursor::Cell::new(row as i64, col as i64)
 }
 
+/// Bare modifier presses carry state but no bytes in the supported terminal
+/// keyboard protocols. Keep this contract shared with ordered app dispatch.
+pub(crate) fn is_modifier_only_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
+}
+
 fn key_to_terminal_sequence(
     key: egui::Key,
     modifiers: egui::Modifiers,
@@ -6362,6 +6378,9 @@ impl TerminalRenderer {
                     modifiers,
                     ..
                 } => {
+                    if is_modifier_only_key(*key) {
+                        continue;
+                    }
                     let consumed_name = consumed_key_name(*key, *modifiers);
                     if !consumed_name.is_empty() && consumed_keys.contains(consumed_name.as_str()) {
                         continue;
@@ -8024,6 +8043,77 @@ mod tests {
             .as_deref(),
             Some("\x1b[Z")
         );
+    }
+
+    #[test]
+    fn modifier_only_keys_emit_no_bytes_in_all_keyboard_protocols() {
+        let renderer = TerminalRenderer::new(
+            14.0,
+            8.0,
+            1.0,
+            crate::config::ScrollbarVisibility::Auto,
+            crate::theme::Theme::default(),
+        );
+        for key in [
+            egui::Key::ShiftLeft,
+            egui::Key::ShiftRight,
+            egui::Key::ControlLeft,
+            egui::Key::ControlRight,
+            egui::Key::AltLeft,
+            egui::Key::AltRight,
+            egui::Key::SuperLeft,
+            egui::Key::SuperRight,
+        ] {
+            assert!(is_modifier_only_key(key));
+            for modifiers in [
+                egui::Modifiers::NONE,
+                egui::Modifiers::CTRL,
+                egui::Modifiers::SHIFT,
+                egui::Modifiers::ALT,
+                egui::Modifiers::COMMAND,
+            ] {
+                for pressed in [false, true] {
+                    let event = egui::Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    };
+                    for flags in [0, 1, 8, 9] {
+                        for report_all in [false, true] {
+                            for modify in [0, 1, 2] {
+                                for format in [0, 1] {
+                                    let mut bytes = Vec::new();
+                                    renderer.handle_keyboard_input(
+                                        &egui::Context::default(),
+                                        &mut bytes,
+                                        &std::collections::HashSet::new(),
+                                        false,
+                                        flags,
+                                        report_all,
+                                        modify,
+                                        format,
+                                        false,
+                                        false,
+                                        true,
+                                        modifiers.alt,
+                                        std::slice::from_ref(&event),
+                                    );
+                                    assert!(
+                                        bytes.is_empty(),
+                                        "{key:?} flags={flags} modify={modify}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for key in [egui::Key::Enter, egui::Key::ArrowLeft, egui::Key::A] {
+            assert!(!is_modifier_only_key(key));
+        }
     }
 
     #[test]

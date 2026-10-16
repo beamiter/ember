@@ -253,7 +253,9 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             return max(int(row['top']), int(anchor['top'])) < min(
                 int(row['top']) + int(row['height']),
                 int(anchor['top']) + int(anchor['height']))
-        rows = [r for r in words if r['text'] == 'Advanced'
+        # Selected tab backgrounds can introduce peripheral OCR punctuation.
+        # Exact normalized word only: no fuzzy/substring or coordinate fallback.
+        rows = [r for r in words if r['text'].strip("‘’'\".,:;()[]").casefold() == 'advanced'
                 and all(shares_row(r, anchor) for anchor in anchors)]
         assert len(rows) == 1, ('ambiguous or absent Advanced tab', rows)
         row = rows[0]

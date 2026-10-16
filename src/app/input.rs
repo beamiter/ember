@@ -2689,8 +2689,12 @@ impl TerminalApp {
                 // selection action before it is older and must be cleared once
                 // the bytes are accepted; a later selection action can set the
                 // bit again.
-                terminal_input_seen = true;
-                selection_postdates_terminal_input = false;
+                // Bare physical modifier presses cannot produce terminal bytes.
+                // Preserve their events/state and any older real-input barrier.
+                if !crate::ui::is_modifier_only_key(press.key) {
+                    terminal_input_seen = true;
+                    selection_postdates_terminal_input = false;
+                }
                 OrderedPressOutcome::Ignored
             }
         });
@@ -3967,6 +3971,67 @@ mod tests {
             ),
             [BlockSearchKeyRoute::CloseToggle]
         );
+    }
+
+    #[test]
+    fn modifier_only_presses_do_not_defer_paste_or_erase_real_input_barriers() {
+        let chord = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        for key in [
+            egui::Key::ShiftLeft,
+            egui::Key::ShiftRight,
+            egui::Key::ControlLeft,
+            egui::Key::ControlRight,
+            egui::Key::AltLeft,
+            egui::Key::AltRight,
+            egui::Key::SuperLeft,
+            egui::Key::SuperRight,
+        ] {
+            let modifier = key_press(key, chord);
+            let paste = key_press(egui::Key::V, chord);
+            for prefix in [
+                vec![],
+                vec![egui::Event::Text("older".into())],
+                vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
+                vec![key_press(egui::Key::ArrowLeft, egui::Modifiers::NONE)],
+                vec![egui::Event::Paste("older".into())],
+            ] {
+                let should_defer = !prefix.is_empty();
+                let mut events = prefix;
+                events.extend([modifier.clone(), paste.clone()]);
+                let batch =
+                    ordered_key_presses(&events, &keybindings::KeyBindings::default_bindings());
+                let mut pending = false;
+                let mut executed = 0;
+                let mut deferred = 0;
+                dispatch_ordered_key_presses(&batch.presses, |press| {
+                    pending |= press.terminal_input_before;
+                    if press.command == Some(keybindings::Command::EditPaste) {
+                        if pending {
+                            deferred += 1;
+                            OrderedPressOutcome::Ignored
+                        } else {
+                            executed += 1;
+                            OrderedPressOutcome::Consumed
+                        }
+                    } else {
+                        if !crate::ui::is_modifier_only_key(press.key) {
+                            pending = true;
+                        }
+                        OrderedPressOutcome::Ignored
+                    }
+                });
+                assert_eq!(
+                    (executed, deferred),
+                    if should_defer { (0, 1) } else { (1, 0) }
+                );
+                assert_eq!(events.iter().filter(|event| **event == modifier).count(), 1);
+            }
+        }
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
