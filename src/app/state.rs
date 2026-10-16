@@ -289,6 +289,10 @@ pub struct TerminalApp {
     /// Passive state survives modal dispatch so pointer fills can claim Enter.
     pub prompt_fill_enter_down: bool,
     pub native_enter_ownership: crate::native_enter::NativeEnterOwnership,
+    pub terminal_ime: crate::terminal_ime::Ownership,
+    pub frame_ime_owner: Option<crate::terminal_ime::Owner>,
+    pub ime_origin_terminal:
+        Option<std::sync::Arc<parking_lot::Mutex<crate::terminal::TerminalState>>>,
 
     /// 工作流选择器（Ctrl+Shift+M，anvil/forge 的 workflows）。打开时同步加载
     /// 有界目录扫描；Enter 对无参数工作流直接回填提示符，有参数则打开填写
@@ -451,6 +455,7 @@ pub struct TerminalApp {
 
 impl TerminalApp {
     pub(crate) fn bump_active_session_epoch(&mut self) {
+        self.cancel_terminal_ime();
         self.active_session_epoch = self.active_session_epoch.wrapping_add(1);
         if self.active_session_epoch == 0 {
             self.active_session_epoch = 1;

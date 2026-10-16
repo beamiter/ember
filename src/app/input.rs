@@ -1008,6 +1008,202 @@ fn block_selection_context_available(
 }
 
 impl TerminalApp {
+    fn current_terminal_ime_owner(&self) -> Option<crate::terminal_ime::Owner> {
+        self.session_manager
+            .sessions()
+            .get(self.session_manager.active_index())
+            .map(|session| crate::terminal_ime::Owner {
+                epoch: self.active_session_epoch,
+                instance: std::sync::Arc::as_ptr(&session.terminal) as usize,
+            })
+    }
+
+    pub(crate) fn cancel_terminal_ime(&mut self) {
+        self.terminal_ime.sync(None);
+        if let Some(terminal) = self.ime_origin_terminal.take() {
+            let mut terminal = terminal.lock();
+            terminal.clear_preedit();
+            terminal.ime_enabled = false;
+        }
+    }
+
+    fn sync_terminal_ime_owner(&mut self, ctx: &egui::Context, focused: bool) {
+        let owner = (focused
+            && !self.terminal_input_blocked(ctx)
+            && !self.block_chrome_owns_keyboard(ctx)
+            && !self.active_terminal_is_read_only())
+        .then(|| self.current_terminal_ime_owner())
+        .flatten();
+        if self.terminal_ime.sync(owner) {
+            if let Some(terminal) = self.ime_origin_terminal.take() {
+                let mut terminal = terminal.lock();
+                terminal.clear_preedit();
+                terminal.ime_enabled = false;
+            }
+        }
+    }
+
+    /// Predict egui's interaction position for this batch, independently of
+    /// the drag/drop hover tracker. egui starts from previous latest_pos,
+    /// updates on moves AND button edges, and retains interact_pos on Gone.
+    fn ime_batch_interaction_pos(
+        previous_latest: Option<egui::Pos2>,
+        events: &[egui::Event],
+    ) -> Option<egui::Pos2> {
+        let mut interaction = previous_latest;
+        for event in events {
+            match event {
+                egui::Event::PointerMoved(pos) | egui::Event::PointerButton { pos, .. } => {
+                    interaction = Some(*pos);
+                }
+                _ => {}
+            }
+        }
+        interaction
+    }
+
+    /// Run before egui sees this batch, including before modal Enter handlers.
+    /// Lifecycle and candidate Enter retain event order; later delivery also
+    /// checks this batch's original session rather than trusting active focus.
+    pub(crate) fn prepare_terminal_ime_input(
+        &mut self,
+        ctx: &egui::Context,
+        raw: &mut egui::RawInput,
+    ) {
+        self.sync_terminal_ime_owner(ctx, raw.focused);
+        self.frame_ime_owner = (raw.focused
+            && !self.terminal_input_blocked(ctx)
+            && !self.block_chrome_owns_keyboard(ctx)
+            && !self.active_terminal_is_read_only())
+        .then(|| self.current_terminal_ime_owner())
+        .flatten();
+        // A native batch may already contain press/repeats/release before we
+        // claim its hold. This local flag never survives to await a lost release.
+        let mut claimed_in_batch = false;
+        let mut pointer_owns_suffix = false;
+        let mut pointer_candidate_pending = false;
+        // Match the main input path's wheel-to-pane routing. Scrolling the
+        // current pane is not an ownership change and preserves composition.
+        let interaction_pos = Self::ime_batch_interaction_pos(
+            ctx.input(|input| input.pointer.latest_pos()),
+            &raw.events,
+        );
+        let wheel_changes_pane = interaction_pos.is_some_and(|pos| {
+            self.layout().panes().len() > 1
+                && self.layout().divider_at(pos).is_none()
+                && self.layout().panes().iter().any(|pane| {
+                    pane.rect.contains(pos)
+                        && pane.session_idx != self.session_manager.active_index()
+                })
+        });
+        raw.events.retain(|event| {
+            let pointer_boundary =
+                matches!(event, egui::Event::PointerButton { pressed: true, .. })
+                    || (wheel_changes_pane && matches!(event, egui::Event::MouseWheel { .. }));
+            if pointer_boundary && self.frame_ime_owner.is_some() {
+                // Pointer dispatch (including opening chrome) happens later.
+                // Keep earlier Commit bytes in order; the suffix has no
+                // proven terminal owner. Same-pane clicks are conservative.
+                pointer_candidate_pending |= self.terminal_ime.has_composition();
+                pointer_owns_suffix = true;
+                self.cancel_terminal_ime();
+            }
+            match event {
+                egui::Event::WindowFocused(false) => {
+                    self.cancel_terminal_ime();
+                    self.frame_ime_owner = None;
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    ..
+                } => {
+                    let ime_claims_enter = self.terminal_ime.claim_enter();
+                    if claimed_in_batch || pointer_candidate_pending || ime_claims_enter {
+                        pointer_candidate_pending = false;
+                        claimed_in_batch = true;
+                        return false;
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: false,
+                    ..
+                } => {
+                    claimed_in_batch = false;
+                }
+                egui::Event::Ime(event) => {
+                    use crate::terminal_ime::Event;
+                    #[allow(deprecated)]
+                    let lifecycle = match event {
+                        egui::ImeEvent::Enabled => Event::Opened,
+                        egui::ImeEvent::Disabled => Event::Closed,
+                        egui::ImeEvent::Preedit { text, .. } => Event::Preedit {
+                            empty: text.is_empty(),
+                        },
+                        egui::ImeEvent::Commit(_) => Event::Commit,
+                        _ => Event::Other,
+                    };
+                    if pointer_owns_suffix {
+                        if matches!(lifecycle, Event::Preedit { empty: false }) {
+                            self.terminal_ime.reject_unowned_preedit();
+                            pointer_candidate_pending = true;
+                        }
+                        if matches!(lifecycle, Event::Commit) {
+                            pointer_candidate_pending = true;
+                        }
+                        // Still retire an old Commit/Closed tombstone. It must
+                        // not consume the overlay's next genuine composition.
+                        self.terminal_ime.admit(lifecycle);
+                        return false;
+                    }
+                    if !self.terminal_ime.admit(lifecycle) {
+                        return false;
+                    }
+                    if matches!(lifecycle, Event::Preedit { empty: false })
+                        && self.frame_ime_owner.is_some()
+                    {
+                        self.ime_origin_terminal = self
+                            .session_manager
+                            .sessions()
+                            .get(self.session_manager.active_index())
+                            .map(|session| std::sync::Arc::clone(&session.terminal));
+                    }
+                    if matches!(lifecycle, Event::Commit | Event::Closed) {
+                        if let Some(terminal) = self.ime_origin_terminal.take() {
+                            terminal.lock().clear_preedit();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            true
+        });
+        if pointer_owns_suffix {
+            // The legacy display pre-scan must not redraw an earlier preedit
+            // after we cancelled it. Earlier commits remain ordered input.
+            raw.events.retain(|event| {
+                !matches!(event, egui::Event::Ime(ime)
+                if !matches!(ime, egui::ImeEvent::Commit(_)))
+            });
+        }
+        // Native input has already observed the entire batch. Claim only if
+        // its candidate hold survived: an earlier press/release must not adopt
+        // a later fresh Enter whose physical press is now in the native set.
+        if claimed_in_batch {
+            self.native_enter_ownership.claim_pressed();
+        }
+    }
+
+    pub(crate) fn discard_stale_frame_ime(&mut self) {
+        if self.frame_ime_owner.is_none()
+            || self.frame_ime_owner != self.current_terminal_ime_owner()
+        {
+            self.frame_events
+                .retain(|event| !matches!(event, egui::Event::Ime(_)));
+        }
+    }
+
     pub(super) fn claim_enter_for_prompt_recall(&mut self) {
         self.native_enter_ownership.claim_pressed();
         claim_prompt_fill_enter(
@@ -2316,6 +2512,11 @@ impl TerminalApp {
     /// Clearing selection here lets a later Ctrl+Up establish a genuinely
     /// newer selection, while a commit after Ctrl+Up clears it immediately.
     fn queue_ordered_ime_commit(&mut self, text: &str) -> bool {
+        if self.frame_ime_owner.is_none()
+            || self.frame_ime_owner != self.current_terminal_ime_owner()
+        {
+            return false;
+        }
         crate::debug_log!("[IME] Commit: {:?}", text);
         let queued = self
             .session_manager
@@ -2420,6 +2621,16 @@ impl TerminalApp {
                 let selection_before = self.block_selection.clone();
                 if self.dispatch_command(ctx, command.clone()) {
                     return OrderedPressOutcome::CloseViewport;
+                }
+                self.sync_terminal_ime_owner(ctx, ctx.input(|input| input.focused));
+                if self.terminal_input_blocked(ctx) || self.block_chrome_owns_keyboard(ctx) {
+                    // A new overlay must not adopt this terminal batch's IME
+                    // suffix when it paints its text field later in the frame.
+                    ctx.input_mut(|input| {
+                        input
+                            .events
+                            .retain(|event| !matches!(event, egui::Event::Ime(_)))
+                    });
                 }
                 let selection_command = matches!(
                     command,

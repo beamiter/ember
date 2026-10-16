@@ -43,6 +43,17 @@ companion uses only verified blank composer space.
 - Keyboard input remains shell-owned, including multiline continuation prompts.
 - `cd`, exported variables, Tab completion, history, IME and password entry keep
   their existing terminal paths. The dock does not resize the shell's PTY.
+- An IME composition belongs to its originating terminal instance. Changing
+  panes/tabs, opening an input-owning panel, or losing window focus cancels it;
+  late commit text is discarded rather than inserted into either terminal.
+  A pointer press conservatively cancels the remaining IME events in that batch,
+  including same-pane clicks and opening a panel; already preceding commits
+  keep their original order. Ordinary scrolling in the current pane preserves
+  composition; scrolling over another pane can change the input owner.
+  After cancellation, the first candidate-confirming Enter or commit may be
+  discarded, so start the composition again if needed. Held Enter repeats stay
+  protected through the native key tracker; a fresh Enter after a real release
+  works even if the IME sends no final cancellation event.
 - Alternate-screen applications, main-screen mouse/Kitty graphics takeovers,
   untrusted command boundaries and cursor addressing above an active output
   boundary use native geometry. Takeover is recorded at parser operations, even
@@ -94,3 +105,17 @@ normal/block/chat switching, pane/tab changes, high-DPI resizing, a password
 prompt, an alternate-screen application and a Kitty graphics application. Do
 not treat an offscreen render or PTY-only pass as verification of the platform
 window, GPU compositor, focus integration or accessibility.
+
+The dependency-free IME routing check extracts the production raw-input and
+writer methods, and runs the ownership reducer and native Enter tracker against
+small event/transport stubs. The negative variant restores the old unguarded
+writer and must fail. This does not validate an actual OS IME or GUI backend:
+
+```sh
+python scripts/test-ime-ownership.py --check-regression
+```
+
+Native IME acceptance still needs X11/Wayland testing: compose in pane A, switch
+to B (and back to A), confirm the old candidate, and verify neither PTY receives
+it. Repeat with a modal, window blur, pane closure, empty preedit before Commit,
+and candidate Enter press/release followed by a fresh Enter in the same frame.

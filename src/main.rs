@@ -50,6 +50,7 @@ mod sidebar;
 mod ssh_files_follow;
 mod tab_manager;
 mod terminal;
+mod terminal_ime;
 mod theme;
 mod ui;
 mod watch_adapter;
@@ -2747,6 +2748,9 @@ impl TerminalApp {
             prompt_fill_enter_latch: Default::default(),
             prompt_fill_enter_down: false,
             native_enter_ownership: Default::default(),
+            terminal_ime: Default::default(),
+            frame_ime_owner: None,
+            ime_origin_terminal: None,
             workflow_picker: None,
             workflow_args: None,
             workflow_refusals: Vec::new(),
@@ -5623,6 +5627,7 @@ impl eframe::App for TerminalApp {
             preserve_paste_event,
             ui_owns_clipboard,
         );
+        self.prepare_terminal_ime_input(ctx, raw_input);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -5904,6 +5909,7 @@ impl eframe::App for TerminalApp {
         // Collect events once per frame to avoid multiple clones
         self.frame_events.clear();
         ctx.input(|i| self.frame_events.extend(i.events.iter().cloned()));
+        self.discard_stale_frame_ime();
         app::input::guard_prompt_fill_enter(
             ctx,
             &mut self.prompt_fill_enter_down,
@@ -6066,6 +6072,8 @@ impl eframe::App for TerminalApp {
             .session_manager
             .protocol_response_sender(active_session_idx)
             .expect("active session has an aligned protocol response queue");
+
+        self.discard_stale_frame_ime();
 
         // Snapshot active session index before mutably borrowing session_manager;
         // we use it to tag pending-paste confirmations so they only deliver to
