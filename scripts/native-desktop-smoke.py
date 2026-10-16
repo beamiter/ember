@@ -47,7 +47,9 @@ class Smoke:
                             ('XDG_CACHE_HOME', '.cache')]:
             self.env[key] = str(home / suffix)
         self.env.update(EMBER_SMOKE_SHELL_TRACE=str(out / 'synthetic-shell-trace.log'), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE='1',
-                        WGPU_BACKEND='vulkan', RUST_LOG='info,wgpu_core=warn,wgpu_hal=info')
+                        WGPU_BACKEND='vulkan', RUST_LOG='info,wgpu_core=warn,wgpu_hal=info,ember::clipboard_route=debug,egui_winit=trace',
+                        EMBER_SMOKE_CAPTURE=str(Path(__file__).with_name('native-pty-capture.py').resolve()),
+                        EMBER_SMOKE_RAW_ROOT=str(out / 'raw-pty'))
         config = home / '.config/ember'
         config.mkdir(parents=True)
         self.config = config / 'config.toml'
@@ -62,6 +64,7 @@ __ember_smoke_prompt() {
     if [[ ${__ember_smoke_seen:-0} == 1 ]]; then printf '\e]133;D;%s\a' "$status"; fi
     __ember_smoke_seen=1
 }
+rawcheck() { EMBER_SMOKE_RAW_OUT="$EMBER_SMOKE_RAW_ROOT/$1" python3 "$EMBER_SMOKE_CAPTURE"; }
 PROMPT_COMMAND=__ember_smoke_prompt
 PS0=$'\e]133;C\a'
 PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
@@ -154,9 +157,14 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
             owner.stdin.write(command.encode())
             owner.stdin.close()
             time.sleep(0.5)
+            reader = ['xclip', '-selection', 'clipboard', '-o'] if self.backend == 'x11' else ['wl-paste', '--no-newline']
+            observed = self.run(reader, capture_output=True).stdout
+            assert observed == command.encode(), 'Synthetic platform clipboard readback mismatch'
             self.key('v', ('ctrl', 'shift'))
         else:
             self.text(command)
+        if paste:
+            time.sleep(2.5)
         self.screenshot(sentinel + '-before-enter')
         self.key('Return')
         wait_for(lambda: self.transcript.exists() and any(line.startswith(sentinel + ':') for line in self.transcript.read_text().splitlines()),
@@ -260,6 +268,26 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         time.sleep(0.5)
         self.screenshot(new + '-live-switch')
 
+    def raw_punctuation_oracle(self, identity, case):
+        self.text('rawcheck ' + case)
+        self.key('Return')
+        out = self.out / 'raw-pty' / case
+        wait_for((out / 'ready').exists, 'real raw PTY collector')
+        # Keep the original failing virtual-keyboard redirection sequence.
+        # It must arrive as text only, with no CR/Enter inserted before `>`.
+        payload = "printf '%s:%s:%s\\n' block-switched \"$$\" \"$(tty)\" >> /tmp/synthetic"
+        (out / 'expected.bin').write_bytes(payload.encode())
+        self.text(payload)
+        self.screenshot(case + '-raw-punctuation-before-finish')
+        (out / 'finish').touch()
+        wait_for((out / 'result.json').exists, 'raw byte capture completed')
+        result = json.loads((out / 'result.json').read_text())
+        assert result['status'] == 'pass', result
+        assert str(result['shell_pid']) + ':' + result['tty'] == identity, result
+        actual = (out / 'bytes.bin').read_bytes()
+        assert actual == payload.encode(), ('wrong raw PTY bytes', actual.hex(), payload.encode().hex())
+        time.sleep(0.3)
+
     def exercise(self):
         self.config.write_text('shell = "/bin/bash"\nterminal_mode = "normal"\n'
                                'initial_width = 1100\ninitial_height = 800\nrestore_session = false\n')
@@ -269,10 +297,12 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
         assert app.poll() is None
         self.screenshot('normal-startup')
         identity = self.command('normal-typed')
+        self.raw_punctuation_oracle(identity, 'normal')
         assert self.command('normal-paste', paste=True) == identity
         old = 'normal'
         for mode in ('block', 'chat', 'normal'):
             self.switch_mode(old, mode)
+            self.raw_punctuation_oracle(identity, mode + 'switch')
             assert self.command(mode + '-switched') == identity, 'Mode switch replaced shell'
             assert self.command(mode + '-switched-paste', paste=True) == identity
             old = mode

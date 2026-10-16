@@ -73,3 +73,4 @@ opt-level = 3
 
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
+egui-winit = { path = "vendor/egui-winit" }

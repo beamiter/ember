@@ -2593,6 +2593,12 @@ impl TerminalApp {
                 selection_postdates_terminal_input = false;
             }
             if let Some(command) = press.command.clone() {
+                if command == keybindings::Command::EditPaste {
+                    log::debug!(target: "ember::clipboard_route",
+                        "paste_dispatch ui_blocked={} older_terminal_input={}",
+                        ui_input_blocked, terminal_input_seen);
+                }
+
                 crate::debug_log!(
                     "[KEYBINDING] Looking up: '{}' => {:?}",
                     build_keybinding_string(press.key, press.modifiers).unwrap_or_default(),

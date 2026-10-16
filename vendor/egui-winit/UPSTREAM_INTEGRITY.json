@@ -1,0 +1,18 @@
+{
+  "version": "0.36.1",
+  "crate_sha256": "9327fc8edef2c57db9bcbcacc82c8a4b1e8cc64cd41a67db4419dcf643d88c83",
+  "git_commit": "4c1f2fae95475a40e524884ebb298bcb1714b08e",
+  "files": {
+    ".cargo_vcs_info.json": "aa19be8da5acb03ec15d5266f31c526b67e9347547c6e531194e1e307926454c",
+    "Cargo.lock": "64b3f04fca38fd8577898619b61cae5ae376355ba1754099b0c397f9d3c69332",
+    "Cargo.toml": "5f9db4f5887701ad909ac0bae353f31a37e375d95c3152c7d5c21abe803120c3",
+    "Cargo.toml.orig": "32c8381166bc165d53f67a6f7a58aec719d1d7cf6f41cc12459673912bc3c8a2",
+    "README.md": "7a8ccbb9fbddf24243446291b8e5a4e6bddcb6b565602c9561581926d5ae362b",
+    "src/clipboard.rs": "571b22d4c85478a23bb2ba18448ecfa1d4559ef24ceacc17464e7c59630fe96e",
+    "src/dropped_file.rs": "8c5b2e67f09233bea2b515d94215d9f699f787d94461576422fd8356420804c9",
+    "src/lib.rs": "45dccc061b2ef2b60b9c4d5379055b163cee7be770308bb67ca033916078f398",
+    "src/safe_area.rs": "7d6efc7d283814d6dcb5e0938225bea19a479a452aa85377092b33e8bd11bb8b",
+    "src/window_settings.rs": "de2848526dfba7655ead1de4860e59199dd11148376062adf3d3edd0d1bf3cfc"
+  },
+  "license_source": "Existing vendored eframe from same upstream commit, unchanged root licenses"
+}

@@ -169,6 +169,21 @@ pub fn normalize_terminal_shortcut_events(
         ui_owns_clipboard
     );
 
+    let diagnostic_clipboard_batch = events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+        )
+    });
+    if diagnostic_clipboard_batch {
+        // Opt-in routing diagnostics contain only state booleans, never text,
+        // clipboard sizes, key history, window titles or terminal data.
+        log::debug!(target: "ember::clipboard_route",
+            "semantic_batch restore={} preserve={} ui={} ctrl={} shift={} alt={} command={}",
+            restore_shortcuts, preserve_paste_event, ui_owns_clipboard,
+            modifiers.ctrl, modifiers.shift, modifiers.alt, modifiers.command);
+    }
+
     // Text edits consume egui's semantic Copy/Cut/Paste events directly. In
     // particular, converting Paste back into Ctrl+V (or dropping it) here
     // makes settings fields accept only individually typed characters. A UI
@@ -191,6 +206,20 @@ pub fn normalize_terminal_shortcut_events(
             _ => {}
         }
         let restore_event = restore_shortcuts && event_modifiers.command && !event_modifiers.alt;
+        if diagnostic_clipboard_batch
+            && matches!(
+                event,
+                egui::Event::ModifiersChanged(_) | egui::Event::Paste(_)
+            )
+        {
+            log::debug!(target: "ember::clipboard_route",
+                "replay paste={} modifier_change={} restore={} ctrl={} shift={} alt={} command={}",
+                matches!(event, egui::Event::Paste(_)),
+                matches!(event, egui::Event::ModifiersChanged(_)), restore_event,
+                event_modifiers.ctrl, event_modifiers.shift, event_modifiers.alt,
+                event_modifiers.command);
+        }
+
         match &event {
             egui::Event::Paste(_) => {
                 crate::debug_log!("[NORMALIZE] found Paste event");
