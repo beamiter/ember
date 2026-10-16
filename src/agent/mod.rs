@@ -9,3 +9,5 @@ pub use jterm_core::agent_task::*;
 pub mod diff;
 #[allow(unused_imports)] // the panel's siblings are used by the UI layer only
 pub use diff::{AgentDiffPanel, AgentDiffState, DiffRequestError};
+
+pub mod recovery;

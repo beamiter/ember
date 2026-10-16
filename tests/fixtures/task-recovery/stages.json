@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "records": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "repository": "/fixture/repository",
+      "path": "/fixture/tasks/task-00000000000040008000000000000001",
+      "branch": "ember/task-00000000000040008000000000000001",
+      "provider": "codex",
+      "stage": "requested",
+      "base_commit": null,
+      "directory_identity": null,
+      "registered_task_id": null
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "repository": "/fixture/repository",
+      "path": "/fixture/tasks/task-00000000000040008000000000000002",
+      "branch": "ember/task-00000000000040008000000000000002",
+      "provider": "codex",
+      "stage": "prepared",
+      "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "directory_identity": {
+        "device": 1,
+        "inode": 102
+      },
+      "registered_task_id": null
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "repository": "/fixture/repository",
+      "path": "/fixture/tasks/task-00000000000040008000000000000003",
+      "branch": "ember/task-00000000000040008000000000000003",
+      "provider": "codex",
+      "stage": "registered",
+      "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "directory_identity": {
+        "device": 1,
+        "inode": 103
+      },
+      "registered_task_id": "10000000-0000-4000-8000-000000000003"
+    }
+  ]
+}

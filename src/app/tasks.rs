@@ -87,6 +87,54 @@ pub enum TaskSidebarAction {
     Archive(TaskId),
 }
 
+fn task_action_waits_for_recovery(action: &TaskSidebarAction, pending: &HashSet<TaskId>) -> bool {
+    matches!(action, TaskSidebarAction::StartNative(id) | TaskSidebarAction::StartTerminal(id)
+        | TaskSidebarAction::RunValidation(id) if pending.contains(id))
+}
+
+fn registration_marker_confirms(
+    task: &crate::agent::AgentTask,
+    record: &crate::agent::recovery::Record,
+) -> bool {
+    record.stage == crate::agent::recovery::Stage::Registered
+        && record.registered_task_id == Some(task.id)
+        && recovery_record_matches_task(task, record)
+}
+
+fn recovery_record_matches_task(
+    task: &crate::agent::AgentTask,
+    record: &crate::agent::recovery::Record,
+) -> bool {
+    record.path == task.worktree_path
+        && record.repository == task.repo_root
+        && record.branch == task.branch
+        && record.provider == task.provider
+        && record.base_commit.as_ref() == Some(&task.base_commit)
+}
+
+fn recovery_dismiss_blocked(
+    manager: &crate::agent::TaskManager,
+    pending: &HashSet<TaskId>,
+    record: &crate::agent::recovery::Record,
+) -> bool {
+    pending.iter().any(|id| {
+        manager
+            .get(*id)
+            .is_some_and(|task| recovery_record_matches_task(task, record))
+    })
+}
+
+fn registration_may_autostart(
+    manager: &crate::agent::TaskManager,
+    id: TaskId,
+    requested: bool,
+) -> bool {
+    requested
+        && manager
+            .get(id)
+            .is_some_and(|task| task.status == TaskStatus::Created)
+}
+
 #[derive(Default)]
 pub struct TaskSidebarState {
     pub selected: Option<TaskId>,
@@ -95,6 +143,12 @@ pub struct TaskSidebarState {
     dashboard_view: jterm_core::agent_task::DashboardView,
     pending_creation: Option<PendingTaskCreation>,
     follow_up_drafts: HashMap<TaskId, String>,
+    recovery_loaded: bool,
+    recovery_records: Vec<crate::agent::recovery::Record>,
+    recovery_error: Option<String>,
+    recovery_job: Option<Receiver<Result<RecoveryResult, String>>>,
+    dismiss_recovery: Option<uuid::Uuid>,
+    unconfirmed_registrations: HashSet<TaskId>,
 }
 
 struct PendingTaskCreation {
@@ -107,14 +161,44 @@ struct PreparedTask {
     context: crate::agent::SemanticCommandContext,
     title: String,
     provider: AgentProvider,
-    worktree: crate::agent::ManagedWorktree,
+    record: crate::agent::recovery::Record,
+    journal: crate::agent::recovery::Journal,
+}
+
+enum RecoveryResult {
+    Loaded(Vec<crate::agent::recovery::Record>),
+    Retry(
+        Box<(
+            crate::agent::recovery::Journal,
+            crate::agent::recovery::Record,
+        )>,
+    ),
+    Open(PathBuf, Box<crate::sidebar::FilesIntentContext>, u64),
+    Registered(
+        Vec<crate::agent::recovery::Record>,
+        TaskId,
+        AgentProvider,
+        bool,
+    ),
+}
+
+fn recovery_root() -> Result<PathBuf, String> {
+    let root = dirs::data_local_dir()
+        .ok_or("Cannot locate the per-user data directory")?
+        .join("ember")
+        .join("agent-tasks");
+    match std::fs::canonicalize(&root) {
+        Ok(root) => Ok(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(root),
+        Err(_) => Err("Cannot access the task worktree directory".into()),
+    }
 }
 
 impl Drop for PendingTaskCreation {
     fn drop(&mut self) {
-        // Cancellation is polled by the service's nonblocking pipe supervisor
-        // and between Git commands. Joining therefore proves no mutating child
-        // remains while adding only one short poll interval to shutdown.
+        // Cancellation is polled by the service between Git commands. Join to
+        // prove no mutating child remains. Journal fsync may delay shutdown on
+        // slow storage; cancellation never removes its recovery record.
         self.cancel.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -602,7 +686,8 @@ impl TerminalApp {
         context: crate::agent::SemanticCommandContext,
         provider: AgentProvider,
     ) -> Result<(), String> {
-        if self.task_sidebar.pending_creation.is_some() {
+        if self.task_sidebar.pending_creation.is_some() || self.task_sidebar.recovery_job.is_some()
+        {
             return Err("another task worktree is still being created".to_string());
         }
         provider
@@ -620,9 +705,6 @@ impl TerminalApp {
             .ok_or_else(|| "source command has no working directory".to_string())?;
         let command = context.command.as_deref().unwrap_or("failed command");
         let title = format!("Fix {}", visible_bounded(command, 112));
-        let token = uuid::Uuid::new_v4().simple().to_string();
-        let task_name = format!("task-{token}");
-        let branch = format!("ember/{task_name}");
         let (sender, receiver) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -631,22 +713,32 @@ impl TerminalApp {
             .spawn(move || {
                 let result = (|| {
                     let service = crate::agent::WorktreeService::new(worktree_root)
-                        .map_err(|error| error.to_string())?
+                        .map_err(|_| "Cannot initialize the trusted worktree service; no task worktree was created.".to_string())?
                         .with_cancel_flag(worker_cancel);
                     let repository = service
                         .resolve_repository_root(&cwd)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|_| "Cannot verify the source repository; no task worktree was created.".to_string())?;
+                    let root = service.managed_root();
+                    let mut journal = crate::agent::recovery::Journal::open(root)
+                        .map_err(|error| crate::agent::recovery::error_message(&error))?;
+                    let record = crate::agent::recovery::Record::requested(root, repository, provider);
+                    // Write-ahead intent must be durable BEFORE Git can create anything.
+                    journal.request(record.clone())
+                        .map_err(|error| crate::agent::recovery::error_message(&error))?;
                     let request = crate::agent::CreateWorktreeRequest::new(
-                        repository, task_name, branch, "HEAD",
+                        &record.repository, record.task_name(), &record.branch, "HEAD",
                     );
                     let worktree = service
                         .create(&request)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|_| "Worktree creation did not finish. Inspect the recovery record; no automatic cleanup was attempted.".to_string())?;
+                    let record = journal.prepared(record.id, &worktree)
+                        .map_err(|error| crate::agent::recovery::error_message(&error))?;
                     Ok(PreparedTask {
                         context,
                         title,
                         provider,
-                        worktree,
+                        record,
+                        journal,
                     })
                 })();
                 let _ = sender.send(result);
@@ -673,6 +765,7 @@ impl TerminalApp {
     /// Poll before PTY routing snapshots are taken: a completed worktree may
     /// add and activate a task terminal later in the same frame.
     pub(crate) fn poll_task_creation(&mut self, ctx: &egui::Context) {
+        self.poll_task_recovery(ctx);
         let result = self
             .task_sidebar
             .pending_creation
@@ -685,76 +778,289 @@ impl TerminalApp {
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 self.task_sidebar.pending_creation = None;
-                self.set_status_for(
-                    "Task worktree worker stopped unexpectedly",
-                    Duration::from_secs(6),
-                );
+                self.task_sidebar.recovery_error = Some("Task worktree worker stopped unexpectedly. Inspect its recovery record; no worktree cleanup was attempted.".into());
+                self.task_sidebar.recovery_loaded = false;
             }
             Some(Ok(result)) => {
                 // The result is sent only after the mutating operation has
                 // completed; dropping its finished handle is nonblocking.
                 self.task_sidebar.pending_creation = None;
                 match result {
-                    Err(error) => self.set_status_for(
-                        format!("Could not create task worktree: {error}"),
-                        Duration::from_secs(8),
-                    ),
+                    Err(error) => {
+                        self.task_sidebar.recovery_error = Some(error);
+                        self.task_sidebar.recovery_loaded = false;
+                    }
                     Ok(prepared) => {
-                        let provider = prepared.provider;
-                        let provider_name = provider.display_name();
-                        let worktree = prepared.worktree;
                         let task = crate::agent::NewTask {
                             title: prepared.title,
-                            provider,
-                            repo_root: worktree.repository,
-                            worktree_path: worktree.path,
-                            branch: worktree.branch,
-                            base_commit: worktree.head,
+                            provider: prepared.provider,
+                            repo_root: prepared.record.repository.clone(),
+                            worktree_path: prepared.record.path.clone(),
+                            branch: prepared.record.branch.clone(),
+                            base_commit: prepared.record.base_commit.clone().unwrap_or_default(),
                             source_context: Some(prepared.context),
                         };
-                        match self.task_manager.create(task) {
-                            Ok(task_id) => {
-                                self.task_sidebar.selected = Some(task_id);
-                                match provider {
-                                    AgentProvider::Codex => {
-                                        // Multi-turn / approvals: wait for an
-                                        // explicit Start so the user can review
-                                        // context before spawning app-server.
-                                        self.set_status(format!(
-                                            "Created an isolated {provider_name} task; choose Start {provider_name}"
-                                        ));
-                                    }
-                                    AgentProvider::Claude | AgentProvider::Kimi => {
-                                        self.set_status(format!(
-                                            "Created an isolated {provider_name} task; starting native {provider_name}…"
-                                        ));
-                                        self.start_task_native_agent(task_id);
-                                    }
-                                    AgentProvider::OpenCode => {
-                                        // PTY is the only path today — start it
-                                        // immediately so Fix is one click from
-                                        // failed command to CLI.
-                                        self.set_status(format!(
-                                            "Created an isolated {provider_name} task; starting {provider_name}…"
-                                        ));
-                                        self.start_task_agent_terminal(task_id);
-                                    }
-                                }
-                            }
-                            Err(error) => self.set_status_for(
-                                format!(
-                                    "Worktree was preserved, but task registration failed: {error}"
-                                ),
-                                Duration::from_secs(8),
-                            ),
-                        }
+                        self.register_prepared_task(prepared.journal, prepared.record, task, true);
                     }
                 }
             }
         }
     }
 
+    fn start_recovery_job(
+        &mut self,
+        job: impl FnOnce() -> Result<RecoveryResult, String> + Send + 'static,
+    ) {
+        if self.task_sidebar.recovery_job.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("ember-task-recovery".into())
+            .spawn(move || {
+                let _ = sender.send(job());
+            }) {
+            Ok(_) => self.task_sidebar.recovery_job = Some(receiver),
+            Err(_) => {
+                self.task_sidebar.recovery_error = Some(
+                    "Could not start recovery worker; no recovery action was performed.".into(),
+                )
+            }
+        }
+    }
+
+    fn register_prepared_task(
+        &mut self,
+        mut journal: crate::agent::recovery::Journal,
+        record: crate::agent::recovery::Record,
+        task: crate::agent::NewTask,
+        autostart: bool,
+    ) {
+        self.task_sidebar.recovery_records = journal.records().to_vec();
+        match crate::agent::recovery::register(&mut self.task_manager, &record, task) {
+            Ok(id) => {
+                self.task_sidebar.selected = Some(id);
+                self.task_sidebar.unconfirmed_registrations.insert(id);
+                self.start_recovery_job(move || {
+                    // Core registration is in memory; this marker is a separate commit.
+                    // No provider starts until the marker write succeeds.
+                    journal
+                        .registered(record.id, id)
+                        .map_err(|e| crate::agent::recovery::error_message(&e))?;
+                    Ok(RecoveryResult::Registered(
+                        journal.records().to_vec(),
+                        id,
+                        record.provider,
+                        autostart,
+                    ))
+                });
+            }
+            Err(error) => {
+                self.task_sidebar.recovery_records = journal.records().to_vec();
+                self.task_sidebar.recovery_error = Some(error);
+            }
+        }
+    }
+
+    fn poll_task_recovery(&mut self, ctx: &egui::Context) {
+        if !self.task_sidebar.recovery_loaded
+            && self.task_sidebar.recovery_job.is_none()
+            && self.task_sidebar.pending_creation.is_none()
+        {
+            self.task_sidebar.recovery_loaded = true;
+            self.start_recovery_job(|| {
+                let journal = crate::agent::recovery::Journal::open(&recovery_root()?)
+                    .map_err(|e| crate::agent::recovery::error_message(&e))?;
+                Ok(RecoveryResult::Loaded(journal.records().to_vec()))
+            });
+        }
+        let result = self
+            .task_sidebar
+            .recovery_job
+            .as_ref()
+            .map(|r| r.try_recv());
+        match result {
+            Some(Err(TryRecvError::Empty)) => ctx.request_repaint_after(Duration::from_millis(75)),
+            Some(result) => {
+                self.task_sidebar.recovery_job = None;
+                let result = result.unwrap_or_else(|_| {
+                    Err("Recovery worker stopped. Reload to inspect the durable record.".into())
+                });
+                match result {
+                    Err(error) => {
+                        self.task_sidebar.recovery_error = Some(error);
+                        // Keep the message visible; Reload is explicit, not an endless I/O retry.
+                    }
+                    Ok(RecoveryResult::Loaded(records)) => {
+                        let another_runtime_won = self
+                            .task_sidebar
+                            .unconfirmed_registrations
+                            .iter()
+                            .any(|id| {
+                                self.task_manager.get(*id).is_some_and(|task| {
+                                    records.iter().any(|record| {
+                                        record.stage == crate::agent::recovery::Stage::Registered
+                                            && recovery_record_matches_task(task, record)
+                                            && record.registered_task_id != Some(task.id)
+                                    })
+                                })
+                            });
+                        if another_runtime_won {
+                            self.task_sidebar.recovery_error = Some("Another app window confirmed this worktree's registration. Use that window or Open worktree; archive this window's unconfirmed task rather than starting a duplicate.".into());
+                        }
+                        self.task_sidebar.unconfirmed_registrations.retain(|id| {
+                            !self.task_manager.get(*id).is_some_and(|task| {
+                                records
+                                    .iter()
+                                    .any(|r| registration_marker_confirms(task, r))
+                            })
+                        });
+                        self.task_sidebar.recovery_records = records;
+                    }
+                    Ok(RecoveryResult::Open(path, intent, epoch)) => {
+                        if !self.sidebar.files_intent_is_current(&intent)
+                            || self.sidebar.files_user_intent_generation() != epoch
+                        {
+                            // A later Files action superseded this read-only verification.
+                            return;
+                        }
+                        if self.sidebar.location().is_remote() {
+                            self.task_sidebar.recovery_error = Some("Switch Files to Local before opening this local worktree, or use Copy path.".into());
+                        } else if let Some(error) = self.sidebar.set_current_dir(path) {
+                            self.task_sidebar.recovery_error = Some(error);
+                        } else {
+                            self.sidebar.view = crate::sidebar::SidebarView::Files;
+                            self.config.sidebar_view = crate::sidebar::SidebarView::Files;
+                        }
+                    }
+                    Ok(RecoveryResult::Retry(prepared)) => {
+                        let (journal, record) = *prepared;
+                        match record.new_task() {
+                            Ok(task) => self.register_prepared_task(journal, record, task, false),
+                            Err(error) => self.task_sidebar.recovery_error = Some(error),
+                        }
+                    }
+                    Ok(RecoveryResult::Registered(records, id, provider, autostart)) => {
+                        self.task_sidebar.recovery_records = records;
+                        self.task_sidebar.unconfirmed_registrations.remove(&id);
+                        self.task_sidebar.recovery_error = None;
+                        self.set_status("Task registered. Recovered tasks require an explicit Start; command context was not saved.");
+                        if registration_may_autostart(&self.task_manager, id, autostart) {
+                            match provider {
+                                AgentProvider::Claude | AgentProvider::Kimi => {
+                                    self.start_task_native_agent(id)
+                                }
+                                AgentProvider::OpenCode => self.start_task_agent_terminal(id),
+                                AgentProvider::Codex => self.set_status(
+                                    "Created an isolated Codex task; choose Start Codex",
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn render_task_recovery(&mut self, ui: &mut egui::Ui) {
+        use crate::agent::recovery::{Journal, Stage};
+        let busy = self.task_sidebar.pending_creation.is_some()
+            || self.task_sidebar.recovery_job.is_some();
+        let mut action = None;
+        if self.task_sidebar.recovery_error.is_some()
+            || !self.task_sidebar.recovery_records.is_empty()
+        {
+            egui::CollapsingHeader::new("Worktree recovery records").default_open(true).show(ui, |ui| {
+                ui.label("These records preserve worktree locations, not task sessions or command context.");
+                if let Some(error) = &self.task_sidebar.recovery_error {
+                    let text = visible_bounded(error, 1024);
+                    ui.colored_label(ui.visuals().warn_fg_color, &text);
+                    if ui.button("Copy error").clicked() { ui.ctx().copy_text(text); }
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Reload recovery records")).clicked() {
+                    self.task_sidebar.recovery_loaded = false;
+                    self.task_sidebar.recovery_error = None;
+                }
+                for record in &self.task_sidebar.recovery_records {
+                    let dismiss_blocked = recovery_dismiss_blocked(&self.task_manager, &self.task_sidebar.unconfirmed_registrations, record);
+                    ui.separator();
+                    ui.label(visible_bounded(&record.path.to_string_lossy(), 4096));
+                    ui.label(match record.stage {
+                        Stage::Requested => "Creation interrupted; original base commit is unknown. Open to inspect; automatic retry is unsafe.",
+                        Stage::Prepared => "Worktree prepared; task registration is unconfirmed. Retry reuses this worktree without recreating its branch.",
+                        Stage::Registered => "Previously registered. Runtime sessions were not saved. Open to inspect; this record will not recreate a completed task.",
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!busy && record.stage == Stage::Prepared, egui::Button::new("Retry registration")).clicked() {
+                            action = Some((record.id, 0));
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Open worktree")).clicked() { action = Some((record.id, 1)); }
+                        if ui.button("Copy path").clicked() { ui.ctx().copy_text(visible_bounded(&record.path.to_string_lossy(), 4096)); }
+                        if ui.add_enabled(!busy && !dismiss_blocked, egui::Button::new("Dismiss record…")).clicked() { self.task_sidebar.dismiss_recovery = Some(record.id); }
+                    });
+                    if dismiss_blocked { ui.label("Retry registration or Reload before dismissing this task's confirmation record."); }
+                    if self.task_sidebar.dismiss_recovery == Some(record.id) {
+                        ui.label("Forget this recovery record? Worktree, branch and files stay untouched; this removes its recovery entry.");
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!busy && !dismiss_blocked, egui::Button::new("Dismiss record only")).clicked() { action = Some((record.id, 2)); self.task_sidebar.dismiss_recovery = None; }
+                            if ui.button("Cancel").clicked() { self.task_sidebar.dismiss_recovery = None; }
+                        });
+                    }
+                }
+            });
+        }
+        if let Some((id, operation)) = action {
+            if operation == 2
+                && self
+                    .task_sidebar
+                    .recovery_records
+                    .iter()
+                    .find(|r| r.id == id)
+                    .is_some_and(|r| {
+                        recovery_dismiss_blocked(
+                            &self.task_manager,
+                            &self.task_sidebar.unconfirmed_registrations,
+                            r,
+                        )
+                    })
+            {
+                self.task_sidebar.recovery_error = Some("Retry registration or Reload before dismissing this task's confirmation record.".into());
+                return;
+            }
+            if operation == 1 {
+                self.sidebar.note_files_user_intent();
+            }
+            let intent = self.sidebar.files_intent_context();
+            let epoch = self.sidebar.files_user_intent_generation();
+            self.start_recovery_job(move || {
+                let root = recovery_root()?;
+                let mut journal =
+                    Journal::open(&root).map_err(|e| crate::agent::recovery::error_message(&e))?;
+                let record = journal
+                    .records()
+                    .iter()
+                    .find(|r| r.id == id)
+                    .cloned()
+                    .ok_or("Record changed; Reload before trying again")?;
+                if operation == 2 {
+                    journal
+                        .dismiss(id)
+                        .map_err(|e| crate::agent::recovery::error_message(&e))?;
+                    return Ok(RecoveryResult::Loaded(journal.records().to_vec()));
+                }
+                record.verify(&root)?;
+                if operation == 0 {
+                    Ok(RecoveryResult::Retry(Box::new((journal, record))))
+                } else {
+                    Ok(RecoveryResult::Open(record.path, Box::new(intent), epoch))
+                }
+            });
+        }
+    }
+
     pub(crate) fn render_sidebar_tasks(&mut self, ui: &mut egui::Ui) {
+        self.render_task_recovery(ui);
         let rows: Vec<_> = self
             .task_manager
             .tasks()
@@ -1382,6 +1688,10 @@ impl TerminalApp {
         let Some(action) = self.task_sidebar.pending_action.take() else {
             return;
         };
+        if task_action_waits_for_recovery(&action, &self.task_sidebar.unconfirmed_registrations) {
+            self.task_sidebar.recovery_error = Some("Task registration is not durably confirmed. Retry registration or Reload recovery records before Start.".into());
+            return;
+        }
         match action {
             TaskSidebarAction::StartNative(task_id) => self.start_task_native_agent(task_id),
             TaskSidebarAction::StartTerminal(task_id) => self.start_task_agent_terminal(task_id),
@@ -1500,6 +1810,7 @@ impl TerminalApp {
                 Ok(()) => {
                     self.agent_runtime.clear_retained(task_id);
                     self.task_sidebar.follow_up_drafts.remove(&task_id);
+                    self.task_sidebar.unconfirmed_registrations.remove(&task_id);
                     if self.task_sidebar.selected == Some(task_id) {
                         self.task_sidebar.selected = None;
                     }
@@ -2706,5 +3017,138 @@ mod feedback_tests {
             .unwrap()
             .ends_with("Validation #2 passed"));
         assert!(task_validation_feedback(&TaskManager::new(), a, "validation-a-retry").is_none());
+    }
+}
+
+#[cfg(test)]
+mod creation_recovery_ui_tests {
+    use super::*;
+
+    #[test]
+    fn creation_recovery_start_guard_uses_exact_task_id_and_reconciles() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut pending = HashSet::from([first]);
+        for action in [
+            TaskSidebarAction::StartNative(first),
+            TaskSidebarAction::StartTerminal(first),
+            TaskSidebarAction::RunValidation(first),
+        ] {
+            assert!(task_action_waits_for_recovery(&action, &pending));
+        }
+        assert!(!task_action_waits_for_recovery(
+            &TaskSidebarAction::StartNative(second),
+            &pending
+        ));
+        assert!(!task_action_waits_for_recovery(
+            &TaskSidebarAction::Archive(first),
+            &pending
+        ));
+        pending.remove(&first);
+        assert!(!task_action_waits_for_recovery(
+            &TaskSidebarAction::StartNative(first),
+            &pending
+        ));
+    }
+    #[test]
+    fn creation_recovery_marker_reconciliation_and_late_autostart_are_identity_safe() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/task-recovery/stages.json"
+        ))
+        .unwrap();
+        let mut record: crate::agent::recovery::Record =
+            serde_json::from_value(value["records"][1].clone()).unwrap();
+        let mut manager = crate::agent::TaskManager::new();
+        let id = manager.create(record.new_task().unwrap()).unwrap();
+        assert!(!registration_marker_confirms(
+            manager.get(id).unwrap(),
+            &record
+        ));
+        record.stage = crate::agent::recovery::Stage::Registered;
+        record.registered_task_id = Some(id);
+        assert!(registration_marker_confirms(
+            manager.get(id).unwrap(),
+            &record
+        ));
+        assert!(registration_may_autostart(&manager, id, true));
+        assert!(
+            !registration_may_autostart(&manager, id, false),
+            "recovery is never automatic Start"
+        );
+        let mut replaced = record.clone();
+        replaced.provider = AgentProvider::Claude;
+        assert!(!registration_marker_confirms(
+            manager.get(id).unwrap(),
+            &replaced
+        ));
+        replaced = record.clone();
+        replaced.path.push("unrelated");
+        assert!(!registration_marker_confirms(
+            manager.get(id).unwrap(),
+            &replaced
+        ));
+        manager.archive(id).unwrap();
+        assert!(
+            !registration_may_autostart(&manager, id, true),
+            "late worker must not launch archived task"
+        );
+        assert!(!registration_may_autostart(&manager, TaskId::new(), true));
+    }
+    #[test]
+    fn creation_recovery_dismiss_cannot_orphan_pending_runtime_confirmation() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/task-recovery/stages.json"
+        ))
+        .unwrap();
+        let mut record: crate::agent::recovery::Record =
+            serde_json::from_value(value["records"][1].clone()).unwrap();
+        let mut manager = crate::agent::TaskManager::new();
+        let id = manager.create(record.new_task().unwrap()).unwrap();
+        let pending = HashSet::from([id]);
+        assert!(recovery_dismiss_blocked(&manager, &pending, &record));
+        record.stage = crate::agent::recovery::Stage::Registered;
+        assert!(
+            recovery_dismiss_blocked(&manager, &pending, &record),
+            "uncertain published marker still needs Reload"
+        );
+        assert!(!recovery_dismiss_blocked(
+            &manager,
+            &HashSet::new(),
+            &record
+        ));
+        let other: crate::agent::recovery::Record =
+            serde_json::from_value(value["records"][2].clone()).unwrap();
+        assert!(!recovery_dismiss_blocked(&manager, &pending, &other));
+        record.provider = AgentProvider::Claude;
+        assert!(!recovery_dismiss_blocked(&manager, &pending, &record));
+    }
+    #[test]
+    fn creation_recovery_registered_marker_unblocks_only_winning_runtime_task() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/task-recovery/stages.json"
+        ))
+        .unwrap();
+        let mut record: crate::agent::recovery::Record =
+            serde_json::from_value(value["records"][1].clone()).unwrap();
+        let mut first = crate::agent::TaskManager::new();
+        let mut second = crate::agent::TaskManager::new();
+        let first_id = first.create(record.new_task().unwrap()).unwrap();
+        // First window's marker failed, so second window can recover Prepared.
+        let winner = second.create(record.new_task().unwrap()).unwrap();
+        assert_ne!(first_id, winner);
+        record.stage = crate::agent::recovery::Stage::Registered;
+        record.registered_task_id = Some(winner);
+        assert!(!registration_marker_confirms(
+            first.get(first_id).unwrap(),
+            &record
+        ));
+        assert!(registration_marker_confirms(
+            second.get(winner).unwrap(),
+            &record
+        ));
+        assert!(
+            record.new_task().is_err(),
+            "restart never recreates a registered task"
+        );
     }
 }
