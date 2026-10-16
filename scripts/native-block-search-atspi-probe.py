@@ -164,7 +164,7 @@ def discovery(pid, output):
 def enable_accessibility():
     import dbus
     session = dbus.SessionBus()
-    props = dbus.Interface(session.get_object('org.a11y.Bus', '/org/a11y/status'), 'org.freedesktop.DBus.Properties')
+    props = dbus.Interface(session.get_object('org.a11y.Bus', '/org/a11y/bus'), 'org.freedesktop.DBus.Properties')
     props.Set('org.a11y.Status', 'ScreenReaderEnabled', dbus.Boolean(True), timeout=3)
     if not bool(props.Get('org.a11y.Status', 'ScreenReaderEnabled', timeout=3)):
         raise RuntimeError('Private accessibility activation failed')

@@ -342,6 +342,19 @@ jobs:
             --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
             --output native-smoke-artifacts/ime-live-switch
 
+      - name: Gate Settings switches during active IME preedit
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-ime.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          python3 scripts/test-native-ime-preedit-switch.py
+          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-ime" scripts/native-ime-preedit-switch.c "$RUNNER_TEMP/ember-ime/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-ime/native-ime-preedit-switch"
+          python3 scripts/native-ime-preedit-switch.py \
+            --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
+            --preedit-client "$RUNNER_TEMP/ember-ime/native-ime-preedit-switch" \
+            --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+            --output native-smoke-artifacts/ime-preedit-switch
+
       - name: Gate measured Wayland scales and narrow geometry
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-pointer.outcome == 'success' }}
         timeout-minutes: 8

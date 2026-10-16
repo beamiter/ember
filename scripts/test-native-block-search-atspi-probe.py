@@ -120,6 +120,27 @@ class Tests(unittest.TestCase):
             self.assertEqual(result['editor_path'], p.ROOT+'/editor')
         self.assertEqual(broker.GetConnectionUnixProcessID.call_count, 2)
 
+    def test_enable_status_uses_bus_object_and_verifies_readback(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                session = Mock(); obj = object(); props = Mock()
+                def get_object(service, path):
+                    self.assertEqual((service, path), ('org.a11y.Bus', '/org/a11y/bus'))
+                    return obj
+                session.get_object.side_effect = get_object
+                props.Get.return_value = enabled
+                dbus = Mock(); dbus.SessionBus.return_value = session
+                dbus.Interface.return_value = props; dbus.Boolean.side_effect = bool
+                with patch.dict('sys.modules', dbus=dbus):
+                    if enabled:
+                        p.enable_accessibility()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'activation failed'):
+                            p.enable_accessibility()
+                dbus.Interface.assert_called_once_with(obj, 'org.freedesktop.DBus.Properties')
+                props.Set.assert_called_once_with('org.a11y.Status', 'ScreenReaderEnabled', True, timeout=3)
+                props.Get.assert_called_once_with('org.a11y.Status', 'ScreenReaderEnabled', timeout=3)
+
     def test_cleanup_group_exit_race_always_closes_smoke(self):
         daemon = Mock(pid=123); daemon.poll.return_value = None
         smoke = Mock()
