@@ -7,6 +7,54 @@ struct ChatCard {
     rect: egui::Rect,
     command: bool,
     composer: bool,
+    top_closed: bool,
+    bottom_closed: bool,
+}
+
+// Paint-only contract shared with the native GTK Chat surfaces. Never inset
+// text or alter projected rows to make a capsule fit. Both paint passes use it.
+fn chat_card_rounding(card: ChatCard) -> egui::CornerRadius {
+    let radius: f32 = if card.command || card.composer {
+        18.0
+    } else {
+        16.0
+    };
+    let limit = (card.rect.width().min(card.rect.height()) * 0.5).max(0.0);
+    let rounded = radius.min(limit) as u8;
+    let tail = 5.0_f32.min(limit) as u8;
+    egui::CornerRadius {
+        nw: if !card.top_closed {
+            0
+        } else if !card.command && !card.composer {
+            tail
+        } else {
+            rounded
+        },
+        ne: if card.top_closed { rounded } else { 0 },
+        sw: if card.bottom_closed { rounded } else { 0 },
+        se: if !card.bottom_closed {
+            0
+        } else if card.command {
+            tail
+        } else {
+            rounded
+        },
+    }
+}
+
+// The dock can be adjacent on screen while skipping history document rows.
+// Only a contiguous following history row proves the command's real bottom.
+fn chat_history_edge_closed(
+    end: usize,
+    history_end: usize,
+    previous: Option<usize>,
+    next: Option<usize>,
+) -> bool {
+    end > 0
+        && end < history_end
+        && previous
+            .zip(next)
+            .is_some_and(|(a, b)| a.checked_add(1) == Some(b))
 }
 
 fn row_rect(content: egui::Rect, rows: std::ops::Range<usize>, line_height: f32) -> egui::Rect {
@@ -41,11 +89,16 @@ impl TerminalRenderer {
                     rect: row_rect(content, rows, self.line_height),
                     command: false,
                     composer: true,
+                    top_closed: true,
+                    bottom_closed: true,
                 });
                 cards[0].rect.min.x -= self.char_width.min(8.0);
                 return cards;
             }
         }
+        let history_end = viewport
+            .chat_composer_rows()
+            .map_or(viewport.rows(), |rows| rows.start);
         let command = viewport
             .chat_command_spans()
             .iter()
@@ -65,6 +118,18 @@ impl TerminalRenderer {
                 rect,
                 command: true,
                 composer: false,
+                top_closed: entry.span.starts_in_viewport,
+                // A clipped command must not acquire a tail at the dock boundary.
+                bottom_closed: chat_history_edge_closed(
+                    command.rows.end,
+                    history_end,
+                    command
+                        .rows
+                        .end
+                        .checked_sub(1)
+                        .and_then(|row| viewport.view_document_row(row)),
+                    viewport.view_document_row(command.rows.end),
+                ),
             });
             result_start = command.rows.end;
             if matches!(
@@ -83,6 +148,9 @@ impl TerminalRenderer {
                 ),
                 command: false,
                 composer: false,
+                top_closed: command.is_some() || entry.span.starts_in_viewport,
+                // Be conservative where the dock skips offscreen history.
+                bottom_closed: entry.span.ends_in_viewport && entry.span.last_row + 1 < history_end,
             });
         }
         for card in &mut cards {
@@ -131,16 +199,7 @@ impl TerminalRenderer {
                 if !card.rect.is_positive() {
                     continue;
                 }
-                let radius: f32 = if card.command {
-                    16.0
-                } else if card.composer {
-                    18.0
-                } else {
-                    12.0
-                };
-                let radius = radius
-                    .min(card.rect.height() * 0.5)
-                    .min(card.rect.width() * 0.5) as u8;
+                let radius = chat_card_rounding(card);
                 let fill = self.chat_card_fill(entry, card);
                 painter.rect_filled(card.rect, radius, fill);
                 let top = ((card.rect.top() - content.top()) / self.line_height)
@@ -182,16 +241,7 @@ impl TerminalRenderer {
                 } else {
                     25
                 };
-                let radius: f32 = if card.command {
-                    16.0
-                } else if card.composer {
-                    18.0
-                } else {
-                    12.0
-                };
-                let radius = radius
-                    .min(card.rect.height() * 0.5)
-                    .min(card.rect.width() * 0.5) as u8;
+                let radius = chat_card_rounding(card);
                 painter.rect_stroke(
                     card.rect,
                     radius,
@@ -1236,6 +1286,75 @@ mod tests {
                 "transition {transition}"
             );
             assert!(renderer.cursor_move_input.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod capsule_geometry_tests {
+    use super::*;
+    #[test]
+    fn docked_composer_cannot_close_a_clipped_history_capsule() {
+        assert!(chat_history_edge_closed(4, 12, Some(40), Some(41)));
+        assert!(!chat_history_edge_closed(4, 4, Some(40), Some(41)));
+        assert!(!chat_history_edge_closed(4, 12, Some(40), Some(99)));
+        assert!(!chat_history_edge_closed(4, 12, Some(40), None));
+        assert!(!chat_history_edge_closed(0, 12, None, Some(41)));
+        assert!(!chat_history_edge_closed(4, 12, Some(usize::MAX), Some(0)));
+    }
+
+    #[test]
+    fn chat_capsule_corners_share_native_contract_at_all_scales_and_clips() {
+        for height in [0.0, 1.0, 8.0, 18.0, 32.0, 64.0] {
+            for width in [0.0, 1.0, 8.0, 160.0] {
+                for (command, composer, radius) in [
+                    (true, false, 18.0_f32),
+                    (false, false, 16.0),
+                    (false, true, 18.0),
+                ] {
+                    for top_closed in [false, true] {
+                        for bottom_closed in [false, true] {
+                            let card = ChatCard {
+                                rect: egui::Rect::from_min_size(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::vec2(width, height),
+                                ),
+                                command,
+                                composer,
+                                top_closed,
+                                bottom_closed,
+                            };
+                            let r = chat_card_rounding(card);
+                            let limit = width.min(height) * 0.5;
+                            let round = radius.min(limit) as u8;
+                            let tail = 5.0_f32.min(limit) as u8;
+                            assert_eq!(
+                                r.nw,
+                                if !top_closed {
+                                    0
+                                } else if !command && !composer {
+                                    tail
+                                } else {
+                                    round
+                                }
+                            );
+                            assert_eq!(r.ne, if top_closed { round } else { 0 });
+                            assert_eq!(r.sw, if bottom_closed { round } else { 0 });
+                            assert_eq!(
+                                r.se,
+                                if !bottom_closed {
+                                    0
+                                } else if command {
+                                    tail
+                                } else {
+                                    round
+                                }
+                            );
+                            assert_eq!(card.rect.size(), egui::vec2(width, height));
+                        }
+                    }
+                }
+            }
         }
     }
 }
