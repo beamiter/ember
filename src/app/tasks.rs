@@ -1595,30 +1595,16 @@ impl TerminalApp {
                 format!("Native Agent issue: {}", issue.detail),
                 Duration::from_secs(7),
             );
-        } else if let Some(completion) = report.completions.last() {
-            let message = if report.completions.len() > 1 {
-                format!(
-                    "{} native Agent sessions stopped; open Tasks for individual results",
-                    report.completions.len()
+        } else if let Some(message) = native_completion_feedback(
+            &self.task_manager,
+            report.completions.iter().map(|completion| {
+                (
+                    completion.task_id,
+                    completion.outcome,
+                    completion.detail.as_deref(),
                 )
-            } else {
-                match completion.outcome {
-                    AgentSessionOutcome::Clean => {
-                        "Native Agent stopped cleanly; review its diff, then run validation"
-                            .to_string()
-                    }
-                    AgentSessionOutcome::Cancelled => {
-                        "Native Agent was cancelled and fully stopped".to_string()
-                    }
-                    AgentSessionOutcome::Failed => format!(
-                        "Native Agent failed: {}",
-                        completion
-                            .detail
-                            .as_deref()
-                            .unwrap_or("provider session did not complete")
-                    ),
-                }
-            };
+            }),
+        ) {
             self.set_status_for(message, Duration::from_secs(8));
         } else if report.preparations_started > 0 {
             self.set_status(if report.preparations_started == 1 {
@@ -1814,6 +1800,20 @@ impl TerminalApp {
                 provider.display_name()
             )
         });
+    }
+
+    /// Apply the authoritative exit before composing passive, task-keyed feedback.
+    pub(crate) fn handle_task_terminal_exit(
+        &mut self,
+        session_id: &str,
+        exit_code: Option<i32>,
+    ) -> bool {
+        let (handled, message) =
+            apply_task_terminal_exit(&mut self.task_manager, session_id, exit_code);
+        if let Some(message) = message {
+            self.set_status_for(message, Duration::from_secs(8));
+        }
+        handled
     }
 
     fn start_task_validation(&mut self, task_id: TaskId) {
@@ -2315,5 +2315,396 @@ mod tests {
         assert_eq!(native_flat_turn_heading(&view), Some(("Stopped turn", 3)));
         view.completed_turns = 3;
         assert_eq!(native_flat_turn_heading(&view), Some(("Latest turn", 3)));
+    }
+}
+
+/// Return feedback only for a newly observed authoritative transition.
+fn apply_task_terminal_exit(
+    manager: &mut crate::agent::TaskManager,
+    session_id: &str,
+    exit_code: Option<i32>,
+) -> (bool, Option<String>) {
+    let before = manager
+        .task_and_role_for_terminal_session(session_id)
+        .map(|(task, role)| {
+            (
+                task.id,
+                role,
+                task.status,
+                task.validation.status,
+                task.validation.attempt,
+            )
+        });
+    let handled = manager
+        .handle_terminal_session_exit(session_id, exit_code)
+        .is_some();
+    let Some((id, role, status_before, validation_before, attempt)) = before else {
+        return (handled, None);
+    };
+    let message = match role {
+        crate::agent::TaskTerminalRole::Validation => manager
+            .get(id)
+            .filter(|task| {
+                validation_before == TaskValidationStatus::Running
+                    && task.validation.attempt == attempt
+                    && task.validation.terminal_session_id.as_deref() == Some(session_id)
+            })
+            .and_then(|_| task_validation_feedback(manager, id, session_id)),
+        crate::agent::TaskTerminalRole::Agent => manager.get(id).and_then(|task| {
+            if task.status == status_before
+                || task.terminal_session_id.as_deref() != Some(session_id)
+            {
+                return None;
+            }
+            let outcome = match task.status {
+                TaskStatus::ReadyForReview => AgentSessionOutcome::Clean,
+                TaskStatus::Cancelled => AgentSessionOutcome::Cancelled,
+                TaskStatus::Failed => AgentSessionOutcome::Failed,
+                _ => return None,
+            };
+            task_completion_feedback(manager, [(id, outcome)])
+        }),
+    };
+    (handled, message)
+}
+
+/// A bounded, redacted title and a stable ID prefix; never use prompt/output text.
+fn feedback_identity(manager: &crate::agent::TaskManager, id: TaskId) -> String {
+    let full = id.to_string();
+    let peers: Vec<_> = manager
+        .tasks()
+        .iter()
+        .filter(|task| task.id != id)
+        .map(|task| task.id.to_string())
+        .collect();
+    let length = feedback_id_prefix_length(&full, &peers);
+    let title = manager
+        .get(id)
+        .map(|task| feedback_title(&task.title))
+        .unwrap_or_else(|| "Task no longer available".into());
+    format!("{title} [{}]", &full[..length])
+}
+
+fn feedback_id_prefix_length(full: &str, peers: &[String]) -> usize {
+    let mut length = 8;
+    while length < full.len() && peers.iter().any(|peer| peer.starts_with(&full[..length])) {
+        length = (length + 4).min(full.len());
+    }
+    length
+}
+
+fn feedback_title(title: &str) -> String {
+    // Redact before bounding so a secret cannot evade detection at the cut point.
+    let redacted = jterm_core::redact::redact_secrets(title);
+    visible_bounded(
+        &redacted.split_whitespace().collect::<Vec<_>>().join(" "),
+        64,
+    )
+}
+
+/// Failed native workers can finish after their task has been hidden. Keep a
+/// bounded diagnostic here even when the Tasks dashboard cannot show that row.
+fn native_completion_feedback<'a>(
+    manager: &crate::agent::TaskManager,
+    completions: impl IntoIterator<Item = (TaskId, AgentSessionOutcome, Option<&'a str>)>,
+) -> Option<String> {
+    let completions: Vec<_> = completions.into_iter().collect();
+    let mut message = task_completion_feedback(
+        manager,
+        completions.iter().map(|(id, outcome, _)| (*id, *outcome)),
+    )?;
+    if let Some((id, _, detail)) = completions
+        .iter()
+        .rev()
+        .find(|(_, outcome, _)| *outcome == AgentSessionOutcome::Failed)
+    {
+        let detail = detail
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("provider session did not complete");
+        // Redact the complete diagnostic before truncation, as for task titles.
+        let redacted = jterm_core::redact::redact_secrets(detail);
+        let detail = visible_bounded(
+            &redacted.split_whitespace().collect::<Vec<_>>().join(" "),
+            112,
+        );
+        // Put the diagnostic before batch context so the status-line byte cap
+        // cannot erase the only remaining failure explanation.
+        let failure = format!(
+            "{}: Agent session failed: {detail}",
+            feedback_identity(manager, *id)
+        );
+        message = if completions.len() > 1 {
+            format!("{failure}; {message}")
+        } else {
+            failure
+        };
+    }
+    Some(message)
+}
+
+pub(crate) fn task_completion_feedback(
+    manager: &crate::agent::TaskManager,
+    completions: impl IntoIterator<Item = (TaskId, crate::agent::AgentSessionOutcome)>,
+) -> Option<String> {
+    use crate::agent::AgentSessionOutcome;
+    let completions: Vec<_> = completions.into_iter().collect();
+    let (id, outcome) = *completions.first()?;
+    if completions.len() > 1 {
+        let failed = completions
+            .iter()
+            .filter(|(_, outcome)| *outcome == AgentSessionOutcome::Failed)
+            .count();
+        let cancelled = completions
+            .iter()
+            .filter(|(_, outcome)| *outcome == AgentSessionOutcome::Cancelled)
+            .count();
+        return Some(format!("{} agent sessions stopped: {} clean, {cancelled} cancelled, {failed} failed; open Tasks for details", completions.len(), completions.len() - failed - cancelled));
+    }
+    let outcome = match outcome {
+        AgentSessionOutcome::Clean => {
+            "Agent session stopped cleanly; review changes, then validate"
+        }
+        AgentSessionOutcome::Cancelled => "Agent session cancelled and stopped",
+        AgentSessionOutcome::Failed => "Agent session failed; open Tasks for details",
+    };
+    Some(format!("{}: {outcome}", feedback_identity(manager, id)))
+}
+
+pub(crate) fn task_validation_feedback(
+    manager: &crate::agent::TaskManager,
+    id: TaskId,
+    session: &str,
+) -> Option<String> {
+    use crate::agent::TaskValidationStatus;
+    let task = manager.get(id)?;
+    let validation = &task.validation;
+    if validation.terminal_session_id.as_deref() != Some(session) {
+        return None;
+    }
+    let outcome = match validation.status {
+        TaskValidationStatus::NotRun | TaskValidationStatus::Running => return None,
+        TaskValidationStatus::Passed => "passed".into(),
+        TaskValidationStatus::Failed => validation
+            .exit_code
+            .map(|code| format!("failed (exit {code})"))
+            .unwrap_or_else(|| "failed; open Tasks for details".into()),
+        TaskValidationStatus::Cancelled => "cancelled".into(),
+        TaskValidationStatus::Inconclusive => {
+            "ended without a confirmed result; open Tasks for details".into()
+        }
+    };
+    Some(format!(
+        "{}: Validation #{} {outcome}",
+        feedback_identity(manager, id),
+        validation.attempt
+    ))
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::agent::{AgentSessionOutcome, NewTask, TaskManager, TaskStatus};
+
+    fn add_task(manager: &mut TaskManager, title: &str) -> TaskId {
+        manager
+            .create(NewTask {
+                title: title.into(),
+                provider: AgentProvider::Codex,
+                repo_root: "/fixture".into(),
+                worktree_path: "/fixture/worktree".into(),
+                branch: "test/feedback".into(),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_feedback_is_once_only_and_rejects_old_validation_sessions() {
+        let mut manager = TaskManager::new();
+        let id = add_task(&mut manager, "Originating task");
+        manager.bind_terminal_session(id, "agent".into()).unwrap();
+        let (handled, message) = apply_task_terminal_exit(&mut manager, "agent", Some(0));
+        assert!(handled);
+        assert!(message.unwrap().contains("session stopped cleanly"));
+        assert!(apply_task_terminal_exit(&mut manager, "agent", Some(0))
+            .1
+            .is_none());
+        manager
+            .bind_validation_session(id, "validation-one".into())
+            .unwrap();
+        assert!(
+            apply_task_terminal_exit(&mut manager, "validation-one", None)
+                .1
+                .unwrap()
+                .contains("without a confirmed result")
+        );
+        assert!(
+            apply_task_terminal_exit(&mut manager, "validation-one", Some(0))
+                .1
+                .is_none()
+        );
+        manager
+            .bind_validation_session(id, "validation-two".into())
+            .unwrap();
+        assert_eq!(
+            apply_task_terminal_exit(&mut manager, "validation-one", Some(0)),
+            (false, None)
+        );
+        assert!(
+            apply_task_terminal_exit(&mut manager, "validation-two", Some(0))
+                .1
+                .unwrap()
+                .ends_with("Validation #2 passed")
+        );
+        assert!(
+            apply_task_terminal_exit(&mut manager, "validation-two", Some(7))
+                .1
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_failed_detail_survives_missing_or_archived_task_safely() {
+        let mut manager = TaskManager::new();
+        let archived = add_task(&mut manager, "Hidden task");
+        manager.archive(archived).unwrap();
+        let missing = TaskId::new();
+        let secret = format!("sk-{}", "a".repeat(32));
+        let detail = format!("worker join failed\n{secret} \u{202e}{}", "界".repeat(400));
+        for id in [archived, missing] {
+            let text = native_completion_feedback(
+                &manager,
+                [(id, AgentSessionOutcome::Failed, Some(detail.as_str()))],
+            )
+            .unwrap();
+            assert!(text.contains(&id.to_string()[..8]));
+            assert!(text.contains("worker join failed"));
+            assert!(
+                crate::review_text::bound_toast_text(text.clone()).contains("worker join failed")
+            );
+            assert!(!text.contains(&secret));
+            assert!(!text.chars().any(char::is_control));
+            assert!(!text.contains('\u{202e}'));
+            assert!(text.len() < 512);
+        }
+        let batch = native_completion_feedback(
+            &manager,
+            [
+                (archived, AgentSessionOutcome::Failed, Some("join failed")),
+                (missing, AgentSessionOutcome::Clean, None),
+            ],
+        )
+        .unwrap();
+        assert!(batch.contains(&archived.to_string()[..8]));
+        assert!(batch.contains("join failed"));
+        assert!(native_completion_feedback(
+            &manager,
+            [(missing, AgentSessionOutcome::Failed, None)]
+        )
+        .unwrap()
+        .contains("provider session did not complete"));
+    }
+
+    #[test]
+    fn completion_feedback_identifies_same_title_tasks_and_missing_task() {
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "Same title");
+        let b = add_task(&mut manager, "Same title");
+        let message =
+            |id| task_completion_feedback(&manager, [(id, AgentSessionOutcome::Failed)]).unwrap();
+        assert_ne!(message(a), message(b));
+        assert!(message(a).contains(&a.to_string()[..8]));
+        assert!(message(b).contains(&b.to_string()[..8]));
+        let missing = TaskId::new();
+        assert!(message(missing).contains("Task no longer available"));
+        assert!(message(missing).contains(&missing.to_string()[..8]));
+        assert!(task_completion_feedback(&manager, []).is_none());
+        let batch = task_completion_feedback(
+            &manager,
+            [
+                (a, AgentSessionOutcome::Clean),
+                (b, AgentSessionOutcome::Cancelled),
+                (a, AgentSessionOutcome::Failed),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            batch,
+            "3 agent sessions stopped: 1 clean, 1 cancelled, 1 failed; open Tasks for details"
+        );
+        assert!(!batch.contains("3 tasks"));
+    }
+
+    #[test]
+    fn feedback_id_prefix_extends_for_live_collisions() {
+        let a = "12345678-1111-4111-8111-111111111111";
+        let b = "12345678-2222-4222-8222-222222222222";
+        assert_eq!(feedback_id_prefix_length(a, &[]), 8);
+        let length = feedback_id_prefix_length(a, &[b.into()]);
+        assert_eq!(length, 12);
+        assert_ne!(&a[..length], &b[..length]);
+    }
+
+    #[test]
+    fn feedback_title_is_redacted_single_line_and_utf8_bounded() {
+        let secret = format!("sk-{}", "a".repeat(32));
+        assert!(!feedback_title(&format!("Fix {secret}")).contains(&secret));
+        let hostile = feedback_title("one\n\t\u{202e}two\u{2066}\u{1b}[31m");
+        assert!(!hostile.chars().any(char::is_control));
+        assert!(!hostile.contains('\u{202e}'));
+        assert!(!hostile.contains('\u{2066}'));
+        assert!(hostile.contains("one "));
+        let long = feedback_title(&"界🙂".repeat(80));
+        assert!(long.len() <= 64);
+        assert!(long.is_char_boundary(long.len()));
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn validation_feedback_uses_bound_attempt_and_stored_result() {
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "Same title");
+        let b = add_task(&mut manager, "Same title");
+        for (id, session) in [(a, "agent-a"), (b, "agent-b")] {
+            manager.bind_terminal_session(id, session.into()).unwrap();
+            manager
+                .update_status(id, TaskStatus::ReadyForReview, None)
+                .unwrap();
+        }
+        manager
+            .bind_validation_session(a, "validation-a".into())
+            .unwrap();
+        manager
+            .bind_validation_session(b, "validation-b".into())
+            .unwrap();
+        assert!(task_validation_feedback(&manager, a, "validation-a").is_none());
+        manager.handle_terminal_session_exit("validation-a", Some(7));
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-a"),
+            Some(a)
+        );
+        let failed = task_validation_feedback(&manager, a, "validation-a").unwrap();
+        assert!(failed.contains(&a.to_string()[..8]));
+        assert!(failed.ends_with("Validation #1 failed (exit 7)"));
+        assert!(task_validation_feedback(&manager, b, "validation-a").is_none());
+        manager
+            .bind_validation_session(a, "validation-a-retry".into())
+            .unwrap();
+        assert!(manager
+            .handle_terminal_session_exit("validation-a", Some(0))
+            .is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a").is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a-retry").is_none());
+        manager.handle_terminal_session_exit("validation-a-retry", Some(0));
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-a-retry"),
+            Some(a)
+        );
+        assert!(task_validation_feedback(&manager, b, "validation-b").is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a-retry")
+            .unwrap()
+            .ends_with("Validation #2 passed"));
+        assert!(task_validation_feedback(&TaskManager::new(), a, "validation-a-retry").is_none());
     }
 }

@@ -5878,10 +5878,7 @@ impl eframe::App for TerminalApp {
             .collect();
         for (session_id, exit_code) in exited_sessions {
             let terminal_role = self.task_manager.terminal_role_for_session(&session_id);
-            let task_terminal = self
-                .task_manager
-                .handle_terminal_session_exit(&session_id, exit_code)
-                .is_some();
+            let task_terminal = self.handle_task_terminal_exit(&session_id, exit_code);
             let Some(session_idx) = self.session_manager.index_of(&session_id) else {
                 continue;
             };
@@ -6574,23 +6571,8 @@ impl eframe::App for TerminalApp {
                         shell_exit_code = Some(code);
                         retain_exited_task_terminal = active_task_terminal.is_some();
                         let uptime = session.shell.uptime();
-                        if let Some((provider, role)) = active_task_terminal {
-                            self.status_message = match (role, code) {
-                                (crate::agent::TaskTerminalRole::Agent, 0) => {
-                                    format!("{provider} task finished")
-                                }
-                                (crate::agent::TaskTerminalRole::Agent, code) => {
-                                    format!("{provider} task exited with code {code}")
-                                }
-                                (crate::agent::TaskTerminalRole::Validation, 0) => {
-                                    "Task validation passed".to_string()
-                                }
-                                (crate::agent::TaskTerminalRole::Validation, code) => {
-                                    format!("Task validation failed with code {code}")
-                                }
-                            };
-                            self.status_expires_at =
-                                Some(std::time::Instant::now() + Duration::from_secs(6));
+                        if active_task_terminal.is_some() {
+                            // Task feedback is composed after applying the authoritative exit below.
                         } else if code != 0 && uptime < SHELL_STARTUP_GRACE {
                             shell_startup_failed = true;
                             self.status_message = format!(
@@ -7910,8 +7892,7 @@ impl eframe::App for TerminalApp {
         drop(session);
 
         if shell_exit_observed {
-            self.task_manager
-                .handle_terminal_session_exit(&active_session_id, shell_exit_code);
+            self.handle_task_terminal_exit(&active_session_id, shell_exit_code);
             if retain_exited_task_terminal {
                 self.session_manager
                     .retain_exited_command(&active_session_id);
