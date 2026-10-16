@@ -5830,7 +5830,15 @@ docker = true
         )];
         let started = std::time::Instant::now();
         let capture = run_capture(&argv, &[], Duration::from_millis(100), 1024).unwrap();
-        assert!(dir.join("ready").exists(), "escaped holder did not start");
+        assert!(
+            dir.join("ready").exists(),
+            "escaped holder did not start: elapsed={:?}, status={:?}, timed_out={}, cancelled={}, stderr={:?}",
+            started.elapsed(),
+            capture.status,
+            capture.timed_out,
+            capture.cancelled,
+            String::from_utf8_lossy(&capture.stderr[..capture.stderr.len().min(1024)]),
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "escaped stderr holder blocked join"
@@ -5854,7 +5862,15 @@ docker = true
             1024,
         )
         .unwrap();
-        assert!(dir.join("ready").exists(), "escaped holder did not start");
+        assert!(
+            dir.join("ready").exists(),
+            "escaped holder did not start: elapsed={:?}, status={:?}, timed_out={}, cancelled={}, stderr={:?}",
+            started.elapsed(),
+            capture.status,
+            capture.timed_out,
+            capture.cancelled,
+            String::from_utf8_lossy(&capture.stderr[..capture.stderr.len().min(1024)]),
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "escaped stdin holder blocked join"

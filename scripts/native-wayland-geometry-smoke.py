@@ -37,6 +37,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     desktop = load('desktop', 'native-desktop-smoke.py')
     geometry = load('geometry', 'native-wayland-geometry.py')
+    configure = load('configure', 'native-wayland-configure.py')
     binary = args.binary.resolve(strict=True)
     smoke = desktop.Smoke(binary, 'wayland', out)
     result = {'status': 'running', 'scale': args.scale, 'window': args.window,
@@ -74,24 +75,31 @@ def main():
             else:
                 smoke.env['WAYLAND_DEBUG'] = previous_debug
         node = desktop.wait_for(smoke.app_window, 'owned Ember window')
+        # One shared setup deadline. IPC command success/pending rect alone
+        # does not prove the client committed the compositor's requested size.
+        deadline = time.monotonic() + 30
+        configure.wait_committed(smoke, 'initial-committed', deadline, 0, False)
+        def marker():
+            return len(configure.complete_lines((out / 'ember.log').read_text()))
+        since = marker()
         sway(smoke, f'[con_id={node}] border none')
+        configure.wait_committed(smoke, 'border-committed', deadline, since, False,
+                                 border='none', size=(output_rect['width'], output_rect['height']))
         floating = args.window == 'narrow'
         expected_rect = output_rect
         if floating:
+            since = marker()
             sway(smoke, f'[con_id={node}] floating enable')
-            sway(smoke, f'[con_id={node}] border none')
+            configure.wait_committed(smoke, 'floating-committed', deadline, since, True, border='none')
+            since = marker()
             sway(smoke, f'[con_id={node}] resize set width 720 px height 720 px')
+            configure.wait_committed(smoke, 'resize-committed', deadline, since, True,
+                                     border='none', size=(720, 720))
             sway(smoke, f'[con_id={node}] move position 30 40')
+            configure.wait_committed(smoke, 'position-committed', deadline, since, True,
+                                     border='none', size=(720, 720), position=(30, 40))
             expected_rect = {'x': 30, 'y': 40, 'width': 720, 'height': 720}
-        # Bounded settling queries only, never replay an input or resize command.
-        def settled():
-            try:
-                return geometry.observe(smoke, 'settling', args.scale, expected_rect, floating)
-            except RuntimeError:
-                if smoke.app.poll() is not None:
-                    raise RuntimeError('Ember exited during geometry setup')
-                return None
-        measured = desktop.wait_for(settled, 'exact owned geometry')
+        measured = geometry.observe(smoke, 'settled', args.scale, expected_rect, floating)
         time.sleep(1)
         identity = smoke.command('geometry-ready')
         smoke.key('o', ('ctrl', 'shift'))

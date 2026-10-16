@@ -313,6 +313,7 @@ jobs:
         shell: bash
         run: |
           python3 scripts/test-native-wayland-geometry.py
+          python3 scripts/test-native-wayland-configure.py
           status=0
           for scale in 1 1.5 2; do
             for window in tiled narrow; do

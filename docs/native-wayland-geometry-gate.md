@@ -42,3 +42,28 @@ cover all six requested layouts, offsets, boundaries, rational rounding,
 clipped words, unsupported output arrangements, stale capture rejection and
 exactly-once pointer dispatch. Hosted runtime is required before any native
 geometry coverage is claimed.
+
+## Serialized setup after protocol diagnosis
+
+A retained failing run showed pending IPC720x720 while the client still had an
+older configure in flight. At scale2 it acknowledged720x720 but received a newer
+full-size configure before committing720 pixels. Its advertised minimum was2x1
+and maximum was unrestricted. This supports an overlapping setup transaction
+cause; it does not establish an application minimum-size refusal.
+
+The setup now issues border, floating, resize and move commands once each,
+separated by bounded owned-client and IPC handshakes. The exact app_id maps the toplevel
+to its xdg surface and wl_surface. A new toplevel configure, matching xdg serial
+acknowledgment, matching window geometry and subsequent surface commit must be
+observed. New pending configures invalidate old readiness; unrelated surfaces,
+old serials, partial log lines and repeated render commits cannot satisfy a new
+size-changing command's barrier. Destruction, ID release/rebinding or app_id
+mutation of the selected chain fails closed; recreation is not supported. A
+position-only move deliberately retains the completed resize handshake and
+requires two fresh IPC samples at the requested position, because moving alone
+need not emit a new size configure. The same geometry/protocol state agrees across two
+read-only IPC samples. IPC alone can expose pending state, so the client commit
+evidence is required alongside it; these observations are not an atomic lock.
+All setup stages share the original30-second budget, with no repeated resize or
+input. Exact720x720 and final stale-layout checks remain unchanged. Protocol
+logs and synthetic before/after config copies/hashes stay in the artifacts.
