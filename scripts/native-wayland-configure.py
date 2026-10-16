@@ -60,6 +60,8 @@ def committed_geometry(text, since=0):
     proposed_line = -1
     latest = None
     committed = None
+    current_geometry = None
+    pending_geometry = None
     for index, line in enumerate(normalized):
         if index <= app_line:
             continue
@@ -72,21 +74,32 @@ def committed_geometry(text, since=0):
         match = re.search(r'xdg_surface@' + surface + r'\.configure\((\d+)\)', line)
         if match:
             latest = {'serial': int(match[1]), 'size': proposed, 'configure_line': index,
-                      'acked': False, 'geometry': None}
+                      'acked': False}
             committed = None
         match = re.search(r'-> xdg_surface@' + surface + r'\.ack_configure\((\d+)\)', line)
         if match and latest is not None and int(match[1]) == latest['serial']:
             latest['acked'] = True
             latest['ack_line'] = index
-        match = re.search(r'-> xdg_surface@' + surface + r'\.set_window_geometry\(0, 0, (\d+), (\d+)\)', line)
-        if match and latest is not None and latest['acked']:
-            geometry = (int(match[1]), int(match[2]))
-            if latest['geometry'] != geometry:
-                committed = None
-            latest['geometry'] = geometry
-        if re.search(r'-> wl_surface@' + wl + r'\.commit\(\)', line) and latest is not None and latest['acked']:
+        geometry_request = r'-> xdg_surface@' + surface + r'\.set_window_geometry\('
+        if re.search(geometry_request, line):
+            match = re.search(geometry_request + r'(-?\d+), (-?\d+), (-?\d+), (-?\d+)\)', line)
+            if match is None:
+                raise RuntimeError('Malformed owned window geometry')
+            x, y, width, height = map(int, match.groups())
+            if (x, y) != (0, 0) or min(width, height) <= 0:
+                raise RuntimeError('Unsupported owned window geometry')
+            pending_geometry = (width, height)
+            committed = None
+        if re.search(r'-> wl_surface@' + wl + r'\.commit\(\)', line):
+            # xdg_surface geometry is double-buffered persistent surface state,
+            # not configure-local state. A same-size configure need not set it again.
+            if pending_geometry is not None:
+                current_geometry = pending_geometry
+                pending_geometry = None
+            if latest is None or not latest['acked']:
+                continue
             size = latest['size']
-            actual = latest['geometry']
+            actual = current_geometry
             if (size is not None and actual is not None and min(actual) > 0 and
                     all(want == 0 or want == got for want, got in zip(size, actual)) and
                     proposed_line >= since and latest['configure_line'] >= since and committed is None):

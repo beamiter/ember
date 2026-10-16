@@ -49,7 +49,7 @@ class ConfigureTests(unittest.TestCase):
             events=EVENTS.copy();events[index]=value
             self.assertIsNone(c.committed_geometry(trace(events)))
         events=EVENTS.copy();events[2],events[3]=events[3],events[2]
-        self.assertIsNone(c.committed_geometry(trace(events)))
+        self.assertIsNotNone(c.committed_geometry(trace(events)))
         events=EVENTS.copy();events[3],events[4]=events[4],events[3]
         self.assertIsNone(c.committed_geometry(trace(events)))
 
@@ -72,6 +72,43 @@ class ConfigureTests(unittest.TestCase):
     def test_repeated_render_commit_does_not_fake_new_handshake(self):
         self.assertEqual(c.committed_geometry(trace()), c.committed_geometry(trace(EVENTS+[EVENTS[-1]])))
         self.assertIsNone(c.committed_geometry(trace(EVENTS+[EVENTS[-1]]), since=9))
+
+    def test_same_size_configure_retains_committed_geometry(self):
+        repeat = [EVENTS[0], EVENTS[1].replace('11', '12'),
+                  EVENTS[2].replace('11', '12'), EVENTS[4]]
+        self.assertIsNone(c.committed_geometry(trace(EVENTS + repeat[:-1])))
+        state = c.committed_geometry(trace(EVENTS + repeat), since=9)
+        self.assertEqual((state['serial'], state['width'], state['height']), (12,720,720))
+        self.assertEqual(state['commit_line'],12)
+        self.assertIsNone(c.committed_geometry(trace(EVENTS + repeat), since=10))
+        for index, wrong in [(0, repeat[0].replace('720, 720','800, 800')),
+                             (2, repeat[2].replace('(12)','(11)')),
+                             (3, repeat[3].replace('@26','@99'))]:
+            changed=repeat.copy();changed[index]=wrong
+            self.assertIsNone(c.committed_geometry(trace(EVENTS + changed)))
+
+    def test_pending_geometry_applies_only_on_owned_commit(self):
+        pending = EVENTS[3].replace('720, 720','800, 800')
+        self.assertIsNone(c.committed_geometry(trace(EVENTS+[pending])))
+        self.assertIsNone(c.committed_geometry(trace(EVENTS+[pending,EVENTS[4]])))
+        new = [EVENTS[0].replace('720, 720','800, 800'),
+               EVENTS[1].replace('11','12'), EVENTS[2].replace('11','12')]
+        self.assertIsNone(c.committed_geometry(trace(EVENTS+[pending]+new)))
+        state=c.committed_geometry(trace(EVENTS+[pending]+new+[EVENTS[4]]))
+        self.assertEqual((state['serial'],state['width'],state['height']),(12,800,800))
+        # Another surface's geometry cannot replace the owned persistent state.
+        self.assertIsNone(c.committed_geometry(trace(EVENTS+[pending.replace('@27','@99')]+new+[EVENTS[4]])))
+
+    def test_unsupported_owned_geometry_cannot_reuse_old_state(self):
+        repeat = [EVENTS[0], EVENTS[1].replace('11','12'),
+                  EVENTS[2].replace('11','12'), EVENTS[4]]
+        for args in ['1, 0, 720, 720', '0, -1, 720, 720', '0, 0, 0, 720',
+                     '0, 0, -1, 720', '0, 0, 720, -1', 'broken']:
+            request='-> xdg_surface@27.set_window_geometry('+args+')'
+            for suffix in [[], repeat]:
+                with self.subTest(args=args,suffix=suffix), self.assertRaisesRegex(RuntimeError,'owned window geometry'):
+                    c.committed_geometry(trace(EVENTS+[request]+suffix))
+        self.assertIsNotNone(c.committed_geometry(trace(EVENTS+['-> xdg_surface@99.set_window_geometry(1, 0, 720, 720)'])))
 
     def test_missing_and_ambiguous_app_identity(self):
         self.assertIsNone(c.committed_geometry(trace().replace('io.github.beamiter.ember','other')))

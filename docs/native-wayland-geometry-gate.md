@@ -67,3 +67,22 @@ evidence is required alongside it; these observations are not an atomic lock.
 All setup stages share the original30-second budget, with no repeated resize or
 input. Exact720x720 and final stale-layout checks remain unchanged. Protocol
 logs and synthetic before/after config copies/hashes stay in the artifacts.
+
+### Persistent geometry in configure evidence
+
+The owned client's `set_window_geometry` is double-buffered surface state, not
+configure-local state. The parser applies pending geometry only at the owned
+`wl_surface.commit` and retains it across later configure events. A same-size
+configure therefore still requires its own matching acknowledgement and a later
+commit, but does not require the client to redundantly resend geometry. New
+configure events invalidate readiness; size mismatch, unacknowledged serials,
+wrong surfaces, partial lines, and destroyed/rebound objects still fail closed.
+Geometry before an acknowledgement is permitted, but is never treated as applied
+before a surface commit. The public protocol contract is documented in
+[xdg_surface.set_window_geometry](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/stable/xdg-shell/xdg-shell.xml).
+
+Hosted run 38967339848 exposed this parser defect in all three narrow cases:
+serial 10 set 1200×600; serial 11 repeated that size and was acknowledged without
+another geometry request, then the owned surface committed. These traces prove
+only the floating-stage size, not the later 720×720 resize or navigation result.
+The successor retains the one-time setup commands and shared 30-second budget.
