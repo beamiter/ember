@@ -107,7 +107,14 @@ PS1='\[\e]133;A\a\]EMBER_SMOKE> \[\e]133;B\a\]'
                 keyboard.remove(matches[0])
             wm_config = self.out / 'openbox-test-rc.xml'
             ET.ElementTree(config).write(wm_config, encoding='utf-8', xml_declaration=True)
-            self.spawn(['openbox', '--sm-disable', '--config', str(wm_config)], 'openbox')
+            manager = self.spawn(['openbox', '--sm-disable', '--config-file', str(wm_config)], 'openbox')
+            def wm_ready():
+                assert manager.poll() is None, 'Openbox exited during startup; see openbox.log'
+                reply = subprocess.run(['xprop', '-root', '_NET_SUPPORTING_WM_CHECK'],
+                                       env=self.env, capture_output=True, text=True, timeout=3)
+                (self.out / 'openbox-readiness.txt').write_text(reply.stdout + reply.stderr)
+                return reply.returncode == 0 and 'window id # 0x' in reply.stdout
+            wait_for(wm_ready, 'Openbox EWMH readiness')
         else:
             cfg = self.out / 'sway.conf'
             cfg.write_text('xwayland disable\noutput * resolution 1280x900\nseat seat0 fallback true\nfocus_follows_mouse no\n')
