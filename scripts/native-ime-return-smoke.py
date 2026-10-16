@@ -36,7 +36,14 @@ def main():
         control = out / 'ime-control'
         control.mkdir()
         ime = smoke.spawn([str(args.ime_client.resolve(strict=True)), str(control)], 'ime-client')
-        module.wait_for((control / 'connected').exists, 'IME protocol connected')
+        def wait_ime_marker(name, label):
+            def ready():
+                status = ime.poll()
+                if status is not None:
+                    raise RuntimeError(f'IME helper exited {status} while awaiting {name}; see ime-client.log')
+                return (control / name).exists()
+            module.wait_for(ready, label)
+        wait_ime_marker('connected', 'IME protocol connected')
         smoke.config.write_text('shell = "/bin/bash"\nterminal_mode = "' + args.mode + '"\nrestore_session = false\n')
         smoke.app = smoke.spawn([str(smoke.binary)], 'ember')
         module.wait_for(smoke.app_window, 'installed Ember IME window')
@@ -44,14 +51,14 @@ def main():
         identity = smoke.command('ime-ready')
         capture = smoke.raw_start('ime-return-' + args.mode)
         (control / 'start').touch()
-        module.wait_for((control / 'preedit').exists, 'genuine compositor preedit')
+        wait_ime_marker('preedit', 'genuine compositor preedit')
         time.sleep(0.5)
         smoke.screenshot('ime-preedit-zero-bytes')
         preedit = (capture / 'live.bin').read_bytes()
         assert preedit == b'', ('preedit leaked terminal bytes', preedit.hex())
         (capture / 'preedit.bin').write_bytes(preedit)
         smoke.key('Return')
-        module.wait_for((control / 'committed').exists, 'native composition Return consumed and grab released')
+        wait_ime_marker('committed', 'native composition Return consumed and grab released')
         expected = '你'.encode()
         module.wait_for(lambda: (capture / 'live.bin').read_bytes() == expected, 'commit text reaches PTY without CR')
         smoke.screenshot('ime-commit-without-cr')
@@ -75,6 +82,8 @@ def main():
             pass
         raise
     finally:
+        if 'ime' in locals():
+            result['helper_exit_code_before_cleanup'] = ime.poll()
         (out / 'result.json').write_text(json.dumps(result, indent=2))
         try:
             smoke.close()

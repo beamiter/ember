@@ -28,6 +28,7 @@ struct state {
     struct xkb_keymap *keymap;
     struct xkb_state *keys;
     const char *directory;
+    const char *stage;
     uint32_t serial, enter_key;
     bool pending_active, active, failed, unavailable, synced;
     bool preedit, committed, released;
@@ -116,6 +117,7 @@ static const struct zwp_input_method_v2_listener method_listener = {
 static void keymap(void *data, struct zwp_input_method_keyboard_grab_v2 *grab,
                    uint32_t format, int32_t fd, uint32_t size) {
     (void)grab; struct state *s = data; struct stat st;
+    fprintf(stderr,"keymap received format=%u size=%u\n",format,size);
     void *mapped = MAP_FAILED; struct xkb_keymap *map = NULL; struct xkb_state *keys = NULL;
     if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || !size || size > 1024 * 1024 ||
         fstat(fd, &st) || st.st_size < (off_t)size) goto fail;
@@ -126,12 +128,13 @@ static void keymap(void *data, struct zwp_input_method_keyboard_grab_v2 *grab,
     if (s->keys) xkb_state_unref(s->keys);
     if (s->keymap) xkb_keymap_unref(s->keymap);
     s->keys = keys; s->keymap = map;
+    fprintf(stderr,"keymap accepted\n");
     munmap(mapped, size); close(fd); return;
 fail:
     if (keys) xkb_state_unref(keys);
     if (map) xkb_keymap_unref(map);
     if (mapped != MAP_FAILED) munmap(mapped, size);
-    close(fd); s->failed = true;
+    close(fd); s->failed = true; s->stage = "keymap-validation";
 }
 static void key(void *data, struct zwp_input_method_keyboard_grab_v2 *grab,
                 uint32_t serial, uint32_t time, uint32_t code, uint32_t value) {
@@ -181,25 +184,33 @@ static void removed(void *d, struct wl_registry *r, uint32_t n) {(void)d;(void)r
 static const struct wl_registry_listener registry_listener={.global=global,.global_remove=removed};
 int main(int argc,char **argv) {
     if(argc!=2){fprintf(stderr,"usage: native-ime-return CONTROL_DIRECTORY\n");return 2;}
-    struct state s={.directory=argv[1]}; int result=1; double deadline=monotonic()+30;
+    struct state s={.directory=argv[1],.stage="connect"}; int result=1; double deadline=monotonic()+30;
     s.xkb=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     s.display=wl_display_connect(NULL);
     if(!s.xkb||!s.display)goto cleanup;
+    s.stage="registry";
     s.registry=wl_display_get_registry(s.display);
     if(!s.registry || wl_registry_add_listener(s.registry,&registry_listener,&s)<0)goto cleanup;
     if(!sync_bounded(&s,deadline)||!s.seat||!s.manager)goto cleanup;
+    s.stage="input-method-connect";
     s.method=zwp_input_method_manager_v2_get_input_method(s.manager,s.seat);
     if(!s.method || zwp_input_method_v2_add_listener(s.method,&method_listener,&s)<0)goto cleanup;
     if(!sync_bounded(&s,deadline)||s.unavailable||!marker(&s,"connected",true))goto cleanup;
+    s.stage="await-start-active";
     while(monotonic()<deadline&&!s.failed&&!s.unavailable){
         if(s.active&&!s.preedit&&marker(&s,"start",false)){
+            s.stage="grab-keyboard";
             s.grab=zwp_input_method_v2_grab_keyboard(s.method);
             if(!s.grab || zwp_input_method_keyboard_grab_v2_add_listener(s.grab,&grab_listener,&s)<0)goto cleanup;
-            if(!sync_bounded(&s,deadline)||!s.keys)goto cleanup;
+            if(!sync_bounded(&s,deadline))goto cleanup;
+            s.stage="grab-keymap-ready";
+            if(!s.keys)goto cleanup;
+            s.stage="send-preedit";
             zwp_input_method_v2_set_preedit_string(s.method,"ni",2,2);
             zwp_input_method_v2_commit(s.method,s.serial);s.preedit=true;
             if(!sync_bounded(&s,deadline)||!marker(&s,"preedit",true))goto cleanup;
         }
+        if(s.preedit&&!s.committed)s.stage="await-composition-return";
         if(s.released&&!marker(&s,"committed",false)){
             if(!sync_bounded(&s,deadline)||!marker(&s,"committed",true))goto cleanup;
         }
@@ -207,6 +218,14 @@ int main(int argc,char **argv) {
         if(!pump(&s,deadline))break;
     }
 cleanup:
+    if(result){
+        int display_error=s.display?wl_display_get_error(s.display):0;
+        const struct wl_interface *interface=NULL; uint32_t object=0;
+        uint32_t protocol_error=s.display?wl_display_get_protocol_error(s.display,&interface,&object):0;
+        fprintf(stderr,"fixture failure stage=%s display_error=%d protocol_error=%u interface=%s object=%u active=%d keymap=%d preedit=%d committed=%d released=%d\n",
+            s.stage,display_error,protocol_error,interface?interface->name:"none",object,
+            s.active,s.keys!=NULL,s.preedit,s.committed,s.released);
+    }
     if(s.grab)zwp_input_method_keyboard_grab_v2_release(s.grab);
     if(s.method)zwp_input_method_v2_destroy(s.method);
     if(s.manager)zwp_input_method_manager_v2_destroy(s.manager);
