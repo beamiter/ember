@@ -8753,10 +8753,14 @@ printf genuine
         .stdout;
         let tar_file = remote.join("tree.tar");
         std::fs::write(&tar_file, tar_bytes).unwrap();
+        // download_dir sends PROBE_SCRIPT on stdin even to this fake remote.
+        // Drain it before exiting so the stdin writer cannot race publication
+        // with BrokenPipe; the destination must still be created mid-transfer.
         let producer = vec![
             "sh".to_string(),
             "-c".to_string(),
-            "mkdir \"$1\" && printf keep > \"$1/marker\" && cat \"$2\"".to_string(),
+            "cat >/dev/null && mkdir \"$1\" && printf keep > \"$1/marker\" && cat \"$2\""
+                .to_string(),
             "--".to_string(),
             dst.to_str().unwrap().to_string(),
             tar_file.to_str().unwrap().to_string(),
