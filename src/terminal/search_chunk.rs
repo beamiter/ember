@@ -96,7 +96,9 @@ pub struct RawSearchChunk {
     pub text: String,
     pub spans: Vec<RawSearchSpan>,
     pub source: SearchSourceVersion,
+    #[cfg(test)]
     pub starts_logical_line: bool,
+    #[cfg(test)]
     pub ends_logical_line: bool,
     pub continuation: Option<RawSearchCursor>,
     pub work: SearchChunkWork,
@@ -105,6 +107,7 @@ impl RawSearchChunk {
     /// Existing per-logical-line regex semantics are valid only when both
     /// boundary lines are complete. A partial line is explicitly unsupported
     /// by that matcher, never a complete negative result.
+    #[cfg(test)]
     pub fn supports_complete_line_regex(&self) -> bool {
         self.starts_logical_line && self.ends_logical_line
     }
@@ -112,6 +115,7 @@ impl RawSearchChunk {
     /// Byte ranges for complete logical lines, preserving existing regex
     /// behavior even when another boundary line in this chunk is partial.
     /// Consumers must still disclose skipped partial boundary lines.
+    #[cfg(test)]
     pub fn complete_logical_lines(&self) -> Vec<std::ops::Range<usize>> {
         let mut ranges = Vec::new();
         let mut start = 0;
@@ -130,13 +134,14 @@ impl RawSearchChunk {
     }
 }
 #[derive(Clone, Debug)]
-pub enum SearchChunkOutcome {
-    Chunk(RawSearchChunk),
+pub enum SearchChunkError {
     Stale,
     Unavailable,
     BudgetTooSmall,
     Unsupported(&'static str),
 }
+
+pub type SearchChunkOutcome = Result<RawSearchChunk, SearchChunkError>;
 
 impl TerminalState {
     pub(super) fn invalidate_search_scrollback_seals(&mut self) {
@@ -145,11 +150,12 @@ impl TerminalState {
         self.search_scrollback_epoch = next_source_epoch();
     }
 
+    #[cfg(test)]
     pub fn seal_search_output(
         &self,
         sequence: u64,
         id: &str,
-    ) -> Result<RawSearchSeal, SearchChunkOutcome> {
+    ) -> Result<RawSearchSeal, SearchChunkError> {
         self.seal_search_output_with_work(sequence, id)
             .map(|(seal, _)| seal)
     }
@@ -158,8 +164,8 @@ impl TerminalState {
         &self,
         sequence: u64,
         id: &str,
-    ) -> Result<(RawSearchSeal, usize), SearchChunkOutcome> {
-        use SearchChunkOutcome::*;
+    ) -> Result<(RawSearchSeal, usize), SearchChunkError> {
+        use SearchChunkError::*;
         if self.use_alt_buffer
             || self.search_scrollback_epoch == 0
             || self.total_lines_scrolled == u64::MAX
@@ -214,21 +220,21 @@ impl TerminalState {
         ))
     }
 
-    pub fn validate_search_seal(&self, seal: &RawSearchSeal) -> Result<(), SearchChunkOutcome> {
+    pub fn validate_search_seal(&self, seal: &RawSearchSeal) -> Result<(), SearchChunkError> {
         self.validate_search_seal_with_work(seal).map(|_| ())
     }
 
     fn validate_search_seal_with_work(
         &self,
         seal: &RawSearchSeal,
-    ) -> Result<usize, SearchChunkOutcome> {
+    ) -> Result<usize, SearchChunkError> {
         if seal.source.epoch != self.search_scrollback_epoch || seal.source.epoch == 0 {
-            return Err(SearchChunkOutcome::Stale);
+            return Err(SearchChunkError::Stale);
         }
         let (current, records_examined) =
             self.seal_search_output_with_work(seal.record_sequence, &seal.record_id)?;
         if current != *seal {
-            return Err(SearchChunkOutcome::Stale);
+            return Err(SearchChunkError::Stale);
         }
         Ok(records_examined)
     }
@@ -241,7 +247,7 @@ impl TerminalState {
     ) -> SearchChunkOutcome {
         let records_examined = match self.validate_search_seal_with_work(seal) {
             Ok(work) => work,
-            Err(outcome) => return outcome,
+            Err(outcome) => return Err(outcome),
         };
         let mut outcome = self.search_output_chunk_with_source(
             seal.record_sequence,
@@ -250,7 +256,7 @@ impl TerminalState {
             budget,
             seal.source,
         );
-        if let SearchChunkOutcome::Chunk(chunk) = &mut outcome {
+        if let Ok(chunk) = &mut outcome {
             chunk.work.records_examined += records_examined;
         }
         outcome
@@ -261,6 +267,7 @@ impl TerminalState {
             self.search_source_revision = self.search_source_revision.checked_add(1).unwrap_or(0);
         }
     }
+    #[cfg(test)]
     pub fn search_source_version(&self) -> SearchSourceVersion {
         SearchSourceVersion {
             epoch: self.search_source_epoch,
@@ -271,6 +278,7 @@ impl TerminalState {
     /// One bounded raw subwindow for one retained completed record. A cursor
     /// can only continue against the exact source instance/revision/record.
     /// No capture fallback, total-byte computation, or global RawRowId walk.
+    #[cfg(test)]
     pub fn search_output_chunk(
         &self,
         sequence: u64,
@@ -295,20 +303,20 @@ impl TerminalState {
         budget: SearchChunkBudget,
         source: SearchSourceVersion,
     ) -> SearchChunkOutcome {
-        use SearchChunkOutcome::*;
+        use SearchChunkError::*;
         let Some(budget) = budget.bounded() else {
-            return BudgetTooSmall;
+            return Err(BudgetTooSmall);
         };
         if source.epoch == 0 || source.revision == 0 {
-            return Unsupported("source revision exhausted");
+            return Err(Unsupported("source revision exhausted"));
         }
         if self.use_alt_buffer {
-            return Unsupported("alternate screen");
+            return Err(Unsupported("alternate screen"));
         }
         if cursor.is_some_and(|c| {
             c.source != source || c.record_sequence != sequence || c.record_id != id
         }) {
-            return Stale;
+            return Err(Stale);
         }
         let mut work = SearchChunkWork::default();
         let record = self
@@ -320,31 +328,32 @@ impl TerminalState {
                 record.sequence == sequence && record.id == id
             });
         let Some(record) = record else {
-            return Unavailable;
+            return Err(Unavailable);
         };
         if !record.complete || record.id.len() > MAX_OSC_133_ID_BYTES {
-            return Unsupported("incomplete record or oversized identity");
+            return Err(Unsupported("incomplete record or oversized identity"));
         }
         let Some((start, end)) = record.output_start.zip(record.output_end) else {
-            return Unavailable;
+            return Err(Unavailable);
         };
         if end < start {
-            return Unsupported("invalid output range");
+            return Err(Unsupported("invalid output range"));
         }
         if cursor
             .is_some_and(|c| c.start != start || c.end != end || c.next < start || c.next > end)
         {
-            return Stale;
+            return Err(Stale);
         }
         // Both anchors must still belong to retained raw data. Do not silently
         // clamp an evicted prefix into a complete-coverage claim.
         if self.buffer_anchor_to_absolute(start).is_none()
             || self.buffer_anchor_to_absolute(end).is_none()
         {
-            return Unavailable;
+            return Err(Unavailable);
         }
         let mut next = cursor.map_or(start, |c| c.next);
         let mut line_start = cursor.is_none_or(|c| c.at_logical_line_start);
+        #[cfg(test)]
         let starts_logical_line = line_start;
         let chunk_start = next;
         let mut text = String::with_capacity(budget.bytes);
@@ -355,21 +364,21 @@ impl TerminalState {
                 break;
             }
             let Some((absolute, _)) = self.buffer_anchor_to_absolute(next) else {
-                return Unavailable;
+                return Err(Unavailable);
             };
             let Some((row_id, width)) = self.retained_raw_row(absolute) else {
-                return Unavailable;
+                return Err(Unavailable);
             };
             if width > super::MAX_TERMINAL_COLS {
-                return Unsupported("invalid row width");
+                return Err(Unsupported("invalid row width"));
             }
             if !row_id.is_tracked() {
-                return Unsupported("untracked raw row");
+                return Err(Unsupported("untracked raw row"));
             }
             if next == cursor.map_or(start, |c| c.next)
                 && cursor.is_some_and(|c| c.row_id != row_id)
             {
-                return Stale;
+                return Err(Stale);
             }
             let encoded = if absolute < self.scrollback.len() {
                 self.scrollback[absolute].search_encoded_bytes()
@@ -381,7 +390,7 @@ impl TerminalState {
                 || work.encoded_bytes_charged.saturating_add(encoded) > budget.encoded_bytes
             {
                 if work.rows_decoded == 0 {
-                    return BudgetTooSmall;
+                    return Err(BudgetTooSmall);
                 }
                 break;
             }
@@ -393,14 +402,14 @@ impl TerminalState {
             let cells = if absolute < self.scrollback.len() {
                 let Some(cells) = self.scrollback[absolute].decode_search_row(width, encoded)
                 else {
-                    return Unsupported("invalid compressed row");
+                    return Err(Unsupported("invalid compressed row"));
                 };
                 cells
             } else {
                 self.grid[absolute - self.scrollback.len()].to_vec()
             };
             if cells.len() != width || width > super::MAX_TERMINAL_COLS {
-                return Unsupported("invalid row width");
+                return Err(Unsupported("invalid row width"));
             }
             let mut row_end = if next.line_id == end.line_id {
                 end.column.min(width)
@@ -467,10 +476,10 @@ impl TerminalState {
             None
         } else {
             let Some((absolute, _)) = self.buffer_anchor_to_absolute(next) else {
-                return Unavailable;
+                return Err(Unavailable);
             };
             let Some((row_id, _)) = self.retained_raw_row(absolute) else {
-                return Unavailable;
+                return Err(Unavailable);
             };
             Some(RawSearchCursor {
                 source,
@@ -483,14 +492,16 @@ impl TerminalState {
                 at_logical_line_start: line_start,
             })
         };
-        Chunk(RawSearchChunk {
+        Ok(RawSearchChunk {
             record_sequence: sequence,
             record_id: id.to_owned(),
             start: chunk_start,
             text,
             spans,
             source,
+            #[cfg(test)]
             starts_logical_line,
+            #[cfg(test)]
             ends_logical_line: line_start,
             continuation,
             work,
@@ -516,7 +527,7 @@ mod tests {
     ) -> RawSearchChunk {
         let record = t.command_records().back().unwrap();
         match t.search_output_chunk(record.sequence, &record.id, c, b) {
-            SearchChunkOutcome::Chunk(c) => c,
+            Ok(c) => c,
             other => panic!("{other:?}"),
         }
     }
@@ -638,7 +649,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            SearchChunkOutcome::BudgetTooSmall
+            Err(SearchChunkError::BudgetTooSmall)
         ));
         assert!(matches!(
             t.search_output_chunk(
@@ -650,7 +661,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            SearchChunkOutcome::BudgetTooSmall
+            Err(SearchChunkError::BudgetTooSmall)
         ));
     }
     #[test]
@@ -683,7 +694,7 @@ mod tests {
                     Some(&c),
                     SearchChunkBudget::default()
                 ),
-                SearchChunkOutcome::Stale
+                Err(SearchChunkError::Stale)
             ));
         }
         let a = terminal(&"abc\r\n".repeat(40), 16, 100);
@@ -705,7 +716,7 @@ mod tests {
                 Some(&c),
                 SearchChunkBudget::default()
             ),
-            SearchChunkOutcome::Stale
+            Err(SearchChunkError::Stale)
         ));
     }
     #[test]
@@ -768,7 +779,6 @@ pub struct RawLiteralHit {
 pub struct RawLiteralMatches {
     pub hits: Vec<RawLiteralHit>,
     pub capped: bool,
-    pub continuation: bool,
 }
 /// Streaming substring matcher only. Regex consumers must separately honor
 /// supports_complete_line_regex; they cannot treat a partial chunk as a line.
@@ -954,11 +964,7 @@ impl RawLiteralOverlap {
         self.tail_spans = tail_spans;
         self.expected = chunk.continuation.clone();
         self.started = true;
-        Ok(RawLiteralMatches {
-            hits,
-            capped,
-            continuation: self.expected.is_some(),
-        })
+        Ok(RawLiteralMatches { hits, capped })
     }
 }
 
@@ -976,7 +982,7 @@ mod literal_tests {
         let mut cursor = None;
         let mut starts = Vec::new();
         loop {
-            let SearchChunkOutcome::Chunk(c) = t.search_output_chunk(
+            let Ok(c) = t.search_output_chunk(
                 r.sequence,
                 &r.id,
                 cursor.as_ref(),
@@ -1010,7 +1016,7 @@ mod literal_tests {
         let mut cursor = None;
         let mut starts = Vec::new();
         loop {
-            let SearchChunkOutcome::Chunk(c) = t.search_output_chunk(
+            let Ok(c) = t.search_output_chunk(
                 r.sequence,
                 &r.id,
                 cursor.as_ref(),
@@ -1041,7 +1047,7 @@ mod literal_tests {
         let mut t = TerminalState::new(32, 4);
         t.process_input(b"\x1b]133;A\x07\x1b]133;C;id=raw\x07abcdefgh\x1b]133;D;0;id=raw\x07");
         let r = t.command_records().back().unwrap();
-        let SearchChunkOutcome::Chunk(c) = t.search_output_chunk(
+        let Ok(c) = t.search_output_chunk(
             r.sequence,
             &r.id,
             None,
@@ -1097,7 +1103,7 @@ mod extra_tests {
         let mut cursor = None;
         let mut hits = Vec::new();
         loop {
-            let SearchChunkOutcome::Chunk(c) = t.search_output_chunk(
+            let Ok(c) = t.search_output_chunk(
                 r.sequence,
                 &r.id,
                 cursor.as_ref(),
@@ -1129,8 +1135,7 @@ mod extra_tests {
             .as_bytes(),
         );
         let r = t.command_records().back().unwrap();
-        let SearchChunkOutcome::Chunk(c) =
-            t.search_output_chunk(r.sequence, &r.id, None, SearchChunkBudget::default())
+        let Ok(c) = t.search_output_chunk(r.sequence, &r.id, None, SearchChunkBudget::default())
         else {
             panic!()
         };
@@ -1181,7 +1186,7 @@ mod shared_literal_tests {
             let mut cursor = None;
             let mut hits = Vec::new();
             loop {
-                let SearchChunkOutcome::Chunk(c) = t.search_output_chunk(
+                let Ok(c) = t.search_output_chunk(
                     r.sequence,
                     &r.id,
                     cursor.as_ref(),
@@ -1314,7 +1319,7 @@ mod seal_tests {
         let started = std::time::Instant::now();
         loop {
             t.process_input(b"live PTY append\r\n");
-            let SearchChunkOutcome::Chunk(chunk) =
+            let Ok(chunk) =
                 t.search_sealed_output_chunk(&seal, cursor.as_ref(), SearchChunkBudget::default())
             else {
                 panic!("stable historical seal interrupted")
@@ -1344,7 +1349,7 @@ mod seal_tests {
         for operation in 0..7 {
             let (mut t, sequence) = terminal(80, 200);
             let seal = t.seal_search_output(sequence, "sealed").unwrap();
-            let SearchChunkOutcome::Chunk(chunk) = t.search_sealed_output_chunk(
+            let Ok(chunk) = t.search_sealed_output_chunk(
                 &seal,
                 None,
                 SearchChunkBudget {
@@ -1377,7 +1382,7 @@ mod seal_tests {
                     chunk.continuation.as_ref(),
                     SearchChunkBudget::default()
                 ),
-                SearchChunkOutcome::Chunk(_)
+                Ok(_)
             ));
         }
         let (a, sequence) = terminal(80, 200);
@@ -1385,7 +1390,7 @@ mod seal_tests {
         let (b, _) = terminal(80, 200);
         assert!(matches!(
             b.validate_search_seal(&seal),
-            Err(SearchChunkOutcome::Stale)
+            Err(SearchChunkError::Stale)
         ));
     }
 
@@ -1401,8 +1406,7 @@ mod seal_tests {
         let seal = t.seal_search_output(sequence, "sealed").unwrap();
         t.set_max_scrollback(60);
         assert!(t.validate_search_seal(&seal).is_ok());
-        let SearchChunkOutcome::Chunk(chunk) =
-            t.search_sealed_output_chunk(&seal, None, SearchChunkBudget::default())
+        let Ok(chunk) = t.search_sealed_output_chunk(&seal, None, SearchChunkBudget::default())
         else {
             panic!()
         };
@@ -1410,7 +1414,7 @@ mod seal_tests {
         t.set_max_scrollback(10);
         assert!(matches!(
             t.validate_search_seal(&seal),
-            Err(SearchChunkOutcome::Unavailable)
+            Err(SearchChunkError::Unavailable)
         ));
     }
 
@@ -1421,13 +1425,13 @@ mod seal_tests {
         let sequence = t.command_records().back().unwrap().sequence;
         assert!(matches!(
             t.seal_search_output(sequence, "sealed"),
-            Err(SearchChunkOutcome::Unsupported(
+            Err(SearchChunkError::Unsupported(
                 "output still touches mutable grid"
             ))
         ));
         let (mut t, sequence) = terminal(80, 200);
         let seal = t.seal_search_output(sequence, "sealed").unwrap();
-        let SearchChunkOutcome::Chunk(raw) = t.search_output_chunk(
+        let Ok(raw) = t.search_output_chunk(
             sequence,
             "sealed",
             None,
@@ -1444,7 +1448,7 @@ mod seal_tests {
                 raw.continuation.as_ref(),
                 SearchChunkBudget::default()
             ),
-            SearchChunkOutcome::Stale
+            Err(SearchChunkError::Stale)
         ));
         // Live-grid edits and no-op resizing do not mutate sealed scrollback.
         t.process_input(b"\x1b[H\x1b[2Kedit");

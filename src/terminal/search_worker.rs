@@ -12,10 +12,11 @@
 //! partial outcomes. Work/time limits expose a move-only bounded continuation;
 //! only an explicit resume advances another window, preserving literal carry.
 use super::search_chunk::{
-    RawLiteralHit, RawLiteralOverlap, RawSearchCursor, RawSearchSeal, RawSearchSpan,
-    SearchChunkBudget, SearchChunkOutcome, SearchChunkWork, RAW_LITERAL_MAX_HITS,
-    RAW_LITERAL_QUERY_MAX_BYTES,
+    RawLiteralHit, RawLiteralOverlap, RawSearchCursor, RawSearchSeal, SearchChunkBudget,
+    SearchChunkError, SearchChunkWork, RAW_LITERAL_MAX_HITS,
 };
+#[cfg(test)]
+use super::search_chunk::{RawSearchSpan, RAW_LITERAL_QUERY_MAX_BYTES};
 use super::{TerminalState, MAX_OSC_133_ID_BYTES};
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,6 +117,7 @@ impl SearchWorkerLimits {
     /// aggregate, one result slot and the continuation's duplicate hit storage. Query/record/cursor/lock/thread metadata,
     /// allocator headers, terminal's existing scrollback and bounded single-row
     /// decoder scratch are separate. No term scales with retained history.
+    #[cfg(test)]
     pub fn payload_accounting(self) -> SearchWorkerPayloadAccounting {
         let limits = self.bounded();
         let span = std::mem::size_of::<RawSearchSpan>();
@@ -131,15 +133,19 @@ impl SearchWorkerLimits {
             // Scalar provenance <= byte count.
             carry_and_query_bytes: 5 * carry + 3 * carry * span + 2 * RAW_LITERAL_QUERY_MAX_BYTES,
             hit_storage_bytes: (512 + 3 * RAW_LITERAL_MAX_HITS) * hit,
+            // Conservative overlap: queued old final plus constructing new final.
+            finished_boxes_bytes: 2 * std::mem::size_of::<SearchFinished>(),
         }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct SearchWorkerPayloadAccounting {
     pub raw_chunk_bytes: usize,
     pub normalized_chunk_bytes: usize,
     pub carry_and_query_bytes: usize,
     pub hit_storage_bytes: usize,
+    pub finished_boxes_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -202,9 +208,9 @@ pub struct SearchFinished {
 impl SearchFinished {
     /// Caller must also ask `worker.is_current(generation)` immediately before
     /// adoption. This validates source retention/mutation, not query generation.
-    pub fn validate_source(&self, terminal: &TerminalState) -> Result<(), SearchChunkOutcome> {
+    pub fn validate_source(&self, terminal: &TerminalState) -> Result<(), SearchChunkError> {
         let Some(seal) = self.seal.as_ref() else {
-            return Err(SearchChunkOutcome::Unavailable);
+            return Err(SearchChunkError::Unavailable);
         };
         terminal.validate_search_seal(seal)
     }
@@ -212,7 +218,7 @@ impl SearchFinished {
 #[derive(Debug)]
 pub enum SearchUpdate {
     Progress(SearchProgress),
-    Finished(SearchFinished),
+    Finished(Box<SearchFinished>),
 }
 impl SearchUpdate {
     pub fn generation(&self) -> u64 {
@@ -445,6 +451,7 @@ impl SearchWorker {
             .filter(|update| update.generation() == state.generation)
     }
     /// Capacity invariant: each component is always 0 or 1.
+    #[cfg(test)]
     pub fn buffered_slots(&self) -> (usize, usize) {
         let state = self.shared.state.lock();
         (
@@ -492,17 +499,16 @@ fn run_worker(
             state.pending.take().expect("pending checked under lock")
         };
         if let Some(result) = run_request(&terminal, &shared, request, limits) {
-            publish(&shared, SearchUpdate::Finished(result));
+            publish(&shared, SearchUpdate::Finished(Box::new(result)));
         }
     }
 }
-fn status_for(outcome: SearchChunkOutcome) -> SearchFinishStatus {
+fn status_for(outcome: SearchChunkError) -> SearchFinishStatus {
     match outcome {
-        SearchChunkOutcome::Stale => SearchFinishStatus::Stale,
-        SearchChunkOutcome::Unavailable => SearchFinishStatus::Unavailable,
-        SearchChunkOutcome::BudgetTooSmall => SearchFinishStatus::BudgetTooSmall,
-        SearchChunkOutcome::Unsupported(reason) => SearchFinishStatus::Unsupported(reason),
-        SearchChunkOutcome::Chunk(_) => unreachable!("capture chunk handled separately"),
+        SearchChunkError::Stale => SearchFinishStatus::Stale,
+        SearchChunkError::Unavailable => SearchFinishStatus::Unavailable,
+        SearchChunkError::BudgetTooSmall => SearchFinishStatus::BudgetTooSmall,
+        SearchChunkError::Unsupported(reason) => SearchFinishStatus::Unsupported(reason),
     }
 }
 fn run_request(
@@ -589,7 +595,7 @@ fn run_request(
                             seal = Some(created);
                             outcome
                         }
-                        Err(outcome) => outcome,
+                        Err(outcome) => Err(outcome),
                     }
                 };
                 progress.capture_time += started.elapsed();
@@ -616,19 +622,21 @@ fn run_request(
             continue;
         };
         backoff = Duration::from_millis(1);
-        let SearchChunkOutcome::Chunk(chunk) = capture else {
-            // Only a remainder after actual progress is resumable. If a fresh
-            // window cannot admit one row, returning the same cursor would
-            // loop forever under identical limits (including on resume).
-            if matches!(capture, SearchChunkOutcome::BudgetTooSmall)
-                && progress.chunks > 0
-                && (budget.cells < limits.chunk.cells
-                    || budget.bytes < limits.chunk.bytes
-                    || budget.encoded_bytes < limits.chunk.encoded_bytes)
-            {
-                break SearchFinishStatus::WorkLimit;
+        let chunk = match capture {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                // A reduced remainder after progress is resumable; a fresh
+                // window incapable of an atomic row remains nonresumable.
+                if matches!(error, SearchChunkError::BudgetTooSmall)
+                    && progress.chunks > 0
+                    && (budget.cells < limits.chunk.cells
+                        || budget.bytes < limits.chunk.bytes
+                        || budget.encoded_bytes < limits.chunk.encoded_bytes)
+                {
+                    break SearchFinishStatus::WorkLimit;
+                }
+                break status_for(error);
             }
-            break status_for(capture);
         };
         if cancelled(shared, request.generation) {
             return None;
@@ -673,7 +681,7 @@ fn run_request(
         publish(shared, SearchUpdate::Progress(progress.clone()));
         // Fairness even when try_lock always succeeds: give PTY/input a
         // cancellable scheduling boundary at most every four captures.
-        if progress.chunks % 4 == 0 {
+        if progress.chunks.is_multiple_of(4) {
             wait_retry(
                 shared,
                 request.generation,
@@ -784,11 +792,36 @@ mod tests {
     fn worker(terminal: &Arc<Mutex<TerminalState>>, limits: SearchWorkerLimits) -> SearchWorker {
         SearchWorker::new(Arc::downgrade(terminal), pool(), limits).unwrap()
     }
+    #[test]
+    fn search_worker_representation_has_explicit_stack_and_box_bounds() {
+        use super::super::search_chunk::{RawSearchChunk, SearchChunkOutcome};
+        use std::mem::size_of;
+        assert!(size_of::<SearchChunkError>() <= 24);
+        assert!(size_of::<RawSearchChunk>() <= 288);
+        assert!(size_of::<SearchChunkOutcome>() <= 320);
+        assert!(size_of::<SearchUpdate>() <= 160);
+        assert!(size_of::<SearchFinished>() <= 1024);
+        assert_eq!(
+            SearchWorkerLimits::default()
+                .payload_accounting()
+                .finished_boxes_bytes,
+            2 * size_of::<SearchFinished>()
+        );
+        eprintln!(
+            "search representations: error={} chunk={} outcome={} update={} finished_box={}",
+            size_of::<SearchChunkError>(),
+            size_of::<RawSearchChunk>(),
+            size_of::<SearchChunkOutcome>(),
+            size_of::<SearchUpdate>(),
+            size_of::<SearchFinished>()
+        );
+    }
+
     fn finish(worker: &SearchWorker) -> SearchFinished {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(SearchUpdate::Finished(result)) = worker.take_update() {
-                return result;
+                return *result;
             }
             assert!(
                 Instant::now() < deadline,
@@ -825,7 +858,7 @@ mod tests {
         terminal.lock().on_resize(65, 4);
         assert!(matches!(
             result.validate_source(&terminal.lock()),
-            Err(SearchChunkOutcome::Stale)
+            Err(SearchChunkError::Stale)
         ));
         worker.cancel();
         assert!(!worker.is_current(result.generation));
@@ -1140,9 +1173,11 @@ mod tests {
     #[test]
     fn search_worker_ready_latency_with_real_input_append_and_bounded_progress() {
         let (terminal, seq, id) = fixture(2000, "abcdefghijklmnopqrstuvwxyz");
-        let mut config = SearchWorkerLimits::default();
-        config.max_chunks = 1024;
-        config.max_duration = MAX_SEARCH_WINDOW_DURATION;
+        let config = SearchWorkerLimits {
+            max_chunks: 1024,
+            max_duration: MAX_SEARCH_WINDOW_DURATION,
+            ..Default::default()
+        };
         let worker = worker(&terminal, config);
         let stop = Arc::new(AtomicBool::new(false));
         let writer_terminal = terminal.clone();

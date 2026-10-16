@@ -134,6 +134,21 @@ class Tests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 driver.validate_manifest(dict(valid, **{key: wrong}), 'flush', 0, '123:/dev/pts/9')
 
+    def test_real_default_block_search_binding_is_used(self):
+        self.assertEqual(driver.BLOCK_SEARCH_CHORD, ('g', ('ctrl', 'shift')))
+        bindings = Path(__file__).parent.parent / 'src/keybindings.rs'
+        self.assertIn('("ctrl+shift+g", Command::BlockSearchToggle)', bindings.read_text())
+        self.assertIn('.insert("ctrl+shift+g".to_string(), "block:search".to_string())', bindings.read_text())
+        source = Path(__file__).with_name('native-block-search.py').read_text()
+        self.assertIn('self.key(*BLOCK_SEARCH_CHORD)', source)
+        self.assertNotIn("self.key('f', ('ctrl', 'shift'))", source)
+
+    def test_generic_find_and_partial_controls_are_rejected(self):
+        controls = [row('Cmd'), row('Out', 30), row('Latest', 60)]
+        self.assertTrue(driver.block_picker_surface(controls))
+        for rows in [[], [row('E03EARLYHIT')], controls[:2], controls + [row('Out', line=2)]]:
+            self.assertFalse(driver.block_picker_surface(rows))
+
     def test_source_uses_real_binary_no_geometry_harness_or_controller(self):
         source = Path(__file__).with_name('native-block-search.py').read_text()
         self.assertIn('self.spawn([str(self.binary)]', source)

@@ -327,6 +327,7 @@ impl super::TerminalState {
             selection: None,
             projected_selection: None,
             selection_revision: 1,
+            #[cfg(test)]
             search_source_epoch: search_chunk::next_source_epoch(),
             search_source_revision: 1,
             search_scrollback_epoch: search_chunk::next_source_epoch(),

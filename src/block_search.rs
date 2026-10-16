@@ -466,7 +466,7 @@ pub struct BlockSearchRawState {
     pub next: usize,
     pub requested: bool,
     pub pending: Option<u64>,
-    pub finished: Option<crate::terminal::search_worker::SearchFinished>,
+    pub finished: Option<Box<crate::terminal::search_worker::SearchFinished>>,
     pub displayed: bool,
     pub current: Option<BlockSearchHistoryCursor>,
     pub continuation: Option<crate::terminal::search_worker::SearchContinuation>,
@@ -1044,6 +1044,7 @@ impl BlockSearchState {
     }
 
     /// The highlighted hit, if any.
+    #[cfg(test)]
     pub fn selected_hit(&self) -> Option<&BlockSearchHit> {
         (!self.is_loading() && self.query_error.is_none())
             .then(|| self.hits.get(self.selected_index))

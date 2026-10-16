@@ -4573,10 +4573,6 @@ impl TerminalApp {
     /// A click/plain Enter accepts and closes. Shift+Enter reveals one hit,
     /// advances to the next, and keeps the picker open so several matches can
     /// be reviewed without rebuilding the query.
-    pub(crate) fn block_search_confirm(&mut self) {
-        self.block_search_accept(false);
-    }
-
     /// Select and reveal the highlighted hit. With no hits this is a no-op and
     /// the picker stays open (palette precedent).
     /// A record that scrolled out of reach in the meantime degrades to the

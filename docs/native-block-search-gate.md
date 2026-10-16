@@ -2,7 +2,12 @@
 
 This first fixture stage launches the installed, uninstrumented production Ember
 binary through the existing scale-one X11 desktop harness and drives the real
-Find picker. It does not invoke application/controller functions. The E11 narrow
+Block Search picker through its actual Ctrl+Shift+G binding. Before typing,
+exact unique Cmd, Out and Latest controls must coexist in one observation. The
+generic terminal Find bar (Ctrl+Shift+F) cannot satisfy that surface check. Query
+clipboard readback remains required. An alternate OCR layout may analyze the
+same screenshot for exact query text; it never retries input or uses fuzzy text.
+It does not invoke application/controller functions. The E11 narrow
 Wayland/IME handshake is not a prerequisite or imported dependency.
 
 Run `python3 scripts/test-native-block-search.py` for pure fixture checks. On an

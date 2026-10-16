@@ -25,6 +25,7 @@ def load(name, filename):
 
 native = load('e03_desktop', 'native-desktop-smoke.py')
 fixture = load('e03_output', 'native-block-search-output.py')
+BLOCK_SEARCH_CHORD = ('g', ('ctrl', 'shift'))
 
 
 def exact_phrase(rows, phrase):
@@ -54,6 +55,11 @@ def phrase_center(rows, phrase):
     top = min(int(r['top']) for r in part)
     bottom = max(int(r['top']) + int(r['height']) for r in part)
     return (left + right) // 2, (top + bottom) // 2
+
+
+def block_picker_surface(rows):
+    # Generic terminal Find has none of these three Block Search controls.
+    return all(len(exact_phrase(rows, label)) == 1 for label in ('Cmd', 'Out', 'Latest'))
 
 
 def raw_hit_claim(rows, token):
@@ -111,6 +117,7 @@ class SearchSmoke(native.Smoke):
         self.sequence += 1
         label = f'{self.sequence:04d}-{name}'
         rows = self.words(label)
+        self.last_observation_label = label
         assert self.app.poll() is None, 'Real app exited'
         self.events.append(dict(event='observation', label=label, monotonic_ns=time.monotonic_ns()))
         return rows
@@ -160,7 +167,14 @@ class SearchSmoke(native.Smoke):
         assert identity == self.identity, 'Fixture switched shell/pane unexpectedly'
 
     def open_find(self, query):
-        self.key('f', ('ctrl', 'shift'))
+        self.key(*BLOCK_SEARCH_CHORD)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if block_picker_surface(self.observe('block-picker-surface')):
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError('Block Search surface not proven; refusing query/input on generic Find')
         self.key('a', ('ctrl',))
         self.text(query)
         # Positive field ownership oracle: copy actual selected UI text.
@@ -169,7 +183,16 @@ class SearchSmoke(native.Smoke):
         self.key('c', ('ctrl',))
         native.wait_for(lambda: self.read_clipboard() == query.encode(), 'Find field readback')
         self.key('Right')
-        self.query_point = phrase_center(self.observe('query-field'), query)
+        rows = self.observe('query-field')
+        if not block_picker_surface(rows):
+            raise RuntimeError('Block Search surface lost before query field targeting')
+        try:
+            self.query_point = phrase_center(rows, query)
+        except RuntimeError:
+            # Alternate OCR layout of the SAME pixels, with exact spelling and
+            # uniqueness still mandatory. Never retry the chord or query input.
+            rows = self.words(self.last_observation_label, psm=6, capture=False)
+            self.query_point = phrase_center(rows, query)
         self.click_phrase('Out', 'output-scope')
 
     def navigate(self, token, row, pointer=False, raw=False, expected_claim=None):

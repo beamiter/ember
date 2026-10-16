@@ -323,6 +323,17 @@ jobs:
           done
           exit "$status"
 
+      - name: Gate IME lifecycle after live Settings mode switches
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-ime.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          python3 scripts/test-native-ime-live-switch.py
+          python3 scripts/native-ime-live-switch.py \
+            --ime-client "$RUNNER_TEMP/ember-ime/native-ime-return" \
+            --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+            --output native-smoke-artifacts/ime-live-switch
+
       - name: Gate measured Wayland scales and narrow geometry
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' && steps.desktop-pointer.outcome == 'success' }}
         timeout-minutes: 8

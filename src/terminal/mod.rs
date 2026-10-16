@@ -577,6 +577,7 @@ impl Default for TerminalDefaultColors {
 }
 
 pub struct TerminalState {
+    #[cfg(test)]
     search_source_epoch: u64,
     search_source_revision: u64,
     search_scrollback_epoch: u64,
