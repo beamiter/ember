@@ -1013,27 +1013,24 @@ mod unix_pty {
         }
 
         fn observe_child_exit(child_pid: i32, nonblocking: bool) -> std::io::Result<bool> {
+            retry_on_eintr(|| Self::observe_child_exit_once(child_pid, nonblocking))
+        }
+
+        // Keep a single syscall available to deadline-bound callers: retrying
+        // EINTR here indefinitely would bypass their timeout check.
+        fn observe_child_exit_once(child_pid: i32, nonblocking: bool) -> std::io::Result<bool> {
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let options =
                 libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
-            retry_on_eintr(|| {
-                // `waitid` may leave siginfo unspecified after EINTR. Reset it
-                // on every attempt so WNOHANG's no-event result remains zero.
-                info = unsafe { std::mem::zeroed() };
-                // SAFETY: `info` is writable, P_PID scopes the observation to
-                // our forked child, and WNOWAIT explicitly preserves its wait
-                // status for the cleanup/reap step below.
-                let result = unsafe {
-                    libc::waitid(libc::P_PID, child_pid as libc::id_t, &mut info, options)
-                };
-                if result < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            })?;
-            // SAFETY: a successful waitid initializes siginfo. With WNOHANG,
-            // si_pid == 0 means the selected child has not changed state.
+            // SAFETY: `info` is writable, P_PID scopes observation to our forked
+            // child, and WNOWAIT preserves its status for cleanup/reaping.
+            let result =
+                unsafe { libc::waitid(libc::P_PID, child_pid as libc::id_t, &mut info, options) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: successful waitid initializes siginfo. WNOHANG's zero
+            // si_pid means no exit; EINTR never reads unspecified siginfo.
             Ok(unsafe { info.si_pid() } == child_pid)
         }
 
@@ -1196,24 +1193,48 @@ mod unix_pty {
             }
         }
 
-        pub fn wait_timeout(&mut self, _timeout_ms: u64) -> Result<i32> {
-            // If we already have a cached exit code, return it directly
+        /// Wait at most `timeout_ms` for the direct child to exit. Zero is a
+        /// single nonblocking observation. A timeout leaves the child running
+        /// and owned by this Pty; it neither signals nor reaps it.
+        /// Callers holding a shared Pty mutex should prefer `try_reap` and wait
+        /// outside the lock when responsiveness to writes/resizes matters.
+        pub fn wait_timeout(&mut self, timeout_ms: u64) -> Result<i32> {
             if let Some(code) = self.exit_code_cached {
                 return Ok(code);
             }
+            if self.lifecycle != ChildLifecycle::Running {
+                return Err(anyhow!("PTY child is owned by the termination reaper"));
+            }
 
-            match self.child_exit_observed(false) {
-                Ok(true) => self
-                    .finish_observed_exit()
-                    .map_err(|error| anyhow!("waitpid failed: {error}")),
-                Ok(false) => Err(anyhow!("waitid returned without an exited PTY child")),
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    crate::debug_log!("[PTY] waitid returned ECHILD, process already reaped");
-                    self.exit_code_cached = Some(-1);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    Ok(-1)
+            let started = Instant::now();
+            let timeout = Duration::from_millis(timeout_ms);
+            loop {
+                match Self::observe_child_exit_once(self.child_pid, true) {
+                    Ok(true) => {
+                        return self
+                            .finish_observed_exit()
+                            .map_err(|error| anyhow!("waitpid failed: {error}"));
+                    }
+                    Ok(false) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                        self.exit_code_cached = Some(-1);
+                        self.lifecycle = ChildLifecycle::Reaped;
+                        return Ok(-1);
+                    }
+                    Err(error) => return Err(anyhow!("waitid failed: {error}")),
                 }
-                Err(error) => Err(anyhow!("waitid failed: {error}")),
+                // Monotonic elapsed time avoids overflowing Instant for very
+                // large u64 budgets. Never sleep for more than what remains.
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for PTY child exit",
+                    )
+                    .into());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
             }
         }
 
@@ -1398,6 +1419,116 @@ mod unix_pty {
             );
         }
 
+        fn timed_test_child(script: &str) -> Pty {
+            let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+            Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+                .expect("spawn real PTY test child")
+        }
+
+        #[test]
+        fn wait_timeout_preserves_live_child_then_caches_exit() {
+            let mut pty = timed_test_child("sleep 2; exit 7");
+            for timeout_ms in [50, 0, 50] {
+                let started = Instant::now();
+                let error = pty
+                    .wait_timeout(timeout_ms)
+                    .expect_err("child is still alive");
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+                let elapsed = started.elapsed();
+                eprintln!("wait_timeout({timeout_ms}) elapsed={elapsed:?}");
+                assert!(elapsed >= Duration::from_millis(timeout_ms));
+                assert!(
+                    elapsed < Duration::from_millis(250),
+                    "wait exceeded its budget substantially"
+                );
+                assert_eq!(pty.lifecycle, ChildLifecycle::Running);
+                assert_eq!(pty.exit_code_cached, None);
+                assert!(pty.is_alive(), "timeout must not kill or reap the child");
+            }
+            assert_eq!(pty.wait_timeout(4000).unwrap(), 7);
+            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            for budget in [0, 50, u64::MAX] {
+                assert_eq!(pty.wait_timeout(budget).unwrap(), 7);
+            }
+            pty.terminate().unwrap();
+            assert_eq!(pty.wait_timeout(0).unwrap(), 7);
+        }
+
+        #[test]
+        fn wait_timeout_handles_large_budget_and_missing_status() {
+            let mut pty = timed_test_child("exit 7");
+            assert_eq!(pty.wait_timeout(u64::MAX).unwrap(), 7);
+
+            let mut pty = timed_test_child("exit 23");
+            // Simulate a foreign consumer having already reaped the child.
+            let mut status = 0;
+            let result = retry_on_eintr(|| {
+                let result = unsafe { libc::waitpid(pty.child_pid, &mut status, 0) };
+                if result < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(result)
+                }
+            })
+            .unwrap();
+            assert_eq!(result, pty.child_pid);
+            assert_eq!(pty.wait_timeout(0).unwrap(), -1);
+            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+            assert_eq!(pty.wait_timeout(50).unwrap(), -1);
+            pty.terminate().unwrap();
+        }
+
+        #[test]
+        fn wait_timeout_and_terminate_preserve_detached_reaper_ownership() {
+            let pty =
+                std::sync::Arc::new(std::sync::Mutex::new(timed_test_child("sleep 2; exit 7")));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let waiter = {
+                let pty = pty.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut pty = pty.lock().unwrap();
+                    barrier.wait();
+                    let error = pty.wait_timeout(50).expect_err("live child must time out");
+                    assert_eq!(
+                        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                        std::io::ErrorKind::TimedOut
+                    );
+                })
+            };
+            barrier.wait();
+            let mut pty = pty.lock().unwrap();
+            pty.terminate().unwrap();
+            let pid = pty.child_pid;
+            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            for _ in 0..20 {
+                assert_eq!(pty.wait_timeout(0).unwrap(), -libc::SIGTERM);
+                assert_eq!(pty.try_reap(), Some(-libc::SIGTERM));
+                assert!(!pty.is_alive());
+                pty.terminate().unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            waiter.join().unwrap();
+            // Observe without stealing status from the sole detached reaper.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match Pty::observe_child_exit(pid, true) {
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => break,
+                    result => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "detached reaper did not finish: {result:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+            assert_eq!(pty.wait_timeout(0).unwrap(), -libc::SIGTERM);
+            pty.terminate().unwrap();
+        }
         #[test]
         fn terminate_cleans_descendants_after_leader_exits_during_grace_period() {
             let root = std::env::temp_dir().join(format!(
