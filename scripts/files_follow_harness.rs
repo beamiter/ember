@@ -396,6 +396,7 @@ struct TerminalApp {
     sidebar: Sidebar,
     ssh_files_follow: ssh_files_follow::State,
     active_session_epoch: u64,
+    ime_cancelled_epochs: Vec<u64>,
     sidebar_name_dialog: Option<()>,
     sidebar_delete_dialog: Option<()>,
     config: AppConfig,
@@ -403,6 +404,11 @@ struct TerminalApp {
     status: Vec<String>,
 }
 impl TerminalApp {
+    // IME transport is outside this Files fixture. Record its cancellation
+    // boundary; the production reducer/routing is tested by test-ime-ownership.py.
+    fn cancel_terminal_ime(&mut self) {
+        self.ime_cancelled_epochs.push(self.active_session_epoch);
+    }
     fn active_ssh_files_observation(&self) -> ssh_files_follow::Observation {
         self.observation.clone()
     }
@@ -421,6 +427,7 @@ fn setup() -> TerminalApp {
         sidebar,
         ssh_files_follow: state,
         active_session_epoch: 11,
+        ime_cancelled_epochs: vec![],
         sidebar_name_dialog: None,
         sidebar_delete_dialog: None,
         config: AppConfig {
@@ -454,6 +461,8 @@ fn combined_listing_commits_once_without_a_second_scan() {
 fn focus_change_during_listing_preserves_old_tree() {
     let mut app = setup();
     app.bump_active_session_epoch();
+    assert_eq!(app.ime_cancelled_epochs, vec![11]);
+    assert_eq!(app.active_session_epoch, 12);
     deliver(&mut app, listing());
     assert_eq!(app.sidebar.commits, 0);
     assert!(app.status.is_empty());
