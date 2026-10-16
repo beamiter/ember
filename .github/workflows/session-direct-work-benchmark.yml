@@ -1,0 +1,109 @@
+name: Session direct-work benchmark (temporary candidate build)
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/session-direct-work-benchmark.yml
+      - scripts/benchmark-session-direct-work.py
+      - tests/fixtures/session-startup/direct-work-overlay.patch
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact reviewed E09 candidate commit
+        required: true
+        default: 60e70c4a24d52e41d173c4baf26bf06bf3bd1569
+permissions:
+  contents: read
+jobs:
+  direct-work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+    steps:
+      - name: Validate immutable refs
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+        run: |
+          test "$CANDIDATE_SHA" = 60e70c4a24d52e41d173c4baf26bf06bf3bd1569
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: control
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+          path: candidate
+          persist-credentials: false
+      - name: Install official build and desktop packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libfontconfig1-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev xvfb openbox xdotool xclip \
+            x11-utils sway wtype wl-clipboard grim imagemagick tesseract-ocr fonts-dejavu-core \
+            mesa-vulkan-drivers mesa-utils libxkbcommon-x11-0 libwayland-bin python3-psutil
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: candidate -> target
+          shared-key: session-direct-work-benchmark
+      - name: Verify candidate and preserve identities before overlay
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+        run: |
+          test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C control status --porcelain)"
+          printf '%s  %s\n' 19967416389d166f427aaa5b0337e31e8762dd4ca1d03b6d14cc1ef7661d620c control/scripts/benchmark-session-startup.py | sha256sum --check
+          printf '%s  %s\n' e564f56be1a4b2f2cf8cfb94b767ed6d176eecee5bee0af476444dcc79c3ba79 control/tests/fixtures/session-startup/direct-work-overlay.patch | sha256sum --check
+          printf '%s  %s\n' 6f206f84585edaba9c5a9de15c9ef68d852c70d4e0871a0c6c3c199aa689779c control/scripts/benchmark-session-direct-work.py | sha256sum --check
+          printf '%s  %s\n' 15459be5d29042ab08ba7dd1fa67fdd4afd3799d33acbeb8c97446b384aad16f control/scripts/native-desktop-smoke.py | sha256sum --check
+          printf '%s  %s\n' ead6106b6df0fb28c8eeaccc33a5894c5a05d227193e417144f30347bf5db38b control/scripts/native-pointer.c | sha256sum --check
+          printf '%s  %s\n' 7849f8c25b5104da9dc508301414331cdd3c8fa33daf08f85b67a8fcd6e2f0b8 control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml | sha256sum --check
+          printf '%s  %s\n' 4d9b53092843e291ad09d16e72cd915df312185aa010291b098547e809db998e control/scripts/native-pty-capture.py | sha256sum --check
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git -C candidate status --porcelain)"
+          mkdir -p benchmark-artifacts
+          { uname -a; rustc -Vv; git -C control rev-parse HEAD; printf '%s\n' "$CANDIDATE_SHA"; sha256sum candidate/Cargo.lock control/tests/fixtures/session-startup/direct-work-overlay.patch control/scripts/benchmark-session-direct-work.py control/scripts/benchmark-session-startup.py; } > benchmark-artifacts/source-identity.txt
+          git -C candidate apply --check "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/direct-work-overlay.patch"
+      - name: Build temporary instrumented candidate only
+        run: |
+          git -C candidate apply "$GITHUB_WORKSPACE/control/tests/fixtures/session-startup/direct-work-overlay.patch"
+          git -C candidate diff --binary > benchmark-artifacts/candidate-overlay.diff
+          cargo build --manifest-path candidate/Cargo.toml --workspace --release --all-features --locked
+          cp candidate/target/release/ember "$RUNNER_TEMP/ember-direct-work-candidate"
+          sha256sum "$RUNNER_TEMP/ember-direct-work-candidate" > benchmark-artifacts/binary-identity.txt
+      - name: Build compositor pointer prerequisite for shared desktop driver
+        run: |
+          mkdir -p "$RUNNER_TEMP/ember-pointer"
+          wayland-scanner client-header control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+          wayland-scanner private-code control/scripts/protocols/wlr-virtual-pointer-unstable-v1.xml "$RUNNER_TEMP/ember-pointer/protocol.c"
+          cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/ember-pointer" control/scripts/native-pointer.c "$RUNNER_TEMP/ember-pointer/protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/ember-pointer/native-pointer"
+          echo "EMBER_POINTER_HELPER=$RUNNER_TEMP/ember-pointer/native-pointer" >> "$GITHUB_ENV"
+      - name: Preregistered direct-work enclosing-region samples
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || '60e70c4a24d52e41d173c4baf26bf06bf3bd1569' }}
+        run: |
+          overlay_sha=$(sha256sum control/tests/fixtures/session-startup/direct-work-overlay.patch | cut -d' ' -f1)
+          status=0
+          for backend in x11 wayland; do
+            if ! /usr/bin/python3 control/scripts/benchmark-session-direct-work.py \
+              --candidate "$RUNNER_TEMP/ember-direct-work-candidate" \
+              --driver control/scripts/native-desktop-smoke.py --backend "$backend" \
+              --helper control/scripts/benchmark-session-startup.py --candidate-sha "$CANDIDATE_SHA" \
+              --overlay-sha "$overlay_sha" --output "benchmark-artifacts/$backend"; then
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Preserve all timing and failure evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ember-session-direct-work-benchmark-${{ github.run_id }}
+          path: benchmark-artifacts
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,138 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -696,6 +696,7 @@
+ }
+ 
+ fn main() -> Result<(), eframe::Error> {
++    eframe::__ember_benchmark_start(std::time::Instant::now());
+     // Keep operational failures observable by default while allowing
+     // `RUST_LOG=ember=debug` (or any normal env_logger filter) to opt into
+     // deeper diagnostics.
+@@ -2466,6 +2467,7 @@
+         let lock_file = session_persistence::try_acquire_instance_lock();
+         let is_first_instance = lock_file.is_some();
+ 
++        let ember_metadata_guard = eframe::__EmberPhaseGuard::new(0);
+         let mut session_restore_notice = None;
+         let mut session_recovery = None;
+         let mut session_persistence_blocked = false;
+@@ -2520,6 +2522,9 @@
+             None
+         };
+ 
++        eframe::__ember_benchmark_quiet(session_recovery.is_none());
++        drop(ember_metadata_guard);
++
+         // 创建首个会话，使用保存的 cwd 和 session_id（如果有）
+         let first_cwd = saved_snapshot
+             .as_ref()
+@@ -2673,6 +2678,7 @@
+             .map(|_| std::time::Instant::now() + Duration::from_secs(10));
+         let initial_status_message = startup_notice.unwrap_or_default();
+ 
++        let _ember_struct_guard = eframe::__EmberPhaseGuard::new(1);
+         Ok(TerminalApp {
+             session_manager,
+             renderer,
+diff --git a/src/app/rendering.rs b/src/app/rendering.rs
+--- a/src/app/rendering.rs
++++ b/src/app/rendering.rs
+@@ -4231,8 +4231,12 @@
+             }
+         }
+ 
++        {
++            let _ember_render_guard = eframe::__EmberPhaseGuard::new(2);
++            eframe::__ember_benchmark_quiet(self.session_recovery.is_none());
+         if let Some(recovery) = &mut self.session_recovery {
+             recovery.show(ctx);
++        }
+         }
+ 
+         // Render after every surface that can create a pending paste. This
+diff --git a/vendor/eframe/src/lib.rs b/vendor/eframe/src/lib.rs
+--- a/vendor/eframe/src/lib.rs
++++ b/vendor/eframe/src/lib.rs
+@@ -615,3 +615,70 @@
+ 
+ /// Short for `Result<T, eframe::Error>`.
+ pub type Result<T = (), E = Error> = std::result::Result<T, E>;
++
++// Benchmark-only passive instrumentation. Never ship this overlay.
++static EMBER_BENCHMARK_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++static EMBER_BENCHMARK_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++static EMBER_PHASE_TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++static EMBER_PHASE_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++static EMBER_PHASE_NOT_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++#[doc(hidden)]
++pub fn __ember_benchmark_start(started: std::time::Instant) {
++    let _ = EMBER_BENCHMARK_STARTED.set(started);
++}
++
++#[doc(hidden)]
++pub fn __ember_benchmark_quiet(quiet: bool) {
++    if !quiet && !EMBER_BENCHMARK_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
++        EMBER_PHASE_NOT_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++#[doc(hidden)]
++pub struct __EmberPhaseGuard {
++    started: Option<std::time::Instant>,
++    phase: usize,
++}
++
++impl __EmberPhaseGuard {
++    #[doc(hidden)]
++    pub fn new(phase: usize) -> Self {
++        Self {
++            started: (!EMBER_BENCHMARK_REPORTED.load(std::sync::atomic::Ordering::Relaxed)).then(std::time::Instant::now),
++            phase,
++        }
++    }
++}
++
++impl Drop for __EmberPhaseGuard {
++    fn drop(&mut self) {
++        if let Some(started) = self.started {
++            let elapsed = started.elapsed().as_nanos();
++            // Overflow rejects the experiment through its budget check.
++            let elapsed = u64::try_from(elapsed).unwrap_or(u64::MAX);
++            EMBER_PHASE_TOTALS[self.phase].fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
++            EMBER_PHASE_COUNTS[self.phase].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++}
++
++pub(crate) fn ember_benchmark_first_painted_frame() {
++    use std::io::Write as _;
++    use std::sync::atomic::Ordering;
++    if let Some(started) = EMBER_BENCHMARK_STARTED.get() {
++        if !EMBER_BENCHMARK_REPORTED.swap(true, Ordering::Relaxed) {
++            // Sample before any diagnostic I/O; output cannot alter these timings.
++            let elapsed_ns = started.elapsed().as_nanos();
++            let mut stderr = std::io::stderr().lock();
++            let _ = writeln!(stderr, "EMBER_BENCHMARK_MAIN_TO_FIRST_PAINT_NS={elapsed_ns}");
++            for phase in 0..3 {
++                let total = EMBER_PHASE_TOTALS[phase].load(Ordering::Relaxed);
++                let count = EMBER_PHASE_COUNTS[phase].load(Ordering::Relaxed);
++                let _ = writeln!(stderr, "EMBER_DIRECT_PHASE_{phase}_NS={total} COUNT={count}");
++            }
++            let quiet = u8::from(!EMBER_PHASE_NOT_QUIET.load(Ordering::Relaxed));
++            let _ = writeln!(stderr, "EMBER_DIRECT_QUIET={quiet}");
++        }
++    }
++}
+diff --git a/vendor/eframe/src/native/epi_integration.rs b/vendor/eframe/src/native/epi_integration.rs
+--- a/vendor/eframe/src/native/epi_integration.rs
++++ b/vendor/eframe/src/native/epi_integration.rs
+@@ -390,6 +390,7 @@
+     pub fn post_rendering(&mut self, window: &winit::window::Window) {
+         profiling::function_scope!();
+         if std::mem::take(&mut self.is_first_frame) {
++            crate::ember_benchmark_first_painted_frame();
+             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
+             window.set_visible(true);
+         }
