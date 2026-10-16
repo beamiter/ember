@@ -1,0 +1,51 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -695,6 +695,7 @@
+ }
+ 
+ fn main() -> Result<(), eframe::Error> {
++    eframe::__ember_benchmark_start(std::time::Instant::now());
+     // Keep operational failures observable by default while allowing
+     // `RUST_LOG=ember=debug` (or any normal env_logger filter) to opt into
+     // deeper diagnostics.
+diff --git a/vendor/eframe/src/lib.rs b/vendor/eframe/src/lib.rs
+--- a/vendor/eframe/src/lib.rs
++++ b/vendor/eframe/src/lib.rs
+@@ -615,3 +615,25 @@
+ 
+ /// Short for `Result<T, eframe::Error>`.
+ pub type Result<T = (), E = Error> = std::result::Result<T, E>;
++
++// Benchmark-only passive instrumentation. Never ship this overlay.
++static EMBER_BENCHMARK_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++static EMBER_BENCHMARK_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// Start the temporary benchmark clock at the caller's main-entry instant.
++#[doc(hidden)]
++pub fn __ember_benchmark_start(started: std::time::Instant) {
++    let _ = EMBER_BENCHMARK_STARTED.set(started);
++}
++
++pub(crate) fn ember_benchmark_first_painted_frame() {
++    use std::io::Write as _;
++    use std::sync::atomic::Ordering;
++    if let Some(started) = EMBER_BENCHMARK_STARTED.get() {
++        if !EMBER_BENCHMARK_REPORTED.swap(true, Ordering::Relaxed) {
++            // Sample before diagnostic I/O. Report errors never affect rendering.
++            let elapsed_ns = started.elapsed().as_nanos();
++            let _ = writeln!(std::io::stderr().lock(), "EMBER_BENCHMARK_MAIN_TO_FIRST_PAINT_NS={elapsed_ns}");
++        }
++    }
++}
+diff --git a/vendor/eframe/src/native/epi_integration.rs b/vendor/eframe/src/native/epi_integration.rs
+--- a/vendor/eframe/src/native/epi_integration.rs
++++ b/vendor/eframe/src/native/epi_integration.rs
+@@ -390,6 +390,7 @@
+     pub fn post_rendering(&mut self, window: &winit::window::Window) {
+         profiling::function_scope!();
+         if std::mem::take(&mut self.is_first_frame) {
++            crate::ember_benchmark_first_painted_frame();
+             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
+             window.set_visible(true);
+         }
