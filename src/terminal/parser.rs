@@ -845,6 +845,9 @@ impl super::TerminalState {
     }
 
     pub fn process_input(&mut self, input: &[u8]) {
+        if !input.is_empty() {
+            self.invalidate_search_source();
+        }
         if self.abort_pending_control_string(input) {
             return;
         }
@@ -2322,6 +2325,7 @@ impl super::TerminalState {
             &mut self.alt_keyboard_enhancement_stack,
         );
         self.watch.boundary();
+        self.invalidate_search_scrollback_seals();
         self.use_alt_buffer = true;
         // Retained cells keep their own keys, but an unterminated primary-screen
         // OSC 8 link must not arm alternate-screen text.
@@ -2366,6 +2370,7 @@ impl super::TerminalState {
             &mut self.alt_keyboard_enhancement_stack,
         );
         self.watch.boundary();
+        self.invalidate_search_scrollback_seals();
         self.use_alt_buffer = false;
         // A TUI's DECSCUSR (vim's insert-mode beam) belongs to its screen.
         if let Some(shape) = self.saved_primary_cursor_shape.take() {

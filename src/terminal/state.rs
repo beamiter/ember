@@ -327,6 +327,9 @@ impl super::TerminalState {
             selection: None,
             projected_selection: None,
             selection_revision: 1,
+            search_source_epoch: search_chunk::next_source_epoch(),
+            search_source_revision: 1,
+            search_scrollback_epoch: search_chunk::next_source_epoch(),
             scroll_offset: 0,
             max_scrollback: 10000,
             use_alt_buffer: false,
@@ -1433,6 +1436,7 @@ impl super::TerminalState {
     }
 
     fn mark_row_identity_changed_preserving_scroll_journal(&mut self) {
+        self.invalidate_search_source();
         self.row_identity_revision = self.row_identity_revision.wrapping_add(1);
         self.visible_cells_cache = None;
         self.projected_viewport_cache = None;
@@ -1937,6 +1941,7 @@ impl super::TerminalState {
     }
 
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
+        self.invalidate_search_source();
         self.max_scrollback = max_scrollback.max(1);
         self.kitty_graphics
             .set_max_scrollback_rows(self.max_scrollback);
@@ -1992,6 +1997,7 @@ impl super::TerminalState {
     }
 
     fn mark_finished_output_provenance_changed(&mut self) {
+        self.invalidate_search_source();
         if self.finished_output_revision != 0 {
             self.finished_output_revision =
                 self.finished_output_revision.checked_add(1).unwrap_or(0);
@@ -2091,6 +2097,8 @@ impl super::TerminalState {
     }
 
     pub(super) fn clear_scrollback_with_projection_provenance(&mut self) {
+        self.invalidate_search_scrollback_seals();
+        self.invalidate_search_source();
         let evicted: HashSet<_> = self
             .scrollback
             .iter()
@@ -2158,7 +2166,7 @@ impl super::TerminalState {
         }
     }
 
-    fn retained_raw_row(&self, absolute_row: usize) -> Option<(RawRowId, usize)> {
+    pub(super) fn retained_raw_row(&self, absolute_row: usize) -> Option<(RawRowId, usize)> {
         if let Some(line) = self.scrollback.get(absolute_row) {
             return Some((line.raw_row_id(), line.columns()));
         }
@@ -4258,7 +4266,7 @@ impl super::TerminalState {
         (grid_row < self.grid.rows()).then(|| self.grid[grid_row].to_vec())
     }
 
-    fn absolute_row_is_wrapped(&self, absolute_row: usize) -> Option<bool> {
+    pub(super) fn absolute_row_is_wrapped(&self, absolute_row: usize) -> Option<bool> {
         if absolute_row < self.scrollback.len() {
             return self
                 .scrollback
@@ -7428,6 +7436,9 @@ impl super::TerminalState {
         if cols == self.grid.row_len() && rows == self.grid.rows() {
             return;
         }
+
+        self.invalidate_search_source();
+        self.invalidate_search_scrollback_seals();
 
         // Reflow and grid resize can keep a RawRowId while changing its cell
         // geometry or contents. Exact output ownership is therefore sealed

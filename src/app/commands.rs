@@ -3906,13 +3906,39 @@ impl TerminalApp {
         let anchor_session_id = self.block_search.session_id.clone();
         let (session_id, record_version) = {
             let session = self.session_manager.get_active_session_mut();
-            let terminal = session.terminal.lock();
+            let Some(terminal) = session.terminal.try_lock() else {
+                return;
+            };
             (
                 session.metadata.session_id.clone(),
                 block_search_record_version(terminal.command_records()),
             )
         };
         let bookmark_revision = self.block_bookmarks.revision(&session_id);
+        let raw_intent_current = self.block_search.session_id.as_deref()
+            == Some(session_id.as_str())
+            && self.block_search.computed_query.as_deref() == Some(query.as_str())
+            && self.block_search.bookmark_revision == Some(bookmark_revision)
+            && self
+                .block_search
+                .raw
+                .operation
+                .as_ref()
+                .is_none_or(|operation| {
+                    operation.intent == self.block_search.raw_operation_intent()
+                });
+        if self.block_search.raw.requested
+            || self.block_search.raw.pending.is_some()
+            || self.block_search.raw.displayed
+        {
+            if raw_intent_current {
+                self.refresh_block_search_raw(&session_id);
+                return;
+            }
+            self.block_search.raw.cancel(true);
+            self.block_search.computed_query = None;
+            retained_anchor = None;
+        }
         // 切换 tab/pane 后旧的高亮行不再有任何意义:同名 id 会指向另一个
         // pane 里完全无关的块。回到第一行。
         if anchor_session_id.as_deref() != Some(session_id.as_str()) {
@@ -3935,8 +3961,8 @@ impl TerminalApp {
         {
             return;
         }
-        if cache_needs_rebuild {
-            self.rebuild_block_search_cache(&session_id, record_version);
+        if cache_needs_rebuild && !self.rebuild_block_search_cache(&session_id, record_version) {
+            return;
         }
 
         let filter = self.block_search.filter;
@@ -3983,6 +4009,23 @@ impl TerminalApp {
                 })
                 .map(|record| record.id.clone())
                 .collect()
+        };
+        self.block_search.raw.eligible = self
+            .block_search
+            .raw
+            .records
+            .iter()
+            .filter(|record| eligible.contains(&record.record_id))
+            .filter(|_| scope != crate::block_mode::BlockSearchScope::Command)
+            .cloned()
+            .collect();
+        self.block_search.raw.next = 0;
+        self.block_search.raw.status = if !self.block_search.raw.eligible.is_empty()
+            && (self.block_search.regex || self.block_search.whole_word)
+        {
+            "Partial coverage: uncaptured/truncated output does not support regex or whole-word; complete snapshots remain searchable".into()
+        } else {
+            String::new()
         };
         let results = match crate::block_mode::validated_block_search_query(&query) {
             Err(error) => Err(error),
@@ -4055,74 +4098,476 @@ impl TerminalApp {
         self.block_search.computed_query = Some(query);
     }
 
-    /// Build the picker's extraction cache from the active session's records,
-    /// newest first (so the hit cap keeps recent history). Output text comes
-    /// from the same source as `block:copy_output`: the captured snapshot —
-    /// read directly off the record, no by-id lookup — with live anchor
-    /// extraction as the fallback for records that have no capture yet, each
-    /// bounded by the captured-output cap. This is the one extraction pass
-    /// per picker-open; per-keystroke searches never touch the terminal.
+    /// Poll at most one worker update per frame. Matching and bounded extraction
+    /// run off the UI thread; no history catch-up loop is permitted here.
+    fn refresh_block_search_raw(&mut self, session_id: &str) {
+        use crate::terminal::search_worker::{
+            SearchFinishStatus, SearchUpdate, SearchWorker, SearchWorkerAdmission,
+            SearchWorkerLimits, SearchWorkerOptions, SearchWorkerPermitPool,
+        };
+        let state = &mut self.block_search;
+        if state.raw.displayed && state.raw.pending.is_none() && !state.raw.requested {
+            if let Some(seal) = state.raw.seal.as_ref() {
+                let session = self.session_manager.get_active_session_mut();
+                if let Some(terminal) = session.terminal.try_lock() {
+                    if terminal.validate_search_seal(seal).is_err() {
+                        state.raw.seal = None;
+                        state.raw.continuation = None;
+                        state.raw.status = "Output invalidated or evicted; coverage incomplete; use Latest or refresh".into();
+                        state.rendered_generation = None;
+                    }
+                }
+            }
+        }
+        if state.raw.requested {
+            let Some(operation) = state.raw.operation.as_mut() else {
+                state.raw.requested = false;
+                return;
+            };
+            if !operation.active || operation.generation != state.raw.operation_generation {
+                state.raw.requested = false;
+                return;
+            }
+            if let Err(reason) = operation.allowance(std::time::Instant::now()) {
+                operation.active = false;
+                state.raw.requested = false;
+                if state.raw.continuation.is_none() {
+                    state.raw.restart = state.raw.current.clone();
+                }
+                state.raw.status = format!(
+                    "Partial output: operation {reason}; {}; {}",
+                    operation.progress_label(),
+                    if state.raw.continuation.is_some() {
+                        "Continue this output"
+                    } else {
+                        "Restart this output"
+                    }
+                );
+                return;
+            }
+            if state.regex || state.whole_word || state.query.trim().is_empty() {
+                state.raw.requested = false;
+                operation.active = false;
+                state.raw.restart = state.raw.current.clone();
+                state.raw.status = "Partial coverage: raw output requires a nonempty literal substring query; regex/whole-word unsupported".into();
+                return;
+            }
+            if state.raw.worker.is_none() {
+                let pool = state
+                    .raw
+                    .pool
+                    .get_or_insert_with(|| std::sync::Arc::new(SearchWorkerPermitPool::new(1)))
+                    .clone();
+                let terminal = &self.session_manager.get_active_session_mut().terminal;
+                match SearchWorker::new(
+                    std::sync::Arc::downgrade(terminal),
+                    pool,
+                    SearchWorkerLimits::default(),
+                ) {
+                    Ok(worker) => state.raw.worker = Some(worker),
+                    Err(SearchWorkerAdmission::Busy) => {
+                        state.raw.status = "Waiting for cancelled search worker to exit…".into();
+                        return;
+                    }
+                    Err(reason) => {
+                        state.raw.requested = false;
+                        operation.active = false;
+                        state.raw.restart = state.raw.current.clone();
+                        state.raw.status =
+                            format!("Search unavailable: {reason:?}; Restart this output to retry");
+                        return;
+                    }
+                }
+            }
+            // Reservation is consumed only once admission succeeds. A failed
+            // submission terminates this action; it can never silently restart.
+            if let Err(reason) = operation.reserve(std::time::Instant::now()) {
+                operation.active = false;
+                state.raw.requested = false;
+                if state.raw.continuation.is_none() {
+                    state.raw.restart = state.raw.current.clone();
+                }
+                state.raw.status =
+                    format!("Partial output: operation {reason}; Continue or Restart explicitly");
+                return;
+            }
+            let worker = state.raw.worker.as_ref().expect("admitted worker");
+            let submitted = if let Some(continuation) = state.raw.continuation.take() {
+                worker.resume(continuation)
+            } else {
+                let record = operation.record.clone();
+                state.raw.restart = None;
+                worker.submit(
+                    record.sequence,
+                    &record.record_id,
+                    &state.query,
+                    SearchWorkerOptions {
+                        case_sensitive: state.case_sensitive,
+                        regex: state.regex,
+                        whole_word: state.whole_word,
+                    },
+                )
+            };
+            state.raw.requested = false;
+            match submitted {
+                Ok(generation) => {
+                    state.raw.pending = Some(generation);
+                    state.raw.status = "Searching a bounded retained-output window…".into();
+                    state.rendered_generation = None;
+                }
+                Err(reason) => {
+                    operation.active = false;
+                    if matches!(
+                        reason,
+                        crate::terminal::search_worker::SearchSubmitError::Closed
+                    ) {
+                        state.raw.worker = None;
+                    }
+                    state.raw.restart = state.raw.current.clone();
+                    state.raw.status =
+                        format!("Partial coverage: {reason:?}; edit query or Restart this output")
+                }
+            }
+        }
+        let Some(generation) = state.raw.pending else {
+            return;
+        };
+        let Some(worker) = state.raw.worker.as_ref() else {
+            return;
+        };
+        let update = if let Some(result) = state.raw.finished.take() {
+            SearchUpdate::Finished(result)
+        } else {
+            let Some(update) = worker.take_update() else {
+                return;
+            };
+            update
+        };
+        if update.generation() != generation || !worker.is_current(generation) {
+            return;
+        }
+        match update {
+            SearchUpdate::Progress(progress) => {
+                state.raw.status = format!(
+                    "Searching retained output: {}; current window {} row decodes, {} cells; partial coverage",
+                    state.raw.operation.as_ref().map(|op|op.progress_label()).unwrap_or_default(),
+                    progress.work.rows_decoded, progress.work.cells_charged
+                );
+            }
+            SearchUpdate::Finished(mut result) => {
+                let session = self.session_manager.get_active_session_mut();
+                let Some(terminal) = session.terminal.try_lock() else {
+                    state.raw.finished = Some(result);
+                    return;
+                };
+                let valid = session.metadata.session_id == session_id
+                    && worker.is_current(generation)
+                    && result.validate_source(&terminal).is_ok();
+                state.raw.pending = None;
+                let charged = state.raw.operation.as_mut().is_some_and(|operation| {
+                    operation.active
+                        && operation.generation == state.raw.operation_generation
+                        && operation.charge(&result.progress)
+                });
+                if !valid || !charged {
+                    if let Some(operation) = &mut state.raw.operation {
+                        operation.active = false;
+                    }
+                    state.raw.continuation = None;
+                    state.raw.seal = None;
+                    state.raw.status = format!(
+                        "Output unavailable or invalidated ({:?}); retained coverage incomplete",
+                        result.status
+                    );
+                    if result.status == SearchFinishStatus::TimeLimit && charged {
+                        state.raw.restart = state.raw.current.clone();
+                        state.raw.status="Interrupted before source could be verified; coverage incomplete; Restart this output".into();
+                    }
+                    // Keep the old paint but prohibit activation until a fresh result.
+                    state.rendered_generation = None;
+                    state.raw.displayed = true;
+                    return;
+                }
+                drop(terminal);
+                let status = match result.status {
+                    SearchFinishStatus::Complete => "Complete for this retained output only",
+                    SearchFinishStatus::WorkLimit => "Partial output: work budget reached; Continue this output",
+                    SearchFinishStatus::TimeLimit => "Interrupted output: time budget reached; Continue this output",
+                    SearchFinishStatus::HitLimit => "Partial output: hit cap reached",
+                    SearchFinishStatus::BudgetTooSmall => "Partial output: budget cannot hold an atomic row; retry requires a larger supported budget",
+                    SearchFinishStatus::Unsupported(_) => "Partial output: unsupported encoding or output shape",
+                    SearchFinishStatus::Stale => "Output invalidated; coverage incomplete",
+                    SearchFinishStatus::Unavailable => "Retained output unavailable; coverage incomplete",
+                    SearchFinishStatus::SessionClosed => "Session closed; coverage incomplete",
+                };
+                let hits = result
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, hit)| crate::block_mode::BlockSearchHit {
+                        record_id: result.record_id.clone(),
+                        is_output_line: true,
+                        // This is a display ordinal, never passed to line extraction.
+                        line_no: Some(index),
+                        match_span: None,
+                        line_text: format!(
+                            "Retained row #{} · literal match: {}",
+                            hit.start.anchor.line_id,
+                            crate::block_mode::single_line_clip(
+                                &state.query,
+                                crate::block_mode::BLOCK_SEARCH_LINE_TEXT_CHARS
+                            )
+                        ),
+                        command_preview: state
+                            .cache
+                            .iter()
+                            .find(|record| record.record_id == result.record_id)
+                            .and_then(|r| r.command.as_deref())
+                            .map(|text| {
+                                crate::block_mode::single_line_clip(
+                                    text,
+                                    crate::block_mode::BLOCK_SEARCH_COMMAND_PREVIEW_CHARS,
+                                )
+                            })
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                state.raw.anchors = result.hits.iter().map(|hit| hit.start.anchor).collect();
+                state.raw.continuation = result.continuation.take();
+                state.raw.seal = result.seal.take();
+                state.raw.displayed = true;
+                state.raw.status = format!(
+                    "Block #{}: {status}; {} chunks this window",
+                    result.record_sequence, result.progress.chunks
+                );
+                state.adopt_hits(
+                    hits,
+                    result.status == SearchFinishStatus::HitLimit,
+                    session_id,
+                    None,
+                );
+                if let Some(operation) = &mut state.raw.operation {
+                    if state.raw.continuation.is_some() {
+                        match operation.allowance(std::time::Instant::now()) {
+                            Ok(()) => {
+                                // At most one next request is queued, for the next
+                                // UI turn; never recursively drain continuations.
+                                state.raw.requested = true;
+                                state.raw.status = format!(
+                                    "Searching this retained output; {}; partial coverage",
+                                    operation.progress_label()
+                                );
+                            }
+                            Err(reason) => {
+                                operation.active = false;
+                                state.raw.status = format!(
+                                    "Partial output: operation {reason}; {}; Continue this output",
+                                    operation.progress_label()
+                                );
+                            }
+                        }
+                    } else {
+                        operation.active = false;
+                        state
+                            .raw
+                            .status
+                            .push_str(&format!("; {}", operation.progress_label()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Capture only a bounded immutable source on the UI thread. The single
+    /// worker owns text normalization; it never touches the terminal or UI.
+    /// Keep the old visible result set until a replacement is revalidated.
     fn rebuild_block_search_cache(
         &mut self,
         session_id: &str,
         record_version: crate::block_search::BlockSearchRecordVersion,
-    ) {
-        // Release the previous 16 MiB-class index and hit allocations before
-        // extracting the new 8 MiB source snapshot. Assignment (rather than
-        // `clear`) drops Vec capacity too, keeping peak at old-or-source+new.
-        self.block_search.release_index_for_rebuild();
+    ) -> bool {
+        // A cancelled raw worker may still own its bounded chunk/overlap.
+        // Do not allocate a snapshot replacement until that actual thread exits.
+        if self.block_search.raw.worker.is_none()
+            && self
+                .block_search
+                .raw
+                .pool
+                .as_ref()
+                .is_some_and(|pool| pool.active_workers() > 0)
+        {
+            return false;
+        }
+        use crate::block_search::{BlockSearchPendingWindow, BlockSearchWindow};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let source_session = self
+            .block_search
+            .history_pending
+            .as_ref()
+            .map(|pending| pending.session_id.as_str())
+            .or(self.block_search.session_id.as_deref());
+        if source_session.is_some_and(|id| id != session_id) {
+            self.block_search.history_before = None;
+            self.block_search.cancel_history_window();
+        }
+        if let Some(pending) = &self.block_search.history_pending {
+            let current = pending.is_current(
+                self.block_search.history_generation,
+                session_id,
+                record_version,
+                &self.block_search.history_before,
+            );
+            if !current {
+                pending.cancelled.store(true, Ordering::Relaxed);
+            }
+            // Cancellation alone cannot release the single-flight permit.
+            if !pending.worker.is_finished() {
+                return false;
+            }
+            let pending = self
+                .block_search
+                .history_pending
+                .take()
+                .expect("checked pending");
+            if current {
+                if let Ok(Some(mut window)) = pending.receiver.try_recv() {
+                    let range = window
+                        .build
+                        .records
+                        .first()
+                        .zip(window.build.records.last())
+                        .and_then(|(first, last)| {
+                            Some((
+                                *window.sequences.get(&first.record_id)?,
+                                *window.sequences.get(&last.record_id)?,
+                            ))
+                        });
+                    window
+                        .unmapped
+                        .retain(|id| window.build.records.iter().any(|r| &r.record_id == id));
+                    window
+                        .unavailable
+                        .retain(|id| window.build.records.iter().any(|r| &r.record_id == id));
+                    window.raw_records.retain(|r| {
+                        window
+                            .build
+                            .records
+                            .iter()
+                            .any(|c| c.record_id == r.record_id)
+                    });
+                    self.block_search.raw.cancel(true);
+                    self.block_search.raw.records = window.raw_records;
+                    self.block_search.cache = window.build.records;
+                    self.block_search.record_sequences = window.sequences;
+                    self.block_search.unmapped_output_records = window.unmapped;
+                    self.block_search.older_not_indexed = window.build.older_not_indexed;
+                    self.block_search.history_range = range;
+                    self.block_search.history_unavailable = window.unavailable.len();
+                    self.block_search.history_boundary_missing = window.boundary_missing;
+                    self.block_search.session_id = Some(session_id.to_owned());
+                    self.block_search.record_version = Some(record_version);
+                    self.block_search.query_error = None;
+                    return true;
+                }
+            }
+        }
+        let before = self.block_search.history_before.clone();
         let session = self.session_manager.get_active_session_mut();
-        let terminal = session.terminal.lock();
-        // Same locked pass, same completed-record set the sources come from.
-        // Bookmarks are stored by terminal sequence and hits carry ids, so the
-        // overlay needs this join on every frame it paints; building it here
-        // means the ids are cloned once per record change instead of once per
-        // frame.
-        let record_sequences = terminal
-            .command_records()
-            .iter()
-            .filter(|record| record.complete)
-            .map(|record| (record.id.clone(), record.sequence))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut unmapped_output_records = std::collections::HashSet::new();
+        let Some(terminal) = session.terminal.try_lock() else {
+            return false;
+        };
+        if block_search_record_version(terminal.command_records()) != record_version {
+            return false;
+        }
+        let boundary_missing = before.as_ref().is_some_and(|cursor| {
+            !terminal
+                .command_records()
+                .iter()
+                .any(|record| record.complete && cursor.matches_record(&record.id, record.sequence))
+        });
+        let sequences = Arc::new(
+            terminal
+                .command_records()
+                .iter()
+                .filter(|record| record.complete)
+                .map(|record| (record.id.clone(), record.sequence))
+                .collect::<HashMap<_, _>>(),
+        );
+        let mut unmapped = std::collections::HashSet::new();
+        let unavailable = std::collections::HashSet::new();
+        let mut raw_records = Vec::new();
         let snapshot = crate::block_mode::bounded_block_search_sources(
             terminal
                 .command_records()
                 .iter()
                 .rev()
-                .filter(|record| record.complete)
+                .filter(|record| {
+                    !boundary_missing
+                        && record.complete
+                        && before
+                            .as_ref()
+                            .is_none_or(|cursor| cursor.includes_earlier(record.sequence))
+                })
                 .map(|record| {
-                    let output = match record.captured_output.as_ref() {
-                        // Captures are produced under MAX_COMPLETED_COMMAND_OUTPUT_BYTES,
-                        // so the snapshot is already bounded.
-                        Some(captured) => Some(captured.clone()),
-                        None => terminal
-                            .command_output_text(&record.id, MAX_COMPLETED_COMMAND_OUTPUT_BYTES),
-                    };
+                    // Only complete immutable captured snapshots enter the fast path.
+                    // Never call the general raw copy extractor from search.
+                    let output = record
+                        .captured_output
+                        .as_ref()
+                        .filter(|captured| !captured.truncated)
+                        .cloned();
+                    if output.is_none() {
+                        raw_records.push(crate::block_search::BlockSearchHistoryCursor {
+                            sequence: record.sequence,
+                            record_id: record.id.clone(),
+                        });
+                    }
                     crate::block_mode::BlockSearchSource::new(
                         record.id.clone(),
                         record.command.clone(),
-                        block_search_output_source(
-                            &record.id,
-                            output,
-                            &mut unmapped_output_records,
-                        ),
+                        block_search_output_source(&record.id, output, &mut unmapped),
                     )
                 }),
             crate::block_mode::BLOCK_SEARCH_SOURCE_MAX_BYTES,
         );
         drop(terminal);
-        let build = crate::block_mode::build_block_search_cache(
-            snapshot,
-            crate::block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
-        );
-        self.block_search.cache = build.records;
-        self.block_search.unmapped_output_records = unmapped_output_records;
-        self.block_search.record_sequences = std::sync::Arc::new(record_sequences);
-        self.block_search.older_not_indexed = build.older_not_indexed;
-        self.block_search.session_id = Some(session_id.to_string());
-        self.block_search.record_version = Some(record_version);
-        self.block_search.query_error = None;
+        // Old hits own their display text and keep selection/range visible.
+        // Release only the obsolete normalized payload before the worker can
+        // allocate its replacement: peak is old cache + source OR source +
+        // new cache, never all three. No worker/UI shares mutable text.
+        self.block_search.cache = Vec::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = crate::block_mode::build_block_search_cache_cancellable(
+                snapshot,
+                crate::block_mode::BLOCK_SEARCH_CACHE_MAX_BYTES,
+                || worker_cancelled.load(Ordering::Relaxed),
+            )
+            .map(|build| BlockSearchWindow {
+                build,
+                sequences,
+                unmapped,
+                unavailable,
+                boundary_missing,
+                raw_records,
+            });
+            let _ = sender.send(result);
+        });
+        self.block_search.history_pending = Some(BlockSearchPendingWindow {
+            generation: self.block_search.history_generation,
+            session_id: session_id.to_owned(),
+            version: record_version,
+            before,
+            cancelled,
+            receiver,
+            worker,
+        });
+        false
     }
 
     /// A click/plain Enter accepts and closes. Shift+Enter reveals one hit,
@@ -4137,25 +4582,69 @@ impl TerminalApp {
     /// A record that scrolled out of reach in the meantime degrades to the
     /// jump path's own toast.
     pub(crate) fn block_search_accept(&mut self, keep_open: bool) {
-        // A PTY completion can rotate the bounded record deque between the
-        // last paint and Enter. Refresh first so a hit built for an old
-        // finalized-record version is never resolved against the new one.
-        self.refresh_block_search_hits();
-        let Some((target, hit)) = self
+        // Capture the claim before refresh can replace a displayed result set.
+        let Some(claim) = self
             .block_search
-            .selected_hit()
-            .zip(self.block_search.session_id.as_ref())
-            .map(|(hit, session_id)| {
-                (
-                    CommandTarget {
-                        session_id: session_id.clone(),
-                        execution_id: hit.record_id.clone(),
-                    },
-                    hit.clone(),
-                )
-            })
+            .activation_target(self.block_search.selected_index)
         else {
             return;
+        };
+        self.block_search_accept_target(claim, keep_open);
+    }
+
+    /// Resolve only the exact rendered claim. Pending-at-entry is a hard
+    /// rejection, including a worker that has finished but is not yet adopted.
+    fn block_search_resolve_activation(
+        &mut self,
+        claim: crate::block_search::BlockSearchActivationTarget,
+    ) -> Option<(String, crate::block_mode::BlockSearchHit)> {
+        if self.block_search.is_loading() || !self.block_search.contains_activation_target(&claim) {
+            return None;
+        }
+        self.refresh_block_search_hits();
+        if !self.block_search.contains_activation_target(&claim) {
+            return None;
+        }
+        let session = self.session_manager.get_active_session_mut();
+        if session.metadata.session_id != claim.session_id {
+            return None;
+        }
+        let terminal = session.terminal.try_lock()?;
+        if !terminal
+            .command_record(&claim.hit.record_id)
+            .is_some_and(|r| r.complete && r.sequence == claim.sequence)
+        {
+            return None;
+        }
+        if self.block_search.raw.displayed {
+            terminal
+                .validate_search_seal(self.block_search.raw.seal.as_ref()?)
+                .ok()?;
+        }
+        Some((claim.session_id, claim.hit))
+    }
+
+    pub(crate) fn block_search_accept_target(
+        &mut self,
+        claim: crate::block_search::BlockSearchActivationTarget,
+        keep_open: bool,
+    ) {
+        let Some((session_id, hit)) = self.block_search_resolve_activation(claim) else {
+            return;
+        };
+        let raw_anchor = if self.block_search.raw.displayed {
+            self.block_search
+                .hits
+                .iter()
+                .position(|candidate| candidate == &hit)
+                .and_then(|index| self.block_search.raw.anchors.get(index))
+                .copied()
+        } else {
+            None
+        };
+        let target = CommandTarget {
+            session_id,
+            execution_id: hit.record_id.clone(),
         };
         if hit.line_no.is_some()
             && self
@@ -4185,20 +4674,31 @@ impl TerminalApp {
                     let policy = &mut session.projection_policy;
                     let view_state = &mut session.projection_view_state;
                     let mut terminal = terminal_arc.lock();
-                    let anchor = hit
-                        .match_span
-                        .as_ref()
-                        .and_then(|span| {
-                            terminal.command_output_match_anchor(
-                                &target.execution_id,
-                                line_no,
-                                span.start,
-                                span.end,
-                            )
-                        })
-                        .or_else(|| {
-                            terminal.command_output_line_anchor(&target.execution_id, line_no)
-                        });
+                    let raw_source_valid = !self.block_search.raw.displayed
+                        || self
+                            .block_search
+                            .raw
+                            .seal
+                            .as_ref()
+                            .is_some_and(|seal| terminal.validate_search_seal(seal).is_ok());
+                    if !raw_source_valid {
+                        return;
+                    }
+                    let anchor = raw_anchor.or_else(|| {
+                        hit.match_span
+                            .as_ref()
+                            .and_then(|span| {
+                                terminal.command_output_match_anchor(
+                                    &target.execution_id,
+                                    line_no,
+                                    span.start,
+                                    span.end,
+                                )
+                            })
+                            .or_else(|| {
+                                terminal.command_output_line_anchor(&target.execution_id, line_no)
+                            })
+                    });
                     if let Some(anchor) = anchor {
                         let transformed = terminal
                             .projected_viewport_with_state(

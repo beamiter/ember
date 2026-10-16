@@ -1,3 +1,5 @@
+pub mod search_chunk;
+pub mod search_worker;
 mod watch;
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
@@ -575,6 +577,9 @@ impl Default for TerminalDefaultColors {
 }
 
 pub struct TerminalState {
+    search_source_epoch: u64,
+    search_source_revision: u64,
+    search_scrollback_epoch: u64,
     pub grid: TerminalGrid,
     alt_grid: TerminalGrid,
     pub scrollback: VecDeque<ScrollbackLine>,

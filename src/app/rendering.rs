@@ -3419,7 +3419,7 @@ impl TerminalApp {
         }
 
         // 跨块搜索选择器(block:search):与命令面板同款的中央浮层。
-        let mut clicked_hit_index = None;
+        let mut clicked_hit_target = None;
         let mut clicked_bookmark_target = None;
         let mut clicked_bookmark_preserve_focus = false;
         let mut hovered_hit_index = None;
@@ -3436,6 +3436,13 @@ impl TerminalApp {
             // text. A completed block (including same-length deque rotation)
             // rebuilds the bounded index before any old hit can be accepted.
             self.refresh_block_search_hits();
+            if self.block_search.is_loading()
+                || self.block_search.record_version.is_none()
+                || self.block_search.computed_query.as_deref()
+                    != Some(self.block_search.query.as_str())
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
 
             let active_index = self.session_manager.active_index();
             let picker_session_id = self.block_search.session_id.clone();
@@ -3676,6 +3683,25 @@ impl TerminalApp {
                         }
                     });
 
+                    ui.horizontal_wrapped(|ui| {
+                        let earlier = ui.add_enabled(self.block_search.can_search_earlier(), egui::Button::new(self.block_search.earlier_label()));
+                        intent_control_focused |= earlier.has_focus();
+                        if earlier.clicked() && self.block_search.request_earlier_history() {
+                            self.refresh_block_search_hits();
+                        }
+                        if self.block_search.raw.operation.as_ref().is_some_and(|operation|operation.active) {
+                            let stop=ui.button("Stop search");
+                            intent_control_focused |= stop.has_focus();
+                            if stop.clicked(){self.block_search.stop_raw_operation();}
+                        }
+                        let latest = ui.add_enabled(self.block_search.history_before.is_some() || self.block_search.raw.displayed || self.block_search.raw.pending.is_some(),
+                            egui::Button::new("Latest"));
+                        intent_control_focused |= latest.has_focus();
+                        if latest.clicked() && self.block_search.request_latest_history() {
+                            self.refresh_block_search_hits();
+                        }
+                        ui.label(egui::RichText::new(self.block_search.history_label()).small());
+                    });
                     ui.separator();
                     let query_error = self.block_search.query_error.clone();
                     if let Some(error) = &query_error {
@@ -3798,7 +3824,7 @@ impl TerminalApp {
                                         |ui| {
                                             let (marker, marker_color) = match hit.line_no {
                                                 Some(line_no) => (
-                                                    format!("L{line_no}"),
+                                                    if self.block_search.raw.displayed { "RAW".to_owned() } else { format!("L{line_no}") },
                                                     egui::Color32::from_rgb(255, 200, 100),
                                                 ),
                                                 None => (
@@ -3827,7 +3853,7 @@ impl TerminalApp {
                                                     };
                                                     hit.line_no.map_or_else(
                                                         || owner.to_string(),
-                                                        |line_no| format!("{owner} · L{line_no}"),
+                                                        |line_no| if self.block_search.raw.displayed { format!("{owner} · retained output") } else { format!("{owner} · L{line_no}") },
                                                     )
                                                 } else {
                                                     "command".to_string()
@@ -3861,13 +3887,16 @@ impl TerminalApp {
                                     } else {
                                         "Bookmark this block for this running session"
                                     };
-                                    let bookmark_accessible_label =
+                                    let bookmark_accessible_label = if self.block_search.raw.displayed {
+                                        format!("{} block bookmark; retained output result {} of {}", if bookmarked { "Remove" } else { "Add" }, idx + 1, hit_count)
+                                    } else {
                                         block_search_bookmark_accessible_label(
                                             hit,
                                             idx,
                                             hit_count,
                                             bookmarked,
-                                        );
+                                        )
+                                    };
                                     let bookmark_response = block_search_bookmark_button(
                                         ui,
                                         ui.make_persistent_id((
@@ -3901,7 +3930,9 @@ impl TerminalApp {
 
                                     let response = response
                                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                    let row_accessible_label = if hit.is_output_line {
+                                    let row_accessible_label = if self.block_search.raw.displayed {
+                                        format!("Result {} of {}; retained output; {}", idx + 1, hit_count, hit.line_text)
+                                    } else if hit.is_output_line {
                                         let owner = if hit.command_preview.is_empty() {
                                             "a commandless block"
                                         } else {
@@ -3948,7 +3979,7 @@ impl TerminalApp {
                                         focused_hit_index = Some(idx);
                                     }
                                     if block_search_result_render_activation(&response) {
-                                        clicked_hit_index = Some(idx);
+                                        clicked_hit_target = self.block_search.activation_target(idx);
                                     }
                                 }
                             },
@@ -4003,6 +4034,7 @@ impl TerminalApp {
                 self.block_search.needs_bookmark_focus = false;
             }
             self.block_search.intent_control_focused = intent_control_focused;
+            self.block_search.mark_hits_rendered();
         }
 
         if let Some(index) = focused_hit_index {
@@ -4025,9 +4057,8 @@ impl TerminalApp {
             if toggled || clicked_bookmark_preserve_focus {
                 ctx.request_repaint();
             }
-        } else if let Some(index) = clicked_hit_index {
-            self.block_search.selected_index = index;
-            self.block_search_confirm();
+        } else if let Some(target) = clicked_hit_target {
+            self.block_search_accept_target(target, false);
         }
 
         // 远程主机选择器（浮动窗口）

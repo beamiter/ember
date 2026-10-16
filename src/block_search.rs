@@ -211,9 +211,315 @@ pub struct BlockSearchBookmarkTarget {
     pub is_output_line: bool,
 }
 
+/// The boundary is a terminal-owned sequence AND its observed external id.
+/// Positions are never cursors: deque retirement must not shift a page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSearchHistoryCursor {
+    pub sequence: u64,
+    pub record_id: String,
+}
+
+impl BlockSearchHistoryCursor {
+    pub fn matches_record(&self, record_id: &str, sequence: u64) -> bool {
+        self.sequence == sequence && self.record_id == record_id
+    }
+    pub fn includes_earlier(&self, sequence: u64) -> bool {
+        sequence < self.sequence
+    }
+}
+
+/// Claim from one rendered result generation, never a visual row index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSearchActivationTarget {
+    pub generation: u64,
+    pub history_generation: u64,
+    pub session_id: String,
+    pub record_version: BlockSearchRecordVersion,
+    pub sequence: u64,
+    pub hit: BlockSearchHit,
+}
+
+pub struct BlockSearchWindow {
+    pub build: crate::block_mode::BlockSearchCacheBuild,
+    pub sequences: std::sync::Arc<HashMap<String, u64>>,
+    pub unmapped: HashSet<String>,
+    pub unavailable: HashSet<String>,
+    pub boundary_missing: bool,
+    pub raw_records: Vec<BlockSearchHistoryCursor>,
+}
+
+/// Keep the receiver until completion, even after cancellation. Dropping the
+/// cancellation token is NOT permission to start another allocating worker.
+pub struct BlockSearchPendingWindow {
+    pub generation: u64,
+    pub session_id: String,
+    pub version: BlockSearchRecordVersion,
+    pub before: Option<BlockSearchHistoryCursor>,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub receiver: std::sync::mpsc::Receiver<Option<BlockSearchWindow>>,
+    pub worker: std::thread::JoinHandle<()>,
+}
+
+impl BlockSearchPendingWindow {
+    pub fn is_current(
+        &self,
+        generation: u64,
+        session_id: &str,
+        version: BlockSearchRecordVersion,
+        before: &Option<BlockSearchHistoryCursor>,
+    ) -> bool {
+        self.generation == generation
+            && self.session_id == session_id
+            && self.version == version
+            && &self.before == before
+            && !self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Cumulative work allowance for one explicit, record-scoped user action.
+#[derive(Clone, Copy, Debug)]
+pub struct RawOperationLimits {
+    pub windows: usize,
+    pub cells: usize,
+    pub bytes: usize,
+    pub encoded_bytes: usize,
+    pub duration: std::time::Duration,
+}
+impl Default for RawOperationLimits {
+    fn default() -> Self {
+        Self {
+            windows: 128,
+            cells: 16 * 1024 * 1024,
+            bytes: 16 * 1024 * 1024,
+            encoded_bytes: 64 * 1024 * 1024,
+            duration: std::time::Duration::from_secs(10),
+        }
+    }
+}
+impl RawOperationLimits {
+    pub fn bounded(self) -> Self {
+        let max = Self::default();
+        Self {
+            windows: self.windows.min(max.windows),
+            cells: self.cells.min(max.cells),
+            bytes: self.bytes.min(max.bytes),
+            encoded_bytes: self.encoded_bytes.min(max.encoded_bytes),
+            duration: self.duration.min(max.duration),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawOperationIntent {
+    pub session: Option<String>,
+    pub query: String,
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
+    pub scope: BlockSearchScope,
+    pub filter: BlockSearchFilter,
+    pub bookmark_revision: Option<u64>,
+    pub history_generation: u64,
+}
+#[derive(Debug)]
+pub struct RawSearchOperation {
+    pub generation: u64,
+    pub active: bool,
+    pub started: std::time::Instant,
+    pub limits: RawOperationLimits,
+    pub submitted: usize,
+    pub completed: usize,
+    pub cells: usize,
+    pub bytes: usize,
+    pub encoded_bytes: usize,
+    pub row_decodes: usize,
+    pub intent: RawOperationIntent,
+    pub record: BlockSearchHistoryCursor,
+}
+impl RawSearchOperation {
+    pub fn new(
+        generation: u64,
+        intent: RawOperationIntent,
+        record: BlockSearchHistoryCursor,
+        limits: RawOperationLimits,
+        now: std::time::Instant,
+    ) -> Self {
+        Self {
+            generation,
+            active: true,
+            started: now,
+            limits: limits.bounded(),
+            submitted: 0,
+            completed: 0,
+            cells: 0,
+            bytes: 0,
+            encoded_bytes: 0,
+            row_decodes: 0,
+            intent,
+            record,
+        }
+    }
+    pub fn allowance(&self, now: std::time::Instant) -> Result<(), &'static str> {
+        let window = crate::terminal::search_worker::SearchWorkerLimits::default();
+        if self.submitted != self.completed {
+            return Err("window in flight");
+        }
+        if self.submitted >= self.limits.windows {
+            return Err("window limit");
+        }
+        if now
+            .saturating_duration_since(self.started)
+            .checked_add(window.max_duration)
+            .is_none_or(|elapsed| elapsed > self.limits.duration)
+        {
+            return Err("time limit");
+        }
+        for (used, reserve, limit, name) in [
+            (
+                self.cells,
+                window.max_cells,
+                self.limits.cells,
+                "cell limit",
+            ),
+            (
+                self.bytes,
+                window.max_bytes,
+                self.limits.bytes,
+                "source-byte limit",
+            ),
+            (
+                self.encoded_bytes,
+                window.max_encoded_bytes,
+                self.limits.encoded_bytes,
+                "encoded-byte limit",
+            ),
+        ] {
+            if used.checked_add(reserve).is_none_or(|total| total > limit) {
+                return Err(name);
+            }
+        }
+        Ok(())
+    }
+    pub fn reserve(&mut self, now: std::time::Instant) -> Result<(), &'static str> {
+        self.allowance(now)?;
+        self.submitted += 1;
+        Ok(())
+    }
+    pub fn charge(&mut self, progress: &crate::terminal::search_worker::SearchProgress) -> bool {
+        let window = crate::terminal::search_worker::SearchWorkerLimits::default();
+        let work = &progress.work;
+        if self.completed >= self.submitted
+            || progress.chunks > window.max_chunks
+            || work.cells_charged > window.max_cells
+            || work.bytes_emitted > window.max_bytes
+            || work.encoded_bytes_charged > window.max_encoded_bytes
+        {
+            return false;
+        }
+        let Some(cells) = self.cells.checked_add(work.cells_charged) else {
+            return false;
+        };
+        let Some(bytes) = self.bytes.checked_add(work.bytes_emitted) else {
+            return false;
+        };
+        let Some(encoded) = self.encoded_bytes.checked_add(work.encoded_bytes_charged) else {
+            return false;
+        };
+        let Some(rows) = self.row_decodes.checked_add(work.rows_decoded) else {
+            return false;
+        };
+        if cells > self.limits.cells
+            || bytes > self.limits.bytes
+            || encoded > self.limits.encoded_bytes
+        {
+            return false;
+        }
+        self.cells = cells;
+        self.bytes = bytes;
+        self.encoded_bytes = encoded;
+        self.row_decodes = rows;
+        self.completed += 1;
+        true
+    }
+    pub fn progress_label(&self) -> String {
+        format!(
+            "{} windows, {} row decodes, {} charged cells, {:.1}s",
+            self.completed,
+            self.row_decodes,
+            self.cells,
+            self.started.elapsed().as_secs_f64()
+        )
+    }
+}
+
+/// Search-only controller state persists across picker dismissal. The pool is
+/// never replaced on close/session change: cancellation is not thread exit.
+#[derive(Default)]
+pub struct BlockSearchRawState {
+    pub operation: Option<RawSearchOperation>,
+    pub operation_generation: u64,
+    pub operation_limits: RawOperationLimits,
+    pub restart: Option<BlockSearchHistoryCursor>,
+    pub pool: Option<std::sync::Arc<crate::terminal::search_worker::SearchWorkerPermitPool>>,
+    pub worker: Option<crate::terminal::search_worker::SearchWorker>,
+    pub records: Vec<BlockSearchHistoryCursor>,
+    pub eligible: Vec<BlockSearchHistoryCursor>,
+    pub next: usize,
+    pub requested: bool,
+    pub pending: Option<u64>,
+    pub finished: Option<crate::terminal::search_worker::SearchFinished>,
+    pub displayed: bool,
+    pub current: Option<BlockSearchHistoryCursor>,
+    pub continuation: Option<crate::terminal::search_worker::SearchContinuation>,
+    pub seal: Option<crate::terminal::search_chunk::RawSearchSeal>,
+    pub anchors: Vec<crate::terminal::BufferAnchor>,
+    pub status: String,
+}
+impl BlockSearchRawState {
+    pub fn cancel(&mut self, close: bool) {
+        self.operation = None;
+        self.restart = None;
+        self.operation_generation = self
+            .operation_generation
+            .checked_add(1)
+            .expect("raw operation generation exhausted");
+        if let Some(worker) = &self.worker {
+            if close {
+                worker.close();
+            } else {
+                worker.cancel();
+            }
+        }
+        if close {
+            self.worker = None;
+        }
+        self.pending = None;
+        self.finished = None;
+        self.requested = false;
+        self.displayed = false;
+        self.current = None;
+        self.continuation = None;
+        self.seal = None;
+        self.anchors.clear();
+        self.next = 0;
+        self.status.clear();
+    }
+    pub fn can_advance(&self) -> bool {
+        self.restart.is_some() || self.continuation.is_some() || self.next < self.eligible.len()
+    }
+}
+
 #[derive(Default)]
 pub struct BlockSearchState {
+    pub raw: BlockSearchRawState,
     pub is_open: bool,
+    pub history_before: Option<BlockSearchHistoryCursor>,
+    pub history_range: Option<(u64, u64)>,
+    pub history_unavailable: usize,
+    pub history_boundary_missing: bool,
+    pub history_generation: u64,
+    pub hits_generation: u64,
+    pub rendered_generation: Option<u64>,
+    pub history_pending: Option<BlockSearchPendingWindow>,
     pub query: String,
     /// Index into `hits` of the highlighted result row.
     pub selected_index: usize,
@@ -283,6 +589,242 @@ pub struct BlockSearchState {
 }
 
 impl BlockSearchState {
+    pub fn raw_operation_intent(&self) -> RawOperationIntent {
+        RawOperationIntent {
+            session: self.session_id.clone(),
+            query: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            regex: self.regex,
+            whole_word: self.whole_word,
+            scope: self.scope,
+            filter: self.filter,
+            bookmark_revision: self.bookmark_revision,
+            history_generation: self.history_generation,
+        }
+    }
+    pub fn stop_raw_operation(&mut self) {
+        if !self
+            .raw
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.active)
+        {
+            return;
+        }
+        if let Some(worker) = &self.raw.worker {
+            worker.cancel();
+        }
+        if let Some(operation) = &mut self.raw.operation {
+            operation.active = false;
+        }
+        self.raw.restart = self.raw.current.clone();
+        self.raw.continuation = None;
+        self.raw.pending = None;
+        self.raw.finished = None;
+        self.raw.requested = false;
+        self.rendered_generation = None;
+        self.hits_generation = self
+            .hits_generation
+            .checked_add(1)
+            .expect("hit generation exhausted");
+        self.raw.status="Search stopped; verified results retained; Restart this output scans from its beginning".into();
+    }
+    pub fn is_loading(&self) -> bool {
+        self.history_pending.is_some()
+            || self.raw.pending.is_some()
+            || self.raw.requested
+            || (self.raw.worker.is_none()
+                && self
+                    .raw
+                    .pool
+                    .as_ref()
+                    .is_some_and(|pool| pool.active_workers() > 0))
+    }
+    pub fn raw_can_advance(&self) -> bool {
+        !self.regex
+            && !self.whole_word
+            && !self.query.trim().is_empty()
+            && self.scope != BlockSearchScope::Command
+            && self.raw.can_advance()
+    }
+    pub fn can_search_earlier(&self) -> bool {
+        !self.is_loading()
+            && self.query_error.is_none()
+            && (self.raw_can_advance() || self.older_not_indexed)
+    }
+    pub fn earlier_label(&self) -> &'static str {
+        if self.raw.restart.is_some() {
+            "Restart this output"
+        } else if self.raw.continuation.is_some() {
+            "Continue this output"
+        } else if self.raw_can_advance() {
+            "Search this retained output"
+        } else {
+            "Earlier history"
+        }
+    }
+
+    /// Call after painting this result set. A loading/invalid set cannot
+    /// authorize activation, even if a worker completes before input handling.
+    pub fn mark_hits_rendered(&mut self) {
+        self.rendered_generation =
+            (!self.is_loading() && self.query_error.is_none()).then_some(self.hits_generation);
+    }
+
+    pub fn activation_target(&self, index: usize) -> Option<BlockSearchActivationTarget> {
+        if !self.is_open
+            || (self.raw.displayed
+                && (self.raw.seal.is_none() || self.raw.anchors.len() != self.hits.len()))
+            || self.is_loading()
+            || self.query_error.is_some()
+            || self.rendered_generation != Some(self.hits_generation)
+            || self.computed_query.as_deref() != Some(self.query.as_str())
+        {
+            return None;
+        }
+        let hit = self.hits.get(index)?.clone();
+        Some(BlockSearchActivationTarget {
+            generation: self.hits_generation,
+            history_generation: self.history_generation,
+            session_id: self.session_id.clone()?,
+            record_version: self.record_version?,
+            sequence: *self.record_sequences.get(&hit.record_id)?,
+            hit,
+        })
+    }
+
+    pub fn contains_activation_target(&self, target: &BlockSearchActivationTarget) -> bool {
+        !self.is_loading()
+            && self.rendered_generation == Some(target.generation)
+            && self.hits_generation == target.generation
+            && self.history_generation == target.history_generation
+            && self.session_id.as_deref() == Some(target.session_id.as_str())
+            && self.record_version == Some(target.record_version)
+            && self.record_sequences.get(&target.hit.record_id) == Some(&target.sequence)
+            && self.is_open
+            && self.query_error.is_none()
+            && self.computed_query.as_deref() == Some(self.query.as_str())
+            && self.hits.iter().any(|hit| hit == &target.hit)
+    }
+
+    pub fn cancel_history_window(&mut self) {
+        self.raw.cancel(true);
+        self.rendered_generation = None;
+        self.history_generation = self
+            .history_generation
+            .checked_add(1)
+            .expect("block search generation exhausted");
+        if let Some(pending) = &mut self.history_pending {
+            pending
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Closing the picker stops result retention immediately, even if
+            // the worker raced cancellation after its final check. Preserve
+            // its handle as the single-flight permit until it actually exits.
+            let (_, disconnected) = std::sync::mpsc::channel();
+            pending.receiver = disconnected;
+        }
+    }
+
+    pub fn request_earlier_history(&mut self) -> bool {
+        if !self.can_search_earlier() {
+            return false;
+        }
+        if self.raw_can_advance() {
+            let record = if let Some(record) = self.raw.restart.clone() {
+                record
+            } else if self.raw.continuation.is_some() {
+                let Some(record) = self.raw.current.clone() else {
+                    return false;
+                };
+                record
+            } else {
+                let Some(record) = self.raw.eligible.get(self.raw.next).cloned() else {
+                    return false;
+                };
+                self.raw.next += 1;
+                record
+            };
+            self.raw.current = Some(record.clone());
+            self.raw.operation_generation = self
+                .raw
+                .operation_generation
+                .checked_add(1)
+                .expect("raw operation generation exhausted");
+            self.raw.operation = Some(RawSearchOperation::new(
+                self.raw.operation_generation,
+                self.raw_operation_intent(),
+                record,
+                self.raw.operation_limits,
+                std::time::Instant::now(),
+            ));
+            self.raw.requested = true;
+            self.rendered_generation = None;
+            return true;
+        }
+        let Some(record) = self.cache.first() else {
+            return false;
+        };
+        let Some(&sequence) = self.record_sequences.get(&record.record_id) else {
+            return false;
+        };
+        self.history_before = Some(BlockSearchHistoryCursor {
+            sequence,
+            record_id: record.record_id.clone(),
+        });
+        self.cancel_history_window();
+        self.record_version = None;
+        true
+    }
+
+    pub fn request_latest_history(&mut self) -> bool {
+        if self.query_error.is_some() {
+            return false;
+        }
+        self.history_before = None;
+        self.cancel_history_window();
+        self.record_version = None;
+        true
+    }
+
+    pub fn history_label(&self) -> String {
+        let mut label = match self.history_range {
+            Some((oldest, newest)) => format!("Retained blocks #{oldest}–#{newest}"),
+            None => "No retained blocks in this window".to_owned(),
+        };
+        if self.is_loading() {
+            label.push_str(" · loading replacement…");
+        } else if self.history_before.is_some() {
+            label.push_str(" · newer blocks outside this window");
+        }
+        if !self.raw.status.is_empty() {
+            label.push_str(" · ");
+            label.push_str(&self.raw.status);
+        }
+        if !self.raw.records.is_empty() && !self.raw.displayed {
+            label.push_str(&format!(
+                " · {} uncaptured/truncated outputs not searched; use Search this retained output",
+                self.raw.records.len()
+            ));
+        }
+        if self.history_boundary_missing {
+            label.push_str(" · earlier boundary evicted; use Latest");
+        }
+        if !self.unmapped_output_records.is_empty() {
+            label.push_str(&format!(
+                " · {} outputs partially searched",
+                self.unmapped_output_records.len()
+            ));
+        }
+        if self.history_unavailable > 0 {
+            label.push_str(&format!(
+                " · {} outputs unavailable",
+                self.history_unavailable
+            ));
+        }
+        label
+    }
+
     pub fn reset_intent(&mut self) {
         self.query.clear();
         self.case_sensitive = false;
@@ -306,6 +848,7 @@ impl BlockSearchState {
         if self.query_error.is_some() {
             return false;
         }
+        self.cancel_history_window();
         self.record_version = None;
         true
     }
@@ -314,6 +857,13 @@ impl BlockSearchState {
     /// selection and pane identity are always rebuilt fresh; query/options,
     /// scope and metadata filter are intentionally not serialized anywhere.
     pub fn open(&mut self) {
+        self.cancel_history_window();
+        self.history_before = None;
+        self.raw.records.clear();
+        self.raw.eligible.clear();
+        self.history_range = None;
+        self.history_unavailable = 0;
+        self.history_boundary_missing = false;
         self.is_open = true;
         self.needs_focus = true;
         self.needs_bookmark_focus = false;
@@ -335,7 +885,10 @@ impl BlockSearchState {
     }
 
     pub fn close(&mut self) {
+        self.cancel_history_window();
         self.is_open = false;
+        self.raw.records.clear();
+        self.raw.eligible.clear();
         self.intent_control_focused = false;
         if self.query.len() > crate::block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES {
             // Do not reopen directly into the one-scalar TooLong sentinel.
@@ -413,6 +966,7 @@ impl BlockSearchState {
     /// Release every index/result allocation before a version rebuild starts.
     /// Query/filter controls survive so the new index can immediately
     /// reevaluate the user's current intent.
+    #[allow(dead_code)] // Compatibility reset, also exercised by the state tests.
     pub fn release_index_for_rebuild(&mut self) {
         self.cache = Vec::new();
         self.record_sequences = std::sync::Arc::default();
@@ -491,14 +1045,18 @@ impl BlockSearchState {
 
     /// The highlighted hit, if any.
     pub fn selected_hit(&self) -> Option<&BlockSearchHit> {
-        self.query_error
-            .is_none()
+        (!self.is_loading() && self.query_error.is_none())
             .then(|| self.hits.get(self.selected_index))
             .flatten()
     }
 
     pub fn bookmark_target(&self, index: usize) -> Option<BlockSearchBookmarkTarget> {
-        if !self.is_open || self.query_error.is_some() || self.computed_query.is_none() {
+        if !self.is_open
+            || self.is_loading()
+            || self.record_version.is_none()
+            || self.query_error.is_some()
+            || self.computed_query.is_none()
+        {
             return None;
         }
         let hit = self.hits.get(index)?;
@@ -567,6 +1125,11 @@ impl BlockSearchState {
                     .map(|anchor| anchor.index.min(hits.len() - 1))
             })
             .unwrap_or(0);
+        self.hits_generation = self
+            .hits_generation
+            .checked_add(1)
+            .expect("block search result generation exhausted");
+        self.rendered_generation = None;
         self.hits = hits;
         self.capped = capped;
         self.query_error = None;
@@ -613,6 +1176,9 @@ impl BlockSearchState {
         }
         if self.older_not_indexed {
             label.push_str(" · older blocks not indexed");
+        }
+        if self.raw.displayed || !self.raw.records.is_empty() {
+            label.push_str(" · this window only; output coverage is partial");
         }
         label
     }

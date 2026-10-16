@@ -837,6 +837,20 @@ pub const MAX_BLOCK_SEARCH_HITS: usize = 500;
 pub const BLOCK_SEARCH_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum resident heap held by the finished original/lowercase index.
 pub const BLOCK_SEARCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Block Search literal-only caseless normalization. This is scalar Unicode
+/// lowercase plus sigma equivalence (Σ/σ/ς), not full Unicode casefold.
+/// Context-free scalars make snapshots and bounded raw chunks identical.
+/// Case-sensitive and regex engines deliberately do not use this helper.
+pub(crate) fn block_search_literal_scalar(character: char) -> impl Iterator<Item = char> {
+    character
+        .to_lowercase()
+        .map(|lower| if lower == 'ς' { 'σ' } else { lower })
+}
+
+pub(crate) fn block_search_literal_normalize(text: &str) -> String {
+    text.chars().flat_map(block_search_literal_scalar).collect()
+}
+
 /// Display clip for a hit's matching line.
 pub const BLOCK_SEARCH_LINE_TEXT_CHARS: usize = 200;
 /// Display clip for a hit's command preview.
@@ -1114,8 +1128,8 @@ impl CachedBlockSearchRecord {
 
     fn from_source(source: BlockSearchSource) -> Self {
         let command = source.command.filter(|command| !command.trim().is_empty());
-        let command_lowercase = command.as_deref().map(str::to_lowercase);
-        let output_lowercase = source.output.as_deref().map(str::to_lowercase);
+        let command_lowercase = command.as_deref().map(block_search_literal_normalize);
+        let output_lowercase = source.output.as_deref().map(block_search_literal_normalize);
         Self {
             record_id: source.record_id,
             command,
@@ -1142,10 +1156,23 @@ pub struct BlockSearchCacheBuild {
     pub resident_bytes: usize,
 }
 
+#[allow(dead_code)] // Synchronous compatibility entry point and bounded-cache tests.
 pub fn build_block_search_cache(
     snapshot: BlockSearchSourceSnapshot,
     max_bytes: usize,
 ) -> BlockSearchCacheBuild {
+    build_block_search_cache_cancellable(snapshot, max_bytes, || false).unwrap_or_default()
+}
+
+/// Cancel between bounded records; a cancelled build is never publishable.
+pub fn build_block_search_cache_cancellable(
+    snapshot: BlockSearchSourceSnapshot,
+    max_bytes: usize,
+    cancelled: impl Fn() -> bool,
+) -> Option<BlockSearchCacheBuild> {
+    if cancelled() {
+        return None;
+    }
     let records = Vec::with_capacity(snapshot.sources.len());
     let vec_bytes = records
         .capacity()
@@ -1162,9 +1189,12 @@ pub fn build_block_search_cache(
             .records
             .capacity()
             .saturating_mul(std::mem::size_of::<CachedBlockSearchRecord>());
-        return build;
+        return Some(build);
     }
     for source in snapshot.sources {
+        if cancelled() {
+            return None;
+        }
         let record = CachedBlockSearchRecord::from_source(source);
         let bytes = record.payload_bytes();
         if build.resident_bytes.saturating_add(bytes) > max_bytes {
@@ -1175,7 +1205,7 @@ pub fn build_block_search_cache(
         build.records.push(record);
     }
     build.records.reverse();
-    build
+    (!cancelled()).then_some(build)
 }
 
 /// [`search_blocks`] result: hits in scan order (records newest first;
@@ -1225,7 +1255,7 @@ impl BlockSearchMatcher {
     fn literal_insensitive(query: &str) -> Option<Self> {
         let query = query.trim();
         (!query.is_empty()).then(|| Self {
-            engine: BlockSearchEngine::LiteralInsensitive(query.to_lowercase()),
+            engine: BlockSearchEngine::LiteralInsensitive(block_search_literal_normalize(query)),
             whole_word: false,
         })
     }
@@ -1260,7 +1290,9 @@ impl BlockSearchMatcher {
             }))
         } else {
             Ok(Some(Self {
-                engine: BlockSearchEngine::LiteralInsensitive(query.to_lowercase()),
+                engine: BlockSearchEngine::LiteralInsensitive(block_search_literal_normalize(
+                    query,
+                )),
                 whole_word: options.whole_word,
             }))
         }
@@ -1302,7 +1334,9 @@ fn original_match_span_at(
     let mut original_start = None;
     let mut original_end = 0usize;
     for (index, character) in text.chars().enumerate() {
-        let expanded_bytes: usize = character.to_lowercase().map(char::len_utf8).sum();
+        let expanded_bytes: usize = block_search_literal_scalar(character)
+            .map(char::len_utf8)
+            .sum();
         let next = lower_cursor.saturating_add(expanded_bytes);
         if next > lowercase_range.start && lower_cursor < lowercase_range.end {
             original_start.get_or_insert(index);

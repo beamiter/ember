@@ -247,6 +247,22 @@ jobs:
         if: steps.desktop-install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/ember-installed/bin/ember" --backend x11 --output native-smoke-artifacts/x11
 
+      - name: Gate real X11 bounded block-search correctness
+        if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}
+        timeout-minutes: 12
+        run: |
+          python3 scripts/test-native-block-search.py
+          status=0
+          for scenario in raw snapshot; do
+            if ! python3 scripts/native-block-search.py \
+              --binary "$RUNNER_TEMP/ember-installed/bin/ember" \
+              --backend x11 --scenario "$scenario" \
+              --output "native-smoke-artifacts/block-search-$scenario"; then
+              status=1
+            fi
+          done
+          exit "$status"
+
       - name: Build compositor protocol pointer helper
         id: desktop-pointer
         if: ${{ !cancelled() && steps.desktop-install.outcome == 'success' }}

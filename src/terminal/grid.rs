@@ -566,6 +566,96 @@ impl ScrollbackLine {
         }
     }
 
+    /// Search-only admission cost. Reading it does not decode or scan text.
+    pub(super) fn search_encoded_bytes(&self) -> usize {
+        match &self.data {
+            CompressedLineData::Plain(text, _) => text.len(),
+            CompressedLineData::Encoded(data) => data.len(),
+        }
+    }
+
+    /// Whole-row decode with checked allocation/run limits. Existing render
+    /// and copy decoders remain untouched. The caller reserves the entire
+    /// row's cells and encoded bytes BEFORE invoking this method.
+    pub(super) fn decode_search_row(
+        &self,
+        max_cells: usize,
+        max_encoded: usize,
+    ) -> Option<Vec<TerminalCell>> {
+        let cols = self.columns();
+        if cols > super::MAX_TERMINAL_COLS
+            || cols > max_cells
+            || self.search_encoded_bytes() > max_encoded
+        {
+            return None;
+        }
+        let mut cells = Vec::with_capacity(cols);
+        match &self.data {
+            CompressedLineData::Plain(text, trailing) => {
+                for character in text.chars() {
+                    if cells.len() == cols {
+                        return None;
+                    }
+                    cells.push(TerminalCell {
+                        character,
+                        ..Default::default()
+                    });
+                }
+                if cells.len().checked_add(*trailing as usize)? != cols {
+                    return None;
+                }
+            }
+            CompressedLineData::Encoded(data) => {
+                let mut pos = 0;
+                while pos < data.len() {
+                    let ch_len = *data.get(pos)? as usize;
+                    pos += 1;
+                    if !(1..=4).contains(&ch_len) {
+                        return None;
+                    }
+                    let text =
+                        std::str::from_utf8(data.get(pos..pos.checked_add(ch_len)?)?).ok()?;
+                    let mut chars = text.chars();
+                    let character = chars.next()?;
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                    pos += ch_len;
+                    let foreground = Self::decode_color(data, &mut pos);
+                    let background = Self::decode_color(data, &mut pos);
+                    let mut flags = Self::decode_flags(*data.get(pos)?);
+                    pos += 1;
+                    let wide = *data.get(pos)?;
+                    pos += 1;
+                    flags.set_wide(wide & 1 != 0);
+                    flags.set_wide_continuation(wide & 2 != 0);
+                    let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
+                        *data.get(pos)?,
+                        *data.get(pos + 1)?,
+                    ]));
+                    pos += 2;
+                    let run = (*data.get(pos)? as usize).max(1);
+                    pos += 1;
+                    if cells.len().checked_add(run)? > cols {
+                        return None;
+                    }
+                    cells.resize(
+                        cells.len() + run,
+                        TerminalCell {
+                            character,
+                            foreground,
+                            background,
+                            flags,
+                            hyperlink_id,
+                        },
+                    );
+                }
+            }
+        }
+        cells.resize(cols, TerminalCell::default());
+        Some(cells)
+    }
+
     /// 供搜索使用的行文本视图,避免对 Plain 行做 decompress → 重建字符串的
     /// 往返。返回(文本, 列映射, 可搜索列数):
     /// - Plain 行只含窄字符(压缩时已排除 wide/wide_continuation),直接借用
@@ -912,5 +1002,42 @@ impl DirtyRegion {
     /// 清除脏标记
     pub fn clear(&mut self) {
         self.rows.clear();
+    }
+}
+
+#[cfg(test)]
+mod search_chunk_decode_tests {
+    use super::*;
+    #[test]
+    fn search_chunk_decode_admission_and_rle_expansion_are_bounded() {
+        let cells = vec![
+            TerminalCell {
+                character: 'x',
+                foreground: Color::Red,
+                ..Default::default()
+            };
+            1024
+        ];
+        let mut line = ScrollbackLine::compress(&cells, false);
+        let bytes = line.search_encoded_bytes();
+        assert!(line.decode_search_row(1023, bytes).is_none());
+        assert!(line.decode_search_row(1024, bytes - 1).is_none());
+        assert_eq!(line.decode_search_row(1024, bytes).unwrap().len(), 1024);
+        // Corrupted compressed input cannot allocate a run beyond cols before
+        // its final resize, unlike the general-purpose historical decoder.
+        if let CompressedLineData::Encoded(data) = &mut line.data {
+            *data.last_mut().unwrap() = 255;
+        } else {
+            panic!("encoded fixture");
+        }
+        assert!(line.decode_search_row(1024, bytes).is_none());
+    }
+    #[test]
+    fn search_chunk_plain_padding_has_whole_row_cell_cost() {
+        let cells = vec![TerminalCell::default(); 1024];
+        let line = ScrollbackLine::compress(&cells, false);
+        assert_eq!(line.columns(), 1024);
+        assert!(line.decode_search_row(1000, 4096).is_none());
+        assert_eq!(line.decode_search_row(1024, 4096).unwrap().len(), 1024);
     }
 }
